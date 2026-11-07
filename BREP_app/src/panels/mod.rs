@@ -123,3 +123,5 @@ pub mod wire_harness;
 
 pub mod ribbon;
 pub mod simulation;
+
+pub(crate) mod selection_inspection;

@@ -4946,13 +4946,10 @@ pub const RECENT_THUMB_SIDE: f32 = crate::plm::thumbnail::RECENT_SIDE;
 /// menu's artwork already uses.
 const RECENT_PLACEHOLDER_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><rect x="1.5" y="1.5" width="37" height="37" rx="4" fill="#8a8a8a" fill-opacity="0.16" stroke="#8a8a8a" stroke-opacity="0.45"/></svg>"##;
 
-/// Shared File menu for both appearances: the workbench picker on the left,
-/// the document commands on the right, the recent documents (with their
-/// thumbnails) in one column under both. Workbench selection uses apply +
-/// store.
+/// File actions and recent documents, shared by Ribbon and Classic.
 pub fn file_menu(
     ui: &mut egui::Ui,
-    state: &mut EngineState,
+    _state: &mut EngineState,
     store: &dyn ModelStore,
     settings_open: &mut bool,
     properties_open: &mut bool,
@@ -4963,29 +4960,14 @@ pub fn file_menu(
     let presentation = crate::workbench::file_presentation;
     egui_extras::install_image_loaders(ui.ctx());
     let menu = ui.menu_button("File", |ui| {
-        // Plugin workbenches declare no artwork of their own; they share the
-        // plugin manager's glyph.
-        let plugin_glyph = presentation("workbench:manage:plugins").glyph;
-        let dynamic = crate::workbench::owned_workbenches(state);
-        let workbench_rows: Vec<(&str, &str)> = crate::workbench::WORKBENCHES
-            .iter()
-            .map(|w| (w.glyph, w.label))
-            .chain(dynamic.iter().map(|w| (plugin_glyph, w.label.as_str())))
-            .collect();
         let file_rows: Vec<_> = crate::workbench::FILE_COMMANDS
             .iter()
             .map(|p| (p.glyph, p.label()))
             .collect();
-        // Fixed measured widths — one per column — avoid feeding the popup's
-        // previous width back through full-width rows while egui settles its
-        // area. The recent rows span both columns.
-        let left_width = toolbar_button::menu_width_salted(ui, "workbench-measure", &workbench_rows);
-        let right_width = toolbar_button::menu_width(ui, &file_rows);
-        let gap = ui.spacing().item_spacing.x;
         let compact = crate::viewport::touch::compact(ui.ctx());
-        let width = if compact { left_width.max(right_width).min((ui.ctx().content_rect().width() - 32.0).max(100.0)) }
-            else { left_width + gap + right_width };
-        let (left_width, right_width) = if compact { (width, width) } else { (left_width, right_width) };
+        let width = toolbar_button::menu_width(ui, &file_rows)
+            .min((ui.ctx().content_rect().width() - 32.0).max(100.0));
+        let right_width = width;
         ui.set_width(width);
         let max_height = ui.ctx().content_rect().height() * 0.8;
         ui.set_max_height(max_height);
@@ -5000,39 +4982,6 @@ pub fn file_menu(
             .max_height(max_height)
             .show(ui, |ui| {
                 let columns = |ui: &mut egui::Ui| {
-                    // LEFT: the workbench picker.
-                    ui.vertical(|ui| {
-                        ui.set_width(left_width);
-                        ui.weak("Workbench");
-                        let current = crate::workbench::resolved_id(state, &state.settings.workbench);
-                        if current != state.settings.workbench {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!(
-                                        "Unavailable workbench: {}; using Modeling",
-                                        state.settings.workbench
-                                    ))
-                                    .weak(),
-                                )
-                                .wrap(),
-                            );
-                        }
-                        let options = crate::workbench::WORKBENCHES
-                            .iter()
-                            .map(|w| (w.id, w.label, w.glyph))
-                            .chain(dynamic.iter().map(|w| (w.id.as_str(), w.label.as_str(), plugin_glyph)));
-                        for (id, label, glyph) in options {
-                            let row = toolbar_button::menu_row(ui, glyph, label, current == id, left_width);
-                            hits.insert(format!("workbench:item:{id}"), row.rect);
-                            if row.clicked() {
-                                let _ = state
-                                    .apply_settings_json(&serde_json::json!({"workbench": id}).to_string());
-                                let _ = store.write(crate::store::SETTINGS_KEY, &state.settings_json());
-                                ui.close();
-                            }
-                        }
-                    });
-                    // RIGHT: everything else, in the order the one-column menu had.
                     ui.vertical(|ui| {
                         ui.set_width(right_width);
                         ui.weak("Document");
@@ -5166,8 +5115,6 @@ pub fn file_menu(
         if compact { hits.insert("file:clip".into(), body.inner_rect); }
     });
     hits.insert("file:menu".into(), menu.response.rect);
-    // Retain the historic menu-opener key for coordinate automation.
-    hits.insert("workbench".into(), menu.response.rect);
     outcome
 }
 

@@ -574,6 +574,14 @@ pub trait ModelStore {
         0
     }
 
+    /// [`Self::pending_writes`], leaving out the writes of the documents
+    /// stored under `names`: what `settle` on one document waits for while
+    /// other tabs save. A store that cannot tell its writes apart counts all.
+    fn pending_writes_except(&self, names: &[&str]) -> usize {
+        let _ = names;
+        self.pending_writes()
+    }
+
     // --- common file-browser filesystem --------------------------------------
 
     /// Current directory shown by the embedded explorer.
@@ -1094,6 +1102,9 @@ mod native_boot {
         }
         fn pending_writes(&self) -> usize {
             self.core.pending_writes()
+        }
+        fn pending_writes_except(&self, names: &[&str]) -> usize {
+            self.core.pending_writes_except(names)
         }
         fn browser_location(&self) -> String {
             self.core.browser_location()
@@ -2422,6 +2433,19 @@ pub(crate) mod mirror_store {
         crate::plm::native::spawn(task);
     }
 
+    /// [`spawn`] for one document's write: natively the task is tagged with
+    /// the document's store name, so `settle` on another document can leave
+    /// it out (`plm::native::pending_except`).
+    fn spawn_for(name: &str, task: impl Future<Output = ()> + 'static) {
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::plm::native::tagged(name, || spawn(task));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = name;
+            spawn(task);
+        }
+    }
+
 
     /// A synchronous [`ModelStore`] over an asynchronous [`StoreBackend`]: the
     /// hydrated mirror plus write-behind. Cheap to clone — every field is shared,
@@ -2632,9 +2656,10 @@ pub(crate) mod mirror_store {
             *self.in_flight.borrow_mut().entry(key.to_string()).or_insert(0) += 1;
             if self.backend.orders_writes_per_key() {
                 let settle = self.settler(key);
+                let tag = name;
                 let name = name.to_string();
                 let request = request();
-                spawn(async move { settle(&name, request.await) });
+                spawn_for(tag, async move { settle(&name, request.await) });
                 return;
             }
             {
@@ -2651,7 +2676,7 @@ pub(crate) mod mirror_store {
             let queues = self.queues.clone();
             let key = key.to_string();
             let first = (name.to_string(), request());
-            spawn(async move {
+            spawn_for(name, async move {
                 let (name, request) = first;
                 settle(&name, request.await);
                 loop {
@@ -3251,6 +3276,11 @@ pub(crate) mod mirror_store {
 
         fn pending_writes(&self) -> usize {
             self.pending()
+        }
+
+        fn pending_writes_except(&self, names: &[&str]) -> usize {
+            let skip: Vec<String> = names.iter().map(|name| Self::key(name)).collect();
+            self.in_flight.borrow().iter().filter(|(key, _)| !skip.contains(key)).map(|(_, count)| *count).sum()
         }
 
         fn take_persistence_errors(&self) -> Vec<String> {
@@ -4332,6 +4362,9 @@ mod web_model {
         }
         fn pending_writes(&self) -> usize {
             self.core.pending_writes()
+        }
+        fn pending_writes_except(&self, names: &[&str]) -> usize {
+            self.core.pending_writes_except(names)
         }
         fn browser_location(&self) -> String {
             self.core.browser_location()

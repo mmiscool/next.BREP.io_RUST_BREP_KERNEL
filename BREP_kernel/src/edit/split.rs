@@ -15,11 +15,25 @@ use crate::{
 };
 use serde::Deserialize;
 
-/// Axis-aligned bounding box of a solid's vertices.
+/// Axis-aligned bounding box of a solid: its vertices, and the control points
+/// of every face's surface and every edge's curve.
+///
+/// The vertices alone do not bound a body whose faces bulge past them: a torus
+/// has one vertex, so the box read as degenerate and the split refused; a
+/// sphere's are its two poles, a segment on the axis. A rational patch or curve
+/// with positive weights lies in the hull of its control points, so they bound
+/// it (loosely, which a tool three diagonals wide does not mind).
 fn solid_aabb(solid: &BrepSolid) -> Aabb {
     let mut bounds = Aabb::empty();
     for vertex in &solid.vertices {
         bounds.include_point(vertex.point);
+    }
+    let surfaces = solid.shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| face.surface.control_points.iter().flatten());
+    let curves = solid.edges.iter().flat_map(|edge| edge.curve.control_points.iter());
+    for control in surfaces.chain(curves) {
+        if let Ok(point) = control.point() {
+            bounds.include_point(point);
+        }
     }
     bounds
 }

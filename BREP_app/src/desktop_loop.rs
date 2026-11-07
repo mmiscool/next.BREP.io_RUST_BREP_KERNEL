@@ -183,7 +183,7 @@ const FALLBACK_SIZE: egui::Vec2 = egui::vec2(800.0, 600.0);
 #[cfg(feature = "automation")]
 fn run_pass(app: &mut BrepApp, installed: &Installed) {
     let ctx = &installed.ctx;
-    let mut raw = {
+    let raw = {
         let mut pass = installed.pass.borrow_mut();
         let mut raw = ctx.input(|i| i.raw.clone());
         // The last pass's input stands for the window (its size, scale,
@@ -217,60 +217,27 @@ fn run_pass(app: &mut BrepApp, installed: &Installed) {
     };
     // Counted as it begins: the pass answers commands from inside it.
     ON_DEMAND_PASSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    eframe::App::raw_input_hook(app, ctx, &mut raw);
-    let mut frame = eframe::Frame::_new_kittest();
-    let output = ctx.run_ui(raw, |ui| {
-        eframe::App::logic(app, ui.ctx(), &mut frame);
-        eframe::App::ui(app, ui, &mut frame);
-    });
-    let egui::FullOutput { platform_output, textures_delta, shapes, pixels_per_point, mut viewport_output } = output;
-    if let Some(render) = &installed.render {
-        crate::offscreen::apply_texture_sets(render, &textures_delta);
-    }
-    // Viewport commands: a capture is drawn here; everything else goes back
-    // onto the context for eframe's next real frame to carry out.
-    let mut captures = Vec::new();
-    for (id, viewport) in viewport_output.iter_mut() {
-        for command in std::mem::take(&mut viewport.commands) {
-            match command {
-                egui::ViewportCommand::Screenshot(user_data) if *id == egui::ViewportId::ROOT => captures.push(user_data),
-                other => ctx.send_viewport_cmd_to(*id, other),
-            }
-        }
-    }
-    if !captures.is_empty() {
-        let size = ctx.content_rect().size() * pixels_per_point;
-        let size_px = [size.x.round() as u32, size.y.round() as u32];
-        let clear = eframe::App::clear_color(app, &ctx.global_style().visuals);
-        let image = match &installed.render {
-            Some(render) => crate::offscreen::capture(render, ctx, shapes, pixels_per_point, size_px, clear),
+    let render = installed.render.as_ref();
+    let pass = crate::on_demand::run(app, ctx, render, raw);
+    // A capture is drawn here, waiting for the GPU (nothing is presented),
+    // and lands in the next pass's input as eframe delivers one.
+    if !pass.captures.is_empty() {
+        let (size_px, clear) = crate::on_demand::capture_target(app, ctx, pass.pixels_per_point);
+        let image = match render {
+            Some(render) => crate::offscreen::capture(render, ctx, pass.shapes, pass.pixels_per_point, size_px, clear),
             None => Err("offscreen capture: the window has no wgpu render state".to_string()),
         };
-        let mut pass = installed.pass.borrow_mut();
         match image {
-            Ok(image) => {
-                let image = std::sync::Arc::new(image);
-                for user_data in captures {
-                    pass.events.push(egui::Event::Screenshot { viewport_id: egui::ViewportId::ROOT, user_data, image: image.clone() });
-                }
-            }
+            Ok(image) => installed.pass.borrow_mut().events.extend(crate::on_demand::screenshot_events(pass.captures, image)),
             Err(error) => {
                 log::error!("{error}");
-                drop(pass);
                 app.automation().fail_captures(&error);
             }
         }
     }
-    if let Some(render) = &installed.render {
-        crate::offscreen::apply_texture_frees(render, &textures_delta);
+    if let Some(render) = render {
+        crate::offscreen::apply_texture_frees(render, &pass.textures_delta);
     }
-    // What the user would have been given (a copy, an opened link) still
-    // happens, on eframe's next real frame.
-    if !platform_output.commands.is_empty() {
-        ctx.output_mut(|o| o.commands.extend(platform_output.commands));
-    }
-    // A window that IS drawn shows the pass's effect on its next frame.
-    ctx.request_repaint();
 }
 
 /// A waker that sends the loop its wake event. Safe from any thread; a closed

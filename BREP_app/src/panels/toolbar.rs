@@ -94,6 +94,7 @@ impl ToolbarPanel {
                 let style = state.settings.toolbar_style;
                 let mut target = None;
                 toolbar_button::wrapped(ui, |ui| {
+                    self.workbench_switcher(ui, state, store);
                     let file = super::file::file_menu(
                         ui,
                         state,
@@ -115,7 +116,9 @@ impl ToolbarPanel {
                             let segments = command.segments();
                             let group = (segments[0], segments[1]);
                             if last_group != Some(group) {
-                                ui.separator();
+                                // Keep the existing button pitch while leaving room
+                                // for the workbench selector in the Classic strip.
+                                ui.add(egui::Separator::default().spacing(1.0));
                                 last_group = Some(group);
                             }
                             if let Some(t) = super::ribbon::draw_command(
@@ -141,6 +144,28 @@ impl ToolbarPanel {
                 ui.add_space(3.0);
             });
         outcome
+    }
+
+    fn workbench_switcher(
+        &mut self, ui: &mut egui::Ui, state: &mut EngineState,
+        store: &dyn ModelStore,
+    ) {
+        let dynamic = workbench::owned_workbenches(state);
+        let plugin_glyph = workbench::file_presentation("workbench:manage:plugins").glyph;
+        let options: Vec<_> = workbench::WORKBENCHES.iter()
+            .map(|w| (w.label, w.id, w.glyph))
+            .chain(dynamic.iter().map(|w| (w.label.as_str(), w.id.as_str(), plugin_glyph)))
+            .collect();
+        let current = workbench::resolved_id(state, &state.settings.workbench);
+        let selected = toolbar_button::select(ui, "workbench", &current, &options);
+        self.hits.insert("workbench".into(), selected.header_rect);
+        for (id, rect) in selected.item_rects {
+            self.hits.insert(format!("workbench:item:{id}"), rect);
+        }
+        if let Some(id) = selected.changed {
+            let _ = state.apply_settings_json(&serde_json::json!({"workbench": id}).to_string());
+            let _ = store.write(crate::store::SETTINGS_KEY, &state.settings_json());
+        }
     }
 
     fn commands(
@@ -173,11 +198,12 @@ impl ToolbarPanel {
         let mut target = None;
         egui::containers::panel::Panel::top("brep-mobile-toolbar").resizable(false).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
+                self.workbench_switcher(ui, state, store);
                 let file = super::file::file_menu(ui, state, store, settings_open, properties_open, &mut self.hits);
                 outcome.file = file.action;
                 outcome.recent_document = file.recent;
-                outcome.plugins = file.plugins;
-                outcome.javascript = file.javascript;
+                outcome.plugins |= file.plugins;
+                outcome.javascript |= file.javascript;
                 let mut commands = self.commands(state, ecad, *info_open);
                 if state.any_sketch_mode() {
                     commands.sort_by_key(|c| !matches!(&c.target, workbench::CommandTarget::Workbench(_)));
@@ -417,7 +443,8 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "toolbar", prefix: "help", meaning: "open the help site", command: Some("help_open") },
     HitKeyDoc { panel: "toolbar", prefix: "info", meaning: "open the info window (licences + diagnostics)", command: Some("info_window") },
     HitKeyDoc { panel: "toolbar", prefix: "bug", meaning: "open the bug report", command: Some("bug_report_open") },
-    HitKeyDoc { panel: "toolbar", prefix: "workbench", meaning: "legacy opener key for the shared File menu", command: Some("settings_set") },
+    HitKeyDoc { panel: "toolbar", prefix: "workbench", meaning: "open the workbench icon-and-name dropdown", command: Some("settings_set") },
     HitKeyDoc { panel: "toolbar", prefix: "workbench:btn:", meaning: "one button of the ACTIVE workbench's action row (workbench:btn:<button id>) \u{2014} published only while that button is offered, so Drawing's `drawing.sheet_close`, the six `drawing.dim.*` constructions, the two `drawing.ord.*` sets, `drawing.section` and `drawing.detail` are here exactly while a sheet is open, and the ten `sketch.tool.*` draw tools and `sketch.autoconstrain` (which EVERY workbench carries) exactly while a sketch is being edited; the armed construction and the armed draw tool draw pressed. A button that is offered but DISABLED (an eCAD action its editor does not allow yet) draws greyed and `workbench_button` refuses it with the reason. A MENU button (PCB's copper-layer picker) opens a menu whose entries publish this key while it is OPEN. Classic wraps available buttons; Ribbon places them in their declared tabs and groups, compacting Large buttons before whole-group overflow. Menu entries publish only while their menu is open", command: Some("workbench_button") },
-    HitKeyDoc { panel: "toolbar", prefix: "workbench:item:", meaning: "pick a radio row from File / Workbench (workbench:item:id)", command: Some("settings_set") },
+    HitKeyDoc { panel: "toolbar", prefix: "workbench:item:", meaning: "pick a workbench from the icon-and-name dropdown (workbench:item:id)", command: Some("settings_set") },
 ];
+

@@ -1307,12 +1307,19 @@ pub(super) fn outline_offset_carrier(
     // even where that trim is not its offset (a concave arc's floor is not),
     // because every such shell was built and gated on it — re-gating on
     // "trim differs" split the notched box's outward shell into two shells.
-    if extension <= 0.0 || !face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? || !outline_has_free_element(source, face)? {
+    if extension <= 0.0 || !face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        return Ok(None);
+    }
+    if !outline_has_free_element(source, face)? && !(convex_polygon_outline_enabled() && outline_is_convex_polygon(source, face)?) {
         return Ok(None);
     }
     // Compared at the extension itself, built with the clearance.
-    let Ok(exact) = offset_outline_wall(source, face, extension)? else {
-        return Ok(None);
+    let exact = match offset_outline_wall(source, face, extension)? {
+        Ok(exact) => exact,
+        Err(reason) => {
+            os_debug!("outline offset of source face {} declined: {reason}", face.id);
+            return Ok(None);
+        }
     };
     let Ok(wall) = offset_outline_wall(source, face, extension + clearance)? else {
         return Ok(None);
@@ -1328,6 +1335,7 @@ pub(super) fn outline_offset_carrier(
     for (u, v) in [(u1, v0), (u0, v1), (u1, v1)] {
         let departure = carrier_face.surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?.sub(frame.origin).dot(normal) - shift.dot(normal);
         if departure.abs() > 1e-9 * crate::solid_scale(source).max(1.0) {
+            os_debug!("outline offset of source face {} declined: the carrier is not the source plane translated ({departure:.3e})", face.id);
             return Ok(None);
         }
     }
@@ -1369,9 +1377,80 @@ pub(super) fn outline_offset_carrier(
     // opening wall keeps its scaled patch, so no shell that was right before
     // is rebuilt on a different patch (`walls_trim_the_same_region`).
     if walls_trim_the_same_region(&place(exact)?, carrier, 1e-9f64.max(crate::solid_scale(source) * 1e-11))? {
+        os_debug!("outline offset of source face {}: the slid net's trim already is the offset outline", face.id);
         return Ok(None);
     }
     Ok(Some(place(wall)?))
+}
+
+/// `BREP_OFFSET_CONVEX_POLYGON_OUTLINE` (default on; `=0` restores): a planar face whose
+/// outline is one CONVEX polygon of lines is trimmed by its outline offset too
+/// ([`outline_offset_carrier`]), not by the slid net's scaled trim.
+///
+/// Cause (a regular tetrahedron grown by 1, brep-bench
+/// offset/tetrahedron-grown): each triangle sits in a rectangular patch, and
+/// sliding the patch's net scales the triangle about the PATCH centre, not
+/// its own, so its corners grow by less than the 2.83 the grown triangle's
+/// corners move. Five of the six carrier pairs met in no piece and the sharp
+/// body refused (non-integral genus). A convex polygon's outline offset is the
+/// mitred larger polygon, with no reflex corner to trim, which is the case the
+/// notched box's two-shell split (a reflex notch) is not. Under the same
+/// switch the pipeline reads pads equal to 1e-9 as the uniform pad: the three
+/// turned sides' pads differed in their last bits, and only the base, whose
+/// pads were bit-equal, had reached this lane.
+pub(super) fn convex_polygon_outline_enabled() -> bool {
+    switch!("BREP_OFFSET_CONVEX_POLYGON_OUTLINE", true)
+}
+
+
+/// One loop, every element a line, every corner turning the same way by a
+/// clear margin (a convex polygon in the face's own plane frame).
+fn outline_is_convex_polygon(source: &BrepSolid, face: &FaceRecord) -> Result<bool, KernelRefusal> {
+    if face.loops.len() != 1 {
+        os_debug!("convex polygon outline: face {} has {} loops", face.id, face.loops.len());
+        return Ok(false);
+    }
+    let tolerance = 1e-6 * crate::solid_scale(source).max(1.0);
+    let frame = PlaneFrame::new(&face.surface)?;
+    let vertex_by_id = source.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect::<HashMap<_, _>>();
+    let mut directions = Vec::new();
+    for coedge in &face.loops[0].coedges {
+        let Some(edge) = source.edges.iter().find(|edge| edge.id == coedge.edge_id) else {
+            return Ok(false);
+        };
+        if edge.degenerate {
+            continue;
+        }
+        let (start_id, end_id) = if coedge.forward {
+            (edge.start_vertex_id, edge.end_vertex_id)
+        } else {
+            (edge.end_vertex_id, edge.start_vertex_id)
+        };
+        let (Some(start), Some(end)) = (vertex_by_id.get(&start_id), vertex_by_id.get(&end_id)) else {
+            return Ok(false);
+        };
+        match classify_edge(&frame, edge, coedge.forward, *start, *end, tolerance)? {
+            Ok(Element::Line { start, end }) => directions.push(unit(sub(end, start))),
+            other => {
+                os_debug!("convex polygon outline: face {} edge {} is not a line ({:?})", face.id, edge.id, other.err());
+                return Ok(false);
+            }
+        }
+    }
+    if directions.len() < 3 {
+        os_debug!("convex polygon outline: face {} has {} lines", face.id, directions.len());
+        return Ok(false);
+    }
+    let mut sign = 0.0f64;
+    for index in 0..directions.len() {
+        let turn = cross(directions[index], directions[(index + 1) % directions.len()]);
+        if turn.abs() <= 1e-6 || (sign != 0.0 && turn.signum() != sign) {
+            os_debug!("convex polygon outline: face {} turns {turn:.3e} at corner {index}", face.id);
+            return Ok(false);
+        }
+        sign = turn.signum();
+    }
+    Ok(true)
 }
 
 /// Whether the face's outer outline has an edge that is neither a line nor a

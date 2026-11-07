@@ -1,6 +1,6 @@
 [package]
 name = "BREP_app"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -230,13 +230,19 @@ web-sys = { version = "0.3", features = [
     # The problem reports this user submitted (src/report_followup.rs): a
     # few ids, kept beside the page rather than in the model store.
     "Storage",
+    # The frame-free automation pump (src/web_pump.rs): a MessageChannel task
+    # is not throttled in a background tab (a timer is), egui's clock is
+    # `performance.now()`, and `document.hidden` says no frame is coming.
+    "MessageChannel",
+    "MessagePort",
+    "Performance",
 ] }
 # The MCP server core WITHOUT its server (no protocol, no transports, no
 # native platform): the tool set alone, which the browser build registers as
 # WebMCP tools over the page's own platform (src/webmcp.rs). Declared per
 # target so the wasm build never resolves rmcp or hyper; the `mcp` feature's
 # `dep:brep-mcp-core` activates whichever entry the target has.
-brep-mcp-core = { package = "BREP_mcp_core", version = "0.9.1", path = "../BREP_mcp_core", default-features = false, optional = true }
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.10.0", path = "../BREP_mcp_core", default-features = false, optional = true }
 # The host protocol's channels (`tokio::sync` is the one tokio feature set
 # that compiles for wasm32); no runtime, no timers — the page's event loop
 # runs the tasks and `setTimeout` is the pause.
@@ -245,7 +251,7 @@ tokio = { version = "1", default-features = false, features = ["sync"], optional
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # The MCP server core (feature `mcp`): the same server `brep-mcp` hosts
 # headlessly, embedded here over the app's own automation queue.
-brep-mcp-core = { package = "BREP_mcp_core", version = "0.9.1", path = "../BREP_mcp_core", optional = true }
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.10.0", path = "../BREP_mcp_core", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"], optional = true }
 # The desktop event loop (src/desktop_loop.rs) wraps eframe's winit handler so
 # application commands dispatch without waiting for a frame. The version eframe

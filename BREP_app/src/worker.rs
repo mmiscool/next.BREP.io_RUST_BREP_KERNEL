@@ -84,6 +84,18 @@ pub struct WorkerRunner {
     pending_install: Option<PluginInstallRequest>,
 }
 
+thread_local! {
+    /// Called after each reply the history worker posts ([`set_reply_wake`]).
+    static REPLY_WAKE: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
+}
+
+/// Install (or with `None` remove) the hook called after each reply the
+/// history worker posts: the browser's counterpart of the runner thread's
+/// `brep_render::runner::set_reply_waker`.
+pub fn set_reply_wake(wake: Option<Rc<dyn Fn()>>) {
+    REPLY_WAKE.with(|w| *w.borrow_mut() = wake);
+}
+
 impl WorkerRunner {
     /// Spawn the module worker and wire its reply pump. Panics with a clear message
     /// if the worker cannot be created (the browser could not load `./worker.js`).
@@ -100,6 +112,12 @@ impl WorkerRunner {
                     Ok(reply) => inbox_cb.borrow_mut().push_back(reply),
                     Err(error) => log::error!("worker reply parse failed: {error}"),
                 }
+            }
+            // The app collects it now, not at its next frame (a background
+            // tab has none): the automation pump's wake (`web_pump`).
+            let wake = REPLY_WAKE.with(|w| w.borrow().clone());
+            if let Some(wake) = wake {
+                wake();
             }
         }) as Box<dyn FnMut(MessageEvent)>);
         worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));

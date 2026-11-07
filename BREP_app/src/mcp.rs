@@ -235,7 +235,7 @@ fn instructions_naming(url: &str, session_root: &Path, token: &Path) -> String {
 async fn forward(queue: &Arc<AutomationQueue>, envelope: Envelope) -> Reply {
     let id = envelope.id;
     let deadline = std::time::Instant::now() + REPLY_TIMEOUT;
-    let rx = queue.submit_before(AppEnvelope { id, cmd: envelope.cmd, args: envelope.args }, Some(deadline));
+    let rx = queue.submit_for(AppEnvelope { id, cmd: envelope.cmd, args: envelope.args }, Some(deadline), envelope.client);
     match tokio::task::spawn_blocking(move || (rx.recv_timeout(REPLY_TIMEOUT), rx)).await {
         Ok((Ok(reply), _)) => reply.into_host(),
         Ok((Err(std::sync::mpsc::RecvTimeoutError::Timeout), rx)) => {
@@ -261,7 +261,7 @@ async fn forward(queue: &Arc<AutomationQueue>, envelope: Envelope) -> Reply {
 /// A capture is the app's own `screenshot` command (egui's viewport
 /// screenshot, completed on a later frame); the PNG rides in the reply blob.
 async fn capture(queue: &Arc<AutomationQueue>, region: Value) -> Result<(Value, Vec<u8>), String> {
-    let reply = forward(queue, Envelope { id: 0, cmd: "screenshot".into(), args: json!({ "region": region }) }).await;
+    let reply = forward(queue, Envelope { id: 0, cmd: "screenshot".into(), args: json!({ "region": region }), client: None }).await;
     if !reply.ok {
         return Err(reply.error.unwrap_or_else(|| "screenshot failed".into()));
     }

@@ -43,6 +43,8 @@ pub(crate) mod band;
 
 #[path = "thicken/periodic.rs"]
 mod periodic;
+#[path = "thicken/to_centre.rs"]
+pub(crate) mod to_centre;
 
 /// The fold factor at or below which the equidistant sheet has collapsed.  The
 /// offset-shell carrier lane refuses at the same number on the same condition
@@ -775,6 +777,9 @@ fn thicken_one_region(
     let mut bottom_cap_loops: Vec<LoopRecord> = Vec::new();
     let mut bottom_junction_points: Vec<Vec3> = Vec::new();
     let mut next_id = 1u64;
+    // A seamed sheet with a pole (`BREP_THICKEN_SEAMED_POLE`) is a cap, not a
+    // ring: the seam adds no handle once one end of the strip closes at a point.
+    let mut seamed_pole_closes = false;
 
     for loop_curves in loops.iter() {
         let count = loop_curves.len();
@@ -807,9 +812,26 @@ fn thicken_one_region(
                 let uv = curve.evaluate(q0 + (q1 - q0) * fraction).or_refuse(KernelStage::Refine, "evaluate")?;
                 images.push(surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Refine, "evaluate")?);
             }
-            pole[index] = seam.is_none()
+            // A seamed sheet's pole joins the pole path only behind
+            // `BREP_THICKEN_SEAMED_POLE`, and only where both its neighbours
+            // are the seam meridians (a revolved cap).
+            let seamed_pole = seam.is_some_and(|[first, second]| {
+                thicken_seamed_pole_on() && {
+                    let neighbours = [(index + 1) % count, (index + count - 1) % count];
+                    neighbours.contains(&first) && neighbours.contains(&second)
+                }
+            });
+            pole[index] = (seam.is_none() || seamed_pole)
                 && images.iter().all(|point| point.sub(images[0]).length() <= pole_band);
         }
+        // A sheet closed at BOTH poles (a whole sphere's skin, brep-bench
+        // `thicken/sphere-skin`) thickens to two concentric spheres, a body
+        // with a void, which this path does not build: it keeps its pole
+        // walls (the path it had before).
+        if seam.is_some() && pole.iter().filter(|is_pole| **is_pole).count() > 1 {
+            pole.fill(false);
+        }
+        seamed_pole_closes |= seam.is_some() && pole.iter().any(|is_pole| *is_pole);
         if pole.iter().all(|is_pole| *is_pole) {
             return Err(KernelRefusal::input(KernelStage::Collect, "thicken_degenerate_boundary", "thickenSheet: sheet boundary is degenerate (every boundary curve is a pole)"));
         }
@@ -916,6 +938,12 @@ fn thicken_one_region(
             if junction_of[junction] != junction {
                 continue;
             }
+            // A seamed sheet's pole junction has no wall on either side (seam
+            // meridians and the pole itself): its vertical edge, the axis
+            // segment between the two offset poles, would bound nothing.
+            if seam.is_some() && (pole[junction] || pole[(junction + count - 1) % count]) {
+                continue;
+            }
             edges.push(EdgeRecord {
                 id: next_id,
                 curve: make_line(bottom_points[junction], top_points[junction]).or_refuse(KernelStage::Refine, "make_line")?,
@@ -955,7 +983,10 @@ fn thicken_one_region(
             edge_welds.push((top_edge_ids[second], top_edge_ids[first]));
             for i in 0..count {
                 for j in i + 1..count {
-                    if (starts[i].y - starts[j].y).abs() <= eps_v {
+                    // Two seam junctions that are already ONE vertex (the
+                    // pole, merged above) need no weld: welding a vertex to
+                    // itself would drop it.
+                    if (starts[i].y - starts[j].y).abs() <= eps_v && bottom_vertex_ids[i] != bottom_vertex_ids[j] {
                         vertex_welds.push((bottom_vertex_ids[j], bottom_vertex_ids[i]));
                         vertex_welds.push((top_vertex_ids[j], top_vertex_ids[i]));
                         edge_welds.push((vertical_edge_ids[j], vertical_edge_ids[i]));
@@ -1137,7 +1168,7 @@ fn thicken_one_region(
             id: shell_id,
             faces,
         }],
-        genus: loops.len() as i64 - 1 + i64::from(seam.is_some()),
+        genus: loops.len() as i64 - 1 + i64::from(seam.is_some() && !seamed_pole_closes),
         kind: crate::BodyKind::Solid,
     };
     let issues = solid.validate();
@@ -1162,6 +1193,17 @@ fn thicken_one_region(
     crate::accept_sound(solid, "thickenSheet")
 }
 
+/// `BREP_THICKEN_SEAMED_POLE` (default on; `=0` restores): a seamed
+/// sheet's pole (a revolved cap's, brep-bench `thicken/hemisphere-both-sides`)
+/// is a degenerate edge on each cap like an unseamed sheet's, with no wall.
+/// Without it the pole gets a ruled wall of zero area on the axis segment
+/// between the offset poles, which the mesher writes as slivers that use that
+/// segment twice each way: the measures are exact, the mesh is not closed.
+fn thicken_seamed_pole_on() -> bool {
+    switch!("BREP_THICKEN_SEAMED_POLE", true)
+}
+
+
 /// §5.9 THICKEN a sheet (an open surface patch over its full parameter
 /// domain) into a closed solid.
 ///
@@ -1182,6 +1224,13 @@ pub fn thicken_face_sheet(
 ) -> Result<Vec<BrepSolid>, KernelRefusal> {
     if !thickness.is_finite() || thickness.abs() <= 1e-12 {
         return Err(KernelRefusal::input(KernelStage::Collect, "thicken_thickness", "thickenSheet: thickness must be a nonzero finite value"));
+    }
+    // `BREP_THICKEN_TO_CENTER` (default on; `=0` restores): an offset that is one point on
+    // the revolution axis (`to_centre`).
+    if !symmetric {
+        if let Some(solid) = to_centre::build(surface, thickness)? {
+            return Ok(vec![solid]);
+        }
     }
     let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
     let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;

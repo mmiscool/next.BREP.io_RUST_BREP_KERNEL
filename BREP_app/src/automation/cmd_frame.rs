@@ -63,6 +63,14 @@ pub struct FrameInfo {
 }
 
 pub fn frame_info(ctx: &Ctx<'_>) -> FrameInfo {
+    frame_info_except(ctx, &[])
+}
+
+/// [`frame_info`], with the store writes and PLM tasks of the documents
+/// stored under `others` left out: one document's view of the app's work, for
+/// `settle` on that document. Work that belongs to no document (a sign-in, a
+/// settings write, `@recovery`'s mirror) still counts.
+fn frame_info_except(ctx: &Ctx<'_>, others: &[&str]) -> FrameInfo {
     let engine = ctx.app.docs.engine();
     let pending = PendingWork {
         // A Work part edited in context is idle only once its assembly has
@@ -73,8 +81,8 @@ pub fn frame_info(ctx: &Ctx<'_>) -> FrameInfo {
         step_probes: engine.step_probes_pending(),
         topology: engine.topology_pending(),
         projection: engine.sheet_lines_pending() || ctx.app.instructions_pdf_pending(),
-        store_writes: ctx.app.model_store().pending_writes() > 0 || store_mirror_in_flight(),
-        plm_requests: plm_requests_in_flight() || ctx.app.plm.busy() || ctx.app.toolbar.inbox().busy(),
+        store_writes: ctx.app.model_store().pending_writes_except(others) > 0 || store_mirror_in_flight(),
+        plm_requests: plm_requests_in_flight(others) || ctx.app.plm.busy() || ctx.app.toolbar.inbox().busy(),
     };
     let idle = !(pending.run
         || pending.queries
@@ -111,16 +119,24 @@ fn store_mirror_in_flight() -> bool {
     crate::plm::backend::mirror_in_flight()
 }
 
-/// Anything unfinished on the native PLM executor.
-fn plm_requests_in_flight() -> bool {
+/// Anything unfinished on the native PLM executor that is not the work of
+/// the documents stored under `others`.
+fn plm_requests_in_flight(others: &[&str]) -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        crate::plm::native::pending() > 0
+        crate::plm::native::pending_except(others) > 0
     }
     #[cfg(target_arch = "wasm32")]
     {
+        let _ = others;
         false
     }
+}
+
+/// The store names of every open document except the one at `index`: whose
+/// saves `settle` on that document does not wait for.
+fn other_documents(ctx: &Ctx<'_>, index: usize) -> Vec<String> {
+    ctx.app.docs.iter().enumerate().filter(|(i, _)| *i != index).filter_map(|(_, doc)| doc.name().map(str::to_string)).collect()
 }
 
 fn ping_result_schema() -> Value {
@@ -168,8 +184,10 @@ pub struct SettleArgs {
     #[serde(default = "default_settle_timeout")]
     pub timeout_ms: u64,
     /// Settle THIS document (a `doc:` handle), background tab or not, so
-    /// another tab's work neither delays nor hides its own. Default: the
-    /// visible document.
+    /// another tab's work (its run, queries, saves and PLM requests) neither
+    /// delays nor hides its own. Default: the visible document. Work that is
+    /// no document's (a sign-in, a settings write, `@recovery`'s mirror)
+    /// always counts.
     #[serde(default)]
     pub document: Option<String>,
 }
@@ -222,14 +240,18 @@ fn settle(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let check = move |ctx: &mut Ctx<'_>| -> Option<Result<Outcome, String>> {
         // Route to the named document for the check, as a context routes an
         // engine-only command (`automation::queue::ENGINE_ONLY`).
-        let route = match &document {
+        let (route, index) = match &document {
             Some(handle) => match ctx.app.docs.index_of_handle(handle) {
-                Some(index) => Some(ctx.app.docs.route_begin(index)),
+                Some(index) => (Some(ctx.app.docs.route_begin(index)), index),
                 None => return Some(Err("document_unknown: no open document has that handle (closed, or never opened)".into())),
             },
-            None => None,
+            None => (None, ctx.app.docs.active_index()),
         };
-        let info = frame_info(ctx);
+        // Another tab's saves and PLM work neither delay this settle nor
+        // count as this document's.
+        let others = other_documents(ctx, index);
+        let others: Vec<&str> = others.iter().map(String::as_str).collect();
+        let info = frame_info_except(ctx, &others);
         let listing = (info.idle && seen + 1 > a.settle).then(|| crate::automation::cmd_history::listing_json(ctx));
         if let Some(visible) = route {
             ctx.app.docs.route_end(visible);

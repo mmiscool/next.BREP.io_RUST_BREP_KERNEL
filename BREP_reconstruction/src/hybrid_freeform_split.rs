@@ -164,6 +164,7 @@ pub(super) fn split(
     band_cylinders: bool,
     join_walls: bool,
     noisy_crossing: bool,
+    chip_planes: bool,
 ) -> SplitReport {
     let mut report = SplitReport::default();
     if indices.len() != segmentation.triangle_region_ids.len() * 3 {
@@ -883,7 +884,7 @@ pub(super) fn split(
                             };
                             let bridges: Option<&dyn Fn(&crate::AnalyticSurface) -> Option<Vec<(u32, Vec<usize>)>>> =
                                 if bore_strips { Some(&bridges) } else { None };
-                            if let Some((bore, held, found)) = coaxial_bore(&cone, &ids, positions, indices, tolerance, cos_gate, bridges) {
+                            if let Some((bore, held, found)) = coaxial_bore(&cone, &ids, positions, indices, tolerance, cos_gate, bridges, &[], false) {
                                 if debug {
                                     eprintln!("[split] region {} cone of {support} takes a coaxial bore {:?} with {} strips", region.id, (bore, held), found.len());
                                 }
@@ -1521,6 +1522,31 @@ pub(super) fn split(
                     // kernel_countersunk_hole_s1_d0.1_jitter-0.1 the draws fit
                     // the countersink whole (92 of 118) but the bore only as
                     // pieces of 7-14, under the bore floor.
+                    // Under `noisy_crossing` a second cone of the proposal
+                    // under NARROW_BORE_CONE_DEG, its axis within that of
+                    // the first's and holding fewer, is the bore drawn as a
+                    // cone, and is dropped so the first is lone (census record
+                    // kernel_countersunk_hole_s10_d0.1_jitter-1.0 at 24 bars:
+                    // the countersink holds 93 of its 100, and a cone of 7.7
+                    // degrees 7.4 degrees off its axis 17 of the bore's 64;
+                    // a bore on the countersink's axis holds all 64).
+                    if noisy_crossing {
+                        let cones: Vec<(usize, crate::ConeSurface, usize)> = merged
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, (s, n))| if let crate::AnalyticSurface::Cone(c) = s { Some((i, *c, *n)) } else { None })
+                            .collect();
+                        if let [(i, a, na), (j, b, nb)] = cones[..] {
+                            let ((wide, held), (narrow, few, k)) = if na >= nb { ((a, na), (b, nb, j)) } else { ((b, nb), (a, na, i)) };
+                            let narrow_gate = NARROW_BORE_CONE_DEG.to_radians();
+                            if narrow.half_angle < narrow_gate && wide.half_angle >= narrow_gate && few < held && wide.axis.dot(narrow.axis).abs() >= narrow_gate.cos() {
+                                if debug {
+                                    eprintln!("[split] noise-bar proposal drops a narrow cone holding {few} (half angle {:.2} degrees) beside the cone holding {held}", narrow.half_angle.to_degrees());
+                                }
+                                merged.remove(k);
+                            }
+                        }
+                    }
                     let lone_cone = {
                         let cones: Vec<crate::ConeSurface> = merged.iter().filter_map(|(s, _)| if let crate::AnalyticSurface::Cone(c) = s { Some(*c) } else { None }).collect();
                         match cones[..] {
@@ -1549,8 +1575,18 @@ pub(super) fn split(
                         let bridges = |bore: &crate::AnalyticSurface| {
                             bore_strip_regions(bore, &cone, &ids, region.id, &*segmentation, &edges, positions, indices, NOISE_ASSIGN_SLACK_BARS * bar, -1.0, cos_gate, NOISE_STRIP_NEAR_BARS * bar, Some(NOISE_BAND_TRIANGLES), false)
                         };
-                        let constructed = coaxial_bore(&cone, &ids, positions, indices, bar, cos_gate, None)
-                            .or_else(|| coaxial_bore(&cone, &ids, positions, indices, bar, cos_gate, Some(&bridges)));
+                        // Under `noisy_crossing` a gathered region's other
+                        // carriers' triangles count for the bore, at 9 in 10
+                        // (census record kernel_countersunk_hole_s1_d0.1_jitter-1.0:
+                        // the joined region of 236 holds both caps, 36 each,
+                        // the countersink, 90, and the bore, 55 of 64).
+                        let others: Vec<crate::AnalyticSurface> = if noisy_crossing && gathered.contains(&region.id) {
+                            merged.iter().filter(|(s, _)| !matches!(s, crate::AnalyticSurface::Cone(_))).map(|(s, _)| s.clone()).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let constructed = coaxial_bore(&cone, &ids, positions, indices, bar, cos_gate, None, &others, noisy_crossing)
+                            .or_else(|| coaxial_bore(&cone, &ids, positions, indices, bar, cos_gate, Some(&bridges), &others, noisy_crossing));
                         if let Some((bore, held, _)) = constructed {
                             if debug {
                                 eprintln!("[split] noise-bar cone takes a constructed coaxial bore {bore:?} holding {held}");
@@ -1589,11 +1625,29 @@ pub(super) fn split(
                                 && (d - cone.axis * d.dot(cone.axis)).length() <= bar
                         }) else { continue };
                         let d = cylinder.axis_origin - cone.apex;
-                        let snapped = crate::CylinderSurface {
+                        let mut snapped = crate::CylinderSurface {
                             axis_origin: cone.apex + cone.axis * d.dot(cone.axis),
                             axis: if cone.axis.dot(cylinder.axis) >= 0.0 { cone.axis } else { cone.axis * -1.0 },
                             radius: cylinder.radius,
                         };
+                        if noisy_crossing {
+                            let cone_surface = crate::AnalyticSurface::Cone(*cone);
+                            let rest: Vec<usize> = ids.iter().copied().filter(|&t| !holds(&cone_surface, t, positions, indices, bar, cos_gate)).collect();
+                            if let Some(radius) = coaxial_radius(cone, &rest, positions, indices, cos_gate) {
+                                let refit = crate::CylinderSurface { radius, ..snapped };
+                                let count = |c: &crate::CylinderSurface| {
+                                    let s = crate::AnalyticSurface::Cylinder(*c);
+                                    rest.iter().filter(|&&t| holds(&s, t, positions, indices, bar, cos_gate)).count()
+                                };
+                                let (before, after) = (count(&snapped), count(&refit));
+                                if debug {
+                                    eprintln!("[split] noise-bar bore on the cone's axis: radius {:.4e} holds {before} of the cone's rest {}, the coaxial radius {radius:.4e} holds {after}", snapped.radius, rest.len());
+                                }
+                                if after >= before {
+                                    snapped = refit;
+                                }
+                            }
+                        }
                         for w in walls.iter_mut() {
                             if *w == *cylinder {
                                 *w = snapped;
@@ -1839,6 +1893,57 @@ pub(super) fn split(
                 square.iter().enumerate().any(|(i, b)| square[i + 1..].iter().any(|c| b.dot(*c).abs() >= flat))
             };
             carriers.retain(|(s, _)| !matches!(s, crate::AnalyticSurface::Cylinder(k) if across_a_stack(k.axis)));
+            // A cylinder parallel to the region's best-held one, its axis
+            // line inside it and its radius under it, is the wall's bore
+            // drawn from a seed of a few triangles: the bores so drawn are
+            // refitted as one cylinder on the wall's axis, its radius the
+            // median distance from that axis of the vertices of the
+            // triangles they hold, and it replaces them when it holds more
+            // than any of them (census record
+            // occt_annular_tube_s1_d0.1_jitter-1.0: a bore of radius 1 drawn
+            // as fits of radius 0.86 and 0.83 holding 35 and 24 of its 84).
+            let wall = carriers.iter().enumerate().filter_map(|(i, (s, n))| if let crate::AnalyticSurface::Cylinder(k) = s { Some((i, *k, *n)) } else { None }).max_by_key(|&(_, _, n)| n);
+            if let Some((at, wall, _)) = wall {
+                let tilt = MERGE_REFIT_TILT_DEG.to_radians().cos();
+                let bores: Vec<usize> = carriers
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, (s, _))| {
+                        let crate::AnalyticSurface::Cylinder(k) = s else { return false };
+                        let d = k.axis_origin - wall.axis_origin;
+                        i != at && wall.axis.dot(k.axis).abs() >= tilt && (d - wall.axis * d.dot(wall.axis)).length() < k.radius && k.radius < wall.radius
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                if !bores.is_empty() {
+                    let radial = |q: crate::Vec3| {
+                        let d = q - wall.axis_origin;
+                        (d - wall.axis * d.dot(wall.axis)).length()
+                    };
+                    let mut radii: Vec<f64> = ids
+                        .iter()
+                        .filter(|&&t| bores.iter().any(|&b| holds(&carriers[b].0, t, positions, indices, tolerance, cos_gate)))
+                        .flat_map(|&t| corners(t).map(radial))
+                        .collect();
+                    radii.sort_by(f64::total_cmp);
+                    if !radii.is_empty() {
+                        let bore = crate::AnalyticSurface::Cylinder(crate::CylinderSurface { axis_origin: wall.axis_origin, axis: wall.axis, radius: radii[radii.len() / 2] });
+                        let held = ids.iter().filter(|&&t| holds(&bore, t, positions, indices, tolerance, cos_gate)).count();
+                        let best = bores.iter().map(|&b| carriers[b].1).max().unwrap_or(0);
+                        if debug {
+                            eprintln!("[split] region {} bores {:?} on the wall's axis refit at radius {:.4e} holding {held} (best {best})", region.id, bores.iter().map(|&b| carriers[b].1).collect::<Vec<_>>(), radii[radii.len() / 2]);
+                        }
+                        if held > best {
+                            let mut i = 0;
+                            carriers.retain(|_| {
+                                i += 1;
+                                !bores.contains(&(i - 1))
+                            });
+                            carriers.push((bore, held));
+                        }
+                    }
+                }
+            }
             // The loose triangles at an end of cylinder `k` are those no
             // cylinder parallel to `k` holds: a cylinder across `k` (a false
             // one chording between a step and the cap beyond it, census
@@ -3000,29 +3105,33 @@ pub(super) fn split(
         for entry in &mut owner {
             entry.1 = carrier_of[&entry.0];
         }
-        let mut pieces: Vec<(usize, Vec<usize>)> = Vec::new();
-        let mut placed = std::collections::HashSet::<usize>::new();
-        for &(start, c) in &owner {
-            if !placed.insert(start) {
-                continue;
-            }
-            let mut piece = vec![start];
-            let mut at = 0;
-            while at < piece.len() {
-                let t = piece[at];
-                at += 1;
-                for k in 0..3 {
-                    let (a, b) = (indices[3 * t + k], indices[3 * t + (k + 1) % 3]);
-                    for &n in &edges[&(a.min(b), a.max(b))] {
-                        if carrier_of.get(&n) == Some(&c) && side.get(&n) == side.get(&t) && placed.insert(n) {
-                            piece.push(n);
+        let build_pieces = |owner: &[(usize, usize)], carrier_of: &std::collections::HashMap<usize, usize>| {
+            let mut pieces: Vec<(usize, Vec<usize>)> = Vec::new();
+            let mut placed = std::collections::HashSet::<usize>::new();
+            for &(start, c) in owner {
+                if !placed.insert(start) {
+                    continue;
+                }
+                let mut piece = vec![start];
+                let mut at = 0;
+                while at < piece.len() {
+                    let t = piece[at];
+                    at += 1;
+                    for k in 0..3 {
+                        let (a, b) = (indices[3 * t + k], indices[3 * t + (k + 1) % 3]);
+                        for &n in &edges[&(a.min(b), a.max(b))] {
+                            if carrier_of.get(&n) == Some(&c) && side.get(&n) == side.get(&t) && placed.insert(n) {
+                                piece.push(n);
+                            }
                         }
                     }
                 }
+                piece.sort_unstable();
+                pieces.push((c, piece));
             }
-            piece.sort_unstable();
-            pieces.push((c, piece));
-        }
+            pieces
+        };
+        let mut pieces = build_pieces(&owner, &carrier_of);
         if debug {
             for (c, piece) in &pieces {
                 eprintln!("[split]   piece of carrier {c}: {} tris", piece.len());
@@ -3058,6 +3167,55 @@ pub(super) fn split(
                     && !carriers.iter().enumerate().any(|(k, (s, _))| k != c && p.iter().all(|&q| s.signed_distance(q).abs() <= tolerance))
             })
         };
+        // Under `noisy_crossing` such a piece goes, before that, to the
+        // carrier beside it that holds all its vertices at the bar (the one
+        // it shares the most edges with): on census record
+        // occt_countersunk_hole_s10_d0.1_jitter-1.0 the joined region's
+        // fifth carrier was a plane through a jittered flat of the
+        // countersink, its 7 triangles within 0.55 of the cone against a bar
+        // of 2.4, and the region of 381 was declined for it.
+        if noisy_crossing && noise_region {
+            let mut moved = 0;
+            for (c, piece) in &pieces {
+                if piece.len() >= SLIVER_TRIANGLES || on_its_face(*c, piece) {
+                    continue;
+                }
+                let inside: std::collections::HashSet<usize> = piece.iter().copied().collect();
+                let mut shared = std::collections::BTreeMap::<usize, usize>::new();
+                for &t in piece {
+                    for k in 0..3 {
+                        let (a, b) = (indices[3 * t + k], indices[3 * t + (k + 1) % 3]);
+                        for &n in &edges[&(a.min(b), a.max(b))] {
+                            if let Some(&o) = carrier_of.get(&n) {
+                                if o != *c && !inside.contains(&n) {
+                                    *shared.entry(o).or_default() += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                let host = shared
+                    .iter()
+                    .filter(|(&o, _)| piece.iter().all(|&t| points(t).iter().all(|&q| carriers[o].0.signed_distance(q).abs() <= tolerance)))
+                    .max_by_key(|(&o, &n)| (n, std::cmp::Reverse(o)))
+                    .map(|(&o, _)| o);
+                if let Some(o) = host {
+                    if debug {
+                        eprintln!("[split] region {}: a piece of {} of carrier {c} goes to carrier {o} beside it, which holds it at the bar", region.id, piece.len());
+                    }
+                    for &t in piece {
+                        carrier_of.insert(t, o);
+                    }
+                    moved += 1;
+                }
+            }
+            if moved > 0 {
+                for entry in &mut owner {
+                    entry.1 = carrier_of[&entry.0];
+                }
+                pieces = build_pieces(&owner, &carrier_of);
+            }
+        }
         if noise_region && pieces.iter().any(|(c, piece)| piece.len() < SLIVER_TRIANGLES && !on_its_face(*c, piece)) {
             if debug {
                 eprintln!("[split] region {} has a piece under {SLIVER_TRIANGLES} triangles at the noise bar, left as segmented", region.id);
@@ -3336,6 +3494,276 @@ pub(super) fn split(
         }
         if debug && joined > 0 {
             eprintln!("[split] retry chips: {joined} triangles join the pieces beside them");
+        }
+    }
+    // On the rebuild `chip_planes` marks
+    // ([`crate::hybrid_region_brep::HybridSwitches::chip_planes_pass`]), on a
+    // jittered body a freeform, sphere or torus chip (under
+    // [`SLIVER_TRIANGLES`]) whose least-squares plane holds every vertex
+    // within the first noise bar is a plane: the segmenter's plane test
+    // reads its facets' dihedral, which the jitter bends (census record
+    // occt_countersunk_hole_s10_d0.05_jitter-1.0: the side wall y = -30 is
+    // two triangles 0.92 degrees apart whose plane holds them within 0.15,
+    // and written as its two facets it carried -208 of the row's -246
+    // volume error, -55 as one plane). A sphere or torus chip is one the
+    // segmenter fitted a curved carrier to by the same jitter (census record
+    // occt_countersunk_hole_s10_d0.1_jitter-1.0: the side wall y = -30, two
+    // triangles read as a sphere, failed as one bounded by open arcs and
+    // stayed two facets).
+    if noisy_crossing && chip_planes {
+        // A body the wall retry did not read (no jittered wall to retry:
+        // census record occt_pointed_cone_s10_d0.02_jitter-1.0, one cone
+        // region and its base in chips) takes the mesh's own diagonal.
+        let mesh_diagonal = || {
+            let (mut low, mut high) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+            for p in positions.chunks_exact(3) {
+                for k in 0..3 {
+                    low[k] = low[k].min(p[k]);
+                    high[k] = high[k].max(p[k]);
+                }
+            }
+            Some((0..3).map(|k| (high[k] - low[k]).powi(2)).sum::<f64>().sqrt()).filter(|d| d.is_finite() && *d > 0.0)
+        };
+        if let Some(diagonal) = body_diagonal.or_else(mesh_diagonal) {
+            let bar = NOISE_BAR_FIT_BARS * options.fit_tolerance * diagonal;
+            let mut members = vec![Vec::<usize>::new(); segmentation.regions.len()];
+            for (t, &r) in segmentation.triangle_region_ids.iter().enumerate() {
+                if let Some(list) = members.get_mut(r as usize) {
+                    list.push(t);
+                }
+            }
+            let point = |v: u32| {
+                let at = v as usize * 3;
+                brep_kernel::Vec3::new(positions[at], positions[at + 1], positions[at + 2])
+            };
+            // The body's own noise, read on its plane regions of
+            // CHIP_NOISE_PLANE_TRIANGLES or more, when it is wider than the
+            // first bar (census record occt_countersunk_hole_s1_d0.1_jitter-1.0:
+            // the caps' planes hold their 46 triangles within 0.09, nine
+            // bars, and three of the four two-triangle side walls fit their
+            // planes at 3.0-3.5 bars).
+            let measured = members
+                .iter()
+                .enumerate()
+                .filter(|(i, tris)| tris.len() >= CHIP_NOISE_PLANE_TRIANGLES && matches!(segmentation.regions[*i].carrier, RegionCarrier::Plane { .. }))
+                .map(|(i, _)| segmentation.regions[i].max_deviation)
+                .fold(0.0_f64, f64::max);
+            if debug && measured > bar {
+                eprintln!("[split] chip planes: the body's plane regions hold within {measured:.3e}, over the first bar {bar:.3e}");
+            }
+            let bar = bar.max(measured);
+            for (i, tris) in members.iter().enumerate() {
+                if tris.is_empty()
+                    || tris.len() >= SLIVER_TRIANGLES
+                    || !matches!(segmentation.regions[i].carrier, RegionCarrier::Freeform | RegionCarrier::Sphere { .. } | RegionCarrier::Torus { .. })
+                {
+                    continue;
+                }
+                let mut cloud: Vec<brep_kernel::Vec3> = tris.iter().flat_map(|&t| [0, 1, 2].map(|c| point(indices[3 * t + c]))).collect();
+                cloud.sort_by(|a, b| (a.x, a.y, a.z).partial_cmp(&(b.x, b.y, b.z)).unwrap_or(std::cmp::Ordering::Equal));
+                cloud.dedup_by(|a, b| a.x == b.x && a.y == b.y && a.z == b.z);
+                let Some((origin, normal)) = crate::hybrid_region_brep::least_squares_plane(&cloud) else { continue };
+                let worst = cloud.iter().map(|&q| q.sub(origin).dot(normal).abs()).fold(0.0_f64, f64::max);
+                if worst > bar {
+                    continue;
+                }
+                let facing: f64 = tris
+                    .iter()
+                    .map(|&t| {
+                        let p = [0, 1, 2].map(|c| point(indices[3 * t + c]));
+                        p[1].sub(p[0]).cross(p[2].sub(p[0])).dot(normal)
+                    })
+                    .sum();
+                let normal = if facing < 0.0 { normal.scale(-1.0) } else { normal };
+                if debug {
+                    eprintln!("[split] {} chip {} of {} is a plane, its vertices within {worst:.3e} (bar {bar:.3e})", segmentation.regions[i].carrier.kind(), segmentation.regions[i].id, tris.len());
+                }
+                segmentation.regions[i].carrier = RegionCarrier::Plane { origin, normal };
+                segmentation.regions[i].max_deviation = worst;
+                changed = true;
+            }
+            // Then plane chips beside one another whose least-squares plane
+            // together holds every vertex within the bar are one plane, grown
+            // from the largest: on census record
+            // occt_pointed_cone_s10_d0.02_jitter-1.0 the base (40 triangles,
+            // its plane within 0.17) is 16 regions of 1-6 triangles, and
+            // the cone's boundary along them failed its winding.
+            let plane_chip = |i: usize, segmentation: &MeshSegmentation| {
+                !members[i].is_empty() && members[i].len() < SLIVER_TRIANGLES && matches!(segmentation.regions[i].carrier, RegionCarrier::Plane { .. })
+            };
+            let mut by_edge = std::collections::HashMap::<(u32, u32), Vec<usize>>::new();
+            for t in 0..segmentation.triangle_region_ids.len() {
+                for c in 0..3 {
+                    let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                    by_edge.entry((a.min(b), a.max(b))).or_default().push(t);
+                }
+            }
+            let cloud_of = |tris: &[usize]| {
+                let mut cloud: Vec<brep_kernel::Vec3> = tris.iter().flat_map(|&t| [0, 1, 2].map(|c| point(indices[3 * t + c]))).collect();
+                cloud.sort_by(|a, b| (a.x, a.y, a.z).partial_cmp(&(b.x, b.y, b.z)).unwrap_or(std::cmp::Ordering::Equal));
+                cloud.dedup_by(|a, b| a.x == b.x && a.y == b.y && a.z == b.z);
+                cloud
+            };
+            let fits = |tris: &[usize]| {
+                let cloud = cloud_of(tris);
+                let (origin, normal) = crate::hybrid_region_brep::least_squares_plane(&cloud)?;
+                let worst = cloud.iter().map(|&q| q.sub(origin).dot(normal).abs()).fold(0.0_f64, f64::max);
+                (worst <= bar).then_some((origin, normal, worst))
+            };
+            let mut order: Vec<usize> = (0..members.len()).filter(|&i| plane_chip(i, segmentation)).collect();
+            order.sort_by_key(|&i| (std::cmp::Reverse(members[i].len()), i));
+            let mut done = vec![false; members.len()];
+            for &seed in &order {
+                if done[seed] {
+                    continue;
+                }
+                done[seed] = true;
+                let mut group = vec![seed];
+                let mut tris = members[seed].clone();
+                let mut fit = None;
+                loop {
+                    let mut near = std::collections::BTreeSet::new();
+                    for &t in &tris {
+                        for c in 0..3 {
+                            let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                            for &n in &by_edge[&(a.min(b), a.max(b))] {
+                                let r = segmentation.triangle_region_ids[n] as usize;
+                                if !done[r] && plane_chip(r, segmentation) {
+                                    near.insert(r);
+                                }
+                            }
+                        }
+                    }
+                    let mut grew = false;
+                    for r in near {
+                        let mut wider = tris.clone();
+                        wider.extend(members[r].iter().copied());
+                        if let Some(found) = fits(&wider) {
+                            done[r] = true;
+                            group.push(r);
+                            tris = wider;
+                            fit = Some(found);
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+                let Some((origin, normal, worst)) = fit else { continue };
+                let facing: f64 = tris
+                    .iter()
+                    .map(|&t| {
+                        let p = [0, 1, 2].map(|c| point(indices[3 * t + c]));
+                        p[1].sub(p[0]).cross(p[2].sub(p[0])).dot(normal)
+                    })
+                    .sum();
+                let normal = if facing < 0.0 { normal.scale(-1.0) } else { normal };
+                if debug {
+                    eprintln!("[split] plane chips {group:?} ({} triangles) are one plane, their vertices within {worst:.3e} (bar {bar:.3e})", tris.len());
+                }
+                for &t in &tris {
+                    segmentation.triangle_region_ids[t] = seed as u32;
+                }
+                segmentation.regions[seed].carrier = RegionCarrier::Plane { origin, normal };
+                segmentation.regions[seed].max_deviation = worst;
+                changed = true;
+            }
+            // Then, at the ladder's next rung (twice the bar, where the noise
+            // bar takes a jittered carrier too), freeform regions of any size
+            // and the plane chips left beside them are one plane when their
+            // least-squares plane holds every vertex and they make a face of
+            // CHIP_NOISE_PLANE_TRIANGLES or more: on census record
+            // occt_pointed_cone_s10_d0.1_jitter-0.3 the base (40 triangles)
+            // is a freeform region of 26 and chips of 1-4; the truth plane
+            // holds it within 0.261 and its least-squares plane within 0.294,
+            // over the first bar 0.227, and the cone was read at 6 bars.
+            let wide = 2.0 * bar;
+            let mut members = vec![Vec::<usize>::new(); segmentation.regions.len()];
+            for (t, &r) in segmentation.triangle_region_ids.iter().enumerate() {
+                if let Some(list) = members.get_mut(r as usize) {
+                    list.push(t);
+                }
+            }
+            let wide_candidate = |i: usize, segmentation: &MeshSegmentation| {
+                !members[i].is_empty()
+                    && match segmentation.regions[i].carrier {
+                        RegionCarrier::Freeform => true,
+                        RegionCarrier::Plane { .. } => members[i].len() < SLIVER_TRIANGLES,
+                        _ => false,
+                    }
+            };
+            let wide_fits = |tris: &[usize]| {
+                let cloud = cloud_of(tris);
+                let (origin, normal) = crate::hybrid_region_brep::least_squares_plane(&cloud)?;
+                let worst = cloud.iter().map(|&q| q.sub(origin).dot(normal).abs()).fold(0.0_f64, f64::max);
+                (worst <= wide).then_some((origin, normal, worst))
+            };
+            let mut order: Vec<usize> = (0..members.len()).filter(|&i| wide_candidate(i, segmentation)).collect();
+            order.sort_by_key(|&i| (std::cmp::Reverse(members[i].len()), i));
+            let mut done = vec![false; members.len()];
+            for &seed in &order {
+                if done[seed] {
+                    continue;
+                }
+                done[seed] = true;
+                let mut group = vec![seed];
+                let mut tris = members[seed].clone();
+                let mut fit = wide_fits(&tris);
+                if fit.is_none() {
+                    continue;
+                }
+                loop {
+                    let mut near = std::collections::BTreeSet::new();
+                    for &t in &tris {
+                        for c in 0..3 {
+                            let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                            for &n in &by_edge[&(a.min(b), a.max(b))] {
+                                let r = segmentation.triangle_region_ids[n] as usize;
+                                if !done[r] && wide_candidate(r, segmentation) {
+                                    near.insert(r);
+                                }
+                            }
+                        }
+                    }
+                    let mut grew = false;
+                    for r in near {
+                        let mut wider = tris.clone();
+                        wider.extend(members[r].iter().copied());
+                        if let Some(found) = wide_fits(&wider) {
+                            done[r] = true;
+                            group.push(r);
+                            tris = wider;
+                            fit = Some(found);
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+                let Some((origin, normal, worst)) = fit else { continue };
+                if tris.len() < CHIP_NOISE_PLANE_TRIANGLES || (group.len() == 1 && !matches!(segmentation.regions[seed].carrier, RegionCarrier::Freeform)) {
+                    continue;
+                }
+                let facing: f64 = tris
+                    .iter()
+                    .map(|&t| {
+                        let p = [0, 1, 2].map(|c| point(indices[3 * t + c]));
+                        p[1].sub(p[0]).cross(p[2].sub(p[0])).dot(normal)
+                    })
+                    .sum();
+                let normal = if facing < 0.0 { normal.scale(-1.0) } else { normal };
+                if debug {
+                    eprintln!("[split] regions {group:?} ({} triangles) are one plane at the next rung, their vertices within {worst:.3e} (bar {wide:.3e})", tris.len());
+                }
+                for &t in &tris {
+                    segmentation.triangle_region_ids[t] = seed as u32;
+                }
+                segmentation.regions[seed].carrier = RegionCarrier::Plane { origin, normal };
+                segmentation.regions[seed].max_deviation = worst;
+                changed = true;
+            }
         }
     }
     if changed {
@@ -3778,6 +4206,41 @@ const NOISE_SLIVER_GROUP_TRIANGLES: usize = 96;
 
 /// The fewest triangles in each piece a coaxial bore holds.
 const MIN_BORE_TRIANGLES: usize = 16;
+/// [`split`]'s noise-bar proposal under `noisy_crossing`: a cone narrower
+/// than this (degrees), its axis within this of a wider cone's, is a bore
+/// drawn as a cone.
+const NARROW_BORE_CONE_DEG: f64 = 10.0;
+/// [`split`]'s `chip_planes`: the fewest triangles a plane region has for
+/// its deviation to read as the body's noise.
+const CHIP_NOISE_PLANE_TRIANGLES: usize = 16;
+
+/// [`coaxial_bore`]'s radius: the median distance from `cone`'s axis of the
+/// vertices of the triangles of `rest` that face away from it within
+/// `cos_gate`; None when none does.
+fn coaxial_radius(cone: &crate::ConeSurface, rest: &[usize], positions: &[f64], indices: &[u32], cos_gate: f64) -> Option<f64> {
+    let point = |v: u32| {
+        let at = v as usize * 3;
+        crate::Vec3::new(positions[at], positions[at + 1], positions[at + 2])
+    };
+    let radial = |q: crate::Vec3| {
+        let d = q - cone.apex;
+        d - cone.axis * d.dot(cone.axis)
+    };
+    let mut radii = Vec::new();
+    for &t in rest {
+        let p = [0, 1, 2].map(|c| point(indices[3 * t + c]));
+        let Some(normal) = (p[1] - p[0]).cross(p[2] - p[0]).normalized() else { continue };
+        let centroid = (p[0] + p[1] + p[2]) * (1.0 / 3.0);
+        if radial(centroid).normalized().is_some_and(|r| r.dot(normal).abs() >= cos_gate) {
+            radii.extend(p.iter().map(|&q| radial(q).length()));
+        }
+    }
+    if radii.is_empty() {
+        return None;
+    }
+    radii.sort_by(f64::total_cmp);
+    Some(radii[radii.len() / 2])
+}
 
 /// A cylinder on `cone`'s axis through the region triangles the cone does
 /// not hold, with its support: the radius is the median distance from the
@@ -3793,41 +4256,73 @@ fn coaxial_bore(
     tolerance: f64,
     cos_gate: f64,
     bridges: Option<&dyn Fn(&crate::AnalyticSurface) -> Option<Vec<(u32, Vec<usize>)>>>,
+    others: &[crate::AnalyticSurface],
+    vote: bool,
 ) -> Option<(crate::AnalyticSurface, usize, Vec<(u32, Vec<usize>)>)> {
     let surface = crate::AnalyticSurface::Cone(*cone);
     let rest: Vec<usize> = ids.iter().copied().filter(|&t| !holds(&surface, t, positions, indices, tolerance, cos_gate)).collect();
-    let point = |v: u32| {
-        let at = v as usize * 3;
-        crate::Vec3::new(positions[at], positions[at + 1], positions[at + 2])
-    };
-    let radial = |q: crate::Vec3| {
-        let d = q - cone.apex;
-        d - cone.axis * d.dot(cone.axis)
-    };
-    let mut radii = Vec::new();
-    for &t in &rest {
-        let p = [0, 1, 2].map(|c| point(indices[3 * t + c]));
-        let Some(normal) = (p[1] - p[0]).cross(p[2] - p[0]).normalized() else { continue };
-        let centroid = (p[0] + p[1] + p[2]) * (1.0 / 3.0);
-        if radial(centroid).normalized().is_some_and(|r| r.dot(normal).abs() >= cos_gate) {
-            radii.extend(p.iter().map(|&q| radial(q).length()));
-        }
-    }
-    if radii.is_empty() {
-        return None;
-    }
-    radii.sort_by(f64::total_cmp);
+    let radius = coaxial_radius(cone, &rest, positions, indices, cos_gate)?;
     let bore = crate::AnalyticSurface::Cylinder(crate::CylinderSurface {
         axis_origin: cone.apex,
         axis: cone.axis,
-        radius: radii[radii.len() / 2],
+        radius,
     });
-    let own: Vec<usize> = rest.iter().copied().filter(|&t| holds(&bore, t, positions, indices, tolerance, cos_gate)).collect();
+    let mut own: Vec<usize> = rest.iter().copied().filter(|&t| holds(&bore, t, positions, indices, tolerance, cos_gate)).collect();
+    // With `vote` (under `noisy_crossing`) a triangle of the rest within the
+    // bar of the bore whose jittered normal fails the gate joins it when it
+    // shares two edges with the bore's triangles, over and over, as the
+    // split's assignment votes gate-tilted triangles (census record
+    // occt_countersunk_hole_s1_d0.1_jitter-1.0: the bore held 71 of its 84
+    // through the gate, in pieces under the floor; every one of the 84 is
+    // within the bar, in one piece).
+    if vote {
+        let mut taken: std::collections::HashSet<usize> = own.iter().copied().collect();
+        let mut by_edge = std::collections::HashMap::<(u32, u32), Vec<usize>>::new();
+        for &t in &rest {
+            for c in 0..3 {
+                let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                by_edge.entry((a.min(b), a.max(b))).or_default().push(t);
+            }
+        }
+        let near = |t: usize| {
+            (0..3).all(|c| {
+                let at = indices[3 * t + c] as usize * 3;
+                bore.signed_distance(crate::Vec3::new(positions[at], positions[at + 1], positions[at + 2])).abs() <= tolerance
+            })
+        };
+        loop {
+            let joined: Vec<usize> = rest
+                .iter()
+                .copied()
+                .filter(|t| !taken.contains(t) && near(*t))
+                .filter(|&t| {
+                    (0..3)
+                        .filter(|&c| {
+                            let (a, b) = (indices[3 * t + c], indices[3 * t + (c + 1) % 3]);
+                            by_edge[&(a.min(b), a.max(b))].iter().any(|&n| n != t && taken.contains(&n))
+                        })
+                        .count()
+                        >= 2
+                })
+                .collect();
+            if joined.is_empty() {
+                break;
+            }
+            taken.extend(joined.iter().copied());
+            own.extend(joined);
+        }
+    }
     let support = ids.len() - rest.len();
     if std::env::var("BREP_DEBUG_SPLIT").is_ok() {
-        eprintln!("[split]   coaxial bore radius {:.4e}: cone holds {support} of {}, bore {} of the rest {}", radii[radii.len() / 2], ids.len(), own.len(), rest.len());
+        eprintln!("[split]   coaxial bore radius {radius:.4e}: cone holds {support} of {}, bore {} of the rest {}", ids.len(), own.len(), rest.len());
     }
-    if own.len() < MIN_BORE_TRIANGLES || (support + own.len()) * 20 < ids.len() * 19 {
+    // With `others` (the region's other carriers) their triangles count, at 9 in 10.
+    let elsewhere = rest.iter().filter(|&&t| !own.contains(&t) && others.iter().any(|s| holds(s, t, positions, indices, tolerance, cos_gate))).count();
+    let (part, whole) = if others.is_empty() { (19, 20) } else { (9, 10) };
+    if std::env::var("BREP_DEBUG_SPLIT").is_ok() && !others.is_empty() {
+        eprintln!("[split]   coaxial bore: {elsewhere} of the rest held by {} other carriers", others.len());
+    }
+    if own.len() < MIN_BORE_TRIANGLES || (support + own.len() + elsewhere) * whole < ids.len() * part {
         return None;
     }
     // Each edge-connected piece the bore holds is a whole strip of at least

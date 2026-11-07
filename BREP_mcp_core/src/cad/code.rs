@@ -853,7 +853,10 @@ async fn dispatch(service: Arc<CadService>, caller: Caller, mut rx: tokio::sync:
         let service = service.clone();
         let caller = caller.clone();
         let wake = wake.clone();
-        tokio::spawn(async move {
+        // The execution is the client: its calls keep their order in the
+        // app's queue, and another execution's need not wait behind them.
+        let client = caller.execution.as_deref().map(crate::host::client_of);
+        tokio::spawn(crate::host::with_client(client, async move {
             let body = serve_recorded(service.clone(), caller, &call).await;
             // A realm that has gone away simply never reads this.
             let mut reply = Wake::Reply { call: call.call, body };
@@ -870,7 +873,7 @@ async fn dispatch(service: Arc<CadService>, caller: Caller, mut rx: tokio::sync:
                     }
                 }
             }
-        });
+        }));
     }
 }
 

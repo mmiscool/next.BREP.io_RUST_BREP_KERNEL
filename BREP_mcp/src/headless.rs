@@ -186,7 +186,7 @@ pub fn spawn(cfg: impl Into<HeadlessConfig>) -> Result<HostHandle, String> {
                     Some(HostRequest::Command { envelope, reply }) => {
                         let id = envelope.id;
                         let cmd = envelope.cmd.clone();
-                        let rx_reply = queue.submit(AppEnvelope { id, cmd: envelope.cmd, args: envelope.args });
+                        let rx_reply = queue.submit_for(AppEnvelope { id, cmd: envelope.cmd, args: envelope.args }, None, envelope.client);
                         inflight.push(InFlight { id, cmd, rx: rx_reply, reply, steps: 0, started: Instant::now() });
                     }
                     // The DOCS ANNOTATION overlay (`crate::annotate`): set the

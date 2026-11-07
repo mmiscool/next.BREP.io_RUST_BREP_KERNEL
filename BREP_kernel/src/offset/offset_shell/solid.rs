@@ -47,11 +47,97 @@ pub fn offset_solid(
     distance: f64,
     corners: OffsetCorners,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
-    let sharp = offset_body(source, &[], -distance, Body::Whole, "offset_solid")?;
+    if corners == OffsetCorners::Rounded && distance > 0.0 {
+        if let Some(grown) = grown_across_reflex_edges(source, distance) {
+            return Ok(grown);
+        }
+    }
+    let sharp = match offset_body(source, &[], -distance, Body::Whole, "offset_solid") {
+        Ok(sharp) => sharp,
+        Err(error) => {
+            if corners == OffsetCorners::Rounded {
+                if let Some(grown) = grown_by_pieces(source, distance) {
+                    return Ok(grown);
+                }
+            }
+            return Err(error);
+        }
+    };
     match corners {
         OffsetCorners::Sharp => Ok(sharp),
         OffsetCorners::Rounded => round_offset_joins(sharp, distance),
     }
+}
+
+/// `BREP_OFFSET_GROW_BY_PIECES` (default on; `=0` restores): [`grown_by_pieces`].
+fn grow_by_pieces_enabled() -> bool {
+    switch!("BREP_OFFSET_GROW_BY_PIECES", true)
+}
+
+
+/// The ROUNDED growth of a body whose own offset body the pipeline could not
+/// assemble, as the union of its pieces' growths: the parallel body of a
+/// union is the union of the parallel bodies, `(A ∪ B) ⊕ D = (A ⊕ D) ∪
+/// (B ⊕ D)`, for any pieces whose union is the body.
+///
+/// Cause (a drum with a groove 1.6 wide grown by 1, brep-bench
+/// offset/grooved-drum-grown): the groove's walls offset across each other,
+/// "a skin partly shadowed that way is not yet assembled", and even assembled
+/// the sharp body would have no groove left to round, while the case's notch
+/// is the two tori about the groove's outer rims. Cut at the planes of its
+/// planar faces the drum is three cylinders; each grows by the pipeline's own
+/// rounded offset, and their union carries the notch where the two rim tori
+/// cross.
+///
+/// The cuts are chosen by [`thin_pair_planes`] (the planes parallel to a pair
+/// of planar faces whose offsets cross), each kept only where it divides a
+/// piece (`split_solid_by_plane`). A SHRINK runs the same construction on the
+/// body's complement in a frame box ([`shrunk_by_pieces`]). Every piece must
+/// grow and the union must validate; anything else declines and the
+/// pipeline's own refusal stands. The faces are all `Offset` images with
+/// `source_face_id` 0, as the rounded caps are: a face of the union may carry
+/// the growth of several source faces' pieces.
+fn grown_by_pieces(source: &BrepSolid, distance: f64) -> Option<OffsetShellResultRecord> {
+    if !grow_by_pieces_enabled() {
+        return None;
+    }
+    match grown_by_pieces_impl(source, distance) {
+        Ok(result) => result,
+        Err(error) => {
+            os_debug!("grow by pieces declined: {error}");
+            None
+        }
+    }
+}
+
+fn grown_by_pieces_impl(source: &BrepSolid, distance: f64) -> Result<Option<OffsetShellResultRecord>, KernelRefusal> {
+    if distance < 0.0 {
+        return shrunk_by_pieces(source, -distance);
+    }
+    let Some(sets) = thin_pair_planes(source, distance, true)? else {
+        return Ok(None);
+    };
+    let mut answer = None;
+    for planes in &sets {
+        match grown_union(source, planes, distance) {
+            Ok(Some(solid)) => {
+                answer = Some(solid);
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => os_debug!("grow by pieces: {} plane(s) declined: {error}", planes.len()),
+        }
+    }
+    let Some(solid) = answer else {
+        return Ok(None);
+    };
+    let face_images = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .map(|_| OffsetShellFaceImageRecord { role: OffsetFaceRole::Offset, source_face_id: 0 })
+        .collect();
+    Ok(Some(OffsetShellResultRecord { solid, face_images }))
 }
 
 /// Roll the sharp body's joins that the ball of radius `|distance|` rounds:
@@ -346,5 +432,316 @@ pub(super) fn direct_refusal_takes_the_boolean_lane(refusal: &KernelRefusal) -> 
             refusal.message.starts_with("offset_shell")
         }
         _ => false,
+    }
+}
+
+/// The cut planes: every planar face's plane parallel to a THIN PAIR, two
+/// planar faces with opposite outward normals closer than `2·amount` that face
+/// each other across void (`grow`) or across material (shrink) — the pair
+/// whose offsets cross. Deduplicated. Two sets are offered in turn: every
+/// planar face's plane parallel to a thin pair, then the thin pairs' own
+/// planes alone (when fewer), because the boolean that unions the grown
+/// pieces can fail on where one set's pieces meet and not the other's (the
+/// dumbbell's complement cut at all four y planes left sliver edges where the
+/// neck-mouth rounds of adjacent pieces cross). `None` when there is no thin
+/// pair or every set has more than eight planes.
+fn thin_pair_planes(solid: &BrepSolid, amount: f64, grow: bool) -> Result<Option<Vec<Vec<(Vec3, Vec3)>>>, KernelRefusal> {
+    let band = 1e-9 * crate::solid_scale(solid).max(1.0);
+    // Each planar face's plane, its OUTWARD normal.
+    let mut faces: Vec<(Vec3, Vec3)> = Vec::new();
+    for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+        let Some((point, normal)) = super::rim_welds::planar_surface_frame(&face.surface, band)? else {
+            continue;
+        };
+        let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+        let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+        let Ok(outward) = super::face_normal(face, 0.5 * (u0 + u1), 0.5 * (v0 + v1)) else {
+            continue;
+        };
+        faces.push((point, if outward.dot(normal) < 0.0 { normal.scale(-1.0) } else { normal }));
+    }
+    let mut directions: Vec<Vec3> = Vec::new();
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for (index, (point, normal)) in faces.iter().enumerate() {
+        for (offset, (other, other_normal)) in faces[index + 1..].iter().enumerate() {
+            if normal.dot(*other_normal) > -1.0 + 1e-12 {
+                continue;
+            }
+            // Signed gap from this face's plane to the other's, along this
+            // face's outward normal: positive across void, negative across
+            // material.
+            let gap = other.sub(*point).dot(*normal);
+            let thin = if grow { gap > band && gap < 2.0 * amount } else { gap < -band && -gap < 2.0 * amount };
+            if thin {
+                pairs.push((index, index + 1 + offset));
+                if !directions.iter().any(|axis| axis.dot(*normal).abs() >= 1.0 - 1e-12) {
+                    directions.push(*normal);
+                }
+            }
+        }
+    }
+    if directions.is_empty() {
+        return Ok(None);
+    }
+    let push = |planes: &mut Vec<(Vec3, Vec3)>, point: Vec3, normal: Vec3| {
+        let seen = planes
+            .iter()
+            .any(|(other, axis)| axis.dot(normal).abs() >= 1.0 - 1e-12 && point.sub(*other).dot(*axis).abs() <= band);
+        if !seen {
+            planes.push((point, normal));
+        }
+    };
+    let mut parallel: Vec<(Vec3, Vec3)> = Vec::new();
+    for (point, normal) in &faces {
+        if directions.iter().any(|axis| axis.dot(*normal).abs() >= 1.0 - 1e-12) {
+            push(&mut parallel, *point, *normal);
+        }
+    }
+    let mut paired: Vec<(Vec3, Vec3)> = Vec::new();
+    for (first, second) in &pairs {
+        push(&mut paired, faces[*first].0, faces[*first].1);
+        push(&mut paired, faces[*second].0, faces[*second].1);
+    }
+    let mut sets = Vec::new();
+    if parallel.len() <= 8 {
+        sets.push(parallel.clone());
+    }
+    if paired.len() <= 8 && paired.len() < parallel.len() {
+        sets.push(paired);
+    }
+    Ok((!sets.is_empty()).then_some(sets))
+}
+
+/// `solid` cut by every plane that divides a piece of it.
+fn cut_by_planes(solid: &BrepSolid, planes: &[(Vec3, Vec3)]) -> Vec<BrepSolid> {
+    let mut pieces = vec![solid.clone()];
+    for (point, normal) in planes {
+        let mut next = Vec::with_capacity(pieces.len() * 2);
+        for piece in pieces {
+            match crate::split_solid_by_plane(&piece, *point, *normal) {
+                Ok((below, above)) => {
+                    next.push(below);
+                    next.push(above);
+                }
+                Err(_) => next.push(piece),
+            }
+        }
+        pieces = next;
+    }
+    pieces
+}
+
+/// The SHRINK by `amount` through the complement: `S ⊖ D = S − ((F − S) ⊕ D)`
+/// for a frame box `F` reaching past `S` by more than `amount`, where the
+/// complement's growth is the union of its pieces' growths, the pieces cut at
+/// the planes of `S`'s planar faces.
+///
+/// Cause (a drum with a flange 1.6 thick shrunk by 1, brep-bench
+/// offset/flanged-drum-shrunk): the flange's two faces offset across each
+/// other ("a skin partly shadowed that way is not yet assembled"), and the
+/// low ridge the case reads is the two concave tori about the flange's inner
+/// rims, which the complement's pieces carry as the rounds of their own
+/// convex rims.
+fn shrunk_by_pieces(source: &BrepSolid, amount: f64) -> Result<Option<OffsetShellResultRecord>, KernelRefusal> {
+    let Some(sets) = thin_pair_planes(source, amount, false)? else {
+        return Ok(None);
+    };
+    let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for face in source.shells.iter().flat_map(|shell| &shell.faces) {
+        for control in face.surface.control_points.iter().flatten() {
+            let Ok(point) = control.point() else { return Ok(None) };
+            low = Vec3::new(low.x.min(point.x), low.y.min(point.y), low.z.min(point.z));
+            high = Vec3::new(high.x.max(point.x), high.y.max(point.y), high.z.max(point.z));
+        }
+    }
+    let margin = 3.0 * amount;
+    let corner = low.sub(Vec3::new(margin, margin, margin));
+    let size = high.sub(low).add(Vec3::new(2.0 * margin, 2.0 * margin, 2.0 * margin));
+    let frame = crate::make_box_brep(corner, size.x, size.y, size.z).or_refuse(KernelStage::Refine, "make_box_brep")?;
+    let options = BooleanOptions::default();
+    let outside = boolean_operation(&frame, source, BooleanOperation::Subtract, &options)?;
+    let mut answer = None;
+    for planes in &sets {
+        let attempt = grown_union(&outside, planes, amount).and_then(|reach| match reach {
+            Some(reach) => boolean_operation(source, &reach, BooleanOperation::Subtract, &options).map(Some),
+            None => Ok(None),
+        });
+        match attempt {
+            Ok(Some(solid)) if solid.validate().is_empty() => {
+                answer = Some(solid);
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => os_debug!("shrink by pieces: {} plane(s) declined: {error}", planes.len()),
+        }
+    }
+    if answer.is_none() && shrink_by_subtraction_enabled() {
+        for planes in &sets {
+            match subtracted_one_by_one(source, &outside, planes, amount) {
+                Ok(Some(solid)) => {
+                    answer = Some(solid);
+                    break;
+                }
+                Ok(None) => {}
+                Err(error) => os_debug!("shrink by subtraction: {} plane(s) declined: {error}", planes.len()),
+            }
+        }
+    }
+    let Some(solid) = answer else {
+        return Ok(None);
+    };
+    let face_images = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .map(|_| OffsetShellFaceImageRecord { role: OffsetFaceRole::Offset, source_face_id: 0 })
+        .collect();
+    Ok(Some(OffsetShellResultRecord { solid, face_images }))
+}
+
+/// `solid` cut at `planes`, each piece grown by `amount` with rounded joins,
+/// and the growths' union; `None` when the planes leave one piece or the
+/// union does not validate.
+fn grown_union(solid: &BrepSolid, planes: &[(Vec3, Vec3)], amount: f64) -> Result<Option<BrepSolid>, KernelRefusal> {
+    let Some(grown) = grown_pieces(solid, planes, amount)? else {
+        return Ok(None);
+    };
+    let union = crate::boolean_operation_nary(&grown, BooleanOperation::Union)?;
+    Ok(union.validate().is_empty().then_some(union))
+}
+
+/// `solid` cut at `planes`, each piece grown by `amount` with rounded joins;
+/// `None` when the planes leave one piece.
+fn grown_pieces(solid: &BrepSolid, planes: &[(Vec3, Vec3)], amount: f64) -> Result<Option<Vec<BrepSolid>>, KernelRefusal> {
+    let pieces = cut_by_planes(solid, planes);
+    if pieces.len() < 2 {
+        return Ok(None);
+    }
+    os_debug!("by pieces: {} plane(s) cut the body into {} piece(s)", planes.len(), pieces.len());
+    let mut grown = Vec::with_capacity(pieces.len());
+    for (index, piece) in pieces.iter().enumerate() {
+        let sharp = offset_body(piece, &[], -amount, Body::Whole, "offset_solid_piece")
+            .map_err(|error| error.with_message(|message| format!("piece {index}: {message}")))?;
+        grown.push(round_offset_joins(sharp, amount)?.solid);
+    }
+    Ok(Some(grown))
+}
+
+/// `BREP_OFFSET_SHRINK_BY_SUBTRACTION` (default on; `=0` restores): where the union of a
+/// shrink's grown complement pieces cannot be assembled, the pieces are
+/// subtracted from the body one at a time instead.
+///
+/// Cause (the dumbbell plate shrunk by 1.5, brep-bench
+/// shell/dumbbell-neck-filled): the grown pieces' concave rounds about the
+/// neck mouths cross at y = 5, and their n-ary union failed ("boolean assembly
+/// produced invalid topology (S=3 genus=2)", one-use edges ~3e-5 long near
+/// (8.882, 5, 1.5)) for every plane set. `S − (A ∪ B) = (S − A) − B`.
+fn shrink_by_subtraction_enabled() -> bool {
+    switch!("BREP_OFFSET_SHRINK_BY_SUBTRACTION", true)
+}
+
+
+fn subtracted_one_by_one(source: &BrepSolid, outside: &BrepSolid, planes: &[(Vec3, Vec3)], amount: f64) -> Result<Option<BrepSolid>, KernelRefusal> {
+    let Some(grown) = grown_pieces(outside, planes, amount)? else {
+        return Ok(None);
+    };
+    let options = BooleanOptions::default();
+    let mut body = source.clone();
+    for (index, piece) in grown.iter().enumerate() {
+        body = boolean_operation(&body, piece, BooleanOperation::Subtract, &options)
+            .map_err(|error| error.with_message(|message| format!("subtracting grown piece {index}: {message}")))?;
+    }
+    Ok(body.validate().is_empty().then_some(body))
+}
+
+/// `BREP_OFFSET_REFLEX_BY_PIECES` (default on; `=0` restores): [`grown_across_reflex_edges`].
+fn reflex_by_pieces_enabled() -> bool {
+    switch!("BREP_OFFSET_REFLEX_BY_PIECES", true)
+}
+
+
+/// The ROUNDED growth of a body with CONCAVE (reflex) edges between planar
+/// faces, as the union of its pieces' growths, the pieces cut at those
+/// faces' planes; `None` (and the ordinary sharp body + rounds) where the body
+/// has none, or a piece or the union fails.
+///
+/// Cause (an L-shaped plate grown by 1, brep-bench offset/l-block-grown, read
+/// volume +0.041 and area −0.061 against the closed form): the sharp body is
+/// right, but where its reflex edge meets the top and bottom, the rounds of
+/// the two convex edges beside it must meet in a sharp concave crease, and
+/// `fillet_edges` blends that corner instead. Cut at x = 5 the plate is two
+/// boxes; each grows to a rounded box exactly, and their union carries the
+/// crease as the two rounds' own intersection.
+fn grown_across_reflex_edges(source: &BrepSolid, distance: f64) -> Option<OffsetShellResultRecord> {
+    if !reflex_by_pieces_enabled() {
+        return None;
+    }
+    let attempt = || -> Result<Option<OffsetShellResultRecord>, KernelRefusal> {
+        let band = 1e-9 * crate::solid_scale(source).max(1.0);
+        let faces = source.shells.iter().flat_map(|shell| &shell.faces).collect::<Vec<_>>();
+        let mut uses = HashMap::<u64, Vec<(&FaceRecord, bool)>>::default();
+        for face in &faces {
+            for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+                uses.entry(coedge.edge_id).or_default().push((face, coedge.forward));
+            }
+        }
+        let mut planes: Vec<(Vec3, Vec3)> = Vec::new();
+        for edge in &source.edges {
+            if edge.degenerate {
+                continue;
+            }
+            let Some(pair) = uses.get(&edge.id) else { continue };
+            if pair.len() != 2 || pair[0].0.id == pair[1].0.id {
+                continue;
+            }
+            if edge_is_convex_join(edge, pair[0], pair[1].0, 1.0 - 1e-6)? != Some(false) {
+                continue;
+            }
+            for (face, _) in pair {
+                let Some((point, normal)) = super::rim_welds::planar_surface_frame(&face.surface, band)? else {
+                    continue;
+                };
+                let seen = planes
+                    .iter()
+                    .any(|(other, axis)| axis.dot(normal).abs() >= 1.0 - 1e-12 && point.sub(*other).dot(*axis).abs() <= band);
+                if !seen {
+                    planes.push((point, normal));
+                }
+            }
+        }
+        if planes.is_empty() || planes.len() > 8 {
+            return Ok(None);
+        }
+        // One plane per reflex edge is enough, and fewer pieces meet in fewer
+        // places: try each plane alone first, then all of them.
+        let mut sets = planes.iter().map(|plane| vec![*plane]).collect::<Vec<_>>();
+        if planes.len() > 1 {
+            sets.push(planes.clone());
+        }
+        for set in &sets {
+            match grown_union(source, set, distance) {
+                Ok(Some(solid)) => {
+                    os_debug!("reflex by pieces: {} plane(s)", set.len());
+                    let face_images = solid
+                        .shells
+                        .iter()
+                        .flat_map(|shell| &shell.faces)
+                        .map(|_| OffsetShellFaceImageRecord { role: OffsetFaceRole::Offset, source_face_id: 0 })
+                        .collect();
+                    return Ok(Some(OffsetShellResultRecord { solid, face_images }));
+                }
+                Ok(None) => {}
+                Err(error) => os_debug!("reflex by pieces: {} plane(s) declined: {error}", set.len()),
+            }
+        }
+        Ok(None)
+    };
+    match attempt() {
+        Ok(result) => result,
+        Err(error) => {
+            os_debug!("reflex by pieces declined: {error}");
+            None
+        }
     }
 }

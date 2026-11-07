@@ -38,9 +38,24 @@ type WakeHook = Arc<dyn Fn() + Send + Sync>;
 /// thread. Process-wide, because a waker fires on whatever thread did the I/O.
 static WAKE_HOOK: Mutex<Option<WakeHook>> = Mutex::new(None);
 
+/// The document a task works for (its store name), when it works for one.
+type Tag = Option<std::rc::Rc<str>>;
+
 thread_local! {
-    /// Tasks spawned on this thread and not finished yet.
-    static QUEUE: RefCell<Vec<(LocalTask, Arc<TaskWaker>)>> = const { RefCell::new(Vec::new()) };
+    /// Tasks spawned on this thread and not finished yet, with their tags.
+    static QUEUE: RefCell<Vec<(LocalTask, Arc<TaskWaker>, Tag)>> = const { RefCell::new(Vec::new()) };
+    /// The tag [`spawn`] gives a task: set for the duration of [`tagged`].
+    static SPAWN_TAG: RefCell<Tag> = const { RefCell::new(None) };
+}
+
+/// Run `f` with every task it spawns tagged as working for the document
+/// stored under `name`, so [`pending_except`] can leave out another
+/// document's work (`settle` on one tab must not wait on another's saves).
+pub fn tagged<R>(name: &str, f: impl FnOnce() -> R) -> R {
+    let previous = SPAWN_TAG.with(|tag| tag.replace(Some(name.into())));
+    let result = f();
+    SPAWN_TAG.with(|tag| *tag.borrow_mut() = previous);
+    result
 }
 
 /// Install the hook a completing task calls — `egui::Context::request_repaint`
@@ -84,8 +99,9 @@ impl Wake for TaskWaker {
 pub fn spawn(task: impl Future<Output = ()> + 'static) {
     let mut task: LocalTask = Box::pin(task);
     let waker = Arc::new(TaskWaker { ready: AtomicBool::new(false), thread: None });
+    let tag = SPAWN_TAG.with(|tag| tag.borrow().clone());
     if poll_once(&mut task, &waker).is_pending() {
-        QUEUE.with(|queue| queue.borrow_mut().push((task, waker)));
+        QUEUE.with(|queue| queue.borrow_mut().push((task, waker, tag)));
     }
 }
 
@@ -104,14 +120,14 @@ pub fn run_pending() -> usize {
         let tasks = QUEUE.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
         let mut progressed = false;
         let mut still = Vec::with_capacity(tasks.len());
-        for (mut task, waker) in tasks {
+        for (mut task, waker, tag) in tasks {
             if waker.ready.swap(false, Ordering::AcqRel) {
                 progressed = true;
                 if poll_once(&mut task, &waker).is_ready() {
                     continue;
                 }
             }
-            still.push((task, waker));
+            still.push((task, waker, tag));
         }
         let remaining = QUEUE.with(|queue| {
             let mut queue = queue.borrow_mut();
@@ -131,6 +147,15 @@ pub fn run_pending() -> usize {
 /// push issued so far has settled.
 pub fn pending() -> usize {
     QUEUE.with(|queue| queue.borrow().len())
+}
+
+/// [`pending`], leaving out the tasks [`tagged`] with one of `names`: the
+/// unfinished work that is not those documents'. An untagged task (a sign-in,
+/// a check, a prefetch) always counts.
+pub fn pending_except(names: &[&str]) -> usize {
+    QUEUE.with(|queue| {
+        queue.borrow().iter().filter(|(_, _, tag)| !tag.as_deref().is_some_and(|t| names.contains(&t))).count()
+    })
 }
 
 /// Drive `future` to completion on this thread, running the spawned queue

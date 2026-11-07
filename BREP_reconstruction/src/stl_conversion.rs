@@ -1165,12 +1165,33 @@ fn convert_component(
         };
 
         let analytic_attempt = match kernel_attempt {
-            Ok(solid) => Ok((
-                solid,
-                ConversionBackend::KernelAnalyticRebuild,
-                "kernel segmentation proved complete plane/cylinder/cone coverage; the kernel region rebuilder then reconstructed and validated the complete analytic shell".to_owned(),
-                None,
-            )),
+            Ok(solid) => {
+                let stitched = repaired.as_ref().is_some_and(|repaired| repaired.stitched_edges > 0);
+                let strips = if stitched && tjunction_strip_hybrid_enabled() {
+                    hybrid_over_kernel_strips(&solid, source_positions, source_indices, options)
+                } else {
+                    None
+                };
+                match strips {
+                    Some(output) => {
+                        whole_carrier_scan = whole_carrier_scan.sum(output.stats.whole_carrier_scan);
+                        let report = hybrid_report(&output.stats);
+                        hybrid_demotions = output.stats.demotions;
+                        Ok((
+                            output.solid,
+                            ConversionBackend::HybridAnalyticRebuild,
+                            "the kernel region rebuilder's shell carried a T-junction's chord as a plane strip; independent segmentation reconstructed and validated a fully analytic shell with fewer faces".to_owned(),
+                            Some(report),
+                        ))
+                    }
+                    None => Ok((
+                        solid,
+                        ConversionBackend::KernelAnalyticRebuild,
+                        "kernel segmentation proved complete plane/cylinder/cone coverage; the kernel region rebuilder then reconstructed and validated the complete analytic shell".to_owned(),
+                        None,
+                    )),
+                }
+            }
             Err(kernel_error) => {
                 let hybrid_attempt = if closed_for_analytics && options.try_hybrid_rebuild {
                     try_hybrid_analytic(source_positions, source_indices, options)
@@ -2051,6 +2072,8 @@ pub(crate) struct RepairedMesh {
     pub(crate) positions: Vec<f64>,
     pub(crate) indices: Vec<u32>,
     message: String,
+    /// T-junction edges the repair split (see [`t_junctions`]).
+    pub(crate) stitched_edges: usize,
 }
 
 /// Repair a mesh that is not a closed two-manifold, and hand it back only
@@ -2120,6 +2143,7 @@ pub(crate) fn repaired_closed_mesh(
         positions,
         indices,
         message,
+        stitched_edges: stitch.stitched_edges,
     })
 }
 
@@ -2485,6 +2509,48 @@ fn solid_round_trips(solid: &brep_kernel::BrepSolid) -> Result<(), String> {
         Some(issues) => Err(format!("imported solid invalid: {issues:?}")),
         None => Ok(()),
     }
+}
+
+/// A stitched T-junction whose vertex splits a curved wall's diagonal sits
+/// inside the wall by its chord's sag, and the kernel segmentation reads the
+/// column it lies in as a plane region: the kernel rebuild then carries that
+/// column as a plane strip (census record kernel_cylinder_s1_d0.1_tjunction:
+/// the diagonal of the column at 90-100.5 degrees split at its midpoint,
+/// 8.3e-3 inside the r = 2 wall; a cylinder, a strip of area 1.83 and two
+/// caps, volume error 1.6e-4). The hybrid rebuild reads that vertex as a
+/// chord vertex and draws the whole wall. Under this switch a kernel rebuild
+/// of a mesh whose repair stitched T-junctions is compared with the hybrid
+/// one ([`hybrid_over_kernel_strips`]). BREP_TJUNCTION_STRIP_HYBRID=1 turns
+/// it on (default off).
+fn tjunction_strip_hybrid_enabled() -> bool {
+    brep_kernel::switch!(live "BREP_TJUNCTION_STRIP_HYBRID", false)
+}
+
+/// [`tjunction_strip_hybrid_enabled`]: the hybrid rebuild of the same mesh,
+/// taken over the kernel's `kernel` solid only when it keeps no faceted face,
+/// has fewer faces, encloses a volume within 1% of the kernel's, and its own
+/// STEP imports and validates.
+fn hybrid_over_kernel_strips(
+    kernel: &brep_kernel::BrepSolid,
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &StlConversionOptions,
+) -> Option<crate::hybrid_region_brep::HybridBrepOutput> {
+    let output = try_hybrid_analytic(positions, indices, options).ok()?;
+    if hybrid_report(&output.stats).faceted_faces != 0
+        || solid_face_count(&output.solid) >= solid_face_count(kernel)
+    {
+        return None;
+    }
+    let (before, after) = (
+        brep_kernel::solid_signed_volume(kernel).ok()?,
+        brep_kernel::solid_signed_volume(&output.solid).ok()?,
+    );
+    if !((after - before).abs() <= 1e-2 * before.abs()) {
+        return None;
+    }
+    solid_round_trips(&output.solid).ok()?;
+    Some(output)
 }
 
 fn segment_carrier_enabled() -> bool {

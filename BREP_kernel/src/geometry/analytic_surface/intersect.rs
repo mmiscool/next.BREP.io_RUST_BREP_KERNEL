@@ -123,10 +123,139 @@ pub(crate) fn intersect_analytic_pair_with(
     if let Some(curves) = intersect_coaxial_revolutions(first, second, tolerance) {
         return Some(curves);
     }
+    // Only under the production gate: the count gate is the escape hatch that
+    // measures the old routing (`ruled_gate_admits_a_straight_generatrix_
+    // whatever_it_counts` reads it sending a re-weighted cone to the marcher).
+    if gate == RuledGate::Geometry && plane_revolution_section_enabled() {
+        if let Some(curves) = intersect_perpendicular_plane_revolution(first, second, tolerance) {
+            return Some(curves);
+        }
+        if let Some(curves) = intersect_perpendicular_plane_revolution(second, first, tolerance) {
+            return Some(curves);
+        }
+    }
     if let Some(curves) = intersect_axial_plane_revolution(first, second, tolerance) {
         return Some(curves);
     }
     intersect_axial_plane_revolution(second, first, tolerance)
+}
+
+/// PLANE x REVOLUTION SECTION (2026-11-06;
+/// `BREP_PLANE_REVOLUTION_SECTION`, default on, `=0` off). A plane square to the axis
+/// of a general surface of revolution (one no quadric arm reads: a revolved
+/// parabola, a revolved spline) meets it in one circle per height at which the
+/// generatrix crosses the plane, over the revolution's sweep. No arm read this
+/// pair, so it went to the marcher, which seeds on a grid and finds no loop
+/// much smaller than the faces: brep-bench
+/// `tangent/paraboloid-tip-a-ten-thousandth-high` (a size-8 paraboloid cut by
+/// z = 1e-4, a rim circle of radius 0.028) read "no boundary faces".
+///
+/// The lane answers only when every crossing is clean: each a sign change of
+/// the generatrix's height over the plane, transversal, and away from the
+/// generatrix's ends and from the axis, and the scan's crossings are as many
+/// as the generatrix's control points change sides of the plane (so none can
+/// hide between two stations). A touching height, a crossing at a
+/// rim the face already has as an edge, or no crossing at all keeps the pair
+/// on the paths it took before (`None`).
+fn plane_revolution_section_enabled() -> bool {
+    crate::switch!("BREP_PLANE_REVOLUTION_SECTION", true)
+}
+
+fn intersect_perpendicular_plane_revolution(
+    plane_surface: &NurbsSurface,
+    revolution: &NurbsSurface,
+    tolerance: f64,
+) -> Option<Vec<NurbsCurve>> {
+    let plane = plane_data(plane_surface.analytic()?)?;
+    if matches!(revolution.analytic(), Some(AnalyticSurface::Plane { .. })) {
+        return None;
+    }
+    let structure = super::revolution::revolution_structure(revolution)?;
+    let frame = &structure.frame;
+    if plane.normal.dot(frame.axis).abs() < 1.0 - 1e-12 {
+        return None;
+    }
+    let generatrix = &structure.generatrix;
+    let [start, end] = generatrix.domain().ok()?;
+    let height = |t: f64| -> Option<f64> { Some(generatrix.evaluate(t).ok()?.sub(plane.origin).dot(plane.normal)) };
+    let scale = surface_scale(revolution).max(1.0);
+    let band = tolerance.max(1e-9 * scale);
+    let spans = generatrix.knots.windows(2).filter(|pair| pair[1] > pair[0]).count().max(1);
+    let stations = 64 * spans;
+    let mut previous_t = start;
+    let mut previous = height(start)?;
+    // A generatrix end ON the plane is a rim the face has as an edge.
+    if previous.abs() <= band || height(end)?.abs() <= band {
+        return None;
+    }
+    let mut roots = Vec::new();
+    for index in 1..=stations {
+        let t = start + (end - start) * index as f64 / stations as f64;
+        let value = height(t)?;
+        if value.abs() <= band && index < stations {
+            // A station on the plane: a touching height or a crossing exactly
+            // here; the bisection below cannot tell them apart.
+            return None;
+        }
+        if (previous < 0.0) != (value < 0.0) {
+            let (mut lo, mut hi, mut lo_value) = (previous_t, t, previous);
+            for _ in 0..200 {
+                let middle = 0.5 * (lo + hi);
+                if middle <= lo || middle >= hi {
+                    break;
+                }
+                let middle_value = height(middle)?;
+                if (middle_value < 0.0) == (lo_value < 0.0) {
+                    lo = middle;
+                    lo_value = middle_value;
+                } else {
+                    hi = middle;
+                }
+            }
+            roots.push(0.5 * (lo + hi));
+        }
+        previous_t = t;
+        previous = value;
+    }
+    if roots.is_empty() {
+        return None;
+    }
+    // The height's numerator `sum w_i ((P_i - o).n) N_i(t)` is a B-spline, so
+    // it has no more roots than its coefficients have sign changes (variation
+    // diminishing). A count above the scan's means two crossings may share a
+    // station, which the scan cannot see: decline rather than drop a circle.
+    let mut coefficient_signs = Vec::new();
+    for control in &generatrix.control_points {
+        if control.w <= 0.0 {
+            return None;
+        }
+        let value = control.point().ok()?.sub(plane.origin).dot(plane.normal);
+        if value.abs() <= band {
+            return None;
+        }
+        coefficient_signs.push(value > 0.0);
+    }
+    let sign_changes = coefficient_signs.windows(2).filter(|pair| pair[0] != pair[1]).count();
+    if sign_changes != roots.len() {
+        return None;
+    }
+    let radius_floor = (tolerance * 10.0).max(1e-9 * scale);
+    let mut curves = Vec::new();
+    for root in roots {
+        let derivatives = generatrix.derivatives(root, 1).ok()?;
+        let tangent = derivatives.get(1)?.normalized().ok()?;
+        if tangent.dot(plane.normal).abs() <= 1e-9 {
+            return None;
+        }
+        let point = generatrix.evaluate(root).ok()?;
+        let (_, radius, axial) = frame.cylindrical(point);
+        if radius <= radius_floor {
+            return None;
+        }
+        let center = frame.origin.add(frame.axis.scale(axial));
+        curves.push(make_arc(center, frame.x_axis, frame.y_axis, radius, 0.0, structure.sweep).ok()?);
+    }
+    Some(curves)
 }
 
 /// Exact intersection of a plane CONTAINING the revolution axis with a

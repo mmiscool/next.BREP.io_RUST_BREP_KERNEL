@@ -57,7 +57,14 @@ fn apply_chamfer_offsets_profile(
     cross: &EdgeCross,
     profile: &[NurbsCurve],
     name: Option<&str>,
+    edge_id: u64,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // Run through to the faces the edge's ends meet where the rails go on past
+    // them (`BREP_CHAMFER_THROUGH_END_FACES`, default on; `=0` restores); the flush cutter
+    // below answers everything else.
+    if let Some(result) = super::tool::chamfer_through_end_faces(solid, edge_id, cross, profile, name) {
+        return Ok(settle_cutter_scaffold(result));
+    }
     let mut tool = match &cross.path {
         EdgePath::Straight { direction, length } => {
             extrude_profile_brep(profile, *direction, *length)?
@@ -115,7 +122,7 @@ pub fn chamfer_edge_asymmetric(
     // the smaller setback keeps that probe inside both faces.
     let cross = analyze_edge(solid, edge_id, d1.min(d2))?;
     let profile = chamfer_cross_section_offsets(&cross, d1, d2)?;
-    apply_chamfer_offsets_profile(solid, &cross, &profile, name)
+    apply_chamfer_offsets_profile(solid, &cross, &profile, name, edge_id)
 }
 
 /// Distance-angle chamfer of one STRAIGHT edge between two planar faces
@@ -143,7 +150,7 @@ pub fn chamfer_edge_angle(
     let cross = analyze_edge(solid, edge_id, d1)?;
     let d2 = chamfer_angle_second_distance(&cross, d1, angle_rad)?;
     let profile = chamfer_cross_section_offsets(&cross, d1, d2)?;
-    apply_chamfer_offsets_profile(solid, &cross, &profile, name)
+    apply_chamfer_offsets_profile(solid, &cross, &profile, name, edge_id)
 }
 
 /// Snap small trim/intersection gaps between blend edges and their vertices.

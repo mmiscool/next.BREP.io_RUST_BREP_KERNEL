@@ -273,6 +273,11 @@ fn offset_shell_any_lane(
             if let Some(result) = sphere_body::sphere_body(source, distance) {
                 return Ok(result);
             }
+            // `BREP_OFFSET_TORUS_APPLE` (default on; `=0` restores): a whole torus grown
+            // past its hole is the revolved apple (`torus_body.rs`).
+            if let Some(result) = super::torus_body::torus_apple(source, distance) {
+                return Ok(result);
+            }
         }
         return imprint_attempts(source, opening_face_ids, distance, body);
     }
@@ -293,6 +298,12 @@ fn offset_shell_any_lane(
         Err(error) => {
             os_debug!("revolved wedge lane declined: could not read the source ({error})");
         }
+    }
+    // `BREP_OFFSET_SPHERE_CUT_SHELL` (default on; `=0` restores): an inward shell of a ball cut by
+    // planes is the source less the moved ball cut by the moved planes
+    // (`sphere_cut_shell.rs`); it declines to the pipeline on anything else.
+    if let Some(result) = sphere_cut_shell::sphere_cut_shell(source, opening_face_ids, distance) {
+        return Ok(result);
     }
     // Row 32 (`BREP_OFFSET_PLANAR_SHELL`, default on; `=0` restores): an outward shell of a
     // convex polyhedron in closed form (`planar_shell.rs`); it declines to the
@@ -575,6 +586,13 @@ fn offset_shell_impl(
             outward_carrier_extension(source, face, &source_faces, &opening_set, distance.abs())?
         } else {
             let mut inward = crate::CarrierExtension::uniform(reflex_extension.unwrap_or(0.0));
+            // `BREP_OFFSET_THIN_SKIN_PAD` (default on; `=0` restores): a skin thinner than
+            // the fragmenter's graze band is padded past its source rims
+            // (`thin_skin_pad`), so its sections end far from its corners.
+            if let Some(pad) = thin_skin_pad(source, face, distance)? {
+                inward = crate::CarrierExtension::uniform(inward.u_min.max(pad));
+                os_debug!("carrier for src face {face_id}: thin skin padded by {pad:.6}");
+            }
             if let Some(reach) = planar_reach {
                 let grown = reach + REACH_CLEARANCE * distance;
                 inward = crate::CarrierExtension::uniform(inward.u_min.max(grown));
@@ -629,6 +647,29 @@ fn offset_shell_impl(
                 if std::env::var("BREP_OFFSET_CURVED_REACH").as_deref() != Ok("0") {
                     curved_reach = curved_opening_reach_source(source, face, distance)?;
                 }
+                // `BREP_OFFSET_CURVED_RULED_REACH` (default on; `=0` restores): where the
+                // rectangle continuation declines (a u-closed band, a tangent
+                // junction), a v-ruled carrier is grown along its rulings
+                // until it crosses the curved opening, as the planar reach
+                // does for a plane (`curved_fallshort_reach`).
+                let mut ruled_reach = false;
+                if curved_reach.is_none() {
+                    if let Some((at_v_max, reach)) =
+                        curved_fallshort_reach(source, face, &source_faces, &opening_set, distance)?
+                    {
+                        let grown = reach + REACH_CLEARANCE * distance.abs();
+                        if at_v_max {
+                            inward.v_max = inward.v_max.max(grown);
+                        } else {
+                            inward.v_min = inward.v_min.max(grown);
+                        }
+                        ruled_reach = true;
+                        os_debug!(
+                            "carrier for src face {face_id}: ruled reach to its curved opening {opening} {reach:.6} at v_{}",
+                            if at_v_max { "max" } else { "min" },
+                        );
+                    }
+                }
                 // Lane O item 705 (`BREP_OFFSET_TANGENT_RIM_ROUND`, default off):
                 // a face that meets its curved opening TANGENTIALLY never
                 // reaches it — its skin runs parallel to the opening at
@@ -636,7 +677,7 @@ fn offset_shell_impl(
                 // the rim (`rim_round.rs`). Record the rim; the round carrier
                 // is emitted beside the apex caps, and this face's carrier is
                 // built as it is.
-                if curved_reach.is_none() && super::rim_round::tangent_rim_round_enabled() {
+                if curved_reach.is_none() && !ruled_reach && super::rim_round::tangent_rim_round_enabled() {
                     for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
                         let Some((mate, mate_use)) = junction_mate(&source_faces, face, coedge.edge_id) else {
                             continue;
@@ -648,7 +689,7 @@ fn offset_shell_impl(
                         tangent_rim_rounds.push((*face_id, opening, coedge.edge_id));
                     }
                 }
-                if curved_reach.is_none() && !tangent_rim_rounds.iter().any(|(id, _, _)| id == face_id) {
+                if curved_reach.is_none() && !ruled_reach && !tangent_rim_rounds.iter().any(|(id, _, _)| id == face_id) {
                     return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_shell_curved_opening_short", format!(
                         "offset_shell: the offset skin of source face {face_id} stops {gap:.3e} short of \
                          curved opening face {opening}; only a planar opening's skin is grown to meet it"
@@ -699,7 +740,10 @@ fn offset_shell_impl(
         let sharp_side = if carved.is_none() && cut_rim.is_none() && curved_reach.is_none() {
             match sharp_side_continued_source(source, face, &source_faces, &opening_set, distance, &extension)? {
                 Some(continued) => Some(continued),
-                None => reflex_side_widened_source(source, face, &source_faces, &opening_set, distance, &extension)?,
+                None => match band_reach_continued_source(source, face, distance, &extension)? {
+                    Some(widened) => Some(widened),
+                    None => reflex_side_widened_source(source, face, &source_faces, &opening_set, distance, &extension)?,
+                },
             }
         } else {
             None
@@ -753,19 +797,26 @@ fn offset_shell_impl(
             // A free-form outline grown uniformly outward is trimmed by its
             // outline OFFSET, not the slid net's scaled trim
             // (`outline_offset_carrier`).
-            let uniform = extension.u_min == extension.u_max
+            let pads = [extension.u_min, extension.u_max, extension.v_min, extension.v_max];
+            let widest = pads.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let narrowest = pads.iter().copied().fold(f64::INFINITY, f64::min);
+            // `BREP_OFFSET_CONVEX_POLYGON_OUTLINE`: pads equal but for their last
+            // bits (a tetrahedron's turned sides read 2.121 four ways, not
+            // bit-equal) are the uniform pad too.
+            let uniform = (extension.u_min == extension.u_max
                 && extension.u_min == extension.v_min
-                && extension.u_min == extension.v_max;
+                && extension.u_min == extension.v_max)
+                || (convex_polygon_outline_enabled() && widest - narrowest <= 1e-9 * widest.abs());
             if distance < 0.0 && uniform {
                 // Past the walls' sections by the same clearance a planar
                 // neighbour of a ruled wall gets, so each section lies
                 // strictly INSIDE the fitted trim rather than on it.
                 let clearance =
                     RULED_NEIGHBOUR_CLEARANCE_BANDS * offset_skin_band(crate::solid_scale(source), distance);
-                if let Some(rebuilt) = outline_offset_carrier(source, face, extension.u_min, clearance, &carrier)? {
+                if let Some(rebuilt) = outline_offset_carrier(source, face, widest, clearance, &carrier)? {
                     os_debug!(
                         "carrier for src face {face_id}: outline trimmed by its offset by {:.4}",
-                        extension.u_min + clearance
+                        widest + clearance
                     );
                     carrier = rebuilt;
                 }
@@ -1970,7 +2021,15 @@ fn offset_shell_impl(
             (face, edges)
         })
         .collect::<Vec<_>>();
-    let offset_skin_tolerance = offset_skin_band(scale, distance);
+    let mut offset_skin_tolerance = offset_skin_band(scale, distance);
+    // `BREP_OFFSET_THIN_SKIN_PAD`: the band's 2e-3 floor is a fixed length;
+    // on a shell thinner than it (box-paper-thin, d = 1e-3) no point was ever
+    // shadowed (`separation < d - 2e-3` cannot hold), so the opening's 1e-3
+    // corner squares, holding no wall seed, read as the void and were left
+    // out of the rim. A thin shell's band is held to a quarter of it.
+    if thin_skin_pad_enabled() && distance > 0.0 {
+        offset_skin_tolerance = offset_skin_tolerance.min(0.25 * distance.abs());
+    }
     // OUTWARD shells: a wall fragment lying IN FRONT of another opening —
     // past that opening's plane on its void side, within the extent of its
     // (extended) wall carrier — is not material: an opening removes
@@ -2813,6 +2872,11 @@ fn offset_shell_impl(
         );
     }
     if chosen_offsets.is_empty() && !shadowed_supports.is_empty() {
+        if matches!(body, Body::Shell) {
+            if let Some(unchanged) = empty_cavity_shell(source, opening_face_ids, distance)? {
+                return Ok(unchanged);
+            }
+        }
         let mut omitted = shadowed_supports.iter().copied().collect::<Vec<_>>();
         omitted.sort_unstable();
         return Err(KernelRefusal::unsupported(KernelStage::Select, "offset_shell_all_shadowed", format!(
@@ -2915,11 +2979,19 @@ fn offset_shell_impl(
     );
     selected.extend(chosen_offsets);
     selected.extend(chosen_walls);
+    // `BREP_OFFSET_THIN_SKIN_PAD`: the same fixed 2e-3 floor as the skin band
+    // welded the 1e-3 rim of box-paper-thin into points (every rim edge
+    // degenerate, the rim eight one-face shells, the volume short by the
+    // rim's 0.072); a thin inward shell's weld is held to a quarter of it.
+    let mut assembly_weld = 2e-3f64.max(scale * 5e-5);
+    if thin_skin_pad_enabled() && distance > 0.0 {
+        assembly_weld = assembly_weld.min(0.25 * distance.abs());
+    }
     let mut solid = profile::detail("assemble_open_fragments", || assemble_open_fragments(
         selected,
         &assembly_sources,
         &imprint,
-        2e-3f64.max(scale * 5e-5),
+        assembly_weld,
     ))?;
     os_debug!("stage: assembled open fragments {:.3}s", stage_clock.elapsed().as_secs_f64());
     profile::detail("orient_open_solid_faces", || orient_open_solid_faces(&mut solid))?;
@@ -3355,3 +3427,130 @@ pub(super) fn wall_surplus_beyond_the_sections(
     on_outline
 }
 
+
+/// `BREP_OFFSET_SHELL_EMPTY_CAVITY` (default on; `=0` restores): [`empty_cavity_shell`].
+fn empty_cavity_enabled() -> bool {
+    switch!("BREP_OFFSET_SHELL_EMPTY_CAVITY", true)
+}
+
+
+/// An INWARD shell whose every retained face's offset skin is shadowed: the
+/// cavity, the points of the solid farther than `distance` from every retained
+/// face, is empty, so the shell is the solid itself, every face its own
+/// `Source` image (brep-bench shell/box-walls-meeting: the box 10 x 8 x 6
+/// shelled by 4 open at its top, whose y walls' offsets meet in the plane
+/// y = 4, was refused "no retained face keeps any offset skin ... there is no
+/// cavity to shell"; the case reads the box, 480 and 376).
+///
+/// The shadow reading is checked before the solid is returned: on a 12³ grid
+/// of cell centres over the solid's control hull, no point the solid
+/// classifies Inside may lie farther than `distance` (plus 1e-9 of the
+/// solid's size) from every retained face. A point that does means the
+/// cavity is not empty, and the refusal stands.
+fn empty_cavity_shell(
+    source: &BrepSolid,
+    opening_face_ids: &[u64],
+    distance: f64,
+) -> Result<Option<OffsetShellResultRecord>, KernelRefusal> {
+    if !empty_cavity_enabled() || distance <= 0.0 || opening_face_ids.is_empty() {
+        return Ok(None);
+    }
+    let faces = source.shells.iter().flat_map(|shell| &shell.faces).collect::<Vec<_>>();
+    let retained = faces.iter().filter(|face| !opening_face_ids.contains(&face.id)).copied().collect::<Vec<_>>();
+    if retained.is_empty() {
+        return Ok(None);
+    }
+    let edges = source.edges.iter().collect::<Vec<_>>();
+    let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for vertex in &source.vertices {
+        low = Vec3::new(low.x.min(vertex.point.x), low.y.min(vertex.point.y), low.z.min(vertex.point.z));
+        high = Vec3::new(high.x.max(vertex.point.x), high.y.max(vertex.point.y), high.z.max(vertex.point.z));
+    }
+    for control in faces.iter().flat_map(|face| face.surface.control_points.iter().flatten()) {
+        let Ok(point) = control.point() else { return Ok(None) };
+        low = Vec3::new(low.x.min(point.x), low.y.min(point.y), low.z.min(point.z));
+        high = Vec3::new(high.x.max(point.x), high.y.max(point.y), high.z.max(point.z));
+    }
+    let scale = crate::solid_scale(source).max(1.0);
+    let tolerance = 1e-9 * scale;
+    const CELLS: usize = 12;
+    let span = high.sub(low);
+    let mut inside = 0usize;
+    for i in 0..CELLS {
+        for j in 0..CELLS {
+            for k in 0..CELLS {
+                let at = |index: usize| (index as f64 + 0.5) / CELLS as f64;
+                let point = Vec3::new(low.x + span.x * at(i), low.y + span.y * at(j), low.z + span.z * at(k));
+                let class = classify_point(point, source, tolerance * 10.0).or_refuse(KernelStage::Select, "classify_point")?.class;
+                if class != PointClass::In {
+                    continue;
+                }
+                inside += 1;
+                let mut nearest = f64::INFINITY;
+                for face in &retained {
+                    nearest = nearest.min(distance_to_trimmed_face(face, &edges, point)?);
+                    if nearest <= distance + tolerance {
+                        break;
+                    }
+                }
+                if nearest > distance + tolerance {
+                    os_debug!(
+                        "empty cavity declined: ({:.4}, {:.4}, {:.4}) lies {nearest:.6} from every retained face",
+                        point.x, point.y, point.z
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    if inside == 0 {
+        return Ok(None);
+    }
+    os_debug!("empty cavity: every retained skin is shadowed and {inside} sampled interior points lie within the distance");
+    let face_images = faces
+        .iter()
+        .map(|face| OffsetShellFaceImageRecord { role: OffsetFaceRole::Source, source_face_id: face.id })
+        .collect();
+    Ok(Some(OffsetShellResultRecord { solid: source.clone(), face_images }))
+}
+
+/// `BREP_OFFSET_THIN_SKIN_PAD` (default on; `=0` restores): [`thin_skin_pad`].
+fn thin_skin_pad_enabled() -> bool {
+    switch!("BREP_OFFSET_THIN_SKIN_PAD", true)
+}
+
+
+/// The pad of an INWARD planar carrier whose shell is thinner than the
+/// fragmenter's graze band: `None` otherwise.
+///
+/// Cause (the 10 × 8 × 6 box shelled 0.001 open at its top, brep-bench
+/// shell/box-paper-thin, read 0.1653 against 0.2959 with an open mesh): each
+/// carrier is its source face moved 0.001, and its neighbours' skins cut it
+/// 0.001 inside its rim, with both ends 0.001 from the carrier's corners. The
+/// imprint's pcurves are right (v = 0.001), but `fragment_face_arranged` lets a
+/// CUT endpoint join a boundary corner image within `arrangement_tolerance ·
+/// 100` (1.2e-3 on a 10 × 8 chart) with no 3D check, so both ends moved onto
+/// the corners, the cut lay on the rim and was dropped as its duplicate
+/// ("drop cut chain 6 as duplicate of boundary chain 0"). Padded past its rims,
+/// the carrier's corners are far from every section's ends; the surplus
+/// strips beyond the sections are outside the source or shadowed by the
+/// neighbours and are dropped by the ordinary selection.
+///
+/// Thin: `distance` under 2e-3 of the solid's size (the band is 1e-4 of a
+/// chart's diagonal, a chart at most the solid's size). The pad is 4e-3 of
+/// the size plus the distance.
+///
+/// The same switch holds the selection's skin band and the assembly's weld to
+/// a quarter of an inward distance: both had a fixed 2e-3 floor, twice this
+/// shell's thickness (see `offset_skin_tolerance` and `assembly_weld`).
+fn thin_skin_pad(source: &BrepSolid, face: &FaceRecord, distance: f64) -> Result<Option<f64>, KernelRefusal> {
+    if !thin_skin_pad_enabled() || distance <= 0.0 || !face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        return Ok(None);
+    }
+    let size = crate::solid_scale(source).max(1e-9);
+    if distance >= 2e-3 * size {
+        return Ok(None);
+    }
+    Ok(Some(4e-3 * size + distance))
+}

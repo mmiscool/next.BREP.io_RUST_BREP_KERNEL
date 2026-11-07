@@ -1116,6 +1116,11 @@ pub(crate) struct HybridSwitches {
     /// Set for the second rebuild [`HybridSwitches::retry_join_walls`]
     /// makes (read from no variable): the retry joins the walls.
     pub(crate) join_walls_pass: bool,
+    /// Set for the rebuild under `noisy_crossing` that
+    /// [`hybrid_plane_cylinder_brep_retry`] makes when the kept rebuild
+    /// left facets (read from no variable): the split reads a jittered
+    /// body's freeform chips that lie on a plane as planes.
+    pub(crate) chip_planes_pass: bool,
     /// Two cylinders of one radius crossing on a coarse jittered body
     /// (census records kernel_crossed_cylinders_s10_d0.1_jitter-1.0 and
     /// -0.3: 17 % of the wall facets tilt past 60 degrees). In the split, on
@@ -1161,7 +1166,15 @@ pub(crate) struct HybridSwitches {
     /// normal bands decline climbs the wide noise-bar ladder
     /// (kernel_sphere_s{1,10}_d0.1_jitter-1.0). The joined-wall rebuild is
     /// kept when it leaves at most one in twenty of the facets
-    /// (occt_countersunk_hole_s10_d0.05_jitter-1.0).
+    /// (occt_countersunk_hole_s10_d0.05_jitter-1.0). A gathered region's
+    /// lone cone takes a coaxial bore when the bore, the cone and the
+    /// region's other carriers hold 9 in 10 of it
+    /// (kernel_countersunk_hole_s1_d0.05_jitter-1.0). A gathered region's
+    /// cylinders parallel to its best-held one and inside it are refitted as
+    /// one bore on its axis (occt_annular_tube_s1_d0.1_jitter-1.0). A kept
+    /// rebuild that left facets is made once more with a jittered body's
+    /// flat freeform chips read as planes, kept when it leaves none
+    /// (occt_countersunk_hole_s10_d0.05_jitter-1.0's side wall).
     /// BREP_HYBRID_NOISY_CROSSING=1 opts in.
     pub(crate) noisy_crossing: bool,
 }
@@ -1257,6 +1270,7 @@ impl HybridSwitches {
             band_cylinders: promoted("BREP_HYBRID_BAND_CYLINDERS"),
             retry_join_walls: promoted("BREP_HYBRID_RETRY_JOIN_WALLS"),
             join_walls_pass: false,
+            chip_planes_pass: false,
             noisy_crossing: opted_in("BREP_HYBRID_NOISY_CROSSING"),
         }
     }
@@ -1302,6 +1316,7 @@ fn segment_for_hybrid_measured(
             switches.band_cylinders,
             switches.join_walls_pass,
             switches.noisy_crossing,
+            switches.chip_planes_pass,
         )
     };
     let mut split = if split_freeform_enabled() {
@@ -3429,18 +3444,39 @@ pub(crate) fn hybrid_plane_cylinder_brep_retry(
     // occt_countersunk_hole_s10_d0.05_jitter-1.0 the first rebuild demotes
     // the bore on a ten-triangle stray of the bottom cap, and the cone with
     // it (306 faceted); the joined one leaves a two-triangle side wall (2).
-    if switches.retry_join_walls && !switches.join_walls_pass && best.stats.faceted_triangles > 0 && best.stats.split_joinable_walls > 0 {
+    let mut kept = (best, switches);
+    if switches.retry_join_walls && !switches.join_walls_pass && kept.0.stats.faceted_triangles > 0 && kept.0.stats.split_joinable_walls > 0 {
         let joined = HybridSwitches { join_walls_pass: true, ..switches };
         if let Ok(output) = hybrid_plane_cylinder_brep_retry_once(positions, indices, options, joined, injected_failure) {
             if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
-                eprintln!("[hybrid] joined-wall rebuild: {} -> {} faceted", best.stats.faceted_triangles, output.stats.faceted_triangles);
+                eprintln!("[hybrid] joined-wall rebuild: {} -> {} faceted", kept.0.stats.faceted_triangles, output.stats.faceted_triangles);
             }
-            if output.stats.faceted_triangles == 0 || (switches.noisy_crossing && output.stats.faceted_triangles * 20 <= best.stats.faceted_triangles) {
+            if output.stats.faceted_triangles == 0 || (switches.noisy_crossing && output.stats.faceted_triangles * 20 <= kept.0.stats.faceted_triangles) {
+                kept = (output, joined);
+            }
+        }
+    }
+    // Under `noisy_crossing` a kept rebuild that left facets is made once
+    // more with a jittered body's flat freeform chips read as planes
+    // (`chip_planes_pass`), and that one is kept when it leaves none: on
+    // census record occt_countersunk_hole_s10_d0.05_jitter-1.0 the joined
+    // rebuild left the side wall y = -30 as its two facets, 0.92 degrees
+    // apart, and they carried -208 of the row's -246 volume error. A chip
+    // read as a plane in a rebuild that stays faceted moves the facets
+    // onto it (census record occt_countersunk_hole_s10_d0.1_jitter-1.0:
+    // volume error 4.2e-3 -> 7.9e-3), so such a rebuild is not kept.
+    if switches.noisy_crossing && !kept.1.chip_planes_pass && kept.0.stats.faceted_triangles > 0 {
+        let chips = HybridSwitches { chip_planes_pass: true, ..kept.1 };
+        if let Ok(output) = hybrid_plane_cylinder_brep_retry_once(positions, indices, options, chips, injected_failure) {
+            if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
+                eprintln!("[hybrid] chip-plane rebuild: {} -> {} faceted", kept.0.stats.faceted_triangles, output.stats.faceted_triangles);
+            }
+            if output.stats.faceted_triangles == 0 {
                 return Ok(output);
             }
         }
     }
-    Ok(best)
+    Ok(kept.0)
 }
 
 /// One [`hybrid_plane_cylinder_brep_retry`] rebuild with `switches` as given.
@@ -4016,6 +4052,7 @@ fn hybrid_plane_cylinder_brep_once(
         &vertices,
         tolerance,
         switches.noisy_cap_tilt,
+        switches.noisy_crossing.then_some(&cone_carriers),
     )
     .map_err(|(region, message)| HybridBuildFailure::Region {
         original: local_to_original[&region],
@@ -6419,10 +6456,38 @@ fn snap_cylinder_axes(
     vertices: &[Vec3],
     tolerance: f64,
     noisy: bool,
+    coaxial_cones: Option<&HashMap<u32, ConeCarrier>>,
 ) -> Result<(), (u32, String)> {
     let mut snapped = HashMap::<u32, Vec<Vec3>>::new();
     for (&region, cylinder) in cylinders.iter() {
         let mut candidates = Vec::new();
+        // [`HybridSwitches::noisy_crossing`]: a bore the split built on its
+        // cone's axis (the cone beside it, the axes parallel and the bore's
+        // origin on the cone's axis line) keeps that axis. The cone's fit
+        // over its wall reads the axis better than one jittered cap's
+        // normal, and the cone takes the bore's axis next (census record
+        // occt_countersunk_hole_s1_d0.05_jitter-1.0: the cap normal tilted
+        // 0.17 degrees, and turning the bore to it about its mid-bore origin
+        // moved the cone 0.01 off the truth; kept, 0.0016).
+        if let Some(cones) = coaxial_cones {
+            let coaxial = chains
+                .iter()
+                .filter(|chain| chain.closed && (chain.adjacent.0 == region || chain.adjacent.1 == region))
+                .filter_map(|chain| cones.get(if chain.adjacent.0 == region { &chain.adjacent.1 } else { &chain.adjacent.0 }))
+                .any(|cone| {
+                    let offset = cylinder.origin.sub(cone.apex);
+                    let sine = cone.axis.cross(cylinder.axis).length();
+                    let off_axis = offset.sub(cone.axis.scale(offset.dot(cone.axis))).length();
+                    if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
+                        eprintln!("[hybrid] cylinder {region} beside a cone: axes {sine:.3e} apart, origin {off_axis:.3e} off its axis (tolerance {tolerance:.3e})");
+                    }
+                    sine <= 1.0e-6 && off_axis <= tolerance
+                });
+            if coaxial {
+                snapped.insert(region, candidates);
+                continue;
+            }
+        }
         for chain in chains.iter().filter(|chain| {
             chain.closed && (chain.adjacent.0 == region || chain.adjacent.1 == region)
         }) {

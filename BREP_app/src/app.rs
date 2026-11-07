@@ -601,6 +601,9 @@ impl BrepApp {
     pub fn new_with(cc: &eframe::CreationContext<'_>, opts: crate::automation::AppOptions) -> Result<Self, String> {
         // Solid scroll bars and readable captions, in both themes.
         cc.egui_ctx.all_styles_mut(app_style);
+        // The action registry's view of each pass (`activate_widget`).
+        #[cfg(feature = "automation")]
+        crate::automation::actions::install(&cc.egui_ctx);
         let crate::automation::AppOptions { store: opt_store, seed } = opts;
         let render_state = cc
             .wgpu_render_state
@@ -1354,6 +1357,10 @@ impl BrepApp {
     ///
     /// [`STATE_BLOBS`]: crate::automation::state_blobs::STATE_BLOBS
     pub fn state_blob_json(&mut self, name: &str, ctx: &egui::Context) -> Option<String> {
+        if name == "__brepSelectionInspection" {
+            let document = self.docs.active_id();
+            return Some(self.selection.inspection_json(self.docs.engine_mut(), document));
+        }
         let engine = self.docs.engine();
         Some(match name {
             // The import preview draws its own engine while it is open.
@@ -1821,12 +1828,46 @@ impl BrepApp {
 }
 
 impl eframe::App for BrepApp {
+    /// The browser's automation pump reaches the app between frames through
+    /// eframe's runner (`WebRunner::app_mut`, `web_pump`). A web-only method.
+    #[cfg(target_arch = "wasm32")]
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     /// Phase 1 of the automation frame (§4.4): queued input commands become
     /// egui events; a screenshot that landed completes its reply. Called by
     /// every eframe runner before `ui`; the headless host calls it itself.
     #[cfg(feature = "automation")]
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let view = self.viewport.last_rect();
+        // eframe runs a pass without `ui` when the window is not visible (a
+        // hidden tab's timer frames, an occluded or minimised window): input
+        // given to it reaches no widget. Automation input waits for a pass
+        // that draws (the loop's or the page pump's own, `on_demand`, which
+        // mark theirs visible), and `activate_widget` keeps the widgets of
+        // the last pass that drew. egui hit-tests pointer input against the
+        // PREVIOUS pass's widgets, so the pass right after one that did not
+        // draw only lays out again, and input waits for the one after it.
+        //
+        // A hidden TAB with a WebMCP host attached draws every pass instead:
+        // eframe runs its timer passes right after the page pump's (each
+        // repaint request schedules one), and a pass that skips `ui` between
+        // a press and its release makes egui forget the press. eframe reads
+        // the root viewport's visibility after this hook, so marking it
+        // visible here is what has it run `ui`.
+        #[cfg(target_arch = "wasm32")]
+        if crate::automation::registry::enabled() {
+            let root = raw_input.viewports.entry(egui::ViewportId::ROOT).or_default();
+            if root.occluded == Some(true) {
+                root.occluded = Some(false);
+            }
+        }
+        let draws = raw_input.viewports.get(&egui::ViewportId::ROOT).and_then(|v| v.visible()).unwrap_or(true);
+        let drew = crate::automation::actions::note_pass(ctx, draws);
+        if !draws || !drew {
+            return;
+        }
         self.automation.drain_input(raw_input, ctx.cumulative_frame_nr(), ctx.pixels_per_point(), view, ctx);
     }
 
@@ -2451,7 +2492,8 @@ impl eframe::App for BrepApp {
                             self.viewport.show_ecad_status(ui);
                         } else {
                             // Modeling context: the selection filter (pickable kinds).
-                            self.selection.show_status_bar(ui, self.docs.engine_mut());
+                            let document = self.docs.active_id();
+                            self.selection.show_status_bar(ui, self.docs.engine_mut(), document);
                         }
                     });
                 });

@@ -63,6 +63,7 @@ const KINDS: [(&str, &str); 7] = [
 #[derive(Default)]
 pub struct SelectionPanel {
     hits: HashMap<String, egui::Rect>,
+    inspection: super::selection_inspection::Cache,
     /// The compact filter button's caption as last drawn, `None` while the
     /// full row is drawn instead (published as `__brepFilterButton`).
     button: Option<String>,
@@ -77,7 +78,20 @@ impl SelectionPanel {
     /// bottom STATUS BAR: a leading "All" tristate checkbox + one CHECKBOX per
     /// pickable kind (all reflecting the LIVE engine `selection_filter`). Rebuilds
     /// `hits` as it draws. Called by the bottom bar in modeling mode.
-    pub fn show_status_bar(&mut self, ui: &mut egui::Ui, state: &mut EngineState) {
+    pub fn show_status_bar(&mut self, ui: &mut egui::Ui, state: &mut EngineState, document: u64) {
+        let inspection = self.inspection.read(state, document);
+        ui.horizontal_wrapped(|ui| {
+            if let Some(text) = inspection["text"].as_str().filter(|s| !s.is_empty()) {
+                ui.label(text);
+                ui.separator();
+            }
+            // Share the existing row; the filter becomes a popup when the
+            // measurements leave too little room for all its checkboxes.
+            self.show_filter_bar(ui, state);
+        });
+    }
+
+    pub fn show_filter_bar(&mut self, ui: &mut egui::Ui, state: &mut EngineState) {
         self.hits.clear();
         self.button = None;
         // A loading label can leave only a sliver of the status bar. Never
@@ -100,6 +114,10 @@ impl SelectionPanel {
         } else {
             ui.horizontal_wrapped(|ui| self.show_filters(ui, state));
         }
+    }
+
+    pub fn inspection_json(&mut self, state: &mut EngineState, document: u64) -> String {
+        self.inspection.read(state, document).to_string()
     }
 
     fn show_filters(&mut self, ui: &mut egui::Ui, state: &mut EngineState) {

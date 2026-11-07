@@ -244,9 +244,13 @@ fn switcher_row_ui(
 /// Every row is measured with its marker slot present, so the header's chevron
 /// and an item's tick are both accounted for whichever row is widest.
 fn switcher_width(ui: &egui::Ui, options: &[(&str, &str, &str)]) -> f32 {
+    switcher_width_salted(ui, "options", options)
+}
+
+fn switcher_width_salted(ui: &egui::Ui, salt: &str, options: &[(&str, &str, &str)]) -> f32 {
     let mut probe = egui::Ui::new(
         ui.ctx().clone(),
-        ui.id().with("switcher-measure"),
+        ui.id().with(("switcher-measure", salt)),
         egui::UiBuilder::new()
             .sizing_pass()
             .invisible()
@@ -271,7 +275,7 @@ fn switcher_width(ui: &egui::Ui, options: &[(&str, &str, &str)]) -> f32 {
 }
 
 /// An icon-and-label toolbar dropdown, as tall as the surrounding buttons and
-/// exactly as wide as its widest option needs.
+/// sized to its current label; the menu fits its widest option.
 /// Options are `(label, id, glyph)` entries from the workbench registry.
 pub fn select(
     ui: &mut egui::Ui,
@@ -281,6 +285,9 @@ pub fn select(
 ) -> SelectResult {
     egui_extras::install_image_loaders(ui.ctx());
     let width = switcher_width(ui, options);
+    let current_option = options.iter().find(|(_, id, _)| *id == current)
+        .expect("selected workbench must be registered");
+    let header_width = switcher_width_salted(ui, "header", &[*current_option]);
     let mut changed = None;
     let mut item_rects = Vec::new();
     let header = ui
@@ -290,21 +297,27 @@ pub fn select(
                 .find(|(_, id, _)| *id == current)
                 .expect("selected workbench must be registered");
             let response =
-                switcher_row_ui(ui, label, glyph, width, false, Some(SELECT_CHEVRON))
+                switcher_row_ui(ui, label, glyph, header_width, false, Some(SELECT_CHEVRON))
                     .on_hover_text("Switch workbench");
             egui::Popup::menu(&response).width(width).show(|ui| {
-                for (label, id, glyph) in options {
-                    let selected = *id == current;
-                    let marker = selected.then_some(SELECT_TICK);
-                    let resp = switcher_row_ui(ui, label, glyph, width, selected, marker);
-                    item_rects.push(((*id).to_string(), resp.rect));
-                    if resp.clicked() {
-                        if !selected {
-                            changed = Some((*id).to_string());
+                let height = (ui.ctx().content_rect().height() - 80.0).max(80.0);
+                ui.set_max_height(height);
+                egui::ScrollArea::vertical()
+                    .max_height(height)
+                    .show(ui, |ui| {
+                        for (label, id, glyph) in options {
+                            let selected = *id == current;
+                            let marker = selected.then_some(SELECT_TICK);
+                            let resp = switcher_row_ui(ui, label, glyph, width, selected, marker);
+                            item_rects.push(((*id).to_string(), resp.rect));
+                            if resp.clicked() {
+                                if !selected {
+                                    changed = Some((*id).to_string());
+                                }
+                                ui.close();
+                            }
                         }
-                        ui.close();
-                    }
-                }
+                    });
             });
             response
         })

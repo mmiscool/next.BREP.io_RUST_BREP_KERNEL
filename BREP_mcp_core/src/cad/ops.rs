@@ -383,7 +383,9 @@ impl Operations {
         // Published before dispatch: a lost reply is recovered by the same key.
         let me = service.clone();
         let caller = caller.clone();
-        tokio::spawn(async move { me.ops.drive(me.clone(), id, command, defaulted, bound, lease, cancel, caller).await });
+        // An execution's operation is its client's: see `host::with_client`.
+        let client = caller.execution.as_deref().map(crate::host::client_of);
+        tokio::spawn(crate::host::with_client(client, async move { me.ops.drive(me.clone(), id, command, defaulted, bound, lease, cancel, caller).await }));
         Ok(admission)
     }
 

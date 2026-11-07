@@ -364,6 +364,24 @@ fn fillet_or_chamfer_inner(
     ends: ToolEnds,
     lane: Lane,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // A lone straight chamfer whose rails run on past the edge's ends is cut
+    // through to the faces those ends meet (`BREP_CHAMFER_THROUGH_END_FACES`,
+    // default on; `=0` restores); it declines to the lanes below on anything else.
+    // A pad below rounding (`tool_ends_to_original_extent` of an untrimmed
+    // edge reads 1.8e-15 at its end) is no pad.
+    let flush = ends.start.abs() <= 1e-9 * (1.0 + radius) && ends.end.abs() <= 1e-9 * (1.0 + radius);
+    if chamfer && flush && lane == Lane::GeneralFirst && chamfer_through_end_faces_on() {
+        let through = analyze_edge(solid, edge_id, radius).ok().and_then(|cross| {
+            let profile = match full_round_profile(&cross, radius, true).ok()? {
+                Some(profile) => profile,
+                None => cross_section_profile(&cross, radius, true).ok()?,
+            };
+            chamfer_through_end_faces(solid, edge_id, &cross, &profile, name)
+        });
+        if let Some(result) = through {
+            return Ok(result);
+        }
+    }
     // The general §4.9 march with direct §6.9 surgery is the PRIMARY lane:
     // it constructs the blend from the rolling ball and re-trims the mates,
     // with no tool solid to run past the edge.  A straight edge between two
@@ -1047,6 +1065,170 @@ pub(super) fn tool_ends_to_original_extent(
             (high - length).max(0.0)
         },
     }
+}
+
+/// `BREP_CHAMFER_THROUGH_END_FACES` (default on; `=0` restores): a lone
+/// chamfer of a straight edge runs on to the faces its ends meet.
+///
+/// A chamfer made after its neighbour (brep-bench `chamfer/box-top-asymmetric`,
+/// `chamfer/octahedron-all-edges-mitered`) is on an edge the neighbour already
+/// trimmed: the edge ends on the neighbour's slanted chamfer face, while the
+/// chamfer's own rails, the lines at its setbacks on the two faces, run on along
+/// those faces until they meet it. A cutter as long as the edge stops short of
+/// that and leaves a wedge of material capped by its own end plane, and the
+/// march caps the stripe at the same place.
+pub(super) fn chamfer_through_end_faces_on() -> bool {
+    switch!("BREP_CHAMFER_THROUGH_END_FACES", true)
+}
+
+
+/// How far one rail of a straight edge's chamfer runs on past each end of the
+/// edge before it leaves the planar face it lies on: `(past the start, past
+/// the end)`, each negative where the rail leaves the face short of that end
+/// (the face was cut back there by an earlier chamfer the edge's end meets).
+///
+/// `rail` is the rail's point in the cross-section at the edge's start and
+/// `direction` the edge's; the rail is `rail + s·direction` for `s` in
+/// `[0, length]` along the edge. The crossings of that line with the face's
+/// boundary (every loop, each edge sampled) bound the stretch of it inside the
+/// face that holds the edge's middle. `None` when neither of `faces` is a plane
+/// through the rail, or the line does not leave the face on both sides.
+fn rail_overrun(
+    solid: &BrepSolid,
+    faces: &[&FaceRecord],
+    rail: Vec3,
+    direction: Vec3,
+    length: f64,
+    scale: f64,
+) -> Option<(f64, f64)> {
+    let face = faces.iter().find(|face| match face.surface.analytic() {
+        Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) => u_dir
+            .cross(*v_dir)
+            .normalized()
+            .is_ok_and(|normal| rail.sub(*origin).dot(normal).abs() <= 1e-7 * scale),
+        _ => false,
+    })?;
+    let Some(crate::AnalyticSurface::Plane { u_dir, v_dir, .. }) = face.surface.analytic() else {
+        return None;
+    };
+    // The in-plane direction square to the edge: a boundary point's offset
+    // from the rail line along it, and its station along the edge.
+    let across = u_dir.cross(*v_dir).cross(direction).normalized().ok()?;
+    let mut stations = Vec::new();
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let edge = solid.edges.iter().find(|edge| edge.id == coedge.edge_id)?;
+        if edge.degenerate {
+            continue;
+        }
+        const SAMPLES: usize = 32;
+        let mut previous: Option<(f64, f64)> = None;
+        for index in 0..=SAMPLES {
+            let t = edge.t0 + (edge.t1 - edge.t0) * index as f64 / SAMPLES as f64;
+            let point = edge.curve.evaluate(t).ok()?.sub(rail);
+            // A boundary vertex ON the rail line (a corner the rail passes
+            // through) reads ±1e-16 off it: snapped, it is a crossing.
+            let off = point.dot(across);
+            let here = (if off.abs() <= 1e-9 * scale { 0.0 } else { off }, point.dot(direction));
+            if let Some((off_a, along_a)) = previous {
+                let (off_b, along_b) = here;
+                if off_a == 0.0 && off_b == 0.0 {
+                    stations.extend([along_a, along_b]);
+                } else if (off_a <= 0.0 && off_b >= 0.0) || (off_a >= 0.0 && off_b <= 0.0) {
+                    let s = off_a / (off_a - off_b);
+                    stations.push(along_a + (along_b - along_a) * s);
+                }
+            }
+            previous = Some(here);
+        }
+    }
+    let middle = 0.5 * length;
+    let low = stations.iter().copied().filter(|&s| s < middle).fold(f64::NEG_INFINITY, f64::max);
+    let high = stations.iter().copied().filter(|&s| s > middle).fold(f64::INFINITY, f64::min);
+    if !low.is_finite() || !high.is_finite() {
+        return None;
+    }
+    Some((-low, high - length))
+}
+
+/// The lone straight chamfer cut through to the faces its ends meet
+/// (`chamfer_through_end_faces_on`): the cutter of `profile` padded at each end
+/// past where either rail leaves its face, by a quarter, one and then four times
+/// the larger setback more, until its end caps clear the solid. At the last
+/// chamfer of a mitered corner the edge starts where the rails have already
+/// left their faces, and the wedge still holds material behind that start.
+///
+/// Answers only when the padding is needed (a rail runs on past an end of the
+/// edge, or leaves its face short of it) and the cut is complete: the result validates and NOTHING of the
+/// cutter but its wall stands on it. Where the material really continues past
+/// an end (a concave corner, a face that runs on around it), the padded cutter
+/// leaves its scaffold standing, and the caller's own construction answers.
+pub(super) fn chamfer_through_end_faces(
+    solid: &BrepSolid,
+    edge_id: u64,
+    cross: &EdgeCross,
+    profile: &[NurbsCurve],
+    name: Option<&str>,
+) -> Option<BrepSolid> {
+    if !chamfer_through_end_faces_on() || !cross.convex {
+        return None;
+    }
+    let EdgePath::Straight { direction, length } = &cross.path else {
+        return None;
+    };
+    let wall = profile.get(1)?;
+    let [w0, w1] = wall.domain().ok()?;
+    let rails = [wall.evaluate(w0).ok()?, wall.evaluate(w1).ok()?];
+    let setback = rails.iter().map(|rail| rail.sub(cross.start).length()).fold(0.0, f64::max);
+    let scale = 1.0 + length + setback;
+    let (edge, faces) = super::analyze::edge_and_faces(solid, edge_id).ok()?;
+    // An edge SPLIT by a vertex (a boolean operand's vertex on it) continues
+    // past that end as another edge between the same two faces: the rails run
+    // on along the continuation, and the padded cutter would chamfer the whole
+    // line where one piece was asked for. Such an end is not a corner; decline.
+    let borders = |face: &FaceRecord, other: u64| {
+        face.loops.iter().flat_map(|loop_record| &loop_record.coedges).any(|coedge| coedge.edge_id == other)
+    };
+    let ends_at = [edge.start_vertex_id, edge.end_vertex_id];
+    let split = solid.edges.iter().any(|other| {
+        other.id != edge_id
+            && !other.degenerate
+            && (ends_at.contains(&other.start_vertex_id) || ends_at.contains(&other.end_vertex_id))
+            && faces.iter().all(|face| borders(face, other.id))
+    });
+    if split {
+        return None;
+    }
+    // Per end, the furthest a rail runs on past it, and whether either rail
+    // does not end there (runs on, or leaves its face short of it): a square
+    // end face, where the flush cutter is right, has both rails end with the
+    // edge.
+    let tolerance = 1e-9 * scale;
+    let mut ends = ToolEnds::default();
+    let mut needed = [false, false];
+    for rail in rails {
+        let (start, end) = rail_overrun(solid, &faces, rail, *direction, *length, scale)?;
+        ends.start = ends.start.max(start);
+        ends.end = ends.end.max(end);
+        needed[0] |= start.abs() > tolerance;
+        needed[1] |= end.abs() > tolerance;
+    }
+    if needed == [false, false] {
+        return None;
+    }
+    for margin in [0.25, 1.0, 4.0].map(|share| share * setback) {
+        let padded = ToolEnds {
+            start: if needed[0] { ends.start + margin } else { 0.0 },
+            end: if needed[1] { ends.end + margin } else { 0.0 },
+        };
+        let tool = build_exact_tool(cross, profile, 0.0, padded, name).ok()?;
+        let Ok(result) = apply_tool_exact(solid, &tool, cross.convex) else {
+            continue;
+        };
+        if count_cutter_scaffold(&result) == 0 && result.validate().is_empty() {
+            return Some(result);
+        }
+    }
+    None
 }
 
 fn fillet_or_chamfer_exact(

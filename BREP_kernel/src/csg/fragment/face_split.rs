@@ -15,6 +15,14 @@ fn boundary_vertex_hints_enabled() -> bool {
 /// `fragment_solid`; without it each face rebuilt `pieces_by_id`/`vertex_by_id`
 /// over ALL pieces (O(F*(P + P*V))) and linear-scanned `by_face`. Lookup-only,
 /// so every face gets the identical pieces/points the scans returned.
+/// `BREP_FRAGMENT_SMALL_RING` (default on; `0`/`off` restores the old
+/// thinning): a chain smaller than the arrangement's junction radius keeps its
+/// shape (see SMALL RING in `fragment_face_arranged`) instead of collapsing
+/// onto its ends.
+pub(crate) fn small_ring_enabled() -> bool {
+    switch!("BREP_FRAGMENT_SMALL_RING", true)
+}
+
 pub(super) struct FragmentIndex<'a> {
     pub(super) by_face: HashMap<(u8, u64), &'a [u64]>,
     pub(super) pieces_by_id: HashMap<u64, &'a ImprintPieceRecord>,
@@ -720,12 +728,42 @@ fn fragment_face_arranged(
         if points.len() > 2 {
             let start = points[0];
             let end = points[points.len() - 1];
-            let mut kept = vec![start];
-            kept.extend(points[1..points.len() - 1].iter().copied().filter(|point| {
-                point.sub(start).length() > junction_radius
-                    && point.sub(end).length() > junction_radius
-            }));
-            kept.push(end);
+            let thin = |radius: f64| {
+                let mut kept = vec![start];
+                kept.extend(points[1..points.len() - 1].iter().copied().filter(|point| {
+                    point.sub(start).length() > radius && point.sub(end).length() > radius
+                }));
+                kept.push(end);
+                kept
+            };
+            let mut kept = thin(junction_radius);
+            // SMALL RING (`BREP_FRAGMENT_SMALL_RING`): a chain that lies wholly
+            // inside the junction radius of its own ends (the 0.028 pinhole on a
+            // plane charted over [0, 30]², radius 0.064) loses every interior
+            // point: a closed one bounds nothing and two half-circles fold onto
+            // one chord, so the region they ring is never carved. When the
+            // thinning would leave the chain flatter than it is (its bulge off
+            // the chord, or off its vertex when closed, past ten tolerances),
+            // thin it at a tenth of that bulge instead.
+            let closed = start.sub(end).length() <= arrangement_tolerance;
+            if kept.len() < if closed { 4 } else { 3 } && small_ring_enabled() {
+                let chord = end.sub(start);
+                let span = chord.length();
+                let bulge = points
+                    .iter()
+                    .map(|point| {
+                        let offset = point.sub(start);
+                        if closed || span <= arrangement_tolerance {
+                            offset.length()
+                        } else {
+                            (offset.x * chord.y - offset.y * chord.x).abs() / span
+                        }
+                    })
+                    .fold(0.0, f64::max);
+                if bulge > arrangement_tolerance * 10.0 {
+                    kept = thin(bulge * 0.1);
+                }
+            }
             points = kept;
         }
         let chain_index = chains.len();

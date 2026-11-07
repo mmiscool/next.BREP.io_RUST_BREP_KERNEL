@@ -498,6 +498,9 @@ pub use surface_surface_intersection::{
 pub(crate) use surface_surface_intersection::TRANSVERSE_SEED_CROSS;
 #[path = "intersect/tangent_curve.rs"]
 mod tangent_curve;
+#[path = "intersect/crossing_node.rs"]
+mod crossing_node;
+pub use crossing_node::{crossing_node_split_enabled, split_at_crossing_nodes};
 pub use tangent_curve::{
     classify_tangent_contact_at, find_tangent_contact, trace_tangent_curve, TangentContact,
     EXTENDED_RANK_FLOOR,

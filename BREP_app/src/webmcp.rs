@@ -165,8 +165,8 @@ mod web {
     use wasm_bindgen_futures::{future_to_promise, spawn_local};
 
     /// How long one command may wait for the app to answer: the native
-    /// embed's bound, for the same reason (a tab that is hidden does not
-    /// paint, and a paint is what answers).
+    /// embed's bound. A hidden tab paints nothing, but the page's pump
+    /// (`web_pump`) answers it with passes of its own.
     const REPLY_TIMEOUT_MS: f64 = 120_000.0;
 
     /// How many kept screenshots the page holds as blob URLs before the
@@ -211,14 +211,13 @@ mod web {
                 self.armed = true;
                 let fired = self.fired.clone();
                 let waker = cx.waker().clone();
-                let callback = Closure::once_into_js(move || {
-                    fired.store(true, Ordering::Release);
-                    waker.wake();
-                });
                 match web_sys::window() {
-                    Some(win) => {
-                        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(callback.unchecked_ref(), self.ms as i32);
-                    }
+                    // The pump's timer: on pace in a background tab too,
+                    // where the page's own timers are throttled.
+                    Some(_) => crate::web_pump::after(self.ms as f64, move || {
+                        fired.store(true, Ordering::Release);
+                        waker.wake();
+                    }),
                     None => {
                         // No window (a worker): there is no timer to wait on;
                         // yield once and continue.
@@ -258,7 +257,7 @@ mod web {
                         return Reply::err(id, q.frame(), "session poisoned");
                     }
                     if now_ms() - started > REPLY_TIMEOUT_MS {
-                        return Reply::err(id, q.frame(), format!("no reply from the app within {} s (is the tab visible?)", REPLY_TIMEOUT_MS / 1000.0));
+                        return Reply::err(id, q.frame(), format!("host_deadline_exceeded: no reply from the app within {} s; the app may have accepted the command; reconcile before retrying", REPLY_TIMEOUT_MS / 1000.0));
                     }
                     sleep(16).await;
                 }

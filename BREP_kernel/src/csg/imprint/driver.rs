@@ -2442,6 +2442,32 @@ fn build_imprints_with_carrier_seeds(
             if let Some(started) = rescue_started {
                 profile.rescue_march += started.elapsed();
             }
+            // CROSSING-NODE SPLIT (`BREP_SSI_NODE_SPLIT`, default on, `=0` off;
+            // `intersect/crossing_node.rs`): a branch the marcher carried
+            // through a saddle tangent node is cut at every passage, so the
+            // node is a vertex where the four half-branches meet.
+            if crate::crossing_node_split_enabled() && !branches.is_empty() {
+                let (split, nodes) = crate::split_at_crossing_nodes(
+                    first_march,
+                    second_march,
+                    std::mem::take(&mut branches),
+                    options.tolerance,
+                )
+                .or_refuse(KernelStage::Intersect, "csg.imprint.driver")?;
+                branches = split;
+                for node in nodes {
+                    if debug_pairs {
+                        eprintln!(
+                            "pair {}x{}: crossing node ({:.9},{:.9},{:.9}) split the march",
+                            first.face.id, second.face.id, node.x, node.y, node.z
+                        );
+                    }
+                    tangent_node.get_or_insert(node);
+                    if !tangent_nodes.iter().any(|known| known.sub(node).length() <= options.tolerance * 10.0) {
+                        tangent_nodes.push(node);
+                    }
+                }
+            }
             if branches.iter().any(|branch| branch.points.len() >= 2) {
                 section_evidence = true;
             }

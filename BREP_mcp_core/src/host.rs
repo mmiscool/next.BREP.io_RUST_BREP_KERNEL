@@ -189,6 +189,47 @@ pub struct Envelope {
     pub cmd: String,
     #[serde(default)]
     pub args: Value,
+    /// Who sent it ([`with_client`]): the app keeps each client's commands
+    /// in order, and lets one client's go ahead of another's that waits for a
+    /// pass. `None` (a direct tool) is ordered against every command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<u64>,
+}
+
+#[cfg(feature = "server")]
+tokio::task_local! {
+    static CLIENT: u64;
+}
+
+/// The client id of a script execution (or any caller named by a string).
+pub fn client_of(name: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Run `future` with every [`HostHandle::call`] it makes sent as `client`'s.
+/// A spawned task does not inherit it: scope each one.
+pub async fn with_client<F: Future>(client: Option<u64>, future: F) -> F::Output {
+    #[cfg(feature = "server")]
+    if let Some(client) = client {
+        return CLIENT.scope(client, future).await;
+    }
+    let _ = client;
+    future.await
+}
+
+/// The client the current task calls for, if [`with_client`] named one.
+pub fn current_client() -> Option<u64> {
+    #[cfg(feature = "server")]
+    {
+        CLIENT.try_with(|c| *c).ok()
+    }
+    #[cfg(not(feature = "server"))]
+    {
+        None
+    }
 }
 
 /// The app's answer. `notices` are the app's `Notice` records as JSON
@@ -350,7 +391,7 @@ impl HostHandle {
         let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send(HostRequest::Command { envelope: Envelope { id, cmd: cmd.to_string(), args }, reply: tx })
+            .send(HostRequest::Command { envelope: Envelope { id, cmd: cmd.to_string(), args, client: current_client() }, reply: tx })
             .map_err(|_| "the app host has stopped".to_string())?;
         rx.await.map_err(|_| "the app host dropped the reply (did it panic?)".to_string())
     }

@@ -125,7 +125,7 @@ impl PickBar {
                         if cancel.clicked() {
                             action = Some(Action::Cancel);
                         }
-                        filter.show_status_bar(ui, state);
+                        filter.show_filter_bar(ui, state);
                     });
                     if !field.names.is_empty() {
                         egui::ScrollArea::vertical().id_salt("pick-bar-picks").max_height(96.0).show(ui, |ui| {

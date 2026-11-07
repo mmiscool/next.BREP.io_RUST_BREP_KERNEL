@@ -37,10 +37,16 @@ pub mod delete_selection;
 /// dispatch that does not wait for a frame (a hidden Wayland window gets none).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod desktop_loop;
-/// One egui pass drawn into an offscreen texture: the desktop loop's captures
-/// while the window is not being drawn.
-#[cfg(not(target_arch = "wasm32"))]
+/// One egui pass drawn into an offscreen texture: the captures of a pass
+/// nothing presents (the desktop loop's, the browser pump's).
 pub mod offscreen;
+/// One egui pass the app runs itself when nothing is drawing it.
+#[cfg(feature = "automation")]
+pub mod on_demand;
+/// The browser's frame-free automation pump: commands answered while the tab
+/// is in the background.
+#[cfg(all(target_arch = "wasm32", feature = "automation"))]
+pub mod web_pump;
 pub mod offsite;
 pub mod palette;
 pub mod panels;
@@ -115,7 +121,12 @@ mod web {
             .dyn_into::<web_sys::HtmlCanvasElement>()
             .map_err(|_| JsValue::from_str("element is not a <canvas>"))?;
 
-        eframe::WebRunner::new()
+        let runner = eframe::WebRunner::new();
+        // The automation pump borrows the app from this runner between
+        // frames (`web_pump`): commands answer in a background tab too.
+        #[cfg(feature = "automation")]
+        crate::web_pump::set_runner(&runner);
+        runner
             .start(
                 canvas,
                 eframe::WebOptions::default(),
@@ -124,6 +135,8 @@ mod web {
                     crate::app::BrepApp::new(cc)
                         .map(|mut app| {
                             app.start_report_followup(&cc.egui_ctx);
+                            #[cfg(feature = "automation")]
+                            crate::web_pump::install(&cc.egui_ctx, cc.wgpu_render_state.clone(), app.automation());
                             // The page's tool surface (WebMCP) answers through
                             // the app's own automation queue: hand it over
                             // here, where the app first exists.

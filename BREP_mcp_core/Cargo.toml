@@ -1,6 +1,6 @@
 [package]
 name = "BREP_mcp_core"
-version = "0.9.1"
+version = "0.10.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"

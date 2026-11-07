@@ -971,6 +971,13 @@ pub(crate) fn transpose_offset_surface(surface: &NurbsSurface) -> Result<NurbsSu
         surface.knots_u.clone(), controls).or_refuse(KernelStage::Refine, "offset_transpose")
 }
 
+/// `BREP_OFFSET_APEX_END_REACH` (default on; `=0` restores): see the RULED EXTENSION
+/// block of `offset_surface_constructed`.
+pub(crate) fn apex_end_reach_enabled() -> bool {
+    switch!("BREP_OFFSET_APEX_END_REACH", true)
+}
+
+
 fn offset_surface_constructed(
     face: &FaceRecord,
     distance: f64,
@@ -1250,6 +1257,15 @@ fn offset_surface_constructed(
         // within the fit contract; otherwise the extended source is sampled
         // pointwise, and either way the refinement reads the carrier against it.
         if extension.extends_v() && !inverted {
+            // `BREP_OFFSET_APEX_END_REACH` (default on; `=0` restores): a sheaf whose apex
+            // lies exactly ON an end row (a cone made to its point: the source
+            // rows read apex_at = 1) is not a sheet folded inside its span; it
+            // is grown away from the apex and not toward it. Without it the
+            // whole sheet read unextendable, so a cone grown by 1 kept its
+            // base ring at z = 0.6 above the grown base plane z = -1, the pair
+            // was skipped on bounds and the ring stayed one-use
+            // (brep-bench offset/cone-grown, non-integral genus).
+            let apex_end_reach = apex_end_reach_enabled();
             let mut min_ruling = f64::MAX;
             let mut back_allowance = f64::MAX;
             let mut forward_allowance = f64::MAX;
@@ -1265,6 +1281,14 @@ fn offset_surface_constructed(
                 let far_radial = row[1].sub(far_centroid).length();
                 if (far_radial - near_radial).abs() > 1e-9 {
                     let apex_at = near_radial / (near_radial - far_radial);
+                    if apex_end_reach && apex_at.abs() <= 1e-9 {
+                        back_allowance = 0.0;
+                        continue;
+                    }
+                    if apex_end_reach && (apex_at - 1.0).abs() <= 1e-9 {
+                        forward_allowance = 0.0;
+                        continue;
+                    }
                     if (-1e-9..=1.0 + 1e-9).contains(&apex_at) {
                         // Apex inside the span: degenerate sheet, do not touch.
                         extendable = false;
@@ -1303,6 +1327,14 @@ fn offset_surface_constructed(
                     let far_radial = far.sub(far_source).length();
                     if (far_radial - near_radial).abs() > 1e-9 {
                         let apex_at = near_radial / (near_radial - far_radial);
+                        if apex_end_reach && apex_at.abs() <= 1e-9 {
+                            source_back = 0.0;
+                            continue;
+                        }
+                        if apex_end_reach && (apex_at - 1.0).abs() <= 1e-9 {
+                            source_forward = 0.0;
+                            continue;
+                        }
                         if (-1e-9..=1.0 + 1e-9).contains(&apex_at) {
                             extendable = false;
                             break;

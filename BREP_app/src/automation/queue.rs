@@ -30,6 +30,9 @@ pub struct Pending {
     pub envelope: Envelope,
     pub reply: Sender<Reply>,
     deadline: Option<std::time::Instant>,
+    /// Who sent it ([`AutomationQueue::submit_for`]): the queue keeps each
+    /// client's commands in order, not every client's in one order.
+    client: Option<u64>,
 }
 
 impl Pending {
@@ -92,19 +95,39 @@ impl Inner {
         !self.layout_dirty && self.layout_at.is_some_and(|at| at.elapsed() < LAYOUT_FRESH)
     }
 
-    /// What the queue's head needs, if there is one.
-    fn front_need(&self) -> Option<Need> {
-        let p = self.pending.front()?;
-        Some(lookup(&p.envelope.cmd).map_or(Need::State, |spec| need(spec, &p.envelope.args)))
+    /// What queued command `index` needs.
+    fn need_at(&self, index: usize) -> Need {
+        let p = &self.pending[index];
+        lookup(&p.envelope.cmd).map_or(Need::State, |spec| need(spec, &p.envelope.args))
     }
 
-    /// The head can be dispatched now, without a pass.
-    fn front_dispatchable(&self) -> bool {
-        match self.front_need() {
-            Some(Need::State) => true,
-            Some(Need::Layout) => self.layout_current(),
-            _ => false,
+    /// Queued command `index` can be dispatched now, without a pass.
+    fn dispatchable(&self, index: usize) -> bool {
+        match self.need_at(index) {
+            Need::State => true,
+            Need::Layout => self.layout_current(),
+            Need::Pass => false,
         }
+    }
+
+    /// Queued command `index` is next in its client's order: nothing queued
+    /// ahead of it is its own client's, or a client's the queue cannot tell
+    /// apart (`client: None`, ordered against everything). The head always is.
+    fn is_next(&self, index: usize) -> bool {
+        let Some(client) = self.pending[index].client else { return index == 0 };
+        self.pending.iter().take(index).all(|p| p.client.is_some_and(|other| other != client))
+    }
+
+    /// The first queued command that is next in its client's order and can
+    /// be dispatched without a pass: one client's command waiting for a pass
+    /// does not hold up another client's.
+    fn next_dispatchable(&self) -> Option<usize> {
+        (0..self.pending.len()).find(|&i| self.is_next(i) && self.dispatchable(i))
+    }
+
+    /// Some command that is next in its client's order waits for a pass.
+    fn waits_for_pass(&self) -> bool {
+        (0..self.pending.len()).any(|i| self.is_next(i) && !self.dispatchable(i))
     }
 }
 
@@ -241,6 +264,15 @@ impl AutomationQueue {
 
     /// A deadline applies before dispatch, never to work already accepted by a handler.
     pub fn submit_before(&self, envelope: Envelope, deadline: Option<std::time::Instant>) -> Receiver<Reply> {
+        self.submit_for(envelope, deadline, None)
+    }
+
+    /// [`submit_before`](Self::submit_before) for `client` (an MCP host's
+    /// script execution, say). Commands from one client keep their order; a
+    /// command may be dispatched ahead of commands that are queued only by
+    /// OTHER clients, so one client's command waiting for a pass does not
+    /// hold up another's. `None` orders it against every command, as before.
+    pub fn submit_for(&self, envelope: Envelope, deadline: Option<std::time::Instant>, client: Option<u64>) -> Receiver<Reply> {
         let (tx, rx) = channel();
         let mut inner = self.inner.lock().unwrap();
         if let Some(why) = &inner.poisoned {
@@ -251,7 +283,7 @@ impl AutomationQueue {
             let _ = tx.send(Reply::err(envelope.id, inner.frame, format!("unknown command `{}`", envelope.cmd), vec![]));
             return rx;
         }
-        inner.pending.push_back(Pending { envelope, reply: tx, deadline });
+        inner.pending.push_back(Pending { envelope, reply: tx, deadline, client });
         // Notify only after the command is visible to the app thread: a wake
         // that arrives first finds it queued.
         drop(inner);
@@ -276,14 +308,14 @@ impl AutomationQueue {
     /// a head it can dispatch without a pass, or polled work.
     pub fn has_frameless_work(&self) -> bool {
         let inner = self.inner.lock().unwrap();
-        !inner.polling.is_empty() || inner.front_dispatchable()
+        !inner.polling.is_empty() || inner.next_dispatchable().is_some()
     }
 
-    /// Whether the queue's head waits for a pass: input, a capture, or a
-    /// layout read with no current layout. The desktop loop runs one on demand.
+    /// Whether a command next in its client's order waits for a pass:
+    /// input, a capture, or a layout read with no current layout. The desktop
+    /// loop runs one on demand.
     pub fn needs_pass(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner.front_need().is_some() && !inner.front_dispatchable()
+        self.inner.lock().unwrap().waits_for_pass()
     }
 
     /// The layout may have changed outside a command (a resize, finished
@@ -475,10 +507,11 @@ impl AutomationQueue {
         }
     }
 
-    /// Dispatch without a pass (the desktop loop's service step): the
-    /// queue's head, in FIFO order, up to the first command that needs a pass
-    /// ([`needs_pass`](Self::needs_pass), which the loop then runs); then one
-    /// poll of the work they started. Returns whether polled work is still
+    /// Dispatch without a pass (the desktop loop's service step): every
+    /// command that is next in its client's order and needs no pass, in
+    /// queue order. A client's commands stop at its first that needs a pass
+    /// ([`needs_pass`](Self::needs_pass), which the loop then runs); other
+    /// clients' go on. Then one poll of the work they started. Returns whether polled work is still
     /// outstanding. Runs on the app's thread, so mutations stay sequential
     /// with the UI's own writers.
     pub fn drain_frameless(&self, ctx: &mut Ctx<'_>) -> bool {
@@ -486,10 +519,10 @@ impl AutomationQueue {
         loop {
             let next = {
                 let mut inner = self.inner.lock().unwrap();
-                let ready = inner.front_dispatchable();
-                match inner.pending.front().and_then(|p| lookup(&p.envelope.cmd)) {
-                    Some(spec) if ready => {
-                        let p = inner.pending.pop_front().expect("front exists");
+                let ready = inner.next_dispatchable();
+                match ready.and_then(|i| lookup(&inner.pending[i].envelope.cmd).map(|spec| (i, spec))) {
+                    Some((index, spec)) => {
+                        let p = inner.pending.remove(index).expect("index from next_dispatchable");
                         if let Handler::Input(f) = &spec.handler {
                             // A read-only input command: answered here, as the
                             // frame's input phase would answer it.

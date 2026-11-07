@@ -45,6 +45,7 @@ pub const STATE_BLOBS: &[(&str, &str)] = &[
     ("__brepAutoConstraints", "auto-constraint inference state"),
     ("__brepStepParts", "STEP parts library panel state"),
     ("__brepSelectionFilter", "which entity kinds a viewport click may pick"),
+    ("__brepSelectionInspection", "selection measurements displayed in the status bar: {shown,text,pending,lengthUnit,areaUnit,items}; cached kernel face/edge queries and world vertex coordinates"),
     ("__brepFilterButton", "the status bar's compact selection filter {shown, label}: whether the filter is one button (touch or a narrow bar) and its caption"),
     ("__brepContext", "context action bar state (offers for the selection)"),
     ("__brepPickBar", "the focused pick bar {shown, label, count}: a touch or narrow window's picker while a dialog's reference field picks, all other chrome hidden"),

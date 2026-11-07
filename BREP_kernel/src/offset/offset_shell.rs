@@ -87,6 +87,8 @@ mod revolved_wedge;
 mod planar_shell;
 #[path = "offset_shell/sphere_body.rs"]
 mod sphere_body;
+#[path = "offset_shell/sphere_cut_shell.rs"]
+mod sphere_cut_shell;
 #[path = "offset_shell/outline_offset.rs"]
 mod outline_offset;
 #[path = "offset_shell/vacated_rim.rs"]
@@ -103,6 +105,8 @@ mod solid;
 mod joint_offset;
 #[path = "offset_shell/refusals.rs"]
 mod refusals;
+#[path = "offset_shell/torus_body.rs"]
+mod torus_body;
 
 use carrier_rebuild::*;
 use carriers::*;

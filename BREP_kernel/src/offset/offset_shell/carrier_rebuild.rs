@@ -3338,3 +3338,338 @@ pub(super) fn reflex_side_widened_source(
     Ok(Some(solid))
 }
 
+
+/// `BREP_OFFSET_BAND_REACH` (default on; `=0` restores): the band-reach lane below.
+pub(super) fn band_reach_enabled() -> bool {
+    switch!("BREP_OFFSET_BAND_REACH", true)
+}
+
+
+/// BAND-REACH lane: a curved retained face trimmed to a BAND of a u-closed
+/// surface (two uses of one seam edge along `u0`/`u1`, two full-period
+/// isolines `v = va`, `v = vb`), in an OUTWARD offset, whose v-sides the
+/// pipeline asked to grow, has its offset carrier built over the band WIDENED
+/// along v toward the surface's ends, so its offset meets the offsets of its
+/// sharp neighbours. Returns the source with that face so rebuilt (the
+/// sharp-side lane's substitution), or `Ok(None)` where the lane does not
+/// apply.
+///
+/// Cause (napkin ring grown by 1, 2026-11-06): the ball's band offsets to the
+/// concentric sphere of radius 6, a closed-form carrier that clones the band's
+/// trim. `offset_surface_constructed` cannot grow it (the sphere lane takes no
+/// extension, "the extension cannot reach a sphere"), so the carrier stops at
+/// the image of the rim, r = 3.6 at z = ±4.8, while the bore's offset (r = 2)
+/// crosses the sphere at z = ±5.657: "one-call imprint: 2 members, 1 admitted
+/// pairs, 0 pieces", and every rim of both carriers stayed one-use ("unwelded
+/// rim ... curved-solid opening is not yet supported").
+///
+/// The widening is along the surface itself, so every `(u, v)` still names
+/// the same point and the offset of the widened band is the same carrier
+/// with a larger trim. Each side grows by the arc length the pipeline asked
+/// (read on the source along four meridians, the farthest taken), clamped to
+/// stop 2% of the v domain short of the surface's end, so a pole is never
+/// reached. The surplus past the true section is cut by the neighbour's
+/// imprint and dropped by the ordinary selection. The loop is edited IN
+/// PLACE: the same four uses in the same order, each on its side. A v-linear
+/// band (a cylinder, a cone) is left to the ruled extension.
+pub(super) fn band_reach_continued_source(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    distance: f64,
+    extension: &crate::CarrierExtension,
+) -> Result<Option<BrepSolid>, KernelRefusal> {
+    if !band_reach_enabled() || distance >= 0.0 || face.loops.len() != 1 || face.loops[0].coedges.len() != 4 {
+        return Ok(None);
+    }
+    if extension.v_min <= 0.0 && extension.v_max <= 0.0 {
+        return Ok(None);
+    }
+    let surface = &face.surface;
+    // A v-linear net (a cylinder, a cone) is grown along its rulings by
+    // `offset_surface_constructed` already; only a curved meridian is not.
+    if surface.degree_v < 2 || surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        return Ok(None);
+    }
+    let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
+    if !closed_u || closed_v {
+        return Ok(None);
+    }
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let band_u = 1e-9 * (u1 - u0).abs().max(1.0);
+    let band_v = 1e-9 * (v1 - v0).abs().max(1.0);
+    // Per use: Some(true) a seam use (constant u at a domain end), Some(false)
+    // a full-period isoline (constant v strictly inside the domain); with the
+    // use's constant coordinate and whether it runs in increasing parameter.
+    let mut kinds = Vec::with_capacity(4);
+    for coedge in &face.loops[0].coedges {
+        let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let samples = (0..=8)
+            .map(|index| coedge.pcurve.evaluate(q0 + (q1 - q0) * index as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate"))
+            .collect::<Result<Vec<_>, KernelRefusal>>()?;
+        let (first, last) = (samples[0], samples[8]);
+        let const_u = samples.iter().all(|uv| (uv.x - first.x).abs() <= band_u);
+        let const_v = samples.iter().all(|uv| (uv.y - first.y).abs() <= band_v);
+        if const_u && ((first.x - u0).abs() <= band_u || (first.x - u1).abs() <= band_u) && !const_v {
+            kinds.push((true, first.x, last.y > first.y));
+        } else if const_v
+            && first.y > v0 + band_v
+            && first.y < v1 - band_v
+            && ((last.x - first.x).abs() - (u1 - u0)).abs() <= 1e-6 * (u1 - u0).abs().max(1.0)
+        {
+            kinds.push((false, first.y, last.x > first.x));
+        } else {
+            return Ok(None);
+        }
+    }
+    let seams = kinds.iter().enumerate().filter(|(_, kind)| kind.0).map(|(index, _)| index).collect::<Vec<_>>();
+    let rings = kinds.iter().enumerate().filter(|(_, kind)| !kind.0).map(|(index, _)| index).collect::<Vec<_>>();
+    if seams.len() != 2 || rings.len() != 2 {
+        return Ok(None);
+    }
+    let coedges = &face.loops[0].coedges;
+    if coedges[seams[0]].edge_id != coedges[seams[1]].edge_id {
+        return Ok(None);
+    }
+    let (va, vb) = {
+        let (a, b) = (kinds[rings[0]].1, kinds[rings[1]].1);
+        if (a - b).abs() <= band_v {
+            return Ok(None);
+        }
+        (a.min(b), a.max(b))
+    };
+    // The v reached by travelling `length` from `start` (sense ±1) along four
+    // meridians, the farthest of them, never past `limit`.
+    let reach = |start: f64, sense: f64, length: f64, limit: f64| -> Result<f64, KernelRefusal> {
+        if length <= 0.0 {
+            return Ok(start);
+        }
+        const STEPS: usize = 2048;
+        let step = (v1 - v0) / STEPS as f64;
+        let mut farthest = start;
+        for station in 0..4 {
+            let u = u0 + (u1 - u0) * (station as f64 + 0.5) / 4.0;
+            let mut v = start;
+            let mut previous = surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?;
+            let mut travelled = 0.0;
+            while travelled < length {
+                let next = v + sense * step;
+                if (next - limit) * sense >= 0.0 {
+                    v = limit;
+                    break;
+                }
+                let point = surface.evaluate(u, next).or_refuse(KernelStage::Refine, "evaluate")?;
+                travelled += point.sub(previous).length();
+                previous = point;
+                v = next;
+            }
+            if (v - farthest) * sense > 0.0 {
+                farthest = v;
+            }
+        }
+        Ok(farthest)
+    };
+    let margin = 0.02 * (v1 - v0);
+    let new_va = reach(va, -1.0, extension.v_min, v0 + margin)?.min(va);
+    let new_vb = reach(vb, 1.0, extension.v_max, v1 - margin)?.max(vb);
+    if new_va >= va - band_v && new_vb <= vb + band_v {
+        return Ok(None);
+    }
+    let mut solid = source.clone();
+    let mut next_id = solid
+        .vertices
+        .iter()
+        .map(|vertex| vertex.id)
+        .chain(solid.edges.iter().map(|edge| edge.id))
+        .chain(solid.shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| {
+            face.loops
+                .iter()
+                .flat_map(|loop_record| loop_record.coedges.iter().map(|coedge| coedge.id).chain([loop_record.id]))
+        }))
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let low_vertex = next_id;
+    let high_vertex = next_id + 1;
+    next_id += 2;
+    solid.vertices.push(VertexRecord { id: low_vertex, point: surface.evaluate(u0, new_va).or_refuse(KernelStage::Refine, "evaluate")? });
+    solid.vertices.push(VertexRecord { id: high_vertex, point: surface.evaluate(u0, new_vb).or_refuse(KernelStage::Refine, "evaluate")? });
+    let ring_edge = |v: f64, vertex: u64, id: u64| -> Result<EdgeRecord, KernelRefusal> {
+        let curve = surface.iso_curve_v(v).or_refuse(KernelStage::Refine, "iso_curve_v")?;
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        Ok(EdgeRecord { id, curve, t0, t1, start_vertex_id: vertex, end_vertex_id: vertex, degenerate: false, name: None })
+    };
+    let (low_edge, high_edge, seam_edge) = (next_id, next_id + 1, next_id + 2);
+    next_id += 3;
+    solid.edges.push(ring_edge(new_va, low_vertex, low_edge)?);
+    solid.edges.push(ring_edge(new_vb, high_vertex, high_edge)?);
+    solid.edges.push(EdgeRecord {
+        id: seam_edge,
+        curve: surface.iso_curve_u(u0).or_refuse(KernelStage::Refine, "iso_curve_u")?,
+        t0: new_va,
+        t1: new_vb,
+        start_vertex_id: low_vertex,
+        end_vertex_id: high_vertex,
+        degenerate: false,
+        name: None,
+    });
+    let _ = next_id;
+    let flat = |u: f64, v: f64| Vec3::new(u, v, 0.0);
+    let line = |from: Vec3, to: Vec3, increasing: bool| -> Result<crate::NurbsCurve, KernelRefusal> {
+        if increasing { crate::make_line(from, to) } else { crate::make_line(to, from) }.or_refuse(KernelStage::Refine, "make_line")
+    };
+    let mut rebuilt = face.clone();
+    for (coedge, (seam, at, increasing)) in rebuilt.loops[0].coedges.iter_mut().zip(kinds) {
+        coedge.forward = increasing;
+        if seam {
+            coedge.edge_id = seam_edge;
+            coedge.pcurve = line(flat(at, new_va), flat(at, new_vb), increasing)?;
+        } else {
+            let v = if (at - va).abs() <= band_v { new_va } else { new_vb };
+            coedge.edge_id = if (at - va).abs() <= band_v { low_edge } else { high_edge };
+            coedge.pcurve = line(flat(u0, v), flat(u1, v), increasing)?;
+        }
+    }
+    for shell in &mut solid.shells {
+        for existing in &mut shell.faces {
+            if existing.id == face.id {
+                *existing = rebuilt.clone();
+            }
+        }
+    }
+    os_debug!(
+        "band-reach lane: source face {} widened to v = [{new_va:.6}, {new_vb:.6}] from [{va:.6}, {vb:.6}]",
+        face.id
+    );
+    Ok(Some(solid))
+}
+
+/// `BREP_OFFSET_CURVED_RULED_REACH` (default on; `=0` restores): [`curved_fallshort_reach`].
+pub(super) fn curved_ruled_reach_enabled() -> bool {
+    switch!("BREP_OFFSET_CURVED_RULED_REACH", true)
+}
+
+
+/// [`fallshort_opening_reach`] for a CURVED opening: how far an inward v-ruled
+/// carrier must grow along its rulings, and at which v end, until its offset
+/// image crosses the curved opening face it falls short of. `None` where the
+/// face is not v-ruled, a ruling never crosses the opening within 12 |d|, or
+/// it crosses the opening's surface outside the opening face.
+///
+/// Cause (a capsule's end shelled open at its dome, 2026-11-06): the side, a
+/// cylinder of radius 5 meeting the hemisphere TANGENTIALLY at z = 10, offsets
+/// to radius 4, whose rim image at z = 10 lies 1 inside the dome. The planar
+/// reach skips a curved opening and `curved_opening_reach_source` declines a
+/// u-closed band and any tangent junction, so the shell refused ("stops 1e0
+/// short of curved opening face"). The skin is the cylinder of radius 4 run
+/// on up to its section with the sphere, at z = 13: the same ruled extension
+/// the planar reach asks, measured against the opening's surface instead of
+/// its plane. Each station walks its ruling in steps of |d|/8 until the
+/// signed distance to the opening (outward normal at the foot) turns
+/// positive, then bisects; the worst station wins.
+pub(super) fn curved_fallshort_reach(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    source_faces: &[&FaceRecord],
+    opening_set: &HashSet<u64>,
+    distance: f64,
+) -> Result<Option<(bool, f64)>, KernelRefusal> {
+    if !curved_ruled_reach_enabled() || distance <= 0.0 || face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        return Ok(None);
+    }
+    let surface = &face.surface;
+    if surface.degree_v != 1 || surface.control_points.iter().any(|row| row.len() != 2) {
+        return Ok(None);
+    }
+    let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let edge_by_id = source.edges.iter().map(|edge| (edge.id, edge)).collect::<HashMap<_, _>>();
+    let band = 2e-3f64.max(crate::solid_scale(source) * 5e-5);
+    let offsets = face_offsets(face);
+    let mut best: Option<(bool, f64)> = None;
+    let mut ends = HashSet::default();
+    for coedge in face.loops.iter().flat_map(|record| &record.coedges) {
+        let Some(edge) = edge_by_id.get(&coedge.edge_id) else {
+            continue;
+        };
+        if edge.degenerate {
+            continue;
+        }
+        let Some((opening, _)) = junction_mate(source_faces, face, coedge.edge_id)
+            .filter(|(mate, _)| opening_set.contains(&mate.id))
+        else {
+            continue;
+        };
+        if surface_is_planar(&opening.surface, band)? {
+            continue;
+        }
+        let signed = |point: Vec3| -> Option<(f64, Vec2)> {
+            let foot = project_point_to_surface(&opening.surface, point).ok()?;
+            let outward = face_normal(opening, foot.u, foot.v).ok()?;
+            Some((point.sub(foot.point).dot(outward), Vec2 { x: foot.u, y: foot.v }))
+        };
+        let [p0, p1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        for index in 0..=8 {
+            let uv = coedge.pcurve.evaluate(p0 + (p1 - p0) * index as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate")?;
+            let at_v_max = (uv.y - v1).abs() < (uv.y - v0).abs();
+            ends.insert(at_v_max);
+            let u = uv.x.clamp(u0, u1);
+            let (near, far) = if at_v_max { (v0, v1) } else { (v1, v0) };
+            let image = |v: f64| offsets.at(u, v, -distance).map(|sample| sample.point).ok();
+            let (Some(from), Some(to)) = (image(near), image(far)) else {
+                return Ok(None);
+            };
+            let Ok(direction) = to.sub(from).normalized() else {
+                return Ok(None);
+            };
+            let Some((start, _)) = signed(to) else {
+                return Ok(None);
+            };
+            if start >= -band {
+                // This station's image already reaches the opening.
+                continue;
+            }
+            let step = distance / 8.0;
+            let mut low = 0.0;
+            let mut high = None;
+            for count in 1..=96 {
+                let t = step * count as f64;
+                let Some((side, _)) = signed(to.add(direction.scale(t))) else {
+                    return Ok(None);
+                };
+                if side > 0.0 {
+                    high = Some(t);
+                    break;
+                }
+                low = t;
+            }
+            let Some(mut high) = high else {
+                return Ok(None);
+            };
+            for _ in 0..60 {
+                let middle = 0.5 * (low + high);
+                match signed(to.add(direction.scale(middle))) {
+                    Some((side, _)) if side > 0.0 => high = middle,
+                    Some(_) => low = middle,
+                    None => return Ok(None),
+                }
+            }
+            // The crossing must lie on the opening FACE, not elsewhere on its
+            // surface.
+            let Some((_, foot)) = signed(to.add(direction.scale(high))) else {
+                return Ok(None);
+            };
+            if parameter_point_in_face(opening, foot, 1e-6).is_ok_and(|class| class == PolygonClass::Outside) {
+                return Ok(None);
+            }
+            if best.is_none_or(|(_, worst)| high > worst) {
+                best = Some((at_v_max, high));
+            }
+        }
+    }
+    // One v end only: the extension grows one side per reach.
+    if ends.len() > 1 {
+        return Ok(None);
+    }
+    Ok(best)
+}
