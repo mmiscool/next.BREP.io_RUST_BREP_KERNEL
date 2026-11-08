@@ -603,6 +603,18 @@ pub(super) fn select_fragments(
     }
     let classifier_b = SolidClassifier::new(pristine_b, tolerance).or_refuse(KernelStage::Select, "new")?;
     let classifier_a = SolidClassifier::new(pristine_a, tolerance).or_refuse(KernelStage::Select, "new")?;
+    // FEATURE SCALE B6 (`BREP_FEATURE_SCALE_SELECT`, default on, `=0` off): the
+    // coincident-On rescue's band (7e-6 on the wedge's 69-diagonal block)
+    // reaches across a sliver between almost parallel faces and rescued the
+    // wedge's top to On, so it is capped at a quarter of the sliver there.
+    let (classifier_a, classifier_b) = if crate::feature_scale::select_enabled() {
+        let caps = crate::feature_scale::FeatureScale::between(pristine_a, pristine_b, tolerance)
+            .or_refuse(KernelStage::Select, "feature_scale")?
+            .regions();
+        (classifier_a.with_coincident_caps(caps.clone()), classifier_b.with_coincident_caps(caps))
+    } else {
+        (classifier_a, classifier_b)
+    };
     let keep_a = side_keep_decisions(
         &fragments_a,
         &classifier_b,

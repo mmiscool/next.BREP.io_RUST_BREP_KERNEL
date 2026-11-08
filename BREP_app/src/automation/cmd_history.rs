@@ -122,7 +122,9 @@ pub struct Report {
     /// `featureApproximations` — a feature id → `[{code, body, measured, bar, volume_bound,
     /// edges, message, summary}]` array for every SUCCESSFUL feature that carries a measured
     /// approximation (the STEP import's `import.shell_closure`), the key absent when none
-    /// does —, `unresolved`, `displayErrors`, timings…).
+    /// does —, `featureAutoTargets` — a feature id → the solid name its boolean ran into
+    /// when it named no target and the part held exactly one solid, the key absent when
+    /// none did —, `unresolved`, `displayErrors`, timings…).
     pub report: Value,
     pub step: usize,
     pub history_len: usize,

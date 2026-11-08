@@ -24,7 +24,7 @@
 //!   ([`offline_html`]): one self-contained `.html`.
 
 use crate::edit;
-use crate::model::{Instructions, Target, ToolUse};
+use crate::model::{Instructions, Style, Target, ToolUse};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -93,6 +93,11 @@ pub struct PlayerData {
     /// motion). Absent from instructions made before motion existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion: Option<Motion>,
+    /// How the page draws the steps: the document's style. Data made before
+    /// styles existed reads as Shaded, as it was drawn; a motion study is
+    /// Shaded.
+    #[serde(default = "Style::saved_before_styles")]
+    pub style: Style,
 }
 
 /// A motion study baked for the player: every frame's poses, in the order
@@ -236,6 +241,11 @@ pub struct Camera {
 pub struct Insertion {
     pub node: usize,
     pub offset: [f64; 3],
+    /// Which of the step's arrows moves the node: the nodes of one arrow (a
+    /// part's solids, a sub-assembly's parts) share one drawn arrow. Data
+    /// made before it reads 0.
+    #[serde(default)]
+    pub arrow: usize,
 }
 
 /// A posed node of a step: its view's explode pose as a column-major 4×4.
@@ -460,6 +470,10 @@ pub struct Scene {
     pub poses: HashMap<String, Vec<Pose>>,
     /// Each step's view PMI, by step id.
     pub pmi: HashMap<String, PlayerPmi>,
+    /// The arrows a step's parts come home along when they are not the
+    /// step's own (a Line art step without arrows gets one per part from the
+    /// engine), by step id; a step not listed uses its own `arrows`.
+    pub arrows: HashMap<String, Vec<crate::model::Arrow>>,
     /// The assembly's occurrence tree ([`PlayerComponent::rows`]); each
     /// row's thumbnail is taken from `thumbnails` by its part.
     pub assembly: Vec<PlayerComponent>,
@@ -674,14 +688,16 @@ impl PlayerData {
                     occurrences.iter().enumerate().filter(|(_, o)| set.contains(o.as_str())).map(|(i, _)| i).collect()
                 };
                 let adding = index_of(&presentation.adding);
+                let arrows = scene.arrows.get(&step.id).unwrap_or(&step.arrows);
                 let insertion = adding
                     .iter()
                     .filter_map(|&node| {
                         let path = &occurrences[node];
-                        step.arrows
+                        arrows
                             .iter()
-                            .find(|a| path == &a.occurrence || (path.starts_with(&a.occurrence) && path[a.occurrence.len()..].starts_with(':')))
-                            .map(|a| Insertion { node, offset: a.start_offset() })
+                            .enumerate()
+                            .find(|(_, a)| path == &a.occurrence || (path.starts_with(&a.occurrence) && path[a.occurrence.len()..].starts_with(':')))
+                            .map(|(arrow, a)| Insertion { node, offset: a.start_offset(), arrow })
                     })
                     .collect();
                 steps.push(PlayerStep {
@@ -745,6 +761,7 @@ impl PlayerData {
             nodes: scene.nodes,
             assembly,
             motion: None,
+            style: block.template.style,
         })
     }
 
@@ -798,6 +815,7 @@ impl PlayerData {
             nodes: scene.nodes,
             assembly: Vec::new(),
             motion: Some(motion),
+            style: Style::Shaded,
         })
     }
 

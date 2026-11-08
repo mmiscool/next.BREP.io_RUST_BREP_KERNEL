@@ -1083,15 +1083,77 @@ pub(super) fn fragment_as_trim(fragment: &FaceFragmentRecord) -> FaceRecord {
 /// What the skin test measures a point against a retained face with: the
 /// MITERED distance on a planar face, and the Euclidean one where there is no
 /// analytic extension to miter along.
+///
+/// Past a TANGENT edge with another retained face there is no miter: the
+/// neighbour's offset carries the skin on from the junction, and the plane's
+/// distance there is the Euclidean one (see [`tangent_edge_euclid_on`]).
 fn skin_distance_to_trimmed_face(
     face: &FaceRecord,
     edges: &[&EdgeRecord],
     point: Vec3,
+    retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
 ) -> Result<f64, KernelRefusal> {
-    match miter_distance_to_trimmed_face(face, edges, point)? {
+    let measured = if tangent_edge_euclid_on() {
+        miter_distance_with_tangent_edges(face, edges, point, &mut |edge| {
+            edge_is_tangent_to_a_retained_face(face, edge, retained_faces)
+        })?
+    } else {
+        miter_distance_to_trimmed_face(face, edges, point)?
+    };
+    match measured {
         Some(measured) => Ok(measured),
         None => distance_to_trimmed_face(face, edges, point),
     }
+}
+
+/// `BREP_OFFSET_TANGENT_EDGE_EUCLID` (default on; `=0` restores): the skin
+/// test's mitered distance to a planar retained face reads the EUCLIDEAN
+/// distance where the foot leaves the trim across the interior of an edge the
+/// face shares TANGENTLY with another retained face.
+///
+/// Cause (user report, 2026-11-07, app 0.14.0): a Ø10 cylinder with a
+/// rectangular post through its side, the post's four junctions filleted r1.5,
+/// shelled 1 inward through the bottom. The mitered metric `max(height, past)`
+/// is the distance a SHARP join's offsets meet at; past a tangent edge the
+/// plane's offset does not continue as a miter, the fillet's offset does. Each
+/// point of the two side fillets' offsets (r2.5 arcs under the post walls)
+/// read the wall plane's height alone, 0.91–0.996 < 1, both fillets' skins were
+/// dropped as SHADOWED, and the assembly refused with twenty-odd one-use
+/// edges. Their true distance to the walls is `hypot(height, past)` ≥ 1.
+pub(super) fn tangent_edge_euclid_on() -> bool {
+    switch!("BREP_OFFSET_TANGENT_EDGE_EUCLID", true)
+}
+
+
+/// Is `edge` of `face` shared with another retained face, the two meeting
+/// TANGENTLY along it ([`super::smooth_sync::uses_are_tangent`], the smooth
+/// pairing's own test)? An edge with no retained neighbour — an opening's rim,
+/// or a trim the neighbour no longer carries — is not.
+fn edge_is_tangent_to_a_retained_face(
+    face: &FaceRecord,
+    edge: &EdgeRecord,
+    retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
+) -> Result<bool, KernelRefusal> {
+    let use_of = |owner: &FaceRecord| {
+        owner
+            .loops
+            .iter()
+            .flat_map(|loop_record| &loop_record.coedges)
+            .find(|coedge| coedge.edge_id == edge.id)
+            .cloned()
+    };
+    let Some(own_use) = use_of(face) else {
+        return Ok(false);
+    };
+    for (other, _) in retained_faces {
+        if other.id == face.id {
+            continue;
+        }
+        if let Some(other_use) = use_of(other) {
+            return super::smooth_sync::uses_are_tangent(face, &own_use, other, &other_use);
+        }
+    }
+    Ok(false)
 }
 
 /// Distance from a point to a TRIMMED face: surface projection when it lands
@@ -1122,6 +1184,20 @@ fn miter_distance_to_trimmed_face(
     face: &FaceRecord,
     edges: &[&EdgeRecord],
     point: Vec3,
+) -> Result<Option<f64>, KernelRefusal> {
+    miter_distance_with_tangent_edges(face, edges, point, &mut |_| Ok(false))
+}
+
+/// [`miter_distance_to_trimmed_face`] where `tangent` marks the edges past
+/// which the reading is Euclidean: a foot whose nearest boundary point is an
+/// INTERIOR point of such an edge reads `hypot(height, past)`. A foot nearest
+/// a vertex keeps the miter: a sharp neighbour's band turns that corner. The
+/// predicate is asked only of edges that could decide the reading.
+fn miter_distance_with_tangent_edges(
+    face: &FaceRecord,
+    edges: &[&EdgeRecord],
+    point: Vec3,
+    tangent: &mut dyn FnMut(&EdgeRecord) -> Result<bool, KernelRefusal>,
 ) -> Result<Option<f64>, KernelRefusal> {
     if !face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(None);
@@ -1159,8 +1235,9 @@ fn miter_distance_to_trimmed_face(
     if parameter_point_in_face(face, uv, 1e-9).or_refuse(KernelStage::Refine, "parameter_point_in_face")? != PolygonClass::Outside {
         return Ok(Some(height.abs()));
     }
-    let mut tangential = f64::INFINITY;
-    for edge in edges {
+    // (distance past the trim to this edge, the edge, nearest at a vertex?)
+    let mut readings: Vec<(f64, &EdgeRecord, bool)> = Vec::with_capacity(edges.len());
+    for edge in edges.iter().copied() {
         if edge.degenerate {
             continue;
         }
@@ -1171,21 +1248,45 @@ fn miter_distance_to_trimmed_face(
         // clamps it and then to [t0, t1] as below. Same reading to round-off;
         // it is only compared with the skin band.
         if segment_miter_enabled() {
-            if let Some(distance) = segment_edge_distance(&edge.curve, edge.t0, edge.t1, foot) {
-                tangential = tangential.min(distance);
+            if let Some((distance, at_vertex)) = segment_edge_distance(&edge.curve, edge.t0, edge.t1, foot) {
+                readings.push((distance, edge, at_vertex));
                 continue;
             }
         }
         // The exact projection, not a sampled one: a sampled rim overstates how
         // far a foot lies past it, and that is the whole quantity here.
         let projection = crate::project_point_to_curve(&edge.curve, foot).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
-        let parameter = projection.u.clamp(edge.t0, edge.t1);
-        tangential = tangential.min(edge.curve.evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?.sub(foot).length());
+        let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
+        let parameter = projection.u.clamp(low, high);
+        let band = 1e-9 * (high - low).abs().max(1.0);
+        let at_vertex = parameter - low <= band || high - parameter <= band;
+        let distance = edge.curve.evaluate(parameter).or_refuse(KernelStage::Refine, "evaluate")?.sub(foot).length();
+        readings.push((distance, edge, at_vertex));
     }
+    readings.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let Some(&(tangential, _, _)) = readings.first() else {
+        return Ok(None);
+    };
     if !tangential.is_finite() {
         return Ok(None);
     }
-    Ok(Some(height.abs().max(tangential)))
+    let height = height.abs();
+    // Nearest edge first: a sharp edge (or a vertex) ends the scan with the
+    // miter, which no farther edge can undercut; a tangent edge's interior
+    // reads Euclidean, and a farther edge may still read nearer.
+    let mut best = f64::INFINITY;
+    for &(past, edge, at_vertex) in &readings {
+        if height.max(past) >= best {
+            break;
+        }
+        if !at_vertex && tangent(edge)? {
+            best = best.min(height.hypot(past));
+        } else {
+            best = best.min(height.max(past));
+            break;
+        }
+    }
+    Ok(Some(best))
 }
 
 /// How far `point` sits from its OWN retained face in the MITERED metric, less
@@ -1193,7 +1294,7 @@ fn miter_distance_to_trimmed_face(
 /// the miter extension band past its own rim. A trace quantity.
 /// Distance from `point` to the window `[t0, t1]` of a straight edge curve
 /// (row 13): `None` for any other curve.
-fn segment_edge_distance(curve: &NurbsCurve, t0: f64, t1: f64, point: Vec3) -> Option<f64> {
+fn segment_edge_distance(curve: &NurbsCurve, t0: f64, t1: f64, point: Vec3) -> Option<(f64, bool)> {
     if curve.degree != 1 || curve.control_points.len() != 2 || curve.knots.len() != 4 {
         return None;
     }
@@ -1209,9 +1310,12 @@ fn segment_edge_distance(curve: &NurbsCurve, t0: f64, t1: f64, point: Vec3) -> O
         return None;
     }
     let along = (point.sub(start).dot(direction) / length_squared).clamp(0.0, 1.0);
-    let parameter = (k0 + (k1 - k0) * along).clamp(t0.min(t1), t0.max(t1));
+    let (low, high) = (t0.min(t1), t0.max(t1));
+    let parameter = (k0 + (k1 - k0) * along).clamp(low, high);
+    let band = 1e-9 * (high - low).abs().max(1.0);
+    let at_vertex = parameter - low <= band || high - parameter <= band;
     let nearest = start.add(direction.scale((parameter - k0) / (k1 - k0)));
-    Some(nearest.sub(point).length())
+    Some((nearest.sub(point).length(), at_vertex))
 }
 
 fn segment_miter_enabled() -> bool {
@@ -1801,7 +1905,7 @@ pub(super) fn offset_skin_reading(
     let target = distance.abs();
     let mut unmeasured = None;
     for (face, edges) in retained_faces {
-        match skin_distance_to_trimmed_face(face, edges, point) {
+        match skin_distance_to_trimmed_face(face, edges, point, retained_faces) {
             Ok(separation) if separation.is_finite() => {
                 if separation < target - tolerance {
                     return SkinReading::Shadowed {

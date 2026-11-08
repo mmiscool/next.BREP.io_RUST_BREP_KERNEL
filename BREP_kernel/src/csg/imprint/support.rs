@@ -1558,6 +1558,34 @@ fn planar_linear_iso_direction_section(
     planar_linear_iso_direction_section_with(plane, ruled, tolerance, linear_v, gate, false)
 }
 
+/// `BREP_FEATURE_SCALE_PLANAR_ISO` (default on, `=0` off): see UNBOUNDED PLANE in
+/// [`planar_linear_iso_direction_section_with`].
+fn feature_scale_planar_iso_enabled() -> bool {
+    crate::switch!("BREP_FEATURE_SCALE_PLANAR_ISO", true)
+}
+
+/// Whether `curve` meets the BOUNDED patch of `plane` over a span: at least
+/// two of 33 even samples lie within the band of it. A curve that only
+/// touches the patch at a point (a corner, an edge it crosses) has at most
+/// one such sample at this spacing, unless the touch is a 32nd of its length.
+fn runs_through_patch(curve: &NurbsCurve, plane: &NurbsSurface, tolerance: f64) -> Result<bool, KernelRefusal> {
+    const SAMPLES: usize = 32;
+    let band = tolerance.max(1e-7);
+    let [a, b] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let mut inside = 0usize;
+    for i in 0..=SAMPLES {
+        let point = curve.evaluate(a + (b - a) * i as f64 / SAMPLES as f64).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let projection = project_point_to_surface(plane, point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
+        if projection.distance <= band {
+            inside += 1;
+            if inside >= 2 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn planar_linear_iso_direction_section_with(
     plane: &NurbsSurface, ruled: &NurbsSurface, tolerance: f64,
     linear_v: bool, gate: IsoGate, projected: bool,
@@ -1680,7 +1708,28 @@ fn planar_linear_iso_direction_section_with(
             return Ok(IsoAnswer::Declined(IsoOutcome::Pole));
         }
     }
-    if !curve_lies_on_surface(&curve, plane, tolerance)? {
+    // UNBOUNDED PLANE (`BREP_FEATURE_SCALE_PLANAR_ISO`, default on, `=0` off): the
+    // patch reading projects onto the plane's BOUNDED carrier, so an iso line
+    // longer than that patch reads off it at its ends however exactly it lies
+    // in the plane (brep-bench tangent/wedge-a-millionth-steep: the half-space
+    // block's 40-wide face crosses the cube's 10-wide top along the x axis at
+    // a slope of 1e-6; the reverse order's ±5e-6 lean is inside the root band,
+    // and the march's seeds on the top's edges graze, so the pair had no
+    // section). The plane is affine, so its unbounded plane is exact, and a
+    // curve whose whole control hull lies within the band of it lies on it.
+    // The bounded reading also kept out a line that only touches the patch:
+    // two boxes meeting along an edge cross one's bottom with the other's
+    // side along a line that meets that side at its corner alone, which is a
+    // point contact, not a section. So the unbounded reading also asks the
+    // line to run through the bounded patch over a span (see
+    // `runs_through_patch`).
+    let on_plane = curve_lies_on_surface(&curve, plane, tolerance)?
+        || (feature_scale_planar_iso_enabled()
+            && curve.control_points.iter().all(|control| {
+                control.point().is_ok_and(|point| signed_distance(point).abs() <= tolerance.max(1e-7))
+            })
+            && runs_through_patch(&curve, plane, tolerance)?);
+    if !on_plane {
         return Ok(IsoAnswer::Declined(IsoOutcome::OffPlane));
     }
     // An iso-curve in `u` (`iso_curve_v`, `v` fixed) runs along the ruled
@@ -2084,6 +2133,7 @@ pub(super) fn cosurface_pair(
     }
     Ok(true)
 }
+
 
 
 

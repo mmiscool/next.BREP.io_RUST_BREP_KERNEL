@@ -109,9 +109,13 @@ pub(super) fn push_edge_split(
     edge: &EdgeRecord,
     parameter: f64,
     model_tolerance: f64,
+    weld_cap: f64,
 ) -> Result<(), KernelRefusal> {
     let span = edge.t1 - edge.t0;
-    let weld_distance = assembler_weld(model_tolerance);
+    // `weld_cap` (B1″ of the feature-scale design; infinite unless
+    // `BREP_FEATURE_SCALE_IMPRINT`) keeps a split a sliver's width from the
+    // edge's end apart from that end.
+    let weld_distance = assembler_weld(model_tolerance).min(weld_cap);
     let tolerance = (KNOT_IDENTITY_TOL * span).max(parameter_tolerance(
         &edge.curve,
         parameter,
@@ -163,6 +167,9 @@ pub(super) struct ImprintBuilder<'a> {
     /// `BREP_EXACT_TANGENT_TOUCH`, its tangential hits on an edge it touches in
     /// passing are junctions, not grazes. See TANGENT TOUCH in `process_curve`.
     pub(super) exact_section: bool,
+    /// The operands' local feature sizes (`BREP_FEATURE_SCALE_IMPRINT`; empty
+    /// without it): see `crate::feature_scale`.
+    pub(super) feature_scale: crate::feature_scale::FeatureScale,
     /// `(piece id, face)` of every pcurve the Hermite lane EMITTED rather
     /// than fitted: the junction passes move its ends instead of re-marching
     /// it, and the coincident merge re-keys it to the keeper.
@@ -281,8 +288,19 @@ impl<'a> ImprintBuilder<'a> {
 
     fn vertex_apart_from(&mut self, point: Vec3, merge_radius: f64, apart_from: Option<u64>) -> (u64, Vec3) {
         let base = self.tolerance * 10.0 * merge_scale(self.scale);
+        // FEATURE SCALE B1 (`BREP_FEATURE_SCALE_IMPRINT`, default on, `=0` off): the
+        // registry's bands (1.8e-5 base, 2e-5 fuzzy radii on a 10 mm part)
+        // reach past a feature far thinner than the part: the hairline saw's
+        // two walls 1e-6 apart minted one vertex per corner. Beside such a
+        // feature every band is capped at a quarter of it.
+        let cap = if self.feature_scale.is_empty() {
+            f64::INFINITY
+        } else {
+            self.feature_scale.cap(point, base.max(merge_radius))
+        };
+        let (base, merge_radius) = (base.min(cap), merge_radius.min(cap));
         for vertex in &self.vertices {
-            let existing_radius = self.vertex_radii.get(&vertex.id).copied().unwrap_or(0.0);
+            let existing_radius = self.vertex_radii.get(&vertex.id).copied().unwrap_or(0.0).min(cap);
             let distance = vertex.point.sub(point).length();
             if apart_from == Some(vertex.id) && distance > base.max(merge_radius) {
                 continue;
@@ -327,11 +345,23 @@ impl<'a> ImprintBuilder<'a> {
         parameter: f64,
     ) -> Result<(), KernelRefusal> {
         let tolerance = self.tolerance;
+        // FEATURE SCALE B1″ (`BREP_FEATURE_SCALE_IMPRINT`, default on, `=0` off): the
+        // endpoint guard reaches the assembler weld (1e-5) from the edge's
+        // ends; beside a sliver that is wider than the sliver itself (the
+        // wedge's corner edges split 5e-6 below the cube's top), so it is
+        // capped at the sliver's scale there.
+        let weld_cap = if self.feature_scale.is_empty() {
+            f64::INFINITY
+        } else {
+            let point = edge.curve.evaluate(parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+            self.feature_scale.cap(point, assembler_weld(tolerance))
+        };
         push_edge_split(
             self.edge_splits.entry((operand, edge.id)).or_default(),
             edge,
             parameter,
             tolerance,
+            weld_cap,
         )
     }
 
@@ -945,7 +975,50 @@ impl<'a> ImprintBuilder<'a> {
                                 }).unwrap_or(false)
                             })
                         };
-                    if hit.tangential && refine && !ends_on && !exact_touch {
+                    // GRAZING CROSSING (`BREP_FEATURE_SCALE_GRAZING_CROSSING`,
+                    // default on, `=0` off): "tangential" is decided by angle,
+                    // but a section can cross an edge at an angle far below that
+                    // and still leave the face there. brep-bench
+                    // tangent/wedge-a-millionth-steep: the half-space's face
+                    // crosses the cube's x = ±5 sides along z = 1e-6·y, which
+                    // passes through the top edges at (±5, 0, 0); skipping that
+                    // hit left the side section one 10-long piece, half of it
+                    // above the top, and the piece read "invalid-boundary". A
+                    // graze stays on one side of the edge; a crossing changes
+                    // side. So a tangential interior hit on the edge to round-off
+                    // is kept when the section's offsets from the edge 1e-3 of
+                    // the domain either side point to opposite sides, each above
+                    // round-off, however small. Straight section, straight edge
+                    // only: two lines meet at one point and change side there
+                    // exactly, while a curved section can change side of an edge
+                    // it is tangent to through its curvature (a G1 elbow over its
+                    // arm grew a face and an edge under this rule).
+                    let straight = |nurbs: &NurbsCurve| nurbs.degree == 1 && nurbs.control_points.len() == 2;
+                    let grazing_crossing = hit.tangential
+                        && interior
+                        && !exact_touch
+                        && grazing_crossing_enabled()
+                        && straight(&curve)
+                        && straight(&edge.curve)
+                        && edge.curve.evaluate(edge_parameter).ok().is_some_and(|on_edge| {
+                            on_edge.sub(junction_point).length() <= 1e-9 * (1.0 + junction_point.length())
+                        })
+                        && {
+                            let step = 1e-3 * (end - start);
+                            let round_off = 1e-12 * (1.0 + junction_point.length());
+                            let offset = |beside: f64| -> Option<Vec3> {
+                                let point = curve.evaluate(beside.clamp(start, end)).ok()?;
+                                let foot = project_point_to_curve(&edge.curve, point).ok()?;
+                                let on_edge = edge.curve.evaluate(foot.u).ok()?;
+                                let offset = point.sub(on_edge);
+                                (offset.length() > round_off).then_some(offset)
+                            };
+                            match (offset(curve_parameter - step), offset(curve_parameter + step)) {
+                                (Some(before), Some(after)) => before.dot(after) < 0.0,
+                                _ => false,
+                            }
+                        };
+                    if hit.tangential && refine && !ends_on && !exact_touch && !grazing_crossing {
                         continue;
                     }
                     if let Some(junction) = fuzzy_junction {
@@ -1737,6 +1810,13 @@ impl<'a> ImprintBuilder<'a> {
     }
 }
 
+
+/// `BREP_FEATURE_SCALE_GRAZING_CROSSING` (default on, `=0` off): a tangential hit
+/// that crosses to the other side of the edge is a junction, however small
+/// the angle. See GRAZING CROSSING in [`ImprintBuilder::process_curve`].
+fn grazing_crossing_enabled() -> bool {
+    crate::switch!("BREP_FEATURE_SCALE_GRAZING_CROSSING", true)
+}
 
 /// `BREP_EXACT_TANGENT_TOUCH` (default on; `=0` restores skipping every
 /// tangential hit): see TANGENT TOUCH in [`ImprintBuilder::process_curve`].

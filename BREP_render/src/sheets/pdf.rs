@@ -317,14 +317,66 @@ fn frame_marks(frame: &FrameDrawing, h: f64, out: &mut String) {
     }
 }
 
+/// A Line art picture ([`super::project::LineArtLayer`]): the ground, the
+/// fills, the lines in the tiers' inks, the outlines and the arrows; black
+/// stroke and fill, butt caps and mitre joins again after it.
+fn line_art_marks(view: &ViewDrawing, layer: &super::project::LineArtLayer, h: f64, out: &mut String) {
+    use super::project::LineArtLayer as L;
+    let rgb = |c: [f64; 3]| format!("{:.3} {:.3} {:.3}", c[0], c[1], c[2]);
+    let [x0, y0, x1, y1] = layer.ground;
+    let (gx, gy) = point([x0, y1], h);
+    out.push_str(&format!("{} rg\n{gx:.3} {gy:.3} {:.3} {:.3} re f\n", rgb(L::GROUND), (x1 - x0) * PT_PER_MM, (y1 - y0) * PT_PER_MM));
+    out.push_str(&format!("{:.4} w 1 j\n", L::SEAM_MM * PT_PER_MM));
+    let mut tier = None;
+    for (triangle, adding) in &layer.fills {
+        if tier != Some(*adding) {
+            let c = rgb(if *adding { L::ADDING_FILL } else { L::PLACED_FILL });
+            out.push_str(&format!("{c} rg {c} RG\n"));
+            tier = Some(*adding);
+        }
+        for (index, p) in triangle.iter().enumerate() {
+            let (x, y) = point(*p, h);
+            out.push_str(&format!("{x:.3} {y:.3} {}\n", if index == 0 { "m" } else { "l" }));
+        }
+        out.push_str("h B\n");
+    }
+    let strokes = |runs: &mut dyn Iterator<Item = &Vec<[f64; 2]>>, color: [f64; 3], width: f64, out: &mut String| {
+        let mut runs = runs.peekable();
+        if runs.peek().is_none() {
+            return;
+        }
+        out.push_str(&format!("{} RG {:.4} w 1 J\n", rgb(color), width * PT_PER_MM));
+        for run in runs {
+            out.push_str(&path(run, h));
+        }
+    };
+    strokes(&mut view.edges.iter(), L::PLACED_EDGE, L::PLACED_EDGE_MM, out);
+    strokes(&mut layer.outlines.iter().filter(|(_, a)| !a).map(|(r, _)| r), L::PLACED_OUTLINE, L::PLACED_OUTLINE_MM, out);
+    strokes(&mut view.highlighted.iter(), L::INK, L::ADDING_EDGE_MM, out);
+    strokes(&mut layer.outlines.iter().filter(|(_, a)| *a).map(|(r, _)| r), L::INK, L::ADDING_OUTLINE_MM, out);
+    out.push_str(&format!("0 0 0 rg 0 0 0 RG {:.4} w 0 J\n", L::ARROW_SHAFT_MM * PT_PER_MM));
+    for (tail, tip) in &layer.arrows {
+        let Some((base, head)) = L::head(*tail, *tip) else { continue };
+        out.push_str(&path(&[*tail, base], h));
+        for (index, p) in head.iter().enumerate() {
+            let (x, y) = point(*p, h);
+            out.push_str(&format!("{x:.3} {y:.3} {}\n", if index == 0 { "m" } else { "l" }));
+        }
+        out.push_str("h f\n");
+    }
+    out.push_str("0 0 0 rg 0 0 0 RG 0 J 0 j\n");
+}
+
 fn view_marks(view: &ViewDrawing, h: f64, out: &mut String) {
-    if !view.edges.is_empty() {
+    if let Some(layer) = &view.line_art {
+        line_art_marks(view, layer, h, out);
+    } else if !view.edges.is_empty() {
         out.push_str(&format!("{:.4} w\n", EDGE_WIDTH * PT_PER_MM));
         for run in &view.edges {
             out.push_str(&path(run, h));
         }
     }
-    if !view.highlighted.is_empty() {
+    if !view.highlighted.is_empty() && view.line_art.is_none() {
         // The highlight stroke, then back to black for everything after it.
         let [r, g, b] = HIGHLIGHT_RGB;
         out.push_str(&format!("{r:.4} {g:.4} {b:.4} RG\n{:.4} w\n", EDGE_WIDTH * HIGHLIGHT_WIDTH_FACTOR * PT_PER_MM));

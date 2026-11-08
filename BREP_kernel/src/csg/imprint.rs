@@ -288,6 +288,18 @@ fn default_maximum_fit_points() -> usize {
 /// angular tolerance and for the near-tangency test that picks the march step.
 const PAIR_ANGULAR_TOLERANCE: f64 = 1e-4;
 
+/// Whether the imprint reads `first` and `second` as ONE surface (the
+/// sampled pair classification's `Cosurface`, or `cosurface_pair`) and
+/// exchanges boundary curves across them instead of intersecting them. The
+/// feature-scale measure (`crate::feature_scale`) records no sliver between
+/// such a pair: the revolve pole fixtures' side planes and their copies stand
+/// 3.8e-6 apart over the region and follow the coincident-face rule.
+pub(crate) fn reads_as_one_surface(first: &NurbsSurface, second: &NurbsSurface, tolerance: f64) -> Result<bool, String> {
+    let relation = crate::classify_surface_pair(first, second, tolerance, PAIR_ANGULAR_TOLERANCE)?.relation;
+    Ok(relation == SurfacePairRelation::Cosurface
+        || support::cosurface_pair(first, second, tolerance).map_err(|refusal| refusal.message)?)
+}
+
 /// Fraction of the part extent used as the FLOOR of the near-tangency march
 /// step when the two carriers actually touch (`minimum_separation == 0`), so
 /// the reachable curve length is a fixed fraction of the model rather than an

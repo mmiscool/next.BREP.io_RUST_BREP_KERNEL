@@ -209,6 +209,25 @@ fn feature_approximations(report: &serde_json::Value, id: &str) -> Vec<(String, 
         .unwrap_or_default()
 }
 
+/// What the boolean target field of feature `id` shows beside its label when
+/// the feature's boolean named no target: `Auto: <solid>` when the kernel used
+/// the part's only solid (`featureAutoTargets[id]`), or `pick a target: N solids`
+/// when the part holds several and nothing was guessed (the `boolean`
+/// `nothing_selected` rejection in `featureFulfilment[id]`). `None` otherwise.
+fn boolean_target_hint(report: &serde_json::Value, id: &str) -> Option<String> {
+    if let Some(name) = report.get("featureAutoTargets").and_then(|m| m.get(id)).and_then(Value::as_str) {
+        return Some(format!("Auto: {name}"));
+    }
+    let rejected = report.get("featureFulfilment")?.get(id)?.get("rejected")?.as_array()?;
+    rejected
+        .iter()
+        .any(|entry| {
+            entry.get("name").and_then(Value::as_str) == Some("boolean")
+                && entry.get("kind").and_then(Value::as_str) == Some("nothing_selected")
+        })
+        .then(|| "pick the target: the part holds several solids".to_string())
+}
+
 fn feature_note_message(report: &serde_json::Value, id: &str) -> Option<String> {
     let prefix = format!("{id}: ");
     let notes: Vec<String> = report
@@ -444,7 +463,15 @@ impl HistoryPanel {
         // with. The id and name identify the form; the tree row behind it shows
         // the icon.
         let title = format!("{id}  {}", crate::plugins::feature_label(state, &ty));
-        let fields = state.feature_form_fields(&ty);
+        let mut fields = state.feature_form_fields(&ty);
+        // A boolean with an operation and no picked target: the label of its
+        // standard target field says what the kernel did — `Auto: <solid>` when
+        // the part's only solid was used, or that the user must pick one.
+        if let Some(hint) = boolean_target_hint(report, id) {
+            for field in fields.iter_mut().filter(|f| f.path == ["boolean", "targets"]) {
+                field.label = format!("{}  ({hint})", field.label);
+            }
+        }
         let mut params: Value =
             serde_json::from_str(&state.feature_params_json(index)).unwrap_or(Value::Null);
         // The schema-driven field-visibility hook: which params this feature's

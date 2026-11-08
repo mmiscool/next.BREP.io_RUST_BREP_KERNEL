@@ -552,6 +552,8 @@ pub use imprint::{
     build_imprints, EdgeSplitRecord, FaceImprints, FaceKey, FacePcurve, ImprintOptions,
     ImprintPieceRecord, ImprintResultRecord, ImprintVertex, TangentSectionRecord,
 };
+#[path = "csg/feature_scale.rs"]
+mod feature_scale;
 #[path = "csg/edge_split.rs"]
 mod edge_split;
 pub use edge_split::{apply_edge_splits, apply_edge_splits_with_map};

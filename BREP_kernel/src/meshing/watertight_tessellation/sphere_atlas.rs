@@ -60,6 +60,20 @@ const CONSTRAINT_CLEARANCE: f64 = 0.35;
 /// a chart the trim left coarse.
 const MAX_REFINE_PASSES: usize = 3;
 
+/// Refinement passes inside a small material cap ([`small_material_cap`]) whose
+/// trim lies within one chart grid step of its axis, while
+/// [`SMALL_CAP_REFINE_POINTS`] holds: the chart grid stops at 96 divisions a
+/// quarter turn, so such a cap has no interior grid point and three passes leave
+/// its triangles far over the chord (brep-bench
+/// tangent/thin-lens: each cap 0.0045 across on a ball of radius 5 meshed 1.6 %
+/// under the lens's volume at every chord from 1e-9 to 1e-11). A wider cap has
+/// grid points of its own, and more passes there only split slivers at its cusps
+/// (midsphere-common's corner patches: vertices closer than a float apart).
+const SMALL_CAP_REFINE_PASSES: usize = 24;
+
+/// The interior points a chart may gain from refinement inside a small cap.
+const SMALL_CAP_REFINE_POINTS: usize = 200_000;
+
 /// A vertex of the atlas mesh, addressed by a GLOBAL index so that a point on a
 /// cube edge or corner is one vertex, not one per chart.
 struct AtlasVertices {
@@ -420,7 +434,16 @@ fn small_cap_enabled() -> bool {
     crate::switch!("BREP_SPHERE_ATLAS_SMALL_CAP", true)
 }
 
-/// The cap (unit axis, cosine of its half-angle) that holds all of this face's
+/// `BREP_SPHERE_ATLAS_SMALL_CAP_REFINE` (default on, `=0` restores three passes):
+/// inside a small material cap narrower than a grid step, refinement runs [`SMALL_CAP_REFINE_PASSES`] passes
+/// (or until no triangle is over the chord, or [`SMALL_CAP_REFINE_POINTS`] would be
+/// passed) instead of [`MAX_REFINE_PASSES`].
+fn small_cap_refine_enabled() -> bool {
+    crate::switch!("BREP_SPHERE_ATLAS_SMALL_CAP_REFINE", true)
+}
+
+/// The cap (unit axis, cosine of its half-angle, and when its trim lies within one grid
+/// step of the axis the cosine of 1.25 times the trim's reach) that holds all of this face's
 /// material, when the trim is small: every boundary point lies within 60 degrees of
 /// the axis (the mean of their directions) and the antipode of the axis is not
 /// material. Outside a cap smaller than a hemisphere the sphere is one connected
@@ -438,7 +461,7 @@ fn small_material_cap(
     boundary: &[(Vec3, Vec3)],
     region: &SphericalRegion,
     chord_tolerance: f64,
-) -> Option<(Vec3, f64)> {
+) -> Option<(Vec3, f64, Option<f64>)> {
     if boundary.is_empty() || region.is_whole_sphere() {
         return None;
     }
@@ -463,8 +486,9 @@ fn small_material_cap(
     }
     let step = std::f64::consts::FRAC_PI_2
         / crate::sphere_chart::chart_grid_divisions(atlas.radius, chord_tolerance) as f64;
-    let angle = (lowest.clamp(-1.0, 1.0).acos() + 2.0 * step).min(std::f64::consts::FRAC_PI_2);
-    Some((axis, angle.cos()))
+    let reach = lowest.clamp(-1.0, 1.0).acos();
+    let angle = (reach + 2.0 * step).min(std::f64::consts::FRAC_PI_2);
+    Some((axis, angle.cos(), (reach < step).then(|| (1.25 * reach).cos())))
 }
 
 fn ordered(a: usize, b: usize) -> (usize, usize) {
@@ -578,7 +602,7 @@ fn mesh_chart(
     chains: &[ChartChain],
     vertices: &mut AtlasVertices,
     chord_tolerance: f64,
-    material_cap: Option<(Vec3, f64)>,
+    material_cap: Option<(Vec3, f64, Option<f64>)>,
 ) -> Result<Option<Vec<[usize; 3]>>, String> {
     use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
     let refuse = |why: &str, points: &[([f64; 2], usize)], ring: usize| -> Option<Vec<[usize; 3]>> {
@@ -731,7 +755,13 @@ fn mesh_chart(
     // Refine until the chord sag of every triangle is under tolerance, or the
     // pass budget runs out.  Only interior points are ever added, so no boundary
     // and no constraint is touched.
-    for _ in 0..MAX_REFINE_PASSES {
+    // a cap narrower than a grid step refines only within 1.25 times its trim's reach:
+    // the trim's constrained loop encloses its triangles, which no point outside it moves
+    let narrow = material_cap.and_then(|(_, _, tight)| tight).filter(|_| small_cap_refine_enabled());
+    let narrow_cap = narrow.is_some();
+    let passes = if narrow_cap { SMALL_CAP_REFINE_PASSES } else { MAX_REFINE_PASSES };
+    let mut refined = 0usize;
+    for _ in 0..passes {
         let mut additions: Vec<[f64; 2]> = Vec::new();
         for face in triangulation.inner_faces() {
             let slots = face.vertices().map(|vertex| vertex.data().authored);
@@ -744,7 +774,8 @@ fn mesh_chart(
             if triangle_sag(atlas, corners) <= chord_tolerance {
                 continue;
             }
-            if let Some((axis, cosine)) = material_cap {
+            if let Some((axis, cosine, _)) = material_cap {
+                let cosine = narrow.unwrap_or(cosine);
                 let direction = corners[0]
                     .add(corners[1])
                     .add(corners[2])
@@ -765,9 +796,10 @@ fn mesh_chart(
             }
             additions.push(centre);
         }
-        if additions.is_empty() {
+        if additions.is_empty() || (narrow_cap && refined + additions.len() > SMALL_CAP_REFINE_POINTS) {
             break;
         }
+        refined += additions.len();
         for uv in additions {
             insert_free_point(&mut triangulation, atlas, chart, uv, &mut points, vertices)?;
         }

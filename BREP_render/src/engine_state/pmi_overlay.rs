@@ -17,6 +17,13 @@ pub(crate) const TEXT_PX_AT_12PT: f64 = 11.0;
 /// PMI line / arrow colour (amber, distinct from the dimension gizmo's rods
 /// and the constraint status colours).
 const PMI_RGB: [f32; 3] = [0.98, 0.78, 0.22];
+/// An exploded view's trace arrows and the instructions' insertion arrows:
+/// black on a light ground, near-white on the dark viewport.
+const EXPLODE_ARROW_RGB: [f32; 3] = [0.0, 0.0, 0.0];
+const EXPLODE_ARROW_ON_DARK_RGB: [f32; 3] = [0.92, 0.94, 0.96];
+/// Their filled head's length on screen, px (the reference frames' ~20 px;
+/// its width is 0.7 of it).
+const INSERTION_HEAD_PX: f64 = 20.0;
 /// An error annotation's chip colour.
 const ERROR_RGB: [f32; 3] = [0.97, 0.32, 0.29];
 /// A disabled annotation's chip colour.
@@ -110,6 +117,7 @@ impl EngineState {
         let mut tris: Vec<f32> = Vec::new();
         let mut tri_colors: Vec<f32> = Vec::new();
         let mut explode_step = 0;
+        let mut arrows: Vec<([f64; 3], [f64; 3])> = Vec::new();
         // Part-way through playback, a balloon rides its moving target.
         let playback = self.explode_playback_poses();
         for row in &view.annotations {
@@ -129,25 +137,78 @@ impl EngineState {
                 plane: row.plane,
                 ..style
             };
+            // An explode trace is an insertion arrow (`arrows` below), drawn
+            // from the parts where they stand to their seat.
+            if let brep_kernel::PmiGeometry::Explode { solids, translate, trace, .. } = &geometry {
+                if *trace {
+                    let mut now = crate::camera::Aabb::empty();
+                    for solid in self.scene.solids() {
+                        if solids.iter().any(|s| solid.name == *s || solid.name.strip_prefix(s.as_str()).is_some_and(|rest| rest.starts_with(':'))) {
+                            now.union(&solid.bbox);
+                        }
+                    }
+                    if !now.is_empty() {
+                        let home = crate::camera::Aabb {
+                            min: std::array::from_fn(|k| now.min[k] - translate[k]),
+                            max: std::array::from_fn(|k| now.max[k] - translate[k]),
+                        };
+                        arrows.extend(self.outline_arrow(&home, *translate));
+                    }
+                }
+                continue;
+            }
             let drawn = pmi_present(&geometry, label, &row.text, &row_style);
+            let rgb = PMI_RGB;
             for polyline in &drawn.polylines {
                 for pair in polyline.windows(2) {
                     for point in pair {
                         lines.extend(point.iter().map(|c| *c as f32));
-                        line_colors.extend_from_slice(&PMI_RGB);
+                        line_colors.extend_from_slice(&rgb);
                     }
                 }
             }
             for arrow in &drawn.arrows {
                 for point in arrow {
                     tris.extend(point.iter().map(|c| *c as f32));
-                    tri_colors.extend_from_slice(&PMI_RGB);
+                    tri_colors.extend_from_slice(&rgb);
                 }
                 // Both windings, so the arrowhead reads from either side.
                 for point in [arrow[0], arrow[2], arrow[1]] {
                     tris.extend(point.iter().map(|c| *c as f32));
-                    tri_colors.extend_from_slice(&PMI_RGB);
+                    tri_colors.extend_from_slice(&rgb);
                 }
+            }
+        }
+        // The exploded view's traces and the instructions player's insertion
+        // arrows: a thin solid line from each moving part to its seat and a
+        // filled head there (owner 2026-11-07), in ink that reads on the
+        // ground: black on a light one (a Line art step's), near-white on
+        // the dark viewport.
+        arrows.extend(self.instructions_insertion_arrows());
+        let ground = if self.scene.line_art.is_some() { crate::thumbnail::line_art::BACKGROUND } else { self.settings.background };
+        let light = 0.2126 * ground[0] + 0.7152 * ground[1] + 0.0722 * ground[2] > 0.5;
+        let ink = if light { EXPLODE_ARROW_RGB } else { EXPLODE_ARROW_ON_DARK_RGB };
+        for (tail, tip) in arrows {
+            let d = [tip[0] - tail[0], tip[1] - tail[1], tip[2] - tail[2]];
+            let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            if !(length > 1e-9) {
+                continue;
+            }
+            let d = d.map(|v| v / length);
+            let head = (INSERTION_HEAD_PX * wpp).min(length * 0.6);
+            let w = crate::geometry3d::cross3(view_dir, d);
+            let wl = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+            let w = if wl > 1e-9 { w.map(|v| v / wl) } else { up };
+            let base: [f64; 3] = std::array::from_fn(|k| tip[k] - d[k] * head);
+            for point in [tail, base] {
+                lines.extend(point.iter().map(|c| *c as f32));
+                line_colors.extend_from_slice(&ink);
+            }
+            let half = head * 0.35;
+            let corners = [tip, std::array::from_fn(|k| base[k] + w[k] * half), std::array::from_fn(|k| base[k] - w[k] * half)];
+            for point in [corners[0], corners[1], corners[2], corners[0], corners[2], corners[1]] {
+                tris.extend(point.iter().map(|c| *c as f32));
+                tri_colors.extend_from_slice(&ink);
             }
         }
         let group = if lines.is_empty() && tris.is_empty() {

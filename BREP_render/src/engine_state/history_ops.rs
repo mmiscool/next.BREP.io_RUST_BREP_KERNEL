@@ -15,7 +15,7 @@ impl EngineState {
             .map_err(|error| format!("history request parse: {error}"))?;
         let report = self.run_plugin_scene(&request)?;
         self.dirty = true;
-        Ok(with_approximations(
+        Ok(with_auto_targets(with_approximations(
             with_refusals(
                 serde_json::json!({
                     "featureErrors": report.feature_errors,
@@ -27,7 +27,7 @@ impl EngineState {
                 &report,
             ),
             &report,
-        )
+        ), &report)
         .to_string())
     }
 
@@ -706,7 +706,7 @@ impl EngineState {
             .iter()
             .map(|(id, names)| (id.clone(), serde_json::json!(names)))
             .collect();
-        let report_json = with_approximations(
+        let report_json = with_auto_targets(with_approximations(
             with_refusals(
                 serde_json::json!({
                     "featureErrors": report.feature_errors,
@@ -720,7 +720,7 @@ impl EngineState {
                 &report,
             ),
             &report,
-        )
+        ), &report)
         .to_string();
         self.release_unresolved_sketch_links(&report.unresolved);
         self.finish_apply(report_json);
@@ -1683,6 +1683,29 @@ fn with_approximations(
         .collect();
     if let serde_json::Value::Object(object) = &mut value {
         object.insert("featureApproximations".into(), serde_json::Value::Object(approximations));
+    }
+    value
+}
+
+/// The run report's `featureAutoTargets` object, added only when a feature's
+/// boolean named no target and ran into the part's ONLY solid: feature id → that
+/// solid's name. Absent otherwise, so a report with no implicit target is
+/// byte-for-byte what it was before this key existed (the `featureRefusals`
+/// contract). The feature panel labels the boolean's target field with it.
+fn with_auto_targets(
+    mut value: serde_json::Value,
+    report: &crate::pipeline::SceneBuildReport,
+) -> serde_json::Value {
+    if report.feature_auto_targets.is_empty() {
+        return value;
+    }
+    let targets: serde_json::Map<String, serde_json::Value> = report
+        .feature_auto_targets
+        .iter()
+        .map(|(id, name)| (id.clone(), serde_json::Value::String(name.clone())))
+        .collect();
+    if let serde_json::Value::Object(object) = &mut value {
+        object.insert("featureAutoTargets".into(), serde_json::Value::Object(targets));
     }
     value
 }

@@ -366,6 +366,12 @@ fn outside_reject_box(point: Vec2, reject: &[f64; 5]) -> bool {
     point.x < reject[0] - reach || point.y < reject[1] - reach || point.x > reject[2] + reach || point.y > reject[3] + reach
 }
 
+/// `BREP_ARRANGE_DIGON_ORDER` (default on; `=0` restores insertion order for
+/// equal angles): see DIGON ORDER in [`arrange_segments`].
+fn digon_order_enabled() -> bool {
+    switch!("BREP_ARRANGE_DIGON_ORDER", true)
+}
+
 fn hole_box_reject_enabled() -> bool {
     switch!("BREP_ARRANGE_HOLE_BOX", true)
 }
@@ -798,9 +804,33 @@ fn arrange_segments_impl(
             (head.y - tail.y).atan2(head.x - tail.x)
         })
         .collect();
+    // DIGON ORDER: two pieces joining the SAME two nodes (a cut lying along a
+    // trim edge for its last stretch, merged onto the edge's nodes) leave
+    // the same angle at both ends, and a sort by angle alone keeps them in
+    // insertion order at BOTH nodes, which no planar embedding has: the walk
+    // then crosses between the two sides of the pair and stitches the region
+    // beside it into the outer cycle, so the region is lost (an offset
+    // fillet's skin vanished at a miter corner, 2026-11-07). Equal
+    // angles are ordered by piece index, reversed at the higher node, so the
+    // pair bounds an empty digon and both neighbours close.
+    let digon_order = digon_order_enabled();
     for node in &mut nodes {
-        node.outgoing
-            .sort_by(|a, b| angles[*a].total_cmp(&angles[*b]));
+        node.outgoing.sort_by(|a, b| {
+            angles[*a].total_cmp(&angles[*b]).then_with(|| {
+                if !digon_order {
+                    return std::cmp::Ordering::Equal;
+                }
+                let rank = |half_edge: usize| {
+                    let piece = (half_edge >> 1) as i64;
+                    if half_tail(half_edge) < half_head(half_edge) {
+                        piece
+                    } else {
+                        -piece
+                    }
+                };
+                rank(*a).cmp(&rank(*b))
+            })
+        });
     }
 
     let mut visited = rustc_hash::FxHashSet::default();
@@ -932,4 +962,5 @@ fn arrange_segments_impl(
     }
     Ok(regions.into_iter().map(|(region, _)| region).collect())
 }
+
 

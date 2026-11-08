@@ -340,14 +340,128 @@ pub fn mesh_regions_to_brep(
     indices: &[u32],
     options: &SegmentOptions,
 ) -> Result<BrepSolid, String> {
+    mesh_regions_to_brep_with(positions, indices, options, plane_corners_enabled(), noisy_polyhedron_enabled())
+}
+
+/// `BREP_MESH_PLANE_CORNERS` (batch 101; promoted ON 2026-11-08,
+/// promotion 15, `BREP_MESH_PLANE_CORNERS=0` restores the old path): a
+/// welded vertex where three or more planar regions, and nothing else, meet
+/// takes the intersection of their fitted planes instead of its raw mesh
+/// position. Switch grammar: `0|off|false` off, `1|on|true` on, anything else
+/// the default. Read once per process.
+fn plane_corners_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("BREP_MESH_PLANE_CORNERS").as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Ok("1" | "on" | "true") => true,
+            Ok("0" | "off" | "false") => false,
+            _ => true,
+        }
+    })
+}
+
+/// Move every welded vertex whose incident regions are three or more planes,
+/// and only planes, onto the least-squares intersection of those fitted
+/// planes. Returns the number of vertices moved.
+///
+/// A plane-plane boundary chain becomes a straight edge between its two end
+/// vertices, so a corner left at its raw (noisy) mesh position puts that
+/// edge, and the vertex, off both faces' planes by the mesh noise. On a
+/// jittered box that is a few 1e-3: the STEP importer's planar split
+/// (`split_off_plane_planar_faces`) then cuts each face into two triangles
+/// and a 6-face box reads back as 12. On the planes' intersection every
+/// straight edge between two such corners lies on both of its faces.
+///
+/// A corner is left where it is when the planes are badly conditioned (the
+/// normal matrix's determinant under 0.1, e.g. two nearly coplanar regions),
+/// when the solved point misses any of the planes by more than a rounding
+/// residual (four or more planes that do not meet in one point), or when it
+/// lies farther from the mesh vertex than ten times the vertex's largest
+/// distance from those planes.
+fn snap_plane_corners(data: &mut MeshData, seg: &MeshSegmentation) -> usize {
+    let mut incident: Vec<Vec<u32>> = vec![Vec::new(); data.verts.len()];
+    for (t, tri) in data.tris.iter().enumerate() {
+        let region = seg.triangle_region_ids[t];
+        for &v in &tri.verts {
+            if !incident[v].contains(&region) {
+                incident[v].push(region);
+            }
+        }
+    }
+    let residual_bar = 1e-9 * data.diag.max(1.0);
+    let mut moved = 0usize;
+    for (v, regions) in incident.iter().enumerate() {
+        if regions.len() < 3 {
+            continue;
+        }
+        let mut planes: Vec<(Vec3, f64)> = Vec::with_capacity(regions.len());
+        for &region in regions {
+            match seg.regions.get(region as usize).map(|region| &region.carrier) {
+                Some(RegionCarrier::Plane { origin, normal }) => match normal.normalized() {
+                    Ok(n) => planes.push((n, n.dot(*origin))),
+                    Err(_) => break,
+                },
+                _ => break,
+            }
+        }
+        if planes.len() != regions.len() {
+            continue;
+        }
+        let mut m = [[0.0f64; 3]; 3];
+        let mut b = [0.0f64; 3];
+        for (n, d) in &planes {
+            let a = [n.x, n.y, n.z];
+            for i in 0..3 {
+                b[i] += a[i] * d;
+                for j in 0..3 {
+                    m[i][j] += a[i] * a[j];
+                }
+            }
+        }
+        let det3 = |c: [[f64; 3]; 3]| {
+            c[0][0] * (c[1][1] * c[2][2] - c[1][2] * c[2][1]) - c[0][1] * (c[1][0] * c[2][2] - c[1][2] * c[2][0])
+                + c[0][2] * (c[1][0] * c[2][1] - c[1][1] * c[2][0])
+        };
+        let det = det3(m);
+        if !(det >= 0.1) {
+            continue;
+        }
+        let mut solved = [0.0f64; 3];
+        for (k, value) in solved.iter_mut().enumerate() {
+            let mut column = m;
+            for i in 0..3 {
+                column[i][k] = b[i];
+            }
+            *value = det3(column) / det;
+        }
+        let point = Vec3::new(solved[0], solved[1], solved[2]);
+        let raw = data.verts[v];
+        let worst_residual = planes.iter().map(|(n, d)| (n.dot(point) - d).abs()).fold(0.0, f64::max);
+        let raw_off = planes.iter().map(|(n, d)| (n.dot(raw) - d).abs()).fold(0.0, f64::max);
+        if !(worst_residual <= residual_bar) || !(point.sub(raw).length() <= 10.0 * raw_off + residual_bar) {
+            continue;
+        }
+        data.verts[v] = point;
+        moved += 1;
+    }
+    moved
+}
+
+pub(super) fn mesh_regions_to_brep_with(
+    positions: &[f64],
+    indices: &[u32],
+    options: &SegmentOptions,
+    plane_corners: bool,
+    noisy_polyhedron: bool,
+) -> Result<BrepSolid, String> {
     if !(options.deflection_angle_deg > 0.0) || !options.deflection_angle_deg.is_finite() {
         return Err("mesh_regions_to_brep: deflection angle must be positive".into());
     }
     if !(options.fit_tolerance > 0.0) || !options.fit_tolerance.is_finite() {
         return Err("mesh_regions_to_brep: fit tolerance must be positive".into());
     }
-    let data = build_mesh_data(positions, indices, options)?;
-    let seg = segment_prepared(&data, options);
+    let mut data = build_mesh_data(positions, indices, options)?;
+    let seg = segment_prepared_with(&data, options, noisy_polyhedron);
 
     // Documented fallback: a mesh with NO recognized carrier at all is the
     // faceted importer's business (triangle-per-face, exact for the mesh).
@@ -395,6 +509,12 @@ pub fn mesh_regions_to_brep(
         .any(|&id| id == UNASSIGNED_REGION)
     {
         return Err("mesh_regions_to_brep: mesh has unassignable degenerate triangles".into());
+    }
+    if plane_corners {
+        let moved = snap_plane_corners(&mut data, &seg);
+        if std::env::var("BREP_DEBUG_SEG").is_ok() {
+            eprintln!("[plane-corners] {moved} corner(s) moved onto their planes' intersection");
+        }
     }
 
     // Region-boundary graph over welded mesh edges.

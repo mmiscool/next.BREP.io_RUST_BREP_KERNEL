@@ -1859,6 +1859,16 @@ fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<Bre
             &heal_closed_band(solid, &band, op)?,
         ));
     }
+    // Imported rings whose walls are cut at meridians, and a ring that overran
+    // the strips beside it (`split_band.rs`): both are the band's question with
+    // survivors the count above cannot read.
+    if let Some(band) = classify_split_band(solid, &face_ids) {
+        return Ok(coalesce_healed_edges(&heal_split_band(solid, &band, op)?));
+    }
+    if let Some(reduced) = reduce_ring_over_strips(solid, &face_ids, op) {
+        let (reduced, remaining) = reduced?;
+        return delete_faces_and_heal_impl(&reduced, &remaining);
+    }
     match read_blend_network(solid, &face_ids, op) {
         NetworkRead::Network(network) => {
             return Ok(coalesce_healed_edges(
@@ -1925,6 +1935,10 @@ fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<Bre
             if let Some(band) = classify_closed_band(&healed, component) {
                 healed =
                     heal_closed_band(&healed, &band, op)?;
+                continue;
+            }
+            if let Some(band) = classify_split_band(&healed, component) {
+                healed = heal_split_band(&healed, &band, op)?;
                 continue;
             }
         }

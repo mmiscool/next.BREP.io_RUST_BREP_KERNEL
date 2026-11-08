@@ -20,7 +20,8 @@ pub(super) fn geometry_diagnostics_schema() -> Value {
         "featureTimings":{"type":"object","additionalProperties":{"type":"number"}},
         "featureOutputs":{"type":"object","additionalProperties":strings},
         "featureRefusals":{"type":"object","additionalProperties":{"type":"object"}},
-        "featureApproximations":{"type":"object","additionalProperties":{"type":"array","items":{"type":"object"}}}
+        "featureApproximations":{"type":"object","additionalProperties":{"type":"array","items":{"type":"object"}}},
+        "featureAutoTargets":{"type":"object","additionalProperties":text}
     }), &["featureErrors","featureNotes","featureFulfilment","unresolved","displayErrors","featureTimings","featureOutputs"]);
     let error = closed_object_required(json!({"error":text}), &["error"]);
     json!({"type":"object","oneOf":[details,interference,report,error]})

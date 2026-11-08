@@ -28,7 +28,7 @@
 use super::assembly_ops::ComponentInsert;
 use super::EngineState;
 use super::{InstructionsRefField, RefSelectTarget};
-use brep_instructions::model::{Instructions, Target, BLOCK_KEY, DOCUMENT_CLASS};
+use brep_instructions::model::{Arrow, Instructions, Step, Style, Target, BLOCK_KEY, DOCUMENT_CLASS};
 use brep_instructions::wizard::Level;
 use brep_instructions::{edit, retarget, source, wizard};
 use brep_kernel::{PmiAnnotation, PmiCamera, PmiDisplay, PmiProjection, PmiView};
@@ -54,6 +54,8 @@ pub struct Insertion {
     moves: Vec<(Vec<String>, [f64; 3])>,
     /// 0 = at the arrows' start, 1 = home.
     fraction: f64,
+    /// Held where it is (automation's still pictures): ticks leave it.
+    held: bool,
 }
 
 /// Where the player goes.
@@ -527,9 +529,12 @@ impl EngineState {
                 .and_then(|parent| parent.view.as_deref())
                 .and_then(|id| state.find_view(id))
                 .and_then(|view| view.camera.clone());
+            // A Line art step whose parts slide in along the derived arrows
+            // frames where they start too.
+            let slides = block.template.style == Style::LineArt && step.arrows.is_empty();
             let camera_now = match existing.as_ref().and_then(|view| view.camera.clone()).filter(|_| step.camera_captured) {
                 Some(kept) => kept,
-                None => self.generated_step_camera(&presentation, &boxes, parent_camera.as_ref()),
+                None => self.generated_step_camera(&presentation, &boxes, parent_camera.as_ref(), slides),
             };
             // The author's annotations stay; the step's own balloons (the
             // ones naming an occurrence) are made again from its parts.
@@ -603,6 +608,7 @@ impl EngineState {
         presentation: &edit::Presentation,
         boxes: &std::collections::HashMap<String, crate::camera::Aabb>,
         parent: Option<&PmiCamera>,
+        slides: bool,
     ) -> PmiCamera {
         let union = |names: &[String]| {
             let mut bbox = crate::camera::Aabb::empty();
@@ -630,6 +636,15 @@ impl EngineState {
                 // so the same step gives the same camera.
                 self.camera.projection = crate::view::Projection::Orthographic { half_height: 10.0 };
                 self.camera.standard_view("iso");
+            }
+        }
+        let mut frame = frame;
+        if slides {
+            if let Some(offset) = default_start_offset(presentation, boxes, self.camera.up) {
+                let mut start = union(&presentation.adding);
+                start.min = std::array::from_fn(|k| start.min[k] + offset[k]);
+                start.max = std::array::from_fn(|k| start.max[k] + offset[k]);
+                frame.union(&start);
             }
         }
         self.camera.width = GENERATED_VIEWPORT[0];
@@ -669,8 +684,11 @@ impl EngineState {
         self.pmi_activate_view(&view)
     }
 
-    /// Draw the shown step as the players do: the parts earlier steps placed
-    /// ghosted (grey and translucent, in the context layer, which draws
+    /// Draw the shown step as the players do. In a Line art document the
+    /// scene carries the look ([`crate::scene::RenderScene::line_art`]): the
+    /// placed parts stay in it, drawn white with grey lines, the added ones
+    /// flat blue with black lines. Otherwise the parts earlier steps placed
+    /// are ghosted (grey and translucent, in the context layer, which draws
     /// without depth writes or picks) and the parts the step adds solid. Run
     /// after a view is applied and after every run while one is shown (the
     /// copies follow the rebuilt displays); with no step shown, or before a
@@ -681,7 +699,18 @@ impl EngineState {
         if !self.is_instructions() {
             return;
         }
-        let placed = self.instructions_shown_presentation().map(|presentation| presentation.placed).unwrap_or_default();
+        let shown = self.instructions_shown_presentation();
+        // A Line art step draws its placed parts opaque and white in the
+        // scene itself (`RenderScene::line_art`), not as translucent ghosts:
+        // hidden lines must not show through them.
+        let line_art = shown.is_some() && self.instructions().ok().flatten().is_some_and(|block| block.template.style == Style::LineArt);
+        let all_placed = shown.map(|presentation| presentation.placed).unwrap_or_default();
+        let look = line_art.then(|| crate::scene::LineArtLook { placed: all_placed.iter().cloned().collect() });
+        if self.scene.line_art != look {
+            self.scene.line_art = look;
+            self.dirty = true;
+        }
+        let placed = if line_art { Vec::new() } else { all_placed };
         let gone: Vec<String> =
             self.context_scene.solids().iter().map(|ghost| ghost.name.clone()).filter(|name| !placed.contains(name)).collect();
         for name in gone {
@@ -715,6 +744,29 @@ impl EngineState {
         }
     }
 
+    /// The arrows `step_id`'s parts come home along: the step's own; in a
+    /// Line art document, a step without any gets one per part it adds (its
+    /// own and its group's), all travelling down its view's up direction
+    /// from a start clear of the parts already placed
+    /// (`default_start_offset`). Derived each time, never written to the
+    /// document: the author's arrows replace them. The first step of a
+    /// group, which places nothing over anything, slides nothing in.
+    pub fn instructions_step_arrows(&self, block: &Instructions, step_id: &str) -> Vec<Arrow> {
+        let Some(step) = block.step(step_id) else { return Vec::new() };
+        if !step.arrows.is_empty() || block.template.style != Style::LineArt {
+            return step.arrows.clone();
+        }
+        let pmi = self.pmi_state();
+        let Some(up) = step.view.as_deref().and_then(|id| pmi.find_view(id)).and_then(|view| view.camera.as_ref()).map(|camera| camera.up) else {
+            return Vec::new();
+        };
+        let solids: Vec<String> = self.scene.solids().iter().map(|s| s.name.clone()).collect();
+        let Ok(presentation) = edit::presentation(block, step_id, &solids) else { return Vec::new() };
+        let boxes: std::collections::HashMap<String, crate::camera::Aabb> =
+            self.scene.solids().iter().map(|s| (s.name.clone(), s.bbox)).collect();
+        default_arrows(step, &presentation, &boxes, up)
+    }
+
     /// Play a step in the in-app player: show its view (its camera, ghosts
     /// and balloons) and start its parts' insertion along their arrows.
     /// Steps go in reading order (a step's children before it); Next on
@@ -739,11 +791,11 @@ impl EngineState {
         let solids: Vec<String> = self.scene.solids().iter().map(|solid| solid.name.clone()).collect();
         let presentation = edit::presentation(&block, &step, &solids)?;
         let under = |path: &str, occurrence: &str| path == occurrence || (path.starts_with(occurrence) && path[occurrence.len()..].starts_with(':'));
+        let arrows = self.instructions_step_arrows(&block, &step);
         let moves: Vec<(Vec<String>, [f64; 3])> = block
             .step(&step)
-            .map(|found| {
-                found
-                    .arrows
+            .map(|_| {
+                arrows
                     .iter()
                     .map(|arrow| {
                         // Only the parts this step adds move: a placed part's
@@ -755,7 +807,7 @@ impl EngineState {
                     .collect()
             })
             .unwrap_or_default();
-        self.instructions_insertion = (!moves.is_empty()).then(|| Insertion { view, moves, fraction: 0.0 });
+        self.instructions_insertion = (!moves.is_empty()).then(|| Insertion { view, moves, fraction: 0.0, held: false });
         self.pmi_apply_explode();
         self.refresh_pmi_overlay();
         Ok(step)
@@ -767,6 +819,9 @@ impl EngineState {
         let Some(insertion) = self.instructions_insertion.as_mut() else { return false };
         if self.pmi_active_view.as_deref() != Some(insertion.view.as_str()) {
             self.instructions_insertion = None;
+            return false;
+        }
+        if insertion.held {
             return false;
         }
         insertion.fraction = (insertion.fraction + dt.max(0.0) / INSERTION_SECONDS).min(1.0);
@@ -793,6 +848,83 @@ impl EngineState {
             .iter()
             .map(|(names, offset)| (names.clone(), offset.map(|v| v * left), [0.0; 3], [1.0; 3], [0.0; 3]))
             .collect()
+    }
+
+    /// The insertion's arrows while it plays, in world space: for each
+    /// moving group of parts, from the edge of its screen outline where it is
+    /// now (on its centre line, on the side it travels toward) to where that
+    /// point lands at home (its seat), so the arrow never crosses the parts,
+    /// shortens as they come in and is gone once they are seated.
+    pub(crate) fn instructions_insertion_arrows(&self) -> Vec<([f64; 3], [f64; 3])> {
+        let Some(insertion) = &self.instructions_insertion else { return Vec::new() };
+        if self.pmi_active_view.as_deref() != Some(insertion.view.as_str()) {
+            return Vec::new();
+        }
+        let left = 1.0 - insertion.fraction;
+        insertion
+            .moves
+            .iter()
+            .filter_map(|(names, offset)| {
+                let mut bbox = crate::camera::Aabb::empty();
+                for name in names {
+                    let home = self.pmi_explode_originals.get(name).or_else(|| self.scene.solid(name));
+                    if let Some(display) = home {
+                        bbox.union(&display.bbox);
+                    }
+                }
+                self.outline_arrow(&bbox, offset.map(|v| v * left))
+            })
+            .collect()
+    }
+
+    /// Hold the playing insertion at `fraction` (clamped to 0..1) until
+    /// another step is played. Nothing when no part is moving.
+    pub fn instructions_hold_insertion(&mut self, fraction: f64) {
+        let Some(insertion) = self.instructions_insertion.as_mut() else { return };
+        insertion.fraction = if fraction.is_finite() { fraction.clamp(0.0, 1.0) } else { 0.0 };
+        insertion.held = true;
+        self.pmi_apply_explode();
+        self.refresh_pmi_overlay();
+    }
+
+    /// An insertion or explode arrow for parts whose bounds at home are
+    /// `home` and which stand `now` away from home: from the edge of their
+    /// screen outline (on their centre line, on the side they travel toward)
+    /// to where that point lands at home, so it never crosses the parts and
+    /// is exactly the travel left. `None` with nothing left to travel.
+    pub(crate) fn outline_arrow(&self, home: &crate::camera::Aabb, now: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
+        let length = (now[0] * now[0] + now[1] * now[1] + now[2] * now[2]).sqrt();
+        if home.is_empty() || !(length > 1e-9) {
+            return None;
+        }
+        // The travel direction, toward home.
+        let d = now.map(|v| -v / length);
+        let (c, size) = (home.center(), home.size());
+        let h = 0.5 * (size[0] * d[0].abs() + size[1] * d[1].abs() + size[2] * d[2].abs());
+        let (right, up, _) = self.camera.basis();
+        let screen = |p: [f64; 3]| [crate::geometry3d::dot3(p, right), crate::geometry3d::dot3(p, up)];
+        let sd = screen(d);
+        let sl = (sd[0] * sd[0] + sd[1] * sd[1]).sqrt();
+        let mut lead = h;
+        if sl > 1e-9 {
+            let u = [sd[0] / sl, sd[1] / sl];
+            let along = |p: [f64; 3]| {
+                let s = screen(p);
+                s[0] * u[0] + s[1] * u[1]
+            };
+            let reach = (0..8)
+                .map(|i| {
+                    along([
+                        if i & 1 == 0 { home.min[0] } else { home.max[0] },
+                        if i & 2 == 0 { home.min[1] } else { home.max[1] },
+                        if i & 4 == 0 { home.min[2] } else { home.max[2] },
+                    ])
+                })
+                .fold(f64::NEG_INFINITY, f64::max);
+            lead = ((reach - along(c)) / sl).max(h);
+        }
+        let seat: [f64; 3] = std::array::from_fn(|k| c[k] + d[k] * lead);
+        Some((std::array::from_fn(|k| seat[k] + now[k]), seat))
     }
 
     /// How far the shown step's parts have come home (0..1), while they move.
@@ -843,4 +975,68 @@ impl EngineState {
             Err(error) => json!({ "instructions": null, "error": error }),
         }
     }
+}
+
+/// The start offset of a Line art step's derived insertion (see
+/// [`EngineState::instructions_step_arrows`]): straight up the view's `up`
+/// by twice the added parts' height along it, and at least a third of
+/// everything the step shows, so a flat part still travels visibly. `None`
+/// when the step places nothing over anything (its first part just
+/// appears) or adds nothing drawn.
+pub(crate) fn default_start_offset(
+    presentation: &edit::Presentation,
+    boxes: &std::collections::HashMap<String, crate::camera::Aabb>,
+    up: [f64; 3],
+) -> Option<[f64; 3]> {
+    if presentation.placed.is_empty() || presentation.adding.is_empty() {
+        return None;
+    }
+    let length = (up[0] * up[0] + up[1] * up[1] + up[2] * up[2]).sqrt();
+    if !(length > 1e-12) {
+        return None;
+    }
+    let up = up.map(|v| v / length);
+    let union = |names: &[String]| {
+        let mut bbox = crate::camera::Aabb::empty();
+        for name in names {
+            if let Some(solid) = boxes.get(name) {
+                bbox.union(solid);
+            }
+        }
+        bbox
+    };
+    let adding = union(&presentation.adding);
+    if adding.is_empty() {
+        return None;
+    }
+    let mut shown = union(&presentation.placed);
+    shown.union(&adding);
+    let along = |b: &crate::camera::Aabb| {
+        let size = b.size();
+        size[0] * up[0].abs() + size[1] * up[1].abs() + size[2] * up[2].abs()
+    };
+    let size = shown.size();
+    let diagonal = (size[0] * size[0] + size[1] * size[1] + size[2] * size[2]).sqrt();
+    let distance = (2.0 * along(&adding)).max(diagonal / 3.0);
+    (distance.is_finite() && distance > 0.0).then(|| up.map(|v| v * distance))
+}
+
+/// A Line art step's derived arrows: one per occurrence the step and its
+/// group add, each starting [`default_start_offset`] away.
+pub(crate) fn default_arrows(
+    step: &Step,
+    presentation: &edit::Presentation,
+    boxes: &std::collections::HashMap<String, crate::camera::Aabb>,
+    up: [f64; 3],
+) -> Vec<Arrow> {
+    let Some(offset) = default_start_offset(presentation, boxes, up) else { return Vec::new() };
+    let distance = (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
+    let mut occurrences = Vec::new();
+    step.occurrences_with_descendants(&mut occurrences);
+    // A sub-assembly's occurrence stands for its parts: one arrow for it.
+    occurrences
+        .iter()
+        .filter(|occurrence| !occurrences.iter().any(|other| other != *occurrence && occurrence.starts_with(&format!("{other}:"))))
+        .map(|occurrence| Arrow { occurrence: occurrence.to_string(), direction: offset.map(|v| -v / distance), distance })
+        .collect()
 }

@@ -58,6 +58,14 @@ pub struct SceneBuildReport {
     /// omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub feature_approximations: Vec<(String, Vec<brep_kernel::Approximation>)>,
+    /// The solid each no-target boolean ran into
+    /// (`brep_kernel::FeatureResult::boolean_auto_target`): `(feature id, solid
+    /// name)` in run order, only for the features whose boolean named no target
+    /// and found the part's ONLY solid. The feature panel shows it on the
+    /// boolean's target field as `Auto: <name>`. Additive: `#[serde(default)]`
+    /// for reports serialized before it, and omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub feature_auto_targets: Vec<(String, String)>,
     /// Solids whose display payload (tessellation) failed, as
     /// `"<solid name>: <message>"` — the solid is skipped, not fatal.
     pub display_errors: Vec<String>,
@@ -276,6 +284,11 @@ fn fold_history(result: &brep_kernel::HistoryResult, report: &mut SceneBuildRepo
             report
                 .feature_approximations
                 .push((feature.id.clone(), feature.approximations.clone()));
+        }
+        if let Some(target) = &feature.boolean_auto_target {
+            report
+                .feature_auto_targets
+                .push((feature.id.clone(), target.clone()));
         }
         // The feature's output solid name(s) — the history tree's Outputs node.
         report.feature_outputs.push((

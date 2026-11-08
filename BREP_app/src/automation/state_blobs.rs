@@ -17,7 +17,7 @@ pub const STATE_BLOBS: &[(&str, &str)] = &[
     ("__brepGizmo", "transform gizmo state"),
     ("__brepFile", "file dialog state (mode, entries, current name)"),
     ("__brepModel", "model signature: solid count, triangle count, per-solid bounds (change detection)"),
-    ("__brepReport", "last run report {featureErrors, featureNotes, featureFulfilment, featureRefusals (only when a feature failed with a typed refusal), featureApproximations (only when a successful feature carries a measured approximation: feature id → [{code, body, measured, bar, volume_bound, edges, message, summary}]), unresolved, displayErrors, featureTimings, featureOutputs}"),
+    ("__brepReport", "last run report {featureErrors, featureNotes, featureFulfilment, featureRefusals (only when a feature failed with a typed refusal), featureApproximations (only when a successful feature carries a measured approximation: feature id → [{code, body, measured, bar, volume_bound, edges, message, summary}]), featureAutoTargets (only when a feature's boolean named no target and used the part's only solid: feature id → solid name), unresolved, displayErrors, featureTimings, featureOutputs}"),
     ("__brepRun", "in-flight run {pending, progress:{generation,index,total,featureId,featureType}|null, cancelled}"),
     ("__brepBusy", "the status bar's working indicator {shown, activities:[{kind, label, document, cancellable, elapsed}]} — everything in flight, most important first; shown once work has lasted 0.2 s"),
     ("__brepExpr", "expressions script, its variables and the configurator"),

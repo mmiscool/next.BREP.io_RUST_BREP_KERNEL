@@ -540,8 +540,8 @@ fn plan_straight_rebuild(
     if edge.curve.straight_segment(tolerance).is_none() {
         return Err(KernelRefusal::unsupported(KernelStage::Refine, "curved_edge_rebuild", format!(
             "rotate_faces: edge {} between {} must be re-stretched but is not a straight line; \
-             a rotation rebuilds a curved edge only where it is the rim of the rotated plane \
-             against a cylinder or cone, not between two faces that stay put — refusing",
+             a rotation rebuilds a curved edge only where a plane meets a cylinder or cone \
+             — refusing",
             edge.id,
             between()
         )));
@@ -791,7 +791,8 @@ fn rotated_rim_section(
 /// carriers meeting there, with the moved ones ROTATED, and every affected edge
 /// is rebuilt between the new corners — straight between planes, and as the
 /// EXACT conic wherever a plane meets an oblique cylinder or cone, whichever of
-/// the two the rotation turns. The TURNED side of such a pair is the tilted
+/// the two the rotation turns, or neither, for a fixed edge whose corner rides
+/// it. The TURNED side of such a pair is the tilted
 /// bore: its mouth is re-intersected in the frame `R` leaves, and its seam
 /// corner rides its own generatrix down to the fixed flat. A quadric meeting a
 /// quadric, or a sphere, torus, general revolution or free-form neighbour,
@@ -1527,6 +1528,55 @@ pub(crate) fn rotate_faces_rigid(
         };
         match classes[&edge.id] {
             EdgeClass::Fixed => {
+                // A CURVED fixed edge between a flat and a cylinder or cone: an
+                // Offset Shell's enlarged bore cutting a tilted inner floor runs
+                // such an ellipse arc out to the rotated face. Both carriers
+                // stayed put, so the section is unchanged as a SET; only the end
+                // on the rotated face moved, along it (the vertex pass solved
+                // that corner on these two carriers). So it is re-cut between
+                // its corners, under the guards a straight rebuild gets.
+                if !edge.degenerate
+                    && edge.start_vertex_id != edge.end_vertex_id
+                    && edge.curve.straight_segment(tolerance).is_none()
+                {
+                    if let Some((fixed_plane, (frame, rho0, rho1, height))) = plane_and_ruled_carriers(
+                        solid,
+                        &face_lookup,
+                        &mut planes,
+                        &faces_of_edge[&edge.id],
+                        plane_tolerance,
+                    ) {
+                        let new_chord = end_new.sub(start_new);
+                        if new_chord.length() <= tolerance {
+                            return Err(KernelRefusal::unsupported(KernelStage::Refine, "edge_collapse", format!(
+                                "rotate_faces: the rotation collapses curved edge {} to zero length — refusing",
+                                edge.id
+                            )));
+                        }
+                        if end_old.sub(start_old).dot(new_chord) <= 0.0 {
+                            return Err(KernelRefusal::unsupported(KernelStage::Refine, EDGE_INVERSION, format!(
+                                "rotate_faces: the rotation inverts curved edge {} (the trim is turned \
+                                 inside out) — refusing",
+                                edge.id
+                            )));
+                        }
+                        let curve = rotated_rim_section(
+                            edge,
+                            &frame,
+                            &frame,
+                            rho0,
+                            rho1,
+                            height,
+                            &fixed_plane,
+                            fixed_plane.normal,
+                            start_new,
+                            end_new,
+                            tolerance,
+                        )?;
+                        actions.insert(edge.id, EdgeAction::Replace { curve });
+                        continue;
+                    }
+                }
                 // A fixed side edge follows its re-solved endpoint. Both of its
                 // own carriers stayed put, so it cannot ride `R`: it is rebuilt
                 // between the endpoints, straight.

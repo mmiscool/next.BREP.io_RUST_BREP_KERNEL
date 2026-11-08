@@ -171,12 +171,15 @@ mod triple_point;
 mod corner_heal;
 #[path = "direct_edit/closed_band.rs"]
 mod closed_band;
+#[path = "direct_edit/split_band.rs"]
+mod split_band;
 #[path = "direct_edit/blend_network_heal.rs"]
 mod blend_network_heal;
 
 
 use blend_network_heal::*;
 use closed_band::*;
+use split_band::*;
 use closed_heal::*;
 use closed_heal_census::*;
 use corner_heal::*;

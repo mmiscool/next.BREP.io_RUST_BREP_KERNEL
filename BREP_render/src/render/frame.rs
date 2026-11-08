@@ -75,7 +75,11 @@ impl RenderCore {
             }
         }
 
-        let bg = params.settings.background;
+        // A Line art instructions step draws on the step pictures' ground.
+        let bg = match &scene.line_art {
+            Some(_) => crate::thumbnail::line_art::BACKGROUND,
+            None => params.settings.background,
+        };
         let targets = self.targets.as_ref().expect("targets ensured");
         let mut encoder = self
             .device
@@ -205,6 +209,32 @@ impl RenderCore {
                     bind_pose(&mut pass, gpu_scene.models.as_ref(), &self.identity_model, gpu_solid.model_slot);
                     pass.set_vertex_buffer(0, gpu_solid.vertex_buf.slice(..));
                     pass.set_index_buffer(gpu_solid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    // A Line art step: one flat fill per tier, whatever the
+                    // model's colours.
+                    if let Some(look) = &scene.line_art {
+                        let style = if look.placed.contains(&solid.name) { &self.styles.line_art_placed_face } else { &self.styles.line_art_adding_face };
+                        if !has_emphasis {
+                            pass.set_bind_group(1, &style.bind, &[]);
+                            draw_visible_faces(&mut pass, solid, gpu_solid);
+                            continue;
+                        }
+                        // A picked or hovered face still shows, in the
+                        // emphasis colour in place of the flat fill.
+                        for (index, face) in solid.faces.iter().enumerate() {
+                            let range = &gpu_solid.faces[index];
+                            if range.index_count == 0 || !solid.visibility.is_face_visible(index) {
+                                continue;
+                            }
+                            let bind = match params.emphasis.face_state(&solid.name, &face.name) {
+                                EmphasisState::Base => &style.bind,
+                                EmphasisState::Selected => &self.styles.face_selected.bind,
+                                EmphasisState::Hovered => &self.styles.face_hovered.bind,
+                            };
+                            pass.set_bind_group(1, bind, &[]);
+                            pass.draw_indexed(range.first_index..range.first_index + range.index_count, 0, 0..1);
+                        }
+                        continue;
+                    }
                     // Fast path: no emphasis AND no hidden faces → one whole-mesh
                     // draw. When any face is hidden we fall to the per-face loop
                     // below, which coalesces contiguous VISIBLE faces and skips
@@ -281,11 +311,31 @@ impl RenderCore {
                 }
             }
 
+            // 1b. A Line art step's outlines: each part's mesh pushed out on
+            //    screen and back in depth, in its tier's ink, over the faces
+            //    but behind them: only the ring round each silhouette (over
+            //    the ground or a part further back) passes the depth test.
+            if let (Some(look), false) = (&scene.line_art, params.settings.wireframe) {
+                pass.set_pipeline(&self.hull_pipeline);
+                for (solid, gpu_solid) in &visible_solids {
+                    if solid.mesh.indices.is_empty() || translucent(solid) {
+                        continue;
+                    }
+                    let style = if look.placed.contains(&solid.name) { &self.styles.line_art_placed_outline } else { &self.styles.line_art_adding_outline };
+                    pass.set_bind_group(1, &style.bind, &[]);
+                    bind_pose(&mut pass, gpu_scene.models.as_ref(), &self.identity_model, gpu_solid.model_slot);
+                    pass.set_vertex_buffer(0, gpu_solid.vertex_buf.slice(..));
+                    pass.set_index_buffer(gpu_solid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    draw_visible_faces(&mut pass, solid, gpu_solid);
+                }
+            }
+
             // 2. Occluded edge portions, dimmed (depth test inverted). Hidden
             //    edges skip their segments (their occluded portion too).
             if params.settings.show_edges
                 && params.settings.show_occluded_edges
                 && params.settings.hidden_edge_alpha > 0.0
+                && scene.line_art.is_none()
             {
                 pass.set_pipeline(&self.edge_hidden_pipeline);
                 pass.set_bind_group(1, &self.styles.edge_hidden.bind, &[]);
@@ -324,6 +374,34 @@ impl RenderCore {
                     // and the aux ones only while the view is close enough
                     // for them to be told apart (`AUX_EDGE_MAX_WORLD_PER_PIXEL`).
                     let split = gpu_solid.occludable_edge_instances;
+                    // A Line art step: the real edges in the tier's ink, a picked
+                    // or hovered one in its emphasis style instead.
+                    if let Some(look) = &scene.line_art {
+                        let style = if look.placed.contains(&solid.name) { &self.styles.line_art_placed_edge } else { &self.styles.line_art_adding_edge };
+                        if !has_emphasis {
+                            pass.set_bind_group(1, &style.bind, &[]);
+                            if any_edge_hidden {
+                                draw_visible_edge_ranges(&mut pass, solid, gpu_solid, EdgeFilter::Real);
+                            } else if split > 0 {
+                                pass.draw(0..6, 0..split);
+                            }
+                            continue;
+                        }
+                        for (index, edge) in solid.edges.iter().enumerate() {
+                            let range = &gpu_solid.edges[index];
+                            if range.instance_count == 0 || edge.aux || !solid.visibility.is_edge_visible(index) {
+                                continue;
+                            }
+                            let bind = match params.emphasis.edge_state(&solid.name, &edge.name) {
+                                EmphasisState::Base => &style.bind,
+                                EmphasisState::Selected => &self.styles.edge_selected.bind,
+                                EmphasisState::Hovered => &self.styles.edge_hovered.bind,
+                            };
+                            pass.set_bind_group(1, bind, &[]);
+                            pass.draw(0..6, range.first_instance..range.first_instance + range.instance_count);
+                        }
+                        continue;
+                    }
                     if !has_emphasis {
                         pass.set_bind_group(1, &self.styles.edge_base.bind, &[]);
                         if any_edge_hidden {
@@ -412,8 +490,9 @@ impl RenderCore {
                 }
             }
 
-            // 5. Vertex points; hidden vertices skip their point sprite.
-            if params.settings.show_vertices && params.settings.vertex_size_px > 0.0 {
+            // 5. Vertex points; hidden vertices skip their point sprite. A
+            //    Line art step is an illustration: no vertex dots.
+            if params.settings.show_vertices && params.settings.vertex_size_px > 0.0 && scene.line_art.is_none() {
                 pass.set_pipeline(&self.point_pipeline);
                 for (solid, gpu_solid) in &visible_solids {
                     let Some(point_buf) = &gpu_solid.point_buf else { continue };
@@ -884,6 +963,40 @@ enum EdgeFilter {
     Real,
     /// Only the display-only ones.
     Aux,
+}
+
+/// Draw a solid's triangles with whatever style is bound, its hidden faces
+/// left out (contiguous visible faces drawn as one range).
+fn draw_visible_faces(pass: &mut wgpu::RenderPass<'_>, solid: &SolidDisplay, gpu_solid: &GpuSolid) {
+    if !solid.visibility.any_face_hidden() {
+        pass.draw_indexed(0..solid.mesh.indices.len() as u32, 0, 0..1);
+        return;
+    }
+    let mut run: Option<(u32, u32)> = None; // first_index, count
+    for index in 0..solid.faces.len() {
+        let range = &gpu_solid.faces[index];
+        if range.index_count == 0 {
+            continue;
+        }
+        if !solid.visibility.is_face_visible(index) {
+            if let Some((first, count)) = run.take() {
+                pass.draw_indexed(first..first + count, 0, 0..1);
+            }
+            continue;
+        }
+        match &mut run {
+            Some((first, count)) if *first + *count == range.first_index => *count += range.index_count,
+            _ => {
+                if let Some((first, count)) = run.take() {
+                    pass.draw_indexed(first..first + count, 0, 0..1);
+                }
+                run = Some((range.first_index, range.index_count));
+            }
+        }
+    }
+    if let Some((first, count)) = run {
+        pass.draw_indexed(first..first + count, 0, 0..1);
+    }
 }
 
 fn draw_visible_edge_ranges(

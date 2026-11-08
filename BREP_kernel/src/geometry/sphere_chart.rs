@@ -695,6 +695,36 @@ fn arcs_cross(a0: Vec3, a1: Vec3, na: Vec3, arc: &Arc) -> bool {
         .any(|p| within(p, a0, a1, na) && within(p, b0, b1, nb))
 }
 
+/// The angle between unit directions `a` and `b`, from their chord (accurate
+/// near zero, where `acos` of their dot product is not).
+fn unit_angle(a: Vec3, b: Vec3) -> f64 {
+    2.0 * (0.5 * a.sub(b).length()).min(1.0).asin()
+}
+
+/// The angle from unit direction `probe` to the great-circle arc from `start` to
+/// `end` (units), whose plane has unit normal `normal` (zero when the ends name
+/// no plane): to its nearest end, or to the arc itself where the probe's foot on
+/// the arc's plane falls between them.
+pub(crate) fn arc_distance(start: Vec3, end: Vec3, normal: Vec3, probe: Vec3) -> f64 {
+    let ends = unit_angle(probe, start).min(unit_angle(probe, end));
+    if normal.length_squared() == 0.0 {
+        return ends;
+    }
+    let height = probe.dot(normal);
+    let foot = probe.sub(normal.scale(height));
+    if start.cross(foot).dot(normal) >= 0.0 && foot.cross(end).dot(normal) >= 0.0 {
+        height.abs().min(1.0).asin().min(ends)
+    } else {
+        ends
+    }
+}
+
+/// The unit normal of the plane through the origin and unit directions `a`
+/// and `b`, zero when they name none (as [`Arc::normal`]).
+pub(crate) fn arc_normal(a: Vec3, b: Vec3) -> Vec3 {
+    a.cross(b).normalized().unwrap_or(Vec3::new(0.0, 0.0, 0.0))
+}
+
 /// One directed boundary arc, with the great-circle plane it lies in.
 #[derive(Clone, Copy, Debug)]
 struct Arc {
@@ -973,6 +1003,30 @@ impl SphericalRegion {
     /// A classifier that cannot decide has to say so.
     pub fn is_decidable(&self) -> bool {
         self.arcs.is_empty() || self.seed.is_some()
+    }
+
+    /// Whether the direction of `point` from `centre` lies farther than `angle`
+    /// (radians, under a quarter turn) from every boundary arc. A run of arcs is
+    /// passed whole when the point is farther from its cone's axis than the cone's
+    /// half-angle and `angle` together: the arcs between ends inside a cap under a
+    /// hemisphere stay inside it.
+    pub fn clear_of_boundary(&self, centre: Vec3, point: Vec3, angle: f64) -> bool {
+        let Ok(probe) = point.sub(centre).normalized() else {
+            return false;
+        };
+        let (cos_margin, sin_margin) = (angle.cos(), angle.sin());
+        for group in &self.groups {
+            if group.cos_half > 0.0 {
+                let bound = group.cos_half * cos_margin - group.sin_half * sin_margin;
+                if probe.dot(group.axis) < bound - 1e-12 {
+                    continue;
+                }
+            }
+            if self.arcs[group.first..group.last].iter().any(|arc| arc_distance(arc.start, arc.end, arc.normal, probe) <= angle) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Whether the sphere point `point` is material.  Pole-free and seam-free:

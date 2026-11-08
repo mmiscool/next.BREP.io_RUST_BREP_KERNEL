@@ -34,7 +34,9 @@ pub enum HandDrawShape {
     Line { a: (f64, f64), b: (f64, f64) },
     /// A closed circle — the fitted center + a rim point on `+u`.
     Circle { center: (f64, f64), rim: (f64, f64) },
-    /// A circular arc — the fitted center + the stroke's start/end (CCW start→end).
+    /// A circular arc — the fitted center + the stroke's two endpoints. An arc always
+    /// runs CCW from `start` to `end`, so a stroke drawn clockwise stores its last
+    /// sample as `start` and its first as `end`: the arc covers the drawn path.
     Arc {
         center: (f64, f64),
         start: (f64, f64),
@@ -100,10 +102,15 @@ pub fn recognize(stroke: &[(f64, f64)]) -> HandDrawShape {
                         rim: (cx + r, cy),
                     };
                 }
+                let (start, end) = if drawn_sweep(stroke, (cx, cy)) < 0.0 {
+                    (b, a)
+                } else {
+                    (a, b)
+                };
                 return HandDrawShape::Arc {
                     center: (cx, cy),
-                    start: a,
-                    end: b,
+                    start,
+                    end,
                 };
             }
         }
@@ -113,6 +120,21 @@ pub fn recognize(stroke: &[(f64, f64)]) -> HandDrawShape {
     HandDrawShape::Bezier {
         controls: fit_cubic(stroke),
     }
+}
+
+/// The signed angle the stroke turns through about `center`, in radians: the sum of
+/// the angles between consecutive radius vectors, positive for counter-clockwise. The
+/// sign is the drawn direction at any sweep, including near a half circle, where the
+/// two candidate arcs have about the same length.
+fn drawn_sweep(stroke: &[(f64, f64)], center: (f64, f64)) -> f64 {
+    stroke
+        .windows(2)
+        .map(|pair| {
+            let (ux, uy) = (pair[0].0 - center.0, pair[0].1 - center.1);
+            let (vx, vy) = (pair[1].0 - center.0, pair[1].1 - center.1);
+            (ux * vy - uy * vx).atan2(ux * vx + uy * vy)
+        })
+        .sum()
 }
 
 /// Materialize a recognized [`HandDrawShape`] into `doc`: mint its points (endpoints

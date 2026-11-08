@@ -37,8 +37,15 @@
 //! this replicates the offset-shell naming byte-for-byte:
 //! a Source image keeps its source face name, an
 //! Offset image appends `_Offset`, an opening Wall inherits its removed face's
-//! name, and collisions dedup as `base`, `base_1`, `base_2`, …. The solid name is
-//! `${targetName}_${featureId}`. One wall is named differently on purpose: the
+//! name, and collisions dedup as `base`, `base_1`, `base_2`, …. A shell that
+//! REPLACES its source keeps the source solid's name (since 2026-11-07,
+//! when the name changed on every shell); one that keeps the source is
+//! `${targetName}_${featureId}`, and — like every copying feature (mirror,
+//! transform copy) — suffixes its face and edge names with `::{featureId}`
+//! (`cube_NZ::shell`), since the kept source still owns the plain names and
+//! the scene refuses two live solids sharing one. A replacing shell also answers to that
+//! former name (`solid_aliases`), which documents saved before 2026-11-07
+//! spell in later features. One wall is named differently on purpose: the
 //! ring a through-bore exposes at an opening (the thickness between the hole
 //! wall and its offset) is named after the HOLE WALL (`Pin_S` → `Pin_S_1`),
 //! not the opening — the ring is the bore's, there is one per bore end, and
@@ -296,7 +303,15 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     } else {
         ctx.id.as_str()
     };
-    let new_name = format!("{target_name}_{feature_id}");
+    // `replaceOriginalSolid !== false` (default true) consumes the source
+    // solid, and the shell takes its place under the SAME name, as every other
+    // in-place feature does (fillet, chamfer, push face): removed-then-added.
+    let replace = ctx
+        .param("replaceOriginalSolid")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let legacy_name = format!("{target_name}_{feature_id}");
+    let new_name = if replace { target_name.clone() } else { legacy_name.clone() };
     // The offset op splits opening-rim edges, so PROPAGATED derived names come
     // through as stale `{A}|{B}[0]_2` fragments while references (and the caller
     // display) use names derived from the FINAL face adjacency. Clear the
@@ -308,14 +323,15 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
             edge.name = None;
         }
     }
+    // A shell beside its kept source would carry the source's face names
+    // (`Source` images) and fail the scene's naming contract; namespace it
+    // the way the copy features do.
+    if !replace {
+        common::namespace_copy_names(&mut shell, feature_id);
+    }
     result.added.push(common::register_added(shell, &new_name));
-
-    // `replaceOriginalSolid !== false` (default true) consumes the source solid.
-    let replace = ctx
-        .param("replaceOriginalSolid")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(true);
     if replace {
+        result.solid_aliases.push((legacy_name, target_name.clone()));
         result.removed.push(target_name);
     }
     Ok(result)

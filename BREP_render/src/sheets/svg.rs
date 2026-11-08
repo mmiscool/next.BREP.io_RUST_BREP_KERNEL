@@ -98,6 +98,64 @@ fn frame_group(frame: &FrameDrawing) -> String {
     out
 }
 
+/// A Line art picture ([`super::project::LineArtLayer`]), the PDF's own
+/// layering: the ground, the fills back to front, the placed parts' lines
+/// and outlines, the added parts' lines and outlines, the arrows.
+fn line_art_group(view: &ViewDrawing, layer: &super::project::LineArtLayer, out: &mut String) {
+    use super::project::LineArtLayer as L;
+    let hex = |c: [f64; 3]| format!("#{:02x}{:02x}{:02x}", (c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8);
+    let [x0, y0, x1, y1] = layer.ground;
+    out.push_str("<g class=\"line-art\">\n");
+    out.push_str(&format!("<rect class=\"ground\" x=\"{x0:.4}\" y=\"{y0:.4}\" width=\"{:.4}\" height=\"{:.4}\" fill=\"{}\" />\n", x1 - x0, y1 - y0, hex(L::GROUND)));
+    let mut tier: Option<bool> = None;
+    for (triangle, adding) in &layer.fills {
+        if tier != Some(*adding) {
+            if tier.is_some() {
+                out.push_str("</g>\n");
+            }
+            let c = hex(if *adding { L::ADDING_FILL } else { L::PLACED_FILL });
+            out.push_str(&format!(
+                "<g class=\"fill-{}\" fill=\"{c}\" stroke=\"{c}\" stroke-width=\"{:.3}\" stroke-linejoin=\"round\">\n",
+                if *adding { "adding" } else { "placed" },
+                L::SEAM_MM
+            ));
+            tier = Some(*adding);
+        }
+        out.push_str(&format!("<path d=\"{} Z\" />\n", path_data(triangle)));
+    }
+    if tier.is_some() {
+        out.push_str("</g>\n");
+    }
+    let runs = |class: &str, runs: &mut dyn Iterator<Item = &Vec<[f64; 2]>>, color: [f64; 3], width: f64, out: &mut String| {
+        let mut runs = runs.peekable();
+        if runs.peek().is_none() {
+            return;
+        }
+        out.push_str(&format!(
+            "<g class=\"{class}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{width:.3}\" stroke-linecap=\"round\" stroke-linejoin=\"round\">\n",
+            hex(color)
+        ));
+        for run in runs {
+            out.push_str(&format!("<path d=\"{}\" />\n", path_data(run)));
+        }
+        out.push_str("</g>\n");
+    };
+    runs("model", &mut view.edges.iter(), L::PLACED_EDGE, L::PLACED_EDGE_MM, out);
+    runs("outline-placed", &mut layer.outlines.iter().filter(|(_, a)| !a).map(|(r, _)| r), L::PLACED_OUTLINE, L::PLACED_OUTLINE_MM, out);
+    runs("model-highlighted", &mut view.highlighted.iter(), L::INK, L::ADDING_EDGE_MM, out);
+    runs("outline-adding", &mut layer.outlines.iter().filter(|(_, a)| *a).map(|(r, _)| r), L::INK, L::ADDING_OUTLINE_MM, out);
+    if !layer.arrows.is_empty() {
+        out.push_str(&format!("<g class=\"arrows\" fill=\"#000000\" stroke=\"#000000\" stroke-width=\"{:.3}\">\n", L::ARROW_SHAFT_MM));
+        for (tail, tip) in &layer.arrows {
+            let Some((base, head)) = L::head(*tail, *tip) else { continue };
+            out.push_str(&format!("<path class=\"arrow\" d=\"{}\" fill=\"none\" />\n", path_data(&[*tail, base])));
+            out.push_str(&format!("<path class=\"arrow-head\" d=\"{} Z\" stroke=\"none\" />\n", path_data(&head)));
+        }
+        out.push_str("</g>\n");
+    }
+    out.push_str("</g>\n");
+}
+
 fn view_group(view: &ViewDrawing) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -113,7 +171,9 @@ fn view_group(view: &ViewDrawing) -> String {
         // leaving a silent blank on the paper.
         out.push_str(&format!("<desc>{}</desc>\n", escape(&view.error)));
     }
-    if !view.edges.is_empty() {
+    if let Some(layer) = &view.line_art {
+        line_art_group(view, layer, &mut out);
+    } else if !view.edges.is_empty() {
         out.push_str(&format!(
             "<g class=\"model\" fill=\"none\" stroke=\"#000000\" stroke-width=\"{EDGE_WIDTH:.6}\" stroke-linecap=\"round\" stroke-linejoin=\"round\">\n"
         ));
@@ -122,7 +182,7 @@ fn view_group(view: &ViewDrawing) -> String {
         }
         out.push_str("</g>\n");
     }
-    if !view.highlighted.is_empty() {
+    if !view.highlighted.is_empty() && view.line_art.is_none() {
         out.push_str(&format!(
             "<g class=\"model-highlighted\" fill=\"none\" stroke=\"{HIGHLIGHT_STROKE}\" stroke-width=\"{:.6}\" stroke-linecap=\"round\" stroke-linejoin=\"round\">\n",
             EDGE_WIDTH * HIGHLIGHT_WIDTH_FACTOR

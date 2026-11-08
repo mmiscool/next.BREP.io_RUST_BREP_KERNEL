@@ -391,6 +391,7 @@ pub(super) fn canonicalize_imprint_junctions(
     emitted_pcurves: &HashSet<(u64, FaceKey)>,
     evidence: &JunctionEvidence,
     combine: JunctionCombineMode,
+    feature_scale: &crate::feature_scale::FeatureScale,
     residual_merge: bool,
 ) -> Result<(), KernelRefusal> {
     let face_map = faces(solid_a, 0)
@@ -435,6 +436,7 @@ pub(super) fn canonicalize_imprint_junctions(
             raw_extent,
             evidence,
             emitted_pcurves,
+            feature_scale,
         )?
     {
         // Incidence changed under the merge — rebuild it for the polish below.
@@ -754,6 +756,7 @@ pub(super) fn merge_residual_coincident_vertices(
     raw_extent: f64,
     evidence: &JunctionEvidence,
     emitted_pcurves: &HashSet<(u64, FaceKey)>,
+    feature_scale: &crate::feature_scale::FeatureScale,
 ) -> Result<bool, KernelRefusal> {
     let (band, sep_cap) = residual_merge_bands(raw_extent, tolerance);
     let weld = assembler_weld(tolerance);
@@ -857,6 +860,17 @@ pub(super) fn merge_residual_coincident_vertices(
             };
             // The whole segment (both ends + midpoint) must lie on every surface.
             let mid = p_a.add(p_b).scale(0.5);
+            // FEATURE SCALE B3 (`BREP_FEATURE_SCALE_IMPRINT`): beside a sliver
+            // the identity proof's band (2·weld·extent, 2e-5 on a 10 mm part)
+            // is capped at a quarter of it. The hairline slot's two top corners,
+            // one on each wall 1e-6 apart, passed the uncapped proof and were
+            // averaged onto x = 5.0000004375, off both walls; their midpoint
+            // lies 5e-7 from each, past the 2.5e-7 cap. A near-tangent
+            // double-mint's points lie on every surface to the march's
+            // accuracy, so the cap leaves it alone (fixture
+            // 10_regression_step269_cone's plates are 1.5e-3 thick or more).
+            // Slabs of one operand only: see `FeatureScale::cap_by_slabs`.
+            let band = if feature_scale.is_empty() { band } else { feature_scale.cap_by_slabs(mid, band) };
             if joint_residual(p_a)? > band
                 || joint_residual(p_b)? > band
                 || joint_residual(mid)? > band

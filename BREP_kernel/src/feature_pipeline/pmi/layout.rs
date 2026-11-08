@@ -291,20 +291,16 @@ pub fn present(geometry: &PmiGeometry, label: [f64; 3], text: &str, style: &Layo
             trace,
             ..
         } => {
+            // The trace is an insertion arrow (owner 2026-11-07, the
+            // assembly-instructions look): one thin solid line from where the
+            // parts are exploded to their seat, a filled head at the seat.
             if *trace {
-                let from = v3(*center);
-                let to = from.add(v3(*translate));
-                let span = to.sub(from);
-                let length = span.length();
-                if length > 1e-9 {
-                    let dash = (style.arrow * 1.5).max(1e-6);
-                    let d = span.scale(1.0 / length);
-                    let mut s = 0.0;
-                    while s < length {
-                        let e = (s + dash).min(length);
-                        out.polylines.push(vec![a3(from.add(d.scale(s))), a3(from.add(d.scale(e)))]);
-                        s += dash * 2.0;
-                    }
+                let seat = v3(*center);
+                let exploded = seat.add(v3(*translate));
+                let span = seat.sub(exploded);
+                if span.length() > 1e-9 {
+                    out.polylines.push(vec![a3(exploded), a3(seat)]);
+                    out.arrows.push(arrowhead(seat, span, style));
                 }
             }
         }

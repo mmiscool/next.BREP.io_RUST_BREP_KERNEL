@@ -356,6 +356,24 @@ pub(in crate::blend) fn ruled_chart_on() -> bool {
     switch!(live "BREP_BLEND_RULED_CHART", true)
 }
 
+/// Whether the ruled re-span also takes ANALYTIC non-planar carriers (an
+/// exactly ruled cylinder or cone): on unless
+/// `BREP_BLEND_RULED_CHART_ANALYTIC=0`/`off`.
+///
+/// The 2026-11-07 "fillet fails" report: a revolve's end cap meets the
+/// revolved inner wall (a cylinder) and floor (a cone, ruled along v) at a
+/// re-entrant corner. Filleting the cap/cylinder edge alone runs the floor's
+/// trims 0.33 past the cone's domain (v to 0.9013 of [0.0839, 0.8849]); the
+/// pcurves followed their edges on the extension, but every `evaluate` of the
+/// carrier clamps, so the next boolean's test point for that sliver of floor
+/// landed ON the old circle edge, classified On and was dropped (the group
+/// miter then refused with one-use edges). An analytic carrier was skipped
+/// here only because the pass was written for free-form side faces.
+pub(in crate::blend) fn ruled_chart_analytic_on() -> bool {
+    switch!(live "BREP_BLEND_RULED_CHART_ANALYTIC", true)
+}
+
+
 /// Samples per coedge when measuring whether its pcurve follows its edge.
 const RULED_MISS_SAMPLES: usize = 32;
 
@@ -465,8 +483,16 @@ fn fit_ruled_charts_to_trims(input: &BrepSolid, result: &mut BrepSolid) -> Resul
     for (shell_index, shell) in result.shells.iter().enumerate() {
         for (face_index, face) in shell.faces.iter().enumerate() {
             let surface = &face.surface;
-            if surface.analytic().is_some() {
-                continue;
+            // A plane is the pass above's (it widens the chart in its own
+            // frame). Any other analytic carrier — the cylinder or cone a
+            // revolve or extrude leaves — is re-spanned here like a free-form
+            // one when its net is exactly ruled: the analytic class is read
+            // back off the net, so the longer net is the same cylinder/cone.
+            match surface.analytic() {
+                None => {}
+                Some(AnalyticSurface::Plane { .. }) => continue,
+                Some(_) if !ruled_chart_analytic_on() => continue,
+                Some(_) => {}
             }
             let Some(along_u) = exact_ruled_direction(surface) else {
                 if debug {

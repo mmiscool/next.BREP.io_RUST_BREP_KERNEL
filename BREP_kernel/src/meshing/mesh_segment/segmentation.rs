@@ -1176,11 +1176,120 @@ pub fn segment_mesh_faces(
 /// (`segment_mesh_faces`) and the BREP rebuild (`mesh_regions_to_brep`), so
 /// both see identical triangle/vertex indexing.
 pub(super) fn segment_prepared(data: &MeshData, options: &SegmentOptions) -> MeshSegmentation {
+    segment_prepared_with(data, options, noisy_polyhedron_enabled())
+}
+
+/// `BREP_MESH_NOISY_POLYHEDRON` (batch 102; promoted ON 2026-11-08,
+/// promotion 15, `BREP_MESH_NOISY_POLYHEDRON=0` restores the old path): a
+/// mesh whose every grown region reads as a plane within
+/// [`NOISY_POLYHEDRON_PLANE_FACTOR`] times the plane bar is taken as a noisy
+/// polyhedron, every region a plane. Switch grammar: `0|off|false` off,
+/// `1|on|true` on, anything else the default. Read once per process.
+pub(super) fn noisy_polyhedron_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("BREP_MESH_NOISY_POLYHEDRON").as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Ok("1" | "on" | "true") => true,
+            Ok("0" | "off" | "false") => false,
+            _ => true,
+        }
+    })
+}
+
+/// How far past the cascade's plane bar (`fit_tolerance` times the region's
+/// diagonal) a region of a noisy polyhedron may sit. The census's 14 jittered
+/// boxes the plane bar refused read at most 6.6 times the bar, and no other
+/// census mesh reads as all planes within 20 (`sim199b.py`).
+const NOISY_POLYHEDRON_PLANE_FACTOR: f64 = 10.0;
+
+/// The most vertices a region past the plane bar may have and still be read
+/// as jitter: the parameter count of the cascade's richest carrier (the
+/// torus: centre, axis, two radii). With no more vertices than that a curved
+/// carrier can pass through all of them, so the cascade's curved fit is no
+/// evidence of curvature (the jittered box's two-triangle sides have four
+/// vertices, and the sphere through them is exact). A region with more is
+/// judged by its fit: the 0.25 mm dome of the app's domed-block fixture, 289
+/// vertices, sits 5.7 times past its plane bar and is a dome, not noise
+/// (promotion 15 gate, 2026-11-08). No census region past the bar has more
+/// than four vertices (`sim203.py`).
+const NOISY_POLYHEDRON_MAX_PAST_BAR_VERTICES: usize = 7;
+
+/// Every grown region as a plane, when every one of them fits a plane within
+/// [`NOISY_POLYHEDRON_PLANE_FACTOR`] times the cascade's plane bar and the
+/// normal tolerance, at least one of them is past the plane bar itself, and
+/// every one past the bar has at most [`NOISY_POLYHEDRON_MAX_PAST_BAR_VERTICES`]
+/// vertices. `None` otherwise, and the cascade decides as before.
+///
+/// A jittered box with two triangles per side gives each side four vertices
+/// off one plane by more than the bar: the cascade then refuses the plane and
+/// takes the sphere through those four points (exact by construction), or
+/// leaves the side freeform. Judged one region at a time a wider plane bar
+/// would also take the two-triangle islands that jitter cuts out of a
+/// cylinder, so the bar widens only for a mesh that is planes everywhere.
+fn noisy_polyhedron_regions(
+    data: &MeshData,
+    regions: &[Vec<u32>],
+    options: &SegmentOptions,
+) -> Option<Vec<(Vec<u32>, RegionOutcome)>> {
+    let mut any_past_bar = false;
+    let mut out = Vec::with_capacity(regions.len());
+    for region in regions {
+        let vert_ids = region_vertices(data, region);
+        if region.len() < options.min_region_triangles || vert_ids.len() < 3 {
+            return None;
+        }
+        let bbox = region_bbox(data, &vert_ids);
+        let diag = bbox.1.sub(bbox.0).length();
+        let scale = if diag > 0.0 { diag } else { data.diag.max(1e-12) };
+        let tol_abs = options.fit_tolerance * scale;
+        let fit = fit_plane(data, region, &vert_ids)?;
+        if !(fit.max_dev.is_finite()
+            && fit.max_dev <= NOISY_POLYHEDRON_PLANE_FACTOR * tol_abs
+            && fit.max_normal_angle_deg <= options.normal_tolerance_deg)
+        {
+            return None;
+        }
+        if fit.max_dev > tol_abs {
+            if vert_ids.len() > NOISY_POLYHEDRON_MAX_PAST_BAR_VERTICES {
+                return None;
+            }
+            any_past_bar = true;
+        }
+        let area: f64 = region.iter().map(|&t| data.tris[t as usize].area).sum();
+        out.push((
+            region.clone(),
+            RegionOutcome {
+                fit,
+                accepted: true,
+                area,
+                bbox,
+                triangle_count: region.len(),
+            },
+        ));
+    }
+    any_past_bar.then_some(out)
+}
+
+pub(super) fn segment_prepared_with(
+    data: &MeshData,
+    options: &SegmentOptions,
+    noisy_polyhedron: bool,
+) -> MeshSegmentation {
     let mut raw_regions = grow_regions(data, options);
     absorb_tiny_regions(data, &mut raw_regions);
 
-    let mut final_regions: Vec<(Vec<u32>, RegionOutcome)> = Vec::new();
-    for region in raw_regions {
+    let noisy = if noisy_polyhedron {
+        noisy_polyhedron_regions(data, &raw_regions, options)
+    } else {
+        None
+    };
+    if std::env::var("BREP_DEBUG_SEG").is_ok() && noisy.is_some() {
+        eprintln!("[seg] noisy polyhedron: {} regions taken as planes", raw_regions.len());
+    }
+    // A noisy polyhedron skips the cascade: its regions are all planes.
+    let cascade = if noisy.is_some() { Vec::new() } else { raw_regions };
+    let mut final_regions: Vec<(Vec<u32>, RegionOutcome)> = noisy.unwrap_or_default();
+    for region in cascade {
         let outcome = fit_region(data, &region, options);
         if outcome.accepted {
             final_regions.push((region, outcome));

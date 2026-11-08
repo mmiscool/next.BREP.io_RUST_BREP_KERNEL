@@ -91,6 +91,41 @@ pub enum Orientation {
     Landscape,
 }
 
+/// How a document's steps are drawn: in the PDF, the step images, the HTML
+/// player and the in-app player alike.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Style {
+    /// A flat technical illustration on light grey: the parts earlier steps
+    /// placed white with thin grey visible edges, the parts the step adds
+    /// flat blue under a heavy black outline, each sliding in along a black
+    /// arrow. The default for a new document.
+    LineArt,
+    /// The shaded look documents had before Line art: lit faces, the parts
+    /// the step adds in their own colours, the placed parts ghosted. What a
+    /// document saved without a style reads as.
+    Shaded,
+}
+
+impl Style {
+    /// Every style, for a dropdown: the value, its key and its label.
+    pub const CHOICES: [(Style, &'static str, &'static str); 2] =
+        [(Style::LineArt, "lineArt", "Line art"), (Style::Shaded, "shaded", "Shaded")];
+
+    /// What a document saved before styles existed reads as: the look it had.
+    pub fn saved_before_styles() -> Self {
+        Style::Shaded
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Style::LineArt => "lineArt",
+            Style::Shaded => "shaded",
+        }
+    }
+}
+
 /// The printed page template, one per document.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,11 +136,16 @@ pub struct Template {
     pub orientation: Orientation,
     /// A paper-size key (`A4`, `Letter`, …).
     pub paper: String,
+    /// How the steps are drawn. A new document is Line art; one saved
+    /// before styles existed reads as Shaded, the look it was made with
+    /// (reading never dirties a document).
+    #[serde(default = "Style::saved_before_styles")]
+    pub style: Style,
 }
 
 impl Default for Template {
     fn default() -> Self {
-        Self { steps_per_page: 1, orientation: Orientation::Portrait, paper: "A4".into() }
+        Self { steps_per_page: 1, orientation: Orientation::Portrait, paper: "A4".into(), style: Style::LineArt }
     }
 }
 

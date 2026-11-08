@@ -35,11 +35,104 @@ pub fn tessellate_brep_watertight(solid: &BrepSolid, chord_tolerance: f64) -> Re
     let one_shell_faces: Option<Vec<&FaceRecord>> =
         (solid.shells.len() == 1).then(|| solid.shells[0].faces.iter().collect());
     orient_mesh_coherently_with(&mut mesh, chord_tolerance, &face_shell_signs, one_shell_faces.as_deref())?;
+    if single_precision_twins_enabled() {
+        separate_single_precision_twins(&mut mesh);
+    }
     let validation_timer = stage_timer(Stage::Validation);
     mesh.validate()?;
     drop(validation_timer);
     crate::watertight_tessellation::profile::end(profile, chord_tolerance, mesh.indices.len() / 3);
     Ok(mesh)
+}
+
+/// SINGLE-PRECISION TWINS (`BREP_TESS_SINGLE_PRECISION_TWINS`): two vertices at different
+/// f64 positions that round to the same f32 point weld when the mesh is read at single
+/// precision, and every edge round them is then used twice each way. One vertex of each such
+/// group is moved along its tangent plane (square to its normal), from two float spacings of
+/// its finest coordinate, doubling until its f32 point is unused. Only a vertex whose position no other vertex shares
+/// moves: a shared position is an edge sample, emitted once per face, and moving one copy
+/// would open the edge. The step stays under a tenth of the vertex's height above the opposite
+/// side of every triangle round it, so no triangle turns over. A group with no such vertex,
+/// or no step that clears, is left as it was.
+pub(super) fn separate_single_precision_twins(mesh: &mut Mesh) {
+    let vertices = mesh.positions.len() / 3;
+    let point = |positions: &[f64], i: usize| [positions[3 * i], positions[3 * i + 1], positions[3 * i + 2]];
+    let bits64 = |p: [f64; 3]| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
+    let bits32 = |p: [f64; 3]| [(p[0] as f32).to_bits(), (p[1] as f32).to_bits(), (p[2] as f32).to_bits()];
+    let mut copies: FxHashMap<[u64; 3], u32> = FxHashMap::default();
+    for i in 0..vertices {
+        *copies.entry(bits64(point(&mesh.positions, i))).or_default() += 1;
+    }
+    // f32 point -> the distinct f64 positions on it (a representative vertex each)
+    let mut single: FxHashMap<[u32; 3], Vec<([u64; 3], usize)>> = FxHashMap::default();
+    for i in 0..vertices {
+        let p = point(&mesh.positions, i);
+        let owners = single.entry(bits32(p)).or_default();
+        if !owners.iter().any(|(b, _)| *b == bits64(p)) {
+            owners.push((bits64(p), i));
+        }
+    }
+    let mut movers: Vec<usize> = Vec::new();
+    for owners in single.values().filter(|owners| owners.len() > 1) {
+        // keep one position (an edge sample if there is one), move the others that may move
+        let keep = owners.iter().position(|(b, _)| copies[b] > 1).unwrap_or(0);
+        movers.extend(owners.iter().enumerate().filter(|&(k, (b, _))| k != keep && copies[b] == 1).map(|(_, &(_, i))| i));
+    }
+    if movers.is_empty() {
+        return;
+    }
+    let mut height = vec![f64::INFINITY; vertices];
+    let wanted: rustc_hash::FxHashSet<usize> = movers.iter().copied().collect();
+    for triangle in mesh.indices.chunks_exact(3) {
+        for corner in 0..3 {
+            let i = triangle[corner] as usize;
+            if !wanted.contains(&i) {
+                continue;
+            }
+            let [p, a, b] = [i, triangle[(corner + 1) % 3] as usize, triangle[(corner + 2) % 3] as usize]
+                .map(|v| Vec3::new(mesh.positions[3 * v], mesh.positions[3 * v + 1], mesh.positions[3 * v + 2]));
+            let twice_area = a.sub(p).cross(b.sub(p)).length();
+            height[i] = height[i].min(twice_area / b.sub(a).length().max(f64::MIN_POSITIVE));
+        }
+    }
+    for i in movers {
+        let p = Vec3::new(mesh.positions[3 * i], mesh.positions[3 * i + 1], mesh.positions[3 * i + 2]);
+        let n = Vec3::new(mesh.normals[3 * i], mesh.normals[3 * i + 1], mesh.normals[3 * i + 2]);
+        let Ok(n) = n.normalized() else { continue };
+        let other = if n.x.abs() <= n.y.abs() && n.x.abs() <= n.z.abs() {
+            Vec3::new(1.0, 0.0, 0.0)
+        } else if n.y.abs() <= n.z.abs() {
+            Vec3::new(0.0, 1.0, 0.0)
+        } else {
+            Vec3::new(0.0, 0.0, 1.0)
+        };
+        let Ok(first) = n.cross(other).normalized() else { continue };
+        let second = n.cross(first);
+        // start at the spacing of the finest coordinate: a step that changes its float is enough
+        let finest = [p.x, p.y, p.z].into_iter().map(f64::abs).filter(|c| *c > 0.0).fold(f64::INFINITY, f64::min);
+        let spacing = f32::EPSILON as f64 * finest.min(1.0).max(f32::MIN_POSITIVE as f64);
+        let limit = 0.1 * height[i];
+        let mut step = 2.0 * spacing;
+        let mut moved = None;
+        'search: while step <= limit {
+            for direction in [first, first.scale(-1.0), second, second.scale(-1.0)] {
+                let q = p.add(direction.scale(step));
+                let key = bits32([q.x, q.y, q.z]);
+                if !single.contains_key(&key) {
+                    moved = Some((q, key));
+                    break 'search;
+                }
+            }
+            step *= 2.0;
+        }
+        if let Some((q, key)) = moved {
+            if let Some(owners) = single.get_mut(&bits32([p.x, p.y, p.z])) {
+                owners.retain(|&(_, v)| v != i);
+            }
+            single.entry(key).or_default().push((bits64([q.x, q.y, q.z]), i));
+            mesh.positions[3 * i..3 * i + 3].copy_from_slice(&[q.x, q.y, q.z]);
+        }
+    }
 }
 
 /// PINCH (`BREP_TESS_PINCH_CUSP`): drop every pair of triangles that two DIFFERENT

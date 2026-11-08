@@ -445,6 +445,76 @@ pub(super) fn solve_miter(
     // seam); `None` is the default 1e-6 relative bar.
     symmetric_bar_override: Option<f64>,
 ) -> Result<MiterClosure, KernelRefusal> {
+    let solve = |curved_crossings: bool| {
+        solve_miter_ordered(
+            stripes,
+            radius,
+            chamfer,
+            sharp,
+            scale,
+            fit_tolerance,
+            consumed_band,
+            symmetric_bar_override,
+            curved_crossings,
+        )
+    };
+    match solve(false) {
+        // A reported model (2026-11-07): a curved canal pair whose
+        // sections cross the sibling canal TWICE. The far rail meets the
+        // sibling on the other branch while the seam continued from the
+        // shared rail is still well inside the strip (fraction 0.76 at the
+        // reported corner); the curved march took that far-rail crossing as
+        // the seam's exit, the exit point jumped across to the other branch
+        // and the fit bowed 1.9e-4 over the last span on every rung. Only a
+        // seam refused for leaving its carriers is re-marched with the
+        // two-crossing ordering; a re-march that also fails keeps the first
+        // refusal, so every corner that builds today is untouched.
+        Err(refusal) if is_marched_fit_off_carriers(&refusal) && miter_curved_crossings_on() => {
+            match solve(true) {
+                Ok(closure) => {
+                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                        eprintln!("miter: {refusal}; re-marched with the two-crossing ordering and built");
+                    }
+                    super::record_count("count.miter.curved_crossings", 1);
+                    Ok(closure)
+                }
+                Err(second) => {
+                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                        eprintln!("miter: the two-crossing re-march refused too: {second}");
+                    }
+                    Err(refusal)
+                }
+            }
+        }
+        other => other,
+    }
+}
+
+/// `BREP_BLEND_MITER_CURVED_CROSSINGS=0`/`off` keeps a curved canal pair's
+/// seam on the first far-rail crossing even when its fit leaves its carriers
+/// (the refusal before 2026-11-07); on (the default) such a seam is
+/// re-marched with the two-crossing ordering straight canals always use.
+const MITER_CURVED_CROSSINGS_DEFAULT: bool = true;
+
+fn miter_curved_crossings_on() -> bool {
+    switch!(live "BREP_BLEND_MITER_CURVED_CROSSINGS", MITER_CURVED_CROSSINGS_DEFAULT)
+}
+
+
+/// [`solve_miter`] with the section-crossing ordering chosen: `curved_crossings`
+/// applies the two-crossing ordering of two straight canals to any canal pair.
+#[allow(clippy::too_many_arguments)]
+fn solve_miter_ordered(
+    stripes: [&MiterStripe<'_>; 2],
+    radius: f64,
+    chamfer: bool,
+    sharp: &EdgeRecord,
+    scale: f64,
+    fit_tolerance: f64,
+    consumed_band: f64,
+    symmetric_bar_override: Option<f64>,
+    curved_crossings: bool,
+) -> Result<MiterClosure, KernelRefusal> {
     let [first, second] = stripes;
     // The bar the EXIT is bisected to, and the exit is an endpoint of the
     // fitted seam, so its error does not stay local — it tilts the whole curve
@@ -464,6 +534,9 @@ pub(super) fn solve_miter(
     let two_straight_canals = !chamfer
         && first.center()?.straight_segment(straight_bar).is_some()
         && center_second.straight_segment(straight_bar).is_some();
+    // The two-crossing ordering: always for two straight canals, and for a
+    // curved pair when `solve_miter` re-marches a seam that left its carriers.
+    let two_crossings = two_straight_canals || (curved_crossings && !chamfer);
     // Distance-to-the-sibling's-spine level: zero where a point of stripe 0
     // lies on stripe 1.  A CHAMFER's wall is the chord ruling INSIDE that
     // canal, not the canal, so the level asks the same question of the right
@@ -532,7 +605,7 @@ pub(super) fn solve_miter(
             return Ok(Some((0.0, first.point(u_start, 0.0)?)));
         }
         let at_far = level(u, 1.0)?;
-        if at_far >= 0.0 && !two_straight_canals {
+        if at_far >= 0.0 && !two_crossings {
             return Ok(None);
         }
         let at_near = level(u, 0.0)?;
@@ -617,7 +690,7 @@ pub(super) fn solve_miter(
             // With two section crossings the other branch may have left
             // this rail earlier. Its level is already positive here and
             // cannot bracket the exit of the seam we are following.
-            if !two_straight_canals {
+            if !two_crossings {
                 candidates.push((0, bisect(previous_u, u, f_low, &mut predicate, bar)?));
             } else if f_low <= 0.0 {
                 let candidate = bisect(previous_u, u, f_low, &mut predicate, bar)?;
@@ -665,7 +738,7 @@ pub(super) fn solve_miter(
         let found = station(u_exit).map(|found| found.map(|(fraction, point)| (fraction, past_second(point).map_or(f64::NAN, |value| value))));
         eprintln!(
             "miter exit: leaves {leaves_first} at u {u_exit:.17} (start {u_start:.6}, end {u_end:.6}); levels near {near:.3e} far {far:.3e}; \
-             far rail past stripe 1 {past:.3e}; station {found:?}; fit tolerance {fit_tolerance:.3e}; two straight canals {two_straight_canals}"
+             far rail past stripe 1 {past:.3e}; station {found:?}; fit tolerance {fit_tolerance:.3e}; two straight canals {two_straight_canals}; two crossings {two_crossings}"
         );
     }
     // The exit through stripe 1's far rail stands only where the seam

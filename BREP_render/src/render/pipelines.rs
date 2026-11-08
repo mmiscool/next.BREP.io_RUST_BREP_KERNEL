@@ -131,6 +131,47 @@ impl RenderCore {
             cache: None,
         });
 
+        // A Line art step's outlines (`vs_hull`), drawn after the faces:
+        // double-sided, depth-tested but not written, no bias (the shader
+        // pushes it back, at most to the far plane, which the camera's depth
+        // range is fitted to: LessEqual keeps what lands exactly there).
+        let hull_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("line art outline"),
+            layout: Some(&solid_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_hull"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<MeshVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_hull"),
+                compilation_options: Default::default(),
+                targets: &[color_target(None)],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample,
+            multiview_mask: None,
+            cache: None,
+        });
+
         let context_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("work part context"),
             layout: Some(&solid_layout),
@@ -447,6 +488,12 @@ impl RenderCore {
             axis_y: StyleBuf::new(&device, &style_layout, "axis-y"),
             axis_z: StyleBuf::new(&device, &style_layout, "axis-z"),
             overlay_line: StyleBuf::new(&device, &style_layout, "overlay-line"),
+            line_art_placed_face: StyleBuf::new(&device, &style_layout, "line-art-placed-face"),
+            line_art_adding_face: StyleBuf::new(&device, &style_layout, "line-art-adding-face"),
+            line_art_placed_edge: StyleBuf::new(&device, &style_layout, "line-art-placed-edge"),
+            line_art_adding_edge: StyleBuf::new(&device, &style_layout, "line-art-adding-edge"),
+            line_art_placed_outline: StyleBuf::new(&device, &style_layout, "line-art-placed-outline"),
+            line_art_adding_outline: StyleBuf::new(&device, &style_layout, "line-art-adding-outline"),
         };
 
         let identity_model = IdentityModel::new(&device, &queue, &model_layout);
@@ -469,6 +516,7 @@ impl RenderCore {
             model_layout,
             identity_model,
             mesh_pipeline,
+            hull_pipeline,
             wire_pipeline,
             edge_visible_pipeline,
             edge_hidden_pipeline,

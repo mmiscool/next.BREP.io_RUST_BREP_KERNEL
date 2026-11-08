@@ -640,6 +640,10 @@ struct PreparedFace {
     generic: std::cell::OnceCell<Result<GenericPrep, String>>,
     /// The spherical trim lane's region, built from `generic`'s samples.
     sphere_region: std::cell::OnceCell<Result<crate::sphere_chart::SphericalRegion, String>>,
+    /// The same region from a reduced boundary, with the margin within which it
+    /// may differ from `sphere_region` ([`build_sphere_region_reduced`]); `None`
+    /// for a trim too small to reduce.
+    sphere_region_reduced: std::cell::OnceCell<Result<Option<(crate::sphere_chart::SphericalRegion, f64)>, String>>,
     /// Each loop's trim samples at [`trim_station`] `0..count` per pcurve, in
     /// coedge order, taken once and shared by the sphere-cap, wrapped-horizon
     /// and generic lanes ([`loop_samples`]); one entry per loop, filled the
@@ -656,6 +660,7 @@ impl PreparedFace {
             rim_strip: std::cell::OnceCell::new(),
             generic: std::cell::OnceCell::new(),
             sphere_region: std::cell::OnceCell::new(),
+            sphere_region_reduced: std::cell::OnceCell::new(),
             loop_samples: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -1869,6 +1874,21 @@ fn sphere_chart_point_in_face(
     let Some(atlas) = sphere_chart_atlas(face) else {
         return Ok(None);
     };
+    if sphere_region_reduced_enabled() {
+        let reduced = lane(&prepared.sphere_region_reduced, || build_sphere_region_reduced(face, &atlas, sampled))?;
+        if let Some((region, margin)) = reduced {
+            if !region.is_whole_sphere() && region.is_decidable() {
+                let probe = face.surface.evaluate(point.x, point.y)?;
+                if region.clear_of_boundary(atlas.centre, probe, *margin) {
+                    return Ok(Some(if region.contains(atlas.centre, probe) {
+                        PolygonClass::Inside
+                    } else {
+                        PolygonClass::Outside
+                    }));
+                }
+            }
+        }
+    }
     let region = lane(&prepared.sphere_region, || build_sphere_region(face, &atlas, sampled))?;
     if region.is_whole_sphere() {
         return Ok(Some(PolygonClass::Inside));
@@ -1884,6 +1904,113 @@ fn sphere_chart_point_in_face(
     } else {
         PolygonClass::Outside
     }))
+}
+
+/// `BREP_SPHERE_REGION_REDUCED` (default on, `=0` restores): see
+/// [`build_sphere_region_reduced`].
+fn sphere_region_reduced_enabled() -> bool {
+    crate::switch!("BREP_SPHERE_REGION_REDUCED", true)
+}
+
+/// Trims with fewer samples than this build only the full region.
+const REDUCED_REGION_SAMPLES: usize = 4096;
+
+/// [`build_sphere_region`] from a reduced boundary, and the margin (radians on the
+/// unit sphere) within which its answer may differ from the full region's.
+///
+/// The trim samples come from each pcurve's knots, not from the curve: a dimple's
+/// rim on a ball, an exact circle, carries a fitted pcurve of 270 to 880 control
+/// points and so 4 000 to 14 000 samples, and brep-bench boolean/golf-ball's ball
+/// face after 54 cuts had 540 000, which every cut's imprint rebuilt the region
+/// from (0.55 s a build, 50 of the case's 85 s). Each coedge's samples are kept
+/// at a stride `k` counted from both of its ends (sample `i` stays when
+/// `min(i, n - 1 - i)` is a multiple of `k`), so a coedge and its reverse keep the
+/// same samples whatever their rounding; `k` is the largest of 32, 16, 8, 4, 2
+/// whose dropped samples all lie within a tenth of the coedge's median chord
+/// angle of the kept arcs, MEASURED. The regions differ only within the largest
+/// such deviation of the kept arcs (plus the 1e-9 canonicalization of both), so a
+/// point farther than twice it from every kept arc is material in one exactly
+/// when it is in the other ([`SphericalRegion::clear_of_boundary`]); any other
+/// point is read on the full region, built then.
+fn build_sphere_region_reduced(
+    face: &FaceRecord,
+    atlas: &crate::sphere_chart::SphereAtlas,
+    sampled: &[LoopSamples],
+) -> Result<Option<(crate::sphere_chart::SphericalRegion, f64)>, String> {
+    use crate::sphere_chart::{arc_distance, arc_normal};
+    let total: usize = sampled.iter().map(|samples| samples.polygon.len()).sum();
+    if total < REDUCED_REGION_SAMPLES {
+        return Ok(None);
+    }
+    let mut uses: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for slot in coedge_slots(face) {
+        *uses.entry(slot as u64).or_insert(0) += 1;
+    }
+    let outward_face_normal = face.same_sense == atlas.parameterization_is_outward(&face.surface)?;
+    let mut points: Vec<Vec3> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut deviation = 0.0f64;
+    for samples in sampled {
+        let count = samples.polygon.len();
+        if count < 2 {
+            continue;
+        }
+        for &(edge_id, first, span) in &samples.coedges {
+            if span == 0 || uses.get(&edge_id).copied().unwrap_or(0) >= 2 {
+                continue;
+            }
+            let mut along: Vec<Vec3> = Vec::with_capacity(span + 1);
+            for offset in 0..=span {
+                let uv = samples.polygon[(first + offset) % count];
+                along.push(face.surface.evaluate(uv.x, uv.y)?);
+            }
+            let Ok(units) = along.iter().map(|p| p.sub(atlas.centre).normalized()).collect::<Result<Vec<_>, _>>() else {
+                return Ok(None);
+            };
+            let last = along.len() - 1;
+            let mut chords: Vec<f64> = units.windows(2).map(|pair| pair[0].sub(pair[1]).length()).collect();
+            chords.sort_by(f64::total_cmp);
+            let target = 0.1 * chords[chords.len() / 2];
+            let mut kept: Vec<usize> = (0..=last).collect();
+            let mut kept_deviation = 0.0f64;
+            for stride in [32usize, 16, 8, 4, 2] {
+                if last < 2 * stride {
+                    continue;
+                }
+                let indices: Vec<usize> = (0..=last).filter(|&i| i.min(last - i) % stride == 0).collect();
+                let mut worst = 0.0f64;
+                for pair in indices.windows(2) {
+                    let (a, b) = (units[pair[0]], units[pair[1]]);
+                    let normal = arc_normal(a, b);
+                    for j in pair[0] + 1..pair[1] {
+                        worst = worst.max(arc_distance(a, b, normal, units[j]));
+                    }
+                }
+                if worst <= target {
+                    kept = indices;
+                    kept_deviation = worst;
+                    break;
+                }
+            }
+            deviation = deviation.max(kept_deviation);
+            let start = points.len();
+            points.extend(kept.iter().map(|&i| along[i]));
+            spans.push((start, points.len()));
+        }
+    }
+    if 2 * points.len() > total {
+        return Ok(None);
+    }
+    crate::sphere_chart::canonicalize_points(&mut points, 1e-9);
+    let mut boundary: Vec<(Vec3, Vec3)> = Vec::new();
+    for (first, last) in spans {
+        for index in first..last.saturating_sub(1) {
+            boundary.push((points[index], points[index + 1]));
+        }
+    }
+    let region = crate::sphere_chart::SphericalRegion::from_segments(atlas.centre, &boundary, outward_face_normal);
+    let rounding = 4e-9 / atlas.radius.max(f64::MIN_POSITIVE);
+    Ok(Some((region, 2.0 * deviation + rounding)))
 }
 
 /// The spherical region [`sphere_chart_point_in_face`] reads `face` against,

@@ -1,6 +1,6 @@
 [package]
 name = "BREP_kernel"
-version = "0.13.2"
+version = "0.14.0"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "A boundary representation (BREP) geometry kernel for building CAD applications."

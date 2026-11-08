@@ -197,7 +197,17 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
   }
 
   // ---------- 3D ----------
-  var canvas = $('canvas'), gl = null, gl2 = false, prog = null, lines = null, meshes = [], view = null;
+  var canvas = $('canvas'), gl = null, gl2 = false, prog = null, lines = null, hull = null, arrowBuf = null, meshes = [], view = null;
+  // Line art (data.style 'lineArt', the default for a new document): the
+  // step pictures' look (BREP_render thumbnail/line_art.rs) — a light grey
+  // ground, the placed parts flat white with grey lines and a dark grey
+  // outline, the parts the step adds flat blue under a heavy black outline,
+  // each sliding in along a thin black arrow with a filled head at its seat.
+  var LA = { ground: [0.925, 0.925, 0.925], placed: [1, 1, 1, 1], adding: [0.616, 0.722, 0.961, 1],
+    placedEdge: [0.55, 0.55, 0.55, 1], ink: [0, 0, 0, 1], placedOutline: [0.30, 0.30, 0.30, 1],
+    placedOutlinePx: 1.5, addingOutlinePx: 2.5, push: 0.01, shaftPx: 2.6, headPx: 20, headWidthPx: 14 };
+  // For automation: hold the insertion at a fraction (0 = start, 1 = home).
+  var held = null, arrowsDrawn = 0;
   // The edge colour the step pictures draw (BREP_render thumbnail.rs).
   var EDGE = [0.10, 0.11, 0.13], showEdges = true;
   // The camera is the app's ViewCamera (BREP_render view.rs): an eye, a
@@ -224,9 +234,10 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
     if (!gl) return false;
     var vs = 'attribute vec3 p; attribute vec3 n; uniform mat4 mvp; uniform mat4 model; varying vec3 vn;' +
       'void main(){ vn = (model * vec4(n, 0.0)).xyz; gl_Position = mvp * vec4(p, 1.0); }';
-    var fs = 'precision mediump float; varying vec3 vn; uniform vec4 color;' +
+    // `unlit`: a Line art step's flat fill.
+    var fs = 'precision mediump float; varying vec3 vn; uniform vec4 color; uniform float unlit;' +
       'void main(){ vec3 l = normalize(vec3(0.4, 0.7, 0.6)); float d = abs(dot(normalize(vn), l));' +
-      ' gl_FragColor = vec4(color.rgb * (0.35 + 0.65 * d), color.a); }';
+      ' gl_FragColor = unlit > 0.5 ? color : vec4(color.rgb * (0.35 + 0.65 * d), color.a); }';
     var compile = function (type, src) {
       var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
       if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
@@ -242,6 +253,7 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
     prog.mvp = gl.getUniformLocation(prog, 'mvp');
     prog.model = gl.getUniformLocation(prog, 'model');
     prog.color = gl.getUniformLocation(prog, 'color');
+    prog.unlit = gl.getUniformLocation(prog, 'unlit');
     var lvs = 'attribute vec3 p; uniform mat4 mvp; void main(){ gl_Position = mvp * vec4(p, 1.0); }';
     var lfs = 'precision mediump float; uniform vec4 color; void main(){ gl_FragColor = color; }';
     lines = gl.createProgram();
@@ -252,6 +264,39 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
     lines.p = gl.getAttribLocation(lines, 'p');
     lines.mvp = gl.getUniformLocation(lines, 'mvp');
     lines.color = gl.getUniformLocation(lines, 'color');
+    // A Line art step's outline: the mesh pushed out along its normals by
+    // `px` (NDC per unit of w) and back in depth by `push`, in flat ink,
+    // drawn before the faces so only the ring round its silhouette stays.
+    // Each vertex moved in world space along the part of its normal across
+    // the screen by `px` CSS px (measured through the projection at the
+    // vertex: `vpx` is the viewport in physical px) and back along the view
+    // direction `fwd` by that distance (and the faces' polygon offset, ~3 px
+    // more) times the face's slope (capped), plus
+    // `push` in clip depth: a face moved sideways comes forward by its slope,
+    // so the copy stays behind its own body and only the ring round the
+    // silhouette is left.
+    var hvs = 'attribute vec3 p; attribute vec3 n; uniform mat4 vp; uniform mat4 model; uniform vec3 fwd; uniform vec2 vpx; uniform float px; uniform float push;' +
+      'void main(){ vec3 w = (model * vec4(p, 1.0)).xyz; vec3 m = w; vec3 wn = (model * vec4(n, 0.0)).xyz; float nl = length(wn);' +
+      ' if (nl > 1e-12) { wn /= nl; float along = dot(wn, fwd); vec3 across = wn - fwd * along; float al = length(across);' +
+      '  if (al > 1e-6) { vec3 dir = across / al; vec4 c0 = vp * vec4(w, 1.0); vec4 cd = vp * vec4(dir, 0.0);' +
+      '   float ppw = length(cd.xy * vpx * 0.5) / max(abs(c0.w), 1e-9); float d = px / max(ppw, 1e-12);' +
+      '   float back = (px + 3.0) / max(ppw, 1e-12); float slope = min(al / max(abs(along), 0.15), 6.0); m = w + dir * d + fwd * (back * slope); } }' +
+      ' vec4 c = vp * vec4(m, 1.0); c.z = min(c.z + push * c.w, c.w); gl_Position = c; }';
+    hull = gl.createProgram();
+    gl.attachShader(hull, compile(gl.VERTEX_SHADER, hvs));
+    gl.attachShader(hull, compile(gl.FRAGMENT_SHADER, lfs));
+    gl.linkProgram(hull);
+    if (!gl.getProgramParameter(hull, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(hull));
+    hull.p = gl.getAttribLocation(hull, 'p');
+    hull.n = gl.getAttribLocation(hull, 'n');
+    hull.vp = gl.getUniformLocation(hull, 'vp');
+    hull.vpx = gl.getUniformLocation(hull, 'vpx');
+    hull.px = gl.getUniformLocation(hull, 'px');
+    hull.push = gl.getUniformLocation(hull, 'push');
+    hull.color = gl.getUniformLocation(hull, 'color');
+    hull.model = gl.getUniformLocation(hull, 'model');
+    hull.fwd = gl.getUniformLocation(hull, 'fwd');
+    arrowBuf = gl.createBuffer();
     meshes = data.meshes.map(function (m) {
       var pos = decode(m.positions, Float32Array), nor = decode(m.normals, Float32Array), idx = decode(m.indices, Uint32Array);
       var seg = m.edges ? decode(m.edges, Float32Array) : new Float32Array(0);
@@ -361,15 +406,18 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
     var w = canvas.clientWidth * devicePixelRatio | 0, h = canvas.clientHeight * devicePixelRatio | 0;
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
     gl.viewport(0, 0, w, h);
-    gl.clearColor(0.075, 0.106, 0.141, 1);
+    var lineArt = data.style === 'lineArt';
+    if (lineArt) gl.clearColor(LA.ground[0], LA.ground[1], LA.ground[2], 1); else gl.clearColor(0.075, 0.106, 0.141, 1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     gl.enable(gl.DEPTH_TEST);
     gl.useProgram(prog);
+    gl.uniform1f(prog.unlit, 0);
     var dist = distance(), aspect = w / Math.max(1, h), far = dist + cam.radius * 8, near = Math.max(dist / 1000, 1e-4);
     var proj = cam.ortho ? ortho(effectiveHalf(), aspect, -far, far) : perspective(cam.fov, aspect, near, far);
     var vp = mul(proj, lookAt(cam.eye, cam.target, cam.up));
-    var t = anim.running ? Math.min(1, (now - anim.start) / DURATION) : 1;
-    var ease = 1 - Math.pow(1 - t, 3);
+    var t = held !== null ? held : anim.running ? Math.min(1, (now - anim.start) / DURATION) : 1;
+    // A held insertion stands exactly at the fraction asked for.
+    var ease = held !== null ? held : 1 - Math.pow(1 - t, 3);
     // The step's motion (a study's published frames), when it has one: its
     // frame poses the nodes in place of the insertion slide and the view's
     // explode poses.
@@ -416,14 +464,23 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
     };
     // The edges over the faces, as the viewport draws them: the faces are
     // pushed back a little so a line on a face is not lost in it.
-    var drawEdges = function (i, alpha) {
+    var drawEdges = function (i, alpha, rgb) {
       var m = meshes[data.nodes[i].mesh];
       if (!m.e) return;
+      var ink = rgb || EDGE;
       gl.uniformMatrix4fv(lines.mvp, false, mul(vp, modelOf(i)));
-      gl.uniform4fv(lines.color, [EDGE[0], EDGE[1], EDGE[2], alpha]);
+      gl.uniform4fv(lines.color, [ink[0], ink[1], ink[2], alpha]);
       gl.bindBuffer(gl.ARRAY_BUFFER, m.e); gl.enableVertexAttribArray(lines.p); gl.vertexAttribPointer(lines.p, 3, gl.FLOAT, false, 0, 0);
       gl.drawArrays(gl.LINES, 0, m.edgeCount);
     };
+    if (lineArt) {
+      drawLineArt(adding, placed, modelOf, drawNode, drawEdges, vp, w, h, cam.radius * LA.push / Math.max(far, 1e-9));
+      arrowsDrawn = drawArrows(insertionArrows(step, modelOf, ease, mf, vp), vp, w, h);
+      drawPmi(step, vp);
+      if ((t < 1 && held === null) || (motion && mplaying)) requestAnimationFrame(draw); else anim.running = false;
+      return;
+    }
+    arrowsDrawn = 0;
     gl.enable(gl.POLYGON_OFFSET_FILL);
     gl.polygonOffset(1, 1);
     gl.disable(gl.BLEND);
@@ -450,6 +507,171 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
     drawPmi(step, vp);
     if (t < 1 || (motion && mplaying)) requestAnimationFrame(draw); else anim.running = false;
   }
+  // ---------- Line art ----------
+  // The flat fills first, opaque with depth writes so no hidden line shows
+  // through; then the outlines: each part's mesh pushed out on screen and
+  // back in depth (`push`: LA.push of the step's radius, in clip depth),
+  // depth-tested but not written,
+  // so only the ring round its silhouette passes; then the visible edges in
+  // the tier's ink.
+  function drawLineArt(adding, placed, modelOf, drawNode, drawEdges, vp, w, h, push) {
+    gl.disable(gl.BLEND);
+    gl.depthMask(true);
+    gl.useProgram(prog);
+    gl.uniform1f(prog.unlit, 1);
+    gl.enable(gl.POLYGON_OFFSET_FILL);
+    gl.polygonOffset(1, 1);
+    placed.forEach(function (i) { drawNode(i, LA.placed); });
+    adding.forEach(function (i) { drawNode(i, LA.adding); });
+    gl.uniform1f(prog.unlit, 0);
+    gl.disable(gl.POLYGON_OFFSET_FILL);
+    gl.useProgram(hull);
+    gl.disableVertexAttribArray(prog.n);
+    gl.depthMask(false);
+    gl.depthFunc(gl.LEQUAL);
+    var outline = function (i, px, color) {
+      var m = meshes[data.nodes[i].mesh];
+      gl.uniformMatrix4fv(hull.vp, false, vp);
+      gl.uniformMatrix4fv(hull.model, false, modelOf(i));
+      gl.uniform3fv(hull.fwd, norm(sub(cam.target, cam.eye)));
+      gl.uniform2f(hull.vpx, w, h);
+      gl.uniform1f(hull.px, px * devicePixelRatio);
+      gl.uniform1f(hull.push, push);
+      gl.uniform4fv(hull.color, color);
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.p); gl.enableVertexAttribArray(hull.p); gl.vertexAttribPointer(hull.p, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, m.n); gl.enableVertexAttribArray(hull.n); gl.vertexAttribPointer(hull.n, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, m.i);
+      gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0);
+    };
+    placed.forEach(function (i) { outline(i, LA.placedOutlinePx, LA.placedOutline); });
+    adding.forEach(function (i) { outline(i, LA.addingOutlinePx, LA.ink); });
+    gl.disableVertexAttribArray(hull.n);
+    gl.depthFunc(gl.LESS);
+    gl.depthMask(true);
+    if (showEdges) {
+      gl.useProgram(lines);
+      placed.forEach(function (i) { drawEdges(i, 1, LA.placedEdge); });
+      adding.forEach(function (i) { drawEdges(i, 1, LA.ink); });
+    }
+  }
+  // A node's world bounds through `model` (its mesh's box corners).
+  function worldBox(i, model) {
+    var m = meshes[data.nodes[i].mesh], lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    for (var c = 0; c < 8; c++) {
+      var p = [(c & 1) ? m.hi[0] : m.lo[0], (c & 2) ? m.hi[1] : m.lo[1], (c & 4) ? m.hi[2] : m.lo[2]];
+      for (var k = 0; k < 3; k++) {
+        var v = model[k] * p[0] + model[4 + k] * p[1] + model[8 + k] * p[2] + model[12 + k];
+        lo[k] = Math.min(lo[k], v); hi[k] = Math.max(hi[k], v);
+      }
+    }
+    return { lo: lo, hi: hi };
+  }
+  // An arrow for a group of nodes (`box`, their bounds at home) whose motion
+  // starts `start` away from home, `left` of it still to go: from their
+  // leading face where they are to their leading face at home; with `vp`,
+  // from the edge of their screen outline (on their centre line, on the side
+  // they travel toward) to where that point lands at home, so it never
+  // crosses them and is gone once they are seated.
+  function seatArrow(box, start, left, vp) {
+    var len = Math.hypot(start[0], start[1], start[2]);
+    if (!(len > 1e-12) || !isFinite(box.lo[0])) return null;
+    var d = [-start[0] / len, -start[1] / len, -start[2] / len];
+    var c = [0, 1, 2].map(function (k) { return (box.lo[k] + box.hi[k]) / 2; });
+    var hh = 0.5 * [0, 1, 2].reduce(function (s, k) { return s + (box.hi[k] - box.lo[k]) * Math.abs(d[k]); }, 0);
+    var lead = hh;
+    if (vp) {
+      var ndc = function (p) {
+        var q = vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15];
+        return [(vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12]) / q, (vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13]) / q];
+      };
+      var eps = hh > 0 ? hh : len * 0.01, a = ndc(c), b = ndc([c[0] + d[0] * eps, c[1] + d[1] * eps, c[2] + d[2] * eps]);
+      var sd = [(b[0] - a[0]) / eps, (b[1] - a[1]) / eps], sl = Math.hypot(sd[0], sd[1]);
+      if (sl > 1e-12) {
+        var u = [sd[0] / sl, sd[1] / sl], reach = -Infinity;
+        for (var k = 0; k < 8; k++) {
+          var p = ndc([(k & 1) ? box.hi[0] : box.lo[0], (k & 2) ? box.hi[1] : box.lo[1], (k & 4) ? box.hi[2] : box.lo[2]]);
+          reach = Math.max(reach, (p[0] - a[0]) * u[0] + (p[1] - a[1]) * u[1]);
+        }
+        lead = Math.max(hh, reach / sl);
+      }
+    }
+    // Both ends at that point of the outline: where the parts are and where
+    // it lands at home, so the arrow is the travel left.
+    var home = [0, 1, 2].map(function (k) { return c[k] + d[k] * lead; });
+    var from = [0, 1, 2].map(function (k) { return home[k] + start[k] * left; });
+    return left * len > len * 1e-3 ? [from, home] : null;
+  }
+  // The step's arrows: one per insertion arrow while its parts slide home
+  // (gone once they are), and one per exploded part of the step's view from
+  // where it is exploded to its seat.
+  function insertionArrows(step, modelOf, ease, mf, vp) {
+    var out = [];
+    if (mf) return out;
+    var groups = {};
+    (step.insertion || []).forEach(function (ins) {
+      var key = ins.arrow || 0, g = groups[key] || (groups[key] = { lo: [Infinity, Infinity, Infinity], hi: [-Infinity, -Infinity, -Infinity], offset: ins.offset, nodes: {} });
+      var node = data.nodes[ins.node], home = new Float32Array(node.matrix);
+      var ex = (step.poses || []).filter(function (p) { return p.node === ins.node; })[0];
+      if (ex) home = mul(new Float32Array(ex.matrix), home);
+      var b = worldBox(ins.node, home);
+      for (var k = 0; k < 3; k++) { g.lo[k] = Math.min(g.lo[k], b.lo[k]); g.hi[k] = Math.max(g.hi[k], b.hi[k]); }
+      g.nodes[ins.node] = true;
+    });
+    Object.keys(groups).forEach(function (key) {
+      var g = groups[key], a = seatArrow(g, g.offset, 1 - ease, vp);
+      if (a) out.push(a);
+    });
+    var sliding = {};
+    Object.keys(groups).forEach(function (key) { Object.keys(groups[key].nodes).forEach(function (n) { sliding[n] = true; }); });
+    (step.poses || []).forEach(function (pose) {
+      if (sliding[pose.node]) return;
+      var node = data.nodes[pose.node], home = new Float32Array(node.matrix);
+      var seated = worldBox(pose.node, home), posed = worldBox(pose.node, mul(new Float32Array(pose.matrix), home));
+      var move = [0, 1, 2].map(function (k) { return (posed.lo[k] + posed.hi[k]) / 2 - (seated.lo[k] + seated.hi[k]) / 2; });
+      var a = seatArrow(seated, move, 1, vp);
+      if (a) out.push(a);
+    });
+    return out;
+  }
+  // Thin solid black shafts and filled black heads at the seat, in screen
+  // space over everything. Returns how many were drawn.
+  function drawArrows(list, vp, w, h) {
+    if (!list.length) return 0;
+    var tri = [], sx = 2 * devicePixelRatio / Math.max(1, w), sy = 2 * devicePixelRatio / Math.max(1, h);
+    var ndc = function (p) {
+      var x = vp[0] * p[0] + vp[4] * p[1] + vp[8] * p[2] + vp[12], y = vp[1] * p[0] + vp[5] * p[1] + vp[9] * p[2] + vp[13], q = vp[3] * p[0] + vp[7] * p[1] + vp[11] * p[2] + vp[15];
+      return [x / q, y / q];
+    };
+    var drawn = 0;
+    list.forEach(function (a) {
+      var p = ndc(a[0]), q = ndc(a[1]);
+      // In CSS px, so the widths are screen-constant.
+      var dx = (q[0] - p[0]) / sx, dy = (q[1] - p[1]) / sy, len = Math.hypot(dx, dy);
+      if (len < 2) return;
+      var ux = dx / len, uy = dy / len, head = Math.min(LA.headPx, len * 0.6);
+      var base = [q[0] - ux * head * sx, q[1] - uy * head * sy];
+      var nx = -uy, ny = ux, hw = LA.shaftPx / 2, hh = LA.headWidthPx / 2;
+      var at = function (o, s, t) { return [o[0] + nx * s * sx + ux * t * sx, o[1] + ny * s * sy + uy * t * sy]; };
+      var a0 = at(p, hw, 0), a1 = at(p, -hw, 0), b0 = at(base, hw, 0), b1 = at(base, -hw, 0);
+      var h0 = at(base, hh, 0), h1 = at(base, -hh, 0);
+      [a0, a1, b0, a1, b1, b0, h0, h1, q].forEach(function (v) { tri.push(v[0], v[1], 0); });
+      drawn++;
+    });
+    if (!tri.length) return 0;
+    gl.useProgram(lines);
+    gl.disableVertexAttribArray(prog.n);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.BLEND);
+    gl.uniformMatrix4fv(lines.mvp, false, new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]));
+    gl.uniform4fv(lines.color, LA.ink);
+    gl.bindBuffer(gl.ARRAY_BUFFER, arrowBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(tri), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(lines.p); gl.vertexAttribPointer(lines.p, 3, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, tri.length / 3);
+    gl.enable(gl.DEPTH_TEST);
+    return drawn;
+  }
+
   // ---------- PMI ----------
   // A step's view annotations (step.pmi): lines (the stroked text among
   // them) and filled arrowheads in world space, drawn over the parts in the
@@ -1389,9 +1611,13 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
       var st = steps[current];
       return { mode: mode, step: st ? st.id : null, index: current, steps: steps.length, done: Object.keys(done), webgl: !!gl, webgl2: gl2, animating: anim.running,
         edges: meshes.filter(function (m) { return m.edgeCount > 0; }).length, tab: tab,
-        pmi: st && st.pmi ? st.pmi.annotations : 0, pmiShown: showPmi && !!(st && st.pmi) };
+        pmi: st && st.pmi ? st.pmi.annotations : 0, pmiShown: showPmi && !!(st && st.pmi),
+        style: data.style || 'shaded', arrows: arrowsDrawn, held: held };
     },
     go: go,
+    // For automation: hold the step's insertion at `fraction` (0 = where
+    // the parts start, 1 = seated); null lets it play again.
+    hold: function (fraction) { held = (fraction === null || fraction === undefined) ? null : Math.max(0, Math.min(1, +fraction)); anim.running = false; redraw(); return held; },
     camera: function () {
       return { eye: cam.eye.slice(), target: cam.target.slice(), up: basis().up, ortho: cam.ortho, halfHeight: effectiveHalf(), fovDeg: cam.fov,
         width: camWidth(), height: camHeight(), worldPerPixel: worldPerPixel() };

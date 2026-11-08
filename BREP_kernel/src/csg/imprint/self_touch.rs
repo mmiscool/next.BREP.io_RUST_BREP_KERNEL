@@ -348,6 +348,7 @@ pub(crate) fn self_touch_edge_splits(
                 edge,
                 parameter,
                 tolerance,
+                f64::INFINITY,
             )?;
         }
     }

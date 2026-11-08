@@ -505,6 +505,23 @@ fn reuse_hull_gate_enabled() -> bool {
     switch!("BREP_SHARED_SECTION_HULL_GATE", true)
 }
 
+/// `BREP_SHARED_SECTION_STRADDLE` (2026-11-07): the
+/// two-sided common block only counts a second support face as already
+/// carrying the section when ITS boundary copy lies on the owning face's copy
+/// — no farther from it than the section itself is (floored at the weld
+/// radius). Two copies that STRADDLE the section are two distinct 1-cells:
+/// the reported shelled box's inward offsets of a bore torus fillet and a
+/// side-edge cylinder fillet meet at an angle, so each carrier's inherited
+/// trim sits 2.0e-2 off the true section, on opposite sides, 4.1e-2 apart —
+/// inside the 1e-3·extent reuse band, but no weld can fuse them, and dropping
+/// the cut from both left six one-use edges (non-integral genus). The
+/// straddling face now keeps its cut (whose pcurve rebuild then fails the
+/// carrier floor, so the true section cuts both carriers). On by default;
+/// `0`/`off` restores the unconditional two-sided drop.
+fn shared_section_straddle_enabled() -> bool {
+    switch!("BREP_SHARED_SECTION_STRADDLE", true)
+}
+
 
 pub(super) fn reuse_boundary_section_edges(
     result: &mut ImprintResultRecord,
@@ -672,6 +689,9 @@ pub(super) fn reuse_boundary_section_edges(
         // face whose boundary carries the section so the apply loop can decline
         // to cut all of them.
         let mut redundant: Vec<FaceKey> = Vec::new();
+        // Each redundant face's closest boundary sub-arc, for the straddle
+        // check below (`BREP_SHARED_SECTION_STRADDLE`).
+        let mut redundant_arcs: Vec<(FaceKey, NurbsCurve, f64)> = Vec::new();
         for face_key in &piece.support_faces {
             let Some(edges) = face_edge_lists.get(face_key) else {
                 continue;
@@ -771,6 +791,14 @@ pub(super) fn reuse_boundary_section_edges(
                     if !redundant.contains(face_key) {
                         redundant.push(*face_key);
                     }
+                    match redundant_arcs.iter_mut().find(|(key, _, _)| key == face_key) {
+                        Some(entry) if span_dev < entry.2 => {
+                            entry.1 = arc.clone();
+                            entry.2 = span_dev;
+                        }
+                        Some(_) => {}
+                        None => redundant_arcs.push((*face_key, arc.clone(), span_dev)),
+                    }
                     if span_dev < best_score {
                         best_score = span_dev;
                         chosen = Some(Reuse {
@@ -786,6 +814,36 @@ pub(super) fn reuse_boundary_section_edges(
             }
         }
         if let Some(mut reuse) = chosen {
+            // Straddle check (`BREP_SHARED_SECTION_STRADDLE`): another face's
+            // boundary copy is the SAME 1-cell as the owning copy only when it
+            // lies no farther from it than the section does (weld-floored).
+            if shared_section_straddle_enabled() && redundant.len() > 1 {
+                let bar = endpoint_gate.max(best_score);
+                let mut kept = Vec::with_capacity(redundant.len());
+                for key in redundant {
+                    if key == reuse.owning {
+                        kept.push(key);
+                        continue;
+                    }
+                    let Some((_, other, _)) = redundant_arcs.iter().find(|(k, _, _)| *k == key) else {
+                        continue;
+                    };
+                    let apart = match (max_curve_deviation(other, &reuse.arc), max_curve_deviation(&reuse.arc, other)) {
+                        (Ok(a), Ok(b)) => a.max(b),
+                        _ => f64::INFINITY,
+                    };
+                    if debug {
+                        eprintln!(
+                            "shared-section STRADDLE? piece {} face {}:{} copies apart={apart:.3e} bar={bar:.3e}",
+                            piece.id, key.operand, key.face_id
+                        );
+                    }
+                    if apart <= bar {
+                        kept.push(key);
+                    }
+                }
+                redundant = kept;
+            }
             // Escape hatch BREP_SHARED_SECTION_BOTH=0: drop the cut from the
             // owning face only, as before the two-sided case was handled.
             reuse.redundant = if std::env::var("BREP_SHARED_SECTION_BOTH").as_deref() == Ok("0") {

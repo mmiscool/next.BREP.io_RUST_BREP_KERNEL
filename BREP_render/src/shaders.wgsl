@@ -70,6 +70,10 @@ fn vs_mesh(
 }
 
 fn mesh_color(in: MeshOut) -> vec3<f32> {
+    // Unlit (params.y): the flat fill of a Line art instructions step.
+    if (style.params.y > 0.5) {
+        return srgb_encode(style.color.rgb);
+    }
     var n = normalize(in.normal);
     if (style.params.x > 0.5) {
         // Flat shading: face normal from screen-space derivatives.
@@ -332,4 +336,55 @@ fn vs_overlay_line(
 @fragment
 fn fs_overlay_line(in: OverlayLineOut) -> @location(0) vec4<f32> {
     return in.color;
+}
+
+// ---------------------------------------------------------------------------
+// Line art outline: each vertex moved, in world space, along the part of its
+// normal across the screen by params.x CSS px (measured through view_proj at
+// the vertex), and back along the view direction by that distance (and the
+// faces' own slope-scaled depth bias, ~3 px more) times the face's slope
+// (capped), plus params.y of the depth range; drawn in flat ink
+// (sRGB) AFTER the faces without depth writes. A face moved sideways by d
+// comes forward by d times its slope, so moving it back by as much keeps the
+// copy behind its own body: over the body it fails the depth test and only the
+// ring round the silhouette is left, over the ground or anything further back.
+// ---------------------------------------------------------------------------
+
+@vertex
+fn vs_hull(
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+) -> @builtin(position) vec4<f32> {
+    let world = (pose.model * vec4<f32>(position, 1.0)).xyz;
+    let fwd = normalize(globals.forward.xyz);
+    var n = (pose.normal * vec4<f32>(normal, 0.0)).xyz;
+    let nl = length(n);
+    var moved = world;
+    if (nl > 1e-12) {
+        n = n / nl;
+        let along = dot(n, fwd);
+        let across = n - fwd * along;
+        let al = length(across);
+        if (al > 1e-6) {
+            let dir = across / al;
+            // Physical pixels per world unit along `dir` at this vertex.
+            let c0 = globals.view_proj * vec4<f32>(world, 1.0);
+            let cd = globals.view_proj * vec4<f32>(dir, 0.0);
+            let ppw = length(cd.xy * globals.viewport.xy * 0.5) / max(abs(c0.w), 1e-9);
+            let d = style.params.x * globals.viewport.z / max(ppw, 1e-12);
+            // The faces are drawn pushed back by their slope over about two
+            // pixels (the mesh pipeline's depth bias): go back past that too.
+            let back = (style.params.x + 3.0) * globals.viewport.z / max(ppw, 1e-12);
+            let slope = min(al / max(abs(along), 0.15), 6.0);
+            moved = world + dir * d + fwd * (back * slope);
+        }
+    }
+    var clip = globals.view_proj * vec4<f32>(moved, 1.0);
+    clip.z = min(clip.z + style.params.y * clip.w, clip.w);
+    return clip;
+}
+
+@fragment
+fn fs_hull() -> @location(0) vec4<f32> {
+    return vec4<f32>(style.color.rgb, 1.0);
 }

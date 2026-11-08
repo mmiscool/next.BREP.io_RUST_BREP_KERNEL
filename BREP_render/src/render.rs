@@ -32,6 +32,12 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Boundary-edge depth bias: NDC in orthographic, scaled by the remaining
 /// depth range in perspective (see vs_edge). Faces also carry rasterizer bias.
 const EDGE_NUDGE: f32 = 2e-4;
+/// A Line art step's outline widths outside the silhouette, CSS px.
+const LINE_ART_PLACED_OUTLINE_PX: f32 = 1.5;
+const LINE_ART_ADDING_OUTLINE_PX: f32 = 2.5;
+/// How far back (of the fitted depth range) an outline is pushed beyond what
+/// its faces' slopes call for (`vs_hull`).
+const LINE_ART_OUTLINE_DEPTH: f32 = 2e-3;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -287,6 +293,15 @@ struct GlobalStyles {
     axis_z: StyleBuf,
     /// Overlay-widget line width (CSS px in `params.x`); color is per-instance.
     overlay_line: StyleBuf,
+    /// A Line art instructions step ([`crate::scene::RenderScene::line_art`]):
+    /// the unlit fills, the visible edges and the outlines of the parts
+    /// earlier steps placed and of the parts the step adds.
+    line_art_placed_face: StyleBuf,
+    line_art_adding_face: StyleBuf,
+    line_art_placed_edge: StyleBuf,
+    line_art_adding_edge: StyleBuf,
+    line_art_placed_outline: StyleBuf,
+    line_art_adding_outline: StyleBuf,
 }
 
 struct FaceRange {
@@ -505,6 +520,8 @@ pub struct RenderCore {
     /// buffers (face boundaries, the world axes).
     identity_model: IdentityModel,
     mesh_pipeline: wgpu::RenderPipeline,
+    /// The Line art outline pass (`vs_hull`/`fs_hull`).
+    hull_pipeline: wgpu::RenderPipeline,
     context_pipeline: wgpu::RenderPipeline,
     context_style: StyleBuf,
     /// A selected / hovered context face: the selection colours, still

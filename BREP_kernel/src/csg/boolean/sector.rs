@@ -70,9 +70,15 @@ const TANGENT_BAND_SIN: f64 = 0.173_648_177_666_930_33;
 /// section that lies on both carriers, far below any crossing a model draws.
 const EXACT_SIDE_FLOOR: f64 = 1e-9;
 
-/// `BREP_SECTOR_EXACT_SIDE` (default off): see EXACT SIDE in [`sample`].
+/// `BREP_SECTOR_EXACT_SIDE` (default on, `=0` restores the step-off ladder there): see
+/// EXACT SIDE in [`sample`]. It acts only with
+/// [`crate::feature_scale::imprint_enabled`], as `BREP_FEATURE_SCALE_SELECT` does:
+/// a crossing below the band read right on a sliver the imprint never split out
+/// is still a sliver the assembly sews shut, and with `BREP_FEATURE_SCALE_IMPRINT=0`
+/// the wedge a millionth steep built a valid two-face solid a third short of its
+/// volume where it had refused.
 fn exact_side_enabled() -> bool {
-    crate::switch!("BREP_SECTOR_EXACT_SIDE", false)
+    crate::switch!("BREP_SECTOR_EXACT_SIDE", true) && crate::feature_scale::imprint_enabled()
 }
 /// Most step-off readings before the ladder gives up.
 const LADDER_STEPS: usize = 20;
@@ -274,7 +280,7 @@ fn sample(
     if side.abs() >= TANGENT_BAND_SIN {
         return Ok(Sample::Class(if side > 0.0 { PointClass::Out } else { PointClass::In }, 0));
     }
-    // EXACT SIDE (`BREP_SECTOR_EXACT_SIDE`, default off): on a section that
+    // EXACT SIDE (`BREP_SECTOR_EXACT_SIDE`, default on): on a section that
     // lies on the other carrier to round-off (an analytic lane's exact curve),
     // a small crossing angle is still a crossing, and `side` reads its sign.
     // The fragment's normal is orthogonal to its binormal, so `side` is the

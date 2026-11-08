@@ -206,6 +206,13 @@ fn boundary_has_cosurface_partner(
 /// Detect a distinct narrow strip before replacing its curves by chords.
 /// Search tolerance only nominates a nearby boundary; positive separation in
 /// model space and parallel interior tangents establish a resolvable strip.
+///
+/// FEATURE SCALE B4 (`BREP_FEATURE_SCALE_FRAGMENT`, default on, `=0` off): a
+/// strip between two CUTS is measured the same way. brep-bench
+/// tangent/hairline-slot: the saw's two walls cross the cube's top 1e-6
+/// apart, under the 1.4e-5 resolution of its 10-wide chart, so the
+/// arrangement read them as one line and the strip between them was never
+/// formed.
 fn thin_boundary_resolution(
     solid: &BrepSolid,
     face: &FaceRecord,
@@ -213,8 +220,23 @@ fn thin_boundary_resolution(
     piece_ids: &[u64],
     index: &FragmentIndex,
     search: f64,
-) -> Option<(f64, f64)> {
+) -> (Option<(f64, f64)>, bool) {
     let mut resolution: Option<(f64, f64)> = None;
+    // Whether a feature-scale measure (a near touch, or a strip between two
+    // cuts) found a strip: only then are the image bands narrowed.
+    let mut feature_found = false;
+    let mut take = |strip: Option<(f64, f64)>| {
+        if let Some((arrangement, sampling)) = strip {
+            resolution = Some(match resolution {
+                Some((a, s)) => (a.min(arrangement), s.min(sampling)),
+                None => (arrangement, sampling),
+            });
+        }
+    };
+    let cuts: Vec<&NurbsCurve> = piece_ids
+        .iter()
+        .filter_map(|piece_id| index.pieces_by_id.get(piece_id).and_then(|piece| pcurve_for(piece, face_key).ok()))
+        .collect();
     for piece_id in piece_ids {
         let Some(piece) = index.pieces_by_id.get(piece_id) else { continue };
         let Ok(cut) = pcurve_for(piece, face_key) else { continue };
@@ -222,49 +244,152 @@ fn thin_boundary_resolution(
             if boundary_has_cosurface_partner(solid, face_key, boundary.edge_id, piece, index) {
                 continue;
             }
-            let measure = || -> Option<(f64, f64)> {
-                let [lo, hi] = cut.domain().ok()?;
-                let middle = cut.evaluate((lo + hi) * 0.5).ok()?;
-                let nearest = project_point_to_curve(&boundary.pcurve, middle).ok()?;
-                if nearest.distance > search * 8.0 { return None; }
-                let mut low_gap = f64::INFINITY;
-                let mut high_gap = 0.0f64;
-                let mut identity = 0.0f64;
-                for fraction in [0.125, 0.25, 0.5, 0.75, 0.875] {
-                    let parameter = lo + (hi - lo) * fraction;
-                    let cut_sample = cut.derivatives(parameter, 1).ok()?;
-                    let point = cut_sample[0];
-                    let projected = project_point_to_curve(&boundary.pcurve, point).ok()?;
-                    if projected.distance > search * 8.0 { return None; }
-                    let boundary_sample = boundary.pcurve.derivatives(projected.u, 1).ok()?;
-                    let a = cut_sample[1];
-                    let b = boundary_sample[1];
-                    let lengths = a.length() * b.length();
-                    if lengths <= 1e-30 || a.dot(b).abs() < 0.995 * lengths { return None; }
-                    let actual = face.surface.evaluate(point.x, point.y).ok()?;
-                    let rim = face.surface.evaluate(projected.point.x, projected.point.y).ok()?;
-                    if actual.sub(rim).length() <= 8e-7 { return None; }
-                    let floor = crate::classification::surface_uv_band(
-                        &face.surface, point.x, point.y, 1e-7,
-                    );
-                    if projected.distance <= floor * 8.0 { return None; }
-                    low_gap = low_gap.min(projected.distance);
-                    high_gap = high_gap.max(projected.distance);
-                    identity = identity.max(floor);
+            let strip = strip_between(face, &cut, &boundary.pcurve, search);
+            take(match strip {
+                None if crate::feature_scale::fragment_enabled() => {
+                    let touch = near_touch(face, &cut, &boundary.pcurve, search);
+                    if touch.is_some() && env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
+                        eprintln!("feature_scale: face {} near touch cut p{piece_id} / boundary e{} -> {touch:?}", face.id, boundary.edge_id);
+                    }
+                    feature_found |= touch.is_some();
+                    touch
                 }
-                // A crossing or isolated tangency does not describe a strip.
-                if high_gap > low_gap * 4.0 { return None; }
-                Some((search.min((low_gap / 128.0).max(identity)), search.min(low_gap / 8.0)))
-            };
-            if let Some((arrangement, sampling)) = measure() {
-                resolution = Some(match resolution {
-                    Some((a, s)) => (a.min(arrangement), s.min(sampling)),
-                    None => (arrangement, sampling),
-                });
+                strip => strip,
+            });
+        }
+    }
+    if crate::feature_scale::fragment_enabled() {
+        for (i, cut) in cuts.iter().enumerate() {
+            for other in &cuts[i + 1..] {
+                let strip = strip_between(face, cut, other, search);
+                let found = strip.or_else(|| near_touch(face, cut, other, search));
+                if found.is_some() && env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
+                    eprintln!("feature_scale: face {} cut pair {i} {} -> {} {found:?}", face.id, if strip.is_some() { "strip" } else { "near touch" }, i);
+                }
+                feature_found |= found.is_some();
+                take(found);
             }
         }
     }
-    resolution
+    (resolution, feature_found)
+}
+
+/// FEATURE SCALE B4, near touch (`BREP_FEATURE_SCALE_FRAGMENT`): the
+/// resolutions a cut needs where it comes closer to `other` than the
+/// arrangement resolves without meeting it. brep-bench
+/// tangent/bore-a-micron-from-the-wall: the bore's circle on each cap passes
+/// 1e-6 inside the rim circle at (5, 0), under the cap's 1.4e-5 resolution, so
+/// the two circles fused there and both cap loops opened. The gaps vary from
+/// 1e-6 to 2 around the circle, which `strip_between` reads as a tangency. The
+/// closest approach is found by 257 samples refined by golden section; it is
+/// a near touch when it lies within `8·search` in the chart yet more than 8e-7
+/// apart in model space and beyond the chart's identity band.
+fn near_touch(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f64) -> Option<(f64, f64)> {
+    // Curves lie in their control hulls: hulls farther apart than the reach
+    // cannot hold a near touch, and most pairs on a face are that far apart.
+    let hull = |curve: &NurbsCurve| crate::spatial::Aabb::from_curve_controls(curve).ok();
+    if !hull(cut)?.intersects(hull(other)?, search * 8.0) {
+        return None;
+    }
+    let [lo, hi] = cut.domain().ok()?;
+    let [other_lo, other_hi] = other.domain().ok()?;
+    let gap = |parameter: f64| -> Option<(f64, Vec3, Vec3, f64)> {
+        let point = cut.evaluate(parameter).ok()?;
+        let projected = project_point_to_curve(other, point).ok()?;
+        Some((projected.distance, point, projected.point, projected.u))
+    };
+    // A closed curve's ends are a seam, not a junction; an open one's are
+    // where it meets the rest of the arrangement.
+    let closed = |curve: &NurbsCurve, a: f64, b: f64| -> bool {
+        match (curve.evaluate(a), curve.evaluate(b)) {
+            (Ok(start), Ok(end)) => start.sub(end).length() <= search,
+            _ => false,
+        }
+    };
+    let (cut_closed, other_closed) = (closed(cut, lo, hi), closed(other, other_lo, other_hi));
+    const SAMPLES: usize = 256;
+    let step = (hi - lo) / SAMPLES as f64;
+    let mut best: Option<(f64, f64)> = None;
+    for i in 0..=SAMPLES {
+        let parameter = lo + step * i as f64;
+        if let Some((distance, _, _, _)) = gap(parameter) {
+            if best.is_none_or(|(_, d)| distance < d) {
+                best = Some((parameter, distance));
+            }
+        }
+    }
+    let (centre, _) = best?;
+    let (mut a, mut b) = ((centre - step).max(lo), (centre + step).min(hi));
+    let ratio = 0.5 * (5f64.sqrt() - 1.0);
+    for _ in 0..80 {
+        let c = b - ratio * (b - a);
+        let d = a + ratio * (b - a);
+        if gap(c)?.0 < gap(d)?.0 { b = d } else { a = c }
+    }
+    let parameter = 0.5 * (a + b);
+    let (low_gap, point, foot, foot_parameter) = gap(parameter)?;
+    if low_gap > search * 8.0 {
+        return None;
+    }
+    // Only an approach in the middle of both curves is a near touch. A marched
+    // cut stops a few 1e-6 short of the boundary it ends on (its slack past the
+    // trim), and resolving the arrangement to that gap kept its end from
+    // snapping to its junction (r16: eleven boolean fixtures refused).
+    let at_end = |t: f64, a: f64, b: f64| (t - a).abs() <= 0.01 * (b - a) || (b - t).abs() <= 0.01 * (b - a);
+    if (!cut_closed && at_end(parameter, lo, hi)) || (!other_closed && at_end(foot_parameter, other_lo, other_hi)) {
+        return None;
+    }
+    let actual = face.surface.evaluate(point.x, point.y).ok()?;
+    let rim = face.surface.evaluate(foot.x, foot.y).ok()?;
+    if actual.sub(rim).length() <= 8e-7 {
+        return None;
+    }
+    let identity = crate::classification::surface_uv_band(&face.surface, point.x, point.y, 1e-7);
+    if low_gap <= identity * 8.0 {
+        return None;
+    }
+    Some((search.min((low_gap / 128.0).max(identity)), search.min(low_gap / 8.0)))
+}
+
+/// The arrangement and sampling resolutions a strip between `cut` and
+/// `other` (both pcurves on `face`) needs, or `None` when they do not bound a
+/// strip: some sample of `cut` farther than `8·search` from `other`, a
+/// tangent not parallel to it, a sample within 8e-7 of it in model space or
+/// within the chart's identity band, or gaps varying more than fourfold (a
+/// crossing or an isolated tangency).
+fn strip_between(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f64) -> Option<(f64, f64)> {
+    let [lo, hi] = cut.domain().ok()?;
+    let middle = cut.evaluate((lo + hi) * 0.5).ok()?;
+    let nearest = project_point_to_curve(other, middle).ok()?;
+    if nearest.distance > search * 8.0 { return None; }
+    let mut low_gap = f64::INFINITY;
+    let mut high_gap = 0.0f64;
+    let mut identity = 0.0f64;
+    for fraction in [0.125, 0.25, 0.5, 0.75, 0.875] {
+        let parameter = lo + (hi - lo) * fraction;
+        let cut_sample = cut.derivatives(parameter, 1).ok()?;
+        let point = cut_sample[0];
+        let projected = project_point_to_curve(other, point).ok()?;
+        if projected.distance > search * 8.0 { return None; }
+        let other_sample = other.derivatives(projected.u, 1).ok()?;
+        let a = cut_sample[1];
+        let b = other_sample[1];
+        let lengths = a.length() * b.length();
+        if lengths <= 1e-30 || a.dot(b).abs() < 0.995 * lengths { return None; }
+        let actual = face.surface.evaluate(point.x, point.y).ok()?;
+        let rim = face.surface.evaluate(projected.point.x, projected.point.y).ok()?;
+        if actual.sub(rim).length() <= 8e-7 { return None; }
+        let floor = crate::classification::surface_uv_band(
+            &face.surface, point.x, point.y, 1e-7,
+        );
+        if projected.distance <= floor * 8.0 { return None; }
+        low_gap = low_gap.min(projected.distance);
+        high_gap = high_gap.max(projected.distance);
+        identity = identity.max(floor);
+    }
+    // A crossing or isolated tangency does not describe a strip.
+    if high_gap > low_gap * 4.0 { return None; }
+    Some((search.min((low_gap / 128.0).max(identity)), search.min(low_gap / 8.0)))
 }
 
 fn fragment_face_indexed(
@@ -402,9 +527,24 @@ fn fragment_face_arranged(
     let diagonal =
         ((u_domain[1] - u_domain[0]).powi(2) + (v_domain[1] - v_domain[0]).powi(2)).sqrt();
     let original_resolution = 1e-7f64.max(diagonal * 1e-6);
-    let strip_resolution = thin_boundary_resolution(solid, face, face_key, piece_ids, index, original_resolution);
+    let (strip_resolution, feature_strip) = thin_boundary_resolution(solid, face, face_key, piece_ids, index, original_resolution);
     let (arrangement_tolerance, sampling_bound) = strip_resolution
         .unwrap_or((original_resolution, original_resolution));
+    // FEATURE SCALE B4 (`BREP_FEATURE_SCALE_FRAGMENT`): with a thin strip
+    // between two cuts or a near touch on the face, a chain end is matched to another vertex's image only within
+    // the strip's own sampling bound in the chart and 1e-7 in model space
+    // (`strip_between` admits only strips over 8e-7 wide), not 100
+    // resolutions and 1e-5: the hairline slot's two walls end 1e-6 apart on
+    // the cube's top, and each wall's cut took the other's far end.
+    // Only for a strip a feature-scale measure found: a cut-against-boundary
+    // strip the fragmenter always measured kept its wide bands (narrowing them
+    // too opened loops on revolve ∪ wedge fixtures with coincident side planes).
+    let strip_snap = feature_strip;
+    let (image_band, image_band_3d) = if strip_snap {
+        (sampling_bound, 1e-7)
+    } else {
+        (arrangement_tolerance * 100.0, 1e-5)
+    };
     let snap_threshold = 0.1 * diagonal;
     let junction_radius = (arrangement_tolerance * 50.0).max(diagonal * 1.5e-3);
     // WRAPPED-BAND RE-BASE: a face on a closed direction whose material is the
@@ -691,8 +831,8 @@ fn fragment_face_arranged(
                     endpoint_images
                         .iter()
                         .find(|(candidate3, candidate)| {
-                            candidate3.sub(point3).length() <= 1e-5
-                                && candidate.sub(point).length() <= arrangement_tolerance * 100.0
+                            candidate3.sub(point3).length() <= image_band_3d
+                                && candidate.sub(point).length() <= image_band
                         })
                         .map(|candidate| candidate.1)
                 })
@@ -703,7 +843,7 @@ fn fragment_face_arranged(
                             .find(|(candidate, candidate3)| {
                                 boundary_side(*candidate) == Some(side)
                                     && candidate.sub(point).length()
-                                        <= arrangement_tolerance * 100.0
+                                        <= image_band
                                     // Boundary endpoints only merge to a same-side
                                     // image when 3D-coincident (same physical
                                     // vertex); cut endpoints keep the graze bridge.

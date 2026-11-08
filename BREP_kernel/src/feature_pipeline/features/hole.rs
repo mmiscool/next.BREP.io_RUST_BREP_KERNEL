@@ -103,9 +103,22 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         // A NONE boolean leaves the scene unchanged (a no-op).
         return Ok(result);
     }
-    let Some(target_name) = boolean.target.clone() else {
-        // No target selected — pass through (the caller repairs / re-dispatches).
-        return Ok(result);
+    let target_name = match boolean.target.clone() {
+        Some(name) => name,
+        // No target selected: the part's only solid, exactly as if it had been
+        // picked (owner 2026-11-07); with several solids the user must pick,
+        // and the hole says so. With none there is nothing to drill.
+        None => match common::implicit_boolean_target(ctx.scene) {
+            common::ImplicitTarget::Sole(name) => {
+                result.boolean_auto_target = Some(name.clone());
+                name
+            }
+            common::ImplicitTarget::Several(names) => {
+                result.fulfilment = Some(common::several_targets_fulfilment(&boolean.operation, &names));
+                return Ok(result);
+            }
+            common::ImplicitTarget::NoSolid => return Ok(result),
+        },
     };
     let Some(target_handle) = ctx.scene.resolve_solid(&target_name) else {
         result.unresolved.push(target_name);

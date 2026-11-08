@@ -153,6 +153,12 @@ pub struct ViewDrawing {
     /// They are not among `edges`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub highlighted: Vec<Vec<[f64; 2]>>,
+    /// A Line art instructions picture's fills, outlines and arrows
+    /// ([`LineArtLayer`]); with it, `edges` are the placed parts' lines and
+    /// `highlighted` the added parts', both drawn thin in the layer's inks.
+    /// `None` on a sheet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_art: Option<LineArtLayer>,
     /// Every enabled, resolved annotation of the saved view, projected.
     pub annotations: Vec<AnnotationDrawing>,
     /// Every point of this projection a SHEET dimension can be anchored to —
@@ -239,6 +245,7 @@ impl ViewDrawing {
             solids: Vec::new(),
             edges: Vec::new(),
             highlighted: Vec::new(),
+            line_art: None,
             annotations: Vec::new(),
             anchors: Vec::new(),
             text_mm: 0.0,
@@ -250,6 +257,58 @@ impl ViewDrawing {
             hidden_line: String::new(),
             tolerances: Vec::new(),
         }
+    }
+}
+
+/// What a Line art instructions picture draws beyond its lines (paper mm):
+/// a light grey ground under the picture, the parts' visible faces as flat
+/// triangles painted back to front (white where an earlier step placed the
+/// part, blue where the step adds it), each part's outline in its tier's
+/// heavier ink, and the insertion arrows (a thin black line from where the
+/// part starts to its seat, a filled black head at the seat).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct LineArtLayer {
+    /// `[x0, y0, x1, y1]`.
+    pub ground: [f64; 4],
+    /// Back to front; `true` for a part the step adds.
+    pub fills: Vec<([[f64; 2]; 3], bool)>,
+    /// Outline runs; `true` for a part the step adds.
+    pub outlines: Vec<(Vec<[f64; 2]>, bool)>,
+    /// `(tail, tip)`: the head's point is at the tip.
+    pub arrows: Vec<([f64; 2], [f64; 2])>,
+}
+
+impl LineArtLayer {
+    /// The ground (sRGB 0..1), the step pictures' own.
+    pub const GROUND: [f64; 3] = [0.925, 0.925, 0.925];
+    pub const PLACED_FILL: [f64; 3] = [1.0, 1.0, 1.0];
+    pub const ADDING_FILL: [f64; 3] = [0.616, 0.722, 0.961];
+    pub const PLACED_EDGE: [f64; 3] = [0.55, 0.55, 0.55];
+    pub const PLACED_OUTLINE: [f64; 3] = [0.30, 0.30, 0.30];
+    pub const INK: [f64; 3] = [0.0, 0.0, 0.0];
+    /// Stroke widths, mm.
+    pub const PLACED_EDGE_MM: f64 = 0.18;
+    pub const ADDING_EDGE_MM: f64 = 0.22;
+    pub const PLACED_OUTLINE_MM: f64 = 0.35;
+    pub const ADDING_OUTLINE_MM: f64 = 0.6;
+    /// A fill triangle's own-colour stroke, closing the seams between them.
+    pub const SEAM_MM: f64 = 0.15;
+    pub const ARROW_SHAFT_MM: f64 = 0.4;
+    pub const ARROW_HEAD_MM: f64 = 3.6;
+    pub const ARROW_HEAD_WIDTH_MM: f64 = 2.6;
+
+    /// An arrow's head as a triangle (tip first), `None` for a zero arrow.
+    pub fn head(tail: [f64; 2], tip: [f64; 2]) -> Option<([f64; 2], [[f64; 2]; 3])> {
+        let (dx, dy) = (tip[0] - tail[0], tip[1] - tail[1]);
+        let length = (dx * dx + dy * dy).sqrt();
+        if !(length > 1e-6) {
+            return None;
+        }
+        let (ux, uy) = (dx / length, dy / length);
+        let head = Self::ARROW_HEAD_MM.min(length * 0.6);
+        let base = [tip[0] - ux * head, tip[1] - uy * head];
+        let half = Self::ARROW_HEAD_WIDTH_MM * 0.5 * head / Self::ARROW_HEAD_MM;
+        Some((base, [tip, [base[0] - uy * half, base[1] + ux * half], [base[0] + uy * half, base[1] - ux * half]]))
     }
 }
 
@@ -499,7 +558,7 @@ impl ViewFrame {
 }
 
 /// View-space `(x, y)` → paper millimetres for a placement.
-fn to_paper(placed: &PlacedView, x: f64, y: f64) -> [f64; 2] {
+pub(crate) fn to_paper(placed: &PlacedView, x: f64, y: f64) -> [f64; 2] {
     [placed.position[0] + x * placed.scale, placed.position[1] - y * placed.scale]
 }
 
@@ -2877,7 +2936,7 @@ fn annotations(
         // row one text run as its fallback; the 3D overlay never reads the
         // runs (its chip pass skips the kind) and the PDF's 3D model leaves
         // the row out (`pdf3d::drawable`), so the sheet was the one consumer
-        // that drew it. The step's dashed trace line stays: it is the row's
+        // that drew it. The step's trace arrow stays: it is the row's
         // own `showTraceLine`, and the viewport draws it too.
         // (The layout itself gives neither step a fallback run any more; this
         // keeps the sheet honest should one ever come back. A hide step is

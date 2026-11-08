@@ -3624,10 +3624,30 @@ fn fillet_edges_group_lanes(
             ..crate::BooleanOptions::default()
         };
         let mut combined: Result<Option<BrepSolid>, KernelRefusal> = Ok(None);
-        for (index, point) in edge_points.iter().enumerate() {
-            let edge_id = resolve_edge_by_point(solid, *point)?;
-            let edge_name = per_edge_name(edge_names, name, index);
-            let blended = {
+        // The units the miter composes: one per selected edge, except that
+        // edges joined at a TANGENT chain corner blend as one unit through
+        // this same group build (see `miter_tangent_units`).
+        let units = miter_tangent_units(solid, &selected_edge_ids, &chain_corners, edge_points.len());
+        for unit in &units {
+            let index = unit[0];
+            let point = &edge_points[index];
+            let blended = if unit.len() > 1 {
+                let points = unit.iter().map(|&member| edge_points[member]).collect::<Vec<_>>();
+                let names = edge_names.map(|all| unit.iter().map(|&member| all[member].clone()).collect::<Vec<_>>());
+                fillet_edges_group_with_corner_policy(
+                    solid,
+                    &points,
+                    names.as_deref(),
+                    radius,
+                    chamfer,
+                    name,
+                    None,
+                    wrap_concave,
+                    !crate::blend::accept_once_on(),
+                )?
+            } else {
+                let edge_id = resolve_edge_by_point(solid, *point)?;
+                let edge_name = per_edge_name(edge_names, name, index);
                 let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
                 check_mixed_concavity(solid, edge_id, entry)?;
                 check_support_extent(solid, edge_id, radius, entry)?;
@@ -3671,7 +3691,10 @@ fn fillet_edges_group_lanes(
         // solid do we surface the miter error so the caller's
         // maximal-valid-subset search can still run.
         match combined {
-            Ok(Some(mitered)) => mitered,
+            Ok(Some(mut mitered)) => {
+                drop_slit_shells(&mut mitered);
+                mitered
+            }
             Ok(None) => {
                 return Err(KernelRefusal::input(
                     KernelStage::Collect,
@@ -3810,6 +3833,167 @@ fn fillet_edges_group_lanes(
 /// corner, one whose star corners carry no concave edge, and one whose
 /// convexity cannot be read — the cases the composition builds in input
 /// order, exactly as before.
+/// Whether the miter composition drops a stray SLIT shell: on unless
+/// `BREP_FILLET_MITER_DROP_SLIT_SHELLS=0`/`off`.
+fn drop_slit_shells_on() -> bool {
+    switch!(live "BREP_FILLET_MITER_DROP_SLIT_SHELLS", true)
+}
+
+/// Remove from a composed miter body every shell beyond the first whose faces
+/// are all SLITS — each loop runs along each of its edges once forward and
+/// once back — over edges no other shell uses, then the edges and vertices
+/// nothing references any more. Returns how many shells went.
+///
+/// Such a shell bounds no area and no volume. The 2026-11-07 "fillet fails"
+/// report's five-edge selection composed to the right body (the volume of
+/// the same composition on the serialised input, which has one shell) plus
+/// one face of the hole's floor plane, `Box_NZ_Offset_1_1`, whose single loop
+/// ran 1.25 out along one edge and straight back; `validate()` accepts it.
+fn drop_slit_shells(body: &mut BrepSolid) -> usize {
+    if !drop_slit_shells_on() || body.shells.len() < 2 {
+        return 0;
+    }
+    let mut users: std::collections::HashMap<u64, std::collections::HashSet<usize>> = std::collections::HashMap::new();
+    for (index, shell) in body.shells.iter().enumerate() {
+        for coedge in shell.faces.iter().flat_map(|face| &face.loops).flat_map(|lp| &lp.coedges) {
+            users.entry(coedge.edge_id).or_default().insert(index);
+        }
+    }
+    let slit_face = |face: &crate::topology::FaceRecord| {
+        face.loops.iter().all(|lp| {
+            let mut runs: std::collections::HashMap<u64, (usize, usize)> = std::collections::HashMap::new();
+            for coedge in &lp.coedges {
+                let entry = runs.entry(coedge.edge_id).or_default();
+                if coedge.forward {
+                    entry.0 += 1;
+                } else {
+                    entry.1 += 1;
+                }
+            }
+            !runs.is_empty() && runs.values().all(|&(forward, back)| forward == 1 && back == 1)
+        })
+    };
+    let mut index = 0usize;
+    let mut dropped = 0usize;
+    body.shells.retain(|shell| {
+        let this = index;
+        index += 1;
+        let slit = this > 0
+            && !shell.faces.is_empty()
+            && shell.faces.iter().all(|face| slit_face(face))
+            && shell
+                .faces
+                .iter()
+                .flat_map(|face| &face.loops)
+                .flat_map(|lp| &lp.coedges)
+                .all(|coedge| users.get(&coedge.edge_id).is_some_and(|set| set.len() == 1));
+        dropped += usize::from(slit);
+        !slit
+    });
+    if dropped == 0 {
+        return 0;
+    }
+    let used_edges: std::collections::HashSet<u64> = body
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .flat_map(|face| &face.loops)
+        .flat_map(|lp| &lp.coedges)
+        .map(|coedge| coedge.edge_id)
+        .collect();
+    body.edges.retain(|edge| used_edges.contains(&edge.id));
+    let used_vertices: std::collections::HashSet<u64> =
+        body.edges.iter().flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id]).collect();
+    body.vertices.retain(|vertex| used_vertices.contains(&vertex.id));
+    dropped
+}
+
+/// Whether the miter composition blends a TANGENT run of the selection as
+/// one unit: on unless `BREP_FILLET_MITER_TANGENT_UNITS=0`/`off`.
+fn miter_tangent_units_on() -> bool {
+    switch!(live "BREP_FILLET_MITER_TANGENT_UNITS", true)
+}
+
+/// The units the §6.9.6 miter composition blends and then intersects (or
+/// unions), in input order of each unit's first edge: every selected edge on
+/// its own, except that edges meeting at a chain corner where their tangents
+/// CONTINUE each other (a G1 joint, the 1e-6 bar of the tangent-chain walk)
+/// form one unit.
+///
+/// The miter exists for SHARP chain corners: two full-length blends run
+/// through the corner and trim each other. At a tangent joint there is
+/// nothing to trim — the two walls meet flush — and two full-length
+/// per-edge blends of the edges either side of it, each capped where its
+/// tangent neighbour was left sharp, overlap along that joint in a sliver
+/// the boolean cannot conform (2026-11-07 "fillet fails" report: a revolve
+/// end cap's hole loop, one cylinder edge meeting a ceiling plane edge that
+/// runs on tangentially through an offset blend into a wall; "one-use edge
+/// conformance did not converge after 8 passes" on the plane-edge result
+/// intersected with the blend-edge result). The network lane builds such a
+/// tangent run whole with flush joins; it refused the selection only for
+/// its sharp re-entrant corners, so a unit that is a STRICT part of the
+/// selection goes back through the group build, which reaches it there.
+/// A selection that is one tangent run keeps per-edge units, so the
+/// recursion always shrinks the selection.
+fn miter_tangent_units(
+    solid: &BrepSolid,
+    selected_edge_ids: &[u64],
+    chain_corners: &[(Vec3, [usize; 2])],
+    count: usize,
+) -> Vec<Vec<usize>> {
+    let singles = || (0..count).map(|index| vec![index]).collect::<Vec<_>>();
+    if !miter_tangent_units_on() || selected_edge_ids.len() != count {
+        return singles();
+    }
+    // The tangent along `edge` pointing AWAY from its end at `corner`.
+    let leaving = |edge_id: u64, corner: Vec3| -> Option<Vec3> {
+        let edge = solid.edges.iter().find(|edge| edge.id == edge_id)?;
+        if edge.degenerate {
+            return None;
+        }
+        let start = edge.curve.evaluate(edge.t0).ok()?;
+        let end = edge.curve.evaluate(edge.t1).ok()?;
+        let at_start = start.sub(corner).length() <= end.sub(corner).length();
+        let t = if at_start { edge.t0 } else { edge.t1 };
+        let tangent = edge.curve.unit_tangent(t, edge.t0, edge.t1).ok()?;
+        Some(if at_start { tangent } else { tangent.scale(-1.0) })
+    };
+    let mut parent: Vec<usize> = (0..count).collect();
+    fn root(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    for (corner, [a, b]) in chain_corners {
+        let (Some(ta), Some(tb)) = (leaving(selected_edge_ids[*a], *corner), leaving(selected_edge_ids[*b], *corner)) else {
+            continue;
+        };
+        // Leaving the corner, a tangent continuation points the opposite way.
+        if ta.dot(tb) <= -(1.0 - 1e-6) {
+            let (ra, rb) = (root(&mut parent, *a), root(&mut parent, *b));
+            if ra != rb {
+                parent[ra.max(rb)] = ra.min(rb);
+            }
+        }
+    }
+    let mut units: Vec<Vec<usize>> = Vec::new();
+    let mut unit_of_root: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for index in 0..count {
+        let r = root(&mut parent, index);
+        let slot = *unit_of_root.entry(r).or_insert_with(|| {
+            units.push(Vec::new());
+            units.len() - 1
+        });
+        units[slot].push(index);
+    }
+    if units.len() <= 1 || units.iter().all(|unit| unit.len() == 1) {
+        return singles();
+    }
+    units
+}
+
 fn concave_star_edges(
     solid: &BrepSolid,
     selected_edge_ids: &[u64],
@@ -4332,7 +4516,7 @@ fn fillet_variable_network(
     // support fit, as the constant group's network is; a re-run that also
     // fails keeps the first refusal. A radius relief's law crowds the
     // march's stations into its ramp, and the rail's knot spans there are
-    // finer than the uniform track can follow (report 1ce49a5c: r 1.4 on
+    // finer than the uniform track can follow (a reported model: r 1.4 on
     // the outline of a cut through a sub-D body, its relieved rail spans
     // 7.7e-5 against a track spacing of 2.4e-4, 1.5e-6 off at 4097
     // samples).

@@ -229,6 +229,129 @@ fn read_boolean_param(ctx: &FeatureContext) -> BooleanParam {
     }
 }
 
+/// What a boolean with an operation and NO picked target acts on (owner
+/// 2026-11-07): "If there is only one solid body in a part … it should
+/// automatically use the one existing solid … In cases where multiple solids
+/// are in the part the user would have to pick the target."
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ImplicitTarget {
+    /// The part holds no solid: the body stands alone, as it always has.
+    NoSolid,
+    /// The part's only solid, used exactly as if the user had picked it.
+    Sole(String),
+    /// Two or more solids, sorted by name: nothing is guessed. The body stands
+    /// alone and the feature reports that the user must pick the target.
+    Several(Vec<String>),
+}
+
+/// The solids "in the part" that a no-target boolean may fall back to, sorted
+/// by name: every solid the scene holds BEFORE this feature (the feature's own
+/// body is never scene-resident while it finalizes), except the members of an
+/// inserted assembly COMPONENT — component geometry is another part, fenced off
+/// as modeling-feature input (`enforce_reference_fence`), so an implicit pick
+/// must not reach it either. The kernel scene has no visibility or
+/// construction state: a body hidden in the viewport is still in the part and
+/// counts, so what a feature builds never depends on a display toggle.
+pub(crate) fn implicit_target_candidates(scene: &crate::feature_pipeline::SceneMap) -> Vec<String> {
+    let mut names: Vec<String> = scene
+        .solids
+        .keys()
+        .filter(|name| !scene.is_component_owned(name))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// Classify the scene for a no-target boolean ([`ImplicitTarget`]).
+pub(crate) fn implicit_boolean_target(scene: &crate::feature_pipeline::SceneMap) -> ImplicitTarget {
+    let mut names = implicit_target_candidates(scene);
+    match names.len() {
+        0 => ImplicitTarget::NoSolid,
+        1 => ImplicitTarget::Sole(names.remove(0)),
+        _ => ImplicitTarget::Several(names),
+    }
+}
+
+/// Whether a feature descriptor asks for the implicit target: its `boolean`
+/// carries an operation (UNION/SUBTRACT/INTERSECT, or anything but NONE) and
+/// no target name. Read by the history loop so the cache keys such a feature
+/// on the part's solids — it names none of them, so the descriptor scan alone
+/// would replay it after its implicit target changed, was renamed, or gained a
+/// sibling. A HOLE's absent operation means SUBTRACT (its own default) and its
+/// target entries may be `{ name }` objects; the BOOLEAN feature's `targets`
+/// are its TOOLS, so it never asks.
+pub(crate) fn wants_implicit_target(feature_type: &str, input_params: &serde_json::Value) -> bool {
+    let is_hole = matches!(feature_type, "H" | "HOLE");
+    if matches!(feature_type, "B" | "BOOLEAN") {
+        return false;
+    }
+    let boolean = input_params.get("boolean");
+    if boolean.is_none() && !is_hole {
+        return false;
+    }
+    let operation = boolean
+        .and_then(|value| value.get("operation"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(if is_hole { "SUBTRACT" } else { "NONE" });
+    if operation.eq_ignore_ascii_case("NONE") {
+        return false;
+    }
+    let named = boolean
+        .and_then(|value| value.get("targets"))
+        .and_then(|value| value.as_array())
+        .is_some_and(|array| {
+            array.iter().any(|entry| {
+                entry
+                    .as_str()
+                    .or_else(|| if is_hole { entry.get("name").and_then(|name| name.as_str()) } else { None })
+                    .is_some_and(|name| !name.trim().is_empty())
+            })
+        });
+    !named
+}
+
+/// The `fulfilment` a no-target boolean reports when the part holds several
+/// solids: the body was built and stands alone, and the user must pick which
+/// solid it booleans into. Shown as the feature's banner and tree leaf.
+pub(crate) fn several_targets_fulfilment(operation: &str, solids: &[String]) -> crate::feature_pipeline::Fulfilment {
+    let listed: Vec<String> = solids.iter().map(|name| format!("`{name}`")).collect();
+    crate::feature_pipeline::Fulfilment {
+        requested: Vec::new(),
+        applied: Vec::new(),
+        rejected: vec![crate::feature_pipeline::Rejected {
+            name: "boolean".to_string(),
+            kind: crate::feature_pipeline::RejectedKind::NothingSelected,
+            reason: format!(
+                "{} names no target and the part holds {} solids ({}): pick the target solid; the body stands alone until you do",
+                operation.to_lowercase(),
+                solids.len(),
+                listed.join(", ")
+            ),
+        }],
+        extended: Vec::new(),
+        followed: Vec::new(),
+    }
+}
+
+/// Resolve a no-target boolean in place: the sole solid becomes `targets`
+/// (recorded on `result.boolean_auto_target`), several solids record the
+/// pick-a-target fulfilment. Returns `false` when the body must stand alone.
+fn apply_implicit_target(ctx: &FeatureContext, boolean: &mut BooleanParam, result: &mut FeatureResult) -> bool {
+    match implicit_boolean_target(ctx.scene) {
+        ImplicitTarget::NoSolid => false,
+        ImplicitTarget::Sole(name) => {
+            result.boolean_auto_target = Some(name.clone());
+            boolean.targets = vec![name];
+            true
+        }
+        ImplicitTarget::Several(names) => {
+            result.fulfilment = Some(several_targets_fulfilment(&boolean.operation, &names));
+            false
+        }
+    }
+}
+
 /// Collect up to two distinct face names per edge, preserving first encounter order.
 fn collect_edge_face_names(
     solid: &BrepSolid,
@@ -546,12 +669,13 @@ fn collect_edge_group_aliases(
         .collect()
 }
 
-/// Finalize several bodies using the optional boolean operation. Without an
-/// operation or resolved targets, register each body separately. Otherwise fold
+/// Finalize several bodies using the optional boolean operation. An operation
+/// with no picked target uses the part's only solid ([`ImplicitTarget`]).
+/// Without an operation or resolved targets, register each body separately. Otherwise fold
 /// bodies into the targets in order and use the first target's name. Missing
 /// targets are reported in `unresolved` for the caller to repair.
 pub fn finalize_solids(ctx: &FeatureContext, bodies: Vec<(String, BrepSolid)>) -> FeatureResult {
-    let boolean = read_boolean_param(ctx);
+    let mut boolean = read_boolean_param(ctx);
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
 
     let separate = |mut result: FeatureResult, bodies: Vec<(String, BrepSolid)>| {
@@ -561,7 +685,11 @@ pub fn finalize_solids(ctx: &FeatureContext, bodies: Vec<(String, BrepSolid)>) -
         result
     };
 
-    if boolean.operation == "NONE" || boolean.targets.is_empty() {
+    if boolean.operation == "NONE" {
+        return separate(result, bodies);
+    }
+    // No target picked: the part's only solid, or nothing (see `ImplicitTarget`).
+    if boolean.targets.is_empty() && !apply_implicit_target(ctx, &mut boolean, &mut result) {
         return separate(result, bodies);
     }
     let operation = match parse_boolean_operation(&boolean.operation) {
@@ -620,10 +748,12 @@ pub fn finalize_solid_grouped(
     base_name: &str,
     containers: &[(String, Vec<String>)],
 ) -> FeatureResult {
-    let boolean = read_boolean_param(ctx);
+    let mut boolean = read_boolean_param(ctx);
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
 
-    if boolean.operation == "NONE" || boolean.targets.is_empty() {
+    let stands_alone = boolean.operation == "NONE"
+        || (boolean.targets.is_empty() && !apply_implicit_target(ctx, &mut boolean, &mut result));
+    if stands_alone {
         result.added.push(register_added_grouped(base, base_name, containers));
         return result;
     }
@@ -2283,6 +2413,7 @@ pub(super) fn optional_boolean_schema() -> serde_json::Value {
         "hint": "Optional boolean operation with selected solids"
     })
 }
+
 
 
 

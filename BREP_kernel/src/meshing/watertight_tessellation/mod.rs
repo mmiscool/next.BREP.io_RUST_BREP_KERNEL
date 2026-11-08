@@ -56,6 +56,19 @@ pub(crate) fn pinch_cusp_enabled() -> bool {
     crate::switch!("BREP_TESS_PINCH_CUSP", true)
 }
 
+/// `BREP_TESS_SINGLE_PRECISION_TWINS` (default on, `=0` restores): the mesh is read at
+/// single precision (STL, glTF, every GPU buffer), where two distinct vertices of different
+/// faces can round to one point and weld, leaving the edges round them used four times. On a
+/// body thinner than a float's spacing at its distance from the origin (brep-bench
+/// tangent/thin-lens: two caps 1e-6 apart at x = 5, where floats are 4.8e-7 apart, meshed
+/// as mirror images so each near-rim sample of one cap lies within 1e-10 of one of the other)
+/// [`orient`] moves one vertex of each such pair a few float spacings along its tangent
+/// plane, never one an edge sample shares, never by more than a tenth of its triangles'
+/// heights.
+pub(crate) fn single_precision_twins_enabled() -> bool {
+    crate::switch!("BREP_TESS_SINGLE_PRECISION_TWINS", true)
+}
+
 pub use face_tess::triangulate_planar_region;
 pub use orient::tessellate_brep_watertight;
 pub use face_memo::clear as clear_face_memo;

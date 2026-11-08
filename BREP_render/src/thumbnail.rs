@@ -17,6 +17,8 @@
 use crate::color::solid_color_srgb;
 use crate::scene::RenderScene;
 
+pub mod line_art;
+
 /// The renderer's version, stored beside each thumbnail on the server. Bump it
 /// whenever the picture for the same document would change, so a server can
 /// tell a thumbnail made by an older renderer.
@@ -134,17 +136,24 @@ struct Projection {
 }
 
 impl Projection {
-    fn fit(capture: &Capture, pixels: u32, (right, up, back): Basis) -> Self {
+    fn fit(capture: &Capture, pixels: u32, basis: Basis) -> Self {
         // Fit the projected extent of every vertex, not the bbox's corners, so
         // a long thin part fills the picture.
+        let points = capture.bodies.iter().flat_map(|body| body.indices.iter().map(|&i| f64s(body.positions[i as usize])));
+        Self::fit_points(points, pixels, basis, FILL)
+    }
+
+    /// Fit `points` so their projected extent fills `fill` of the picture.
+    fn fit_points(points: impl Iterator<Item = [f64; 3]>, pixels: u32, (right, up, back): Basis, fill: f64) -> Self {
         let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
-        for body in &capture.bodies {
-            for &i in &body.indices {
-                let p = f64s(body.positions[i as usize]);
-                let (x, y) = (dot(p, right), dot(p, up));
-                lo = [lo[0].min(x), lo[1].min(y)];
-                hi = [hi[0].max(x), hi[1].max(y)];
-            }
+        for p in points {
+            let (x, y) = (dot(p, right), dot(p, up));
+            lo = [lo[0].min(x), lo[1].min(y)];
+            hi = [hi[0].max(x), hi[1].max(y)];
+        }
+        if !(lo[0] <= hi[0]) {
+            lo = [0.0; 2];
+            hi = [0.0; 2];
         }
         let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-12);
         let mid = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
@@ -153,7 +162,7 @@ impl Projection {
             right[1] * mid[0] + up[1] * mid[1],
             right[2] * mid[0] + up[2] * mid[1],
         ];
-        Self { right, up, back, center, scale: pixels as f64 * FILL / extent, half: pixels as f64 * 0.5 }
+        Self { right, up, back, center, scale: pixels as f64 * fill / extent, half: pixels as f64 * 0.5 }
     }
 
     fn project(&self, p: [f64; 3]) -> [f64; 3] {

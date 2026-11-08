@@ -23,10 +23,12 @@ use super::{component_move::now_ms, EngineState};
 use crate::scene::SolidDisplay;
 use brep_instructions::wizard;
 use crate::sheets::print::{self, PictureAt};
-use crate::sheets::project::{poses_of, project_view_through, Deferred, LinesMode, Model, Unposed, ViewDrawing, ViewFrame};
+use crate::sheets::project::{poses_of, project_view_through, to_paper, Deferred, LineArtLayer, LinesMode, Model, Unposed, ViewDrawing, ViewFrame};
 use crate::sheets::PlacedView;
 use crate::thumbnail;
+use crate::thumbnail::line_art;
 use brep_instructions::edit;
+use brep_instructions::model::{Arrow, Style};
 use brep_instructions::layout::{self, Rect};
 use brep_instructions::player::{self, Mode, PlayerData, PlayerMesh, PlayerNode};
 use brep_kernel::PmiProjection;
@@ -108,8 +110,9 @@ impl EngineState {
                 // Discover at most one cache miss, then submit it after the scene borrow ends.
                 let mut requests = Vec::new();
                 let mut defer = |request| { requests.push(request); pending.set(true); Deferred::Pending };
+                let arrows = (job.block.template.style == Style::LineArt).then(|| self.instructions_step_arrows(&job.block, step_id));
                 let drawing = self.instructions_project_with(job.unposed.as_ref().unwrap(), &job.views, view, *rect, &placed,
-                    &mut LinesMode::Export(&mut defer), &pending);
+                    arrows.as_deref(), &mut LinesMode::Export(&mut defer), &pending);
                 for request in requests {
                     if matches!(self.sheet_lines.defer(self.runner.as_mut(), request), Deferred::Here) {
                         return Err("the background runner could not draw the PDF picture; export again".into());
@@ -182,11 +185,26 @@ impl EngineState {
     /// ([`ViewDrawing::highlighted`]). Visibility is decided once over every
     /// part; a second pass at the same placement with the placed parts hidden
     /// says which visible runs lie on the added parts' own edges.
-    fn instructions_project(&self, unposed: &Unposed, views: &[PmiView], view_id: &str, rect: Rect, placed: &[String]) -> ViewDrawing {
-        self.instructions_project_with(unposed, views, view_id, rect, placed, &mut LinesMode::Compute, &std::cell::Cell::new(false)).expect("synchronous projection")
+    fn instructions_project(&self, unposed: &Unposed, views: &[PmiView], view_id: &str, rect: Rect, placed: &[String], line_art: Option<&[Arrow]>) -> ViewDrawing {
+        self.instructions_project_with(unposed, views, view_id, rect, placed, line_art, &mut LinesMode::Compute, &std::cell::Cell::new(false))
+            .expect("synchronous projection")
     }
 
-    fn instructions_project_with(&self, unposed: &Unposed, views: &[PmiView], view_id: &str, rect: Rect, placed: &[String], mode: &mut LinesMode, pending: &std::cell::Cell<bool>) -> Option<ViewDrawing> {
+    /// With `line_art` (the step's arrows, [`Self::instructions_step_arrows`])
+    /// the picture is a Line art one: its frame takes the arrows in, and the
+    /// drawing carries the fills, outlines and arrows ([`LineArtLayer`]).
+    #[allow(clippy::too_many_arguments)]
+    fn instructions_project_with(
+        &self,
+        unposed: &Unposed,
+        views: &[PmiView],
+        view_id: &str,
+        rect: Rect,
+        placed: &[String],
+        line_art: Option<&[Arrow]>,
+        mode: &mut LinesMode,
+        pending: &std::cell::Cell<bool>,
+    ) -> Option<ViewDrawing> {
         let env = self.sheet_env();
         let model = Model { scene: &self.scene, unposed, env: &env };
         let view = views.iter().find(|view| view.id == view_id);
@@ -200,13 +218,33 @@ impl EngineState {
         if !measured.error.is_empty() {
             return Some(measured);
         }
-        let (position, scale) = print::fit(measured.bounds, rect);
+        let frame = view.and_then(|view| view.camera.as_ref()).map(ViewFrame::of);
+        // A Line art picture's parts, posed as the lines are, and its arrows.
+        let art = match (line_art, &frame) {
+            (Some(arrows), Some(frame)) => Some(line_art_scene(unposed, report, &measured.solids, placed, arrows, frame)),
+            _ => None,
+        };
+        let mut bounds = measured.bounds;
+        if let (Some(art), Some(frame)) = (&art, &frame) {
+            // The frame takes in where the arrows start.
+            for (tail, tip) in &art.arrows {
+                for p in [tail, tip] {
+                    let v = frame.to_view(*p);
+                    let (x, y) = (v[0], -v[1]);
+                    bounds = [bounds[0].min(x), bounds[1].min(y), bounds[2].max(x), bounds[3].max(y)];
+                }
+            }
+        }
+        let (position, scale) = print::fit(bounds, rect);
         let mut drawing = project_view_through(&model, &placement(position, scale), view, report, None, None, mode);
         if pending.get() { return None; }
         let Some(view) = view else { return Some(drawing) };
         if placed.is_empty() || drawing.edges.is_empty() {
             // Nothing placed yet: everything drawn is being added.
             drawing.highlighted = std::mem::take(&mut drawing.edges);
+            if let (Some(art), Some(frame)) = (&art, &frame) {
+                line_art_layer(&mut drawing, art, frame, &placement(position, scale), rect);
+            }
             return Some(drawing);
         }
         // The same view with what earlier steps placed hidden too (a
@@ -220,6 +258,9 @@ impl EngineState {
         let (edges, highlighted) = split_highlighted(std::mem::take(&mut drawing.edges), &alone.edges);
         drawing.edges = edges;
         drawing.highlighted = highlighted;
+        if let (Some(art), Some(frame)) = (&art, &frame) {
+            line_art_layer(&mut drawing, art, frame, &placement(position, scale), rect);
+        }
         Some(drawing)
     }
 
@@ -243,7 +284,8 @@ impl EngineState {
         for (at, step_id, rect) in print::picture_rects(&block, &layout) {
             if let Some(view) = block.step(&step_id).and_then(|step| step.view.clone()) {
                 let placed = self.instructions_placed_names(&block, &step_id);
-                pictures.insert(at, self.instructions_project(&unposed, &pmi.views, &view, rect, &placed));
+                let arrows = (block.template.style == Style::LineArt).then(|| self.instructions_step_arrows(&block, &step_id));
+                pictures.insert(at, self.instructions_project(&unposed, &pmi.views, &view, rect, &placed, arrows.as_deref()));
             }
         }
         let pages = print::pages(&block, &layout, &pictures);
@@ -258,8 +300,9 @@ impl EngineState {
         let step = block.step(step_id).ok_or_else(|| format!("no step '{step_id}'"))?;
         self.instructions_topology_ready();
         let placed = self.instructions_placed_names(&block, step_id);
+        let arrows = (block.template.style == Style::LineArt).then(|| self.instructions_step_arrows(&block, step_id));
         let picture = step.view.as_deref().map(|view| {
-            self.instructions_project(&self.instructions_export_displays(), &self.pmi_state().views, view, print::image_picture_rect(), &placed)
+            self.instructions_project(&self.instructions_export_displays(), &self.pmi_state().views, view, print::image_picture_rect(), &placed, arrows.as_deref())
         });
         Ok(crate::sheets::svg::to_svg(&print::step_image(&block, step_id, picture)?))
     }
@@ -281,6 +324,39 @@ impl EngineState {
         let names: Vec<String> = self.scene.solids().iter().map(|solid| solid.name.clone()).collect();
         let presentation = edit::presentation(&block, step_id, &names)?;
         let unposed = self.instructions_export_displays();
+        if block.template.style == Style::LineArt {
+            let mut art = line_art::LineArt::default();
+            let mut bounds: HashMap<&str, ([f64; 3], [f64; 3])> = HashMap::new();
+            for name in &names {
+                if view.hides(name) || presentation.hidden.contains(name) {
+                    continue;
+                }
+                let Some(display) = unposed.get(name).filter(|display| !display.is_sketch) else { continue };
+                let Some(body) = posed_body(display, &poses_of(report, name), false) else { continue };
+                if presentation.placed.contains(name) {
+                    art.placed.push(body);
+                } else {
+                    bounds.insert(name.as_str(), body_bounds(&body));
+                    art.adding.push(body);
+                }
+            }
+            // Each arrow over the seated parts it moves, from where they start.
+            for arrow in self.instructions_step_arrows(&block, step_id) {
+                let mut lo = [f64::INFINITY; 3];
+                let mut hi = [f64::NEG_INFINITY; 3];
+                for (name, (a, b)) in &bounds {
+                    if under(name, &arrow.occurrence) {
+                        lo = std::array::from_fn(|k| lo[k].min(a[k]));
+                        hi = std::array::from_fn(|k| hi[k].max(b[k]));
+                    }
+                }
+                if lo[0] <= hi[0] {
+                    art.arrows.extend(line_art::still_arrow(lo, hi, arrow.start_offset()));
+                }
+            }
+            return line_art::render_png(&art, size, (frame.right, frame.up, back))
+                .ok_or_else(|| format!("step '{step_id}' shows nothing to draw"));
+        }
         let mut capture = thumbnail::Capture::default();
         for name in &names {
             if view.hides(name) || presentation.hidden.contains(name) {
@@ -354,6 +430,12 @@ impl EngineState {
         };
         let pmi = self.pmi_state();
         for (_, step) in block.steps() {
+            if step.arrows.is_empty() {
+                let derived = self.instructions_step_arrows(&block, &step.id);
+                if !derived.is_empty() {
+                    scene.arrows.insert(step.id.clone(), derived);
+                }
+            }
             // The step view's explode poses, a matrix per posed node, in the
             // order the pictures apply them.
             if let Some(view_id) = step.view.as_deref() {
@@ -451,6 +533,25 @@ impl EngineState {
     }
 }
 
+/// `path` is `occurrence` or a solid under it.
+fn under(path: &str, occurrence: &str) -> bool {
+    path == occurrence || path.strip_prefix(occurrence).is_some_and(|rest| rest.starts_with(':'))
+}
+
+/// A body's world bounds over the vertices its triangles use.
+fn body_bounds(body: &thumbnail::Body) -> ([f64; 3], [f64; 3]) {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for &i in &body.indices {
+        let p = body.positions[i as usize];
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k] as f64);
+            hi[k] = hi[k].max(p[k] as f64);
+        }
+    }
+    (lo, hi)
+}
+
 /// Column-major 4×4 product `a · b` (b applied first).
 fn mul4(a: [f64; 16], b: [f64; 16]) -> [f64; 16] {
     let mut out = [0.0; 16];
@@ -491,6 +592,167 @@ fn posed_body(display: &SolidDisplay, poses: &[crate::sheets::project::SolidPose
         body.edges.clear();
     }
     Some(body)
+}
+
+/// A Line art step picture's parts and arrows in world space: each drawn
+/// solid posed by its view's explode rows, with whether the step adds it,
+/// and each arrow over the seated parts it moves ([`line_art::still_arrow`]).
+struct LineArtScene {
+    bodies: Vec<(thumbnail::Body, bool)>,
+    arrows: Vec<([f64; 3], [f64; 3])>,
+}
+
+fn line_art_scene(
+    unposed: &Unposed,
+    report: Option<&brep_kernel::PmiViewReport>,
+    solids: &[String],
+    placed: &[String],
+    arrows: &[Arrow],
+    _frame: &ViewFrame,
+) -> LineArtScene {
+    let mut bodies = Vec::new();
+    let mut bounds: Vec<(&str, ([f64; 3], [f64; 3]))> = Vec::new();
+    for name in solids {
+        let Some(display) = unposed.get(name).filter(|display| !display.is_sketch) else { continue };
+        let Some(body) = posed_body(display, &poses_of(report, name), false) else { continue };
+        let adding = !placed.contains(name);
+        if adding {
+            bounds.push((name.as_str(), body_bounds(&body)));
+        }
+        bodies.push((body, adding));
+    }
+    let mut out = Vec::new();
+    for arrow in arrows {
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for (name, (a, b)) in &bounds {
+            if under(name, &arrow.occurrence) {
+                lo = std::array::from_fn(|k| lo[k].min(a[k]));
+                hi = std::array::from_fn(|k| hi[k].max(b[k]));
+            }
+        }
+        if lo[0] <= hi[0] {
+            out.extend(line_art::still_arrow(lo, hi, arrow.start_offset()));
+        }
+    }
+    LineArtScene { bodies, arrows: out }
+}
+
+/// The paper cell of a Line art picture's coverage grid, mm.
+const LINE_ART_CELL_MM: f64 = 0.12;
+/// How far (mm) to either side of a line its two sides are read.
+const LINE_ART_SIDE_MM: f64 = 0.3;
+
+/// Put the Line art layer on a step picture drawn at `placed`: the visible
+/// faces as flat triangles painted back to front (back faces left out), the
+/// lines that bound a part against the ground or another tier moved into
+/// the outlines, and the arrows on paper.
+fn line_art_layer(drawing: &mut ViewDrawing, art: &LineArtScene, frame: &ViewFrame, placed: &PlacedView, rect: Rect) {
+    let paper = |p: [f64; 3]| -> ([f64; 2], f64) {
+        let v = frame.to_view(p);
+        (to_paper(placed, v[0], v[1]), v[2])
+    };
+    let mut fills: Vec<(f64, [[f64; 2]; 3], bool)> = Vec::new();
+    for (body, adding) in &art.bodies {
+        let projected: Vec<([f64; 2], f64)> = body.positions.iter().map(|p| paper([p[0] as f64, p[1] as f64, p[2] as f64])).collect();
+        for tri in body.indices.chunks_exact(3) {
+            let [a, b, c] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+            // A face turned away from the eye is behind the part's front.
+            let n: [f64; 3] = std::array::from_fn(|k| (body.normals[a][k] + body.normals[b][k] + body.normals[c][k]) as f64);
+            if n[0] * frame.forward[0] + n[1] * frame.forward[1] + n[2] * frame.forward[2] > 0.2 * (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt() {
+                continue;
+            }
+            let (pa, pb, pc) = (projected[a], projected[b], projected[c]);
+            let area = (pb.0[0] - pa.0[0]) * (pc.0[1] - pa.0[1]) - (pc.0[0] - pa.0[0]) * (pb.0[1] - pa.0[1]);
+            if area.abs() < 1e-6 {
+                continue;
+            }
+            fills.push(((pa.1 + pb.1 + pc.1) / 3.0, [pa.0, pb.0, pc.0], *adding));
+        }
+    }
+    // Furthest first.
+    fills.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // Which tier shows in each cell of the picture, painted as the fills are.
+    let cols = ((rect.w / LINE_ART_CELL_MM).ceil() as usize).max(1);
+    let rows = ((rect.h / LINE_ART_CELL_MM).ceil() as usize).max(1);
+    let mut tier = vec![0u8; cols * rows];
+    for (_, t, adding) in &fills {
+        let value = if *adding { 2 } else { 1 };
+        let x0 = ((t.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min) - rect.x) / LINE_ART_CELL_MM).floor().max(0.0) as usize;
+        let x1 = (((t.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max) - rect.x) / LINE_ART_CELL_MM).ceil() as usize).min(cols);
+        let y0 = ((t.iter().map(|p| p[1]).fold(f64::INFINITY, f64::min) - rect.y) / LINE_ART_CELL_MM).floor().max(0.0) as usize;
+        let y1 = (((t.iter().map(|p| p[1]).fold(f64::NEG_INFINITY, f64::max) - rect.y) / LINE_ART_CELL_MM).ceil() as usize).min(rows);
+        let side = |a: [f64; 2], b: [f64; 2], p: [f64; 2]| (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+        let orient = side(t[0], t[1], t[2]).signum();
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = [rect.x + (x as f64 + 0.5) * LINE_ART_CELL_MM, rect.y + (y as f64 + 0.5) * LINE_ART_CELL_MM];
+                if (0..3).all(|k| side(t[k], t[(k + 1) % 3], p) * orient >= 0.0) {
+                    tier[y * cols + x] = value;
+                }
+            }
+        }
+    }
+    let tier_at = |p: [f64; 2]| -> u8 {
+        let (x, y) = ((p[0] - rect.x) / LINE_ART_CELL_MM, (p[1] - rect.y) / LINE_ART_CELL_MM);
+        if x < 0.0 || y < 0.0 || x >= cols as f64 || y >= rows as f64 {
+            return 0;
+        }
+        tier[y as usize * cols + x as usize]
+    };
+    // A segment is on its part's outline when either side shows another
+    // tier or the ground.
+    let outline_of = |own: u8| {
+        move |a: [f64; 2], b: [f64; 2]| -> bool {
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let length = (dx * dx + dy * dy).sqrt();
+            if !(length > 1e-9) {
+                return false;
+            }
+            let (nx, ny) = (-dy / length * LINE_ART_SIDE_MM, dx / length * LINE_ART_SIDE_MM);
+            let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+            tier_at([mid[0] + nx, mid[1] + ny]) != own || tier_at([mid[0] - nx, mid[1] - ny]) != own
+        }
+    };
+    let mut outlines = Vec::new();
+    let (edges, placed_outlines) = split_runs(std::mem::take(&mut drawing.edges), outline_of(1));
+    outlines.extend(placed_outlines.into_iter().map(|run| (run, false)));
+    let (lit, adding_outlines) = split_runs(std::mem::take(&mut drawing.highlighted), outline_of(2));
+    outlines.extend(adding_outlines.into_iter().map(|run| (run, true)));
+    drawing.edges = edges;
+    drawing.highlighted = lit;
+    let arrows = art.arrows.iter().map(|(tail, tip)| (paper(*tail).0, paper(*tip).0)).collect();
+    drawing.line_art = Some(LineArtLayer {
+        ground: [rect.x, rect.y, rect.x + rect.w, rect.y + rect.h],
+        fills: fills.into_iter().map(|(_, t, adding)| (t, adding)).collect(),
+        outlines,
+        arrows,
+    });
+}
+
+/// `runs` cut where `pred` changes along them: `(false runs, true runs)`.
+fn split_runs(runs: Vec<Vec<[f64; 2]>>, pred: impl Fn([f64; 2], [f64; 2]) -> bool) -> (Vec<Vec<[f64; 2]>>, Vec<Vec<[f64; 2]>>) {
+    let (mut no, mut yes) = (Vec::new(), Vec::new());
+    for run in runs {
+        let mut current: Vec<[f64; 2]> = Vec::new();
+        let mut class: Option<bool> = None;
+        for pair in run.windows(2) {
+            let c = pred(pair[0], pair[1]);
+            if class.is_some_and(|k| k != c) {
+                let done = std::mem::take(&mut current);
+                if class == Some(true) { yes.push(done) } else { no.push(done) }
+            }
+            if current.is_empty() {
+                current.push(pair[0]);
+            }
+            current.push(pair[1]);
+            class = Some(c);
+        }
+        if current.len() >= 2 {
+            if class == Some(true) { yes.push(current) } else { no.push(current) }
+        }
+    }
+    (no, yes)
 }
 
 /// How close (paper mm) a visible segment's midpoint must lie to one of the

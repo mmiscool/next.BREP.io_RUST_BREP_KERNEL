@@ -537,6 +537,16 @@ impl RenderCore {
         s.axis_z.write(q, [0.23, 0.51, 0.96, 1.0], axis_params);
         // Overlay-widget line width (color is per-instance from the gizmo).
         s.overlay_line.write(q, [1.0, 1.0, 1.0, 1.0], [2.5, 0.0, 0.0, 0.0]);
+        // Line art: the step pictures' colours (thumbnail::line_art), faces
+        // unlit (params.y), edges and outlines in sRGB.
+        use crate::thumbnail::line_art as la;
+        let srgb = |c: [f32; 3]| [c[0], c[1], c[2], 1.0];
+        s.line_art_placed_face.write(q, face(srgb(la::PLACED_FILL)), [0.0, 1.0, 0.0, 0.0]);
+        s.line_art_adding_face.write(q, face(srgb(la::ADDING_FILL)), [0.0, 1.0, 0.0, 0.0]);
+        s.line_art_placed_edge.write(q, srgb(la::PLACED_EDGE), [1.0, EDGE_NUDGE, 0.0, 0.0]);
+        s.line_art_adding_edge.write(q, srgb(la::INK), [1.2, EDGE_NUDGE, 0.0, 0.0]);
+        s.line_art_placed_outline.write(q, srgb(la::PLACED_OUTLINE), [LINE_ART_PLACED_OUTLINE_PX, LINE_ART_OUTLINE_DEPTH, 0.0, 0.0]);
+        s.line_art_adding_outline.write(q, srgb(la::INK), [LINE_ART_ADDING_OUTLINE_PX, LINE_ART_OUTLINE_DEPTH, 0.0, 0.0]);
     }
 
     /// Rebuild the selected/hovered-face boundary outline buffer for one solid

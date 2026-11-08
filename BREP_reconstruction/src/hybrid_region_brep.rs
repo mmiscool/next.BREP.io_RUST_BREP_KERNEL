@@ -408,14 +408,38 @@ pub(crate) fn without_promotion_13(switches: HybridSwitches) -> HybridSwitches {
 }
 
 /// `switches` with promotion 14's switch (2026-11-04) off:
-/// `retry_join_walls`.
+/// `retry_join_walls`, and promotion 15's with it.
 pub(crate) fn without_promotion_14(switches: HybridSwitches) -> HybridSwitches {
-    HybridSwitches { retry_join_walls: false, ..switches }
+    without_promotion_15(HybridSwitches { retry_join_walls: false, ..switches })
+}
+
+/// `switches` with promotion 15's hybrid switch (2026-11-08) off:
+/// `noisy_crossing`. Promotion 15's other switches are not hybrid rows
+/// (`BREP_TJUNCTION_STRIP_HYBRID` in the STL conversion,
+/// `BREP_MESH_PLANE_CORNERS` and `BREP_MESH_NOISY_POLYHEDRON` in the kernel's
+/// mesh rebuild), so this leaves them as they are.
+pub(crate) fn without_promotion_15(switches: HybridSwitches) -> HybridSwitches {
+    HybridSwitches { noisy_crossing: false, ..switches }
+}
+
+/// [`hybrid_plane_cylinder_brep`] without promotion 15's hybrid switch
+/// ([`without_promotion_15`]): the STL conversion's first further try when
+/// the rebuilt solid fails its STEP round trip.
+pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_15(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &SegmentOptions,
+) -> Result<Option<HybridBrepOutput>, String> {
+    let switches = HybridSwitches::from_env();
+    if !switches.noisy_crossing {
+        return Ok(None);
+    }
+    hybrid_plane_cylinder_brep_retry(positions, indices, options, without_promotion_15(switches), None).map(Some)
 }
 
 /// [`hybrid_plane_cylinder_brep`] without promotion 14's switch
-/// ([`without_promotion_14`]): the STL conversion's first further try when
-/// the rebuilt solid fails its STEP round trip.
+/// ([`without_promotion_14`]): the STL conversion's next try when the
+/// rebuilt solid fails its STEP round trip.
 pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_14(
     positions: &[f64],
     indices: Option<&[u32]>,
@@ -1175,7 +1199,8 @@ pub(crate) struct HybridSwitches {
     /// rebuild that left facets is made once more with a jittered body's
     /// flat freeform chips read as planes, kept when it leaves none
     /// (occt_countersunk_hole_s10_d0.05_jitter-1.0's side wall).
-    /// BREP_HYBRID_NOISY_CROSSING=1 opts in.
+    /// BREP_HYBRID_NOISY_CROSSING=0 restores the old path (promoted ON
+    /// 2026-11-08, promotion 15).
     pub(crate) noisy_crossing: bool,
 }
 
@@ -1211,11 +1236,10 @@ impl HybridSwitches {
     }
 
     /// The switches the variables `lookup` returns select: a promoted row
-    /// is on unless its variable is exactly "0", an opt-in row only when it
-    /// is exactly "1" (`noisy_crossing`).
+    /// is on unless its variable is exactly "0" (every row since promotion
+    /// 15 turned on `noisy_crossing`).
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let promoted = |name: &str| lookup(name).as_deref() != Some("0");
-        let opted_in = |name: &str| lookup(name).as_deref() == Some("1");
         Self {
             absorb_unsplit: promoted("BREP_HYBRID_ABSORB_UNSPLIT"),
             ring_mean_bar: promoted("BREP_HYBRID_RING_MEAN_BAR"),
@@ -1271,7 +1295,7 @@ impl HybridSwitches {
             retry_join_walls: promoted("BREP_HYBRID_RETRY_JOIN_WALLS"),
             join_walls_pass: false,
             chip_planes_pass: false,
-            noisy_crossing: opted_in("BREP_HYBRID_NOISY_CROSSING"),
+            noisy_crossing: promoted("BREP_HYBRID_NOISY_CROSSING"),
         }
     }
 }

@@ -1454,7 +1454,37 @@ fn build_imprints_with_carrier_seeds(
         std::env::var("BREP_OFFSET_IMPRINT_READINGS").map_or(true, |v| v != "0" && v != "off");
     let mut section_evidence = false;
     let edges = edge_map(solid_a, solid_b);
+    // FEATURE SCALE (`BREP_FEATURE_SCALE_IMPRINT`, default on, `=0` off):
+    // the slivers between almost parallel plane faces of the two operands,
+    // measured before any section is processed so that every band the
+    // imprint applies sees them. A sliver a quarter of which is under the
+    // tolerance cannot be resolved by any band, so the boolean refuses
+    // rather than merge it away.
+    let feature_scale = if crate::feature_scale::imprint_enabled() {
+        let scale = crate::feature_scale::FeatureScale::between(solid_a, solid_b, options.tolerance)
+            .or_refuse(KernelStage::Intersect, "feature_scale")?;
+        if let Some(thinnest) = scale.thinnest() {
+            if crate::feature_scale::FRACTION * thinnest < options.tolerance {
+                return Err(KernelRefusal::new(
+                    RefusalClass::IllPosed { what: "feature size".into() },
+                    KernelStage::Intersect,
+                    format!(
+                        "boolean: a sliver {thinnest:.3e} thick between almost parallel faces is smaller than the \
+                         section's resolution (tolerance {:.1e})",
+                        options.tolerance
+                    ),
+                ));
+            }
+        }
+        scale
+    } else {
+        Default::default()
+    };
+    // The tail passes (coincident-piece merge, junction canonicalisation)
+    // run after the builder is consumed; they read the same scale.
+    let tail_feature_scale = feature_scale.clone();
     let mut builder = ImprintBuilder {
+        feature_scale,
         open_carriers,
         edges,
         tolerance: options.tolerance,
@@ -3269,6 +3299,15 @@ fn build_imprints_with_carrier_seeds(
                     && {
                         let a = &result.pieces[index];
                         let b = &result.pieces[other];
+                        // FEATURE SCALE B2 (`BREP_FEATURE_SCALE_IMPRINT`):
+                        // the weld (1e-6) equals the hairline slot's width,
+                        // so the two walls' pieces read as one; beside a
+                        // feature the weld is capped at a quarter of it.
+                        let weld = if tail_feature_scale.is_empty() {
+                            weld
+                        } else {
+                            tail_feature_scale.cap(ends[index][0], weld).min(tail_feature_scale.cap(ends[index][1], weld))
+                        };
                         max_curve_deviation(&a.curve, &b.curve)? <= weld
                             && max_curve_deviation(&b.curve, &a.curve)? <= weld
                     };
@@ -3338,6 +3377,7 @@ fn build_imprints_with_carrier_seeds(
         &emitted_pcurves,
         &junction_evidence,
         junction_combine_mode(options),
+        &tail_feature_scale,
         // The composite one-call carrier imprint keeps the per-pair contract:
         // no residual-evidence vertex merge across its admitted pairs (see
         // the parameter doc on `canonicalize_imprint_junctions`).

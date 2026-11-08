@@ -346,6 +346,16 @@ pub struct FeatureResult {
     /// step it was, which no class can. Additive: absent when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused_step: Option<String>,
+    /// The solid a no-target boolean ran into: the part's ONLY solid, which a
+    /// feature whose `boolean.operation` is UNION/SUBTRACT/INTERSECT with no
+    /// `targets` uses as if the user had picked it (owner 2026-11-07;
+    /// `features::common::implicit_boolean_target`). Decided at every
+    /// evaluation and never written into the document, so the document stays
+    /// "auto" and follows a rename. `None` for every result that booleaned an
+    /// explicit target, or none. The feature panel shows it as `Auto: <name>`.
+    /// Additive: absent when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boolean_auto_target: Option<String>,
     /// `reference_selection` names this feature could not resolve against the
     /// scene-map. NOT an error/halt — the caller runs a snapshot-repair pass and
     /// re-dispatches (migration-plan Stage 5 gate).
@@ -428,6 +438,16 @@ pub struct FeatureResult {
     /// component surface (`component.rs`) resolves against the live scene.
     #[serde(skip)]
     pub components: Vec<ComponentRecord>,
+    /// Former solid names this feature's result still answers to, as
+    /// `(legacy, canonical)`: [`SceneMap::resolve_solid`] reads `legacy` as
+    /// the resident solid named `canonical`. An Offset Shell that replaces
+    /// its source keeps the source's name (since 2026-11-07); a
+    /// document saved before that names the shell `{target}_{featureId}` in
+    /// later features, and the alias keeps every such reference resolving.
+    /// Same INTERNAL `#[serde(skip)]` side-channel; a produced name, so it
+    /// versions like one for the history cache.
+    #[serde(skip)]
+    pub solid_aliases: Vec<(String, String)>,
 }
 
 impl FeatureResult {
@@ -444,6 +464,7 @@ impl FeatureResult {
             refusal: None,
             fulfilment: None,
             refused_step: None,
+            boolean_auto_target: None,
             unresolved: Vec::new(),
             notes: Vec::new(),
             approximations: Vec::new(),
@@ -457,6 +478,7 @@ impl FeatureResult {
             points: Vec::new(),
             ports: Vec::new(),
             components: Vec::new(),
+            solid_aliases: Vec::new(),
         }
     }
 
@@ -923,12 +945,39 @@ pub struct SceneMap {
     /// by a freshly-run feature as that feature's error, so the offending
     /// operation trips its own tests + shows an error in the app.
     pub name_collisions: Vec<String>,
+    /// Legacy solid name -> the canonical resident name it stands for
+    /// ([`FeatureResult::solid_aliases`]). A resident solid of the legacy
+    /// name itself always wins; an alias whose canonical solid is consumed
+    /// (removed and not re-added by the same result) is dropped.
+    pub solid_aliases: HashMap<String, String>,
 }
 
 impl SceneMap {
-    /// Resolve a solid name to its resident handle (exact match).
+    /// Rewrite each `removed` name that spells a legacy solid alias (and no
+    /// resident solid) to the canonical name it stands for, so an old
+    /// document's boolean on `{target}_{featureId}` consumes the shell
+    /// everywhere `removed` is read (this map, the render scene, the
+    /// history cache's blast radius).
+    pub(crate) fn canonical_removed(&self, result: &mut FeatureResult) {
+        for name in &mut result.removed {
+            if self.solids.contains_key(name.as_str()) {
+                continue;
+            }
+            if let Some(canonical) = self.solid_aliases.get(name.as_str()) {
+                *name = canonical.clone();
+            }
+        }
+    }
+
+    /// Resolve a solid name to its resident handle (exact match, then a
+    /// legacy alias of a resident solid — [`Self::solid_aliases`]).
     pub fn resolve_solid(&self, name: &str) -> Option<u32> {
-        self.solids.get(name).copied()
+        self.solids.get(name).copied().or_else(|| {
+            self.solid_aliases
+                .get(name)
+                .and_then(|canonical| self.solids.get(canonical))
+                .copied()
+        })
     }
 
     /// Resolve a face name to its `(handle, face_id)` (exact match).
@@ -1088,6 +1137,14 @@ impl SceneMap {
     /// solid the moment a downstream boolean consumed it.
     fn apply(&mut self, result: &FeatureResult) {
         for name in &result.removed {
+            // (A removal spelling a legacy alias was canonicalized when the
+            // feature ran — `canonical_removed` — so every consumer of
+            // `removed` sees the resident name.)
+            if self.solids.contains_key(name)
+                && !result.added.iter().any(|added| &added.name == name)
+            {
+                self.solid_aliases.retain(|_, canonical| canonical != name);
+            }
             // A removed COMPONENT id drops the record and unmaps every member
             // solid (names only — handle ownership stays with the cache, same
             // as plain solid removal). Feature ids never collide with solid
@@ -1154,6 +1211,9 @@ impl SceneMap {
         // Ingest any harness ports (PORT features).
         for (name, port) in &result.ports {
             self.ports.insert(name.clone(), port.clone());
+        }
+        for (legacy, canonical) in &result.solid_aliases {
+            self.solid_aliases.insert(legacy.clone(), canonical.clone());
         }
         // Ingest any component records (ACOMP features).
         for record in &result.components {
@@ -1520,7 +1580,7 @@ pub(crate) fn execute_feature_with_later(
     // Alias resolution mirrors the caller's feature registry, which matches short name,
     // LONG name, and class name (all uppercased) — saved files and tests use
     // long-name type strings like "CHAMFER"/"PLANE".
-    match feature_type.as_str() {
+    let mut result = match feature_type.as_str() {
         // --- Fully implemented (the exemplary pattern) ---
         "P.CU" | "CUBE" => features::cube::execute(&ctx),
         "P.S" | "SPHERE" => features::sphere::execute(&ctx),
@@ -1589,7 +1649,11 @@ pub(crate) fn execute_feature_with_later(
         _ if feature_type.contains('/') => extension::execute(&ctx),
         // --- Genuinely unknown type string ---
         _ => FeatureResult::error(id, feature_type.clone(), format!("unknown feature type '{feature_type}'")),
-    }
+    };
+    // Every entry point (the history walk and a direct `execute_feature`)
+    // reports a removal spelled as a legacy solid alias by its resident name.
+    scene.canonical_removed(&mut result);
+    result
 }
 
 // ===========================================================================
@@ -1986,6 +2050,7 @@ fn produced_names(result: &FeatureResult) -> Vec<String> {
     // A component's id is a produced name: a reference to the component (a
     // COMPONENT-type selection in a descriptor) versions against its producer.
     names.extend(result.components.iter().map(|record| record.id.clone()));
+    names.extend(result.solid_aliases.iter().map(|(legacy, _)| legacy.clone()));
     names
 }
 
@@ -2115,7 +2180,15 @@ pub fn execute_history_observed(
         // every other feature type.
         let (fingerprint, library_dirty) =
             parts_library::mix_descriptor_fingerprint(descriptor, fingerprint);
-        let consumed = scan_consumed(descriptor, &available);
+        let mut consumed = scan_consumed(descriptor, &available);
+        // A boolean with an operation and no picked target runs into the
+        // part's ONLY solid, which its descriptor never names
+        // (`common::implicit_boolean_target`). It consumes every candidate
+        // solid instead, so the cache re-runs it when that solid changes, is
+        // renamed, or gains a sibling — and a NONE boolean is untouched.
+        if features::common::wants_implicit_target(&descriptor.feature_type, &descriptor.input_params) {
+            consumed.extend(features::common::implicit_target_candidates(&scene));
+        }
         let reseat_references = if matches!(descriptor.feature_type.as_str(), "B" | "BOOLEAN") {
             seam_reseat_references(&consumed, &scene, &input_texts[index + 1..], persistent_after[index + 1])
         } else {

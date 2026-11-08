@@ -206,6 +206,10 @@ pub struct SolidClassifier<'a> {
     bounds: Aabb,
     bvh: Bvh,
     tolerance: f64,
+    /// `(region, cap)`: within `region` the On and coincident-On bands reach
+    /// at most `cap` (the feature-scale design's B6/B6′; empty unless the boolean's
+    /// `BREP_FEATURE_SCALE_SELECT` sets it with [`Self::with_coincident_caps`]).
+    coincident_caps: Vec<(Aabb, f64)>,
 }
 
 /// Clip the segment `start + s·direction, s ∈ [0, length]` to `bounds`
@@ -268,6 +272,7 @@ impl<'a> SolidClassifier<'a> {
             bounds,
             bvh,
             tolerance,
+            coincident_caps: Vec::new(),
         })
     }
 
@@ -326,7 +331,13 @@ impl<'a> SolidClassifier<'a> {
                 on_normal: None,
             });
         }
-        let on_tolerance = tolerance * 10.0;
+        // FEATURE SCALE B6′ (`BREP_FEATURE_SCALE_SELECT`; no caps without it):
+        // the On band (1e-6) reaches across a slab 1e-6 thick, so the middle
+        // of the hairline slot's strips read On its walls, not In the saw.
+        let on_tolerance = self.capped_band(point, tolerance * 10.0);
+        if !self.coincident_caps.is_empty() && env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
+            eprintln!("feature_scale: classify at {point:?} on band {on_tolerance:.3e} (uncapped {:.3e}, {} caps)", tolerance * 10.0, self.coincident_caps.len());
+        }
         let mut candidates = Vec::new();
         self.bvh
             .containing_point(point, on_tolerance, &mut candidates);
@@ -461,7 +472,7 @@ impl<'a> SolidClassifier<'a> {
                     p.ray_csi_ms += classify_elapsed_ms(csi_started);
                 });
                 for intersection in intersections {
-                    if intersection.point.sub(point).length() <= tolerance * 10.0 {
+                    if intersection.point.sub(point).length() <= on_tolerance {
                         let trim_started = classify_profile_started();
                         let trim = parameter_point_in_face(
                             face,
@@ -562,6 +573,23 @@ impl<'a> SolidClassifier<'a> {
     /// classification path is unchanged.  Interior-only (boundary hits are
     /// ignored) so it fires only on a genuine surface overlap, never on mere
     /// proximity to an edge.
+    /// Caps the coincident-On band within each region (see
+    /// `coincident_caps`): a test point a sliver's width from the other
+    /// solid's face is a feature, not noise to rescue to On.
+    pub fn with_coincident_caps(mut self, caps: Vec<(Aabb, f64)>) -> Self {
+        self.coincident_caps = caps;
+        self
+    }
+
+    /// `band` capped by every `coincident_caps` region within its reach of
+    /// `point`, strictly (a point exactly at a cap's distance is a feature).
+    fn capped_band(&self, point: Vec3, band: f64) -> f64 {
+        self.coincident_caps
+            .iter()
+            .filter(|(region, _)| region.expanded(band).contains(point))
+            .fold(band, |band, &(_, cap)| band.min(cap * (1.0 - 1e-9)))
+    }
+
     pub fn coincident_on_normal(&self, point: Vec3) -> Result<Option<Vec3>, String> {
         let started = classify_profile_started();
         let result = self.coincident_on_normal_inner(point);
@@ -574,6 +602,10 @@ impl<'a> SolidClassifier<'a> {
 
     fn coincident_on_normal_inner(&self, point: Vec3) -> Result<Option<Vec3>, String> {
         let band = (self.tolerance * 10.0).max(self.bounds.diagonal() * 1e-7);
+        // A point at a capped band's edge is a feature, not noise: strictly
+        // inside the cap only (`< cap`, as the projection test below reads
+        // `> band` as off).
+        let band = self.capped_band(point, band);
         if !self.bounds.expanded(band).contains(point) {
             return Ok(None);
         }

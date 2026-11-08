@@ -1205,8 +1205,20 @@ fn convert_component(
                 let hybrid_attempt = hybrid_attempt.and_then(|output| {
                     if hybrid_roundtrip_fallback_enabled() {
                         if let Err(error) = solid_round_trips(&output.solid) {
-                            // Promotion 14's switch first: the rebuild
+                            // Promotion 15's switch first: the rebuild
                             // without it.
+                            let crossing = crate::hybrid_region_brep::hybrid_plane_cylinder_brep_before_promotion_15(
+                                source_positions,
+                                source_indices,
+                                &segmentation_options(source_positions, options),
+                            );
+                            if let Ok(Some(crossing)) = crossing {
+                                if solid_round_trips(&crossing.solid).is_ok() {
+                                    return Ok(crossing);
+                                }
+                            }
+                            // Then promotion 14's switch: the rebuild
+                            // without it (and promotion 15's).
                             let joined = crate::hybrid_region_brep::hybrid_plane_cylinder_brep_before_promotion_14(
                                 source_positions,
                                 source_indices,
@@ -2520,10 +2532,10 @@ fn solid_round_trips(solid: &brep_kernel::BrepSolid) -> Result<(), String> {
 /// caps, volume error 1.6e-4). The hybrid rebuild reads that vertex as a
 /// chord vertex and draws the whole wall. Under this switch a kernel rebuild
 /// of a mesh whose repair stitched T-junctions is compared with the hybrid
-/// one ([`hybrid_over_kernel_strips`]). BREP_TJUNCTION_STRIP_HYBRID=1 turns
-/// it on (default off).
+/// one ([`hybrid_over_kernel_strips`]). Promoted ON 2026-11-08 (promotion
+/// 15); BREP_TJUNCTION_STRIP_HYBRID=0 restores the old path.
 fn tjunction_strip_hybrid_enabled() -> bool {
-    brep_kernel::switch!(live "BREP_TJUNCTION_STRIP_HYBRID", false)
+    brep_kernel::switch!(live "BREP_TJUNCTION_STRIP_HYBRID", true)
 }
 
 /// [`tjunction_strip_hybrid_enabled`]: the hybrid rebuild of the same mesh,

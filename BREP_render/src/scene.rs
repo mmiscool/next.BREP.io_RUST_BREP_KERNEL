@@ -186,6 +186,17 @@ pub struct RenderScene {
     /// default [`crate::render::WORK_PART_CONTEXT_RGBA`]). Set by
     /// `EngineState::set_context_display`; the context render pass reads it.
     pub tint: Option<[f32; 4]>,
+    /// Draw the scene as a Line art instructions step (set by the engine
+    /// while such a step is shown): a light grey ground, flat unlit fills,
+    /// the parts in `placed` white with grey lines, every other part flat
+    /// blue with black lines, and each part outlined.
+    pub line_art: Option<LineArtLook>,
+}
+
+/// What [`RenderScene::line_art`] needs: which solids earlier steps placed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LineArtLook {
+    pub placed: std::collections::HashSet<String>,
 }
 
 impl RenderScene {

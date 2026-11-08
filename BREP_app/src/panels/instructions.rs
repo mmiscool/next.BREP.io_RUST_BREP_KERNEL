@@ -16,7 +16,7 @@
 
 use crate::automation::hit_keys::HitKeyDoc;
 use brep_instructions::edit;
-use brep_instructions::model::{Arrow, Callout, CalloutKind, Instructions, Orientation, Step, Torque, TorqueSource, ToolUse};
+use brep_instructions::model::{Arrow, Callout, CalloutKind, Instructions, Orientation, Step, Style, Torque, TorqueSource, ToolUse};
 use brep_render::engine_state::PublishedMotion;
 use brep_render::engine_state::{EngineState, InstructionsRefField, RefSelectField, RefSelectTarget};
 use brep_render::style::{FieldKind, FormField};
@@ -350,9 +350,18 @@ impl InstructionsPanel {
         let per_page_choices: Vec<(u8, &str, &str)> = per_page_choices.iter().map(|(n, s)| (*n, s.as_str(), s.as_str())).collect();
         let orientation_choices = [(Orientation::Portrait, "Portrait", "Portrait"), (Orientation::Landscape, "Landscape", "Landscape")];
         let paper_choices: Vec<(String, &str, &str)> = brep_instructions::layout::PAPER_SIZES.iter().map(|(key, _, _)| (key.to_string(), *key, *key)).collect();
+        let style_choices: Vec<(Style, &str, &str)> = Style::CHOICES.iter().map(|(style, key, label)| (*style, *key, *label)).collect();
         ui.horizontal_wrapped(|ui| {
             ui.label("Print");
             let mut probe: HashMap<String, egui::Rect> = HashMap::new();
+            // How every output draws the steps: the PDF, the images, the
+            // HTML player and the Player pane.
+            keep_pair_together(ui, "Style:", 92.0);
+            ui.label("Style:");
+            let mut style = template.style;
+            if crate::form::enum_dropdown(ui, "instructions:print:style", &style_choices, &mut style, Some(92.0), Some(&mut probe)).0 {
+                *change = Some(Change::Print(Box::new(move |block| block.template.style = style)));
+            }
             keep_pair_together(ui, "Steps a page:", 56.0);
             ui.label("Steps a page:");
             let mut per_page = template.steps_per_page;
@@ -1075,7 +1084,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "instructions", prefix: "panel:clip", meaning: "the visible region of the pane (scroll_into_view scrolls an instructions:* widget inside it)", command: None },
     HitKeyDoc { panel: "instructions", prefix: "instructions:error", meaning: "why the last action was refused", command: None },
     HitKeyDoc { panel: "instructions", prefix: "instructions:notice", meaning: "what the last action did", command: None },
-    HitKeyDoc { panel: "instructions", prefix: "instructions:print:", meaning: "the print settings as dropdowns (form::enum_dropdown): per_page (items #1, #2, #4), orientation (#Portrait, #Landscape), paper (#A4 … #Tabloid, one list), and the parts and tools list checkboxes", command: Some("instructions_update") },
+    HitKeyDoc { panel: "instructions", prefix: "instructions:print:", meaning: "the print settings as dropdowns (form::enum_dropdown): style (#lineArt, #shaded: how the PDF, images and both players draw the steps), per_page (items #1, #2, #4), orientation (#Portrait, #Landscape), paper (#A4 … #Tabloid, one list), and the parts and tools list checkboxes", command: Some("instructions_update") },
     HitKeyDoc { panel: "instructions", prefix: "instructions:retarget:", meaning: "the pending re-target: heading, added:/removed:/replaced:<index> rows, step:<id> (show a step it changed), approve and reject (instructions_retarget_reject)", command: Some("instructions_retarget_approve") },
     HitKeyDoc { panel: "instructions", prefix: "instructions:unplanned:", meaning: "a part of the assembly in no step yet, by occurrence (drag it onto a step's row), and its Add to selected step button (:add)", command: Some("instructions_add_parts") },
     HitKeyDoc { panel: "instructions", prefix: "instructions:step:", meaning: "a step's row, by step id (a step's children are indented under it): select it and show its view; drop a BOM row or an unplanned part on it to add the parts, drop another step's row on it to nest that step under it; drag it to nest it elsewhere", command: Some("instructions_show_step") },
