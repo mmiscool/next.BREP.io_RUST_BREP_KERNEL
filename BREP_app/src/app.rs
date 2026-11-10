@@ -2906,6 +2906,9 @@ impl eframe::App for BrepApp {
         // Drawn at ctx level like the file dialog; idempotent while idle. Draws
         // NOTHING during capture, so the screenshot it requested never contains
         // this dialog.
+        if let Some(report) = crate::form_view::take_problem_report_request(&ctx) {
+            self.bug_report.request_for_error(&ctx, self.docs.engine(), &self.diagnostics, &report.dialog, &report.error);
+        }
         self.bug_report.show(&ctx, self.docs.engine_mut());
         if let Some((id, summary)) = self.bug_report.take_submitted() {
             self.report_followup.record(id, summary);

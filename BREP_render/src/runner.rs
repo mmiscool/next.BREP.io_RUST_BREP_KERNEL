@@ -1412,7 +1412,13 @@ pub enum Reply {
 fn probe_step(request: StepProbeRequest) -> StepProbeReply {
     StepProbeReply {
         id: request.id,
-        result: brep_kernel::read_step_assembly(&request.text),
+        // The same probe answers an IGES file, whose structure is subfigure
+        // instances; the app's choice and import consume either alike.
+        result: if crate::engine_state::is_iges_text(&request.text) {
+            brep_kernel::read_iges_assembly(&request.text)
+        } else {
+            brep_kernel::read_step_assembly(&request.text)
+        },
     }
 }
 

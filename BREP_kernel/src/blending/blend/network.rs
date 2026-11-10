@@ -164,6 +164,12 @@ enum VertexKind<'a> {
     /// stripe ends on the rib through its two points and the ribs are filled
     /// by the ribbon Coons patch (`build_ribbon_star_patch`).
     RibbonStar { corner: Corner },
+    /// A convex star of equal radii on four planar faces with no common ball:
+    /// the rolling ball's closure. The offsets of the pair `ridge_faces` meet in
+    /// a line the ball runs along between two seats, one against each remaining
+    /// face (the opening of the solid): a sphere triangle at each seat and a
+    /// cylinder between them. One [`Corner`] per seat.
+    RidgeStar { seats: [Corner; 2] },
     /// A miter: two selected edges, the third sharp.  `shared` is the face
     /// both stripes touch; `sharp` the unselected edge; the ball still seats
     /// on the three faces and supplies P, the point both shared-face rails
@@ -1156,6 +1162,25 @@ fn blend_star_network_building(
         let bar = 1e-7 * (1.0 + scale);
         if ball.residual > bar && !ribbon_star {
             if is_star && super::no_common_ball_star_on() && !tapered_here {
+                if !chamfer && super::ridge_star_on() {
+                    if let Some([seat_a, seat_b]) = solve_ridge_seats(&faces, &stripe_indices, &mates, corner_radius) {
+                        let mut mint = |seat: RidgeSeat| {
+                            let tangency = seat
+                                .contacts
+                                .iter()
+                                .map(|&(face_id, point)| {
+                                    let id = take_id();
+                                    result.vertices.push(VertexRecord { id, point });
+                                    (face_id, point, id)
+                                })
+                                .collect();
+                            Corner { center: seat.center, outward: true, tangency, radius: corner_radius }
+                        };
+                        let seats = [mint(seat_a), mint(seat_b)];
+                        corners.push((*vertex_id, stripe_indices.clone(), VertexKind::RidgeStar { seats }));
+                        continue;
+                    }
+                }
                 ribbon_star = true;
             } else {
                 return Err(KernelRefusal::unsupported(KernelStage::Refine, "n_sided_corner", format!(
@@ -2124,6 +2149,14 @@ fn blend_star_network_building(
 
     // ---- 5. Turn every corner into per-stripe end plans. ----
     let end_plans_timing = super::BlendTimer::start("timing.end_plans_ms");
+    /// A ridge star's cylinder: its two end arcs (at the two seats, each stored
+    /// as the cylinder's loop walks it) and the two lines on the ridge faces.
+    struct PendingRidge {
+        arcs: [EdgeRecord; 2],
+        lines: [(EdgeRecord, u64); 2],
+        seat_centers: [Vec3; 2],
+        name: Option<String>,
+    }
     struct PendingPatch {
         center: Vec3,
         outward: bool,
@@ -2158,6 +2191,7 @@ fn blend_star_network_building(
         (0..stripes.len()).map(|_| [None, None]).collect();
     let mut patches: Vec<PendingPatch> = Vec::new();
     let mut ribbon_patches: Vec<PendingRibbonPatch> = Vec::new();
+    let mut pending_ridges: Vec<PendingRidge> = Vec::new();
     let mut pending_miters: Vec<PendingMiter> = Vec::new();
     // Whether a full-width miter consumed a sharp edge whole (see
     // `collapse_full_width`).
@@ -2457,6 +2491,97 @@ fn blend_star_network_building(
         match kind {
             // Planned below, once every star and miter is in.
             VertexKind::Reentrant { .. } | VertexKind::Flush { .. } | VertexKind::MixedStar(_) => continue,
+            VertexKind::RidgeStar { seats } => {
+                let mut ridge_arcs: Vec<EdgeRecord> = Vec::with_capacity(2);
+                for corner in seats {
+                    let holds = |face_id: u64| corner.tangency.iter().any(|(id, _, _)| *id == face_id);
+                    let mut arcs: Vec<EdgeRecord> = Vec::with_capacity(3);
+                    for &index in stripe_indices.iter().filter(|&&index| holds(stripes[index].first.face.id) && holds(stripes[index].second.face.id)) {
+                        let stripe = &stripes[index];
+                        let at_start = stripe.at_start(*vertex_id);
+                        let (first_point, first_vertex) = corner.tangency_on(stripe.first.face.id)?;
+                        let (second_point, second_vertex) = corner.tangency_on(stripe.second.face.id)?;
+                        let station = 0.5
+                            * (station_on(stripe, stripe.first.face.id, first_point)?
+                                + station_on(stripe, stripe.second.face.id, second_point)?);
+                        let walk_first_to_second = stripe.walk_first_to_second(at_start);
+                        let (from, to, from_vertex, to_vertex) = if walk_first_to_second {
+                            (first_point, second_point, first_vertex, second_vertex)
+                        } else {
+                            (second_point, first_point, second_vertex, first_vertex)
+                        };
+                        let arc = corner_section_arc(corner.center, corner.radius, from, to)?;
+                        let domain = arc.domain().or_refuse(KernelStage::Refine, "domain")?;
+                        let arc_edge_id = take_id();
+                        let record = EdgeRecord { id: arc_edge_id, curve: arc, t0: domain[0], t1: domain[1], start_vertex_id: from_vertex, end_vertex_id: to_vertex, degenerate: false, name: None };
+                        result.edges.push(record.clone());
+                        arcs.push(record);
+                        let arc_blend_pcurve = if walk_first_to_second {
+                            crate::sweep_topology::parameter_line(station, 0.0, station, 1.0).or_refuse(KernelStage::Refine, "parameter_line")?
+                        } else {
+                            crate::sweep_topology::parameter_line(station, 1.0, station, 0.0).or_refuse(KernelStage::Refine, "parameter_line")?
+                        };
+                        end_plans[index][usize::from(!at_start)] = Some(EndPlan::Corner(CornerEnd {
+                            cr_parameter: station,
+                            cs_parameter: station,
+                            first_vertex,
+                            second_vertex,
+                            arc_edge_id,
+                            arc_blend_pcurve,
+                        }));
+                    }
+                    let [a, b] = arcs.as_slice() else {
+                        return Err(KernelRefusal::internal(KernelStage::Refine, "ridge_star_stripes", format!(
+                            "blend network: a seat of the ridge star at vertex {vertex_id} ends {} stripes, not two", arcs.len()
+                        )));
+                    };
+                    // The two stripe arcs share the end wall's contact; the third
+                    // closes the cycle, so all three run one way round the triangle.
+                    let (start_vertex, end_vertex) = if a.end_vertex_id == b.start_vertex_id {
+                        (b.end_vertex_id, a.start_vertex_id)
+                    } else if b.end_vertex_id == a.start_vertex_id {
+                        (a.end_vertex_id, b.start_vertex_id)
+                    } else {
+                        return Err(KernelRefusal::internal(KernelStage::Refine, "ridge_star_cycle", format!(
+                            "blend network: the stripe arcs at a seat of vertex {vertex_id} do not chain"
+                        )));
+                    };
+                    let contact = |id: u64| corner.tangency.iter().find(|(_, _, vertex)| *vertex == id).map(|(_, point, _)| *point)
+                        .ok_or(KernelRefusal::internal(KernelStage::Refine, "ridge_star_contact", "blend network: a ridge arc ends off its seat"));
+                    let arc = corner_section_arc(corner.center, corner.radius, contact(start_vertex)?, contact(end_vertex)?)?;
+                    let domain = arc.domain().or_refuse(KernelStage::Refine, "domain")?;
+                    let record = EdgeRecord { id: take_id(), curve: arc, t0: domain[0], t1: domain[1], start_vertex_id: start_vertex, end_vertex_id: end_vertex, degenerate: false, name: None };
+                    result.edges.push(record.clone());
+                    arcs.push(record.clone());
+                    ridge_arcs.push(record);
+                    let normals = corner.tangency.iter().map(|(_, point, _)| point.sub(corner.center).normalized().or_refuse(KernelStage::Refine, "normalized")).collect::<Result<Vec<_>, _>>()?;
+                    patches.push(PendingPatch { center: corner.center, outward: true, normals, arcs, name: corner_name(stripe_indices), radius: corner.radius });
+                }
+                // Each ridge face holds one contact per seat: a line joins them.
+                let [arc_a, arc_b] = <[EdgeRecord; 2]>::try_from(ridge_arcs).map_err(|_| KernelRefusal::internal(KernelStage::Refine, "ridge_star_arcs", "blend network: a ridge star needs two arcs"))?;
+                let face_of = |seat: &Corner, vertex: u64| seat.tangency.iter().find(|(_, _, id)| *id == vertex).map(|(face, point, _)| (*face, *point))
+                    .ok_or(KernelRefusal::internal(KernelStage::Refine, "ridge_star_contact", "blend network: a ridge arc ends off its seat"));
+                let mut lines = Vec::with_capacity(2);
+                for (from_vertex, from_seat, to_vertex, to_seat) in [
+                    (arc_a.end_vertex_id, &seats[0], arc_b.start_vertex_id, &seats[1]),
+                    (arc_b.end_vertex_id, &seats[1], arc_a.start_vertex_id, &seats[0]),
+                ] {
+                    let (from_face, from_point) = face_of(from_seat, from_vertex)?;
+                    let (to_face, to_point) = face_of(to_seat, to_vertex)?;
+                    if from_face != to_face {
+                        return Err(KernelRefusal::internal(KernelStage::Refine, "ridge_star_faces", format!(
+                            "blend network: the ridge arcs at vertex {vertex_id} run the same way round"
+                        )));
+                    }
+                    let line = crate::make_line(from_point, to_point).or_refuse(KernelStage::Refine, "make_line")?;
+                    let domain = line.domain().or_refuse(KernelStage::Refine, "domain")?;
+                    let record = EdgeRecord { id: take_id(), curve: line, t0: domain[0], t1: domain[1], start_vertex_id: from_vertex, end_vertex_id: to_vertex, degenerate: false, name: None };
+                    result.edges.push(record.clone());
+                    lines.push((record, from_face));
+                }
+                let lines = <[(EdgeRecord, u64); 2]>::try_from(lines).map_err(|_| KernelRefusal::internal(KernelStage::Refine, "ridge_star_lines", "blend network: a ridge star needs two lines"))?;
+                pending_ridges.push(PendingRidge { arcs: [arc_a, arc_b], lines, seat_centers: [seats[0].center, seats[1].center], name: corner_name(stripe_indices) });
+            }
             VertexKind::Star { corner } => {
                 let radius = corner.radius;
                 let mut arcs: Vec<EdgeRecord> = Vec::with_capacity(stripe_indices.len());
@@ -3050,6 +3175,10 @@ fn blend_star_network_building(
         /// (`tilted_horn_on`): closed by the ruled patch between the two
         /// sections, not the torus.
         tilted: bool,
+        /// A corner whose stops sit on no common horn torus (unequal wall
+        /// dihedrals, curved walls or concave edge): closed by the ball's
+        /// envelope, [`canal_corner_patch`].
+        canal: Option<CanalCorner>,
     }
     let mut pending_horns: Vec<PendingHorn> = Vec::new();
     stars_miters_timing.stop();
@@ -3105,7 +3234,13 @@ fn blend_star_network_building(
         }
         let pole = ends[0].3;
         let pole_gap = ends[1].3.sub(pole).length();
-        if pole_gap > 1e-6 * (1.0 + radius) {
+        // A corner the exact torus cannot close is closed by the ball's
+        // envelope, when the cap is a plane and the section is the ball's arc.
+        let canal_allowed = canal_corner_on()
+            && !chamfer
+            && matches!(cap.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. }));
+        let mut canal = pole_gap > 1e-6 * (1.0 + radius) && canal_allowed;
+        if pole_gap > 1e-6 * (1.0 + radius) && !canal {
             return Err(KernelRefusal::unsupported(KernelStage::Refine, "horn_torus_dihedrals", format!(
                 "blend network: the two blends at vertex {vertex_id} reach the concave edge \
                  {pole_gap:.3e} apart (unequal wall dihedrals) — the closure is not a horn torus \
@@ -3158,12 +3293,23 @@ fn blend_star_network_building(
                 tilted = true;
                 continue;
             }
+            if canal {
+                continue;
+            }
+            if (direction.dot(axis).abs() > 1e-6 || !on_pivot) && canal_allowed {
+                canal = true;
+                continue;
+            }
             if direction.dot(axis).abs() > 1e-6 || !on_pivot {
                 return Err(KernelRefusal::unsupported(KernelStage::Refine, "horn_torus_tilt", format!(
                     "blend network: edge {}'s section at vertex {vertex_id} is not a meridian \
                      of the horn torus about the concave edge (tilted class) — not in this lane",
                     stripe.edge.id
                 )));
+            }
+            if (cap_point.sub(corner_point).length() - radius).abs() > 1e-6 * (1.0 + radius) && canal_allowed {
+                canal = true;
+                continue;
             }
             if (cap_point.sub(corner_point).length() - radius).abs() > 1e-6 * (1.0 + radius) {
                 return Err(KernelRefusal::unsupported(KernelStage::Refine, "horn_torus_cap", format!(
@@ -3180,8 +3326,19 @@ fn blend_star_network_building(
             result.vertices.push(VertexRecord { id, point: pole });
             id
         };
+        // The canal closure keeps each stripe's own pole when they differ.
+        let two_poles = canal && pole_gap > 1e-6 * (1.0 + radius);
+        let second_pole_vertex = if two_poles {
+            let id = take_id();
+            result.vertices.push(VertexRecord { id, point: ends[1].3 });
+            id
+        } else {
+            pole_vertex
+        };
+        let deeper_second = if sharp.start_vertex_id == *vertex_id { ends[1].2 > ends[0].2 } else { ends[1].2 < ends[0].2 };
         let mut committed: Vec<(usize, EdgeRecord, u64, Vec3, Vec3)> = Vec::new();
-        for (index, u_stop, _, _, cap_point, center) in &ends {
+        for (end_number, (index, u_stop, _, end_pole, cap_point, center)) in ends.iter().enumerate() {
+            let (pole, pole_vertex) = if end_number == 0 { (*end_pole, pole_vertex) } else { (*end_pole, second_pole_vertex) };
             let stripe = &stripes[*index];
             let at_start = stripe.at_start(*vertex_id);
             let cap_first = stripe.first.face.id == cap.id;
@@ -3245,13 +3402,18 @@ fn blend_star_network_building(
             vertex: *vertex_id,
             cap_face: cap.id,
             sharp_edge: sharp.id,
-            sharp_parameter: ends[0].2,
-            pole_vertex,
+            // Two poles: the concave edge survives from the DEEPER one on.
+            sharp_parameter: if two_poles && deeper_second { ends[1].2 } else { ends[0].2 },
+            pole_vertex: if two_poles && deeper_second { second_pole_vertex } else { pole_vertex },
             pole,
             axis,
             ends: committed,
             name: corner_name(stripe_indices),
             tilted,
+            canal: canal.then(|| CanalCorner {
+                poles: [(pole_vertex, ends[0].3, ends[0].2), (second_pole_vertex, ends[1].3, ends[1].2)],
+                deeper_second,
+            }),
         });
     }
 
@@ -4059,6 +4221,9 @@ fn blend_star_network_building(
             .ok_or(KernelRefusal::internal(KernelStage::Sew, "shell", "blend network: the solid has no shell to sew the corner patch into"))?;
         result.shells[shell_index].faces.push(face);
     }
+    for ridge in pending_ridges {
+        sew_ridge_face(&mut result, ridge.arcs, ridge.lines, ridge.seat_centers, ridge.name.as_deref(), &mut take_id)?;
+    }
     for patch in ribbon_patches {
         let ribs: Vec<RibbonRib<'_>> = patch
             .ribs
@@ -4259,7 +4424,17 @@ fn blend_star_network_building(
         // Tilted: the ball's contact with the cap runs only the pivot's
         // length (radius x crease angle); its chord stands on the cap to the
         // cap's curvature over that length, read by the pcurve's projection.
-        let cap_arc = if horn.tilted {
+        let canal_patch = match &horn.canal {
+            Some(canal) => {
+                let sharp = solid.edges.iter().find(|edge| edge.id == horn.sharp_edge)
+                    .ok_or(KernelRefusal::internal(KernelStage::Refine, "canal_sharp", "blend network: the concave edge is missing"))?;
+                Some(canal_corner_patch(sharp, [canal.poles[0].2, canal.poles[1].2], center_a, center_b, cap_point_a, radius, solid)?)
+            }
+            None => None,
+        };
+        let cap_arc = if let Some((_, cap_curve)) = &canal_patch {
+            cap_curve.clone()
+        } else if horn.tilted {
             crate::make_line(cap_point_a, cap_point_b).or_refuse(KernelStage::Refine, "make_line")?
         } else {
             corner_section_arc(corner_point, radius, cap_point_a, cap_point_b)?
@@ -4372,10 +4547,11 @@ fn blend_star_network_building(
         // The horn-torus sector: the generatrix is the first stripe's section
         // arc run from the pole to its cap point, revolved about the concave
         // edge through the pole by the angle between the two ball centres.
+        let (pole_vertex_a, pole_vertex_b) = horn.canal.as_ref().map_or((horn.pole_vertex, horn.pole_vertex), |canal| (canal.poles[0].0, canal.poles[1].0));
         let radial_a = center_a.sub(horn.pole).normalized().or_refuse(KernelStage::Refine, "normalized")?;
-        let radial_b = center_b.sub(horn.pole).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+        let radial_b = center_b.sub(horn.pole).normalized().unwrap_or(radial_a);
         let sweep = radial_a.dot(radial_b).clamp(-1.0, 1.0).acos();
-        if sweep < 1e-9 {
+        if sweep < 1e-9 && canal_patch.is_none() {
             return Err(KernelRefusal::internal(KernelStage::Refine, "horn_torus_sweep", "blend network: degenerate horn-torus sweep"));
         }
         let revolve_axis = if radial_a.cross(radial_b).dot(horn.axis) > 0.0 {
@@ -4396,7 +4572,9 @@ fn blend_star_network_building(
         } else {
             corner_section_arc(center_a, radius, horn.pole, cap_point_a)?
         };
-        let surface = if horn.tilted {
+        let surface = if let Some((patch, _)) = canal_patch {
+            patch
+        } else if horn.tilted {
             tilted_horn_patch(&generatrix, &corner_section_arc(center_b, radius, horn.pole, cap_point_b)?, center_a, center_b, radius, solid)?
         } else {
             crate::make_revolution(horn.pole, revolve_axis, &generatrix, sweep).or_refuse(KernelStage::Refine, "make_revolution")?
@@ -4410,16 +4588,47 @@ fn blend_star_network_building(
             )));
         }
         let pole_edge_id = take_id();
-        result.edges.push(EdgeRecord {
-            id: pole_edge_id,
-            curve: crate::make_line(horn.pole, horn.pole).or_refuse(KernelStage::Refine, "make_line")?,
-            t0: 0.0,
-            t1: 1.0,
-            start_vertex_id: horn.pole_vertex,
-            end_vertex_id: horn.pole_vertex,
-            degenerate: true,
-            name: None,
-        });
+        let distinct_poles = pole_vertex_a != pole_vertex_b;
+        if distinct_poles {
+            let canal = horn.canal.as_ref().ok_or(KernelRefusal::internal(KernelStage::Sew, "canal_poles", "blend network: two poles without a canal"))?;
+            let sharp = solid.edges.iter().find(|edge| edge.id == horn.sharp_edge)
+                .ok_or(KernelRefusal::internal(KernelStage::Refine, "canal_sharp", "blend network: the concave edge is missing"))?;
+            let [t_a, t_b] = [canal.poles[0].2, canal.poles[1].2];
+            let piece = sharp_piece(sharp, t_a, t_b)?;
+            let domain = piece.domain().or_refuse(KernelStage::Refine, "domain")?;
+            result.edges.push(EdgeRecord {
+                id: pole_edge_id,
+                curve: piece.clone(),
+                t0: domain[0],
+                t1: domain[1],
+                start_vertex_id: pole_vertex_a,
+                end_vertex_id: pole_vertex_b,
+                degenerate: false,
+                name: None,
+            });
+            // The stripe that stopped nearer the corner leaves its wall to
+            // meet the patch along this piece.
+            let near_is_a = canal.deeper_second;
+            let near = if near_is_a { index_a } else { index_b };
+            let (wall_face, wall_rail) = if stripes[near].first.face.id == horn.cap_face {
+                (stripes[near].second.face.id, sewn[near].cs_edge_id)
+            } else {
+                (stripes[near].first.face.id, sewn[near].cr_edge_id)
+            };
+            let wall_rail = wall_rail.ok_or(KernelRefusal::unsupported(KernelStage::Sew, "canal_rail", "blend network: a wall rail at the corner collapsed"))?;
+            insert_canal_wall_edge(&mut result, wall_face, wall_rail, horn.sharp_edge, pole_edge_id, near_is_a, &piece, domain, &mut take_id)?;
+        } else {
+            result.edges.push(EdgeRecord {
+                id: pole_edge_id,
+                curve: crate::make_line(horn.pole, horn.pole).or_refuse(KernelStage::Refine, "make_line")?,
+                t0: 0.0,
+                t1: 1.0,
+                start_vertex_id: horn.pole_vertex,
+                end_vertex_id: horn.pole_vertex,
+                degenerate: true,
+                name: None,
+            });
+        }
         let pl = |u0, v0, u1, v1| crate::sweep_topology::parameter_line(u0, v0, u1, v1);
         // Every shared edge is used with the sense OPPOSITE to its
         // neighbour: the blends use their section arcs forward (they were
@@ -4427,8 +4636,8 @@ fn blend_star_network_building(
         // with the sense the splice gave it.  Those three senses fix the
         // walk; the u/v boundaries are: u = 0 meridian = arc_a, v = 1 = the
         // cap arc, u = 1 meridian = arc_b, v = 0 = the pole.
-        let a_walks_down = arc_a.start_vertex_id == horn.pole_vertex; // forward=false walks cap_a -> pole
-        let b_walks_up = arc_b.end_vertex_id == horn.pole_vertex; // forward=false walks pole -> cap_b
+        let a_walks_down = arc_a.start_vertex_id == pole_vertex_a; // forward=false walks cap_a -> pole
+        let b_walks_up = arc_b.end_vertex_id == pole_vertex_b; // forward=false walks pole -> cap_b
         let cap_walks_back = cap_forward_on_cap; // horn uses !cap_forward: cap_b -> cap_a iff the cap walked a -> b
         if a_walks_down != b_walks_up || a_walks_down != cap_walks_back {
             return Err(
@@ -4488,7 +4697,7 @@ fn blend_star_network_building(
                 CoedgeRecord {
                     id: take_id(),
                     edge_id: pole_edge_id,
-                    forward: true,
+                    forward: !distinct_poles,
                     pcurve: pl(1.0, 0.0, 0.0, 0.0).or_refuse(KernelStage::Refine, "pl")?,
                 },
             ]
@@ -5547,7 +5756,7 @@ fn concave_corner_reach(
     let (_, _, kind) = corners.iter().find(|(id, _, _)| *id == vertex)?;
     let corner = match kind {
         VertexKind::Star { corner } | VertexKind::RibbonStar { corner } | VertexKind::Miter { corner, .. } => corner,
-        VertexKind::Flush { .. } | VertexKind::Reentrant { .. } | VertexKind::MixedStar(_) => return None,
+        VertexKind::RidgeStar { .. } | VertexKind::Flush { .. } | VertexKind::Reentrant { .. } | VertexKind::MixedStar(_) => return None,
     };
     if corner.outward {
         return None;
@@ -5670,6 +5879,7 @@ fn corner_rails_reach(
         VertexKind::Star { corner } | VertexKind::RibbonStar { corner } => {
             on(corner, first.face.id) && on(corner, second.face.id)
         }
+        VertexKind::RidgeStar { seats } => seats.iter().any(|seat| on(seat, first.face.id) && on(seat, second.face.id)),
         // A miter only reads the tangency on the SHARED face; its other rim
         // vertices come from the seam.
         VertexKind::Miter { corner, shared, .. } => on(corner, shared.id),
@@ -5968,6 +6178,229 @@ fn tilted_horn_patch(
     Ok(surface)
 }
 
+/// Whether a re-entrant corner the exact horn torus cannot close is closed by
+/// the ball's envelope: on unless `BREP_BLEND_CANAL_CORNER=0`/`off`.
+pub(in crate::blend) fn canal_corner_on() -> bool {
+    switch!(live "BREP_BLEND_CANAL_CORNER", true)
+}
+
+/// The largest height of the envelope's foot on the concave edge above or
+/// below the ball centres' plane, as a fraction of the radius.
+const CANAL_MAX_FOOT_HEIGHT: f64 = 0.25;
+
+/// The two stops of a re-entrant corner closed by [`canal_corner_patch`]:
+/// `(vertex, point, parameter on the concave edge)`, in stripe order.
+struct CanalCorner {
+    poles: [(u64, Vec3, f64); 2],
+    /// The second stripe's pole lies farther down the concave edge.
+    deeper_second: bool,
+}
+
+/// The piece of `sharp`'s curve from parameter `from` to `to` (either order),
+/// running from `from` to `to`.
+fn sharp_piece(sharp: &EdgeRecord, from: f64, to: f64) -> Result<NurbsCurve, KernelRefusal> {
+    let (low, high) = (from.min(to), from.max(to));
+    let [t0, t1] = sharp.curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let tail = if low > t0 { sharp.curve.split(low).or_refuse(KernelStage::Refine, "split")?.1 } else { sharp.curve.clone() };
+    let piece = if high < t1 { tail.split(high).or_refuse(KernelStage::Refine, "split")?.0 } else { tail };
+    if from <= to {
+        Ok(piece)
+    } else {
+        piece.reversed().or_refuse(KernelStage::Refine, "reversed")
+    }
+}
+
+/// The closure of a re-entrant corner whose stops share no horn torus: the
+/// envelope of the ball that stays tangent to the planar cap and touches the
+/// concave edge at its nearest point, pivoting from one stripe's stop ball to
+/// the other's. Each stop ball is on the family exactly: tangent to its wall
+/// at the pole, so its radial there is normal to the concave edge, which lies
+/// in the wall (a reported model: walls a cylinder and cones meeting at 81
+/// degrees; the poles sit 4e-3 to 5e-2 apart along the concave edge).
+///
+/// `u` runs stop a -> stop b, `v` the ball's arc from the concave edge (v = 0)
+/// to the cap (v = 1). Returns the patch and its v = 1 boundary. Refused by
+/// name when a station does not solve or the fit misses the true envelope.
+fn canal_corner_patch(
+    sharp: &EdgeRecord,
+    poles: [f64; 2],
+    center_a: Vec3,
+    center_b: Vec3,
+    cap_point_a: Vec3,
+    radius: f64,
+    solid: &BrepSolid,
+) -> Result<(crate::NurbsSurface, NurbsCurve), KernelRefusal> {
+    let unsolved = |what: &'static str| KernelRefusal::unsupported(KernelStage::Refine, what, "blend network: the corner's ball envelope does not solve");
+    let cap_up = cap_point_a.sub(center_a).normalized().or_refuse(KernelStage::Refine, "canal_cap_normal")?;
+    if center_b.sub(center_a).dot(cap_up).abs() > 1e-6 * (1.0 + radius) {
+        return Err(unsolved("canal_centres_off_plane"));
+    }
+    let evaluate = |t: f64| -> Result<(Vec3, Vec3), KernelRefusal> {
+        let row = sharp.curve.derivatives(t, 1).or_refuse(KernelStage::Refine, "derivatives")?;
+        Ok((row[0], row[1]))
+    };
+    // The ball centre over edge point `p` in unit direction `dir` of the
+    // centres' plane; `None` when the point is out of the ball's reach.
+    let centre_at = |p: Vec3, dir: Vec3| -> Option<Vec3> {
+        let height = p.sub(center_a).dot(cap_up);
+        let foot = p.sub(cap_up.scale(height));
+        let reach = radius * radius - height * height;
+        (reach > 0.0).then(|| foot.add(dir.scale(reach.sqrt())))
+    };
+    let in_plane = |v: Vec3| v.sub(cap_up.scale(v.dot(cap_up)));
+    let start = in_plane(center_a.sub(evaluate(poles[0])?.0)).normalized().or_refuse(KernelStage::Refine, "canal_radial")?;
+    let finish = in_plane(center_b.sub(evaluate(poles[1])?.0)).normalized().or_refuse(KernelStage::Refine, "canal_radial")?;
+    let side = cap_up.cross(start);
+    let total = finish.dot(side).atan2(finish.dot(start));
+    let [t0, t1] = sharp.curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+    // The nearest-point condition along the edge for one pivot angle.
+    let station = |u: f64, guess: f64| -> Result<(f64, Vec3, Vec3), KernelRefusal> {
+        let angle = total * u;
+        let dir = start.scale(angle.cos()).add(side.scale(angle.sin()));
+        let residual = |t: f64| -> Result<Option<f64>, KernelRefusal> {
+            let (p, tangent) = evaluate(t)?;
+            Ok(centre_at(p, dir).map(|centre| centre.sub(p).dot(tangent)))
+        };
+        let step = 1e-6 * (t1 - t0);
+        let mut t = guess;
+        for _ in 0..32 {
+            let value = residual(t)?.ok_or_else(|| unsolved("canal_out_of_reach"))?;
+            if value.abs() <= 1e-12 * (1.0 + radius) * (t1 - t0).max(1.0) {
+                let p = evaluate(t)?.0;
+                let centre = centre_at(p, dir).ok_or_else(|| unsolved("canal_out_of_reach"))?;
+                return Ok((t, p, centre));
+            }
+            let ahead = residual(t + step)?.ok_or_else(|| unsolved("canal_out_of_reach"))?;
+            let slope = (ahead - value) / step;
+            if slope == 0.0 {
+                return Err(unsolved("canal_flat_residual"));
+            }
+            t = (t - value / slope).clamp(t0, t1);
+        }
+        Err(unsolved("canal_no_convergence"))
+    };
+    // The arc's three homogeneous control points, concave edge to cap.
+    let arc_controls = |p: Vec3, centre: Vec3| -> Result<[crate::Vec4; 3], KernelRefusal> {
+        let cap = centre.add(cap_up.scale(radius));
+        let (from, to) = (p.sub(centre), cap.sub(centre));
+        let cosine = (from.dot(to) / (radius * radius)).clamp(-1.0, 1.0);
+        let half = 0.5 * cosine.acos();
+        if half >= 1.45 {
+            return Err(unsolved("canal_wide_arc"));
+        }
+        // Where the edge leaves the centres' plane (height `h`) the arc starts
+        // slightly past the ball's pivot axis, and that short run rotates
+        // backwards: a fold about h^2 / (2 r) deep, inherent to the envelope
+        // because the stop arcs are the stripes' own sections. Bounded here
+        // (0.004 at r = 0.3 on the reported model's corners); deeper, the corner stays
+        // with the miter composition.
+        if p.sub(center_a).dot(cap_up).abs() > CANAL_MAX_FOOT_HEIGHT * radius {
+            return Err(unsolved("canal_foot_height"));
+        }
+        let middle = centre.add(from.add(to).normalized().or_refuse(KernelStage::Refine, "canal_middle")?.scale(radius / half.cos()));
+        Ok([crate::Vec4::from_point(p, 1.0), crate::Vec4::from_point(middle, half.cos()), crate::Vec4::from_point(cap, 1.0)])
+    };
+    let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+    for count in [16usize, 32, 64] {
+        let parameters: Vec<f64> = (0..=count).map(|k| k as f64 / count as f64).collect();
+        let mut columns: [Vec<crate::Vec4>; 3] = std::array::from_fn(|_| Vec::with_capacity(count + 1));
+        let mut guess = poles[0];
+        for &u in &parameters {
+            let (t, p, centre) = station(u, guess)?;
+            guess = t;
+            let controls = arc_controls(p, centre)?;
+            for (column, control) in columns.iter_mut().zip(controls) {
+                column.push(control);
+            }
+        }
+        let fitted: Vec<NurbsCurve> = columns
+            .iter()
+            .map(|column| crate::fit::interpolate_homogeneous(column, 3, &parameters).or_refuse(KernelStage::Refine, "canal_fit"))
+            .collect::<Result<_, _>>()?;
+        let rows: Vec<Vec<crate::Vec4>> = (0..fitted[0].control_points.len())
+            .map(|i| fitted.iter().map(|curve| curve.control_points[i]).collect())
+            .collect();
+        let surface = crate::NurbsSurface::new(3, 2, fitted[0].knots.clone(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], rows)
+            .or_refuse(KernelStage::Refine, "canal_surface")?;
+        // The fit against the true envelope between the stations.
+        let mut worst = 0.0_f64;
+        let mut guess = poles[0];
+        for k in 0..count {
+            let u = (k as f64 + 0.5) / count as f64;
+            let (t, p, centre) = station(u, guess)?;
+            guess = t;
+            let exact = arc_controls(p, centre)?;
+            let row = NurbsCurve::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], exact.to_vec()).or_refuse(KernelStage::Refine, "canal_row")?;
+            for j in 0..=8 {
+                let v = j as f64 / 8.0;
+                let on_patch = surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?;
+                worst = worst.max(on_patch.sub(row.evaluate(v).or_refuse(KernelStage::Refine, "evaluate")?).length());
+            }
+        }
+        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+            eprintln!("canal corner: {count} stations, {worst:.3e} off the envelope (bar {bar:.3e})");
+        }
+        if worst <= bar {
+            return Ok((surface, fitted[2].clone()));
+        }
+    }
+    Err(unsolved("canal_fit_off_envelope"))
+}
+
+/// Put the concave-edge piece between the two poles into the loop of the wall
+/// whose stripe stopped nearer the corner: between that wall's rail, which
+/// ends at the near pole, and the concave edge, which now starts at the deep
+/// one. `piece` runs from stop a's pole to stop b's.
+#[allow(clippy::too_many_arguments)]
+fn insert_canal_wall_edge(
+    result: &mut BrepSolid,
+    wall_face: u64,
+    wall_rail: u64,
+    sharp_edge: u64,
+    piece_edge: u64,
+    near_is_a: bool,
+    piece: &NurbsCurve,
+    domain: [f64; 2],
+    take_id: &mut impl FnMut() -> u64,
+) -> Result<(), KernelRefusal> {
+    let face = result
+        .shells
+        .iter_mut()
+        .flat_map(|shell| &mut shell.faces)
+        .find(|face| face.id == wall_face)
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "canal_wall", "blend network: the wall face is missing"))?;
+    let mut samples = Vec::with_capacity(17);
+    let mut parameters = Vec::with_capacity(17);
+    for k in 0..=16 {
+        let point = piece.evaluate(domain[0] + (domain[1] - domain[0]) * k as f64 / 16.0).or_refuse(KernelStage::Refine, "evaluate")?;
+        let projection = crate::project_point_to_surface(&face.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+        samples.push(crate::Vec4::from_point(Vec3::new(projection.u, projection.v, 0.0), 1.0));
+        parameters.push(k as f64 / 16.0);
+    }
+    let pcurve = crate::fit::interpolate_homogeneous(&samples, 3, &parameters).or_refuse(KernelStage::Refine, "interpolate_homogeneous")?;
+    for loop_record in &mut face.loops {
+        let count = loop_record.coedges.len();
+        let (Some(at_rail), Some(at_sharp)) = (
+            loop_record.coedges.iter().position(|coedge| coedge.edge_id == wall_rail),
+            loop_record.coedges.iter().position(|coedge| coedge.edge_id == sharp_edge),
+        ) else {
+            continue;
+        };
+        let (insert_at, near_to_deep) = if (at_rail + 1) % count == at_sharp {
+            (at_rail + 1, true)
+        } else if (at_sharp + 1) % count == at_rail {
+            (at_sharp + 1, false)
+        } else {
+            return Err(KernelRefusal::unsupported(KernelStage::Sew, "canal_wall_loop", "blend network: the wall rail and the concave edge are not adjacent"));
+        };
+        let forward = near_is_a == near_to_deep;
+        let pcurve = if forward { pcurve } else { pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")? };
+        loop_record.coedges.insert(insert_at, CoedgeRecord { id: take_id(), edge_id: piece_edge, forward, pcurve });
+        return Ok(());
+    }
+    Err(KernelRefusal::unsupported(KernelStage::Sew, "canal_wall_loop", "blend network: no wall loop holds the rail and the concave edge"))
+}
+
 /// Split cap rail `rail` where its pcurve on the periodic cap `cap_face`
 /// leaves the cap's domain across the seam that meets `corner`, and trim that
 /// seam edge to the split point. Returns the piece past the seam (now the
@@ -6114,7 +6547,7 @@ fn fraction_of(edge: &EdgeRecord, t: f64, forward: bool) -> f64 {
     if forward { f } else { 1.0 - f }
 }
 
-fn corner_section_arc(
+pub(super) fn corner_section_arc(
     center: Vec3,
     radius: f64,
     from: Vec3,
@@ -7538,3 +7971,170 @@ fn refine_seam_crossing(
     }
 }
 
+
+
+/// One seat of a ridge star: the ball's centre and its contact with each of the
+/// three faces it touches.
+struct RidgeSeat {
+    center: Vec3,
+    contacts: Vec<(u64, Vec3)>,
+}
+
+/// The two ball seats of a convex star on four planar faces with equal radii and
+/// no common ball, or `None` when the star is not that class. The faces with no
+/// selected edge between them are opposite. The ridge pair is the opposite pair
+/// whose offset line, cut by the offsets of the other two faces, has both seats
+/// inside the faces it does not touch.
+fn solve_ridge_seats(
+    faces: &[(&FaceRecord, f64, usize)],
+    stripe_indices: &[usize],
+    mates: &[(&EdgeRecord, BlendMate, BlendMate)],
+    radius: f64,
+) -> Option<[RidgeSeat; 2]> {
+    if faces.len() != 4 || stripe_indices.len() != 4 {
+        return None;
+    }
+    let mut planes: Vec<(u64, Vec3, f64)> = Vec::with_capacity(4);
+    for (face, _, _) in faces {
+        let Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) = face.surface.analytic() else {
+            return None;
+        };
+        let normal = u_dir.cross(*v_dir).normalized().ok()?;
+        let outward = if face.same_sense { normal } else { normal.scale(-1.0) };
+        planes.push((face.id, outward, outward.dot(*origin)));
+    }
+    let adjacent = |a: u64, b: u64| {
+        stripe_indices.iter().any(|&index| {
+            let (first, second) = (mates[index].1.face.id, mates[index].2.face.id);
+            (first == a && second == b) || (first == b && second == a)
+        })
+    };
+    let seat = |ridge: [usize; 2], end: usize| -> Option<Vec3> {
+        let (n0, n1, n2) = (planes[ridge[0]].1, planes[ridge[1]].1, planes[end].1);
+        let det = n0.dot(n1.cross(n2));
+        if det.abs() < 1e-9 {
+            return None;
+        }
+        let (d0, d1, d2) = (planes[ridge[0]].2 - radius, planes[ridge[1]].2 - radius, planes[end].2 - radius);
+        Some(n1.cross(n2).scale(d0).add(n2.cross(n0).scale(d1)).add(n0.cross(n1).scale(d2)).scale(1.0 / det))
+    };
+    let clearance = 1e-9 * (1.0 + radius);
+    let inside = |center: Vec3, k: usize| planes[k].1.dot(center) <= planes[k].2 - radius - clearance;
+    for k in 1..4 {
+        if adjacent(planes[0].0, planes[k].0) {
+            continue;
+        }
+        let others: Vec<usize> = (1..4).filter(|&j| j != k).collect();
+        for (ridge, ends) in [([0, k], [others[0], others[1]]), ([others[0], others[1]], [0, k])] {
+            let (Some(a), Some(b)) = (seat(ridge, ends[0]), seat(ridge, ends[1])) else { continue };
+            if !inside(a, ends[1]) || !inside(b, ends[0]) {
+                continue;
+            }
+            let contacts = |center: Vec3, end: usize| {
+                [ridge[0], ridge[1], end].iter().map(|&j| (planes[j].0, center.add(planes[j].1.scale(radius)))).collect::<Vec<_>>()
+            };
+            return Some([
+                RidgeSeat { center: a, contacts: contacts(a, ends[0]) },
+                RidgeSeat { center: b, contacts: contacts(b, ends[1]) },
+            ]);
+        }
+    }
+    None
+}
+
+/// Build the ridge cylinder from its end arcs and splice its two lines into the
+/// ridge faces' loops. The surface is the first arc carried along the ridge, so
+/// its section is that arc exactly. The cylinder walks the arcs and lines forward;
+/// each ridge face walks its line backward, between the two rails that end there.
+fn sew_ridge_face(
+    result: &mut BrepSolid,
+    arcs: [EdgeRecord; 2],
+    lines: [(EdgeRecord, u64); 2],
+    centers: [Vec3; 2],
+    name: Option<&str>,
+    take_id: &mut dyn FnMut() -> u64,
+) -> Result<(), KernelRefusal> {
+    use crate::sweep_topology::parameter_line;
+    let [arc_a, arc_b] = arcs;
+    let shift = centers[1].sub(centers[0]);
+    let carried: Vec<Vec<crate::Vec4>> = arc_a
+        .curve
+        .control_points
+        .iter()
+        .map(|p| vec![*p, crate::Vec4 { x: p.x + p.w * shift.x, y: p.y + p.w * shift.y, z: p.z + p.w * shift.z, w: p.w }])
+        .collect();
+    let surface = crate::NurbsSurface::new(arc_a.curve.degree, 1, arc_a.curve.knots.clone(), vec![0.0, 0.0, 1.0, 1.0], carried)
+        .or_refuse(KernelStage::Sew, "ridge_surface")?;
+    let (u0, u1) = (arc_a.t0, arc_a.t1);
+    let line = |a: f64, b: f64, c: f64, d: f64| parameter_line(a, b, c, d).or_refuse(KernelStage::Sew, "parameter_line");
+    let coedges = vec![
+        CoedgeRecord { id: take_id(), edge_id: arc_a.id, forward: true, pcurve: line(u0, 0.0, u1, 0.0)? },
+        CoedgeRecord { id: take_id(), edge_id: lines[0].0.id, forward: true, pcurve: line(u1, 0.0, u1, 1.0)? },
+        CoedgeRecord { id: take_id(), edge_id: arc_b.id, forward: true, pcurve: line(u1, 1.0, u0, 1.0)? },
+        CoedgeRecord { id: take_id(), edge_id: lines[1].0.id, forward: true, pcurve: line(u0, 1.0, u0, 0.0)? },
+    ];
+    let mid = 0.5 * (u0 + u1);
+    let derivatives = surface.derivatives(mid, 0.5, 1).or_refuse(KernelStage::Sew, "derivatives")?;
+    let normal = derivatives[1][0].cross(derivatives[0][1]);
+    let outward = derivatives[0][0].sub(centers[0].add(shift.scale(0.5)));
+    let face = FaceRecord {
+        id: take_id(),
+        surface,
+        same_sense: normal.dot(outward) > 0.0,
+        loops: vec![crate::topology::LoopRecord { id: take_id(), coedges }],
+        name: name.map(|value| value.to_string()),
+    };
+    let shell = result
+        .shells
+        .iter_mut()
+        .find(|shell| !shell.faces.is_empty())
+        .ok_or(KernelRefusal::internal(KernelStage::Sew, "shell", "blend network: the solid has no shell to sew the ridge into"))?;
+    shell.faces.push(face);
+    let ends: rustc_hash::FxHashMap<u64, (u64, u64)> = result.edges.iter().map(|edge| (edge.id, (edge.start_vertex_id, edge.end_vertex_id))).collect();
+    for (edge, face_id) in lines {
+        let coedge_id = take_id();
+        let face = result
+            .shells
+            .iter_mut()
+            .flat_map(|shell| &mut shell.faces)
+            .find(|face| face.id == face_id)
+            .ok_or(KernelRefusal::internal(KernelStage::Sew, "ridge_wall", "blend network: a ridge face is missing"))?;
+        // Backward along the line: from its end to its start.
+        let start = edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Sew, "evaluate")?;
+        let finish = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?;
+        let pcurve = build_line_pcurve(&face.surface, start, finish)?;
+        let mut spliced = false;
+        for loop_record in &mut face.loops {
+            let walk_end = |coedge: &CoedgeRecord| ends.get(&coedge.edge_id).map(|&(s, e)| if coedge.forward { e } else { s });
+            let Some(after) = loop_record.coedges.iter().position(|coedge| walk_end(coedge) == Some(edge.end_vertex_id)) else {
+                continue;
+            };
+            loop_record.coedges.insert(after + 1, CoedgeRecord { id: coedge_id, edge_id: edge.id, forward: false, pcurve: pcurve.clone() });
+            spliced = true;
+            break;
+        }
+        if !spliced {
+            return Err(KernelRefusal::internal(KernelStage::Sew, "ridge_wall_loop", "blend network: no rail ends at a ridge line on its face"));
+        }
+    }
+    Ok(())
+}
+
+/// The straight parameter-space image of a segment on a plane's surface.
+pub(super) fn build_line_pcurve(surface: &crate::NurbsSurface, start: Vec3, finish: Vec3) -> Result<NurbsCurve, KernelRefusal> {
+    let Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) = surface.analytic() else {
+        return Err(KernelRefusal::internal(KernelStage::Sew, "ridge_wall_surface", "blend network: a ridge face is not a plane"));
+    };
+    let chart = |point: Vec3| -> Result<[f64; 2], KernelRefusal> {
+        let d = point.sub(*origin);
+        let (a, b, c) = (u_dir.dot(*u_dir), u_dir.dot(*v_dir), v_dir.dot(*v_dir));
+        let (r0, r1) = (u_dir.dot(d), v_dir.dot(d));
+        let det = a * c - b * b;
+        if det.abs() < 1e-300 {
+            return Err(KernelRefusal::internal(KernelStage::Sew, "ridge_wall_chart", "blend network: a ridge plane's chart is singular"));
+        }
+        Ok([(c * r0 - b * r1) / det, (a * r1 - b * r0) / det])
+    };
+    let (p, q) = (chart(start)?, chart(finish)?);
+    crate::sweep_topology::parameter_line(p[0], p[1], q[0], q[1]).or_refuse(KernelStage::Sew, "parameter_line")
+}

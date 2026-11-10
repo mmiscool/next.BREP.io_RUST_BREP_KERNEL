@@ -205,14 +205,15 @@ impl EngineState {
             return quiet;
         }
 
-        // What the handle resolved, formatted the way a dimension label is —
-        // `compact_decimal(_, 4)`, so the chip and the form agree digit for
-        // digit rather than rounding to different numbers.
+        // What the handle resolved, on the same 0.001 grid the drag stores, so
+        // the chip and the form agree digit for digit.
         let (kind, label, value, unit, text) = match delta {
             Some(TransformDelta::Translate(world)) => {
-                let distance = (world[0] * world[0] + world[1] * world[1] + world[2] * world[2]).sqrt();
+                let distance = crate::formatting::snap_drag_value(
+                    (world[0] * world[0] + world[1] * world[1] + world[2] * world[2]).sqrt(),
+                );
                 let axis = dominant_axis_label(&world);
-                let shown = crate::formatting::compact_decimal(distance, 4);
+                let shown = crate::formatting::compact_decimal(distance, 3);
                 (
                     "translate",
                     axis.to_string(),
@@ -222,9 +223,9 @@ impl EngineState {
                 )
             }
             Some(TransformDelta::Rotate { axis, radians }) => {
-                let degrees = radians.to_degrees();
+                let degrees = crate::formatting::snap_drag_value(radians.to_degrees());
                 let label = dominant_axis_label(&axis);
-                let shown = crate::formatting::compact_decimal(degrees, 4);
+                let shown = crate::formatting::compact_decimal(degrees, 3);
                 (
                     "rotate",
                     label.to_string(),
@@ -817,6 +818,9 @@ impl EngineState {
     /// Write `pose` into the armed feature's `inputParams.transform.{position,
     /// rotationEuler}` (preserving every other field, incl. `scale`) and re-run.
     fn write_armed_pose(&mut self, pose: &TransformPose) {
+        // Each number is snapped as it is STORED, after any pivot or centre is
+        // taken off: a world pose on the grid minus an off-grid pivot is not.
+        let start = self.transform_gizmo.drag.map(|drag| drag.start);
         if let Some(address) = self.transform_gizmo.port.clone() {
             self.write_port_point_pose(&address, pose);
             return;
@@ -848,7 +852,11 @@ impl EngineState {
                         self.explode_playback.progress = Some(progress.max(step as f64 + 1.0));
                     }
                     let mut params = annotation.params.clone();
-                    params["transform"] = serde_json::json!({ "position": std::array::from_fn::<_, 3, _>(|i| pose.position[i] - center[i]), "rotationEuler": pose.rotation_deg, "scale": pose.scale });
+                    let position: [f64; 3] = std::array::from_fn(|i| {
+                        drag_stored(start.map(|s| s.position[i] - center[i]), pose.position[i] - center[i])
+                    });
+                    let rotation = drag_stored_rotation(start.as_ref(), pose);
+                    params["transform"] = serde_json::json!({ "position": position, "rotationEuler": rotation, "scale": pose.scale });
                     let _ = self.pmi_update_annotation(&id, &params.to_string());
                 }
                 return;
@@ -862,7 +870,9 @@ impl EngineState {
             return;
         }
         if let Some(anchor) = self.transform_gizmo.anchor {
-            self.write_spline_anchor_pose(&id, anchor, pose.position, pose.rotation_deg);
+            let position = std::array::from_fn(|i| drag_stored(start.map(|s| s.position[i]), pose.position[i]));
+            let rotation = drag_stored_rotation(start.as_ref(), pose);
+            self.write_spline_anchor_pose(&id, anchor, position, rotation);
             return;
         }
         let mut params = self
@@ -882,7 +892,10 @@ impl EngineState {
         } else {
             [0.0; 3]
         };
-        let position: [f64; 3] = std::array::from_fn(|axis| pose.position[axis] - pivot[axis]);
+        let position: [f64; 3] = std::array::from_fn(|axis| {
+            drag_stored(start.map(|s| s.position[axis] - pivot[axis]), pose.position[axis] - pivot[axis])
+        });
+        let rotation = drag_stored_rotation(start.as_ref(), pose);
         // Ensure `transform` is an object, then set the two edited vectors.
         if !params
             .get("transform")
@@ -895,10 +908,24 @@ impl EngineState {
         }
         if let Some(transform) = params.get_mut("transform").and_then(|t| t.as_object_mut()) {
             transform.insert("position".into(), serde_json::json!(position));
-            transform.insert("rotationEuler".into(), serde_json::json!(pose.rotation_deg));
+            transform.insert("rotationEuler".into(), serde_json::json!(rotation));
         }
         let _ = self.update_feature_params(&id, &params.to_string());
     }
+}
+
+/// The number to store for one pose value: on the drag grid during a drag
+/// (`before` is its value at the grab), untouched for any other write.
+fn drag_stored(before: Option<f64>, after: f64) -> f64 {
+    match before {
+        Some(before) => crate::formatting::snap_drag_moved(before, after),
+        None => after,
+    }
+}
+
+/// [`drag_stored`] for a pose's Euler triple.
+fn drag_stored_rotation(start: Option<&TransformPose>, pose: &TransformPose) -> [f64; 3] {
+    std::array::from_fn(|i| drag_stored(start.map(|s| s.rotation_deg[i]), pose.rotation_deg[i]))
 }
 
 /// Name the axis a world vector lies along — `X`, `Y` or `Z` when it lies along
@@ -1253,14 +1280,18 @@ impl EngineState {
     /// Coalesced per address, so a whole drag is one undo step.
     pub(super) fn write_port_point_pose(&mut self, address: &str, pose: &TransformPose) {
         let seat = self.port_point_seat(address);
-        let position = array3(brep_kernel::unseat_point(&seat, vec3(pose.position)));
-        let local_axes = super::spline_edit::axes_from_euler_deg(pose.rotation_deg)
-            .map(|axis| unseat_axis(&seat, axis));
-        let rotation = super::spline_edit::euler_xyz_deg_from_axes(
-            local_axes[0],
-            local_axes[1],
-            local_axes[2],
-        );
+        let local = |pose: &TransformPose| {
+            let local_axes = super::spline_edit::axes_from_euler_deg(pose.rotation_deg)
+                .map(|axis| unseat_axis(&seat, axis));
+            (
+                array3(brep_kernel::unseat_point(&seat, vec3(pose.position))),
+                super::spline_edit::euler_xyz_deg_from_axes(local_axes[0], local_axes[1], local_axes[2]),
+            )
+        };
+        let (position, rotation) = local(pose);
+        let before = self.transform_gizmo.drag.map(|drag| local(&drag.start));
+        let position: [f64; 3] = std::array::from_fn(|i| drag_stored(before.map(|b| b.0[i]), position[i]));
+        let rotation: [f64; 3] = std::array::from_fn(|i| drag_stored(before.map(|b| b.1[i]), rotation[i]));
         let key = format!("port-point-pose:{address}");
         self.edit_port_point(address, Some(&key), |point| {
             point.insert(

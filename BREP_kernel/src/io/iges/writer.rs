@@ -18,6 +18,13 @@
 //! cross-references, and finally call [`IgesWriter::finish`] to emit the whole
 //! document with correct sequence numbering and the terminate record.
 
+// Status numbers (directory-entry field 9) the writer uses.
+pub(crate) const STATUS_INDEPENDENT: &str = "00000000";
+/// Physically dependent: written only as part of the entity that lists it.
+pub(crate) const STATUS_DEPENDENT: &str = "00010000";
+/// A definition (a 308) that appears only through its instances.
+pub(crate) const STATUS_DEFINITION: &str = "00000200";
+
 /// A single entity queued for output. `params` are the parameter-data fields
 /// that FOLLOW the leading entity-type number (the writer prepends the type).
 pub(crate) struct IgesEntity {
@@ -28,6 +35,15 @@ pub(crate) struct IgesEntity {
     pub form: i64,
     /// Up to 8 characters, directory-entry label (field 18).
     pub label: String,
+    /// Directory-entry colour (field 13): a colour number, or minus the DE
+    /// pointer of a 314 colour definition.
+    pub color: i64,
+    /// Directory-entry transformation matrix (field 7): the DE pointer of a
+    /// 124, or 0.
+    pub transform: i64,
+    /// Directory-entry status number (field 9), eight digits: blank, subordinate
+    /// (01 physically dependent), entity use (02 definition), hierarchy.
+    pub status: &'static str,
 }
 
 impl IgesEntity {
@@ -37,6 +53,9 @@ impl IgesEntity {
             params,
             form: 0,
             label: String::new(),
+            color: 0,
+            transform: 0,
+            status: STATUS_INDEPENDENT,
         }
     }
 }
@@ -119,9 +138,9 @@ impl IgesWriter {
                 0,                  // 4 line font pattern
                 0,                  // 5 level
                 0,                  // 6 view
-                0,                  // 7 transformation matrix
+                entity.transform,   // 7 transformation matrix
                 0,                  // 8 label display associativity
-                "00000000",         // 9 status number
+                entity.status,      // 9 status number
                 seq1,
             );
             // Line 2: fields 11-19 (cols 1-72) then 'D' + seq.
@@ -130,7 +149,7 @@ impl IgesWriter {
                 "{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}{:>8}D{:>7}",
                 entity.entity_type, // 11 entity type
                 0,                  // 12 line weight number
-                0,                  // 13 color number
+                entity.color,       // 13 color number
                 pd_count,           // 14 parameter line count
                 entity.form,        // 15 form number
                 "",                 // 16 reserved
@@ -231,6 +250,12 @@ pub(crate) fn hollerith(text: &str) -> String {
 /// real syntax (a decimal point or exponent is always present).
 pub(crate) fn real_field(value: f64) -> String {
     let mut s = format!("{}", value);
+    // Plain notation spells a tiny or huge value out in full (5.7e-77 is 90
+    // characters), longer than a 64-column parameter field holds; exponent
+    // form keeps every value to one short token.
+    if s.len() > 24 {
+        s = format!("{:E}", value);
+    }
     if !s.contains('.') && !s.contains('e') && !s.contains('E') {
         s.push('.');
     }

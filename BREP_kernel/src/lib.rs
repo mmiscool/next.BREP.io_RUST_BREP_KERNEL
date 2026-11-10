@@ -382,6 +382,7 @@ pub use feature_pipeline::assign_sketch_loop_ids;
 pub use feature_pipeline::features::sketch3d::{
     reference_record as sketch3d_reference_record, resolve_reference as resolve_sketch3d_reference,
     ResolvedReference as Sketch3dResolvedReference, REFERENCE_TIP_LENGTH as SKETCH3D_REFERENCE_TIP_LENGTH,
+    common_edge_end as sketch3d_common_edge_end, curve_reference_controls as sketch3d_curve_reference_controls, REFERENCE_ANCHOR_EDGES_KEY as SKETCH3D_ANCHOR_EDGES_KEY,
     SKETCH3D_DOC_KEY, SKETCH3D_EDIT_BUTTON, SKETCH3D_FEATURE_TYPE, SKETCH3D_REFERENCES_PARAM,
     SKETCH3D_REFS_KEY,
 };
@@ -726,7 +727,10 @@ pub fn io_step_decode_text_for_tests(value: &str) -> String {
 }
 #[path = "io/iges/mod.rs"]
 mod iges;
-pub use iges::{export_iges, import_iges};
+pub use iges::{
+    export_iges, export_iges_assembly, export_iges_bodies, import_iges, import_iges_report,
+    read_iges_assembly, IgesBody, IgesImportReport,
+};
 #[path = "io/mesh_io.rs"]
 mod mesh_io;
 pub use mesh_io::{
@@ -797,7 +801,7 @@ mod direct_edit;
 pub use direct_edit::{
     delete_face_and_heal, delete_faces_and_heal, draft_faces, draft_faces_parted, move_faces, offset_freeform_face,
     offset_revolution_face, offset_ruled_face, offset_sphere_face, offset_torus_face,
-    recut_moved_planes, recut_moved_planes_rigid, resolve_face_by_point, rotate_faces,
+    recut_moved_planes, recut_moved_planes_rigid, reblend_lost_fillets, resolve_face_by_point, rotate_faces,
     route_reading, RouteReading,
 };
 pub use direct_edit::{face_refusal_slugs, face_transform_reason, FaceTransformReason};

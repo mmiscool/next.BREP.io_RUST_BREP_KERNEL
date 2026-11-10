@@ -43,7 +43,8 @@ pub struct FormViewSpec<'a> {
     /// every field change with no extra plumbing.
     pub hidden: Option<&'a HashSet<String>>,
     /// A message banner drawn under the title — e.g. the feature's run error.
-    pub banner: Option<(&'a str, egui::Color32)>,
+    /// A banner marked as an error also carries the Report problem button.
+    pub banner: Option<FormBanner<'a>>,
     /// Read-only sections appended after the fields — e.g. `[("Outputs", …)]`.
     pub trailing: Option<&'a [(&'a str, Vec<String>)]>,
     /// ONE consumer-drawn section `(title, drawer)` placed after the schema
@@ -84,6 +85,48 @@ pub struct FormViewSpec<'a> {
     /// out as [`FormViewOut::pick_remove`]. `None` draws every reference field
     /// at rest.
     pub picking: Option<form::ActivePick<'a>>,
+}
+
+/// The message under a form's title. The slot also carries statuses and notes,
+/// so whether it is an ERROR is stated by the consumer, never read off a colour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FormBanner<'a> {
+    pub text: &'a str,
+    pub color: egui::Color32,
+    pub is_error: bool,
+}
+
+impl<'a> FormBanner<'a> {
+    /// A status or a note: drawn alone.
+    pub fn note(text: &'a str, color: egui::Color32) -> Self {
+        Self { text, color, is_error: false }
+    }
+
+    /// An error: drawn with the Report problem button.
+    pub fn error(text: &'a str, color: egui::Color32) -> Self {
+        Self { text, color, is_error: true }
+    }
+}
+
+/// A form's Report problem button was pressed: what the report is pre-filled
+/// with. It travels through egui memory to the app, which owns the report flow,
+/// so a new dialog gets the button with no plumbing through its panel.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ProblemReportRequest {
+    /// The form's title: which feature or dialog the error came from.
+    pub dialog: String,
+    /// The error text the dialog is showing.
+    pub error: String,
+}
+
+fn problem_report_id() -> egui::Id {
+    egui::Id::new("form-view-report-problem")
+}
+
+/// The Report problem press waiting for the app, if there is one; taking it
+/// clears it, so one press opens one report.
+pub fn take_problem_report_request(ctx: &egui::Context) -> Option<ProblemReportRequest> {
+    ctx.data_mut(|data| data.remove_temp(problem_report_id()))
 }
 
 /// A reference field's `Select` was pressed — the caller dispatches this to its
@@ -142,6 +185,8 @@ pub struct FormViewOut {
 /// | `form:feature` | the title label |
 /// | `form:section:{Group}` | an accordion header |
 /// | `form:return` | the exit button, right end of the title row |
+/// | `form:error` | the error banner, while the form shows an error |
+/// | `form:report-problem` | that banner's Report problem button |
 /// | `field:{path}` | a field's input widget |
 /// | `field:{path}#{variant}` | an OPEN enum's items |
 /// | `field:{path}#activate` / `#x{i}` | a reference's Select / remove buttons (the focused field's Select is its Done) |
@@ -266,17 +311,27 @@ fn form_body(
     // --- banner: the subject's error, ABOVE the fields ---------------------
     // (The history tree ALSO keeps this on the feature's row, so a failure is
     // still visible while scanning the tree — see the panel.)
-    if let Some((text, color)) = spec.banner {
-        egui::Frame::group(ui.style())
-            .stroke(egui::Stroke::new(1.0, color))
-            .fill(color.gamma_multiply(0.12))
+    if let Some(banner) = spec.banner {
+        let frame = egui::Frame::group(ui.style())
+            .stroke(egui::Stroke::new(1.0, banner.color))
+            .fill(banner.color.gamma_multiply(0.12))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.add(
-                    egui::Label::new(egui::RichText::new(text).color(color))
+                    egui::Label::new(egui::RichText::new(banner.text).color(banner.color))
                         .wrap_mode(egui::TextWrapMode::Wrap),
                 );
+                banner.is_error.then(|| ui.button("Report problem"))
             });
+        if let Some(report) = frame.inner {
+            publish(spec, hits, "form:error", frame.response.rect);
+            publish(spec, hits, "form:report-problem", report.rect);
+            if report.clicked() {
+                let request = ProblemReportRequest { dialog: spec.title.to_string(), error: banner.text.to_string() };
+                ui.ctx().data_mut(|data| data.insert_temp(problem_report_id(), request));
+                ui.ctx().request_repaint();
+            }
+        }
         ui.add_space(4.0);
     }
 

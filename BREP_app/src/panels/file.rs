@@ -511,7 +511,7 @@ fn step_document_name(file_name: &str) -> String {
     let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
     let cut = base
         .rfind('.')
-        .filter(|dot| is_step_name(&base[*dot..]))
+        .filter(|dot| is_step_name(&base[*dot..]) || is_iges_name(&base[*dot..]))
         .unwrap_or(base.len());
     let stem = &base[..cut];
     if stem.is_empty() {
@@ -1294,7 +1294,9 @@ impl FileDialog {
             } else if is_step_name(&name) {
                 self.import_text(docs.engine_mut(), &name, &bytes, Self::import_step);
             } else if is_iges_name(&name) {
-                self.import_text(docs.engine_mut(), &name, &bytes, Self::import_iges);
+                // IGES takes the STEP lane's probe: a file of subfigure
+                // instances raises the same assembly choice.
+                self.import_text(docs.engine_mut(), &name, &bytes, Self::import_step);
             } else if is_stl_name(&name) {
                 self.stage_mesh_preview(MeshImportFormat::Stl, name, bytes);
             } else if is_3mf_name(&name) {
@@ -1437,7 +1439,7 @@ impl FileDialog {
                     self.import_text(state, &name, &bytes, Self::import_step)
                 }
                 Some(bytes) if is_iges_name(&name) => {
-                    self.import_text(state, &name, &bytes, Self::import_iges)
+                    self.import_text(state, &name, &bytes, Self::import_step)
                 }
                 Some(bytes) if is_stl_name(&name) => {
                     self.stage_mesh_preview(MeshImportFormat::Stl, name, bytes)
@@ -3275,7 +3277,7 @@ impl FileDialog {
         let (text, ext) = match format {
             "stl" => (state.export_stl_text(), "stl"),
             "obj" => (state.export_obj_text(), "obj"),
-            "iges" => (state.export_iges_text(), "igs"),
+            "iges" => (state.export_iges_text_selected(&name, None), "igs"),
             "json" => (Ok(state.history_request_json()), "nbrep"),
             // The document's name becomes the root PRODUCT's — an assembly
             // exports as `<name>` with its parts named under it.
@@ -3703,7 +3705,8 @@ impl FileDialog {
     /// structureless file, an unparseable one, and the dialog's "Import as
     /// bodies".
     fn import_step_flat(&mut self, state: &mut EngineState, name: &str, contents: &str) {
-        match state.import_step_feature(contents) {
+        // A STEP or an IGES text alike: the probe routes both.
+        match state.import_model_text_feature(contents) {
             // Framing is deferred to the engine (`pending_fit`): under the native
             // thread / wasm worker runner the body is not resident yet, so framing
             // here would frame the empty scene. See [`EngineState::pending_fit`].
@@ -3828,14 +3831,6 @@ impl FileDialog {
 
     /// Append an imported IGES file to the model (an IMPORT3D feature) — the
     /// IGES sibling of [`Self::import_step`].
-    fn import_iges(&mut self, state: &mut EngineState, name: &str, contents: &str) {
-        match state.import_iges_feature(contents) {
-            // Framing deferred to the engine (`pending_fit`) — see `import_step`.
-            Ok(_) => self.status = format!("imported {name}"),
-            Err(e) => self.status = format!("import failed: {e}"),
-        }
-    }
-
     fn stage_mesh_preview(
         &mut self,
         format: MeshImportFormat,

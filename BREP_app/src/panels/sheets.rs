@@ -71,7 +71,7 @@
 
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::column_tree::{self, CellKind, ColumnLayout, ColumnSpec, ColumnTreeSpec, RowAction, RowNode};
-use crate::form_view::{form_view, FormViewSpec};
+use crate::form_view::{form_view, FormBanner, FormViewSpec};
 use brep_render::engine_state::{EngineState, RefSelectTarget};
 use brep_render::features::form_fields_from_schema;
 use brep_render::sheets::SheetState;
@@ -857,7 +857,7 @@ impl SheetsPanel {
             title: &title,
             subtitle: None,
             fields: &fields,
-            banner: note.map(|note| (note, egui::Color32::from_rgb(0x58, 0xa6, 0xff))),
+            banner: note.map(|note| FormBanner::note(note, egui::Color32::from_rgb(0x58, 0xa6, 0xff))),
             trailing: None,
             exit_label: "Return to tree",
             extra: is_sheet.then_some(("Tables", &draw_revisions as &dyn Fn(&mut egui::Ui))),

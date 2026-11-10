@@ -23,6 +23,41 @@ pub(crate) fn small_ring_enabled() -> bool {
     switch!("BREP_FRAGMENT_SMALL_RING", true)
 }
 
+/// `BREP_BRIDGE_T_JUNCTION_ANCHOR` (default on; `=0` restores): a cut end lying
+/// on the run of another cut chain is a T-junction the arrangement nodes
+/// exactly, not half of a broken cut, so it is no bridge candidate. Without
+/// this, two independent T-ends close together on one chain read as a broken
+/// junction and are welded to their midpoint, or refused as a missing piece.
+fn bridge_t_junction_anchor_enabled() -> bool {
+    switch!("BREP_BRIDGE_T_JUNCTION_ANCHOR", true)
+}
+
+/// `BREP_BRIDGE_BOUNDARY_T_JUNCTION_ANCHOR` (default on; `=0` restores): a cut end lying on
+/// the run of one of the face's own BOUNDARY chains is a T-junction with the
+/// trim, which the arrangement nodes like any cut meeting the boundary, so it is
+/// no bridge candidate either. Cause (a reported box and pin model at 2.51 and
+/// 2.52): on the wall offset x = d, the bore and floor sections end on the
+/// opening edge 0.25 apart. Their other ends lie within the junction radius of
+/// the front offset's section (d - 2.5 = 0.01 from them), which reads them as
+/// anchored, so the two ends on the opening edge read as a broken cut and were
+/// welded to their midpoint, deleting the short bore arc there.
+fn bridge_boundary_t_junction_anchor_enabled() -> bool {
+    switch!("BREP_BRIDGE_BOUNDARY_T_JUNCTION_ANCHOR", true)
+}
+
+/// `BREP_BRIDGE_SKIP_CROSSING_PAIRS` (default on; `=0` restores): two loose cut ends whose
+/// chains cross each other are not a broken cut. The crossing is their
+/// junction, which the arrangement nodes, and its degree-1 pruning drops both
+/// overshoot stubs, so the pair is never bridged. Cause (a reported
+/// box and pin model at 2.54): on the floor offset, the wall and bore sections cross
+/// 0.061 from the wall section's end, inside the junction radius 0.064, so the
+/// overshoot exclusion did not see it; their ends lay 0.066 apart, just past
+/// that radius, so both read as loose and were welded to their midpoint, which
+/// left the loops open.
+fn bridge_skip_crossing_pairs_enabled() -> bool {
+    switch!("BREP_BRIDGE_SKIP_CROSSING_PAIRS", true)
+}
+
 pub(super) struct FragmentIndex<'a> {
     pub(super) by_face: HashMap<(u8, u64), &'a [u64]>,
     pub(super) pieces_by_id: HashMap<u64, &'a ImprintPieceRecord>,
@@ -293,6 +328,33 @@ fn near_touch(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f
     }
     let [lo, hi] = cut.domain().ok()?;
     let [other_lo, other_hi] = other.domain().ok()?;
+    // A cut that ENDS on `other` has no near touch with it, and saying so
+    // takes two projections instead of the search's 417 (brep-bench
+    // boolean/cross-drilled-cube: the Steinmetz arcs of crossing bores meet
+    // at their ends, and this search was 70% of that case's time). The search
+    // below samples the cut's ends exactly, so its closest approach is no
+    // wider in the chart than this end's gap (under 1e-3 of the reach and
+    // the identity band, below any gap it takes as a near touch), and the refined approach then lies
+    // at an open cut's end (`at_end`) or within 8e-7 in model space: None
+    // either way. The gap must be tiny in the chart AND in space (at a pole
+    // the chart's points meet in space while far apart in the chart). A cut
+    // that stops short of a boundary (a marched cut, by a few 1e-6) keeps
+    // the search.
+    let ends_on_other = [lo, hi].into_iter().any(|t| {
+        let Ok(point) = cut.evaluate(t) else { return false };
+        let Ok(foot) = project_point_to_curve(other, point) else { return false };
+        let identity = crate::classification::surface_uv_band(&face.surface, point.x, point.y, 1e-7);
+        if foot.distance > (search * 1e-3).min(identity) {
+            return false;
+        }
+        match (face.surface.evaluate(point.x, point.y), face.surface.evaluate(foot.point.x, foot.point.y)) {
+            (Ok(here), Ok(there)) => here.sub(there).length() <= 1e-9,
+            _ => false,
+        }
+    });
+    if ends_on_other {
+        return None;
+    }
     let gap = |parameter: f64| -> Option<(f64, Vec3, Vec3, f64)> {
         let point = cut.evaluate(parameter).ok()?;
         let projected = project_point_to_curve(other, point).ok()?;
@@ -2023,6 +2085,25 @@ fn fragment_face_arranged(
                 })
             })
         };
+        let boundary_anchor = bridge_boundary_t_junction_anchor_enabled();
+        let lies_on_another_cut_run = |i: usize, point: Vec2| -> bool {
+            bridge_t_junction_anchor_enabled()
+                && chains.iter().enumerate().any(|(j, other)| {
+                    j != i
+                        && !dropped_chains.contains(&j)
+                        && (boundary_anchor || matches!(other.source, ChainSource::Cut { .. }))
+                        && other.segments.iter().any(|&(a, b)| {
+                            let along = b.sub(a);
+                            let span = along.dot(along);
+                            let t = if span > 0.0 {
+                                (point.sub(a).dot(along) / span).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            };
+                            a.add(along.scale(t)).sub(point).length() <= arrangement_tolerance
+                        })
+                })
+        };
         let mut loose: Vec<(usize, bool, Vec2)> = Vec::new();
         for (i, c) in chains.iter().enumerate() {
             if !matches!(c.source, ChainSource::Cut { .. }) {
@@ -2030,6 +2111,12 @@ fn fragment_face_arranged(
             }
             for (is_end, this, other) in [(false, c.start, c.end), (true, c.end, c.start)] {
                 if !anchored(i, this) && anchored(i, other) {
+                    if lies_on_another_cut_run(i, this) {
+                        if debug {
+                            eprintln!("  cut chain {i} end {} is a T-junction on another chain's run", if is_end { "end" } else { "start" });
+                        }
+                        continue;
+                    }
                     if cut_chain_has_interior_crossing(i) {
                         if debug {
                             eprintln!(
@@ -2049,11 +2136,28 @@ fn fragment_face_arranged(
         // edge<->vertex gap), well under a percent of the face diagonal; bound the
         // bridge span so two unrelated loose cuts across a face are never joined.
         let bridge_band = (diagonal * 0.02).max(junction_radius * 4.0);
+        if debug && !loose.is_empty() {
+            eprintln!("  junction_radius={junction_radius:.6} bridge_band={bridge_band:.6} loose={loose:?}");
+        }
+        let skip_crossing_pairs = bridge_skip_crossing_pairs_enabled();
+        let chains_cross = |i: usize, j: usize| -> bool {
+            chains[i].segments.iter().any(|&(a0, a1)| {
+                chains[j].segments.iter().any(|&(b0, b1)| {
+                    crate::arrangement::segment_intersection(a0, a1, b0, b1, arrangement_tolerance).is_some()
+                })
+            })
+        };
         let mut pairs: Vec<(f64, usize, usize)> = Vec::new();
         for a in 0..loose.len() {
             for b in (a + 1)..loose.len() {
                 if loose[a].0 == loose[b].0 {
                     continue; // never bridge a chain to itself
+                }
+                if skip_crossing_pairs && chains_cross(loose[a].0, loose[b].0) {
+                    if debug {
+                        eprintln!("  loose ends of chains {} and {} are not bridged: the chains cross", loose[a].0, loose[b].0);
+                    }
+                    continue;
                 }
                 let gap = loose[a].2.sub(loose[b].2).length();
                 if gap <= bridge_band {
@@ -2134,6 +2238,12 @@ fn fragment_face_arranged(
                 }
             }
             let midpoint = point_a.add(point_b).scale(0.5);
+            if debug {
+                eprintln!(
+                    "  bridging chain {chain_a} at ({:.9},{:.9}) and chain {chain_b} at ({:.9},{:.9}), uv gap {gap:.6}",
+                    point_a.x, point_a.y, point_b.x, point_b.y
+                );
+            }
             for (chain, old) in [(chain_a, point_a), (chain_b, point_b)] {
                 if chains[chain].start.sub(old).length() <= 1e-15 {
                     chains[chain].start = midpoint;
@@ -2389,7 +2499,8 @@ fn fragment_face_arranged(
         );
     }
     let mut fragments = Vec::new();
-    for region in regions {
+    for mut region in regions {
+        super::loops::detach_touched_closed_boundaries(&mut region, &chains, arrangement_tolerance)?;
         let order = FragmentOrder {
             area: region.outer_area,
             key: super::loops::region_topology_key(&region.outer, &region.holes),

@@ -71,6 +71,15 @@ pub const SKETCH3D_EDIT_BUTTON: &str = "editSketch3d";
 /// only sizes what the editor draws.
 pub const REFERENCE_TIP_LENGTH: f64 = 1.0;
 
+/// Record key of a vertex reference's topological anchor: two edge names whose
+/// one shared end IS the vertex. A `{solid}@x,y,z` name is only a coordinate,
+/// so without this a vertex that moves stops resolving.
+pub const REFERENCE_ANCHOR_EDGES_KEY: &str = "anchorEdges";
+
+/// Two edge ends closer than this (relative to the larger coordinate) are one
+/// vertex. Loose enough for the editor's single-precision display polylines.
+const ANCHOR_END_REL: f64 = 1e-5;
+
 /// Two segment ends closer than this (relative to the sketch's length scale)
 /// are the same junction when chaining.
 const CHAIN_JOIN_REL: f64 = 1e-7;
@@ -89,6 +98,7 @@ pub fn execute(ctx: &FeatureContext) -> FeatureResult {
             result.axes = output.axes;
             result.points = output.points;
             result.unresolved = output.unresolved;
+            result.notes.extend(output.notes);
             result
         }
         Err(error) => ctx.fail(error),
@@ -141,10 +151,12 @@ struct Output {
     axes: Vec<(String, Axis)>,
     points: Vec<(String, ScenePoint)>,
     unresolved: Vec<String>,
+    notes: Vec<String>,
 }
 
 fn build(ctx: &FeatureContext) -> Result<Output, String> {
     let mut unresolved: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
 
     // A brand-new 3D sketch has no document yet (the app seeds an empty
     // `persistentData`), which is a legitimate state: nothing to publish.
@@ -169,6 +181,7 @@ fn build(ctx: &FeatureContext) -> Result<Output, String> {
                 axes: Vec::new(),
                 points: Vec::new(),
                 unresolved,
+                notes,
             });
         }
     };
@@ -197,14 +210,25 @@ fn build(ctx: &FeatureContext) -> Result<Output, String> {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        match resolve_reference(ctx.scene, name) {
+        // A vertex with a topological anchor is found through its edges; its
+        // coordinate name is stale the moment the vertex moves, and may even
+        // name a different vertex by then, so a failed anchor is a lost
+        // reference and never falls back to the name.
+        let resolved = match anchor_edge_names(entry) {
+            Some(anchors) => resolve_anchored_vertex(ctx.scene, &anchors).map(ResolvedReference::Point),
+            None => resolve_reference(ctx.scene, name),
+        };
+        let resolved = resolved.map(|r| r.as_recorded(kind));
+        match resolved {
             Some(resolved) if resolved.kind() == kind && resolved.positions().len() == ids.len() => {
                 // A plane is (origin, normal) and an axis line (point,
                 // direction): any origin ON the plane / line is as good as
                 // the one the exact BREP reports, so the editor's own origin
                 // is kept, projected onto the resolved entity, and only its
                 // tip follows the resolved direction. A regenerate then moves
-                // nothing the user placed; a point and an arc are exact.
+                // nothing the user placed. A model EDGE (a segment, a circle)
+                // is exact like a point and an arc: its ends and centre are
+                // what a midpoint or centre constraint is measured from.
                 let positions = resolved.positions();
                 let positions = match resolved {
                     ResolvedReference::Plane(origin, tip) | ResolvedReference::Line(origin, tip) => {
@@ -241,7 +265,10 @@ fn build(ctx: &FeatureContext) -> Result<Output, String> {
             // Resolved to a different shape than the editor materialized (an
             // edge that became an arc after a model edit) or not at all: keep
             // the last coordinates and say so.
-            _ => unresolved.push(name.to_string()),
+            _ => {
+                notes.push(lost_reference_note(&doc, name, &ids));
+                unresolved.push(name.to_string());
+            }
         }
     }
     // Names the dialog lists that the editor has not materialized yet are
@@ -337,7 +364,66 @@ fn build(ctx: &FeatureContext) -> Result<Output, String> {
         axes,
         points,
         unresolved,
+        notes,
     })
+}
+
+/// What the run says about a linked reference that stopped resolving: the
+/// reference by name and every constraint that depends on it.
+fn lost_reference_note(doc: &Sketch3dDoc, name: &str, ids: &[Value]) -> String {
+    let needed: Vec<String> = doc
+        .constraints
+        .iter()
+        .filter(|c| c.points().iter().any(|p| ids.iter().any(|id| crate::sketch_id_key(id) == crate::sketch_id_key(p))))
+        .map(|c| format!("{} {}", c.ctype().unwrap_or("?"), c.id().map(id_display).unwrap_or_else(|| "?".into())))
+        .collect();
+    if needed.is_empty() {
+        format!("3D sketch: reference '{name}' no longer resolves; it keeps its last position")
+    } else {
+        format!(
+            "3D sketch: reference '{name}' no longer resolves; it keeps its last position, needed by constraint {}",
+            needed.join(", ")
+        )
+    }
+}
+
+fn anchor_edge_names(entry: &Value) -> Option<Vec<String>> {
+    let names: Vec<String> = entry
+        .get(REFERENCE_ANCHOR_EDGES_KEY)?
+        .as_array()?
+        .iter()
+        .filter_map(|n| n.as_str().map(String::from))
+        .collect();
+    (names.len() == 2).then_some(names)
+}
+
+/// The one end two edges share, `None` when they share no end or both ends
+/// (two halves of a seamed rim say nothing about which end is meant).
+pub fn common_edge_end(a: (Vec3, Vec3), b: (Vec3, Vec3)) -> Option<Vec3> {
+    let scale = [a.0, a.1, b.0, b.1]
+        .iter()
+        .fold(1.0f64, |m, p| m.max(p.x.abs()).max(p.y.abs()).max(p.z.abs()));
+    let tol = ANCHOR_END_REL * scale;
+    let mut shared: Vec<Vec3> = Vec::new();
+    for end in [a.0, a.1] {
+        if [b.0, b.1].iter().any(|other| end.sub(*other).length() <= tol) {
+            shared.push(end);
+        }
+    }
+    match shared.as_slice() {
+        [only] => Some(*only),
+        [first, second] if first.sub(*second).length() <= tol => Some(*first),
+        _ => None,
+    }
+}
+
+fn resolve_anchored_vertex(scene: &SceneMap, anchors: &[String]) -> Option<Vec3> {
+    let ends = |name: &String| -> Option<(Vec3, Vec3)> {
+        let curve = common::edge_curve(scene.resolve_edge(name)?).ok()?;
+        let [t0, t1] = curve.domain().ok()?;
+        Some((curve.evaluate(t0).ok()?, curve.evaluate(t1).ok()?))
+    };
+    common_edge_end(ends(anchors.first()?)?, ends(anchors.get(1)?)?)
 }
 
 /// A geometry's `{id}:G{id}` / `{id}:P{id}` suffix: a number prints bare, a
@@ -419,13 +505,80 @@ fn pre_evaluate_expressions(ctx: &FeatureContext, sketch: &mut Value) -> Result<
 pub enum ResolvedReference {
     /// A vertex, a published point, a sphere's centre: one fixed point.
     Point(Vec3),
-    /// A straight edge, a datum axis, a cylinder's axis, a closed circular
-    /// edge's axis: a fixed construction line `[a, b]`.
+    /// A datum axis or a cylinder's axis, an infinite line in all but name: a
+    /// fixed construction line `[a, b]` whose origin is free to slide.
     Line(Vec3, Vec3),
+    /// A model EDGE, straight or a best-effort chord: `[start, end]`, exact.
+    Segment(Vec3, Vec3),
+    /// A closed circular edge: `[center, center + axis * radius]`, exact, so
+    /// the centre follows the model and the tip carries the radius.
+    CircleAxis(Vec3, Vec3),
     /// A circular arc edge: `[center, start, end]`.
     Arc(Vec3, Vec3, Vec3),
     /// A planar face or a datum/construction plane: `[origin, normalTip]`.
     Plane(Vec3, Vec3),
+    /// A free-form edge: the control points of a fitted cubic bezier chain
+    /// (see [`curve_reference_controls`]).
+    Curve(Vec<Vec3>),
+}
+
+/// How densely a free-form edge is sampled for its fit.
+const REFERENCE_CURVE_SAMPLES: usize = 128;
+
+/// How many cubic spans a free-form edge is fitted with. Fixed, so a rebuild
+/// updates the same control points in place.
+pub const REFERENCE_CURVE_SPANS: usize = 8;
+
+/// The control points (`3 * REFERENCE_CURVE_SPANS + 1`) of a C1 cubic bezier
+/// chain through samples of a curve, its anchors spaced evenly by arc length.
+/// `None` for fewer than two samples or a curve of no length.
+pub fn curve_reference_controls(samples: &[Vec3]) -> Option<Vec<Vec3>> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let mut cumulative = Vec::with_capacity(samples.len());
+    let mut total = 0.0;
+    cumulative.push(0.0);
+    for pair in samples.windows(2) {
+        total += pair[1].sub(pair[0]).length();
+        cumulative.push(total);
+    }
+    if total <= 0.0 {
+        return None;
+    }
+    let spans = REFERENCE_CURVE_SPANS;
+    let mut segment = 0;
+    let anchors: Vec<Vec3> = (0..=spans)
+        .map(|i| {
+            let at = total * i as f64 / spans as f64;
+            while segment + 2 < samples.len() && cumulative[segment + 1] < at {
+                segment += 1;
+            }
+            let length = cumulative[segment + 1] - cumulative[segment];
+            let t = if length > 0.0 { ((at - cumulative[segment]) / length).clamp(0.0, 1.0) } else { 0.0 };
+            samples[segment].add(samples[segment + 1].sub(samples[segment]).scale(t))
+        })
+        .collect();
+    let closed = samples[0].sub(samples[samples.len() - 1]).length() <= 1e-9 * total;
+    let tangent = |i: usize| -> Vec3 {
+        let (before, after) = match i {
+            0 if closed => (anchors[spans - 1], anchors[1]),
+            0 => (anchors[0], anchors[1]),
+            n if n == spans && closed => (anchors[spans - 1], anchors[1]),
+            n if n == spans => (anchors[spans - 1], anchors[spans]),
+            n => (anchors[n - 1], anchors[n + 1]),
+        };
+        let scale = if !closed && (i == 0 || i == spans) { 1.0 / 3.0 } else { 1.0 / 6.0 };
+        after.sub(before).scale(scale)
+    };
+    let mut controls = Vec::with_capacity(3 * spans + 1);
+    for i in 0..spans {
+        controls.push(anchors[i]);
+        controls.push(anchors[i].add(tangent(i)));
+        controls.push(anchors[i + 1].sub(tangent(i + 1)));
+    }
+    controls.push(anchors[spans]);
+    Some(controls)
 }
 
 impl ResolvedReference {
@@ -433,9 +586,24 @@ impl ResolvedReference {
     pub fn kind(&self) -> &'static str {
         match self {
             ResolvedReference::Point(..) => "point",
-            ResolvedReference::Line(..) => "line",
+            // A saved record says "line" for all three; the string must not
+            // change or re-linking would re-mint the points under constraints.
+            ResolvedReference::Line(..) | ResolvedReference::Segment(..) | ResolvedReference::CircleAxis(..) => "line",
             ResolvedReference::Arc(..) => "arc",
             ResolvedReference::Plane(..) => "plane",
+            ResolvedReference::Curve(..) => "curve",
+        }
+    }
+
+    /// As a saved record of `kind` holds it: a free-form edge linked before
+    /// curves existed is a `line` chord, and stays one so the points under its
+    /// constraints are not re-minted.
+    pub fn as_recorded(self, kind: &str) -> ResolvedReference {
+        match self {
+            ResolvedReference::Curve(controls) if kind == "line" && controls.len() >= 2 => {
+                ResolvedReference::Segment(controls[0], controls[controls.len() - 1])
+            }
+            other => other,
         }
     }
 
@@ -443,9 +611,10 @@ impl ResolvedReference {
     pub fn positions(&self) -> Vec<Vec3> {
         match *self {
             ResolvedReference::Point(p) => vec![p],
-            ResolvedReference::Line(a, b) => vec![a, b],
+            ResolvedReference::Line(a, b) | ResolvedReference::Segment(a, b) | ResolvedReference::CircleAxis(a, b) => vec![a, b],
             ResolvedReference::Arc(c, s, e) => vec![c, s, e],
             ResolvedReference::Plane(o, n) => vec![o, n],
+            ResolvedReference::Curve(ref controls) => controls.clone(),
         }
     }
 
@@ -454,9 +623,10 @@ impl ResolvedReference {
     pub fn geometry_type(&self) -> Option<&'static str> {
         match self {
             ResolvedReference::Point(..) => None,
-            ResolvedReference::Line(..) => Some("line"),
+            ResolvedReference::Line(..) | ResolvedReference::Segment(..) | ResolvedReference::CircleAxis(..) => Some("line"),
             ResolvedReference::Arc(..) => Some("arc"),
             ResolvedReference::Plane(..) => Some("plane"),
+            ResolvedReference::Curve(..) => Some("bezier"),
         }
     }
 }
@@ -511,15 +681,23 @@ pub fn resolve_reference(scene: &SceneMap, name: &str) -> Option<ResolvedReferen
             Ok(SelectionGeometry::Circle { center, axis, radius }) => {
                 if end.sub(start).length() <= 1e-9 * radius.max(1.0) {
                     // A closed circle: its axis is what a pipe lines up with.
-                    ResolvedReference::Line(center, center.add(axis.scale(radius.max(REFERENCE_TIP_LENGTH))))
+                    ResolvedReference::CircleAxis(center, center.add(axis.scale(radius)))
                 } else {
                     ResolvedReference::Arc(center, start, end)
                 }
             }
-            Ok(SelectionGeometry::Line { .. }) => ResolvedReference::Line(start, end),
-            // A spline edge or anything without an analytic frame: its chord,
-            // the same best-effort the edge-axis resolver makes.
-            _ => ResolvedReference::Line(start, end),
+            Ok(SelectionGeometry::Line { .. }) => ResolvedReference::Segment(start, end),
+            // A spline edge or anything without an analytic frame: a fitted
+            // bezier chain, or its chord if the curve will not sample.
+            _ => {
+                let samples: Option<Vec<Vec3>> = (0..=REFERENCE_CURVE_SAMPLES)
+                    .map(|i| curve.evaluate(t0 + (t1 - t0) * i as f64 / REFERENCE_CURVE_SAMPLES as f64).ok())
+                    .collect();
+                match samples.as_deref().and_then(curve_reference_controls) {
+                    Some(controls) => ResolvedReference::Curve(controls),
+                    None => ResolvedReference::Segment(start, end),
+                }
+            }
         });
     }
     if let Some((solid_name, coords)) = name.rsplit_once('@') {

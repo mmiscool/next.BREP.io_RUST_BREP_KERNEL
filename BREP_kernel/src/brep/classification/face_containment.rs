@@ -1937,7 +1937,6 @@ fn build_sphere_region_reduced(
     atlas: &crate::sphere_chart::SphereAtlas,
     sampled: &[LoopSamples],
 ) -> Result<Option<(crate::sphere_chart::SphericalRegion, f64)>, String> {
-    use crate::sphere_chart::{arc_distance, arc_normal};
     let total: usize = sampled.iter().map(|samples| samples.polygon.len()).sum();
     if total < REDUCED_REGION_SAMPLES {
         return Ok(None);
@@ -1947,6 +1946,12 @@ fn build_sphere_region_reduced(
         *uses.entry(slot as u64).or_insert(0) += 1;
     }
     let outward_face_normal = face.same_sense == atlas.parameterization_is_outward(&face.surface)?;
+    let memo = sphere_reduction_memo_enabled();
+    let carrier = memo.then(|| {
+        let mut lane = crate::mass_properties::TwoLane::new();
+        crate::mass_properties::hash_surface(&mut lane, &face.surface);
+        lane.finish()
+    });
     let mut points: Vec<Vec3> = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut deviation = 0.0f64;
@@ -1959,42 +1964,44 @@ fn build_sphere_region_reduced(
             if span == 0 || uses.get(&edge_id).copied().unwrap_or(0) >= 2 {
                 continue;
             }
-            let mut along: Vec<Vec3> = Vec::with_capacity(span + 1);
-            for offset in 0..=span {
-                let uv = samples.polygon[(first + offset) % count];
-                along.push(face.surface.evaluate(uv.x, uv.y)?);
+            let key = carrier.map(|carrier| {
+                let mut lane = crate::mass_properties::TwoLane::new();
+                lane.u64(carrier[0]);
+                lane.u64(carrier[1]);
+                lane.usize(span);
+                for offset in 0..=span {
+                    let uv = samples.polygon[(first + offset) % count];
+                    lane.f64(uv.x);
+                    lane.f64(uv.y);
+                }
+                lane.finish()
+            });
+            if let Some(served) = key.and_then(|key| SPHERE_REDUCTIONS.with(|memo| memo.borrow().get(&key).cloned())) {
+                let Some((kept, kept_deviation)) = served else {
+                    return Ok(None);
+                };
+                deviation = deviation.max(kept_deviation);
+                let start = points.len();
+                points.extend(kept.iter().copied());
+                spans.push((start, points.len()));
+                continue;
             }
-            let Ok(units) = along.iter().map(|p| p.sub(atlas.centre).normalized()).collect::<Result<Vec<_>, _>>() else {
+            let reduced = reduce_sphere_coedge(face, atlas, &samples.polygon, first, span)?;
+            if let Some(key) = key {
+                SPHERE_REDUCTIONS.with(|memo| {
+                    let mut memo = memo.borrow_mut();
+                    if memo.len() >= SPHERE_REDUCTION_ENTRIES {
+                        memo.clear();
+                    }
+                    memo.insert(key, reduced.clone());
+                });
+            }
+            let Some((kept, kept_deviation)) = reduced else {
                 return Ok(None);
             };
-            let last = along.len() - 1;
-            let mut chords: Vec<f64> = units.windows(2).map(|pair| pair[0].sub(pair[1]).length()).collect();
-            chords.sort_by(f64::total_cmp);
-            let target = 0.1 * chords[chords.len() / 2];
-            let mut kept: Vec<usize> = (0..=last).collect();
-            let mut kept_deviation = 0.0f64;
-            for stride in [32usize, 16, 8, 4, 2] {
-                if last < 2 * stride {
-                    continue;
-                }
-                let indices: Vec<usize> = (0..=last).filter(|&i| i.min(last - i) % stride == 0).collect();
-                let mut worst = 0.0f64;
-                for pair in indices.windows(2) {
-                    let (a, b) = (units[pair[0]], units[pair[1]]);
-                    let normal = arc_normal(a, b);
-                    for j in pair[0] + 1..pair[1] {
-                        worst = worst.max(arc_distance(a, b, normal, units[j]));
-                    }
-                }
-                if worst <= target {
-                    kept = indices;
-                    kept_deviation = worst;
-                    break;
-                }
-            }
             deviation = deviation.max(kept_deviation);
             let start = points.len();
-            points.extend(kept.iter().map(|&i| along[i]));
+            points.extend(kept.iter().copied());
             spans.push((start, points.len()));
         }
     }
@@ -2011,6 +2018,79 @@ fn build_sphere_region_reduced(
     let region = crate::sphere_chart::SphericalRegion::from_segments(atlas.centre, &boundary, outward_face_normal);
     let rounding = 4e-9 / atlas.radius.max(f64::MIN_POSITIVE);
     Ok(Some((region, 2.0 * deviation + rounding)))
+}
+
+/// One coedge's reduced boundary for [`build_sphere_region_reduced`]: its
+/// samples `polygon[first..=first + span]` (cyclically) on the ball, kept at the
+/// largest stride whose dropped samples lie within a tenth of the median chord
+/// angle of the kept arcs, and that largest deviation; None when a sample is at
+/// the centre. A function of the carrier and those samples alone.
+fn reduce_sphere_coedge(
+    face: &FaceRecord,
+    atlas: &crate::sphere_chart::SphereAtlas,
+    polygon: &[Vec2],
+    first: usize,
+    span: usize,
+) -> Result<Option<(std::rc::Rc<Vec<Vec3>>, f64)>, String> {
+    use crate::sphere_chart::{arc_distance, arc_normal};
+    let count = polygon.len();
+    let mut along: Vec<Vec3> = Vec::with_capacity(span + 1);
+    for offset in 0..=span {
+        let uv = polygon[(first + offset) % count];
+        along.push(face.surface.evaluate(uv.x, uv.y)?);
+    }
+    let Ok(units) = along.iter().map(|p| p.sub(atlas.centre).normalized()).collect::<Result<Vec<_>, _>>() else {
+        return Ok(None);
+    };
+    let last = along.len() - 1;
+    let mut chords: Vec<f64> = units.windows(2).map(|pair| pair[0].sub(pair[1]).length()).collect();
+    chords.sort_by(f64::total_cmp);
+    let target = 0.1 * chords[chords.len() / 2];
+    let mut kept: Vec<usize> = (0..=last).collect();
+    let mut kept_deviation = 0.0f64;
+    for stride in [32usize, 16, 8, 4, 2] {
+        if last < 2 * stride {
+            continue;
+        }
+        let indices: Vec<usize> = (0..=last).filter(|&i| i.min(last - i) % stride == 0).collect();
+        let mut worst = 0.0f64;
+        for pair in indices.windows(2) {
+            let (a, b) = (units[pair[0]], units[pair[1]]);
+            let normal = arc_normal(a, b);
+            for j in pair[0] + 1..pair[1] {
+                worst = worst.max(arc_distance(a, b, normal, units[j]));
+            }
+        }
+        if worst <= target {
+            kept = indices;
+            kept_deviation = worst;
+            break;
+        }
+    }
+    Ok(Some((std::rc::Rc::new(kept.iter().map(|&i| along[i]).collect()), kept_deviation)))
+}
+
+/// `BREP_SPHERE_REDUCTION_MEMO` (default on, `=0` reduces every coedge afresh):
+/// [`build_sphere_region_reduced`] serves a coedge's reduction from
+/// [`SPHERE_REDUCTIONS`]. brep-bench boolean/golf-ball: every cut changes the
+/// ball face, so its first query rebuilt the reduced region from all 540 000
+/// trim samples of its 55 dimple rims, 54 of them the previous cut's (4.3 s of
+/// the case's 40 s); now each cut reduces its one new rim.
+fn sphere_reduction_memo_enabled() -> bool {
+    let enabled = crate::switch!("BREP_SPHERE_REDUCTION_MEMO", true);
+    enabled
+}
+
+
+/// Bound on [`SPHERE_REDUCTIONS`]; the memo is emptied when it is reached.
+const SPHERE_REDUCTION_ENTRIES: usize = 4096;
+
+thread_local! {
+    /// [`reduce_sphere_coedge`]'s result per coedge, keyed by the carrier's
+    /// identity (`hash_surface`, which fixes the atlas) and the bits of the
+    /// coedge's samples, everything the reduction reads.
+    static SPHERE_REDUCTIONS: std::cell::RefCell<std::collections::HashMap<[u64; 2], Option<(std::rc::Rc<Vec<Vec3>>, f64)>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// The spherical region [`sphere_chart_point_in_face`] reads `face` against,
@@ -2481,5 +2561,6 @@ fn point_in_face_scanned(
     trace_lane(face, point, "parity (nearest curve declined)", parity);
     Ok(parity)
 }
+
 
 

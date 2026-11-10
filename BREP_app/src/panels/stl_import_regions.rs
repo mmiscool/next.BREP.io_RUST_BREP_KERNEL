@@ -802,7 +802,7 @@ impl RegionView {
             subtitle: Some(&subtitle),
             fields: &fields,
             hidden: None,
-            banner: Some((&proposal, banner_colour)),
+            banner: Some(crate::form_view::FormBanner::note(&proposal, banner_colour)),
             trailing: Some(&trailing),
             extra: None,
             exit_label: "Close",

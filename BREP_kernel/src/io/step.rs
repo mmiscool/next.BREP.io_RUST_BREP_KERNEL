@@ -5,7 +5,7 @@ use crate::{make_arc, KernelTolerances, NurbsCurve, NurbsSurface, Vec3};
 use rustc_hash::FxHashMap as HashMap;
 
 #[path = "step/pcurve.rs"]
-mod pcurve;
+pub(crate) mod pcurve;
 use pcurve::{build_pcurve, EmittedCurve, EmittedFrame, EmittedSurface, Pcurve2d};
 #[path = "step/pmi.rs"]
 pub(crate) mod pmi;
@@ -733,6 +733,40 @@ fn write_length_unit(writer: &mut StepWriter, unit: &str) -> Result<usize, Strin
     Ok(writer.add("(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))"))
 }
 
+/// The outward shell (an index into `shells`, one of `outer`) that owns the
+/// void `void`: the smallest by volume of those its shell lies inside. The
+/// shells of a valid solid do not meet, so one point of the void (the middle
+/// of its first proper edge) is inside or outside each of them throughout.
+fn void_owner(
+    solid: &BrepSolid,
+    void: usize,
+    outer: &[usize],
+    shells: &[(usize, bool, f64)],
+) -> Result<usize, String> {
+    let probe = solid.shells[void]
+        .faces
+        .iter()
+        .flat_map(|face| &face.loops)
+        .flat_map(|lp| &lp.coedges)
+        .find_map(|coedge| {
+            let edge = solid.edges.iter().find(|edge| edge.id == coedge.edge_id)?;
+            (!edge.degenerate).then(|| edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)).ok()).flatten()
+        })
+        .ok_or("export_step: a void shell with no edge to place it by")?;
+    let mut best: Option<usize> = None;
+    for &candidate in outer {
+        let alone = BrepSolid {
+            shells: vec![solid.shells[candidate].clone()],
+            ..solid.clone()
+        };
+        let class = crate::classify_point(probe, &alone, 1e-7)?.class;
+        if class == crate::PointClass::In && best.is_none_or(|b| shells[candidate].2 < shells[b].2) {
+            best = Some(candidate);
+        }
+    }
+    best.ok_or_else(|| "export_step: a void shell lies inside no outward shell".into())
+}
+
 fn vertex_for(solid: &BrepSolid, id: u64) -> Result<&VertexRecord, String> {
     solid
         .vertices
@@ -1312,27 +1346,46 @@ pub(crate) fn write_product_geometry(
                 face_ids.push(face_step_id);
             }
             let closed_shell = writer.add(format!("CLOSED_SHELL('',{})", id_list(&face_ids)));
-            let inward = if solid.shells.len() > 1 {
-                crate::mass_properties::shell_signed_volume(shell)? < 0.0
+            let signed_volume = if solid.shells.len() > 1 {
+                crate::mass_properties::shell_signed_volume(shell)?
             } else {
-                false
+                1.0
             };
-            emitted_shells.push((closed_shell, inward));
+            emitted_shells.push((closed_shell, signed_volume < 0.0, signed_volume.abs()));
         }
-        if emitted_shells.iter().any(|&(_, inward)| inward) {
-            let outer = emitted_shells.iter().filter(|&&(_, inward)| !inward).collect::<Vec<_>>();
-            if outer.len() != 1 {
-                return Err("export_step: a solid with voids must have exactly one outward shell".into());
+        if emitted_shells.iter().any(|&(_, inward, _)| inward) {
+            let outer: Vec<usize> = (0..emitted_shells.len()).filter(|&i| !emitted_shells[i].1).collect();
+            if outer.is_empty() {
+                return Err("export_step: a solid with voids must have an outward shell".into());
             }
-            let voids = emitted_shells.iter().filter(|&&(_, inward)| inward)
-                .map(|&(shell, _)| writer.add(format!("ORIENTED_CLOSED_SHELL('',*,#{shell},.T.)")))
-                .collect::<Vec<_>>();
-            let body_id = writer.add(format!(
-                "BREP_WITH_VOIDS('{}',#{},{})", step_string(solid_name), outer[0].0, id_list(&voids)
-            ));
-            written.solids.push((solid_name.to_string(), body_id));
+            // Each void belongs to the smallest outward shell around it: one
+            // body per outward shell, its voids those it owns (several bodies
+            // nested in each other's hollows are several solids in STEP).
+            let mut owned: Vec<Vec<usize>> = vec![Vec::new(); emitted_shells.len()];
+            for void in (0..emitted_shells.len()).filter(|&i| emitted_shells[i].1) {
+                let owner = if outer.len() == 1 {
+                    outer[0]
+                } else {
+                    void_owner(solid, void, &outer, &emitted_shells)?
+                };
+                owned[owner].push(void);
+            }
+            for &shell in &outer {
+                let closed_shell = emitted_shells[shell].0;
+                let body_id = if owned[shell].is_empty() {
+                    writer.add(format!("MANIFOLD_SOLID_BREP('{}',#{closed_shell})", step_string(solid_name)))
+                } else {
+                    let voids = owned[shell].iter()
+                        .map(|&void| writer.add(format!("ORIENTED_CLOSED_SHELL('',*,#{},.T.)", emitted_shells[void].0)))
+                        .collect::<Vec<_>>();
+                    writer.add(format!(
+                        "BREP_WITH_VOIDS('{}',#{closed_shell},{})", step_string(solid_name), id_list(&voids)
+                    ))
+                };
+                written.solids.push((solid_name.to_string(), body_id));
+            }
         } else {
-            for (closed_shell, _) in emitted_shells {
+            for (closed_shell, _, _) in emitted_shells {
                 let body_id = writer.add(format!(
                     "MANIFOLD_SOLID_BREP('{}',#{closed_shell})", step_string(solid_name)
                 ));

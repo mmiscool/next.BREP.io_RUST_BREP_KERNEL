@@ -438,6 +438,32 @@ fn assemble_fragments_impl(
         .count() as i64;
     let euler = assembler.vertices.len() as i64 - edge_count + face_count - hole_count;
     let mut numerator = shells.len() as i64 * 2 - euler;
+    // CUSP BEFORE WELD: a point where one face's fans touch (a flat tangent to
+    // a wall, two crescents meeting at the contact) counts once per fan. When
+    // that alone makes the genus integral the assembly is right and no vertex
+    // pair needs welding; the nearest pair in the band below can be two
+    // distinct corners of a sliver (printmotor-assembly B517, 0.028 apart).
+    // Tried on copies, so any other failing assembly goes on exactly as before.
+    if (numerator < 0 || numerator % 2 != 0)
+        && super::refusal_welds::pinch_vertex_fans_enabled()
+        && std::env::var("BREP_CUSP_BEFORE_WELD").as_deref() != Ok("0")
+    {
+        let mut vertices = assembler.vertices.clone();
+        let mut edges = assembler.edges.clone();
+        let mut next_vertex_id = assembler.next_vertex_id;
+        let split = super::refusal_welds::split_pinched_vertices_by_fan(&mut vertices, &mut edges, &shells, &mut next_vertex_id);
+        let euler = vertices.len() as i64 - edge_count + face_count - hole_count;
+        let candidate = shells.len() as i64 * 2 - euler;
+        if split > 0 && candidate >= 0 && candidate % 2 == 0 {
+            assembler.vertices = vertices;
+            assembler.edges = edges;
+            assembler.next_vertex_id = next_vertex_id;
+            numerator = candidate;
+            if std::env::var("BREP_DEBUG_BOOL").is_ok() {
+                eprintln!("boolean assembly split {split} cusp fan(s) before any weld (numerator now {numerator})");
+            }
+        }
+    }
     if numerator < 0 || numerator % 2 != 0 {
         // TANGENCY DUPLICATE-VERTEX WELD (repair-not-refuse): where two blend
         // surfaces meet TANGENTIALLY (e.g. adjacent fillet cylinders sharing a

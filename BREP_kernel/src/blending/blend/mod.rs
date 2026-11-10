@@ -20,6 +20,7 @@
 mod carve;
 mod chain;
 mod collapse;
+pub(crate) mod convex_parallel;
 mod corner;
 pub(crate) mod creased_rim;
 mod edge;
@@ -113,6 +114,15 @@ const NO_COMMON_BALL_STAR_DEFAULT: bool = true;
 
 pub(crate) fn no_common_ball_star_on() -> bool {
     switch!(live "BREP_BLEND_RIBBON_STAR", NO_COMMON_BALL_STAR_DEFAULT)
+}
+
+/// An equal-radius convex star on four planar faces with no common ball closes
+/// as the rolling ball does: a ridge cylinder between two sphere triangles.
+/// `BREP_BLEND_RIDGE_STAR=0` restores the ribbon fill.
+const RIDGE_STAR_DEFAULT: bool = true;
+
+pub(crate) fn ridge_star_on() -> bool {
+    switch!(live "BREP_BLEND_RIDGE_STAR", RIDGE_STAR_DEFAULT)
 }
 
 /// The corner has no common ball; the point both shared-face rails stop at is

@@ -396,9 +396,16 @@ impl<'a> SolidBuilder<'a> {
             Some(seam) => Some(seam),
             None => self.equal_gap_sphere_seam(surface_ref, &bounds, face_same_sense)?,
         };
+        // A cap whose boundary circles a carrier pole, with no edge at the
+        // pole, has no closed trim in the carrier's chart. Choose an axis whose
+        // poles lie off the face instead.
+        let sphere_axis = match sphere_seam {
+            Some(_) => None,
+            None => self.pole_free_sphere_axis(surface_ref, &bounds, face_same_sense)?,
+        };
         let surface = self
             .resolver
-            .surface_for_face(surface_ref, &samples, sphere_seam)?;
+            .surface_for_face(surface_ref, &samples, sphere_seam, sphere_axis)?;
         // Route a vendor v-periodic POLE-CAP surface of revolution (angle on v,
         // meridian on u, capped by a degenerate VERTEX_LOOP apex) through the
         // kernel's universal u-periodic convention so the rim/apex loops stitch
@@ -527,6 +534,33 @@ impl<'a> SolidBuilder<'a> {
             .map(|(edge_id, forward)| (self.edge_record(*edge_id), *forward))
             .collect::<Vec<_>>();
         interior_pole_loop_seam(&frame, radius, &edges, face_same_sense)
+    }
+
+    /// See [`pole_free_axis`]. `None` for anything but a spherical carrier.
+    fn pole_free_sphere_axis(
+        &self,
+        surface_ref: usize,
+        bounds: &[(Vec<(u64, bool)>, bool)],
+        face_same_sense: bool,
+    ) -> Result<Option<Vec3>, String> {
+        if std::env::var("BREP_STEP_SPHERE_POLE_REFRAME").as_deref() == Ok("0") {
+            return Ok(None);
+        }
+        let entity = self.resolver.get(surface_ref)?;
+        let Some(args) = entity.find("SPHERICAL_SURFACE") else {
+            return Ok(None);
+        };
+        let frame = self.resolver.placement(args[1].as_ref_id()?)?;
+        let loops = bounds
+            .iter()
+            .map(|(specs, _)| {
+                specs
+                    .iter()
+                    .map(|(edge_id, forward)| (self.edge_record(*edge_id), *forward))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Ok(pole_free_axis(&frame, &loops, face_same_sense))
     }
 
     /// Phase 2 of face construction: stitch OCC full-cylinder rim loops and

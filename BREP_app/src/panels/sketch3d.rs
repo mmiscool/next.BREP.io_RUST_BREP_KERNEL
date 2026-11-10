@@ -225,12 +225,18 @@ impl Sketch3dPanel {
                     a.iter()
                         .map(|c| Row {
                             id: c["id"].clone(),
-                            label: match c["value"].as_f64() {
-                                Some(v) => format!("{} {} = {v:.3}", c["type"].as_str().unwrap_or("?"), id_text(&c["id"])),
-                                None => format!("{} {}", c["type"].as_str().unwrap_or("?"), id_text(&c["id"])),
+                            label: {
+                                let base = match c["value"].as_f64() {
+                                    Some(v) => format!("{} {} = {v:.3}", c["type"].as_str().unwrap_or("?"), id_text(&c["id"])),
+                                    None => format!("{} {}", c["type"].as_str().unwrap_or("?"), id_text(&c["id"])),
+                                };
+                                match c["lostReference"].as_str() {
+                                    Some(name) => format!("{base} \u{26A0} lost reference {name}"),
+                                    None => base,
+                                }
                             },
                             selected: selected("constraint", &c["id"]),
-                            conflicting: c["conflicting"] == true,
+                            conflicting: c["conflicting"] == true || c["lostReference"].is_string(),
                         })
                         .collect()
                 })

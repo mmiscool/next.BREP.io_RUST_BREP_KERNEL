@@ -673,9 +673,11 @@ impl EngineState {
         // Preserve SIGN so a linear dim can be dragged through the origin to the
         // negative side (a directional dim — cube size, height — then extends the
         // other way; the kernel takes |value| for magnitude dims). A small dead-zone
-        // keeps it off an exact 0 (a degenerate extent the builders reject).
+        // keeps it off an exact 0 (a degenerate extent the builders reject), one
+        // grid step wide so that it survives the drag grid.
         let raw = t_world * scale_recip;
-        let new_value = if raw >= 0.0 { raw.max(1e-4) } else { raw.min(-1e-4) };
+        let snapped = crate::formatting::snap_drag_value(raw);
+        let new_value = if raw >= 0.0 { snapped.max(0.001) } else { snapped.min(-0.001) };
         self.write_feature_dimension_param(feature_id, field_key, serde_json::json!(new_value));
         // Live-follow: re-bake the world-space leaders onto the rebuilt geometry so
         // the arrow tracks the pointer this frame (Fix 3).
@@ -751,7 +753,7 @@ impl EngineState {
         } else {
             clamped
         };
-        Some(floored)
+        Some(crate::formatting::snap_drag_value(floored))
     }
 
     /// Squared screen-pixel distance from `(x, y)` to the arc-end at `deg` for an

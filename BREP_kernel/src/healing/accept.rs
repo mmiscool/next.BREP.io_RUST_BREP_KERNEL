@@ -2535,6 +2535,21 @@ fn split_and_drop(
         verified = plan.enumerate(DropClosure::Retrim).0;
     }
 
+    // Several drops verified: the rebuilt bodies cannot say which material the
+    // crossing enclosed, but the body that crossed itself can. Its winding
+    // number decides (`winding_choice`); `BREP_HEAL_WINDING_DECIDES=0` restores
+    // the refusal.
+    let winding_decides = switch!("BREP_HEAL_WINDING_DECIDES", true);
+    if verified.len() > 1 && winding_decides {
+        let pieces: Vec<usize> = pieces_a.iter().chain(pieces_b.iter()).copied().collect();
+        if let Some(index) = winding_choice(solid, &fragments, &pieces, &verified) {
+            if trace_on() {
+                eprintln!("HEAL winding decides: candidate {index} of {}", verified.len());
+            }
+            let chosen = verified.swap_remove(index);
+            verified = vec![chosen];
+        }
+    }
     if verified.len() > 1 {
         return Err(KernelRefusal::ill_posed(
             KernelStage::Select,
@@ -2611,6 +2626,79 @@ struct Candidate {
     retired: Vec<u64>,
     retrimmed: Vec<u64>,
     solid: BrepSolid,
+}
+
+
+/// Which of several verified drops is the body that crossed itself meant to
+/// be? Its material is where its WINDING NUMBER is at least one: two holes
+/// widened into each other remove their overlap twice, so the plate winds once
+/// round a point of the plate, not at all round a point of one hole, and -1
+/// round a point of both, which is void like the rest of the opening. A piece
+/// of a crossing face is boundary of that material exactly when the side its
+/// outward normal leaves winds below one and the side it enters winds one or
+/// more; every other piece is a tail to drop.
+///
+/// The winding is read off the unrepaired body's watertight mesh, the sum of
+/// its triangles' solid angles (exact for any closed mesh, crossing or not),
+/// at two points a little either side of each piece's interior test point.
+/// The offset is many chord tolerances, so the mesh's chord error cannot put
+/// a point on the wrong side of its own face. Any winding that does not come
+/// out within a quarter of an integer, a piece whose material lies on the
+/// wrong side of it (a drop never turns a face over), or anything other than
+/// exactly one candidate keeping exactly the predicted pieces, answers
+/// nothing, and the caller's ambiguity refusal stands.
+fn winding_choice(
+    solid: &BrepSolid,
+    fragments: &[crate::fragment::FaceFragmentRecord],
+    pieces: &[usize],
+    verified: &[Candidate],
+) -> Option<usize> {
+    let scale = crate::solid_scale(solid);
+    let offset = scale * 1e-3;
+    let mesh = crate::tessellate_brep_watertight(solid, offset / 20.0).ok()?;
+    let point = |index: u32| {
+        let at = 3 * index as usize;
+        crate::Vec3::new(mesh.positions[at], mesh.positions[at + 1], mesh.positions[at + 2])
+    };
+    let winding = |q: crate::Vec3| -> Option<i64> {
+        let mut total = 0.0;
+        for triangle in mesh.indices.chunks_exact(3) {
+            let a = point(triangle[0]).sub(q);
+            let b = point(triangle[1]).sub(q);
+            let c = point(triangle[2]).sub(q);
+            let (la, lb, lc) = (a.length(), b.length(), c.length());
+            let numerator = a.dot(b.cross(c));
+            let denominator = la * lb * lc + a.dot(b) * lc + a.dot(c) * lb + b.dot(c) * la;
+            total += 2.0 * numerator.atan2(denominator);
+        }
+        let turns = total / (4.0 * std::f64::consts::PI);
+        ((turns - turns.round()).abs() < 0.25).then_some(turns.round() as i64)
+    };
+    let mut keep: Vec<(usize, bool)> = Vec::with_capacity(pieces.len());
+    for &index in pieces {
+        let fragment = fragments.get(index)?;
+        let normal = fragment.surface.normal(fragment.test_uv.x, fragment.test_uv.y).ok()?;
+        let normal = normal.normalized().ok()?;
+        let outward = if fragment.same_sense { normal } else { normal.scale(-1.0) };
+        let outside = winding(fragment.test_point.add(outward.scale(offset)))?;
+        let inside = winding(fragment.test_point.sub(outward.scale(offset)))?;
+        match (inside >= 1, outside >= 1) {
+            (true, false) => keep.push((index, true)),
+            (false, true) => return None,
+            _ => keep.push((index, false)),
+        }
+        if trace_on() {
+            eprintln!(
+                "HEAL winding: piece {index} of face {} inside {inside} outside {outside}",
+                fragment.source_face_id
+            );
+        }
+    }
+    let mut matching = verified.iter().enumerate().filter(|(_, candidate)| {
+        keep.iter().all(|&(index, kept)| candidate.dropped.contains(&index) != kept)
+    });
+    let first = matching.next()?.0;
+    matching.next().is_none().then_some(first)
 }
 
 /// How a candidate drop closes over a neighbour it leaves holding a boundary

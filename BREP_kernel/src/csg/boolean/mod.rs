@@ -206,7 +206,7 @@ use coincident::*;
 use touch::TouchCensus;
 pub(crate) use assemble::{
     assemble_fragments, assemble_open_fragments, commit_nearby_edge_endpoints,
-    clear_candidate_memo, edge_interior_lies_on, finalize_assembled_solid,
+    clear_candidate_memo, edge_interior_lies_on, finalize_assembled_solid, refresh_derived_genus,
 };
 use assemble::{assemble_fragments_scoped, AssemblyScope};
 // Currently referenced only inside `assemble`, so the re-export is unused.
@@ -2048,21 +2048,35 @@ fn operand_bounds(solid: &BrepSolid) -> crate::Aabb {
 /// strictly inside both boxes in every axis; two such axes leave a line or a
 /// point of contact, which has no area to merge.
 fn line_or_point_contact(first: &BrepSolid, second: &BrepSolid, bounds: [crate::Aabb; 2]) -> bool {
-    let plain = |solid: &BrepSolid| {
-        solid.kind == crate::BodyKind::Solid
-            && solid.cells.is_empty()
-            && solid.shells.iter().flat_map(|shell| &shell.faces).all(|face| {
-                face.surface.control_points.iter().flatten().all(|control| control.w > 0.0 && control.w.is_finite())
-            })
-    };
-    let [a, b] = bounds;
+    apart_axes(bounds) >= 2 && plain_hull_solid(first) && plain_hull_solid(second)
+}
+
+/// One apart axis: no point can be interior to both operands (see
+/// [`line_or_point_contact`]), though the boxes may share a face's area.
+fn boxes_share_no_interior(first: &BrepSolid, second: &BrepSolid, bounds: [crate::Aabb; 2]) -> bool {
+    apart_axes(bounds) >= 1 && plain_hull_solid(first) && plain_hull_solid(second)
+}
+
+/// The axes in which the boxes are separated or touch exactly (no band).
+fn apart_axes([a, b]: [crate::Aabb; 2]) -> usize {
     let apart = |a_min: f64, a_max: f64, b_min: f64, b_max: f64| a_max <= b_min || b_max <= a_min;
-    let axes = [
+    [
         apart(a.minimum.x, a.maximum.x, b.minimum.x, b.maximum.x),
         apart(a.minimum.y, a.maximum.y, b.minimum.y, b.maximum.y),
         apart(a.minimum.z, a.maximum.z, b.minimum.z, b.maximum.z),
-    ];
-    axes.iter().filter(|&&apart| apart).count() >= 2 && plain(first) && plain(second)
+    ]
+    .into_iter()
+    .filter(|&apart| apart)
+    .count()
+}
+
+/// A plain solid whose faces lie in their control-net boxes: every weight positive.
+fn plain_hull_solid(solid: &BrepSolid) -> bool {
+    solid.kind == crate::BodyKind::Solid
+        && solid.cells.is_empty()
+        && solid.shells.iter().flat_map(|shell| &shell.faces).all(|face| {
+            face.surface.control_points.iter().flatten().all(|control| control.w > 0.0 && control.w.is_finite())
+        })
 }
 
 /// The result faces the soundness scan reads under pass-through: the
@@ -2246,6 +2260,15 @@ fn boolean_pipeline(
         && contact_fast_path(options)
         && options.seam_reseat_later_references.is_some()
         && line_or_point_contact(first, second, bounds);
+    // One apart axis already leaves no common interior, so an intersect is
+    // empty even where the boxes share a face's area (which is why a union or
+    // a subtract stays on the pipeline). Nothing survives to carry an id, so
+    // no caller has to say what follows.
+    let contact = contact
+        || (!disjoint
+            && matches!(operation, BooleanOperation::Intersect)
+            && contact_fast_path(options)
+            && boxes_share_no_interior(first, second, bounds));
     if disjoint || contact {
         let operation_started = Instant::now();
         let mut diagnostics = KernelDiagnostics::default();

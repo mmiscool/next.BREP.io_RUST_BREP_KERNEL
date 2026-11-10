@@ -2043,6 +2043,9 @@ pub(in crate::blend) struct EndSurgery {
     /// built from it is NEW, so the caller gates it through
     /// [`SpokeCrossings::gate`].
     pub(in crate::blend) escalated: bool,
+    /// Present when two faces stand across the corner; `end_face_id` and the
+    /// transverse fields then describe the first face's piece.
+    pub(in crate::blend) split: Option<super::split_floor::SplitFloor>,
 }
 
 /// How one end of a stripe is closed.
@@ -2339,13 +2342,28 @@ pub(in crate::blend) fn resolve_free_end(
             )
         }))
     };
-    let end_face = end_face_id(
+    let mut split_plan = None;
+    let end_face = match end_face_id(
         solid,
         first_face.id,
         second_face.id,
         first_edge_id,
         second_edge_id,
-    )?;
+    ) {
+        Ok(face) => face,
+        Err(error) if matches!(&error.class, RefusalClass::UnsupportedGeometry { what } if what == "end_face_none") => {
+            let planned = super::split_floor::plan_split_floor(solid, blended, first, second, rows, vertex, at_start, first_edge_id, second_edge_id);
+            if std::env::var("BREP_DEBUG_SPLIT_FLOOR").is_ok() {
+                eprintln!("split floor: edge {edge_id} vertex {vertex} exact {} planned {}", rows.exact_extrusion, planned.is_some());
+            }
+            let Some((face, plan, piece)) = planned else {
+                return Err(error);
+            };
+            split_plan = Some((plan, piece));
+            face
+        }
+        Err(error) => return Err(error),
+    };
     let first_boundary = solid
         .edges
         .iter()
@@ -2506,12 +2524,13 @@ pub(in crate::blend) fn resolve_free_end(
         cr_parameter <= 1.0 - RIM_MARGIN && cs_parameter <= 1.0 - RIM_MARGIN
     };
     let clamp01 = |value: f64| value.clamp(0.0, 1.0);
-    let (transverse, blend_pcurve, end_pcurve) = match exact_section_transverse(
+    let split_piece = split_plan.as_ref().map(|(_, piece)| piece.clone());
+    let (transverse, blend_pcurve, end_pcurve) = match if split_piece.is_some() { split_piece } else { exact_section_transverse(
         rows,
         end_record,
         clamp01(cr_parameter),
         clamp01(cs_parameter),
-    )? {
+    )? } {
         Some(exact) => exact,
         None => {
             // Lane L (2026-10-15): at an EXTEND landing the boundary stub and
@@ -2598,6 +2617,7 @@ pub(in crate::blend) fn resolve_free_end(
             transverse_blend_pcurve: blend_pcurve,
             transverse_end_pcurve: end_pcurve,
             escalated: cr_escalated || cs_escalated,
+            split: split_plan.map(|(plan, _)| plan),
         },
         in_range,
     ))

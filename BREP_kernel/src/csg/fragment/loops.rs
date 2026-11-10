@@ -445,6 +445,91 @@ fn chain_index(usage: &crate::CycleUse) -> Result<usize, KernelRefusal> {
 // Returns `Ok(None)` when the cycle is a spurious zero-area "antenna" region
 // (a self-touching fold that encloses no material — see the seam-grazing note at
 // the incomplete-run site); the caller drops that region instead of aborting.
+/// A closed boundary curve touched at one point by a cut (a footprint's edge
+/// tangent to a bore's rim: printmotor-assembly B517) gives the arrangement a
+/// node there, so the region's outer cycle runs in along the cut, around the
+/// whole closed curve and out again. The face still has that curve as a hole
+/// of its own, and nothing else meets it, so the run is moved to `holes`,
+/// starting at the chain's own start: the closed edge stays one edge on its
+/// own vertex and the loop count is the surface's. Returns the runs moved.
+/// `BREP_FRAGMENT_DETACH_TOUCHED_RING=0` keeps the single cycle.
+pub(super) fn detach_touched_closed_boundaries(
+    region: &mut crate::ArrangementRegion,
+    chains: &[Chain],
+    tolerance: f64,
+) -> Result<usize, KernelRefusal> {
+    if !switch!("BREP_FRAGMENT_DETACH_TOUCHED_RING", true) || region.outer.len() < 2 {
+        return Ok(0);
+    }
+    let chain_of = |usage: &crate::CycleUse| chain_index(usage);
+    let begin = |usage: &crate::CycleUse| if usage.forward { usage.piece.a } else { usage.piece.b };
+    let end = |usage: &crate::CycleUse| if usage.forward { usage.piece.b } else { usage.piece.a };
+    let count = region.outer.len();
+    let mut start = None;
+    for index in 0..count {
+        if chain_of(&region.outer[(index + count - 1) % count])? != chain_of(&region.outer[index])? {
+            start = Some(index);
+            break;
+        }
+    }
+    // One chain all the way round is an ordinary closed loop.
+    let Some(start) = start else { return Ok(0) };
+    let mut rotated = region.outer.clone();
+    rotated.rotate_left(start);
+    // A hole winds against the region's whole cycle. The cycle's own outer rim
+    // winds with it and must stay (a bore a micron inside a cap's rim: moving
+    // the rim would leave the bore as the outer loop).
+    let signed_area = |uses: &[crate::CycleUse]| -> f64 {
+        uses.iter().map(|usage| {
+            let (from, to) = (begin(usage), end(usage));
+            from.x * to.y - to.x * from.y
+        }).sum::<f64>() / 2.0
+    };
+    let whole_area = signed_area(&rotated);
+    let mut kept = Vec::with_capacity(count);
+    let mut detached = Vec::new();
+    let mut index = 0;
+    while index < rotated.len() {
+        let chain_id = chain_of(&rotated[index])?;
+        let mut run_end = index + 1;
+        while run_end < rotated.len() && chain_of(&rotated[run_end])? == chain_id {
+            run_end += 1;
+        }
+        let run = &rotated[index..run_end];
+        let closed_ring = chains.get(chain_id).is_some_and(|chain| {
+            matches!(chain.source, ChainSource::Boundary { .. })
+                && chain.start.sub(chain.end).length() <= tolerance
+                && begin(&run[0]).sub(end(&run[run.len() - 1])).length() <= tolerance
+                && {
+                    let along: f64 = run.iter().map(|usage| usage.piece.b.sub(usage.piece.a).length()).sum();
+                    let whole: f64 = chain.segments.iter().map(|(a, b)| b.sub(*a).length()).sum();
+                    (along - whole).abs() <= tolerance * 4.0
+                }
+        });
+        if closed_ring && run.len() < rotated.len() && signed_area(run) * whole_area < 0.0 {
+            let chain = &chains[chain_id];
+            let first = run.iter().position(|usage| begin(usage).sub(chain.start).length() <= tolerance);
+            match first {
+                Some(first) => {
+                    let mut ring = run.to_vec();
+                    ring.rotate_left(first);
+                    detached.push(ring);
+                }
+                None => kept.extend_from_slice(run),
+            }
+        } else {
+            kept.extend_from_slice(run);
+        }
+        index = run_end;
+    }
+    let moved = detached.len();
+    if moved > 0 {
+        region.outer = kept;
+        region.holes.extend(detached);
+    }
+    Ok(moved)
+}
+
 pub(super) fn build_loop(
     cycle: &[crate::CycleUse],
     reverse: bool,

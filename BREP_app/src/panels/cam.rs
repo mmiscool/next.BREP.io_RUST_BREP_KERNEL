@@ -16,7 +16,7 @@
 
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::document::cam::{self as cam_doc, resolve_frame, strategy_kinds, CamDocument, SetupFrame, SetupOrientation};
-use crate::form_view::{form_view, FormViewSpec};
+use crate::form_view::{form_view, FormBanner, FormViewSpec};
 use crate::panels::file::{SaveBody, SaveRequest};
 use crate::panels::{cam_generate, cam_library, cam_machine, cam_operation, cam_setup, cam_tool};
 use crate::store::ModelStore;
@@ -1446,8 +1446,8 @@ impl CamPanel {
         let title = format!("Setup {id}");
         let frame_error = self.geometry.get(id).and_then(|g| g.frame.clone().err());
         let banner = match (&frame_error, &self.notice) {
-            (Some(why), _) => Some((why.as_str(), egui::Color32::from_rgb(0xf8, 0x51, 0x49))),
-            (None, Some(notice)) => Some((notice.as_str(), egui::Color32::from_rgb(0xd2, 0x99, 0x22))),
+            (Some(why), _) => Some(FormBanner::error(why.as_str(), egui::Color32::from_rgb(0xf8, 0x51, 0x49))),
+            (None, Some(notice)) => Some(FormBanner::note(notice.as_str(), egui::Color32::from_rgb(0xd2, 0x99, 0x22))),
             (None, None) => None,
         };
         let picking = state
@@ -1541,8 +1541,8 @@ impl CamPanel {
         let subtitle = format!("{} \u{00b7} {} \u{00b7} {}", operation.strategy.kind_name(), operation.setup, operation.tool);
         let problem = cam_operation::strategy_problem(operation);
         let banner = match (&self.notice, &problem) {
-            (Some(n), _) => Some((n.as_str(), egui::Color32::from_rgb(0xd2, 0x99, 0x22))),
-            (None, Some(p)) => Some((p.as_str(), egui::Color32::from_rgb(0xd2, 0x99, 0x22))),
+            (Some(n), _) => Some(FormBanner::note(n.as_str(), egui::Color32::from_rgb(0xd2, 0x99, 0x22))),
+            (None, Some(p)) => Some(FormBanner::note(p.as_str(), egui::Color32::from_rgb(0xd2, 0x99, 0x22))),
             (None, None) => None,
         };
         let picking = state
@@ -1634,7 +1634,7 @@ impl CamPanel {
         let mut params = cam_machine::machine_form_params(machine);
         let hidden = cam_machine::hidden_fields(&params);
         let title = format!("Machine {id}");
-        let banner = self.notice.as_ref().map(|n| (n.as_str(), egui::Color32::from_rgb(0xd2, 0x99, 0x22)));
+        let banner = self.notice.as_ref().map(|n| FormBanner::note(n.as_str(), egui::Color32::from_rgb(0xd2, 0x99, 0x22)));
         let spec = FormViewSpec {
             title: &title,
             subtitle: Some(machine.name.as_str()),
@@ -1674,7 +1674,7 @@ impl CamPanel {
         }
         let hidden = cam_tool::hidden_fields(&params);
         let title = format!("Tool {id}");
-        let banner = self.notice.as_ref().map(|n| (n.as_str(), egui::Color32::from_rgb(0xd2, 0x99, 0x22)));
+        let banner = self.notice.as_ref().map(|n| FormBanner::note(n.as_str(), egui::Color32::from_rgb(0xd2, 0x99, 0x22)));
         let spec = FormViewSpec {
             title: &title,
             subtitle: Some(tool.name.as_str()),

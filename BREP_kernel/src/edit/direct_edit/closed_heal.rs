@@ -206,15 +206,18 @@ pub(super) fn align_closed_rim_origin(
             ),
         )
     };
-    let (center, normal, radius) =
-        circle_through(samples[0], samples[SAMPLES / 3], samples[2 * SAMPLES / 3])
-            .ok_or_else(decline)?;
-    for sample in &samples {
-        let radial = sample.sub(center);
-        if (radial.length() - radius).abs() > tolerance || radial.dot(normal).abs() > tolerance {
-            return Err(decline());
-        }
-    }
+    let circle = circle_through(samples[0], samples[SAMPLES / 3], samples[2 * SAMPLES / 3])
+        .filter(|(center, normal, radius)| {
+            samples.iter().all(|sample| {
+                let radial = sample.sub(*center);
+                (radial.length() - radius).abs() <= tolerance && radial.dot(*normal).abs() <= tolerance
+            })
+        });
+    let Some((center, normal, radius)) = circle else {
+        // Not a circle: a marched space curve keeps its own shape, cut at the
+        // seam and rejoined at the old origin.
+        return rotate_closed_polynomial(curve, crossing.u, tolerance).ok_or_else(decline);
+    };
     let radial = target.sub(center);
     let x_axis = radial
         .sub(normal.scale(radial.dot(normal)))
@@ -234,6 +237,29 @@ pub(super) fn align_closed_rim_origin(
         }
     }
     Ok(rebuilt)
+}
+
+/// `curve`, closed and polynomial, re-origined at parameter `at` over the same
+/// point set: `[at, t1]` followed by `[t0, at]`, one curve with a C0 knot where
+/// the old ends meet. `None` for a rational curve or one that is not closed.
+fn rotate_closed_polynomial(curve: &NurbsCurve, at: f64, tolerance: f64) -> Option<NurbsCurve> {
+    if curve.control_points.iter().any(|control| control.w != 1.0) {
+        return None;
+    }
+    let [t0, t1] = curve.domain().ok()?;
+    if curve.evaluate(t0).ok()?.sub(curve.evaluate(t1).ok()?).length() > tolerance {
+        return None;
+    }
+    let (head, tail) = curve.split(at).ok()?;
+    let mut knots = tail.knots.clone();
+    knots.pop();
+    knots.extend(head.knots.iter().skip(curve.degree + 1).map(|knot| knot + (t1 - t0)));
+    let mut controls = tail.control_points.clone();
+    controls.extend(head.control_points.iter().skip(1).copied());
+    // The join is bitwise only if the rotated curve still closes on `at`.
+    let last = controls.len() - 1;
+    controls[last] = controls[0];
+    NurbsCurve::new(curve.degree, knots, controls).ok()
 }
 
 /// Signed area of ONE of a face's trim loops in the carrier's own parameter

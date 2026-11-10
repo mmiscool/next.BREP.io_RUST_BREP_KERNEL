@@ -1124,6 +1124,7 @@ pub use interference::{ClearancePair, InterferencePair, InterferenceReport, INTE
 pub use model_io::{
     EmbeddedOnly, PartSink, StepAssemblyImport, StepAssemblyProbe, StepAssemblyReport,
 };
+pub(crate) use model_io::is_iges_text;
 pub use selection_filter::SelectionFilter;
 pub use sketch_mode::{SketchDrag, SketchEdit};
 pub use sketch_panel::{NoticeSeverity, SketchConstraintAction, SketchEntityRow};

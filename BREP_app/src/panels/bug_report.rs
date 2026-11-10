@@ -190,6 +190,23 @@ impl BugReportPanel {
         ctx.request_repaint();
     }
 
+    /// [`Self::request`] from a dialog's Report problem button: the same flow,
+    /// with the description already naming the dialog and its error.
+    pub fn request_for_error(
+        &mut self,
+        ctx: &egui::Context,
+        state: &EngineState,
+        diagnostics: &Diagnostics,
+        dialog: &str,
+        error: &str,
+    ) {
+        if self.phase != Phase::Idle {
+            return;
+        }
+        self.request(ctx, state, diagnostics);
+        self.description = error_description(dialog, error);
+    }
+
     /// Draw + drive the flow. Called once per frame at ctx level (like the file
     /// dialog). Idempotent while `Phase::Idle`.
     pub fn show(&mut self, ctx: &egui::Context, state: &mut EngineState) {
@@ -579,6 +596,7 @@ impl BugReportPanel {
         serde_json::json!({
             "phase": phase,
             "hasScreenshot": self.screenshot_png.is_some(),
+            "description": self.description,
             "annotationCount": self.markup.as_ref().map_or(0, markup::Markup::count),
             "diagnostics": self.diagnostics,
             "status": self.status,
@@ -605,6 +623,14 @@ impl BugReportPanel {
             .collect();
         serde_json::Value::Object(map).to_string()
     }
+}
+
+/// The description a dialog's Report problem button starts from. The dialog and
+/// the error lead, because the server's list and notification summarise a report
+/// by its first line; the blank line leaves the user room to add to it.
+fn error_description(dialog: &str, error: &str) -> String {
+    let dialog = dialog.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("{dialog}: {error}\n\n")
 }
 
 /// Encode an egui `ColorImage` (the screenshot) to PNG bytes via the pure-Rust

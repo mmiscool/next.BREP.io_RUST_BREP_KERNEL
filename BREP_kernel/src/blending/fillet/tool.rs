@@ -734,6 +734,160 @@ fn build_exact_tool(
     Ok(tool)
 }
 
+/// Whether a concave fill's end follows its two floor edges (below): on unless
+/// `BREP_FILLET_CONCAVE_TILTED_END=0`/`off`.
+fn concave_tilted_end_on() -> bool {
+    switch!(live "BREP_FILLET_CONCAVE_TILTED_END", true)
+}
+
+/// The plane a concave fill stops on at one end of its edge.
+struct TiltedEnd {
+    /// The edge's end vertex: on the plane.
+    point: Vec3,
+    /// Unit plane normal, pointing along the edge into the fill.
+    inward: Vec3,
+    /// A unit direction in the plane.
+    along: Vec3,
+}
+
+/// The farthest the section profile reaches from the edge at `origin`.
+fn profile_reach(profile: &[NurbsCurve], origin: Vec3) -> Result<f64, KernelRefusal> {
+    let mut reach = 0.0_f64;
+    for curve in profile {
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Fragment, "profile_domain")?;
+        for step in 0..=8 {
+            let point = curve.evaluate(t0 + (t1 - t0) * step as f64 / 8.0).or_refuse(KernelStage::Fragment, "profile_point")?;
+            reach = reach.max(point.sub(origin).length());
+        }
+    }
+    Ok(reach)
+}
+
+/// The tilted end planes of a straight concave fill between two planar walls,
+/// `[start, end]` along the cutter's path; `None` at an end that keeps the
+/// square end cap.
+///
+/// The fill's floor at an end is what bounds its two walls there: the edge
+/// each wall's boundary continues into at the end vertex. When those two floor
+/// edges lie in the plane square to the filleted edge the square cap is that
+/// floor. When they do not, the square cap leaves one wall's contact line
+/// hanging past that wall's boundary, closed by a folded triangle (a reported
+/// model: `Box_NY|R9_END[0]` ends at the apex of a revolve's cone, whose
+/// generator on `R9_END` climbs 9 degrees away from the z = 0 cap). The plane
+/// through both floor edges closes the fill with one flat face that meets both.
+/// Only floors made of two different faces take it.
+fn concave_tilted_ends(solid: &BrepSolid, edge_id: u64, cross: &EdgeCross, reach: f64) -> [Option<TiltedEnd>; 2] {
+    let EdgePath::Straight { direction, .. } = cross.path else { return [None, None] };
+    if !concave_tilted_end_on() {
+        return [None, None];
+    }
+    let Some(edge) = solid.edges.iter().find(|edge| edge.id == edge_id) else { return [None, None] };
+    let point_of = |id: u64| solid.vertices.iter().find(|vertex| vertex.id == id).map(|vertex| vertex.point);
+    let (Some(first), Some(last)) = (point_of(edge.start_vertex_id), point_of(edge.end_vertex_id)) else {
+        return [None, None];
+    };
+    // `cross.start` is the path's start; the walk may run the edge backwards.
+    let start_vertex = if first.sub(cross.start).length() <= last.sub(cross.start).length() {
+        edge.start_vertex_id
+    } else {
+        edge.end_vertex_id
+    };
+    let end_vertex = if start_vertex == edge.start_vertex_id { edge.end_vertex_id } else { edge.start_vertex_id };
+    let faces: Vec<&crate::topology::FaceRecord> = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter(|face| face.loops.iter().flat_map(|lp| &lp.coedges).any(|coedge| coedge.edge_id == edge_id))
+        .collect();
+    if faces.len() != 2 || !faces.iter().all(|face| matches!(face.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. }))) {
+        return [None, None];
+    }
+    // The straight edge continuing `face`'s boundary from the filleted edge at
+    // `vertex`, as the unit direction leaving the vertex and the id of the
+    // face across that edge; `None` for a curved or too-short one (the fill's
+    // contact must land on it).
+    let floor = |face: &crate::topology::FaceRecord, vertex: u64| -> Option<(Vec3, u64)> {
+        let lp = face.loops.iter().find(|lp| lp.coedges.iter().any(|coedge| coedge.edge_id == edge_id))?;
+        let mut found = lp.coedges.iter().filter_map(|coedge| {
+            let other = solid.edges.iter().find(|other| other.id == coedge.edge_id)?;
+            (other.id != edge_id && !other.degenerate && (other.start_vertex_id == vertex || other.end_vertex_id == vertex)).then_some(other)
+        });
+        let other = found.next()?;
+        if found.next().is_some() || other.start_vertex_id == other.end_vertex_id {
+            return None;
+        }
+        let at_start = other.start_vertex_id == vertex;
+        let (near, far) = (other.curve.evaluate(other.t0).ok()?, other.curve.evaluate(other.t1).ok()?);
+        let middle = other.curve.evaluate(0.5 * (other.t0 + other.t1)).ok()?;
+        let chord = far.sub(near);
+        let length = chord.length();
+        if length < reach || middle.sub(near.add(chord.scale(0.5))).length() > 1e-9 * (1.0 + length) {
+            return None;
+        }
+        let across = solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .find(|mate| mate.id != face.id && mate.loops.iter().flat_map(|lp| &lp.coedges).any(|coedge| coedge.edge_id == other.id))?
+            .id;
+        Some((if at_start { chord.scale(1.0 / length) } else { chord.scale(-1.0 / length) }, across))
+    };
+    let plane_at = |vertex: u64, inward: Vec3| -> Option<TiltedEnd> {
+        let point = point_of(vertex)?;
+        let ((a, across_a), (b, across_b)) = (floor(faces[0], vertex)?, floor(faces[1], vertex)?);
+        // One face across both floor edges is one floor, which the square cap
+        // and the corner closures that read it already serve.
+        if across_a == across_b {
+            return None;
+        }
+        let normal = a.cross(b).normalized().ok()?;
+        let normal = if normal.dot(inward) < 0.0 { normal.scale(-1.0) } else { normal };
+        // Square already (the ordinary end), or too oblique to be this class.
+        let tilt = normal.dot(inward);
+        if tilt >= 1.0 - 1e-9 || tilt < 0.5 {
+            return None;
+        }
+        Some(TiltedEnd { point, inward: normal, along: a })
+    };
+    [plane_at(start_vertex, direction), plane_at(end_vertex, direction.scale(-1.0))]
+}
+
+/// Cut `tool` back to each tilted end plane: intersect it with a slab standing
+/// on the plane, far larger than the tool on every other side. The new cap
+/// is scaffold like the tool's own, so it is settled and named the same way.
+fn clip_fill_to_tilted_ends(
+    solid: &BrepSolid,
+    mut tool: BrepSolid,
+    ends: &[Option<TiltedEnd>; 2],
+    reach: f64,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let options = BooleanOptions { merge_coplanar_faces: false, ..BooleanOptions::default() };
+    let bounds = crate::recentre::solid_bounds(solid);
+    let diagonal = bounds.maximum.sub(bounds.minimum).length();
+    if !diagonal.is_finite() {
+        return Ok(tool);
+    }
+    let span = 8.0 * (diagonal + reach);
+    for end in ends.iter().flatten() {
+        let side = end.inward.cross(end.along).normalized().or_refuse(KernelStage::Fragment, "tilted_end_axis")?;
+        let corner = |a: f64, b: f64| end.point.add(end.along.scale(a * span)).add(side.scale(b * span));
+        let corners = [corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)];
+        let mut outline = Vec::with_capacity(4);
+        for k in 0..4 {
+            outline.push(crate::make_line(corners[k], corners[(k + 1) % 4]).or_refuse(KernelStage::Fragment, "tilted_end_outline")?);
+        }
+        let mut slab = extrude_profile_brep(&outline, end.inward, span)?;
+        for shell in &mut slab.shells {
+            for face in &mut shell.faces {
+                face.name = Some(scaffold_tag(name));
+            }
+        }
+        tool = crate::boolean_operation_with_diagnostics(&tool, &slab, BooleanOperation::Intersect, &options)?.value;
+    }
+    Ok(tool)
+}
+
 /// Clip a concave edge's fill tool by the prism of its support face's outline
 /// (lane F row 5): where the fill's contact runs past the face's outer boundary
 /// into air, the blend is the fill cut back to the side planes the face is
@@ -1277,6 +1431,19 @@ fn fillet_or_chamfer_exact(
     // unconditionally: its corner closures are built against the bulkhead
     // the next cutter in the chain removes.
     let prefer_through = lane == Lane::GeneralFirst && ends == ToolEnds::default();
+    // A concave fill's end whose two floor edges leave the vertex out of the
+    // plane square to the edge ends on the plane of those floor edges: the
+    // tool runs past the end and is cut back there.
+    let reach = profile_reach(&profile, cross.start)?;
+    let tilted_ends = if !chamfer && !cross.convex && ends == ToolEnds::default() && clip.is_none() {
+        concave_tilted_ends(solid, edge_id, &cross, reach)
+    } else {
+        [None, None]
+    };
+    let tool_ends = ToolEnds {
+        start: ends.start + if tilted_ends[0].is_some() { 2.0 * reach } else { 0.0 },
+        end: ends.end + if tilted_ends[1].is_some() { 2.0 * reach } else { 0.0 },
+    };
     // Walk the ladder TWICE.  The first pass assembles each cutter with the
     // exact arrangement only, so a flush tool that hits a terminus degeneracy
     // falls through to the overshoot tool — whose end caps cut the pole faces
@@ -1291,11 +1458,12 @@ fn fillet_or_chamfer_exact(
     let mut capped: Option<BrepSolid> = None;
     for exact_only in [true, false] {
         for (attempt, &overshoot) in overshoots.iter().enumerate() {
-            let tool = build_exact_tool(&cross, &profile, overshoot, ends, name)?;
+            let tool = build_exact_tool(&cross, &profile, overshoot, tool_ends, name)?;
             let tool = match clip {
                 Some(face) => clip_fill_by_face_outline(solid, &tool, face, edge_id, 2.0 * radius, name)?,
                 None => tool,
             };
+            let tool = clip_fill_to_tilted_ends(solid, tool, &tilted_ends, reach, name)?;
             let assembled = if exact_only {
                 apply_tool_exact(solid, &tool, cross.convex)
             } else {

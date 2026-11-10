@@ -518,21 +518,71 @@ impl EngineState {
         self.add_feature(&feature.to_string())
     }
 
-    /// Export the CURRENT model's resident solids to an IGES 5.3 document of
-    /// trimmed NURBS surfaces — the IGES analogue of [`Self::export_step_text`],
-    /// handing the resident handles to [`brep_kernel::export_iges_handles`].
+    /// Export the CURRENT model to an IGES 5.3 document of Manifold Solid
+    /// B-Reps — the IGES analogue of [`Self::export_step_text`].
     pub fn export_iges_text(&self) -> Result<String, String> {
+        self.export_iges_text_selected("Part", None)
+    }
+
+    /// [`Self::export_iges_text`] under the document's own name and, like
+    /// [`Self::export_step_text_selected`], restricted to the resident solids
+    /// named in `only` (a part document's subset). Each solid keeps its scene
+    /// name and the colour the STEP export would give it; a document with
+    /// assembly components writes the same product tree the STEP export does,
+    /// as subfigure definitions (308) placed by instances (408).
+    pub fn export_iges_text_selected(&self, document_name: &str, only: Option<&[String]>) -> Result<String, String> {
         self.plugin_export_ready()?;
         let request: HistoryRequest = serde_json::from_value(self.run_request_value())
             .map_err(|e| format!("export IGES: history request: {e}"))?;
-        let handles: Vec<u32> = self.plugin_resident_handles(&request)?
-            .into_iter()
-            .map(|(_, handle)| handle)
-            .collect();
-        if handles.is_empty() {
+        let mut named = self.plugin_resident_handles(&request)?;
+        if let Some(only) = only {
+            if !self.assembly_components.is_empty() {
+                return Err("export IGES: a subset of solids is exported from a part document, not an assembly".into());
+            }
+            for name in only {
+                if !named.iter().any(|(n, _)| n == name) {
+                    return Err(format!("export IGES: `{name}` is not a solid of this model"));
+                }
+            }
+            named.retain(|(n, _)| only.contains(n));
+        }
+        if named.is_empty() {
             return Err("nothing to export: the model has no solids".into());
         }
-        brep_kernel::export_iges_handles(&handles, "Part", "MM", "")
+        let colors = self.step_export_colors(&named);
+        let resident: Vec<(String, brep_kernel::BrepSolid)> = named
+            .iter()
+            .map(|(name, handle)| Ok((name.clone(), brep_kernel::registered_solid_clone(*handle)?)))
+            .collect::<Result<_, String>>()?;
+        let assembly = if self.assembly_components.is_empty() {
+            // A part: the document itself is the one product.
+            brep_kernel::StepAssemblyExport {
+                products: vec![brep_kernel::StepExportProduct {
+                    name: document_name.to_string(),
+                    bodies: resident,
+                    ..Default::default()
+                }],
+                occurrences: Vec::new(),
+            }
+        } else {
+            let components: Vec<(String, String, brep_kernel::Mat4)> = self
+                .assembly_components
+                .iter()
+                .map(|record| (record.id.clone(), record.part_name.clone(), record.transform))
+                .collect();
+            self.with_plugin_provider(|| brep_kernel::assembly_export_tree(document_name, resident, &components))?
+        };
+        brep_kernel::export_iges_assembly(&assembly, &colors, document_name, "MM", "")
+    }
+
+    /// The flat import of a STEP or an IGES text, whichever it is: the lane a
+    /// structureless probe, or a structure nothing built out of, falls back to.
+    pub fn import_model_text_feature(&mut self, text: &str) -> Result<String, String> {
+        if is_iges_text(text) {
+            self.import_iges_feature(text)
+        } else {
+            self.import_step_feature(text)
+        }
     }
 
     /// Export the CURRENT display scene to an ASCII STL string (one `solid` with a
@@ -1022,7 +1072,13 @@ impl EngineState {
         self.pending_step_assembly = None;
         let id = self.next_step_probe_id;
         self.next_step_probe_id = self.next_step_probe_id.wrapping_add(1);
-        if !step_text.contains("NEXT_ASSEMBLY_USAGE_OCCURRENCE") {
+        // IGES structure is a subfigure instance (408) in the directory.
+        let may_have_structure = if is_iges_text(step_text) {
+            iges_has_instances(step_text)
+        } else {
+            step_text.contains("NEXT_ASSEMBLY_USAGE_OCCURRENCE")
+        };
+        if !may_have_structure {
             self.step_probe_results
                 .push_back((id, super::StepProbeOutcome::Flat));
             return id;
@@ -1118,7 +1174,7 @@ impl EngineState {
                 failed_products,
                 first_error,
             }) => {
-                self.import_step_feature(step_text)?;
+                self.import_model_text_feature(step_text)?;
                 Ok(StepAssemblyReport {
                     failed_products,
                     first_error,
@@ -1127,7 +1183,7 @@ impl EngineState {
                 })
             }
             None => {
-                self.import_step_feature(step_text)?;
+                self.import_model_text_feature(step_text)?;
                 Ok(StepAssemblyReport {
                     flat_fallback: true,
                     ..StepAssemblyReport::default()
@@ -2376,6 +2432,23 @@ fn factor_key(factor: &Mat4) -> [u64; 9] {
 /// (`PCB_Board`, `PCB_F.Cu/GND#3`). A component's reference designator is
 /// never taken for an occurrence label when it is this word.
 const BOARD_OCCURRENCE: &str = "PCB";
+
+/// Whether a text is IGES rather than Part 21: no ISO-10303-21 header, and its
+/// records carry an S/G/D/P/T section letter in column 73.
+pub(crate) fn is_iges_text(text: &str) -> bool {
+    !text.contains("ISO-10303-21")
+        && text
+            .lines()
+            .any(|line| matches!(line.chars().nth(72), Some('S' | 'G' | 'D' | 'P' | 'T')))
+}
+
+/// Whether an IGES text's directory holds a singular subfigure instance (408):
+/// the only way an IGES file carries product structure.
+fn iges_has_instances(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.chars().nth(72) == Some('D') && line.get(..8).is_some_and(|field| field.trim() == "408")
+    })
+}
 
 /// A `PRODUCT.id` a receiving system can use. A library part with no BOM part
 /// number is identified by the `sourceKey` it was imported from, which is an

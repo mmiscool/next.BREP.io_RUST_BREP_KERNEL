@@ -63,12 +63,12 @@ pub struct NurbsSurface {
     /// Cached Newton seed grid for general point projection (see
     /// `projection.rs`) — (u, v, point) samples over the knot spans.
     #[serde(skip, default)]
-    pub(crate) projection_grid: std::cell::OnceCell<Vec<(f64, f64, Vec3)>>,
+    pub(crate) projection_grid: std::cell::OnceCell<crate::projection::SampleGrid>,
     /// Cached dense fallback grid for degenerate general projection
     /// (`projection.rs`) — (u, v, point) samples at fixed per-surface
     /// parameters, so the ~1.7M-call metre-mm fallback reuses the evals.
     #[serde(skip, default)]
-    pub(crate) projection_dense_grid: std::cell::OnceCell<Vec<(f64, f64, Vec3)>>,
+    pub(crate) projection_dense_grid: std::cell::OnceCell<crate::projection::SampleGrid>,
     /// Cached boundary-ring sample points for the degenerate projection
     /// fallback (`projection.rs`), flattened as 4 sides × 22 exponents ×
     /// 33 indices of evaluated surface points at fixed per-surface params.

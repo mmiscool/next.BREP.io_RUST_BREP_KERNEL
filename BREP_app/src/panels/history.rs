@@ -34,7 +34,7 @@
 //! `[-]` down to the rolled-to step and `[+]` below it.
 
 use crate::automation::hit_keys::HitKeyDoc;
-use crate::form_view::{form_view, FormViewSpec};
+use crate::form_view::{form_view, FormBanner, FormViewSpec};
 use crate::panels::spline_anchors;
 use crate::panels::cage_editor;
 use crate::palette::{Palette, PaletteItem};
@@ -498,14 +498,21 @@ impl HistoryPanel {
             .map(|(summary, _)| summary.as_str())
             .collect::<Vec<_>>()
             .join("\n");
+        // An edit the engine refused is this form's error too, and the newest.
+        let rejected = self.rejected_edit.as_ref().filter(|(feature, _)| feature == id).map(|(_, why)| why.as_str());
+        let error = match (rejected, error) {
+            (Some(rejected), Some(error)) => Some(format!("{rejected}\n{error}")),
+            (Some(rejected), None) => Some(rejected.to_string()),
+            (None, error) => error,
+        };
         let banner = error
             .as_deref()
-            .map(|message| (message, ERROR_RED))
-            .or_else(|| partial.as_deref().map(|message| (message, PARTIAL_ORANGE)))
-            .or_else(|| note.as_deref().map(|message| (message, NOTE_AMBER)))
+            .map(|message| FormBanner::error(message, ERROR_RED))
+            .or_else(|| partial.as_deref().map(|message| FormBanner::note(message, PARTIAL_ORANGE)))
+            .or_else(|| note.as_deref().map(|message| FormBanner::note(message, NOTE_AMBER)))
             .or_else(|| {
                 (!approximation_summaries.is_empty())
-                    .then_some((approximation_summaries.as_str(), APPROX_BLUE))
+                    .then_some(FormBanner::note(approximation_summaries.as_str(), APPROX_BLUE))
             });
         let outputs: Vec<String> = report
             .get("featureOutputs")
@@ -641,6 +648,7 @@ impl HistoryPanel {
         }
         if out.changed {
             self.rejected_edit = state.update_feature_params(id, &params.to_string()).err().map(|e| (id.to_string(), e));
+            ui.ctx().request_repaint();
             // An edit elsewhere on the form while a pick runs ends the pick
             // (at the end of the frame, see `ref_select_request_finish`): the
             // model is rolled to BEFORE this feature while its field is being
@@ -650,9 +658,6 @@ impl HistoryPanel {
             if picking.is_some() {
                 state.ref_select_request_finish();
             }
-        }
-        if let Some((feature, error)) = &self.rejected_edit {
-            if feature == id { ui.colored_label(ui.visuals().error_fg_color, error); }
         }
         // A button click (e.g. `editSketch`) binds to no param — stage it as a
         // deferred action keyed by (feature id, button key); `show` acts after the
@@ -1286,6 +1291,8 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "history", prefix: "del:", meaning: "delete feature i (del:i)", command: None },
     HitKeyDoc { panel: "history", prefix: "box:", meaning: "feature i's visibility box (box:i)", command: None },
     HitKeyDoc { panel: "history", prefix: "add:menu", meaning: "open the add-feature palette", command: None },
+    HitKeyDoc { panel: "history", prefix: "form:error", meaning: "the open form's error banner, while it shows an error", command: None },
+    HitKeyDoc { panel: "history", prefix: "form:report-problem", meaning: "the error banner's Report problem button: opens the problem report pre-filled with the dialog and its error", command: None },
     HitKeyDoc { panel: "history", prefix: "form:return", meaning: "close the open form and roll to the tip", command: None },
     HitKeyDoc { panel: "history", prefix: "form:read-only", meaning: "the open form's read-only banner (a PLM revision not checked out, or released): the fields take no edit", command: None },
     HitKeyDoc { panel: "history", prefix: "form:feature", meaning: "the open form's title row (form:feature) and its feature chip (form:feature:id)", command: None },

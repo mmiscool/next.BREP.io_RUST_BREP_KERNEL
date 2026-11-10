@@ -408,10 +408,16 @@ impl EngineState {
             "constraintCount": session.doc.constraints.len(),
             "pendingLen": edit.pending.len(),
             "selection": session.selection.items,
+            "constraintGlyphs": session
+                .constraint_glyphs(self.camera.world_per_pixel())
+                .into_iter()
+                .map(|(id, position, shape)| json!({ "id": id, "position": position, "shape": shape }))
+                .collect::<Vec<_>>(),
             "hovered": session.selection.hovered,
             "applicableConstraints": session.applicable_constraints(),
             "dimensions": session.dimension_labels(),
             "externalRefs": edit.external_refs,
+            "lostReferences": session.lost_reference_messages(),
             "lastHit": edit.last_hit,
             "canUndo": !edit.undo_stack.is_empty(),
             "canRedo": !edit.redo_stack.is_empty(),
@@ -604,19 +610,18 @@ impl EngineState {
                 if let Some(ids) = self.sketch3d_link_reference_silent(name) {
                     if let Some(edit) = self.sketch3d_edit.as_mut() {
                         match ids.len() {
-                            // A line: on the infinite line through its ends.
+                            // A line: on the infinite line through its ends; a
+                            // circle, published as its axis: on the circle.
                             2 => {
-                                edit.session.doc.add_constraint("onLine", vec![id.clone(), ids[0].clone(), ids[1].clone()], None);
+                                let circle = edit.session.doc.geometries.iter().any(|g| {
+                                    g.points == ids && g.extra.get("circle").and_then(Value::as_bool) == Some(true)
+                                });
+                                let ctype = if circle { "onCircle" } else { "onLine" };
+                                edit.session.doc.add_constraint(ctype, vec![id.clone(), ids[0].clone(), ids[1].clone()], None);
                             }
-                            // An arc [center, start, end]: at the arc's radius
-                            // from its center (the on-arc relation this sketch
-                            // can state).
+                            // An arc [center, start, end]: on the arc.
                             3 => {
-                                let radius = edit
-                                    .session
-                                    .measure("distance", &[ids[0].clone(), ids[1].clone()])
-                                    .unwrap_or(0.0);
-                                edit.session.doc.add_constraint("distance", vec![id.clone(), ids[0].clone()], Some(radius));
+                                edit.session.doc.add_constraint("onArc", vec![id.clone(), ids[0].clone(), ids[1].clone(), ids[2].clone()], None);
                             }
                             _ => {}
                         }
@@ -706,6 +711,13 @@ impl EngineState {
     /// edge, planar face or datum plane) into the sketch as fixed construction
     /// geometry. Returns whether something was linked.
     pub fn sketch3d_pick_reference_at(&mut self, x: f64, y: f64) -> bool {
+        let Some(name) = self.sketch3d_model_reference_at(x, y) else { return false };
+        self.sketch3d_link_reference(&name)
+    }
+
+    /// The reference name of the model entity under the cursor: a
+    /// `{solid}@x,y,z` vertex, an edge or face name, or a datum plane.
+    fn sketch3d_model_reference_at(&self, x: f64, y: f64) -> Option<String> {
         let candidates = self.pick_candidates_at(x, y);
         let mut name: Option<String> = None;
         for candidate in candidates {
@@ -730,8 +742,24 @@ impl EngineState {
                 _ => {}
             }
         }
-        let Some(name) = name else { return false };
-        self.sketch3d_link_reference(&name)
+        name
+    }
+
+    /// Link the model entity under the cursor (once: a name already linked is
+    /// reused, with no new undo step) and return the sketch entity standing
+    /// for it, its geometry or, for a vertex, its point.
+    fn sketch3d_link_model_at(&mut self, x: f64, y: f64) -> Option<Value> {
+        let name = self.sketch3d_model_reference_at(x, y)?;
+        let record_of = |refs: &[Value]| refs.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(name.as_str())).cloned();
+        let known = record_of(&self.sketch3d_edit.as_ref()?.external_refs).is_some();
+        if !known && !self.sketch3d_link_reference(&name) {
+            return None;
+        }
+        let record = record_of(&self.sketch3d_edit.as_ref()?.external_refs)?;
+        if let Some(geometry) = record.get("geometry").filter(|g| !g.is_null()) {
+            return Some(crate::sketch3d::entity_geometry_ref(geometry));
+        }
+        record.get("points")?.get(0).map(crate::sketch3d::entity_point_ref)
     }
 
     /// Link a model entity BY NAME (a `{solid}@x,y,z` vertex, an edge or face
@@ -759,7 +787,30 @@ impl EngineState {
     /// Materialize (or update) a reference without an undo snapshot or
     /// overlay refresh; returns the record's point ids.
     fn sketch3d_link_reference_silent(&mut self, name: &str) -> Option<Vec<Value>> {
-        let resolved = self.sketch3d_resolve_reference_from_display(name)?;
+        let prior = self.sketch3d_edit.as_ref().and_then(|edit| {
+            edit.external_refs
+                .iter()
+                .find(|r| r.get("name").and_then(Value::as_str) == Some(name))
+                .cloned()
+        });
+        let anchors: Option<Vec<String>> = prior
+            .as_ref()
+            .and_then(|r| r.get(brep_kernel::SKETCH3D_ANCHOR_EDGES_KEY))
+            .and_then(|a| serde_json::from_value(a.clone()).ok());
+        // An anchored vertex is found through its edges; its coordinate name
+        // goes stale the moment it moves.
+        let resolved = match &anchors {
+            Some(edges) => brep_kernel::Sketch3dResolvedReference::Point(self.sketch3d_anchored_vertex(edges)?),
+            None => self.sketch3d_resolve_reference_from_display(name)?,
+        };
+        let resolved = match prior.as_ref().and_then(|r| r.get("kind")).and_then(Value::as_str) {
+            Some(kind) => resolved.as_recorded(kind),
+            None => resolved,
+        };
+        let new_anchors = match (&resolved, &anchors) {
+            (brep_kernel::Sketch3dResolvedReference::Point(p), None) => self.sketch3d_vertex_anchor_edges(name, [p.x, p.y, p.z]),
+            _ => None,
+        };
         let edit = self.sketch3d_edit.as_mut()?;
         let positions = resolved.positions();
         // Update an existing record of the same kind in place.
@@ -781,7 +832,32 @@ impl EngineState {
                         point.external_reference = true;
                     }
                 }
+                if matches!(resolved, brep_kernel::Sketch3dResolvedReference::CircleAxis(..)) {
+                    if let Some(g) = record.get("geometry").and_then(|id| edit.session.doc.geometry_mut(id)) {
+                        g.extra.insert("circle".into(), Value::Bool(true));
+                    }
+                }
+                // A vertex linked before anchors existed gets one the first
+                // time it is seen where its name says it is.
+                if let Some(anchor) = new_anchors {
+                    if let Some(map) = edit
+                        .external_refs
+                        .iter_mut()
+                        .find(|r| r.get("name").and_then(Value::as_str) == Some(name))
+                        .and_then(Value::as_object_mut)
+                    {
+                        map.insert(brep_kernel::SKETCH3D_ANCHOR_EDGES_KEY.into(), json!(anchor));
+                    }
+                }
                 return Some(ids);
+            }
+            // The shape changed under constraints that need these points:
+            // that is a lost reference, not something to rebuild over them.
+            let held = edit.session.doc.constraints.iter().any(|c| {
+                c.points().iter().any(|p| ids.iter().any(|id| brep_kernel::sketch_id_key(id) == brep_kernel::sketch_id_key(p)))
+            });
+            if held {
+                return None;
             }
             // The shape changed: drop the old materialization and rebuild.
             edit.external_refs.retain(|r| r.get("name").and_then(Value::as_str) != Some(name));
@@ -805,8 +881,61 @@ impl EngineState {
         let geometry = resolved
             .geometry_type()
             .map(|ty| edit.session.doc.add_geometry(ty, ids.clone(), true));
-        edit.external_refs.push(reference_record(name, &resolved, &ids, geometry.as_ref()));
+        if matches!(resolved, brep_kernel::Sketch3dResolvedReference::CircleAxis(..)) {
+            if let Some(g) = geometry.as_ref().and_then(|id| edit.session.doc.geometry_mut(id)) {
+                g.extra.insert("circle".into(), Value::Bool(true));
+            }
+        }
+        let mut record = reference_record(name, &resolved, &ids, geometry.as_ref());
+        if let (Some(anchor), Some(map)) = (new_anchors, record.as_object_mut()) {
+            map.insert(brep_kernel::SKETCH3D_ANCHOR_EDGES_KEY.into(), json!(anchor));
+        }
+        edit.external_refs.push(record);
         Some(ids)
+    }
+
+    /// The ends of a display edge by name.
+    fn sketch3d_display_edge_ends(&self, name: &str) -> Option<(brep_kernel::Vec3, brep_kernel::Vec3)> {
+        let polyline = self.scene.edge_polyline_world(name)?;
+        let v = |a: [f64; 3]| brep_kernel::Vec3::new(a[0], a[1], a[2]);
+        Some((v(*polyline.first()?), v(*polyline.last()?)))
+    }
+
+    /// The vertex two anchor edges share, on the display scene.
+    fn sketch3d_anchored_vertex(&self, edges: &[String]) -> Option<brep_kernel::Vec3> {
+        let a = self.sketch3d_display_edge_ends(edges.first()?)?;
+        let b = self.sketch3d_display_edge_ends(edges.get(1)?)?;
+        brep_kernel::sketch3d_common_edge_end(a, b)
+    }
+
+    /// Two named edges of the `{solid}@x,y,z` vertex at `position` that share
+    /// only that vertex: its topological anchor. `None` for a name that is not
+    /// a vertex, or a vertex with no such pair (a lone seam vertex).
+    fn sketch3d_vertex_anchor_edges(&self, name: &str, position: [f64; 3]) -> Option<Vec<String>> {
+        let (solid_name, _) = name.rsplit_once('@')?;
+        let solid = self.scene.solids().iter().find(|s| s.name == solid_name)?;
+        let tol = 1e-4 * (1.0 + position.iter().fold(0.0f64, |m, c| m.max(c.abs())));
+        let at_vertex: Vec<&str> = solid
+            .edges
+            .iter()
+            .filter(|edge| !edge.aux && !edge.name.is_empty())
+            .filter(|edge| {
+                let touches = |p: Option<&[f32; 3]>| p.map_or(false, |p| dist([p[0] as f64, p[1] as f64, p[2] as f64], position) <= tol);
+                touches(edge.polyline.first()) || touches(edge.polyline.last())
+            })
+            .map(|edge| edge.name.as_str())
+            .collect();
+        for (i, first) in at_vertex.iter().enumerate() {
+            for second in &at_vertex[i + 1..] {
+                let (Some(a), Some(b)) = (self.sketch3d_display_edge_ends(first), self.sketch3d_display_edge_ends(second)) else {
+                    continue;
+                };
+                if brep_kernel::sketch3d_common_edge_end(a, b).is_some() {
+                    return Some(vec![first.to_string(), second.to_string()]);
+                }
+            }
+        }
+        None
     }
 
     /// Resolve a reference name against the DISPLAY scene (the backdrop as
@@ -880,8 +1009,11 @@ impl EngineState {
             }
         }
         let names: Vec<String> = names.into_iter().filter(|n| listed.contains(n)).collect();
+        let mut lost: Vec<String> = Vec::new();
         for name in &names {
-            let _ = self.sketch3d_link_reference_silent(name);
+            if self.sketch3d_link_reference_silent(name).is_none() {
+                lost.push(name.clone());
+            }
         }
         let mut unlinked = Vec::new();
         for name in listed {
@@ -895,6 +1027,22 @@ impl EngineState {
         if let Some(edit) = self.sketch3d_edit.as_mut() {
             edit.listed_unlinked = unlinked;
             let _ = edit.session.resolve();
+            edit.session.lost_references = lost
+                .iter()
+                .filter_map(|name| {
+                    let record = edit.external_refs.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(name.as_str()))?;
+                    let ids: Vec<Value> = record.get("points").and_then(Value::as_array).cloned().unwrap_or_default();
+                    Some((name.clone(), ids))
+                })
+                .collect();
+        }
+        let notices: Vec<String> = self
+            .sketch3d_edit
+            .as_ref()
+            .map(|edit| edit.session.lost_reference_messages())
+            .unwrap_or_default();
+        for message in notices {
+            self.push_notice(message);
         }
     }
 
@@ -976,7 +1124,16 @@ impl EngineState {
             .sketch3d_edit
             .as_ref()
             .and_then(|edit| edit.session.pick_entity(&self.camera, x, y, radius));
+        // A model entity is linked where it is clicked and joins the selection,
+        // so the constraints for point + target are offered with no tool change.
+        let linked = if hit.is_none() { self.sketch3d_link_model_at(x, y) } else { None };
         let Some(edit) = self.sketch3d_edit.as_mut() else { return };
+        if let Some(entity) = linked {
+            edit.session.toggle_selection(entity);
+            self.refresh_sketch3d_overlay();
+            self.dirty = true;
+            return;
+        }
         match hit {
             None => edit.session.clear_selection(),
             Some(entity) => {
@@ -1394,7 +1551,7 @@ fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
 /// `[center, start, end]`, or, closed, the circle's axis as a line; anything
 /// else → its chord, the same best effort the kernel makes.
 fn classify_edge_polyline(polyline: &[[f64; 3]]) -> Option<brep_kernel::Sketch3dResolvedReference> {
-    use brep_kernel::{Sketch3dResolvedReference as R, Vec3, SKETCH3D_REFERENCE_TIP_LENGTH as TIP};
+    use brep_kernel::{Sketch3dResolvedReference as R, Vec3};
     let v = |a: [f64; 3]| Vec3::new(a[0], a[1], a[2]);
     if polyline.len() < 2 {
         return None;
@@ -1418,7 +1575,7 @@ fn classify_edge_polyline(polyline: &[[f64; 3]]) -> Option<brep_kernel::Sketch3d
             })
             .fold(0.0f64, f64::max);
         if off <= 1e-6 * extent {
-            return Some(R::Line(start, end));
+            return Some(R::Segment(start, end));
         }
     }
     // Circular: fit the circle through three well-spread samples and check
@@ -1438,13 +1595,17 @@ fn classify_edge_polyline(polyline: &[[f64; 3]]) -> Option<brep_kernel::Sketch3d
                 .fold(0.0f64, f64::max);
             if worst <= 1e-4 * radius && planar <= 1e-4 * radius {
                 if chord.length() <= 1e-6 * extent {
-                    return Some(R::Line(center, center.add(axis.scale(radius.max(TIP)))));
+                    return Some(R::CircleAxis(center, center.add(axis.scale(radius))));
                 }
                 return Some(R::Arc(center, start, end));
             }
         }
     }
-    (chord.length() > 1e-9 * extent).then_some(R::Line(start, end))
+    let samples: Vec<Vec3> = polyline.iter().map(|p| v(*p)).collect();
+    match brep_kernel::sketch3d_curve_reference_controls(&samples) {
+        Some(controls) => Some(R::Curve(controls)),
+        None => (chord.length() > 1e-9 * extent).then_some(R::Segment(start, end)),
+    }
 }
 
 /// The circle through three points: `(center, radius, unit axis)`.
@@ -1456,8 +1617,8 @@ fn circle_through(a: brep_kernel::Vec3, b: brep_kernel::Vec3, c: brep_kernel::Ve
     if n2 <= 1e-24 {
         return None;
     }
-    // Circumcenter: a + ((|ac|² ab − |ab|² ac) × n) / (2 |n|²)
-    let term = ab.scale(ac.dot(ac)).sub(ac.scale(ab.dot(ab))).cross(n).scale(1.0 / (2.0 * n2));
+    // Circumcenter: a + (n × (|ac|² ab − |ab|² ac)) / (2 |n|²)
+    let term = n.cross(ab.scale(ac.dot(ac)).sub(ac.scale(ab.dot(ab)))).scale(1.0 / (2.0 * n2));
     let center = a.add(term);
     let radius = a.sub(center).length();
     let axis = n.normalized().ok()?;

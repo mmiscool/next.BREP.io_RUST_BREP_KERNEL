@@ -1018,7 +1018,7 @@ pub(in crate::boolean) fn conform_unmatched_one_use_edges(
 /// Recompute the derived genus with the same shell-aware Euler formula
 /// `validate()` checks against (left untouched when the counts do not give an
 /// integral genus — validation then reports the real defect).
-pub(super) fn refresh_derived_genus(solid: &mut BrepSolid) {
+pub(crate) fn refresh_derived_genus(solid: &mut BrepSolid) {
     let hole_count = solid.bounding_hole_count();
     let face_count: i64 = solid
         .shells

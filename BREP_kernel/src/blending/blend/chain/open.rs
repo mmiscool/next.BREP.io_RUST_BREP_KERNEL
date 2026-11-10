@@ -410,6 +410,7 @@ fn open_chain_rung(
             second_edge_id,
             second_edge_parameter,
             end_face_id: end_face,
+            split: None,
             transverse_curve: transverse,
             transverse_blend_pcurve: blend_pcurve,
             transverse_end_pcurve: end_pcurve,

@@ -1025,15 +1025,42 @@ impl SceneMap {
         if let Some(edge) = self.edges.get(name) {
             return vec![*edge];
         }
-        self.edge_groups
-            .get(name)
-            .map(|members| {
-                members
-                    .iter()
-                    .filter_map(|member| self.edges.get(member).copied())
-                    .collect()
-            })
-            .unwrap_or_default()
+        if let Some(members) = self.edge_groups.get(name) {
+            return members
+                .iter()
+                .filter_map(|member| self.edges.get(member).copied())
+                .collect();
+        }
+        self.resolve_edge_reversed(name).into_iter().collect()
+    }
+
+    /// A topology edge named with its two faces the other way round: `B|A[n]`
+    /// for the stamped `A|B[n]` ([`features::common::stamp_derived_edge_names`]
+    /// sorts the pair, and numbers each sorted pair, so `[n]` carries over).
+    /// Face names may themselves hold `|` (a blend face is named after its
+    /// edge), so every split is tried, and the name resolves only when exactly
+    /// one of them names a resident edge — never a guess between two.
+    fn resolve_edge_reversed(&self, name: &str) -> Option<EdgeRef> {
+        let (base, index) = match name.rfind('[') {
+            Some(at) if name.ends_with(']') && name[at + 1..name.len() - 1].bytes().all(|b| b.is_ascii_digit()) => {
+                (&name[..at], &name[at..])
+            }
+            _ => (name, ""),
+        };
+        let mut found: Option<EdgeRef> = None;
+        for (at, _) in base.match_indices('|') {
+            let (left, right) = (&base[..at], &base[at + 1..]);
+            if left.is_empty() || right.is_empty() {
+                continue;
+            }
+            if let Some(edge) = self.edges.get(&format!("{right}|{left}{index}")) {
+                if found.is_some_and(|seen| (seen.handle, seen.edge_id) != (edge.handle, edge.edge_id)) {
+                    return None;
+                }
+                found = Some(*edge);
+            }
+        }
+        found
     }
 
     /// Resolve an edge name to its `(handle, edge_id)` (exact match). Contract
@@ -2452,5 +2479,6 @@ pub fn execute_history_json(request_json: &str) -> Result<String, JsValue> {
     let result = execute_history(&request);
     serde_json::to_string(&result).map_err(|error| JsValue::from_str(&error.to_string()))
 }
+
 
 

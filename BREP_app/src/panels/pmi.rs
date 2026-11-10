@@ -45,7 +45,7 @@
 
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::column_tree::{self, CellKind, ColumnLayout, ColumnSpec, ColumnTreeSpec, RowAction, RowNode};
-use crate::form_view::{form_view, FormViewSpec};
+use crate::form_view::{form_view, FormBanner, FormViewSpec};
 use brep_render::brep_kernel::{pmi_schema_catalogue, pmi_type, PmiReport, PmiState, PmiStatus, PMI_TYPES};
 use brep_render::engine_state::{pmi_view_params, pmi_view_schema, EngineState, PmiViewPatch, RefSelectField, RefSelectTarget};
 use brep_render::features::form_fields_from_schema;
@@ -718,7 +718,7 @@ impl PmiPanel {
             fields: &fields,
             hidden: Some(&hidden),
             // A Plane section whose face or plane does not resolve cuts nothing: say why.
-            banner: (!section_error.is_empty()).then(|| (section_error, egui::Color32::from_rgb(0xf8, 0x51, 0x49))),
+            banner: (!section_error.is_empty()).then(|| FormBanner::error(section_error, egui::Color32::from_rgb(0xf8, 0x51, 0x49))),
             trailing: None,
             exit_label: "Return to tree",
             extra: None,
@@ -793,16 +793,16 @@ impl PmiPanel {
         let id = annotation.id().to_string();
         let def = pmi_type(&annotation.kind);
         let title = format!("{} {}", def.map(|d| d.label).unwrap_or(&annotation.kind), id);
-        let (banner_text, banner_color) = match report.annotation(&id) {
-            Some(row) if row.status == PmiStatus::Ok => (row.text.replace('\n', " / "), egui::Color32::from_rgb(0x3f, 0xb9, 0x50)),
-            Some(row) => (row.message.clone(), egui::Color32::from_rgb(0xf8, 0x51, 0x49)),
-            None => ("not resolved yet".to_string(), egui::Color32::GRAY),
+        let (banner_text, banner_color, banner_is_error) = match report.annotation(&id) {
+            Some(row) if row.status == PmiStatus::Ok => (row.text.replace('\n', " / "), egui::Color32::from_rgb(0x3f, 0xb9, 0x50), false),
+            Some(row) => (row.message.clone(), egui::Color32::from_rgb(0xf8, 0x51, 0x49), true),
+            None => ("not resolved yet".to_string(), egui::Color32::GRAY, false),
         };
         let spec = FormViewSpec {
             title: &title,
             subtitle: None,
             fields: &fields,
-            banner: Some((banner_text.as_str(), banner_color)),
+            banner: Some(FormBanner { text: banner_text.as_str(), color: banner_color, is_error: banner_is_error }),
             trailing: None,
             hidden: None,
             exit_label: "Return to tree",

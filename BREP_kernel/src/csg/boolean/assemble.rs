@@ -20,6 +20,7 @@ pub(crate) use finalize::{
 };
 pub(super) use finalize::repair_open_assembly_via_heal_chain;
 pub(crate) use pipeline::{assemble_fragments, assemble_open_fragments};
+pub(crate) use refusal_welds::refresh_derived_genus;
 pub(crate) use inherited::clear_candidate_memo;
 pub(super) use pipeline::assemble_cellular_fragments;
 pub(super) use pipeline::{assemble_fragments_scoped, AssemblyScope};

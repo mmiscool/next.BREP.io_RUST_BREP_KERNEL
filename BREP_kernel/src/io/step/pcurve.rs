@@ -73,7 +73,7 @@ const VERIFY_SAMPLES: usize = 97;
 /// was actually written, plus which way its azimuth runs relative to the
 /// STORED carrier's own frame.
 #[derive(Clone, Debug)]
-pub(super) struct EmittedFrame {
+pub(crate) struct EmittedFrame {
     pub origin: Vec3,
     /// Placement `ref_direction`; STEP azimuth u = 0 points along it.
     pub x_axis: Vec3,
@@ -105,7 +105,7 @@ impl EmittedFrame {
 /// evaluate it in ISO 10303-42's own parameterization — the only
 /// parameterization a pcurve may be expressed in.
 #[derive(Clone, Debug)]
-pub(super) enum EmittedSurface {
+pub(crate) enum EmittedSurface {
     /// `PLANE`: S(x,y) = origin + x·x̂ + y·ŷ, with ŷ = normal × x̂ derived by
     /// the reader from the `AXIS2_PLACEMENT_3D` we wrote.
     Plane {
@@ -255,7 +255,7 @@ impl EmittedSurface {
 /// parameterization ISO 10303-42 gives it — the parameter a pcurve on this
 /// edge has to share.
 #[derive(Clone, Debug)]
-pub(super) enum EmittedCurve {
+pub(crate) enum EmittedCurve {
     /// `LINE(pnt, VECTOR(dir, |chord|))`: C(s) = start + s·(end − start), s ∈ [0,1].
     /// The magnitude carries the chord length, so the STEP parameter is the
     /// fraction along the chord (see `write_analytic_curve`).
@@ -279,7 +279,7 @@ pub(super) enum EmittedCurve {
 }
 
 impl EmittedCurve {
-    pub(super) fn domain(&self) -> Result<[f64; 2], String> {
+    pub(crate) fn domain(&self) -> Result<[f64; 2], String> {
         Ok(match self {
             EmittedCurve::Line { .. } => [0.0, 1.0],
             EmittedCurve::Circle { sweep, .. } => [0.0, *sweep],
@@ -349,7 +349,7 @@ impl EmittedCurve {
 /// A 2D curve in an emitted surface's parameter space, ready to be written
 /// into a `DEFINITIONAL_REPRESENTATION`.
 #[derive(Clone, Debug)]
-pub(super) enum Pcurve2d {
+pub(crate) enum Pcurve2d {
     /// `LINE(pnt, VECTOR(dir, |vector|))`: P(s) = point + s·vector.
     Line { point: [f64; 2], vector: [f64; 2] },
     /// `CIRCLE(AXIS2_PLACEMENT_2D(centre, ref), r)`: P(a) = c + r(cos a·ref +
@@ -393,7 +393,7 @@ impl Pcurve2d {
 }
 
 /// What [`build_pcurve`] decided, including the measured evidence for it.
-pub(super) struct PcurveOutcome {
+pub(crate) struct PcurveOutcome {
     /// `None` when every candidate missed the export band: the reader
     /// reprojects, exactly as it must for our pcurve-free files today.
     pub curve: Option<Pcurve2d>,
@@ -407,7 +407,7 @@ pub(super) struct PcurveOutcome {
 ///
 /// `pcurve` must ALREADY be reversed into edge direction when the coedge runs
 /// against the edge; fraction-synchronisation makes that reversal exact.
-pub(super) fn build_pcurve(
+pub(crate) fn build_pcurve(
     stored_surface: &NurbsSurface,
     emitted_surface: &EmittedSurface,
     emitted_curve: &EmittedCurve,

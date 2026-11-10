@@ -1,11 +1,10 @@
 //! Conversions between kernel NURBS geometry and IGES entities.
 //!
 //! Supported entity types:
-//! * **126** Rational B-Spline Curve  ↔ [`NurbsCurve`]
+//! * **126** Rational B-Spline Curve  ← [`NurbsCurve`] (export)
 //! * **128** Rational B-Spline Surface ↔ [`NurbsSurface`]
-//! * **102** Composite Curve (a loop of 126 curves)
-//! * **142** Curve on a Parametric Surface (trimming curve: model + parameter)
-//! * **144** Trimmed (Parametric) Surface (one kernel face)
+//!
+//! Import reads every other entity in [`super::to_step`].
 //!
 //! The kernel stores control points in weighted-homogeneous form (`Vec4`, with
 //! `x,y,z` premultiplied by `w`); IGES stores plain Cartesian coordinates and a
@@ -76,44 +75,44 @@ pub(crate) fn curve_to_126(curve: &NurbsCurve) -> Result<IgesEntity, String> {
     Ok(IgesEntity::new(126, params))
 }
 
-/// Reconstruct a NURBS curve from an IGES type-126 entity. When `coord_scale`
-/// is `Some(s)`, the 3D coordinates are multiplied by `s` (units → mm); pass
-/// `None` for parameter-space (pcurve) curves, whose `(u, v)` values must not
-/// be scaled.
-pub(crate) fn curve_from_126(entity: &ParsedEntity, coord_scale: Option<f64>) -> Result<NurbsCurve, String> {
-    let k = entity.int(0)?;
-    let degree = entity.int(1)? as usize;
-    if k < 1 {
-        return Err(format!("iges 126: invalid upper index K={k}"));
-    }
-    let num = (k + 1) as usize;
-    let knot_count = num + degree + 1;
-    let mut idx = 6; // after K, M, PROP1..PROP4
-    let mut knots = Vec::with_capacity(knot_count);
-    for _ in 0..knot_count {
-        knots.push(entity.real(idx)?);
-        idx += 1;
-    }
-    let mut weights = Vec::with_capacity(num);
-    for _ in 0..num {
-        weights.push(entity.real(idx)?);
-        idx += 1;
-    }
-    let scale = coord_scale.unwrap_or(1.0);
-    let mut control_points = Vec::with_capacity(num);
-    for i in 0..num {
-        let x = entity.real(idx)? * scale;
-        let y = entity.real(idx + 1)? * scale;
-        let z = entity.real(idx + 2)? * scale;
-        idx += 3;
-        control_points.push(Vec4::from_point(Vec3::new(x, y, z), weights[i]));
-    }
-    NurbsCurve::new(degree, knots, control_points)
-}
-
 // ===========================================================================
 // Entity 128 — Rational B-Spline Surface
 // ===========================================================================
+
+fn flag(value: bool) -> String {
+    if value { "1" } else { "0" }.into()
+}
+
+/// Whether the first and last control rows (u) and columns (v) coincide, to
+/// within a relative 1e-9 of the net's size, weights included.
+fn closed_directions(surface: &NurbsSurface) -> Result<(bool, bool), String> {
+    let net = &surface.control_points;
+    let mut points = Vec::with_capacity(net.len() * net[0].len());
+    for row in net {
+        for c in row {
+            points.push(c.point()?);
+        }
+    }
+    let (mut lo, mut hi) = (points[0], points[0]);
+    for p in &points {
+        lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+        hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+    }
+    let tolerance = 1e-9 * (1.0 + hi.sub(lo).length());
+    let same = |a: &Vec4, b: &Vec4| -> Result<bool, String> {
+        Ok(a.point()?.sub(b.point()?).length() <= tolerance && (a.w - b.w).abs() <= WEIGHT_TOL)
+    };
+    let (last_u, last_v) = (net.len() - 1, net[0].len() - 1);
+    let mut closed_u = true;
+    for j in 0..=last_v {
+        closed_u &= same(&net[0][j], &net[last_u][j])?;
+    }
+    let mut closed_v = true;
+    for row in net {
+        closed_v &= same(&row[0], &row[last_v])?;
+    }
+    Ok((closed_u, closed_v))
+}
 
 /// Serialize a NURBS surface as an IGES type-128 entity.
 pub(crate) fn surface_to_128(surface: &NurbsSurface) -> Result<IgesEntity, String> {
@@ -147,11 +146,17 @@ pub(crate) fn surface_to_128(surface: &NurbsSurface) -> Result<IgesEntity, Strin
     params.push(k2.to_string());
     params.push((du as i64).to_string());
     params.push((dv as i64).to_string());
-    params.push("0".into()); // PROP1 closed in u
-    params.push("0".into()); // PROP2 closed in v
+    // A net whose first and last rows coincide is closed in that direction.
+    // It is also flagged periodic: the kernel's pcurves on such a carrier may
+    // run past the domain and wrap, and OpenCASCADE only wraps a parameter on a
+    // surface marked periodic (otherwise it extrapolates the net, which put
+    // m0015's seam-crossing edges 2.8 mm off their face).
+    let (closed_u, closed_v) = closed_directions(surface)?;
+    params.push(flag(closed_u)); // PROP1 closed in u
+    params.push(flag(closed_v)); // PROP2 closed in v
     params.push(if rational { "0" } else { "1" }.into()); // PROP3 rational/poly
-    params.push("0".into()); // PROP4 periodic in u
-    params.push("0".into()); // PROP5 periodic in v
+    params.push(flag(closed_u)); // PROP4 periodic in u
+    params.push(flag(closed_v)); // PROP5 periodic in v
     for knot in &surface.knots_u {
         params.push(real_field(*knot));
     }
@@ -225,107 +230,4 @@ pub(crate) fn surface_from_128(entity: &ParsedEntity, coord_scale: f64) -> Resul
         }
     }
     NurbsSurface::new(du, dv, knots_u, knots_v, control_points)
-}
-
-// ===========================================================================
-// Entity 102 — Composite Curve
-// ===========================================================================
-
-/// A composite curve groups constituent curve entities (their DE pointers) into
-/// a single ordered boundary.
-pub(crate) fn composite_102(members: &[i64]) -> IgesEntity {
-    let mut params: Vec<String> = Vec::with_capacity(members.len() + 1);
-    params.push(members.len().to_string());
-    for m in members {
-        params.push(m.to_string());
-    }
-    IgesEntity::new(102, params)
-}
-
-/// Read the ordered member DE pointers of a composite curve.
-pub(crate) fn composite_members(entity: &ParsedEntity) -> Result<Vec<i64>, String> {
-    let n = entity.int(0)? as usize;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        out.push(entity.int(1 + i)?);
-    }
-    Ok(out)
-}
-
-// ===========================================================================
-// Entity 142 — Curve on a Parametric Surface
-// ===========================================================================
-
-/// Build a curve-on-surface entity: `sptr` = surface DE pointer, `bptr` = the
-/// boundary curve in parameter space (a 102/126 in `(u, v, 0)`), `cptr` = the
-/// same boundary in model space (a 102/126 in 3D). PREF=1 (parameter space is
-/// authoritative).
-pub(crate) fn curve_on_surface_142(sptr: i64, bptr: i64, cptr: i64) -> IgesEntity {
-    IgesEntity::new(
-        142,
-        vec![
-            "0".into(),         // CRTN: how the curve was created (unspecified)
-            sptr.to_string(),   // SPTR: surface
-            bptr.to_string(),   // BPTR: parameter-space curve
-            cptr.to_string(),   // CPTR: model-space curve
-            "1".into(),         // PREF: prefer parameter space
-        ],
-    )
-}
-
-/// Parsed 142: (surface ptr, parameter-space curve ptr, model-space curve ptr).
-pub(crate) struct CurveOnSurface {
-    pub surface: i64,
-    pub param_curve: i64,
-    pub model_curve: i64,
-}
-
-pub(crate) fn curve_on_surface_from_142(entity: &ParsedEntity) -> Result<CurveOnSurface, String> {
-    Ok(CurveOnSurface {
-        surface: entity.int(1)?,
-        param_curve: entity.int(2)?,
-        model_curve: entity.int(3)?,
-    })
-}
-
-// ===========================================================================
-// Entity 144 — Trimmed (Parametric) Surface
-// ===========================================================================
-
-/// Build a trimmed surface: `pts` = surface DE pointer, `outer` = outer
-/// boundary (142) DE pointer, `holes` = inner boundary (142) DE pointers.
-pub(crate) fn trimmed_surface_144(pts: i64, outer: i64, holes: &[i64]) -> IgesEntity {
-    let mut params: Vec<String> = Vec::new();
-    params.push(pts.to_string()); // PTS surface
-    params.push("1".into()); // N1: outer boundary is given by PTO
-    params.push(holes.len().to_string()); // N2: number of inner boundaries
-    params.push(outer.to_string()); // PTO outer boundary
-    for h in holes {
-        params.push(h.to_string());
-    }
-    IgesEntity::new(144, params)
-}
-
-/// Parsed 144: surface pointer, outer boundary pointer, inner boundary pointers.
-pub(crate) struct TrimmedSurface {
-    pub surface: i64,
-    pub outer: Option<i64>,
-    pub inner: Vec<i64>,
-}
-
-pub(crate) fn trimmed_surface_from_144(entity: &ParsedEntity) -> Result<TrimmedSurface, String> {
-    let surface = entity.int(0)?;
-    let n1 = entity.int(1)?;
-    let n2 = entity.int(2)? as usize;
-    let outer = entity.int(3)?;
-    let outer = if n1 != 0 && outer != 0 { Some(outer) } else { None };
-    let mut inner = Vec::with_capacity(n2);
-    for i in 0..n2 {
-        inner.push(entity.int(4 + i)?);
-    }
-    Ok(TrimmedSurface {
-        surface,
-        outer,
-        inner,
-    })
 }

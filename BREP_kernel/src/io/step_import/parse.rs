@@ -702,6 +702,7 @@ impl<'a> Resolver<'a> {
         entity: &Entity,
         samples: &[Vec3],
         sphere_seam: Option<Vec3>,
+        sphere_axis: Option<Vec3>,
     ) -> Result<Option<NurbsSurface>, String> {
         if let Some(args) = entity.find("PLANE") {
             let frame = self.placement(args[1].as_ref_id()?)?;
@@ -773,6 +774,10 @@ impl<'a> Resolver<'a> {
         }
         if let Some(args) = entity.find("SPHERICAL_SURFACE") {
             let placement = self.placement(args[1].as_ref_id()?)?;
+            let placement = match sphere_axis {
+                Some(axis) => frame_about_axis(&placement, axis)?,
+                None => placement,
+            };
             let frame = if let Some(x) = sphere_seam {
                 let x = x.sub(placement.z.scale(x.dot(placement.z))).normalized()?;
                 Frame {
@@ -1103,6 +1108,7 @@ impl<'a> Resolver<'a> {
         id: usize,
         samples: &[Vec3],
         sphere_seam: Option<Vec3>,
+        sphere_axis: Option<Vec3>,
     ) -> Result<NurbsSurface, String> {
         let entity = self.get(id)?;
         // OFFSET_SURFACE(name, basis_surface, distance, self_intersect): a copy
@@ -1124,7 +1130,7 @@ impl<'a> Resolver<'a> {
                     .ok_or("step_import: OFFSET_SURFACE missing distance")?
                     .as_real()?,
             );
-            let basis = self.surface_for_face(basis_ref, samples, sphere_seam)?;
+            let basis = self.surface_for_face(basis_ref, samples, sphere_seam, sphere_axis)?;
             // A temporary carrier face with same_sense = true, so
             // stable_face_normal returns the raw du×dv normal. offset_surface
             // shifts by -distance·N, so negate to follow STEP's convention of
@@ -1138,7 +1144,7 @@ impl<'a> Resolver<'a> {
             };
             return offset_surface(&carrier, -distance, 0.0).map_err(String::from);
         }
-        if let Some(surface) = self.analytic_surface(entity, samples, sphere_seam)? {
+        if let Some(surface) = self.analytic_surface(entity, samples, sphere_seam, sphere_axis)? {
             return Ok(surface);
         }
         self.surface(id)

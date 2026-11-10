@@ -1205,8 +1205,20 @@ fn convert_component(
                 let hybrid_attempt = hybrid_attempt.and_then(|output| {
                     if hybrid_roundtrip_fallback_enabled() {
                         if let Err(error) = solid_round_trips(&output.solid) {
-                            // Promotion 15's switch first: the rebuild
-                            // without it.
+                            // Promotion 16's chip_rung_groups first: the
+                            // rebuild without it.
+                            let chips = crate::hybrid_region_brep::hybrid_plane_cylinder_brep_before_promotion_16(
+                                source_positions,
+                                source_indices,
+                                &segmentation_options(source_positions, options),
+                            );
+                            if let Ok(Some(chips)) = chips {
+                                if solid_round_trips(&chips.solid).is_ok() {
+                                    return Ok(chips);
+                                }
+                            }
+                            // Then promotion 15's switch: the rebuild
+                            // without it (and promotion 16's).
                             let crossing = crate::hybrid_region_brep::hybrid_plane_cylinder_brep_before_promotion_15(
                                 source_positions,
                                 source_indices,

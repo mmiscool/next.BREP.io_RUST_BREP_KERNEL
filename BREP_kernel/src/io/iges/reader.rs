@@ -15,9 +15,19 @@ use rustc_hash::FxHashMap as HashMap;
 #[derive(Clone, Debug)]
 pub(crate) struct DirectoryEntry {
     pub entity_type: i64,
-    /// Field 15: form number (retained for entity-form disambiguation).
-    #[allow(dead_code)]
+    /// Field 15: form number.
     pub form: i64,
+    /// Field 7: DE pointer of the 124 this entity is placed by (0 = none).
+    pub transform: i64,
+    /// Field 9, digits 3-4: 0 when the entity stands on its own in the file.
+    pub subordinate: i64,
+    /// Field 5: the level (layer) number, or minus the DE pointer of a 406
+    /// form 1 listing several.
+    pub level: i64,
+    /// Field 13: a colour number 1-8, or minus the DE pointer of a 314.
+    pub color: i64,
+    /// Field 18: the entity label, trimmed ("" when blank).
+    pub label: String,
 }
 
 /// One resolved entity: its directory record plus the raw parameter tokens that
@@ -55,6 +65,14 @@ pub(crate) struct GlobalSection {
     pub units_flag: i64,
     pub units_name: String,
     pub model_scale: f64,
+    /// Field 19: the smallest distance the file claims to tell apart, in
+    /// model units; 0 when it does not say.
+    pub min_resolution: f64,
+    /// Fields 1 and 2: the parameter and record delimiters the file declares.
+    pub param_delim: char,
+    pub record_delim: char,
+    /// Field 3: the sending system's product identification ("" when blank).
+    pub product_id: String,
 }
 
 impl GlobalSection {
@@ -78,6 +96,11 @@ impl GlobalSection {
                 "M" | "METER" | "METERS" | "METRE" => 1000.0,
                 "CM" => 10.0,
                 "FT" | "FEET" => 304.8,
+                "MI" => 1_609_344.0,
+                "KM" => 1_000_000.0,
+                "MIL" => 0.0254,
+                "UM" | "MICRON" => 0.001,
+                "UIN" => 25.4e-6,
                 other => {
                     return Err(format!(
                         "iges_import: unsupported units name {other:?} (flag {})",
@@ -116,6 +139,20 @@ impl IgesFile {
         self.entities
             .iter()
             .filter(move |e| e.de.entity_type == entity_type)
+    }
+
+    /// Every entity of one type with its DE pointer, in directory order.
+    pub fn pointers_of_type(&self, entity_type: i64) -> Vec<(i64, &ParsedEntity)> {
+        let mut found: Vec<(i64, &ParsedEntity)> = self
+            .by_pointer
+            .iter()
+            .filter_map(|(&pointer, &index)| {
+                let entity = self.entities.get(index)?;
+                (entity.de.entity_type == entity_type).then_some((pointer, entity))
+            })
+            .collect();
+        found.sort_unstable_by_key(|(pointer, _)| *pointer);
+        found
     }
 }
 
@@ -190,8 +227,21 @@ pub(crate) fn parse_iges(text: &str) -> Result<IgesFile, String> {
         let line2 = &de_lines[pair_index * 2 + 1];
         let entity_type = de_field(line1, 0)?;
         let form = de_field(line2, 4)?;
+        let transform = de_field(line1, 6)?;
         let de_pointer = (2 * pair_index + 1) as i64;
-        directory.insert(de_pointer, DirectoryEntry { entity_type, form });
+        let status: Vec<char> = line1.chars().skip(64).take(8).collect();
+        let subordinate = status
+            .get(2..4)
+            .map(|digits| digits.iter().collect::<String>())
+            .and_then(|digits| digits.trim().parse().ok())
+            .unwrap_or(0);
+        let level = de_field(line1, 4)?;
+        let color = de_field(line2, 2)?;
+        let label: String = line2.chars().skip(56).take(8).collect::<String>().trim().to_string();
+        directory.insert(
+            de_pointer,
+            DirectoryEntry { entity_type, form, transform, subordinate, level, color, label },
+        );
     }
 
     // ---- Parameter data → tokens per entity --------------------------------
@@ -234,10 +284,10 @@ pub(crate) fn parse_iges(text: &str) -> Result<IgesFile, String> {
 
 impl GlobalSection {
     fn param_delim(&self) -> char {
-        ','
+        self.param_delim
     }
     fn record_delim(&self) -> char {
-        ';'
+        self.record_delim
     }
 }
 
@@ -259,15 +309,38 @@ fn de_field(line: &str, index: usize) -> Result<i64, String> {
         .map_err(|_| format!("iges: directory field {index} not an integer: {field:?}"))
 }
 
-/// Parse the Global section into the values the importer needs. Delimiters are
-/// assumed to be the defaults `,` and `;` (params 1-2 declare them but they are
-/// the defaults for every writer we interoperate with).
-fn parse_global(raw: &str) -> Result<GlobalSection, String> {
-    let tokens = tokenize_parameters(raw, ',', ';')?;
-    // Standard positional layout; tokens[13] = units flag, [14] = units name,
-    // [12] = model space scale. Guard against short globals.
+/// The delimiters a Global section declares in its first two fields, each a
+/// Hollerith `1Hc` or empty for the default (`,` and `;`).
+fn declared_delimiters(raw: &str) -> (char, char) {
+    let chars: Vec<char> = raw.trim_start().chars().collect();
+    let mut param = ',';
+    let mut at = 0;
+    if chars.len() >= 3 && chars[0] == '1' && chars[1] == 'H' {
+        param = chars[2];
+        at = 3;
+    }
+    // Past the first field's terminator, which is the parameter delimiter.
+    if chars.get(at) == Some(&param) {
+        at += 1;
+    }
+    let record = if chars.get(at) == Some(&'1') && chars.get(at + 1) == Some(&'H') {
+        chars.get(at + 2).copied().unwrap_or(';')
+    } else {
+        ';'
+    };
+    (param, record)
+}
+
+/// Parse the Global section into the values the importer needs, with the
+/// delimiters it declares.
+pub(super) fn parse_global(raw: &str) -> Result<GlobalSection, String> {
+    let (param_delim, record_delim) = declared_delimiters(raw);
+    let tokens = tokenize_parameters(raw, param_delim, record_delim)?;
+    // Standard positional layout (0-based): [12] model space scale, [13] units
+    // flag, [14] units name, [18] minimum resolution.
     let get = |i: usize| tokens.get(i).map(|s| s.as_str()).unwrap_or("");
     let model_scale = parse_real(get(12)).unwrap_or(1.0);
+    let min_resolution = parse_real(get(18)).unwrap_or(0.0).abs();
     let units_flag = get(13).trim().parse::<i64>().unwrap_or(2);
     let units_name = get(14).trim().to_string();
     Ok(GlobalSection {
@@ -278,6 +351,10 @@ fn parse_global(raw: &str) -> Result<GlobalSection, String> {
             units_name
         },
         model_scale,
+        min_resolution,
+        param_delim,
+        record_delim,
+        product_id: get(2).trim().to_string(),
     })
 }
 

@@ -872,6 +872,159 @@ pub(super) fn equal_gap_great_circle_seam(
     Ok(Some(excluded))
 }
 
+/// `placement` turned so its z axis is `axis`, keeping its origin and handedness.
+pub(super) fn frame_about_axis(placement: &Frame, axis: Vec3) -> Result<Frame, String> {
+    let z = axis.normalized()?;
+    let helper = [placement.x, placement.y, placement.z]
+        .into_iter()
+        .min_by(|a, b| a.dot(z).abs().total_cmp(&b.dot(z).abs()))
+        .unwrap_or(placement.x);
+    let x = helper.sub(z.scale(helper.dot(z))).normalized()?;
+    Ok(Frame { origin: placement.origin, x, y: z.cross(x).normalized()?, z })
+}
+
+/// A sphere axis whose two poles both lie off the face, for a face that holds a
+/// pole of its authored axis in its interior with no edge there.
+///
+/// Such a loop winds around the carrier's closed direction, so it is open in the
+/// carrier's chart: the trim hull does not bound the material (the march window
+/// loses the cap), and the planar arrangement cannot close the regions of a cut
+/// without a seam and pole edge the face does not have (a reported
+/// teapot's dome between two planes, whose spout pierced it around the pole).
+/// On an axis whose poles are off the face the same boundary is one ordinary
+/// closed trim. The sphere is the same point set on any axis.
+///
+/// `None` keeps the authored axis: a loop that does not wind, a band with both
+/// poles excluded, a face with a pole on its boundary or a degenerate pole edge,
+/// and a face too large to leave an antipodal pair clear of it (a hemisphere).
+pub(super) fn pole_free_axis(
+    frame: &Frame,
+    loops: &[Vec<(&EdgeRecord, bool)>],
+    face_same_sense: bool,
+) -> Option<Vec3> {
+    const SAMPLES: usize = 64;
+    const MIN_CLEARANCE: f64 = 5.0 * std::f64::consts::PI / 180.0;
+    const MIN_SEAM_GAP: f64 = 15.0 * std::f64::consts::PI / 180.0;
+    let mut polylines: Vec<Vec<Vec3>> = Vec::new();
+    for edges in loops {
+        let mut polyline: Vec<Vec3> = Vec::new();
+        for &(edge, forward) in edges {
+            if edge.degenerate {
+                return None;
+            }
+            for index in 0..=SAMPLES {
+                let fraction = index as f64 / SAMPLES as f64;
+                let fraction = if forward { fraction } else { 1.0 - fraction };
+                let t = edge.t0 + (edge.t1 - edge.t0) * fraction;
+                let direction = edge.curve.evaluate(t).ok()?.sub(frame.origin).normalized().ok()?;
+                if polyline.last().is_none_or(|last: &Vec3| last.sub(direction).length() > 1e-9) {
+                    polyline.push(direction);
+                }
+            }
+        }
+        if polyline.len() > 1 && polyline[0].sub(polyline[polyline.len() - 1]).length() <= 1e-9 {
+            polyline.pop();
+        }
+        if polyline.len() < 3 {
+            return None;
+        }
+        polylines.push(polyline);
+    }
+    let clearance = |axis: Vec3| -> f64 {
+        polylines
+            .iter()
+            .flatten()
+            .map(|point| point.dot(axis).abs().min(1.0).acos())
+            .fold(f64::INFINITY, f64::min)
+    };
+    let azimuth = |point: Vec3, x: Vec3, y: Vec3| point.dot(y).atan2(point.dot(x));
+    let winds = |axis: Vec3| -> Option<bool> {
+        let turned = frame_about_axis(frame, axis).ok()?;
+        Some(polylines.iter().any(|polyline| {
+            let mut total = 0.0;
+            for index in 0..polyline.len() {
+                let a = azimuth(polyline[index], turned.x, turned.y);
+                let b = azimuth(polyline[(index + 1) % polyline.len()], turned.x, turned.y);
+                let mut step = b - a;
+                if step > std::f64::consts::PI {
+                    step -= std::f64::consts::TAU;
+                } else if step < -std::f64::consts::PI {
+                    step += std::f64::consts::TAU;
+                }
+                total += step;
+            }
+            (total / std::f64::consts::TAU).round() != 0.0
+        }))
+    };
+    // Material is left of the traversal on the oriented face: the nearest
+    // boundary sample says which side a clear direction is on.
+    let on_material = |query: Vec3| -> Option<bool> {
+        let mut best: Option<(f64, f64)> = None;
+        for polyline in &polylines {
+            let count = polyline.len();
+            for index in 0..count {
+                let point = polyline[index];
+                let distance = point.sub(query).length();
+                if best.is_some_and(|(nearest, _)| nearest <= distance) {
+                    continue;
+                }
+                let tangent = polyline[(index + 1) % count].sub(polyline[(index + count - 1) % count]);
+                let normal = if face_same_sense { point } else { point.scale(-1.0) };
+                best = Some((distance, query.sub(point).dot(normal.cross(tangent))));
+            }
+        }
+        best.map(|(_, side)| side > 0.0)
+    };
+    if clearance(frame.z) < MIN_CLEARANCE || !winds(frame.z)? {
+        return None;
+    }
+    if !on_material(frame.z)? && !on_material(frame.z.scale(-1.0))? {
+        return None;
+    }
+    let mut best: Option<(f64, Vec3)> = None;
+    for a in -1i32..=1 {
+        for b in -1i32..=1 {
+            for c in -1i32..=1 {
+                // One of each antipodal pair, and not the authored axis.
+                if (a, b, c) <= (0, 0, 0) || (a == 0 && b == 0) {
+                    continue;
+                }
+                let Ok(axis) = frame
+                    .x
+                    .scale(a as f64)
+                    .add(frame.y.scale(b as f64))
+                    .add(frame.z.scale(c as f64))
+                    .normalized()
+                else {
+                    continue;
+                };
+                let margin = clearance(axis);
+                if margin < MIN_CLEARANCE
+                    || best.is_some_and(|(score, _)| score >= margin)
+                    || winds(axis)?
+                    || on_material(axis)?
+                    || on_material(axis.scale(-1.0))?
+                {
+                    continue;
+                }
+                let turned = frame_about_axis(frame, axis).ok()?;
+                let mut angles = polylines
+                    .iter()
+                    .flatten()
+                    .map(|point| azimuth(*point, turned.x, turned.y))
+                    .collect::<Vec<_>>();
+                angles.sort_by(f64::total_cmp);
+                let wrap = angles[0] + std::f64::consts::TAU - angles[angles.len() - 1];
+                let gap = angles.windows(2).map(|pair| pair[1] - pair[0]).fold(wrap, f64::max);
+                if gap >= MIN_SEAM_GAP {
+                    best = Some((margin, axis));
+                }
+            }
+        }
+    }
+    best.map(|(_, axis)| axis)
+}
+
 /// Resolve the other spherical equal-gap ambiguity: an outer loop containing
 /// an edge that crosses a carrier pole in its INTERIOR. Longitude on the pole
 /// is undefined, so the two opposite-meridian limits admit two half-period UV

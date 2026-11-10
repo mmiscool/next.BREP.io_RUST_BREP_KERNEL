@@ -373,23 +373,49 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
             Err(error) => return Ok(refused_at(error, REFUSED_STEP_TRANSLATION)),
         },
         Some((pivot, axis, angle)) => {
-            if !translates {
-                match rotate_faces(&solid, &face_ids, pivot, axis, angle) {
-                    Ok(turned) => turned,
-                    Err(error) => return Ok(refused_at(error, REFUSED_STEP_ROTATION)),
-                }
+            let solved = if !translates {
+                rotate_faces(&solid, &face_ids, pivot, axis, angle)
             } else {
-                match crate::direct_edit::rotate_faces_rigid(
+                crate::direct_edit::rotate_faces_rigid(
                     &solid, &face_ids, pivot, axis, angle, translation,
-                ) {
-                    Ok(moved) => moved,
-                    Err(error) => {
-                        let error = error.with_message(|error| {
-                            format!("transformFace: the combined rigid motion refused — {error}")
-                        });
-                        return Ok(refused_at(error, REFUSED_STEP_ROTATION));
+                )
+                .map_err(|error| {
+                    error.with_message(|error| {
+                        format!("transformFace: the combined rigid motion refused — {error}")
+                    })
+                })
+            };
+            match solved {
+                Ok(moved) => moved,
+                // A face tangent to a fillet beside it has no rim to re-solve:
+                // turned, it cuts that fillet in a different ruling or leaves
+                // it altogether, and either way the answer is a different
+                // topology. That is what the re-cut road below is for, so this
+                // one refusal is offered to it directly. Its body still passes
+                // the acceptance below.
+                Err(error) if is_ruling_refusal(&error) => {
+                    match crate::recut_moved_planes_rigid(&solid, &face_ids, turn, translation) {
+                        Ok(body) => {
+                            result.notes.push(format!(
+                                "transformFace: the turned face could not be re-solved against \
+                                 the fillet beside it ({error}), so the selection was RE-CUT \
+                                 from the original body instead"
+                            ));
+                            let (body, lost) = crate::reblend_lost_fillets(&solid, &face_ids, body);
+                            result.notes.extend(lost);
+                            body
+                        }
+                        Err(reason) => {
+                            let error = error.with_message(|error| {
+                                format!(
+                                    "{error}. The re-cut road was offered it too and declined: {reason}"
+                                )
+                            });
+                            return Ok(refused_at(error, REFUSED_STEP_ROTATION));
+                        }
                     }
                 }
+                Err(error) => return Ok(refused_at(error, REFUSED_STEP_ROTATION)),
             }
         }
     };
@@ -414,26 +440,15 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let moved = match crate::accept_sound(moved, "transformFace") {
         Ok(body) => body,
         Err(refusal) => {
-            match crate::recut_moved_planes_rigid(&solid, &face_ids, turn, translation)
-                // The re-cut body passes the SAME acceptance the primitives'
-                // body did: a boolean's output is sound by construction, so
-                // this is a check and not a repair, and a body it refuses is
-                // refused here by name rather than returned.
-                .and_then(|body| {
-                    crate::accept_sound(body, "transformFace").map_err(|reason| {
-                        reason.with_message(|reason| {
-                            format!("the re-cut built a body the acceptance refused — {reason}")
-                        })
-                    })
-                })
-            {
-                Ok(body) => {
+            match recut_past_a_refusal(&solid, &face_ids, turn, translation) {
+                Ok((body, lost)) => {
                     result.notes.push(format!(
                         "transformFace: the moved carriers could not be re-solved onto the body \
                          they left ({refusal}), so the selection was RE-CUT from the original \
                          body instead — the result is the boolean this motion defines, and a \
                          face whose carrier left the body is no longer on it"
                     ));
+                    result.notes.extend(lost);
                     body
                 }
                 // The acceptance's refusal stays the primary one — its class
@@ -465,6 +480,31 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     });
     result.removed.push(target_name);
     Ok(result)
+}
+
+/// The re-cut offered after the acceptance refused the moved body.
+///
+/// The body passes the SAME acceptance the primitives' body did: a boolean's
+/// output is sound by construction, so this is a check and not a repair, and a
+/// body it refuses is refused by name rather than returned. Fillets the re-cut
+/// filled in are then re-made one by one, and the second value names any that
+/// could not be.
+fn recut_past_a_refusal(
+    solid: &BrepSolid,
+    face_ids: &[u64],
+    turn: Option<(Vec3, Vec3, f64)>,
+    translation: Vec3,
+) -> Result<(BrepSolid, Vec<String>), KernelRefusal> {
+    let body = crate::recut_moved_planes_rigid(solid, face_ids, turn, translation)?;
+    let body = crate::accept_sound(body, "transformFace").map_err(|reason| {
+        reason.with_message(|reason| format!("the re-cut built a body the acceptance refused — {reason}"))
+    })?;
+    Ok(crate::reblend_lost_fillets(solid, face_ids, body))
+}
+
+/// The rotation primitive's refusal for a face tangent to a ruled neighbour.
+fn is_ruling_refusal(error: &KernelRefusal) -> bool {
+    matches!(&error.class, crate::RefusalClass::UnsupportedGeometry { what } if what == "ruling_edge")
 }
 
 /// Context-bar applicability ([`crate::feature_pipeline::context_offer`]):

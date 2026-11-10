@@ -285,6 +285,26 @@ pub struct SweepClip {
 /// The prefix of every refusal of this operation.
 pub const SOLID_SWEEP_REFUSAL: &str = "sweepSolidWithin";
 
+/// Words of the refusal for a level the sweep covers at every angle.
+const WHOLE_LEVEL: &str = "the sweep covers every angle at level";
+
+/// Turns of a thread each row of faces carries (measured: shorter rows cost more
+/// meshing, longer ones more edge reading).
+const TURNS_PER_ROW: f64 = 2.0;
+
+/// `BREP_SWEEP_THREAD_ROWS` (default on; `=0` one body-long face per wall and the
+/// boolean for the clip): a thread is built a few turns at a time, since readings
+/// over a face cost the square of its length.
+fn thread_rows_on() -> bool {
+    crate::switch!("BREP_SWEEP_THREAD_ROWS", true)
+}
+
+/// `BREP_SWEEP_WHOLE_LEVEL` (default on; `=0` restores the refusal): a screw's
+/// sweep whose turns meet at a crest, built as the clip less what stays.
+fn whole_level_on() -> bool {
+    crate::switch!("BREP_SWEEP_WHOLE_LEVEL", true)
+}
+
 fn refuse(what: &'static str, message: String) -> KernelRefusal {
     KernelRefusal::unsupported(KernelStage::Classify, what, format!("{SOLID_SWEEP_REFUSAL}: {message}"))
 }
@@ -347,6 +367,15 @@ enum Source {
     /// Prism outline piece `piece` at the motion's first (`end = false`) or last
     /// position, parameter s.
     PrismEnd { piece: usize, end: bool },
+    /// Under a screw, at the tool's own place (the screw's reduction is invariant
+    /// along it): side face of outline piece `piece`, (s ∈ [0,1], height).
+    ScrewPrismSide { piece: usize },
+    /// Under a screw: the upright edge at the start of piece `piece`, parameter height.
+    ScrewPrismEdge { piece: usize },
+    /// Under a screw: outline piece `piece` at the prism's low (`end = false`) or
+    /// high end, parameter s. An end cap itself maps one-to-one into the reduced
+    /// plane (polar coordinates at a fixed height), so only its rim can bound.
+    ScrewPrismRim { piece: usize, end: bool },
 }
 
 struct Engine<'a> {
@@ -356,6 +385,8 @@ struct Engine<'a> {
     frame: Frame,
     class: Class,
     clip: &'a SweepClip,
+    /// The clip was narrowed to a crest level: below it some material is left.
+    crest_gap: bool,
     sources: Vec<Source>,
     /// Per face source: its parameter grid (nu × nv) of reduced coordinates.
     grids: Vec<Option<Grid>>,
@@ -471,10 +502,19 @@ impl<'a> Engine<'a> {
                     .add(r1.scale(m[0] * phi.sin()))
                     .add(axis.scale(m[1]))
             }
-            (SweptTool::Prism { origin, normal, x_axis, outline, .. }, _) => {
+            (SweptTool::Prism { origin, normal, x_axis, outline, from, to }, _) => {
                 let n = normal.normalized_or(*normal);
                 let xa = x_axis.normalized_or(*x_axis);
                 let ya = n.cross(xa);
+                let at_own_place = match source {
+                    Source::ScrewPrismSide { piece } => Some((outline[piece].point(u), v)),
+                    Source::ScrewPrismEdge { piece } => Some((outline[piece].point(0.0), u)),
+                    Source::ScrewPrismRim { piece, end } => Some((outline[piece].point(u), if end { *to } else { *from })),
+                    _ => None,
+                };
+                if let Some((q, h)) = at_own_place {
+                    return origin.add(xa.scale(q[0])).add(ya.scale(q[1])).add(n.scale(h));
+                }
                 let (q, t) = match source {
                     Source::PrismFace { piece } => (outline[piece].point(u), v),
                     Source::PrismVertex { piece } => (outline[piece].point(0.0), u),
@@ -498,7 +538,7 @@ impl<'a> Engine<'a> {
     }
 
     fn is_face(source: Source) -> bool {
-        matches!(source, Source::RevolvedFace { .. } | Source::PrismFace { .. })
+        matches!(source, Source::RevolvedFace { .. } | Source::PrismFace { .. } | Source::ScrewPrismSide { .. })
     }
 
     /// Parameter domain of a source: (u range, v range, v periodic).
@@ -510,6 +550,16 @@ impl<'a> Engine<'a> {
             Source::PrismFace { .. } => ([0.0, 1.0], time, false),
             Source::PrismVertex { .. } => (time, [0.0, 0.0], false),
             Source::PrismEnd { .. } => ([0.0, 1.0], [0.0, 0.0], false),
+            Source::ScrewPrismSide { .. } => ([0.0, 1.0], self.prism_extent(), false),
+            Source::ScrewPrismEdge { .. } => (self.prism_extent(), [0.0, 0.0], false),
+            Source::ScrewPrismRim { .. } => ([0.0, 1.0], [0.0, 0.0], false),
+        }
+    }
+
+    fn prism_extent(&self) -> [f64; 2] {
+        match self.tool {
+            SweptTool::Prism { from, to, .. } => [*from, *to],
+            SweptTool::Revolved { .. } => [0.0, 0.0],
         }
     }
 
@@ -518,7 +568,7 @@ impl<'a> Engine<'a> {
     fn u_periodic(&self, source: Source) -> bool {
         match (self.tool, source) {
             (SweptTool::Revolved { meridian, .. }, Source::RevolvedFace { piece }) => meridian[piece].is_full_circle(),
-            (SweptTool::Prism { outline, .. }, Source::PrismFace { piece }) => outline[piece].is_full_circle(),
+            (SweptTool::Prism { outline, .. }, Source::PrismFace { piece } | Source::ScrewPrismSide { piece }) => outline[piece].is_full_circle(),
             _ => false,
         }
     }
@@ -610,6 +660,7 @@ impl<'a> Engine<'a> {
         let (u, v, v_periodic) = self.domain(source);
         let (nu, nv) = match source {
             Source::RevolvedFace { .. } => (64, 256),
+            Source::ScrewPrismSide { .. } => (64, 64),
             _ => {
                 let turn = self
                     .motion
@@ -754,7 +805,7 @@ impl<'a> Engine<'a> {
             let (range, _, _) = self.domain(source);
             let periodic = matches!(source, Source::RevolvedCorner { .. });
             let n = match source {
-                Source::RevolvedCorner { .. } | Source::PrismEnd { .. } => 1024,
+                Source::RevolvedCorner { .. } | Source::PrismEnd { .. } | Source::ScrewPrismEdge { .. } | Source::ScrewPrismRim { .. } => 1024,
                 _ => self.grids_len_for_time(),
             };
             let _ = periodic;
@@ -770,7 +821,12 @@ impl<'a> Engine<'a> {
             for k in 1..samples.len() {
                 let p = samples[k];
                 let value = self.source_reduced(source, p, 0.0).0 - level;
-                if previous == 0.0 || previous * value < 0.0 {
+                if previous == 0.0 {
+                    // A root exactly on the sample (a band's end level on the
+                    // curve's own end): bisecting from a zero walks to the far
+                    // end of the bracket, a whole sample step away.
+                    out.push((self.source_reduced(source, samples[k - 1], 0.0).1, index));
+                } else if previous * value < 0.0 {
                     let (mut a, mut b) = (samples[k - 1], p);
                     let fa0 = previous;
                     for _ in 0..200 {
@@ -789,6 +845,10 @@ impl<'a> Engine<'a> {
                     out.push((o, index));
                 }
                 previous = value;
+            }
+            if previous == 0.0 {
+                let last = *samples.last().expect("nonempty");
+                out.push((self.source_reduced(source, last, 0.0).1, index));
             }
         }
     }
@@ -927,7 +987,7 @@ impl<'a> Engine<'a> {
             if (0..probes).all(|k| self.removed(level, base + span * (k as f64 + 0.5) / probes as f64)) {
                 return Err(refuse(
                     "whole_level",
-                    format!("the sweep covers every angle at level {level}, which this construction does not build"),
+                    format!("{WHOLE_LEVEL} {level}, which this construction does not build"),
                 ));
             }
             return Ok(Vec::new());
@@ -948,10 +1008,18 @@ impl<'a> Engine<'a> {
             removed.push(self.removed(level, 0.5 * (a + b)));
         }
         let mut intervals = Vec::new();
+        // Below a crest some material is left, however narrow: the widest gap,
+        // which the oracle can no longer see inside.
+        if self.crest_gap && self.angular && removed.iter().all(|r| *r) {
+            let width = |k: usize| if k + 1 < n { candidates[k + 1].0 - candidates[k].0 } else { candidates[0].0 + TAU - candidates[k].0 };
+            if let Some(widest) = (0..gaps).max_by(|&a, &b| width(a).total_cmp(&width(b))) {
+                removed[widest] = false;
+            }
+        }
         if self.angular && removed.iter().all(|r| *r) {
             return Err(refuse(
                 "whole_level",
-                format!("the sweep covers every angle at level {level}, which this construction does not build"),
+                format!("{WHOLE_LEVEL} {level}, which this construction does not build"),
             ));
         }
         // Start the walk after a material gap so a run never straddles the start.
@@ -1310,11 +1378,11 @@ fn same_or_bounding(engine: &Engine, a: usize, b: usize) -> bool {
     };
     // (piece of the face, piece whose start the edge is)
     let face = |s: Source| match s {
-        Source::RevolvedFace { piece } | Source::PrismFace { piece } => Some(piece),
+        Source::RevolvedFace { piece } | Source::PrismFace { piece } | Source::ScrewPrismSide { piece } => Some(piece),
         _ => None,
     };
     let edge = |s: Source| match s {
-        Source::RevolvedCorner { piece } | Source::PrismVertex { piece } => Some(piece),
+        Source::RevolvedCorner { piece } | Source::PrismVertex { piece } | Source::ScrewPrismEdge { piece } => Some(piece),
         _ => None,
     };
     let (sa, sb) = (engine.sources[a], engine.sources[b]);
@@ -1391,6 +1459,7 @@ pub fn sweep_solid_within(
     motion: &SolidMotion,
     clip: &SweepClip,
 ) -> Result<Vec<BrepSolid>, KernelRefusal> {
+    let narrowed: SweepClip;
     // --- Frame and classification.
     let ez = clip
         .axis_direction
@@ -1428,7 +1497,7 @@ pub fn sweep_solid_within(
         let offset = origin.sub(clip.axis_origin);
         parallel && offset.sub(ez.scale(offset.dot(ez))).length() < 1e-9 * (1.0 + clip.radius[1])
     };
-    let class = match tool {
+    let class = 'class: { match tool {
         SweptTool::Revolved { meridian, .. } => {
             validate_outline(meridian, "meridian")?;
             if motion.steps.len() != 1 || !on_axis(motion.steps[0].axis_origin, axes[0]) {
@@ -1452,6 +1521,17 @@ pub fn sweep_solid_within(
         SweptTool::Prism { normal, outline, from, to, origin, .. } => {
             validate_outline(outline, "prism")?;
             let n = normal.normalized().or_refuse(KernelStage::Collect, "prism_normal")?;
+            let screw = motion.steps.len() == 1
+                && motion.steps[0].turn != 0.0
+                && motion.steps[0].advance != 0.0
+                && on_axis(motion.steps[0].axis_origin, axes[0])
+                && n.cross(ez).length() <= 1e-12;
+            if screw {
+                // A screw carries the prism's ends along, so the clip may run past them.
+                let step = motion.steps[0];
+                let sense = axes[0].dot(ez).signum();
+                break 'class Class::Screw((step.advance * sense) / (step.turn * sense));
+            }
             if n.cross(ez).length() > 1e-12 {
                 return Err(refuse("motion_class", "a prism is swept here only along its own direction's clip axis".into()));
             }
@@ -1478,7 +1558,7 @@ pub fn sweep_solid_within(
             }
             Class::Planar
         }
-    };
+    } };
     let prism_height = match tool {
         SweptTool::Prism { from, to, .. } => 0.5 * (from + to),
         _ => 0.0,
@@ -1489,6 +1569,7 @@ pub fn sweep_solid_within(
     // turns 540°, which its half-turn symmetry makes a whole period). The
     // permutation says which piece continues which across the wrap.
     let wrap: Option<Vec<usize>> = match tool {
+        SweptTool::Prism { .. } if matches!(class, Class::Screw(_)) => None,
         SweptTool::Prism { origin, normal, x_axis, outline, .. } => {
             let probe = Engine {
                 tool,
@@ -1497,6 +1578,7 @@ pub fn sweep_solid_within(
                 frame,
                 class,
                 clip,
+                crest_gap: false,
                 sources: Vec::new(),
                 grids: Vec::new(),
                 critical: Vec::new(),
@@ -1547,6 +1629,16 @@ pub fn sweep_solid_within(
                 }
             }
         }
+        SweptTool::Prism { outline, .. } if matches!(class, Class::Screw(_)) => {
+            for piece in 0..outline.len() {
+                sources.push(Source::ScrewPrismSide { piece });
+                if !outline[piece].is_full_circle() {
+                    sources.push(Source::ScrewPrismEdge { piece });
+                }
+                sources.push(Source::ScrewPrismRim { piece, end: false });
+                sources.push(Source::ScrewPrismRim { piece, end: true });
+            }
+        }
         SweptTool::Prism { outline, .. } => {
             for piece in 0..outline.len() {
                 sources.push(Source::PrismFace { piece });
@@ -1568,6 +1660,7 @@ pub fn sweep_solid_within(
         frame,
         class,
         clip,
+        crest_gap: false,
         sources,
         grids: Vec::new(),
         critical: Vec::new(),
@@ -1593,8 +1686,20 @@ pub fn sweep_solid_within(
         check_ends_clear(&engine)?;
     }
 
+    // --- A screw whose grooves meet: above a crest level nothing stays. Build
+    //     what stays below it, and take that from the clip at the end.
+    let mut crest = None;
+    if matches!(class, Class::Screw(_)) && clip.radius[0] == 0.0 && clip.angle.is_none() && whole_level_on() {
+        crest = crest_level(&engine)?;
+        if let Some(level) = crest {
+            narrowed = SweepClip { radius: [0.0, level], ..clip.clone() };
+            engine.clip = &narrowed;
+            engine.crest_gap = true;
+        }
+    }
+
     // --- Scan the levels for events.
-    let (l0, l1) = (clip.radius[0], clip.radius[1]);
+    let (l0, l1) = (engine.clip.radius[0], engine.clip.radius[1]);
     let scan = 192;
     let mut levels: Vec<f64> = (0..=scan).map(|k| l0 + (l1 - l0) * k as f64 / scan as f64).collect();
     // Never sample exactly on a critical level: nudge the scan off them.
@@ -1880,13 +1985,466 @@ pub fn sweep_solid_within(
             }
         }
     }
+    // --- At a crest the walls have met: the top arc is no boundary of what stays.
+    if let Some(level) = crest {
+        pieces.retain(|piece| !(piece.level_segment && (piece.points[0].0 - level).abs() < 1e-9 * scale));
+    }
     // --- Assemble loops and build the bodies.
     let loops = assemble_loops(&engine, pieces)?;
     let mut bodies = Vec::new();
     for pieces in loops {
         bodies.push(build_body(&engine, &pieces)?);
     }
+    if crest.is_some() {
+        let [kept] = bodies.as_slice() else {
+            return Err(refuse("whole_level", "what stays below the crest is not one body".into()));
+        };
+        return clip_less(clip, frame_base(&engine), kept);
+    }
     Ok(bodies)
+}
+
+/// Replace a screw loft's side surfaces and helical edges by quintic splines
+/// through the exact screw and its first two derivatives. A cubic interpolant
+/// through `segments + 1` sections misses a turn by h⁴; these by h⁶, which is
+/// what lets a long fine thread be built with few spans. Sections, caps and
+/// parameters are the loft's, so the trims stay as they are.
+fn carry_along_screw(body: &mut BrepSolid, engine: &Engine, c: f64, span: f64, segments: usize) -> Result<(), KernelRefusal> {
+    let origin = engine.clip.axis_origin;
+    let ez = engine.frame.ez;
+    // The six Bézier points of each span collapse to three a span, C² at the joints.
+    let carry = |start: Vec3| -> Vec<Vec3> {
+        let h = span / segments as f64;
+        let axial = ez.scale(start.sub(origin).dot(ez));
+        let radial = start.sub(origin).sub(axial);
+        let at = |k: usize| {
+            let angle = h * k as f64;
+            let r = radial.rotate_about(ez, angle);
+            let value = origin.add(axial).add(r).add(ez.scale(c * angle));
+            (value, ez.cross(r).add(ez.scale(c)), r.scale(-1.0))
+        };
+        let piece = |k: usize| {
+            let ((f0, d0, a0), (f1, d1, a1)) = (at(k), at(k + 1));
+            [
+                f0,
+                f0.add(d0.scale(h / 5.0)),
+                f0.add(d0.scale(2.0 * h / 5.0)).add(a0.scale(h * h / 20.0)),
+                f1.sub(d1.scale(2.0 * h / 5.0)).add(a1.scale(h * h / 20.0)),
+                f1.sub(d1.scale(h / 5.0)),
+                f1,
+            ]
+        };
+        let mut points = Vec::with_capacity(3 * segments + 3);
+        let first = piece(0);
+        points.extend_from_slice(&first[..3]);
+        for k in 0..segments - 1 {
+            let (here, next) = (piece(k), piece(k + 1));
+            points.push(here[3]);
+            points.push(here[4].scale(2.0).sub(here[3]));
+            points.push(next[2]);
+        }
+        let last = piece(segments - 1);
+        points.extend_from_slice(&last[3..]);
+        points
+    };
+    let knots = |lo: f64, hi: f64| -> Vec<f64> {
+        let mut knots = vec![lo; 6];
+        for k in 1..segments {
+            knots.extend([lo + (hi - lo) * k as f64 / segments as f64; 3]);
+        }
+        knots.extend([hi; 6]);
+        knots
+    };
+    let point = |p: &crate::Vec4| Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w);
+    let moved = |p: &crate::Vec4, angle: f64| -> Vec3 {
+        rotate(point(p), origin, ez, angle).add(ez.scale(c * angle))
+    };
+    let tolerance = 1e-7 * engine.scale;
+    for face in body.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
+        let rows = &face.surface.control_points;
+        if rows[0].len() != segments + 1 {
+            continue; // a cap
+        }
+        // The loft's columns must already be this screw, from section to section.
+        if rows.iter().any(|row| moved(&row[0], span).sub(point(&row[segments])).length() > tolerance) {
+            return Err(refuse("screw_loft", "a lofted wall does not follow the screw".into()));
+        }
+        let lifted: Vec<Vec<crate::Vec4>> = rows
+            .iter()
+            .map(|row| {
+                let w = row[0].w;
+                carry(point(&row[0])).into_iter().map(|q| crate::Vec4::from_point(q, w)).collect()
+            })
+            .collect();
+        let v = &face.surface.knots_v;
+        let (lo, hi) = (v[0], *v.last().expect("knots"));
+        face.surface = crate::NurbsSurface::new(face.surface.degree_u, 5, face.surface.knots_u.clone(), knots(lo, hi), lifted)
+            .or_refuse(KernelStage::Fragment, "screw_surface")?;
+    }
+    let height = c * span;
+    let points: rustc_hash::FxHashMap<u64, Vec3> = body.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
+    for edge in &mut body.edges {
+        let (from, to) = (points[&edge.start_vertex_id], points[&edge.end_vertex_id]);
+        let rise = to.sub(from).dot(ez);
+        if (rise.abs() - height.abs()).abs() > tolerance {
+            continue; // lies in a cap
+        }
+        let domain = edge.curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
+        let forward = rise * height > 0.0;
+        let mut path = carry(if forward { from } else { to });
+        if !forward {
+            path.reverse();
+        }
+        edge.curve = NurbsCurve::new(5, knots(domain[0], domain[1]), path.into_iter().map(|q| crate::Vec4::from_point(q, 1.0)).collect())
+            .or_refuse(KernelStage::Fragment, "screw_edge")?;
+    }
+    Ok(())
+}
+
+/// `rows` copies of `row` along the screw, each the image of the last, sharing
+/// the section edges and vertices between neighbours; only the first bottom cap
+/// and the last top cap stay.
+fn stack_screw_rows(
+    row: &BrepSolid,
+    engine: &Engine,
+    c: f64,
+    span: f64,
+    segments: usize,
+    rows: usize,
+) -> Result<BrepSolid, KernelRefusal> {
+    let origin = engine.clip.axis_origin;
+    let ez = engine.frame.ez;
+    let moved = |x: Vec3, copy: usize| -> Vec3 {
+        let angle = span * copy as f64;
+        rotate(x, origin, ez, angle).add(ez.scale(c * angle))
+    };
+    let tolerance = 1e-7 * engine.scale;
+    let height = |x: Vec3| x.sub(origin).dot(ez);
+    let points: rustc_hash::FxHashMap<u64, Vec3> = row.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
+    let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+    for vertex in &row.vertices {
+        low = low.min(height(vertex.point));
+        high = high.max(height(vertex.point));
+    }
+    let at = |id: u64, level: f64| (height(points[&id]) - level).abs() <= tolerance;
+    let in_level = |edge: &crate::topology::EdgeRecord, level: f64| at(edge.start_vertex_id, level) && at(edge.end_vertex_id, level);
+    let (bottom, top) = if c * span > 0.0 { (low, high) } else { (high, low) };
+    // Each bottom vertex and edge of a copy is a top one of the copy before.
+    let mut vertex_below: rustc_hash::FxHashMap<u64, u64> = Default::default();
+    for vertex in row.vertices.iter().filter(|vertex| at(vertex.id, bottom)) {
+        let up = moved(vertex.point, 1);
+        let below = row.vertices.iter().find(|other| at(other.id, top) && other.point.sub(up).length() <= tolerance);
+        let Some(below) = below else { return Err(refuse("screw_rows", "a row's section does not meet the next".into())) };
+        vertex_below.insert(vertex.id, below.id);
+    }
+    let mut edge_below: rustc_hash::FxHashMap<u64, u64> = Default::default();
+    for edge in row.edges.iter().filter(|edge| in_level(edge, bottom)) {
+        let ends = (vertex_below[&edge.start_vertex_id], vertex_below[&edge.end_vertex_id]);
+        let below = row.edges.iter().find(|other| in_level(other, top) && (other.start_vertex_id, other.end_vertex_id) == ends);
+        let Some(below) = below else { return Err(refuse("screw_rows", "a row's section edge does not meet the next".into())) };
+        edge_below.insert(edge.id, below.id);
+    }
+    let face_ids = row.shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| {
+        std::iter::once(face.id).chain(face.loops.iter().flat_map(|l| std::iter::once(l.id).chain(l.coedges.iter().map(|c| c.id))))
+    });
+    let stride = row
+        .vertices
+        .iter()
+        .map(|v| v.id)
+        .chain(row.edges.iter().map(|e| e.id))
+        .chain(face_ids)
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let vertex_id = |id: u64, copy: usize| match vertex_below.get(&id) {
+        Some(&below) if copy > 0 => below + stride * (copy as u64 - 1),
+        _ => id + stride * copy as u64,
+    };
+    let edge_id = |id: u64, copy: usize| match edge_below.get(&id) {
+        Some(&below) if copy > 0 => below + stride * (copy as u64 - 1),
+        _ => id + stride * copy as u64,
+    };
+    let is_cap = |face: &crate::FaceRecord| face.surface.control_points[0].len() != 3 * segments + 3;
+    let cap_level = |face: &crate::FaceRecord, level: f64| {
+        face.loops.iter().flat_map(|l| &l.coedges).all(|coedge| {
+            row.edges.iter().find(|edge| edge.id == coedge.edge_id).is_some_and(|edge| in_level(edge, level))
+        })
+    };
+    let mut stacked = row.clone();
+    stacked.mass_properties_cache = Default::default();
+    stacked.vertices.clear();
+    stacked.edges.clear();
+    for shell in &mut stacked.shells {
+        shell.faces.clear();
+    }
+    for copy in 0..rows {
+        for vertex in &row.vertices {
+            if copy == 0 || !vertex_below.contains_key(&vertex.id) {
+                stacked.vertices.push(crate::topology::VertexRecord { id: vertex_id(vertex.id, copy), point: moved(vertex.point, copy) });
+            }
+        }
+        for edge in &row.edges {
+            if copy == 0 || !edge_below.contains_key(&edge.id) {
+                stacked.edges.push(crate::topology::EdgeRecord {
+                    id: edge_id(edge.id, copy),
+                    curve: transform_curve(&edge.curve, |x| moved(x, copy))?,
+                    t0: edge.t0,
+                    t1: edge.t1,
+                    start_vertex_id: vertex_id(edge.start_vertex_id, copy),
+                    end_vertex_id: vertex_id(edge.end_vertex_id, copy),
+                    degenerate: edge.degenerate,
+                    name: edge.name.clone(),
+                });
+            }
+        }
+        for (target, shell) in stacked.shells.iter_mut().zip(&row.shells) {
+            for face in &shell.faces {
+                if is_cap(face) && !((copy == 0 && cap_level(face, bottom)) || (copy + 1 == rows && cap_level(face, top))) {
+                    continue;
+                }
+                let control_points = face
+                    .surface
+                    .control_points
+                    .iter()
+                    .map(|line| {
+                        line.iter()
+                            .map(|p| {
+                                let w = p.w;
+                                crate::Vec4::from_point(moved(Vec3::new(p.x / w, p.y / w, p.z / w), copy), w)
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let surface = crate::NurbsSurface::new(
+                    face.surface.degree_u,
+                    face.surface.degree_v,
+                    face.surface.knots_u.clone(),
+                    face.surface.knots_v.clone(),
+                    control_points,
+                )
+                .or_refuse(KernelStage::Fragment, "screw_rows")?;
+                let mut copied = face.clone();
+                copied.surface = surface;
+                copied.id += stride * copy as u64;
+                for loop_record in &mut copied.loops {
+                    loop_record.id += stride * copy as u64;
+                    for coedge in &mut loop_record.coedges {
+                        coedge.id += stride * copy as u64;
+                        coedge.edge_id = edge_id(coedge.edge_id, copy);
+                    }
+                }
+                target.faces.push(copied);
+            }
+        }
+    }
+    let issues = stacked.validate();
+    if issues.iter().any(|issue| issue.severity == "error") {
+        return Err(refuse("screw_rows", format!("the stacked thread is invalid: {issues:?}")));
+    }
+    Ok(stacked)
+}
+
+/// Where the clip's solid starts, on its axis.
+fn frame_base(engine: &Engine) -> Vec3 {
+    engine.frame.world([0.0, 0.0, engine.clip.axial[0]])
+}
+
+/// The whole clip cylinder with `kept` taken out of it.
+fn clip_less(clip: &SweepClip, base: Vec3, kept: &BrepSolid) -> Result<Vec<BrepSolid>, KernelRefusal> {
+    let direction = clip.axis_direction.normalized().or_refuse(KernelStage::Collect, "clip_axis")?;
+    let cylinder = crate::make_cylinder_brep(base, direction, clip.radius[1], clip.axial[1] - clip.axial[0])
+        .or_refuse(KernelStage::Fragment, "clip_cylinder")?;
+    if thread_rows_on() {
+        if let Some(direct) = clip_less_direct(&cylinder, base, direction, kept)? {
+            return Ok(vec![direct]);
+        }
+    }
+    let r = crate::boolean_operation(&cylinder, kept, crate::BooleanOperation::Subtract, &Default::default())?;
+    Ok(vec![r])
+}
+
+/// `cylinder` with `kept` taken out, where `kept` runs from cap to cap inside
+/// the wall: nothing crosses, so the result is written down: `kept`'s end loops
+/// become holes in the caps and its sides turn inside out. `None` when the
+/// bodies are not that shape; the caller takes the boolean then.
+fn clip_less_direct(
+    cylinder: &BrepSolid,
+    base: Vec3,
+    direction: Vec3,
+    kept: &BrepSolid,
+) -> Result<Option<BrepSolid>, KernelRefusal> {
+    if kept.shells.len() != 1 || cylinder.shells.len() != 1 {
+        return Ok(None);
+    }
+    let mut stride = 0;
+    for shell in &cylinder.shells {
+        for face in &shell.faces {
+            stride = stride.max(face.id);
+            for loop_record in &face.loops {
+                stride = stride.max(loop_record.id);
+                stride = loop_record.coedges.iter().fold(stride, |m, c| m.max(c.id));
+            }
+        }
+    }
+    stride = cylinder.vertices.iter().fold(stride, |m, v| m.max(v.id));
+    stride = cylinder.edges.iter().fold(stride, |m, e| m.max(e.id)) + 1;
+    let corners = |surface: &crate::NurbsSurface| -> Result<([f64; 4], [Vec3; 3]), String> {
+        let (u0, u1) = (surface.knots_u[0], *surface.knots_u.last().ok_or("knots")?);
+        let (v0, v1) = (surface.knots_v[0], *surface.knots_v.last().ok_or("knots")?);
+        Ok(([u0, u1, v0, v1], [surface.evaluate(u0, v0)?, surface.evaluate(u1, v0)?, surface.evaluate(u0, v1)?]))
+    };
+    let mut result = cylinder.clone();
+    result.mass_properties_cache = Default::default();
+    result.genus = 1;
+    result.vertices.extend(kept.vertices.iter().map(|v| crate::topology::VertexRecord { id: v.id + stride, point: v.point }));
+    for edge in &kept.edges {
+        let mut edge = edge.clone();
+        edge.id += stride;
+        edge.start_vertex_id += stride;
+        edge.end_vertex_id += stride;
+        result.edges.push(edge);
+    }
+    let mut holes = 0;
+    let turned = |loop_record: &crate::topology::LoopRecord| -> Result<crate::topology::LoopRecord, KernelRefusal> {
+        let mut coedges = Vec::with_capacity(loop_record.coedges.len());
+        for coedge in loop_record.coedges.iter().rev() {
+            coedges.push(crate::topology::CoedgeRecord {
+                id: coedge.id + stride,
+                edge_id: coedge.edge_id + stride,
+                forward: !coedge.forward,
+                pcurve: coedge.pcurve.reversed().or_refuse(KernelStage::Fragment, "clip_less_pcurve")?,
+            });
+        }
+        Ok(crate::topology::LoopRecord { id: loop_record.id + stride, coedges })
+    };
+    for face in &kept.shells[0].faces {
+        let mut loops = Vec::with_capacity(face.loops.len());
+        for loop_record in &face.loops {
+            loops.push(turned(loop_record)?);
+        }
+        if !face.surface.is_affine().unwrap_or(false) {
+            result.shells[0].faces.push(crate::FaceRecord {
+                id: face.id + stride,
+                surface: face.surface.clone(),
+                same_sense: !face.same_sense,
+                loops,
+                name: face.name.clone(),
+            });
+            continue;
+        }
+        // An end: its loops are holes in the cap at its height, read in that cap's chart.
+        let (from_box, from) = corners(&face.surface).or_refuse(KernelStage::Fragment, "clip_less_chart")?;
+        let height = from[0].sub(base).dot(direction);
+        let mut caps = result.shells[0].faces.iter_mut().filter(|cap| {
+            cap.surface.is_affine().unwrap_or(false)
+                && cap.surface.evaluate(cap.surface.knots_u[0], cap.surface.knots_v[0]).is_ok_and(|p| (p.sub(base).dot(direction) - height).abs() < 1e-9 * (1.0 + height.abs()))
+        });
+        let (Some(cap), None) = (caps.next(), caps.next()) else { return Ok(None) };
+        let (to_box, to) = corners(&cap.surface).or_refuse(KernelStage::Fragment, "clip_less_chart")?;
+        let (eu, ev) = (to[1].sub(to[0]), to[2].sub(to[0]));
+        if eu.dot(ev).abs() > 1e-9 * eu.length() * ev.length() {
+            return Ok(None);
+        }
+        let chart = |p: Vec3| {
+            let d = p.sub(to[0]);
+            [
+                to_box[0] + (to_box[1] - to_box[0]) * d.dot(eu) / eu.dot(eu),
+                to_box[2] + (to_box[3] - to_box[2]) * d.dot(ev) / ev.dot(ev),
+            ]
+        };
+        let source = |a: f64, b: f64| from[0].add(from[1].sub(from[0]).scale(a)).add(from[2].sub(from[0]).scale(b));
+        let (origin, across, up) = (chart(source(0.0, 0.0)), chart(source(1.0, 0.0)), chart(source(0.0, 1.0)));
+        for loop_record in &mut loops {
+            for coedge in &mut loop_record.coedges {
+                let curve = &coedge.pcurve;
+                let control_points = curve
+                    .control_points
+                    .iter()
+                    .map(|p| {
+                        let a = (p.x / p.w - from_box[0]) / (from_box[1] - from_box[0]);
+                        let b = (p.y / p.w - from_box[2]) / (from_box[3] - from_box[2]);
+                        let x = origin[0] + a * (across[0] - origin[0]) + b * (up[0] - origin[0]);
+                        let y = origin[1] + a * (across[1] - origin[1]) + b * (up[1] - origin[1]);
+                        crate::Vec4 { x: x * p.w, y: y * p.w, z: p.z, w: p.w }
+                    })
+                    .collect();
+                coedge.pcurve = NurbsCurve::new(curve.degree, curve.knots.clone(), control_points)
+                    .or_refuse(KernelStage::Fragment, "clip_less_pcurve")?;
+            }
+        }
+        cap.loops.extend(loops);
+        holes += 1;
+    }
+    if holes != 2 || result.validate().iter().any(|issue| issue.severity == "error") {
+        return Ok(None);
+    }
+    Ok(Some(result))
+}
+
+/// The level above which a screw's sweep covers every angle, up to the clip,
+/// when the material between its turns narrows to nothing there; `None` when
+/// the sweep leaves something at the clip's edge.
+fn crest_level(engine: &Engine) -> Result<Option<f64>, KernelRefusal> {
+    let whole = |level: f64| -> Result<bool, KernelRefusal> {
+        match engine.intervals_at(level) {
+            Ok(_) => Ok(false),
+            Err(error) if error.message.contains(WHOLE_LEVEL) => Ok(true),
+            Err(error) => Err(error),
+        }
+    };
+    let [l0, l1] = engine.clip.radius;
+    let scan = 64;
+    let level_at = |k: usize| l0 + (l1 - l0) * k as f64 / scan as f64;
+    if !whole(l1)? {
+        return Ok(None);
+    }
+    let mut first = scan;
+    while first > 0 && whole(level_at(first - 1))? {
+        first -= 1;
+    }
+    if first == 0 {
+        return Ok(None);
+    }
+    let (mut below, mut above) = (level_at(first - 1), level_at(first));
+    for _ in 0..60 {
+        let middle = 0.5 * (below + above);
+        if whole(middle)? {
+            above = middle;
+        } else {
+            below = middle;
+        }
+    }
+    // The material must narrow to nothing there, not stop at some width. Near
+    // the end the walls have already crossed unseen (the oracle stops seeing the
+    // gap a little past the crest), so the crest is where the gap, measured
+    // well below, extrapolates to zero.
+    let gap = |level: f64| -> Result<f64, KernelRefusal> {
+        Ok(TAU - engine.intervals_at(level)?.iter().map(|interval| interval.hi - interval.lo).sum::<f64>())
+    };
+    let step = 4e-5 * (l1 - l0);
+    let (x0, x1, x2) = (below - 3.0 * step, below - 2.0 * step, below - step);
+    let (g0, g1, g2) = (gap(x0)?, gap(x1)?, gap(x2)?);
+    if !(g2 > 0.0 && g1 > g2 && g0 > g1) || g2 > 16.0 * (g1 - g2) {
+        return Ok(None);
+    }
+    let curve = |x: f64| {
+        g0 * (x - x1) * (x - x2) / ((x0 - x1) * (x0 - x2))
+            + g1 * (x - x0) * (x - x2) / ((x1 - x0) * (x1 - x2))
+            + g2 * (x - x0) * (x - x1) / ((x2 - x0) * (x2 - x1))
+    };
+    let (mut lo, mut hi) = (x2, below + step);
+    if curve(hi) > 0.0 {
+        return Ok(None);
+    }
+    for _ in 0..80 {
+        let middle = 0.5 * (lo + hi);
+        if curve(middle) > 0.0 {
+            lo = middle;
+        } else {
+            hi = middle;
+        }
+    }
+    Ok(Some(0.5 * (lo + hi)))
 }
 
 fn find_events(
@@ -1924,8 +2482,8 @@ fn find_events(
 }
 
 /// The candidate of `source` at `level` nearest `guess` (or its critical point
-/// at that level).
-fn end_value(engine: &Engine, source: usize, level: f64, guess: f64) -> f64 {
+/// at that level); `fallback` when the source has none there.
+fn end_value(engine: &Engine, source: usize, level: f64, guess: f64, fallback: f64) -> f64 {
     let mut candidates = Vec::new();
     engine.source_candidates(source, level, &mut candidates);
     let mut options: Vec<f64> = candidates.iter().map(|c| c.0).collect();
@@ -1934,7 +2492,7 @@ fn end_value(engine: &Engine, source: usize, level: f64, guess: f64) -> f64 {
             options.push(critical.1);
         }
     }
-    let mut best = guess;
+    let mut best = fallback;
     let mut distance = f64::INFINITY;
     for option in options {
         let d = engine.o_difference(option, guess).abs();
@@ -2020,10 +2578,17 @@ fn sample_band(
         // Ends: the same source's value at exactly the band's end levels,
         // nearest the linear extrapolation of the two nearest samples.
         for i in 0..count {
-            for (end, inner, inner2, level) in [(0usize, 1usize, 2usize, a), (n, n - 1, n - 2, b)] {
-                let extrapolate = |values: &Vec<f64>| 2.0 * values[inner] - values[inner2];
-                lo[i][end] = end_value(engine, lo_src[i][inner], level, extrapolate(&lo[i]));
-                hi[i][end] = end_value(engine, hi_src[i][inner], level, extrapolate(&hi[i]));
+            for (end, inner, inner2, inner3, level) in [(0usize, 1usize, 2usize, 3usize, a), (n, n - 1, n - 2, n - 3, b)] {
+                // A quadratic in the sample index through the three nearest samples.
+                // The levels cluster as σ² at the ends, so a regular end is quadratic
+                // in σ and a √ end (a tip) linear: this is exact for both, where
+                // `2v₁ − v₂` misses the first by the slope times a sample spacing. A
+                // source whose domain ends at this level has no candidate there, so
+                // the estimate IS the end value (1e-3 on the bar swung on its edge).
+                let near = |values: &Vec<f64>| 2.0 * values[inner] - values[inner2];
+                let quadratic = |values: &Vec<f64>| 3.0 * values[inner] - 3.0 * values[inner2] + values[inner3];
+                lo[i][end] = end_value(engine, lo_src[i][inner], level, near(&lo[i]), quadratic(&lo[i]));
+                hi[i][end] = end_value(engine, hi_src[i][inner], level, near(&hi[i]), quadratic(&hi[i]));
             }
         }
         // Accuracy: compare the fitted ends at the σ mid-points with exact values.
@@ -2036,7 +2601,8 @@ fn sample_band(
                     .collect();
                 let curve = fit_piece(&points)?;
                 let parameters = chord_parameters(&points);
-                for k in (1..n - 1).step_by((n / 8).max(1)) {
+                // The end spans too: an end value is read differently from the samples.
+                for k in (1..n - 1).step_by((n / 8).max(1)).chain([0, n - 1]) {
                     let s = 0.5 * (sigma[k] + sigma[k + 1]);
                     let level = level_at(s);
                     let intervals = engine.intervals_at(level)?;
@@ -2361,7 +2927,13 @@ fn build_body(engine: &Engine, pieces: &[Piece]) -> Result<BrepSolid, KernelRefu
     match engine.class {
         Class::Screw(c) => {
             let span = (clip.axial[1] - clip.axial[0]) / c; // radians of screw
-            let sections = ((span.abs() / TAU * 64.0).ceil() as usize).max(8) + 1;
+            // Over a crest the walls are re-carried below to high order, so 12 a turn is enough.
+            let per_turn = if engine.crest_gap { 12.0 } else { 64.0 };
+            // Every turn is the screw image of the first: build one and stack
+            // copies, so no surface or edge runs the thread's whole length.
+            let rows = if engine.crest_gap && thread_rows_on() { (span.abs() / TAU / TURNS_PER_ROW).round().max(1.0) as usize } else { 1 };
+            let span = span / rows as f64;
+            let sections = ((span.abs() / TAU * per_turn).ceil() as usize).max(8) + 1;
             let mut lofted = Vec::with_capacity(sections);
             for k in 0..sections {
                 let angle = span * k as f64 / (sections - 1) as f64;
@@ -2372,7 +2944,14 @@ fn build_body(engine: &Engine, pieces: &[Piece]) -> Result<BrepSolid, KernelRefu
                     .collect::<Result<_, _>>()?;
                 lofted.push(moved);
             }
-            loft_profile_brep(&lofted)
+            let mut body = loft_profile_brep(&lofted)?;
+            if engine.crest_gap {
+                carry_along_screw(&mut body, engine, c, span, sections - 1)?;
+            }
+            if rows > 1 {
+                body = stack_screw_rows(&body, engine, c, span, sections - 1, rows)?;
+            }
+            Ok(body)
         }
         Class::Turn => {
             let angle = clip.angle.map(|a| a[1] - a[0]).unwrap_or(TAU);

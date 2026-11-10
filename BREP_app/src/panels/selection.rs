@@ -80,14 +80,23 @@ impl SelectionPanel {
     /// `hits` as it draws. Called by the bottom bar in modeling mode.
     pub fn show_status_bar(&mut self, ui: &mut egui::Ui, state: &mut EngineState, document: u64) {
         let inspection = self.inspection.read(state, document);
-        ui.horizontal_wrapped(|ui| {
+        // `Align::Min` for the same reason as the bar's own row: centring
+        // against the unbounded height below would double the bar.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            // Measurements hold the right end, leaving the filter button room
+            // on a narrow bar; a clipped reading shows in full on hover.
             if let Some(text) = inspection["text"].as_str().filter(|s| !s.is_empty()) {
-                ui.label(text);
-                ui.separator();
+                let width = (ui.available_width() - 100.0).max(0.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(width);
+                    ui.add(egui::Label::new(text).truncate());
+                });
             }
-            // Share the existing row; the filter becomes a popup when the
-            // measurements leave too little room for all its checkboxes.
-            self.show_filter_bar(ui, state);
+            // The filter becomes a popup when the measurements leave too
+            // little room for all its checkboxes.
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.horizontal_wrapped(|ui| self.show_filter_bar(ui, state));
+            });
         });
     }
 

@@ -115,8 +115,14 @@
 //! edit built is read. It is the same edit performed the other way round, from
 //! the ORIGINAL body and the motion, which is why it can return a body with a
 //! different face count. `transform_face` reaches it only after `accept_sound`
-//! has refused, so no motion that builds today changes by a bit, and a motion
-//! `move_faces` / `rotate_faces` itself refuses never reaches it.
+//! has refused, so no motion that builds today changes by a bit. Of the motions
+//! `move_faces` / `rotate_faces` themselves refuse, only one reaches it: a turned
+//! face TANGENT to a fillet beside it (`ruling_edge`). The fillet has no
+//! half-space, so the tool is bounded past it by the planar faces around it
+//! (`tangent_surround`). On the side that moves in, the plane cuts the fillet in
+//! a new ruling. On the side that moves out, it may miss the fillet altogether,
+//! and the fillet is then filled in, the tilted face meeting the wall beyond it.
+//! `reblend_lost_fillets` rounds that edge again at the fillet's radius.
 //!
 //! Names are RE-STAMPED rather than collected, because the boolean mints its
 //! own faces: a result face whose carrier is an original face's carrier (at its
@@ -328,13 +334,23 @@ pub fn recut_moved_planes_rigid(
         // Every face that bounds this one, with its outward plane at HOME and
         // where the motion LEAVES it (the same plane for an unmoved face).
         let mut neighbour_planes: HashMap<u64, ((Vec3, f64), (Vec3, f64))> = HashMap::default();
+        // A turned face's TANGENT curved neighbours (see `tangent_surround`).
+        let mut tangent_bands: HashSet<u64> = HashSet::default();
         let polygon = trim_polygon(solid, face, normal, edge_band)?;
         for source in &polygon.sources {
             let &EdgeSource::Neighbour(neighbour) = source else { continue };
-            if neighbour_planes.contains_key(&neighbour) {
+            if neighbour_planes.contains_key(&neighbour) || tangent_bands.contains(&neighbour) {
                 continue;
             }
             let other = face_by_id(solid, neighbour)?;
+            if motion.rotation.is_some()
+                && !moved_set.contains(&neighbour)
+                && plane_of_surface(&other.surface, tolerance.max(1e-9) * 10.0, OP).is_err()
+                && band_is_tangent_along_shared_edges(face, other, normal)
+            {
+                tangent_bands.insert(neighbour);
+                continue;
+            }
             let plane = plane_of_surface(&other.surface, tolerance.max(1e-9) * 10.0, OP)
                 .map_err(|error| {
                     KernelRefusal::unsupported(
@@ -376,6 +392,12 @@ pub fn recut_moved_planes_rigid(
                 format!("{OP}: face {id}{}'s trim could not be cut into convex cells — {error}", named(face)),
             )
         })?;
+
+        let surround = if tangent_bands.is_empty() {
+            None
+        } else {
+            Some(tangent_surround(solid, face, normal, offset, &tangent_bands, &moved_set, tolerance)?)
+        };
 
         for cell in &cells {
             let seat = polygon.frame.lift(cell.centroid());
@@ -420,7 +442,25 @@ pub fn recut_moved_planes_rigid(
                     HalfSpace { normal: outer.0.scale(-1.0), offset: -outer.1 },
                 ]
             };
+            // A growing cell beside a tangent band also fills what the band
+            // rounded off, so its inner wall starts behind the band.
+            let touches_band = cell.sources.iter().any(|source| {
+                matches!(source, EdgeSource::Neighbour(neighbour) if tangent_bands.contains(neighbour))
+            });
+            let (inner, outer) = match (&surround, adds && touches_band) {
+                (Some(surround), true) => (inner, (outer.0, outer.1 - surround.inner_wall_depth)),
+                _ => (inner, outer),
+            };
             let mut spaces = clip.clone();
+            if let (Some(surround), true) = (&surround, touches_band) {
+                for plane in &surround.planes {
+                    push_unique(
+                        &mut spaces,
+                        HalfSpace { normal: plane.0, offset: plane.1 },
+                        tolerance,
+                    );
+                }
+            }
             if motion.rotation.is_none() {
                 // The slab the carrier sweeps, in the arithmetic this road has
                 // always used for it.
@@ -448,6 +488,19 @@ pub fn recut_moved_planes_rigid(
             let mut sides: Vec<HalfSpace> = Vec::new();
 
             for (edge, source) in cell.sources.iter().enumerate() {
+                // A tangent band has no half-space: `surround.planes` bound the
+                // tool past it. For the cell's own read of its bounds, the edge
+                // stands for itself.
+                if matches!(source, EdgeSource::Neighbour(neighbour) if tangent_bands.contains(neighbour)) {
+                    let plane = polygon.frame.edge_plane(cell, edge);
+                    let home_sign = if plane.0.dot(seat) - plane.1 > 0.0 { -1.0 } else { 1.0 };
+                    push_unique(
+                        &mut at_home,
+                        HalfSpace { normal: plane.0.scale(home_sign), offset: plane.1 * home_sign },
+                        tolerance,
+                    );
+                    continue;
+                }
                 let (home, bound) = match source {
                     EdgeSource::Neighbour(neighbour) => {
                         let &(home, left) = neighbour_planes
@@ -508,7 +561,12 @@ pub fn recut_moved_planes_rigid(
             }
             cell_is_its_bounds(face, cell, &polygon.frame, &at_home, scale)?;
             if motion.rotation.is_some() {
-                one_way_only(id, &clip, &sides, wedge(outer, inner), tolerance, || named(face))?;
+                let (home_inner, home_outer) = if adds {
+                    ((moved_normal, moved_offset), (normal, offset))
+                } else {
+                    ((normal, offset), (moved_normal, moved_offset))
+                };
+                one_way_only(id, &clip, &sides, wedge(home_outer, home_inner), tolerance, || named(face))?;
             }
 
             let tool = convex_solid(&spaces, probe, tolerance).map_err(|error| {
@@ -575,6 +633,281 @@ pub fn recut_moved_planes_rigid(
             })?;
     }
     Ok(restamp(cut, solid, &moved_set, &motion, tolerance))
+}
+
+/// Put back the fillets a re-cut filled in.
+///
+/// Where a turned plane misses a tangent fillet, the re-cut leaves the turned
+/// face meeting the wall beyond it at a sharp edge. That edge is rounded again
+/// at the fillet's radius and under its name, so the face re-meets its fillet.
+/// A fillet that cannot be re-made stays filled in; the returned notes name
+/// each one, with the reason, so the loss is never silent.
+pub fn reblend_lost_fillets(original: &BrepSolid, moved: &[u64], mut body: BrepSolid) -> (BrepSolid, Vec<String>) {
+    let tolerance = (solid_model_scale(original) * 1e-6).max(1e-9);
+    let moved_set: HashSet<u64> = moved.iter().copied().collect();
+    let faces: HashMap<u64, &FaceRecord> =
+        original.shells.iter().flat_map(|shell| &shell.faces).map(|face| (face.id, face)).collect();
+    let mut owners: HashMap<u64, Vec<u64>> = HashMap::default();
+    for face in faces.values() {
+        for coedge in face.loops.iter().flat_map(|wire| &wire.coedges) {
+            owners.entry(coedge.edge_id).or_default().push(face.id);
+        }
+    }
+    let across = |face: &FaceRecord| -> Vec<u64> {
+        let mut found: Vec<u64> = face
+            .loops
+            .iter()
+            .flat_map(|wire| &wire.coedges)
+            .flat_map(|coedge| owners.get(&coedge.edge_id).into_iter().flatten().copied())
+            .filter(|id| *id != face.id)
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found
+    };
+    let mut notes = Vec::new();
+    let mut ordered = moved.to_vec();
+    ordered.sort_unstable();
+    for id in ordered {
+        let Some(&face) = faces.get(&id) else { continue };
+        let Ok(plane) = plane_of_surface(&face.surface, tolerance * 10.0, OP) else { continue };
+        for band_id in across(face) {
+            let band = faces[&band_id];
+            let Some(band_name) = band.name.clone() else { continue };
+            if moved_set.contains(&band_id)
+                || plane_of_surface(&band.surface, tolerance * 10.0, OP).is_ok()
+                || !band_is_tangent_along_shared_edges(face, band, plane.normal)
+                || body.shells.iter().flat_map(|shell| &shell.faces).any(|f| f.name.as_deref() == Some(&band_name))
+            {
+                continue;
+            }
+            // Only a constant radius can be rolled again; anything else is
+            // still a fillet this edit filled in, so it is named.
+            let radius = super::face_move::ruled_revolution_carrier(&band.surface)
+                .filter(|(_, rho0, rho1, _)| (rho0 - rho1).abs() <= tolerance)
+                .map(|(_, rho0, _, _)| rho0);
+            let Some(rho0) = radius else {
+                notes.push(format!(
+                    "transformFace: fillet `{band_name}` was lost: the moved face no longer reaches \
+                     it, so it was filled in, and only a constant-radius fillet can be re-made"
+                ));
+                continue;
+            };
+            let remade = across(band)
+                .into_iter()
+                .filter(|wall| *wall != id)
+                .find_map(|wall| {
+                    let wall = faces[&wall];
+                    let wall_plane = plane_of_surface(&wall.surface, tolerance * 10.0, OP).ok()?;
+                    band_is_tangent_along_shared_edges(wall, band, wall_plane.normal).then_some(wall)
+                })
+                .ok_or_else(|| "the wall beyond it could not be read".to_string())
+                .and_then(|wall| sharp_edge_between(&body, face, wall))
+                .and_then(|edge| {
+                    let rebuilt = crate::fillet_edge(&body, edge, rho0, Some(&band_name)).map_err(|e| e.to_string())?;
+                    let issues = rebuilt.validate();
+                    if !issues.is_empty() {
+                        return Err(format!("the new fillet is invalid: {issues:?}"));
+                    }
+                    // Checked one by one, so a fillet the acceptance would
+                    // refuse costs that fillet and not the whole edit.
+                    crate::accept_sound(rebuilt, "transformFace").map_err(|e| e.to_string())
+                });
+            match remade {
+                Ok(rebuilt) => {
+                    body = rebuilt;
+                    // A blend that ran round the old fillet has nothing to run
+                    // round until it too is re-made; that is not built.
+                    for beside in across(band) {
+                        let beside = faces[&beside];
+                        let Some(beside_name) = beside.name.as_deref() else { continue };
+                        if !moved_set.contains(&beside.id)
+                            && plane_of_surface(&beside.surface, tolerance * 10.0, OP).is_err()
+                            && !body.shells.iter().flat_map(|shell| &shell.faces).any(|f| f.name.as_deref() == Some(beside_name))
+                        {
+                            notes.push(format!(
+                                "transformFace: blend `{beside_name}`, which ran round fillet \
+                                 `{band_name}`, was not re-made: the fillet was rebuilt at its radius \
+                                 and the faces either side of that blend now meet over it"
+                            ));
+                        }
+                    }
+                }
+                Err(reason) => notes.push(format!(
+                    "transformFace: fillet `{band_name}` (radius {rho0}) was lost: the moved face no \
+                     longer reaches it, so it was filled in, and it could not be re-made ({reason})"
+                )),
+            }
+        }
+    }
+    (body, notes)
+}
+
+/// The one edge of `body` between the faces named as `first` and `second`.
+fn sharp_edge_between(body: &BrepSolid, first: &FaceRecord, second: &FaceRecord) -> Result<u64, String> {
+    let edges_of = |face: &FaceRecord| -> Result<HashSet<u64>, String> {
+        let name = face.name.as_deref().ok_or_else(|| format!("face {} has no name to find it by", face.id))?;
+        Ok(body
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|f| f.name.as_deref() == Some(name))
+            .flat_map(|f| f.loops.iter().flat_map(|wire| &wire.coedges).map(|coedge| coedge.edge_id))
+            .collect())
+    };
+    let (a, b) = (edges_of(first)?, edges_of(second)?);
+    let mut shared = a.intersection(&b).copied();
+    match (shared.next(), shared.next()) {
+        (Some(edge), None) => Ok(edge),
+        _ => Err("no single sharp edge joins the turned face to the wall beyond it".to_string()),
+    }
+}
+
+/// What bounds a turned face's wedge past the tangent band (a fillet) beside it.
+struct TangentSurround {
+    /// Outward planes `n̂·x ≤ o` of the planar faces reached across curved faces.
+    planes: Vec<(Vec3, f64)>,
+    /// How far behind the face a growing tool's inner wall must start.
+    inner_wall_depth: f64,
+}
+
+/// Is `band` tangent to the planar `face` along the edges they share?
+fn band_is_tangent_along_shared_edges(
+    face: &FaceRecord,
+    band: &FaceRecord,
+    normal: Vec3,
+) -> bool {
+    let own: HashSet<u64> =
+        face.loops.iter().flat_map(|wire| &wire.coedges).map(|coedge| coedge.edge_id).collect();
+    let mut shared = 0usize;
+    for coedge in band.loops.iter().flat_map(|wire| &wire.coedges) {
+        if !own.contains(&coedge.edge_id) {
+            continue;
+        }
+        let Ok([q0, q1]) = coedge.pcurve.domain() else {
+            return false;
+        };
+        let Ok(uv) = coedge.pcurve.evaluate(0.5 * (q0 + q1)) else {
+            return false;
+        };
+        let Ok(band_normal) = band.surface.normal(uv.x, uv.y) else {
+            return false;
+        };
+        if band_normal.cross(normal).length() > 1e-4 {
+            return false;
+        }
+        shared += 1;
+    }
+    shared > 0
+}
+
+/// The planar faces that close the region around a turned face's tangent bands:
+/// every planar face reached from the bands through curved faces only.
+///
+/// A plane missing a fillet leaves no ruling to re-meet, so the growing side's
+/// answer is the fillet filled in and the tilted face meeting the wall beyond
+/// it. Those walls bound the tool, which is sound only where the material is
+/// convex: every plane must hold every vertex of the region, or the tool could
+/// fill a pocket the part really has.
+fn tangent_surround(
+    solid: &BrepSolid,
+    face: &FaceRecord,
+    normal: Vec3,
+    offset: f64,
+    bands: &HashSet<u64>,
+    moved: &HashSet<u64>,
+    tolerance: f64,
+) -> Result<TangentSurround, KernelRefusal> {
+    let mut owners: HashMap<u64, Vec<u64>> = HashMap::default();
+    for other in solid.shells.iter().flat_map(|shell| &shell.faces) {
+        for coedge in other.loops.iter().flat_map(|wire| &wire.coedges) {
+            owners.entry(coedge.edge_id).or_default().push(other.id);
+        }
+    }
+    let edges: HashMap<u64, &EdgeRecord> = solid.edges.iter().map(|edge| (edge.id, edge)).collect();
+    let points: HashMap<u64, Vec3> =
+        solid.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
+    let plane_band = tolerance.max(1e-9) * 10.0;
+
+    let mut curved: HashSet<u64> = bands.clone();
+    let mut planar: HashSet<u64> = HashSet::default();
+    let mut stack: Vec<u64> = bands.iter().copied().collect();
+    while let Some(id) = stack.pop() {
+        let current = face_by_id(solid, id)?;
+        for coedge in current.loops.iter().flat_map(|wire| &wire.coedges) {
+            for &next in owners.get(&coedge.edge_id).into_iter().flatten() {
+                if next == id || next == face.id || curved.contains(&next) || planar.contains(&next) {
+                    continue;
+                }
+                if moved.contains(&next) {
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "curved_neighbour",
+                        format!(
+                            "{OP}: face {next} is also selected and borders the fillet beside face \
+                             {}, so what bounds the tool past that fillet is itself moving; refusing",
+                            face.id
+                        ),
+                    ));
+                }
+                let other = face_by_id(solid, next)?;
+                if plane_of_surface(&other.surface, plane_band, OP).is_ok() {
+                    planar.insert(next);
+                } else {
+                    curved.insert(next);
+                    stack.push(next);
+                }
+            }
+        }
+    }
+
+    let vertices_of = |id: u64| -> Result<Vec<Vec3>, KernelRefusal> {
+        let mut found = Vec::new();
+        for coedge in face_by_id(solid, id)?.loops.iter().flat_map(|wire| &wire.coedges) {
+            if let Some(edge) = edges.get(&coedge.edge_id) {
+                found.extend(points.get(&edge.start_vertex_id).copied());
+                found.extend(points.get(&edge.end_vertex_id).copied());
+            }
+        }
+        Ok(found)
+    };
+    let mut region: Vec<Vec3> = Vec::new();
+    let mut depth = 0.0f64;
+    for &id in &curved {
+        for point in vertices_of(id)? {
+            depth = depth.max(offset - normal.dot(point));
+            region.push(point);
+        }
+    }
+    let mut ordered: Vec<u64> = planar.iter().copied().collect();
+    ordered.sort_unstable();
+    for &id in &ordered {
+        region.extend(vertices_of(id)?);
+    }
+
+    let mut planes = Vec::new();
+    for &id in &ordered {
+        let other = face_by_id(solid, id)?;
+        let plane = plane_of_surface(&other.surface, plane_band, OP)
+            .map_err(|error| KernelRefusal::unsupported(KernelStage::Classify, "curved_neighbour", error.to_string()))?;
+        let outward = if other.same_sense { plane.normal } else { plane.normal.scale(-1.0) };
+        let outward_offset = outward.dot(plane.origin);
+        if let Some(point) = region.iter().find(|point| outward.dot(**point) - outward_offset > plane_band) {
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "curved_neighbour",
+                format!(
+                    "{OP}: the part is not convex around the fillet beside face {} (face {id}{} has \
+                     material on both sides, at {point:?}), so the wedge a turn adds there has no \
+                     bound that keeps it out of the part's other features; refusing",
+                    face.id,
+                    named(other)
+                ),
+            ));
+        }
+        planes.push((outward, outward_offset));
+    }
+    Ok(TangentSurround { planes, inner_wall_depth: depth * 1.5 + tolerance })
 }
 
 /// Add a half-space unless an equal one (same normal, same offset within the
@@ -1067,15 +1400,17 @@ fn split_by_line(cell: &Cell, sides: &[f64], band: f64) -> [Cell; 2] {
         let source = cell.sources[j];
         let p_on = fp.abs() <= band;
         let q_on = fq.abs() <= band;
-        // P itself, to every side it is on; an on-line point's leaving edge
-        // runs along the line unless Q is on that side too.
+        // P itself, to every side it is on. Only an on-line point's leaving
+        // edge can run along the line, and only when Q is off that side. A
+        // point strictly on a side keeps the edge's source even when the edge
+        // crosses: the piece from P to the crossing is still that edge.
         if fp > band || p_on {
             positive.points.push(p);
-            positive.sources.push(if fq > band || q_on { source } else { EdgeSource::Hinge });
+            positive.sources.push(if !p_on || fq > band || q_on { source } else { EdgeSource::Hinge });
         }
         if fp < -band || p_on {
             negative.points.push(p);
-            negative.sources.push(if fq < -band || q_on { source } else { EdgeSource::Hinge });
+            negative.sources.push(if !p_on || fq < -band || q_on { source } else { EdgeSource::Hinge });
         }
         // A strict crossing: the crossing point goes to both sides.
         if (fp > band && fq < -band) || (fp < -band && fq > band) {

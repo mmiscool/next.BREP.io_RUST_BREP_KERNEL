@@ -109,6 +109,50 @@ pub(super) fn coedge_to_vertex(coedge: &CoedgeRecord, edges: &HashMap<u64, EdgeR
     })
 }
 
+/// The transition corners that cannot move to their recovered corner, by
+/// lateral index: a mitred chamfer's outer corner carries an edge whose far face
+/// is no neighbour of the strip and does not reach the recovered corner, so the
+/// corner stays and the mitre becomes the edge along lateral x wall (four
+/// chamfers around a block's top). At most one per lateral: with both ends
+/// anchored there is no corner left to recover, and the gate refuses it.
+fn anchored_corners(
+    solid: &BrepSolid,
+    boundary_edges: &HashSet<u64>,
+    corners: &[u64],
+    neighbours: &[u64; 4],
+    plan: &HealPlan,
+    plane_tolerance: f64,
+) -> HashMap<usize, u64> {
+    let held_at = |corner: u64, target: Vec3| -> bool {
+        solid.edges.iter().filter(|edge| {
+            !boundary_edges.contains(&edge.id)
+                && (edge.start_vertex_id == corner || edge.end_vertex_id == corner)
+        }).any(|edge| {
+            solid.shells.iter().flat_map(|shell| &shell.faces).filter(|face| {
+                !neighbours.contains(&face.id)
+                    && face.loops.iter().flat_map(|l| &l.coedges).any(|coedge| coedge.edge_id == edge.id)
+            }).any(|face| {
+                plane_of_surface(&face.surface, plane_tolerance, "delete_face_and_heal").is_ok_and(|plane| {
+                    target.sub(plane.origin).dot(plane.normal).abs() > plane_tolerance
+                })
+            })
+        })
+    };
+    let mut anchored = HashMap::default();
+    for &lateral in &plan.lateral {
+        let target = plan.lateral_point[&lateral];
+        let ends = [corners[lateral], corners[(lateral + 1) % 4]];
+        let held: Vec<u64> = ends.into_iter().filter(|corner| held_at(*corner, target)).collect();
+        if let [corner] = held[..] {
+            let at_target = solid.vertices.iter().any(|vertex| vertex.id == corner && vertex.point.sub(target).length() <= plane_tolerance);
+            if !at_target {
+                anchored.insert(lateral, corner);
+            }
+        }
+    }
+    anchored
+}
+
 /// Golovanov §6.12 — delete a transition face and heal the hole by extending
 /// and re-intersecting its immediate neighbours. See the module docs for the
 /// covered vs deferred cases. Returns a fresh solid that is guaranteed to
@@ -341,6 +385,9 @@ pub(super) fn delete_face_and_heal_impl(
     // and neighbour[i]; exactly one of those two is a lateral face, and the
     // corner collapses onto that lateral's recovered corner.
     let lateral_set: HashSet<usize> = plan.lateral.iter().copied().collect();
+    let plane_tolerance = (scale * 1e-6).max(1e-7);
+    let anchored_corners =
+        anchored_corners(&solid, &boundary_edge_ids, &transition_vertices, &neighbour_ids, &plan, plane_tolerance);
     let mut collapse: HashMap<u64, u64> = HashMap::default();
     for index in 0..4usize {
         let previous = (index + 3) % 4;
@@ -356,8 +403,33 @@ pub(super) fn delete_face_and_heal_impl(
                         lateral face (unexpected neighbour ordering)",
             ));
         };
+        if anchored_corners.get(&lateral_index) == Some(&transition_vertices[index]) {
+            continue;
+        }
         let target = lateral_vertex[&lateral_index];
         collapse.insert(transition_vertices[index], target);
+    }
+    // Each anchored corner reaches its recovered corner along lateral x wall.
+    let mut bridges: HashMap<u64, (u64, u64)> = HashMap::default();
+    let mut bridge_of_lateral: HashMap<usize, (u64, u64)> = HashMap::default();
+    let mut bridge_edges: Vec<EdgeRecord> = Vec::new();
+    for (lateral_index, corner) in &anchored_corners {
+        let target = lateral_vertex[lateral_index];
+        let edge_id = alloc();
+        let from = edge_point(&solid, *corner)?;
+        let to = plan.lateral_point[lateral_index];
+        bridge_edges.push(EdgeRecord {
+            id: edge_id,
+            curve: make_line(from, to).or_refuse(KernelStage::Fragment, "make_line")?,
+            t0: 0.0,
+            t1: 1.0,
+            start_vertex_id: *corner,
+            end_vertex_id: target,
+            degenerate: false,
+            name: None,
+        });
+        bridges.insert(*corner, (edge_id, target));
+        bridge_of_lateral.insert(*lateral_index, (edge_id, *corner));
     }
     let new_vertex_points: HashMap<u64, Vec3> = [(vertex_a, point_a), (vertex_b, point_b)]
         .into_iter()
@@ -439,6 +511,11 @@ pub(super) fn delete_face_and_heal_impl(
         .map(|edge| (edge.id, edge.clone()))
         .collect();
     edges_by_id.insert(sharp_edge_id, sharp_edge.clone());
+    let old_boundary: HashMap<u64, (u64, u64)> = unmoved
+        .iter()
+        .filter(|edge| boundary_edge_ids.contains(&edge.id))
+        .map(|edge| (edge.id, (edge.start_vertex_id, edge.end_vertex_id)))
+        .collect();
 
     // --- Rewrite neighbour loops ------------------------------------------
     // Primary faces: replace their support coedge (on the deleted face's edge)
@@ -475,9 +552,15 @@ pub(super) fn delete_face_and_heal_impl(
                 "delete_face_and_heal: could not resolve loop connectivity",
             )
         })?;
-        let forward = if required_from == vertex_a && required_to == vertex_b {
+        // A loop arriving at an anchored corner reaches the sharp edge over
+        // that corner's bridge.
+        let bridge_in = bridges.get(&required_from).copied();
+        let bridge_out = bridges.get(&required_to).copied();
+        let sharp_from = bridge_in.map_or(required_from, |(_, target)| target);
+        let sharp_to = bridge_out.map_or(required_to, |(_, target)| target);
+        let forward = if sharp_from == vertex_a && sharp_to == vertex_b {
             true
-        } else if required_from == vertex_b && required_to == vertex_a {
+        } else if sharp_from == vertex_b && sharp_to == vertex_a {
             false
         } else {
             return Err(KernelRefusal::internal(
@@ -495,7 +578,17 @@ pub(super) fn delete_face_and_heal_impl(
             pcurve: make_line(Vec3::default(), Vec3::new(1.0, 0.0, 0.0))
                 .or_refuse(KernelStage::Sew, "make_line")?,
         };
-        face.loops[loop_index].coedges[coedge_index] = new_coedge;
+        // Placeholders likewise: the re-trim below recomputes every pcurve.
+        let placeholder = new_coedge.pcurve.clone();
+        let mut spliced = Vec::with_capacity(3);
+        if let Some((edge_id, _)) = bridge_in {
+            spliced.push(CoedgeRecord { id: alloc(), edge_id, forward: true, pcurve: placeholder.clone() });
+        }
+        spliced.push(new_coedge);
+        if let Some((edge_id, _)) = bridge_out {
+            spliced.push(CoedgeRecord { id: alloc(), edge_id, forward: false, pcurve: placeholder.clone() });
+        }
+        face.loops[loop_index].coedges.splice(coedge_index..=coedge_index, spliced);
     }
 
     // Lateral (cap) faces: drop the cap coedge; its two neighbours already
@@ -514,6 +607,15 @@ pub(super) fn delete_face_and_heal_impl(
                 ),
             )
         })?;
+        if let Some(&(edge_id, corner)) = bridge_of_lateral.get(&lateral_index) {
+            // An anchored end: the cap keeps a side, now along the wall.
+            let coedge = &mut face.loops[loop_index].coedges[coedge_index];
+            let (start, end) = old_boundary[&lateral_edge];
+            coedge.forward = (if coedge.forward { start } else { end }) == corner;
+            coedge.edge_id = edge_id;
+            coedge.id = alloc();
+            continue;
+        }
         face.loops[loop_index].coedges.remove(coedge_index);
         if face.loops[loop_index].coedges.is_empty() {
             return Err(KernelRefusal::internal(
@@ -531,8 +633,10 @@ pub(super) fn delete_face_and_heal_impl(
     solid
         .edges
         .retain(|edge| !boundary_edge_ids.contains(&edge.id));
-    let removed_vertices: HashSet<u64> = transition_vertices.iter().copied().collect();
+    let removed_vertices: HashSet<u64> =
+        transition_vertices.iter().copied().filter(|vertex| !bridges.contains_key(vertex)).collect();
     solid.edges.push(sharp_edge);
+    solid.edges.extend(bridge_edges);
     solid
         .vertices
         .retain(|vertex| !removed_vertices.contains(&vertex.id));

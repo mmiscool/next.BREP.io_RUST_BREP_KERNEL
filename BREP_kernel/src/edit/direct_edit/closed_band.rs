@@ -398,7 +398,7 @@ pub(super) fn heal_closed_band(
     };
     let surface_a = surface_of(&solid, neighbour_ids[0])?;
     let surface_b = surface_of(&solid, neighbour_ids[1])?;
-    let curves = intersect_analytic_pair(&surface_a, &surface_b, tolerance).ok_or_else(|| {
+    let curves = wall_sections(&surface_a, &surface_b, &band_points, scale, tolerance)?.ok_or_else(|| {
         KernelRefusal::unsupported(
             KernelStage::Classify,
             "analytic_pair",

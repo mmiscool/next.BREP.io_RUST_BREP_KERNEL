@@ -189,6 +189,19 @@ impl StepAssemblyExport {
         Ok(*root)
     }
 
+    /// Each product's occurrence namespaces ("ACOMP3:", "ACOMP3:ACOMP1:", and
+    /// "" for the root), sorted: the prefixes its colours resolve through.
+    pub(crate) fn occurrence_prefixes(&self, root: usize) -> Vec<Vec<String>> {
+        self.occurrence_paths(root)
+            .into_iter()
+            .map(|paths| {
+                let mut prefixes: Vec<String> = paths.into_iter().map(|path| path.prefix).collect();
+                prefixes.sort();
+                prefixes
+            })
+            .collect()
+    }
+
     /// Every chained occurrence path that reaches each product: the component
     /// namespace prefix the DOCUMENT knows its entities by, and the transform
     /// into root space. The root itself gets one empty path at identity.

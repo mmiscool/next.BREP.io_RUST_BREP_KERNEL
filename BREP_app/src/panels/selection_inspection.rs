@@ -32,6 +32,7 @@ impl Cache {
 }
 
 pub fn readout(state: &mut EngineState) -> Value {
+    let solids: Vec<_> = state.emphasis.selected_solids.iter().cloned().collect();
     let faces: Vec<_> = state.emphasis.selected_faces.iter().cloned().collect();
     let edges: Vec<_> = state.emphasis.selected_edges.iter().cloned().collect();
     let vertices = state.emphasis.selected_vertices.clone();
@@ -42,6 +43,34 @@ pub fn readout(state: &mut EngineState) -> Value {
     let mut unavailable = false;
     // The document's current length convention is millimetres (the same as
     // Properties/Info); no independent unit preference exists in the document.
+    if !solids.is_empty() {
+        let (mut area, mut volume, mut any_volume, mut complete) = (0.0, 0.0, false, true);
+        for name in &solids {
+            let info: Value = serde_json::from_str(&state.object_info_json(name)).unwrap_or(Value::Null);
+            let waiting = info["pending"].as_bool().unwrap_or(false);
+            pending |= waiting;
+            // A committed sketch picks as a solid but is a sheet: it reports
+            // `area` and has no volume, which is not a failed measurement.
+            let sheet = info["kind"] == "sketch";
+            let measured_area = info["surfaceArea"].as_f64().or(info["area"].as_f64()).filter(|v| v.is_finite());
+            let measured_volume = info["volume"].as_f64().filter(|v| v.is_finite());
+            match (measured_area, measured_volume) {
+                (Some(a), Some(v)) => { area += a; volume += v; any_volume = true; }
+                (Some(a), None) if sheet => area += a,
+                _ => { complete = false; unavailable |= !waiting; }
+            }
+            items.push(info);
+        }
+        if complete {
+            let prefix = if solids.len() > 1 { "Total " } else { "" };
+            totals.insert("surfaceArea".into(), json!(area));
+            parts.push(format!("{prefix}Surface Area: {} mm²", num(area)));
+            if any_volume {
+                totals.insert("volume".into(), json!(volume));
+                parts.push(format!("{prefix}Volume: {} mm³", num(volume)));
+            }
+        }
+    }
     for (names, key, label, unit) in [
         (&faces, "area", "Area", "mm²"),
         (&edges, "length", "Length", "mm"),

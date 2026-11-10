@@ -379,6 +379,7 @@ impl EngineState {
             return;
         };
         let selected = arm.selected.clone();
+        let dragging = self.transform_dragging();
         let euler = [
             pose.rotation_deg[0].to_radians(),
             pose.rotation_deg[1].to_radians(),
@@ -395,11 +396,15 @@ impl EngineState {
         for (index, start) in selected.iter().zip(snapshot.iter()) {
             let offset = [start[0] - center[0], start[1] - center[1], start[2] - center[2]];
             let turned = rotate_euler_xyz_f64(offset, euler);
-            let moved = Vec3::new(
-                center[0] + turned[0] + shift[0],
-                center[1] + turned[1] + shift[1],
-                center[2] + turned[2] + shift[2],
-            );
+            let moved: [f64; 3] = std::array::from_fn(|axis| {
+                let after = center[axis] + turned[axis] + shift[axis];
+                if dragging {
+                    crate::formatting::snap_drag_moved(start[axis], after)
+                } else {
+                    after
+                }
+            });
+            let moved = Vec3::new(moved[0], moved[1], moved[2]);
             let _ = cage.set_point(*index, moved);
         }
         if let Some(arm) = self.transform_gizmo.cage.as_mut() {

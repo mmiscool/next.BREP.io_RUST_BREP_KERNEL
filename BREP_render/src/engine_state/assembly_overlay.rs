@@ -608,7 +608,7 @@ impl EngineState {
                     };
                     (t * ratio).max(0.0)
                 };
-                (raw * 1e4).round() / 1e4
+                crate::formatting::snap_drag_value(raw)
             }
             ConstraintOverlayKind::Angle => {
                 let Some(degrees) = self.angular_drag_degrees(&annotation, x, y) else {

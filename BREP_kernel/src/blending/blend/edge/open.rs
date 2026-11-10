@@ -1922,6 +1922,14 @@ pub(in crate::blend) fn build_open_surgery_with_tail(
     // on the end face for a free end, or — at a corner — the end
     // cross-section arc the corner patch was already given, committed by the
     // caller and merely referenced here.
+    let mut commit_split = |plan: &EndPlan, second_rim: u64, corner: u64| -> Result<Option<super::split_floor::SplitCommit>, KernelRefusal> {
+        match plan.free().and_then(|free| free.split.as_ref()) {
+            Some(split) => super::split_floor::commit_split_end(result, &mut *take_id, split, second_rim, corner).map(Some),
+            None => Ok(None),
+        }
+    };
+    let start_split = commit_split(&start_end, w2a, old_start)?;
+    let finish_split = commit_split(&finish_end, w2b, old_finish)?;
     let mut commit_end_edge = |plan: &EndPlan,
                                first_rim: u64,
                                second_rim: u64|
@@ -1945,8 +1953,8 @@ pub(in crate::blend) fn build_open_surgery_with_tail(
             }
         }
     };
-    let transverse_a_id = commit_end_edge(&start_end, w1a, w2a)?;
-    let transverse_b_id = commit_end_edge(&finish_end, w1b, w2b)?;
+    let transverse_a_id = commit_end_edge(&start_end, w1a, start_split.as_ref().map_or(w2a, |split| split.q1_vertex))?;
+    let transverse_b_id = commit_end_edge(&finish_end, w1b, finish_split.as_ref().map_or(w2b, |split| split.q1_vertex))?;
 
     // Replace the blended edge in each PRISTINE mate's loop — the blend
     // face's loop direction is forced by manifold pairing with F1's use of
@@ -2130,6 +2138,9 @@ pub(in crate::blend) fn build_open_surgery_with_tail(
         let (Some(end), Some(transverse_id)) = (end, transverse_id) else {
             continue;
         };
+        if end.split.is_some() {
+            continue;
+        }
         let face = result
             .shells
             .iter()
@@ -2162,6 +2173,20 @@ pub(in crate::blend) fn build_open_surgery_with_tail(
             first_consumed,
             second_consumed,
         ));
+    }
+
+    let split_corners = |end: Option<&EndSurgery>, corner: u64, result: &BrepSolid| -> Result<Option<[super::support::EndCorner; 2]>, KernelRefusal> {
+        match end.and_then(|end| end.split.as_ref().map(|split| (end, split))) {
+            Some((end, split)) => super::split_floor::locate_split_corners(result, end, split, corner).map(Some),
+            None => Ok(None),
+        }
+    };
+    let start_split_corners = split_corners(start_free, old_start, result)?;
+    let finish_split_corners = split_corners(finish_free, old_finish, result)?;
+    if (start_split_corners.is_some() && (start_first.is_consumed() || start_second.is_consumed()))
+        || (finish_split_corners.is_some() && (finish_first.is_consumed() || finish_second.is_consumed()))
+    {
+        return Err(KernelRefusal::unsupported(KernelStage::Sew, "split_floor_consumed", "blend: a two-face end whose rail consumes its boundary"));
     }
 
     // Trim the boundary edges at their support crossings.  A consumed side is
@@ -2331,6 +2356,22 @@ pub(in crate::blend) fn build_open_surgery_with_tail(
     };
     let start_slot = end_slot(&start_end, transverse_a_id, !blend_cr_forward)?;
     let finish_slot = end_slot(&finish_end, transverse_b_id, blend_cr_forward)?;
+    let start_slot = match (start_free, &start_split, transverse_a_id) {
+        (Some(end), Some(commit), Some(id)) => super::split_floor::split_slot(end, end.split.as_ref().expect("planned"), commit, id, !blend_cr_forward, &mut *take_id)?,
+        _ => start_slot,
+    };
+    let finish_slot = match (finish_free, &finish_split, transverse_b_id) {
+        (Some(end), Some(commit), Some(id)) => super::split_floor::split_slot(end, end.split.as_ref().expect("planned"), commit, id, blend_cr_forward, &mut *take_id)?,
+        _ => finish_slot,
+    };
+    for (end, commit, id, corners, corner, forward) in [
+        (start_free, &start_split, transverse_a_id, &start_split_corners, old_start, !blend_cr_forward),
+        (finish_free, &finish_split, transverse_b_id, &finish_split_corners, old_finish, blend_cr_forward),
+    ] {
+        if let (Some(end), Some(commit), Some(id), Some(corners)) = (end, commit, id, corners) {
+            super::split_floor::finish_split_end(result, &mut *take_id, end, end.split.as_ref().expect("planned"), commit, id, corners, corner, forward, name)?;
+        }
+    }
     // A collapsed rail has no coedge: the end slots on either side of it meet
     // at its one rim point.
     let coedges = if blend_cr_forward {

@@ -154,6 +154,15 @@ fn every_skin_piece_enabled() -> bool {
     crate::switch!("BREP_OFFSET_EVERY_SKIN_PIECE", true)
 }
 
+/// `BREP_OFFSET_EVERY_SEEDED_SKIN_PIECE` (default on; `=0` restores): when an
+/// inward shell's assembly fails, EVERY SKIN PIECE is retried on the seeded
+/// path too. Past 2.0 a reported box and pin model's bore skin comes apart into one piece
+/// per corner channel and the seed answered for one of them. Only as a retry:
+/// a shell the seed's choice closes keeps that answer.
+fn every_seeded_skin_piece_enabled() -> bool {
+    crate::switch!("BREP_OFFSET_EVERY_SEEDED_SKIN_PIECE", true)
+}
+
 pub fn offset_shell(
     source: &BrepSolid,
     opening_face_ids: &[u64],
@@ -163,6 +172,213 @@ pub fn offset_shell(
         Some(forced) => Err(forced),
         None => offset_body(source, opening_face_ids, distance, Body::Shell, "offset_shell"),
     };
+    let mut shelled = offset_shell_lanes(source, opening_face_ids, distance, direct)?;
+    if membrane_shells_on() {
+        drop_folded_shells(&mut shelled.solid, distance);
+        let membranes = membrane_shell_indices(&shelled.solid, distance);
+        let paired = paired_face_ids(&shelled.solid);
+        if !membranes.is_empty() || !paired.is_empty() {
+            for (first, second) in &paired {
+                let shell = shelled.solid.shells.iter().position(|shell| shell.faces.iter().any(|face| face.id == *first));
+                os_debug!(
+                    "membrane pair: faces {first} and {second} in shell {shell:?} of {:?} faces",
+                    shell.map(|index| shelled.solid.shells[index].faces.len())
+                );
+            }
+            return Err(KernelRefusal::unsupported(KernelStage::Validate, "offset_shell_membrane", format!(
+                "offset_shell: at this distance the result has {} shell(s) enclosing no volume and \
+                 {} pair(s) of faces bounded by the same edges{} (zero-thickness membranes \
+                 beside the cavity), which no solid carries",
+                membranes.len(),
+                paired.len(),
+                paired.first().map(|(a, b)| format!(", first faces {a} and {b}")).unwrap_or_default()
+            )));
+        }
+    }
+    Ok(shelled)
+}
+
+/// `BREP_OFFSET_MEMBRANE_SHELLS` (default on; `=0` restores): a shell of the
+/// result that encloses nothing (made only of FOLDED faces, each loop running
+/// along its edges once in each direction, closed by point edges; or of zero
+/// volume over its area; or a bag, its faces pairing up on the same edges) is
+/// removed with the edges and vertices only it used, when the
+/// rest still validates. Otherwise, and for two faces of one real shell bounded
+/// by the same edges (a zero-thickness fin), the shell is refused as a
+/// membrane.
+///
+/// Cause (a reported box and pin model): at 2.38 and 2.40 the result reported
+/// three shells, two of them single folded faces of about 6.5e-6 mm^2 at the
+/// floor/wall corner; at 2.46 (with the corner-debris switch) six more, folded
+/// faces and two-face bags of volume 1e-8 over area 4e-3. None shares an edge
+/// with the cavity's shell. `validate()` accepts them all and the volume is
+/// right, but the shell count is not, nor is anything that walks the shells.
+///
+/// Every test is scaled by the offset distance, since a real piece of the shell
+/// is about |distance| thick: a folded or bag shell is removed only when its
+/// volume is at most 1% of |distance| × its area (a sphere face, whose seam
+/// also runs both ways, encloses the sealed cavity of a sphere-cut shell), and
+/// the zero-volume bar never exceeds 1e-3 × |distance| (a shell 1e-7 thick is
+/// a real sliver, not a membrane).
+fn membrane_shells_on() -> bool {
+    switch!("BREP_OFFSET_MEMBRANE_SHELLS", true)
+}
+
+/// Whether every non-degenerate edge of `face`'s loops is used once forward
+/// and once reversed by the face itself.
+fn face_is_folded(face: &FaceRecord, edges: &HashMap<u64, &EdgeRecord>) -> bool {
+    let mut balance: HashMap<u64, (usize, usize)> = HashMap::default();
+    for coedge in face.loops.iter().flat_map(|l| &l.coedges) {
+        if edges.get(&coedge.edge_id).is_some_and(|edge| edge.degenerate) {
+            continue;
+        }
+        let entry = balance.entry(coedge.edge_id).or_default();
+        if coedge.forward {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
+        }
+    }
+    !balance.is_empty() && balance.values().all(|&(forward, reversed)| forward == 1 && reversed == 1)
+}
+
+/// Whether every face of `shell` shares its whole set of non-degenerate edges
+/// with exactly one other face of it: two-sided sheets with nothing between.
+fn shell_is_bag(shell: &ShellRecord, edges: &HashMap<u64, &EdgeRecord>) -> bool {
+    let mut sets: HashMap<Vec<u64>, usize> = HashMap::default();
+    for face in &shell.faces {
+        let mut set: Vec<u64> = face
+            .loops
+            .iter()
+            .flat_map(|l| &l.coedges)
+            .map(|coedge| coedge.edge_id)
+            .filter(|id| !edges.get(id).is_some_and(|edge| edge.degenerate))
+            .collect();
+        set.sort_unstable();
+        set.dedup();
+        if set.is_empty() {
+            return false;
+        }
+        *sets.entry(set).or_default() += 1;
+    }
+    !sets.is_empty() && sets.values().all(|&count| count == 2)
+}
+
+/// Removes the shells made only of folded faces, then the edges and vertices
+/// no remaining face uses. Keeps `solid` unchanged when that would leave no
+/// shell or a result that does not validate. A folded or bag shell qualifies
+/// only when its volume is at most 1% of |distance| × its area.
+pub(crate) fn drop_folded_shells(solid: &mut BrepSolid, distance: f64) {
+    let edges: HashMap<u64, &EdgeRecord> = solid.edges.iter().map(|edge| (edge.id, edge)).collect();
+    let empty = membrane_shell_indices(solid, distance);
+    let folded: Vec<usize> = (0..solid.shells.len())
+        .filter(|&index| {
+            let shell = &solid.shells[index];
+            empty.contains(&index)
+                || ((shell.faces.iter().all(|face| face_is_folded(face, &edges)) || shell_is_bag(shell, &edges))
+                    && shell_volume_and_area(solid, index)
+                        .is_some_and(|(volume, area)| volume.abs() <= 1e-2 * distance.abs() * area))
+        })
+        .collect();
+    if folded.is_empty() || folded.len() == solid.shells.len() {
+        return;
+    }
+    let mut trimmed = solid.clone();
+    let mut index = 0;
+    trimmed.shells.retain(|_| {
+        let keep = !folded.contains(&index);
+        index += 1;
+        keep
+    });
+    let used_edges: HashSet<u64> = trimmed
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .flat_map(|face| &face.loops)
+        .flat_map(|l| &l.coedges)
+        .map(|coedge| coedge.edge_id)
+        .collect();
+    trimmed.edges.retain(|edge| used_edges.contains(&edge.id));
+    let used_vertices: HashSet<u64> = trimmed
+        .edges
+        .iter()
+        .flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id])
+        .collect();
+    trimmed.vertices.retain(|vertex| used_vertices.contains(&vertex.id));
+    crate::boolean::refresh_derived_genus(&mut trimmed);
+    let issues = trimmed.validate();
+    if !issues.is_empty() {
+        os_debug!("folded shells {folded:?} kept: without them the result does not validate: {issues:?}");
+        return;
+    }
+    os_debug!("dropped folded shells {folded:?}");
+    *solid = trimmed;
+}
+
+/// Pairs of faces of one shell bounded by exactly the same non-degenerate
+/// edges: two sides of a zero-thickness fin. By face id.
+pub(crate) fn paired_face_ids(solid: &BrepSolid) -> Vec<(u64, u64)> {
+    let mut pairs = Vec::new();
+    let degenerate: HashSet<u64> = solid.edges.iter().filter(|edge| edge.degenerate).map(|edge| edge.id).collect();
+    for shell in &solid.shells {
+        let mut seen: HashMap<Vec<u64>, u64> = HashMap::default();
+        for face in &shell.faces {
+            let mut edges: Vec<u64> = face
+                .loops
+                .iter()
+                .flat_map(|l| &l.coedges)
+                .map(|c| c.edge_id)
+                .filter(|id| !degenerate.contains(id))
+                .collect();
+            edges.sort_unstable();
+            if edges.len() < 2 {
+                continue;
+            }
+            match seen.get(&edges) {
+                Some(&other) => pairs.push((other, face.id)),
+                None => {
+                    seen.insert(edges, face.id);
+                }
+            }
+        }
+    }
+    pairs
+}
+
+/// The volume and area of shell `index` of `solid` on its own.
+fn shell_volume_and_area(solid: &BrepSolid, index: usize) -> Option<(f64, f64)> {
+    let mut alone = solid.clone();
+    alone.shells = vec![solid.shells[index].clone()];
+    crate::solid_mass_properties(&alone).ok().map(|mass| (mass.volume, mass.surface_area))
+}
+
+/// The shells of `solid` that enclose no volume, by index: |V| at most
+/// min(1e-6 × the bounding-box diagonal, 1e-3 × |distance|) × the shell's
+/// area. A shell whose mass properties cannot be measured is never reported.
+pub(crate) fn membrane_shell_indices(solid: &BrepSolid, distance: f64) -> Vec<usize> {
+    if solid.vertices.is_empty() {
+        return Vec::new();
+    }
+    let mut lo = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut hi = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for vertex in &solid.vertices {
+        lo = Vec3::new(lo.x.min(vertex.point.x), lo.y.min(vertex.point.y), lo.z.min(vertex.point.z));
+        hi = Vec3::new(hi.x.max(vertex.point.x), hi.y.max(vertex.point.y), hi.z.max(vertex.point.z));
+    }
+    let thickness = (1e-6 * hi.sub(lo).length()).min(1e-3 * distance.abs());
+    (0..solid.shells.len())
+        .filter(|&index| {
+            shell_volume_and_area(solid, index).is_some_and(|(volume, area)| volume.abs() <= thickness * area)
+        })
+        .collect()
+}
+
+fn offset_shell_lanes(
+    source: &BrepSolid,
+    opening_face_ids: &[u64],
+    distance: f64,
+    direct: Result<OffsetShellResultRecord, KernelRefusal>,
+) -> Result<OffsetShellResultRecord, KernelRefusal> {
     match direct {
         Ok(result) => Ok(result),
         // The boolean lane answers the direct construction's own named
@@ -348,6 +564,8 @@ fn imprint_attempts(
         &mut extension_fired,
         &mut reflex_rebuilds,
         &HashSet::default(),
+        &HashSet::default(),
+        false,
         &mut shadowed_points,
         &mut omitted,
         &mut vacated_notes,
@@ -380,6 +598,8 @@ fn imprint_attempts(
                 &mut unused,
                 &mut retry_reflex,
                 &HashSet::default(),
+                &HashSet::default(),
+                false,
                 &mut shadowed_points,
                 &mut omitted,
                 &mut vacated_notes,
@@ -485,6 +705,8 @@ fn offset_shell_impl(
     extension_fired: &mut bool,
     reflex_rebuilds: &mut usize,
     shadowed_supports: &HashSet<u64>,
+    cavity_bounds: &HashSet<u64>,
+    every_seeded_piece: bool,
     shadowed_points: &mut Vec<(Vec3, u64)>,
     omitted_supports: &mut HashSet<u64>,
     vacated_notes: &mut Vec<String>,
@@ -2267,6 +2489,12 @@ fn offset_shell_impl(
                     },
                     other => other,
                 };
+                // One test point cannot speak for a skin that bounds a cavity
+                // the solid demonstrably has: see `cavity_witness`.
+                let reading = match reading {
+                    SkinReading::Shadowed { .. } if cavity_bounds.contains(&carrier.source_face_id) => SkinReading::On,
+                    other => other,
+                };
                 readings.push(reading);
             }
             for (fragment, reading) in fragments_by_carrier[index].iter().zip(&readings) {
@@ -2340,7 +2568,22 @@ fn offset_shell_impl(
                 }
             }
             if skinless && !apex_cap_sources.contains(&index) {
-                if !shadowed_supports.is_empty() {
+                if body == Body::Shell && distance > 0.0 && cascade_omission_enabled() {
+                    let held = fragments_holding_true_skin(
+                        source_by_id[&carrier.source_face_id],
+                        source,
+                        &fragments_by_carrier[index],
+                        &retained_faces_with_edges,
+                        distance,
+                        offset_skin_tolerance,
+                    )?;
+                    if !held.is_empty() {
+                        os_debug!("  select[{index}] src={}: {} fragment(s) hold true skin", carrier.source_face_id, held.len());
+                        chosen_offsets.extend(held);
+                        continue;
+                    }
+                }
+                if !shadowed_supports.is_empty() && !(body == Body::Shell && distance > 0.0 && cascade_omission_enabled()) {
                     let mut omitted = shadowed_supports.iter().copied().collect::<Vec<_>>();
                     omitted.sort_unstable();
                     return Err(KernelRefusal::unsupported(KernelStage::Select, "offset_shell_shadow_cascade", format!(
@@ -2530,6 +2773,7 @@ fn offset_shell_impl(
                     });
                     candidates.into_iter().next()
                 };
+                let mut drop_debris = false;
                 if let Some(fragment) = &selected {
                     os_debug!(
                         "  select[{index}] src={} chosen test point departs its own face's offset \
@@ -2552,13 +2796,30 @@ fn offset_shell_impl(
                             distance
                         )
                     );
-                    if let Some((other, separation)) = coincident_offset_face(
+                    let coincidence = coincident_offset_face(
                         fragment.test_point,
                         carrier.source_face_id,
                         &retained_faces_with_edges,
                         distance,
                         offset_skin_tolerance,
-                    )? {
+                    )?;
+                    let coincidence = match coincidence {
+                        Some((other, separation))
+                            if coincide_debris_on()
+                                && fragment_is_band_debris(fragment, offset_skin_tolerance)? =>
+                        {
+                            os_debug!(
+                                "  select[{index}] src={} drops corner debris coincident with {other} \
+                                 (separation {separation}) at {:?}",
+                                carrier.source_face_id,
+                                fragment.test_point
+                            );
+                            drop_debris = true;
+                            None
+                        }
+                        reading => reading,
+                    };
+                    if let Some((other, separation)) = coincidence {
                         return Err(KernelRefusal::unsupported(KernelStage::Select, "offset_shell_coincident_offsets", format!(
                             "offset_shell: the offsets of source faces {} and {other} coincide near \
                              ({:.4}, {:.4}, {:.4}) — the material between those faces is twice the \
@@ -2573,6 +2834,7 @@ fn offset_shell_impl(
                         )));
                     }
                 }
+                let selected = if drop_debris { None } else { selected };
                 if let Some(fragment) = selected {
                     // A pinched face's seeds each find their own region; a
                     // fallback that ignores the seed can answer the same
@@ -2608,7 +2870,7 @@ fn offset_shell_impl(
             // cylinder against 0.1, reflex_junction_under_a_filleted_top).
             if every_skin_piece_enabled()
                 && distance > 0.0
-                && viable.is_empty()
+                && (viable.is_empty() || every_seeded_piece)
                 && skin_filter_active
                 && inward_extended_walls.is_empty()
                 && classified.len() > region_skins.len()
@@ -2942,7 +3204,8 @@ fn offset_shell_impl(
         // build.
         shadowed_points.clear();
         profile::lap(&mut clock, profile::SELECT);
-        return offset_shell_impl(
+        let cascaded = !shadowed_supports.is_empty();
+        let rebuilt = offset_shell_impl(
             source,
             opening_face_ids,
             distance,
@@ -2951,13 +3214,54 @@ fn offset_shell_impl(
             extension_fired,
             reflex_rebuilds,
             &omitted,
+            cavity_bounds,
+            every_seeded_piece,
             shadowed_points,
             omitted_supports,
             vacated_notes,
         );
+        let rebuilt = rebuilt?;
+        if cascaded {
+            refuse_a_cascade_that_kept_the_cavity(source, opening_face_ids, distance, &rebuilt.solid)?;
+        }
+        return Ok(rebuilt);
     }
     if chosen_offsets.is_empty() && !shadowed_supports.is_empty() {
         if matches!(body, Body::Shell) {
+            if let Some(witness) = cavity_witness(source, opening_face_ids, distance)? {
+                if !witness.bounds.is_subset(cavity_bounds) {
+                    let mut bounds = cavity_bounds.clone();
+                    bounds.extend(witness.bounds.iter().copied());
+                    os_debug!(
+                        "every skin read shadowed, but ({:.4}, {:.4}, {:.4}) lies {:.6} from every retained face: re-running with faces {:?} kept",
+                        witness.point.x, witness.point.y, witness.point.z, witness.clearance, bounds
+                    );
+                    shadowed_points.clear();
+                    profile::lap(&mut clock, profile::SELECT);
+                    return offset_shell_impl(
+                        source,
+                        opening_face_ids,
+                        distance,
+                        body,
+                        extend_oblique_carriers,
+                        extension_fired,
+                        reflex_rebuilds,
+                        &HashSet::default(),
+                        &bounds,
+                        every_seeded_piece,
+                        shadowed_points,
+                        omitted_supports,
+                        vacated_notes,
+                    );
+                }
+                return Err(KernelRefusal::unsupported(KernelStage::Select, "offset_shell_cavity_unbuilt", format!(
+                    "offset_shell: a cavity remains at this distance (the point ({:.4}, {:.4}, {:.4}) is {:.4} from \
+                     every retained face, past the shell distance {distance}), but every offset skin around it \
+                     reads as covered by another face, so it could not be built; returning the solid unchanged \
+                     would be wrong — use a smaller shell distance",
+                    witness.point.x, witness.point.y, witness.point.z, witness.clearance
+                )));
+            }
             if let Some(unchanged) = empty_cavity_shell(source, opening_face_ids, distance)? {
                 return Ok(unchanged);
             }
@@ -3238,6 +3542,27 @@ fn offset_shell_impl(
     let mut solid = match finalized {
         Ok(solid) => solid,
         Err(error) => {
+            os_debug!("finalize_assembled_solid: {}", error.message);
+            if !every_seeded_piece && body == Body::Shell && distance > 0.0 && every_seeded_skin_piece_enabled() {
+                let retried = offset_shell_impl(
+                    source,
+                    opening_face_ids,
+                    distance,
+                    body,
+                    extend_oblique_carriers,
+                    extension_fired,
+                    reflex_rebuilds,
+                    shadowed_supports,
+                    cavity_bounds,
+                    true,
+                    shadowed_points,
+                    omitted_supports,
+                    vacated_notes,
+                );
+                if retried.is_ok() {
+                    return retried;
+                }
+            }
             if let Some((index, own, other, thickness)) = sealing_distance(
                 &sealed,
                 source,
@@ -3557,6 +3882,200 @@ pub(super) fn wall_surplus_beyond_the_sections(
 }
 
 
+/// `BREP_OFFSET_SHELL_CASCADE_OMISSION` (default on; `=0` restores): an inward
+/// shell judges a carrier that reads shadowed at every fragment's test point
+/// by its true skin instead ([`fragments_holding_true_skin`]). One test point
+/// cannot speak for a fragment that is partly skin: a reported cylinder boss model's
+/// root fillets bound the cavity's bulge toward the boss mouth at every
+/// distance past the boss limit (checked with
+/// `scripts/offset_cavity_volume.py`), and were dropped as shadowed. A carrier
+/// holding no skin at all may then be omitted even after an earlier omission.
+fn cascade_omission_enabled() -> bool {
+    switch!("BREP_OFFSET_SHELL_CASCADE_OMISSION", true)
+}
+
+/// A cascade of omissions must leave the deepest point of the true cavity
+/// hollow: a carrier omitted on a test point that did not stand for its
+/// fragment would show as material there.
+fn refuse_a_cascade_that_kept_the_cavity(
+    source: &BrepSolid,
+    opening_face_ids: &[u64],
+    distance: f64,
+    result: &BrepSolid,
+) -> Result<(), KernelRefusal> {
+    let Some(witness) = cavity_witness(source, opening_face_ids, distance)? else {
+        return Ok(());
+    };
+    let scale = crate::solid_scale(source).max(1.0);
+    let class = classify_point(witness.point, result, 1e-8 * scale).or_refuse(KernelStage::Select, "classify_point")?.class;
+    if class == PointClass::In {
+        return Err(KernelRefusal::unsupported(KernelStage::Select, "offset_shell_shadow_cascade", format!(
+            "offset_shell: omitting offsets that read shadowed only after earlier omissions leaves material at \
+             ({:.4}, {:.4}, {:.4}), which is {:.4} from every retained face, past the shell distance {distance}; \
+             the cavity there could not be built — use a smaller shell distance",
+            witness.point.x, witness.point.y, witness.point.z, witness.clearance
+        )));
+    }
+    Ok(())
+}
+
+/// `BREP_OFFSET_SHELL_CAVITY_WITNESS` (default on; `=0` restores): [`cavity_witness`].
+fn cavity_witness_enabled() -> bool {
+    switch!("BREP_OFFSET_SHELL_CAVITY_WITNESS", true)
+}
+
+/// A point of the solid farther than the shell distance from every retained
+/// face, and the faces nearest it, whose skins bound that cavity.
+#[derive(Debug)]
+pub(super) struct CavityWitness {
+    pub(super) point: Vec3,
+    pub(super) clearance: f64,
+    pub(super) bounds: HashSet<u64>,
+}
+
+/// Looks for the cavity the shadow reading says is not there. A fragment's
+/// single test point can read shadowed while most of the fragment is real skin
+/// (a reported cylinder boss model at 4.8: the r 0.2 bore of a cylinder r 5, one uncut
+/// fragment whose test point lies 4.72 from a boss wall), and a cavity that
+/// thin falls between the 12³ cells of [`empty_cavity_shell`], which then
+/// returned the source as a success.
+///
+/// Distance to the retained faces is 1-Lipschitz, so any cavity's maximum is
+/// climbed to from the samples that read highest: the best cell centres start
+/// a pattern search that stays inside the solid. It is a search, not a proof;
+/// what it cannot miss is a cavity whose ridge those starts climb.
+pub(super) fn cavity_witness(
+    source: &BrepSolid,
+    opening_face_ids: &[u64],
+    distance: f64,
+) -> Result<Option<CavityWitness>, KernelRefusal> {
+    if !cavity_witness_enabled() || distance <= 0.0 || opening_face_ids.is_empty() {
+        return Ok(None);
+    }
+    let faces = source.shells.iter().flat_map(|shell| &shell.faces).collect::<Vec<_>>();
+    let retained = faces.iter().filter(|face| !opening_face_ids.contains(&face.id)).copied().collect::<Vec<_>>();
+    if retained.is_empty() {
+        return Ok(None);
+    }
+    // Each face's own edges: a foot off the trim falls back on the edges it is
+    // given, and the whole solid's would read a wall as near as any rim.
+    let edge_by_id = source.edges.iter().map(|edge| (edge.id, edge)).collect::<HashMap<_, _>>();
+    let retained = retained
+        .into_iter()
+        .map(|face| {
+            let edges = face
+                .loops
+                .iter()
+                .flat_map(|loop_record| &loop_record.coedges)
+                .filter_map(|coedge| edge_by_id.get(&coedge.edge_id).copied())
+                .collect::<Vec<_>>();
+            (face, edges)
+        })
+        .collect::<Vec<_>>();
+    let Some((low, high)) = control_hull(source, &faces) else { return Ok(None) };
+    let scale = crate::solid_scale(source).max(1.0);
+    let classify_tolerance = 1e-8 * scale;
+    let margin = 1e-6 * scale;
+    let readings = |point: Vec3| -> Result<Vec<(u64, f64)>, KernelRefusal> {
+        retained.iter().map(|(face, edges)| Ok((face.id, distance_to_trimmed_face(face, edges, point)?))).collect()
+    };
+    let clearance = |values: &[(u64, f64)]| values.iter().map(|(_, value)| *value).fold(f64::INFINITY, f64::min);
+    let inside = |point: Vec3| -> Result<bool, KernelRefusal> {
+        Ok(classify_point(point, source, classify_tolerance).or_refuse(KernelStage::Select, "classify_point")?.class == PointClass::In)
+    };
+    const CELLS: usize = 12;
+    const STARTS: usize = 24;
+    const MOVES: usize = 160;
+    let span = high.sub(low);
+    let mut starts = Vec::new();
+    for i in 0..CELLS {
+        for j in 0..CELLS {
+            for k in 0..CELLS {
+                let at = |index: usize| (index as f64 + 0.5) / CELLS as f64;
+                let point = Vec3::new(low.x + span.x * at(i), low.y + span.y * at(j), low.z + span.z * at(k));
+                if inside(point)? {
+                    starts.push((clearance(&readings(point)?), point));
+                }
+            }
+        }
+    }
+    starts.sort_by(|a, b| b.0.total_cmp(&a.0));
+    starts.truncate(STARTS);
+    const DIRECTIONS: [(f64, f64, f64); 14] = [
+        (1.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, 1.0), (0.0, 0.0, -1.0),
+        (1.0, 1.0, 1.0), (-1.0, -1.0, -1.0), (1.0, 1.0, -1.0), (-1.0, -1.0, 1.0),
+        (1.0, -1.0, 1.0), (-1.0, 1.0, -1.0), (-1.0, 1.0, 1.0), (1.0, -1.0, -1.0),
+    ];
+    let first_step = span.x.max(span.y).max(span.z) / CELLS as f64;
+    let mut footless = None;
+    for (start_clearance, start) in starts {
+        let (mut point, mut best, mut step) = (start, start_clearance, first_step);
+        for _ in 0..MOVES {
+            if step < 1e-6 * scale {
+                break;
+            }
+            let mut moved = false;
+            for (x, y, z) in DIRECTIONS {
+                let length = (x * x + y * y + z * z).sqrt();
+                let next = Vec3::new(point.x + step * x / length, point.y + step * y / length, point.z + step * z / length);
+                let value = clearance(&readings(next)?);
+                if value > best && inside(next)? {
+                    (point, best, moved) = (next, value, true);
+                    break;
+                }
+            }
+            if !moved {
+                step *= 0.5;
+            }
+        }
+        if best > distance + margin {
+            // The climb ends on the ridge, where every face around it ties.
+            // Nudged off the ridge, still inside the cavity, each point has one
+            // nearest face, which counts if its foot lands inside its trim (a
+            // tie through a face's rim is that edge, not its offset). The faces
+            // that wrap the cavity collect the votes; a fillet seen only
+            // through the mouth of a boss does not.
+            let nudge = 0.5 * (best - distance);
+            let mut votes = HashMap::<u64, usize>::default();
+            for (x, y, z) in DIRECTIONS {
+                let length = (x * x + y * y + z * z).sqrt();
+                let near = Vec3::new(point.x + nudge * x / length, point.y + nudge * y / length, point.z + nudge * z / length);
+                let values = readings(near)?;
+                let Some((id, _)) = values.iter().min_by(|a, b| a.1.total_cmp(&b.1)).copied() else { continue };
+                let Some((face, _)) = retained.iter().find(|(face, _)| face.id == id) else { continue };
+                if foot_inside_trim(face, near)? {
+                    *votes.entry(id).or_default() += 1;
+                }
+            }
+            let most = votes.values().copied().max().unwrap_or(0);
+            let bounds = votes.iter().filter(|(_, count)| **count * 2 >= most).map(|(id, _)| *id).collect::<HashSet<_>>();
+            let witness = CavityWitness { point, clearance: best, bounds };
+            if !witness.bounds.is_empty() {
+                return Ok(Some(witness));
+            }
+            footless = Some(witness);
+        }
+    }
+    Ok(footless)
+}
+
+/// The box of the solid's vertices and face control points; `None` when a
+/// control point cannot be read.
+fn control_hull(source: &BrepSolid, faces: &[&FaceRecord]) -> Option<(Vec3, Vec3)> {
+    let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for vertex in &source.vertices {
+        low = Vec3::new(low.x.min(vertex.point.x), low.y.min(vertex.point.y), low.z.min(vertex.point.z));
+        high = Vec3::new(high.x.max(vertex.point.x), high.y.max(vertex.point.y), high.z.max(vertex.point.z));
+    }
+    for control in faces.iter().flat_map(|face| face.surface.control_points.iter().flatten()) {
+        let point = control.point().ok()?;
+        low = Vec3::new(low.x.min(point.x), low.y.min(point.y), low.z.min(point.z));
+        high = Vec3::new(high.x.max(point.x), high.y.max(point.y), high.z.max(point.z));
+    }
+    Some((low, high))
+}
+
 /// `BREP_OFFSET_SHELL_EMPTY_CAVITY` (default on; `=0` restores): [`empty_cavity_shell`].
 fn empty_cavity_enabled() -> bool {
     switch!("BREP_OFFSET_SHELL_EMPTY_CAVITY", true)
@@ -3590,17 +4109,7 @@ fn empty_cavity_shell(
         return Ok(None);
     }
     let edges = source.edges.iter().collect::<Vec<_>>();
-    let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-    let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for vertex in &source.vertices {
-        low = Vec3::new(low.x.min(vertex.point.x), low.y.min(vertex.point.y), low.z.min(vertex.point.z));
-        high = Vec3::new(high.x.max(vertex.point.x), high.y.max(vertex.point.y), high.z.max(vertex.point.z));
-    }
-    for control in faces.iter().flat_map(|face| face.surface.control_points.iter().flatten()) {
-        let Ok(point) = control.point() else { return Ok(None) };
-        low = Vec3::new(low.x.min(point.x), low.y.min(point.y), low.z.min(point.z));
-        high = Vec3::new(high.x.max(point.x), high.y.max(point.y), high.z.max(point.z));
-    }
+    let Some((low, high)) = control_hull(source, &faces) else { return Ok(None) };
     let scale = crate::solid_scale(source).max(1.0);
     let tolerance = 1e-9 * scale;
     const CELLS: usize = 12;

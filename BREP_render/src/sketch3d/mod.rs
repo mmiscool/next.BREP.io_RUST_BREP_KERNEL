@@ -36,8 +36,17 @@ pub const OVERLAY_POINTS: &str = "sketch3d-points";
 pub const OVERLAY_PREVIEW: &str = "sketch3d-preview";
 pub const OVERLAY_WORKPLANE: &str = "sketch3d-workplane";
 /// Every group, for a clear.
+pub const OVERLAY_GLYPHS: &str = "sketch3d-constraints";
 pub const OVERLAY_GROUPS: &[&str] =
-    &[OVERLAY_GEOMETRY, OVERLAY_POINTS, OVERLAY_PREVIEW, OVERLAY_WORKPLANE];
+    &[OVERLAY_GEOMETRY, OVERLAY_POINTS, OVERLAY_PREVIEW, OVERLAY_WORKPLANE, OVERLAY_GLYPHS];
+
+/// Half-size of a constraint glyph, and how far apart stacked glyphs sit, in
+/// pixels.
+const GLYPH_HALF_PX: f64 = 6.0;
+const GLYPH_STEP_PX: f64 = 16.0;
+/// The direction glyphs step away from their anchor: not along any axis, so a
+/// glyph stays clear of its point from the usual views.
+const GLYPH_OFFSET_DIR: [f64; 3] = [0.76, 0.56, 0.33];
 
 /// Samples per arc and per bezier span when drawing / hit-testing.
 const ARC_SEGMENTS: usize = 48;
@@ -149,6 +158,9 @@ pub struct Sketch3dSession {
     pub work_plane: WorkPlane,
     /// The overlay palette (the planar sketch's, shared).
     pub colors: SketchColors,
+    /// Linked references the backdrop can no longer resolve: `(name, the
+    /// fixed point ids holding its last position)`.
+    pub lost_references: Vec<(String, Vec<Value>)>,
 }
 
 impl Sketch3dSession {
@@ -161,6 +173,7 @@ impl Sketch3dSession {
             tool: None,
             work_plane: WorkPlane::default(),
             colors: SketchColors::default(),
+            lost_references: Vec::new(),
         };
         session.resolve()?;
         Ok(session)
@@ -255,6 +268,14 @@ impl Sketch3dSession {
             return Some(point_ref(id));
         }
         let wpp = camera.world_per_pixel();
+        let mut best_glyph: Option<(f64, Value)> = None;
+        for (id, centre, _) in self.constraint_glyphs(wpp) {
+            let Some((sx, sy)) = project(camera, centre) else { continue };
+            let d = (sx - x).hypot(sy - y);
+            if d <= radius_px.min(GLYPH_HALF_PX) && best_glyph.as_ref().map_or(true, |(bd, _)| d < *bd) {
+                best_glyph = Some((d, id));
+            }
+        }
         let mut best_geo: Option<(f64, &Value)> = None;
         for g in &self.doc.geometries {
             let Some(poly) = self.sample_geometry(g, wpp) else { continue };
@@ -271,7 +292,78 @@ impl Sketch3dSession {
                 best_geo = Some((dmin, &g.id));
             }
         }
-        best_geo.map(|(_, id)| geometry_ref(id))
+        // A glyph near a line must not steal a click aimed at the line.
+        match (best_glyph, best_geo) {
+            (Some((glyph, id)), Some((geo, _))) if glyph < geo => Some(entity_constraint_ref(&id)),
+            (Some((_, id)), None) => Some(entity_constraint_ref(&id)),
+            (_, geo) => geo.map(|(_, id)| geometry_ref(id)),
+        }
+    }
+
+    /// One mark per non-dimensional constraint: `(id, centre, shape)`. Marks
+    /// sharing an anchor are stacked, so each stays selectable.
+    pub fn constraint_glyphs(&self, world_per_pixel: f64) -> Vec<(Value, [f64; 3], &'static str)> {
+        let mut stacks: std::collections::HashMap<[i64; 3], usize> = std::collections::HashMap::new();
+        let step = GLYPH_STEP_PX * world_per_pixel;
+        let mut out = Vec::new();
+        for constraint in &self.doc.constraints {
+            let (Some(id), Some(ctype)) = (constraint.id(), constraint.ctype()) else { continue };
+            if sketch3d_constraint_type(ctype).map_or(true, |t| t.dimensional) {
+                continue;
+            }
+            let ids = constraint.points();
+            let at = |i: usize| ids.get(i).and_then(|id| self.point_world(id));
+            let (anchor, shape) = match ctype {
+                "fixed" | "coincident" => (at(0), "star"),
+                "onLine" | "onPlane" | "onArc" | "onCircle" | "onCurve" | "midpoint" => (at(0), "diamond"),
+                "symmetric" => (at(0).zip(at(1)).map(|(a, b)| [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]), 0.5 * (a[2] + b[2])]), "diamond"),
+                _ => (at(0).zip(at(1)).map(|(a, b)| [0.5 * (a[0] + b[0]), 0.5 * (a[1] + b[1]), 0.5 * (a[2] + b[2])]), "box"),
+            };
+            let Some(anchor) = anchor else { continue };
+            let key = anchor.map(|c| (c / step.max(1e-9)).round() as i64);
+            let slot = stacks.entry(key).or_insert(0);
+            *slot += 1;
+            let distance = step * *slot as f64;
+            let centre = [
+                anchor[0] + GLYPH_OFFSET_DIR[0] * distance,
+                anchor[1] + GLYPH_OFFSET_DIR[1] * distance,
+                anchor[2] + GLYPH_OFFSET_DIR[2] * distance,
+            ];
+            out.push((id.clone(), centre, shape));
+        }
+        out
+    }
+
+    fn glyph_tessellation(&self, world_per_pixel: f64) -> SketchTessellation {
+        let mut out = SketchTessellation::default();
+        let half = GLYPH_HALF_PX * world_per_pixel;
+        let colors = &self.colors;
+        for (id, c, shape) in self.constraint_glyphs(world_per_pixel) {
+            let color = interaction_color(colors, colors.preview, self.selection.hovered.as_ref(), &self.selection.items, "constraint", &id);
+            let rgb = rgb_of(color);
+            let at = |x: f64, y: f64, z: f64| [c[0] + x * half, c[1] + y * half, c[2] + z * half];
+            let segments: Vec<([f64; 3], [f64; 3])> = match shape {
+                "star" => vec![(at(-1.0, 0.0, 0.0), at(1.0, 0.0, 0.0)), (at(0.0, -1.0, 0.0), at(0.0, 1.0, 0.0)), (at(0.0, 0.0, -1.0), at(0.0, 0.0, 1.0))],
+                "diamond" => {
+                    let ring = [at(1.0, 0.0, 0.0), at(0.0, 1.0, 0.0), at(-1.0, 0.0, 0.0), at(0.0, -1.0, 0.0)];
+                    (0..4)
+                        .flat_map(|i| [(ring[i], ring[(i + 1) % 4]), (ring[i], at(0.0, 0.0, 1.0)), (ring[i], at(0.0, 0.0, -1.0))])
+                        .collect()
+                }
+                _ => {
+                    let corner = |i: usize| at(if i & 1 == 0 { -0.8 } else { 0.8 }, if i & 2 == 0 { -0.8 } else { 0.8 }, if i & 4 == 0 { -0.8 } else { 0.8 });
+                    (0..8usize)
+                        .flat_map(|i| [1usize, 2, 4].map(|bit| (i, i | bit)))
+                        .filter(|(i, j)| i != j)
+                        .map(|(i, j)| (corner(i), corner(j)))
+                        .collect()
+                }
+            };
+            for (a, b) in segments {
+                push_seg(&mut out, a, b, rgb);
+            }
+        }
+        out
     }
 
     /// The nearest DRAGGABLE point under `(x, y)` (id + its authored `fixed`
@@ -371,8 +463,14 @@ impl Sketch3dSession {
     /// The `set_overlay` JSON for the solved geometry + points.
     pub fn overlay_json(&self, world_per_pixel: f64) -> String {
         let tess = self.tessellation(world_per_pixel);
+        let glyphs = self.glyph_tessellation(world_per_pixel);
         json!({
             "groups": [
+                {
+                    "name": OVERLAY_GLYPHS,
+                    "renderOrder": 10001,
+                    "lines": { "positions": glyphs.line_positions, "colors": glyphs.line_colors },
+                },
                 {
                     "name": OVERLAY_GEOMETRY,
                     "renderOrder": 10000,
@@ -513,6 +611,14 @@ impl Sketch3dSession {
         };
         let line_pts = |g: &Sketch3dGeometry| vec![g.points[0].clone(), g.points[1].clone()];
         let plane_pts = |g: &Sketch3dGeometry| vec![g.points[0].clone(), g.points[1].clone()];
+        if let ([point], [curve]) = (points.as_slice(), geos.as_slice()) {
+            if curve.geom_type == "bezier" && curve.points.len() >= 4 {
+                let mut ids = vec![point.clone()];
+                ids.extend(curve.points.iter().cloned());
+                push("onCurve", "On curve", ids);
+                return out;
+            }
+        }
         if others > 0 {
             return out;
         }
@@ -542,11 +648,30 @@ impl Sketch3dSession {
                 push("angle", "Angle", ids.clone());
                 push("equal", "Equal length", ids);
             }
+            // A linked circle is published as its axis line, flagged `circle`.
+            (1, 1, 0, 0) if lines[0].extra.get("circle").and_then(Value::as_bool) == Some(true) => {
+                let mut ids = vec![points[0].clone()];
+                ids.extend(line_pts(lines[0]));
+                push("coincident", "At centre", vec![points[0].clone(), lines[0].points[0].clone()]);
+                push("onCircle", "On circle", ids);
+            }
             (1, 1, 0, 0) => {
                 let mut ids = vec![points[0].clone()];
                 ids.extend(line_pts(lines[0]));
                 push("onLine", "On line", ids.clone());
-                push("lineDistance", "Distance to line", ids);
+                push("lineDistance", "Distance to line", ids.clone());
+                push("midpoint", "At midpoint", ids);
+            }
+            (1, 0, 1, 0) => {
+                let mut ids = vec![points[0].clone()];
+                ids.extend(arcs[0].points[..3].iter().cloned());
+                push("coincident", "At centre", vec![points[0].clone(), arcs[0].points[0].clone()]);
+                push("onArc", "On arc", ids);
+            }
+            (2, 0, 0, 1) => {
+                let mut ids = vec![points[0].clone(), points[1].clone()];
+                ids.extend(plane_pts(planes[0]));
+                push("symmetric", "Symmetric", ids);
             }
             (1, 0, 0, 1) => {
                 let mut ids = vec![points[0].clone()];
@@ -603,6 +728,39 @@ impl Sketch3dSession {
         }
     }
 
+    /// The name of the lost reference a constraint depends on, if any.
+    pub fn lost_reference_of(&self, constraint: &Sketch3dConstraint) -> Option<&str> {
+        let key = brep_kernel::sketch_id_key;
+        self.lost_references
+            .iter()
+            .find(|(_, ids)| constraint.points().iter().any(|p| ids.iter().any(|id| key(id) == key(p))))
+            .map(|(name, _)| name.as_str())
+    }
+
+    /// One sentence per lost reference, naming the constraints that need it.
+    pub fn lost_reference_messages(&self) -> Vec<String> {
+        self.lost_references
+            .iter()
+            .map(|(name, _)| {
+                let needed: Vec<String> = self
+                    .doc
+                    .constraints
+                    .iter()
+                    .filter(|c| self.lost_reference_of(c) == Some(name.as_str()))
+                    .map(|c| format!("{} {}", c.ctype().unwrap_or("?"), c.id().map(brep_kernel::sketch_id_key).unwrap_or_default()))
+                    .collect();
+                if needed.is_empty() {
+                    format!("3D sketch: reference '{name}' no longer resolves; it keeps its last position")
+                } else {
+                    format!(
+                        "3D sketch: reference '{name}' no longer resolves; it keeps its last position, needed by constraint {}",
+                        needed.join(", ")
+                    )
+                }
+            })
+            .collect()
+    }
+
     /// Rows for the entity lists: `(kind, id, label)` per point, geometry and
     /// constraint, with the mobility / conflict state the list colors by.
     pub fn entity_rows_json(&self) -> Value {
@@ -646,6 +804,7 @@ impl Sketch3dSession {
                     "points": c.points(),
                     "value": c.value(),
                     "conflicting": c.id().map_or(false, |id| self.diagnostics.constraint_conflicting(id)),
+                    "lostReference": self.lost_reference_of(c),
                 })
             })
             .collect();

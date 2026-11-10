@@ -414,17 +414,42 @@ pub(crate) fn without_promotion_14(switches: HybridSwitches) -> HybridSwitches {
 }
 
 /// `switches` with promotion 15's hybrid switch (2026-11-08) off:
-/// `noisy_crossing`. Promotion 15's other switches are not hybrid rows
-/// (`BREP_TJUNCTION_STRIP_HYBRID` in the STL conversion,
-/// `BREP_MESH_PLANE_CORNERS` and `BREP_MESH_NOISY_POLYHEDRON` in the kernel's
-/// mesh rebuild), so this leaves them as they are.
+/// `noisy_crossing`, and promotion 16's with it. Promotion 15's other
+/// switches are not hybrid rows (`BREP_TJUNCTION_STRIP_HYBRID` in the STL
+/// conversion, `BREP_MESH_PLANE_CORNERS` and `BREP_MESH_NOISY_POLYHEDRON` in
+/// the kernel's mesh rebuild), so this leaves them as they are.
 pub(crate) fn without_promotion_15(switches: HybridSwitches) -> HybridSwitches {
-    HybridSwitches { noisy_crossing: false, ..switches }
+    without_promotion_16(HybridSwitches { noisy_crossing: false, ..switches })
+}
+
+/// `switches` with promotion 16's switches (2026-11-08) off:
+/// `chip_pass_one_try` and `chip_rung_groups`.
+pub(crate) fn without_promotion_16(switches: HybridSwitches) -> HybridSwitches {
+    HybridSwitches { chip_pass_one_try: false, chip_rung_groups: false, ..switches }
+}
+
+/// [`hybrid_plane_cylinder_brep`] without promotion 16's
+/// `chip_rung_groups`: the STL conversion's first further try when the
+/// rebuilt solid fails its STEP round trip. It keeps `chip_pass_one_try`,
+/// which changes no rebuild that leaves no facet (batch 105, w105) and only
+/// saves the time of a dropped chip-plane rebuild's fallback ladder; and it
+/// is made only under `noisy_crossing`, without which the chip-plane rebuild
+/// is never made and this try would repeat the first.
+pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_16(
+    positions: &[f64],
+    indices: Option<&[u32]>,
+    options: &SegmentOptions,
+) -> Result<Option<HybridBrepOutput>, String> {
+    let switches = HybridSwitches::from_env();
+    if !(switches.noisy_crossing && switches.chip_rung_groups) {
+        return Ok(None);
+    }
+    hybrid_plane_cylinder_brep_retry(positions, indices, options, HybridSwitches { chip_rung_groups: false, ..switches }, None).map(Some)
 }
 
 /// [`hybrid_plane_cylinder_brep`] without promotion 15's hybrid switch
-/// ([`without_promotion_15`]): the STL conversion's first further try when
-/// the rebuilt solid fails its STEP round trip.
+/// ([`without_promotion_15`]): the STL conversion's next try when the
+/// rebuilt solid fails its STEP round trip.
 pub(crate) fn hybrid_plane_cylinder_brep_before_promotion_15(
     positions: &[f64],
     indices: Option<&[u32]>,
@@ -1202,6 +1227,32 @@ pub(crate) struct HybridSwitches {
     /// BREP_HYBRID_NOISY_CROSSING=0 restores the old path (promoted ON
     /// 2026-11-08, promotion 15).
     pub(crate) noisy_crossing: bool,
+    /// The rebuild [`HybridSwitches::chip_planes_pass`] marks is kept only
+    /// when it leaves no facet, and a rebuild that fails is dropped; with
+    /// this switch one that fails whole is not made again down the fallback
+    /// ladder (without the cone seam, the curved slivers, the noise bar,
+    /// revolve ends first, the cone-strip gather), each step of which is a
+    /// whole rebuild that recurses on failure. On the app fixture
+    /// gearbox-keychain the chip-plane rebuild failed whole (open edges) and
+    /// its ladder made 20 failing rebuilds, 213-222 s of a 330 s import, all
+    /// discarded; no census or app-mesh chip-plane rebuild that left no
+    /// facet used a fallback step (batch 105, c105 and w105).
+    /// BREP_HYBRID_CHIP_PASS_ONE_TRY=0 restores the ladder (
+    /// batch 106; promoted ON 2026-11-08, promotion 16).
+    pub(crate) chip_pass_one_try: bool,
+    /// On the rebuild [`HybridSwitches::chip_planes_pass`] marks, the split's
+    /// next rung (twice the chip bar) also takes the plane groups its first
+    /// rung joined from chips, so a freeform region beside one can join it.
+    /// Without it a cap the first rung grouped is past the chip size and
+    /// the freeform rest of the cap beside it stays a facet run: on census
+    /// record kernel_countersunk_hole_s1_d0.1_jitter-0.3 the chip pass read
+    /// the side wall y = -3 as a plane, but the top cap became a group of 26
+    /// and a freeform region of 10 (the kept rebuild joins all 36 in
+    /// `join_noisy_planar_fragments`, whose fragments are planes under 16
+    /// triangles), so the pass left 10 facets for the kept rebuild's 2 and
+    /// was dropped. BREP_HYBRID_CHIP_RUNG_GROUPS=0 restores the chips-only
+    /// rung (batch 107; promoted ON 2026-11-08, promotion 16).
+    pub(crate) chip_rung_groups: bool,
 }
 
 /// [`HybridSwitches::noisy_cap_tilt`]: the largest sine a noisy cap may
@@ -1296,6 +1347,8 @@ impl HybridSwitches {
             join_walls_pass: false,
             chip_planes_pass: false,
             noisy_crossing: promoted("BREP_HYBRID_NOISY_CROSSING"),
+            chip_pass_one_try: promoted("BREP_HYBRID_CHIP_PASS_ONE_TRY"),
+            chip_rung_groups: promoted("BREP_HYBRID_CHIP_RUNG_GROUPS"),
         }
     }
 }
@@ -1341,6 +1394,7 @@ fn segment_for_hybrid_measured(
             switches.join_walls_pass,
             switches.noisy_crossing,
             switches.chip_planes_pass,
+            switches.chip_rung_groups,
         )
     };
     let mut split = if split_freeform_enabled() {
@@ -3471,9 +3525,16 @@ pub(crate) fn hybrid_plane_cylinder_brep_retry(
     let mut kept = (best, switches);
     if switches.retry_join_walls && !switches.join_walls_pass && kept.0.stats.faceted_triangles > 0 && kept.0.stats.split_joinable_walls > 0 {
         let joined = HybridSwitches { join_walls_pass: true, ..switches };
-        if let Ok(output) = hybrid_plane_cylinder_brep_retry_once(positions, indices, options, joined, injected_failure) {
+        let started = web_time::Instant::now();
+        let joined_output = hybrid_plane_cylinder_brep_retry_once(positions, indices, options, joined, injected_failure);
+        if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
+            if let Err(message) = &joined_output {
+                eprintln!("[hybrid] joined-wall rebuild failed in {:.1} s: {message}", started.elapsed().as_secs_f64());
+            }
+        }
+        if let Ok(output) = joined_output {
             if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
-                eprintln!("[hybrid] joined-wall rebuild: {} -> {} faceted", kept.0.stats.faceted_triangles, output.stats.faceted_triangles);
+                eprintln!("[hybrid] joined-wall rebuild: {} -> {} faceted in {:.1} s", kept.0.stats.faceted_triangles, output.stats.faceted_triangles, started.elapsed().as_secs_f64());
             }
             if output.stats.faceted_triangles == 0 || (switches.noisy_crossing && output.stats.faceted_triangles * 20 <= kept.0.stats.faceted_triangles) {
                 kept = (output, joined);
@@ -3491,9 +3552,16 @@ pub(crate) fn hybrid_plane_cylinder_brep_retry(
     // volume error 4.2e-3 -> 7.9e-3), so such a rebuild is not kept.
     if switches.noisy_crossing && !kept.1.chip_planes_pass && kept.0.stats.faceted_triangles > 0 {
         let chips = HybridSwitches { chip_planes_pass: true, ..kept.1 };
-        if let Ok(output) = hybrid_plane_cylinder_brep_retry_once(positions, indices, options, chips, injected_failure) {
+        let started = web_time::Instant::now();
+        let chip_output = hybrid_plane_cylinder_brep_retry_once(positions, indices, options, chips, injected_failure);
+        if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
+            if let Err(message) = &chip_output {
+                eprintln!("[hybrid] chip-plane rebuild failed in {:.1} s: {message}", started.elapsed().as_secs_f64());
+            }
+        }
+        if let Ok(output) = chip_output {
             if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
-                eprintln!("[hybrid] chip-plane rebuild: {} -> {} faceted", kept.0.stats.faceted_triangles, output.stats.faceted_triangles);
+                eprintln!("[hybrid] chip-plane rebuild: {} -> {} faceted in {:.1} s", kept.0.stats.faceted_triangles, output.stats.faceted_triangles, started.elapsed().as_secs_f64());
             }
             if output.stats.faceted_triangles == 0 {
                 return Ok(output);
@@ -3593,6 +3661,12 @@ fn rebuild_with_forbidden_hosts(
         .as_ref()
         .is_ok_and(|(segmentation, ..)| segmentation.regions.iter().any(|r| matches!(r.carrier, RegionCarrier::Cone { .. })));
     let mut rebuilt = hybrid_brep_from_segmentation(positions, index_buffer, options, switches, injected_failure, segmented.clone());
+    if chip_pass_gives_up(switches, rebuilt.is_err()) {
+        if std::env::var("BREP_DEBUG_HYBRID").is_ok() {
+            eprintln!("[hybrid] chip-plane rebuild failed whole; no fallback ladder (BREP_HYBRID_CHIP_PASS_ONE_TRY)");
+        }
+        return rebuilt;
+    }
     let without_seam = HybridSwitches { cone_seam: false, ..switches };
     let without_slivers = HybridSwitches { absorb_curved_slivers: false, ..without_seam };
     // [`HybridSwitches::split_noise_bar`]: a rebuild that still fails is
@@ -3680,6 +3754,13 @@ fn rebuild_with_forbidden_hosts(
         };
     }
     rebuilt
+}
+
+/// [`HybridSwitches::chip_pass_one_try`]: whether a rebuild that failed
+/// whole is returned as it is, without the fallback ladder: only on the
+/// chip-plane rebuild, whose failure is dropped anyway.
+fn chip_pass_gives_up(switches: HybridSwitches, failed: bool) -> bool {
+    failed && switches.chip_planes_pass && switches.chip_pass_one_try
 }
 
 /// Rebuilds [`HybridSwitches::absorb_retry`] makes at most.

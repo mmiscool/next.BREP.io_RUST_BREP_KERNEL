@@ -96,8 +96,8 @@ pub enum ExportFormat {
 #[serde(deny_unknown_fields)]
 pub struct ExportArgs {
     pub format: ExportFormat,
-    /// STEP only: export just these resident solids of a part document
-    /// (default: every solid). Its PMI is left out of a subset.
+    /// STEP or IGES: export just these resident solids of a part document
+    /// (default: every solid). A STEP subset leaves its PMI out.
     #[serde(default)]
     pub solids: Option<Vec<String>>,
 }
@@ -220,8 +220,10 @@ pub struct Exported {
 
 /// A BOM export's rows read back from its text (see `Exported::bom_rows`).
 fn bom_read_back(format: &str, text: &str) -> Option<Vec<Value>> {
-    if format == "bom_json" {
-        return serde_json::from_str(text).ok();
+    match format {
+        "bom_json" => return serde_json::from_str(text).ok(),
+        "bom_csv" => {}
+        _ => return None,
     }
     // Minimal RFC-4180: quoted fields with doubled quotes, as the writer quotes.
     fn fields(line: &str) -> Vec<String> {
@@ -444,8 +446,8 @@ fn doc_import(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 
 fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: ExportArgs = parse_args(args)?;
-    if a.solids.is_some() && !matches!(a.format, ExportFormat::Step) {
-        return Err("`solids` selects what a STEP export writes; other formats export the whole document".into());
+    if a.solids.is_some() && !matches!(a.format, ExportFormat::Step | ExportFormat::Iges) {
+        return Err("`solids` selects what a STEP or IGES export writes; other formats export the whole document".into());
     }
     // Files and the root PRODUCT take the document's DISPLAY name, as the
     // UI's Export does (its name field starts from `model_display_name`). A
@@ -562,7 +564,7 @@ fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         ExportFormat::Step => ("step", engine.export_step_text_selected(&document_name, a.solids.as_deref())?),
         ExportFormat::Stl => ("stl", engine.export_stl_text()?),
         ExportFormat::Obj => ("obj", engine.export_obj_text()?),
-        ExportFormat::Iges => ("iges", engine.export_iges_text()?),
+        ExportFormat::Iges => ("iges", engine.export_iges_text_selected(&document_name, a.solids.as_deref())?),
         ExportFormat::Dxf => ("dxf", engine.export_flat_pattern_dxf()?),
         ExportFormat::Svg => ("svg", engine.export_flat_pattern_svg()?),
         ExportFormat::SheetSvg => {

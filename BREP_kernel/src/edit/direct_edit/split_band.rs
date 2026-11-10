@@ -117,6 +117,41 @@ fn same_carrier(a: &NurbsSurface, b: &NurbsSurface, tolerance: f64) -> bool {
     }
 }
 
+/// Where a closed band's two walls meet: the closed forms, else the march.
+///
+/// A cylinder through a cone on a parallel axis (a vent in a lid, once filleted)
+/// meets it in a closed space curve no closed form covers, so such a band needs
+/// the marcher the fitted lanes already use. `Ok(None)` means the walls have no
+/// closed form and the march proved they do not meet.
+pub(super) fn wall_sections(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    band_points: &[Vec3],
+    scale: f64,
+    tolerance: f64,
+) -> Result<Option<Vec<NurbsCurve>>, KernelRefusal> {
+    if let Some(curves) = intersect_analytic_pair(first, second, tolerance) {
+        return Ok(Some(curves));
+    }
+    let policy = MarchPolicy {
+        tolerance: (scale * 1e-7).max(1e-9),
+        residual_tolerance: (scale * 1e-6).max(1e-7),
+        seeds: band_points.to_vec(),
+    };
+    match reintersect_carriers(first, second, &policy) {
+        Ok(rim) => Ok(Some(
+            rim.sections.into_iter().filter(|section| section.closed).map(|section| section.curve).collect(),
+        )),
+        Err(ReintersectRefusal::Separated) => Ok(None),
+        Err(ReintersectRefusal::Failed(refusal)) => Err(refusal),
+        Err(other) => Err(KernelRefusal::unsupported(
+            KernelStage::Refine,
+            "marched_reintersection",
+            format!("the walls of the closed band do not re-intersect ({})", other.describe()),
+        )),
+    }
+}
+
 /// Does this selection read as a closed band whose two walls are split across
 /// several faces? `None` leaves it to the lanes after this one.
 pub(super) fn classify_split_band(solid: &BrepSolid, face_ids: &[u64]) -> Option<SplitBand> {
@@ -349,8 +384,8 @@ pub(super) fn heal_split_band(
     };
     let surface_a = surface(&solid, band.groups[0][0].face)?;
     let surface_b = surface(&solid, band.groups[1][0].face)?;
-    let curves = intersect_analytic_pair(&surface_a, &surface_b, tolerance).ok_or_else(|| {
-        refusal("analytic_pair", "its walls are not a recognized analytic pair".into())
+    let curves = wall_sections(&surface_a, &surface_b, &band_points, scale, tolerance)?.ok_or_else(|| {
+        refusal("analytic_pair", "its walls are not a recognized analytic pair and do not meet".into())
     })?;
     let mut centre = Vec3::default();
     for point in &band_points {

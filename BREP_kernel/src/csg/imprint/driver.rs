@@ -2728,6 +2728,12 @@ fn build_imprints_with_carrier_seeds(
                 std::borrow::Cow::Borrowed(&seed_points)
             } else {
                 let resolvable = (options.tolerance / (2.0 * builder.scale.max(options.tolerance))).sqrt();
+                // A crease fading to tangency along a rim brushes it at |tan.n|
+                // around 1e-4 for its last stretch, and those hits cut the
+                // section into micro-pieces whose ends disagree; the interval
+                // this path exists for pierced at 3.5e-3. `BREP_GRAZING_CLIP_FLOOR=0`
+                // restores the resolvable bound alone.
+                let resolvable = if switch!("BREP_GRAZING_CLIP_FLOOR", true) { resolvable.max(1e-3) } else { resolvable };
                 let mut points = seed_points.clone();
                 points.extend(grazing_hits.iter().filter(|hit| hit.1 >= resolvable).map(|hit| hit.0));
                 if debug_pairs && points.len() != seed_points.len() {

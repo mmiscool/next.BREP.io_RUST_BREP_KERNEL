@@ -90,7 +90,7 @@ impl StepColors {
     /// only one colour per entity: the first prefix in the caller's order wins,
     /// the same "a shared part resolves to the one face" rule the PMI writer
     /// documents for annotations.
-    fn resolve(&self, prefixes: &[String], name: &str) -> Option<[u8; 3]> {
+    pub(crate) fn resolve(&self, prefixes: &[String], name: &str) -> Option<[u8; 3]> {
         prefixes.iter().find_map(|prefix| {
             if prefix.is_empty() {
                 self.by_name.get(name).copied()

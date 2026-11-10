@@ -686,7 +686,7 @@ fn seed_audit_record(
 /// every knot span. A pure function of the surface, cached on it — building
 /// the grid costs hundreds of evaluations and projection is the hottest
 /// entry point in the kernel.
-fn projection_seed_grid(surface: &NurbsSurface) -> Result<&[(f64, f64, Vec3)], String> {
+fn projection_seed_grid(surface: &NurbsSurface) -> Result<&SampleGrid, String> {
     if let Some(grid) = surface.projection_grid.get() {
         return Ok(grid);
     }
@@ -721,7 +721,7 @@ fn projection_seed_grid(surface: &NurbsSurface) -> Result<&[(f64, f64, Vec3)], S
             }
         }
     }
-    Ok(surface.projection_grid.get_or_init(|| grid))
+    Ok(surface.projection_grid.get_or_init(|| SampleGrid::new(grid)))
 }
 
 /// The dense fallback grid for degenerate general projection: (u, v, point)
@@ -730,7 +730,7 @@ fn projection_seed_grid(surface: &NurbsSurface) -> Result<&[(f64, f64, Vec3)], S
 /// it — on metre-unit-mm parts the degenerate fallback fires ~1.7M times and
 /// each re-evaluated all ~561 lattice points; caching them makes the argmin a
 /// pure distance scan over reused points (bit-identical seed).
-fn projection_dense_grid(surface: &NurbsSurface) -> Result<&[(f64, f64, Vec3)], String> {
+fn projection_dense_grid(surface: &NurbsSurface) -> Result<&SampleGrid, String> {
     if let Some(grid) = surface.projection_dense_grid.get() {
         return Ok(grid);
     }
@@ -752,7 +752,108 @@ fn projection_dense_grid(surface: &NurbsSurface) -> Result<&[(f64, f64, Vec3)], 
             grid.push((u, v, surface.evaluate(u, v)?));
         }
     }
-    Ok(surface.projection_dense_grid.get_or_init(|| grid))
+    Ok(surface.projection_dense_grid.get_or_init(|| SampleGrid::new(grid)))
+}
+
+/// Samples per block of a [`SampleGrid`].
+const SAMPLE_BLOCK: usize = 32;
+
+/// A cached `(u, v, point)` sample grid, with the axis-aligned box of each run
+/// of [`SAMPLE_BLOCK`] consecutive samples, so the nearest-sample scan
+/// ([`nearest_sample`]) skips a run none of whose samples can beat the answer
+/// it holds.
+#[derive(Clone, Debug)]
+pub(crate) struct SampleGrid {
+    samples: Vec<(f64, f64, Vec3)>,
+    blocks: Vec<SampleBlock>,
+}
+
+/// One run's box. `prunable` is false when a sample has a non-finite
+/// coordinate: the box says nothing about it, and the run is always scanned.
+#[derive(Clone, Copy, Debug)]
+struct SampleBlock {
+    low: Vec3,
+    high: Vec3,
+    prunable: bool,
+}
+
+impl SampleGrid {
+    fn new(samples: Vec<(f64, f64, Vec3)>) -> Self {
+        let blocks = samples
+            .chunks(SAMPLE_BLOCK)
+            .map(|chunk| {
+                let mut low = chunk[0].2;
+                let mut high = low;
+                let mut prunable = true;
+                for &(_, _, p) in chunk {
+                    prunable &= p.x.is_finite() && p.y.is_finite() && p.z.is_finite();
+                    low = Vec3::new(low.x.min(p.x), low.y.min(p.y), low.z.min(p.z));
+                    high = Vec3::new(high.x.max(p.x), high.y.max(p.y), high.z.max(p.z));
+                }
+                SampleBlock { low, high, prunable }
+            })
+            .collect();
+        Self { samples, blocks }
+    }
+}
+
+impl SampleBlock {
+    /// A floor on `sample.sub(point).length_squared()` over the run's samples,
+    /// as COMPUTED, not only as real numbers: per axis the gap from `point` to
+    /// the box is the same subtraction against the box face, and IEEE rounding
+    /// is monotone, so `|fl(s - p)| >= fl(face - p)`; squaring and the same
+    /// left-to-right sum of non-negative terms keep the order (`Vec3::dot`
+    /// has no fused multiply-add). A NaN `point` reads gaps of 0 and every
+    /// distance is NaN, which no scan takes, so skipping changes nothing.
+    fn lower_bound(&self, point: Vec3) -> f64 {
+        let gap = |p: f64, low: f64, high: f64| {
+            if p < low {
+                low - p
+            } else if p > high {
+                p - high
+            } else {
+                0.0
+            }
+        };
+        let x = gap(point.x, self.low.x, self.high.x);
+        let y = gap(point.y, self.low.y, self.high.y);
+        let z = gap(point.z, self.low.z, self.high.z);
+        x * x + y * y + z * z
+    }
+}
+
+/// `BREP_PROJECTION_PRUNED_SCAN=0` scans every sample, as before 2026-11-10,
+/// for a same-binary A/B. Read once per process.
+fn pruned_scan() -> bool {
+    switch!("BREP_PROJECTION_PRUNED_SCAN", true)
+}
+
+/// Replace `best` with the grid's nearest sample when that is strictly nearer,
+/// the first such in scan order: the bits of the linear scan, which this was
+/// until 2026-11-10. A run is skipped only when its box's floor is not below
+/// the distance held, so none of its samples could have replaced it (the
+/// strict `<`), and the runs are visited in scan order. ABC 00027566's
+/// 166-span rational faces take the dense fallback on 71% of their pcurve
+/// probes (the first Newton not converged), each scanning 22.7k samples: 9.1 s
+/// of a face's 11.5 s of local answers.
+fn nearest_sample(grid: &SampleGrid, point: Vec3, best: &mut NewtonResult) {
+    nearest_sample_with(grid, point, best, pruned_scan());
+}
+
+fn nearest_sample_with(grid: &SampleGrid, point: Vec3, best: &mut NewtonResult, pruned: bool) {
+    for (block, chunk) in grid.blocks.iter().zip(grid.samples.chunks(SAMPLE_BLOCK)) {
+        if pruned && block.prunable && block.lower_bound(point) >= best.distance_squared {
+            continue;
+        }
+        for &(u, v, sample) in chunk {
+            let distance_squared = sample.sub(point).length_squared();
+            if distance_squared < best.distance_squared {
+                best.u = u;
+                best.v = v;
+                best.distance_squared = distance_squared;
+            }
+        }
+    }
 }
 
 // Boundary-ring cache geometry: 4 sides × 22 exponents × 33 indices. The scan
@@ -822,14 +923,7 @@ fn nearest_seed_answer(
         distance_squared: f64::INFINITY,
         converged: false,
     };
-    for &(u, v, sample) in projection_seed_grid(surface)? {
-        let distance_squared = sample.sub(point).length_squared();
-        if distance_squared < best.distance_squared {
-            best.u = u;
-            best.v = v;
-            best.distance_squared = distance_squared;
-        }
-    }
+    nearest_sample(projection_seed_grid(surface)?, point, &mut best);
     if let Some(revolution) = project_linear_revolution(surface, point)? {
         if revolution.distance * revolution.distance < best.distance_squared {
             best.u = revolution.u;
@@ -853,14 +947,7 @@ fn nearest_seed_answer(
     let degenerate = su.cross(sv).length() <= 1e-5 * (1.0 + su.length() + sv.length());
     if degenerate || !first_newton.converged {
         let mut grid = best;
-        for &(u, v, sample) in projection_dense_grid(surface)? {
-            let distance_squared = sample.sub(point).length_squared();
-            if distance_squared < grid.distance_squared {
-                grid.u = u;
-                grid.v = v;
-                grid.distance_squared = distance_squared;
-            }
-        }
+        nearest_sample(projection_dense_grid(surface)?, point, &mut grid);
         if grid.distance_squared < best.distance_squared {
             best = grid;
         }
@@ -2107,3 +2194,4 @@ pub(crate) fn curve_foot_newton(
     let (_, nearest, squared) = curve_foot_newton_state(curve, point, seed, bracket, policy)?;
     Ok((nearest, squared))
 }
+

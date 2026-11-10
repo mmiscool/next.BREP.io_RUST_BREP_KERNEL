@@ -165,6 +165,7 @@ pub(super) fn split(
     join_walls: bool,
     noisy_crossing: bool,
     chip_planes: bool,
+    chip_rung_groups: bool,
 ) -> SplitReport {
     let mut report = SplitReport::default();
     if indices.len() != segmentation.triangle_region_ids.len() * 3 {
@@ -3613,6 +3614,9 @@ pub(super) fn split(
             let mut order: Vec<usize> = (0..members.len()).filter(|&i| plane_chip(i, segmentation)).collect();
             order.sort_by_key(|&i| (std::cmp::Reverse(members[i].len()), i));
             let mut done = vec![false; members.len()];
+            // [`crate::hybrid_region_brep::HybridSwitches::chip_rung_groups`]:
+            // the groups this rung joins, which the next rung takes too.
+            let mut rung_groups = std::collections::BTreeSet::<usize>::new();
             for &seed in &order {
                 if done[seed] {
                     continue;
@@ -3662,6 +3666,7 @@ pub(super) fn split(
                 if debug {
                     eprintln!("[split] plane chips {group:?} ({} triangles) are one plane, their vertices within {worst:.3e} (bar {bar:.3e})", tris.len());
                 }
+                rung_groups.insert(seed);
                 for &t in &tris {
                     segmentation.triangle_region_ids[t] = seed as u32;
                 }
@@ -3689,7 +3694,9 @@ pub(super) fn split(
                 !members[i].is_empty()
                     && match segmentation.regions[i].carrier {
                         RegionCarrier::Freeform => true,
-                        RegionCarrier::Plane { .. } => members[i].len() < SLIVER_TRIANGLES,
+                        RegionCarrier::Plane { .. } => {
+                            members[i].len() < SLIVER_TRIANGLES || (chip_rung_groups && rung_groups.contains(&i))
+                        }
                         _ => false,
                     }
             };

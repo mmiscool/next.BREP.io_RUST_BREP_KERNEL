@@ -1795,7 +1795,23 @@ pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<Brep
     // a re-intersected rim is exactly what can produce one, and a fold is
     // wrong in AREA where it is right in volume, so nothing that measures
     // volume would notice. See `healing::accept_sound`.
-    crate::accept_sound(delete_faces_and_heal_impl(solid, face_ids)?, "deleteFace")
+    let healed = match delete_faces_and_heal_impl(solid, face_ids) {
+        Ok(healed) => healed,
+        // Only after every lane has refused, so no selection that healed
+        // before changes (`prism_ring.rs`).
+        Err(refusal) => match classify_prism_ring(solid, face_ids) {
+            Some(ring) => match heal_prism_ring(solid, &ring, "delete_faces_and_heal") {
+                Ok(healed) => coalesce_healed_edges(&healed),
+                Err(reason) => {
+                    return Err(refusal.with_message(|refusal| {
+                        format!("{refusal}. The prism-ring heal was tried too and declined: {reason}")
+                    }))
+                }
+            },
+            None => return Err(refusal),
+        },
+    };
+    crate::accept_sound(healed, "deleteFace")
 }
 
 /// The whole selection's heal, without the soundness floor: see
@@ -1848,6 +1864,9 @@ fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<Bre
     }
     if let Some(patch) = classify_patch(solid, &face_ids) {
         return Ok(coalesce_healed_edges(&cap_face_patch(solid, &patch, op)?));
+    }
+    if let Some(answer) = super::conical_cap::cap_conical_apex(solid, &face_ids) {
+        return answer;
     }
     if let Some(group) = classify_corner_blend_group(solid, &face_ids) {
         return Ok(coalesce_healed_edges(

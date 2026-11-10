@@ -240,7 +240,7 @@ fn rho_at(rho0: f64, rho1: f64, height: f64, axial: f64) -> f64 {
 /// from here without editing `analytic_surface.rs`), so the tiny extraction is
 /// re-derived from the (public) frame basis instead of shared. A CURVED
 /// generatrix (sphere/torus-like, non-ruled) returns None → it must still refuse.
-fn ruled_revolution_carrier(
+pub(super) fn ruled_revolution_carrier(
     surface: &NurbsSurface,
 ) -> Option<(crate::RevolutionFrame, f64, f64, f64)> {
     match surface.analytic() {

@@ -349,6 +349,11 @@ pub const SKETCH3D_CONSTRAINT_TYPES: &[Sketch3dConstraintType] = &[
     Sketch3dConstraintType { name: "alongZ", arity: 2, dimensional: false, meaning: "the line runs along world Z" },
     Sketch3dConstraintType { name: "equal", arity: 4, dimensional: false, meaning: "[a0, a1, b0, b1]: equal lengths (an arc's radius is center→start)" },
     Sketch3dConstraintType { name: "tangent", arity: 5, dimensional: false, meaning: "[a0, a1, center, start, end]: the line is tangent to the arc at the arc end it shares" },
+    Sketch3dConstraintType { name: "midpoint", arity: 3, dimensional: false, meaning: "[p, a0, a1]: the point is halfway between a0 and a1" },
+    Sketch3dConstraintType { name: "onArc", arity: 4, dimensional: false, meaning: "[p, center, start, end]: the point is on the arc's circle, in its plane, at its current radius" },
+    Sketch3dConstraintType { name: "onCircle", arity: 3, dimensional: false, meaning: "[p, center, axisTip]: the point is on the circle whose axis is center->axisTip and whose radius is that length" },
+    Sketch3dConstraintType { name: "symmetric", arity: 4, dimensional: false, meaning: "[a, b, origin, normalTip]: a and b mirror each other in the plane" },
+    Sketch3dConstraintType { name: "onCurve", arity: 5, dimensional: false, meaning: "[p, c0, c1, ...]: the point is on the cubic bezier chain with these 3n + 1 control points" },
 ];
 
 /// Look up a constraint type by its `type` string.
@@ -453,7 +458,7 @@ impl Sketch3dDiagnostics {
 /// One residual atom over point INDICES into the coordinate array. `rows()`
 /// is the number of scalar rows; `eff_rows()` the atom's rank at a solution
 /// (a 3-row cross-product block only ever removes 2 DOF).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Atom {
     /// `a − b` (3 rows, eff 3).
     Coincide(usize, usize),
@@ -480,12 +485,63 @@ enum Atom {
     /// `unit(a1 − a0) · unit((s − c) × (e − c))` (1 row): the line lies in
     /// the arc's plane.
     InArcPlane(usize, usize, usize, usize, usize),
+    /// `p − (a + b)/2` (3 rows, eff 3).
+    Midpoint(usize, usize, usize),
+    /// `n̂·((a + b)/2 − o)`, then the part of `a − b` perpendicular to `n̂`,
+    /// with `n̂ = unit(t − o)` (4 rows, eff 3): `a` and `b` mirror in the plane.
+    Symmetric(usize, usize, usize, usize),
+    /// `p − C(t*)`, `C(t*)` the point of the cubic bezier chain nearest `p`
+    /// (3 rows, eff 2).
+    OnBezier(usize, Box<[usize]>),
+}
+
+/// The point of a cubic bezier chain nearest `target`: a coarse scan, then
+/// Newton on `(C − target) · C'` inside the winning span.
+fn nearest_on_bezier(controls: &[Vec3], target: Vec3) -> Vec3 {
+    const SCAN: usize = 16;
+    let value = |c: &[Vec3], t: f64| {
+        let u = 1.0 - t;
+        c[0].scale(u * u * u).add(c[1].scale(3.0 * u * u * t)).add(c[2].scale(3.0 * u * t * t)).add(c[3].scale(t * t * t))
+    };
+    let first = |c: &[Vec3], t: f64| {
+        let u = 1.0 - t;
+        c[1].sub(c[0]).scale(3.0 * u * u).add(c[2].sub(c[1]).scale(6.0 * u * t)).add(c[3].sub(c[2]).scale(3.0 * t * t))
+    };
+    let second = |c: &[Vec3], t: f64| {
+        let d1 = c[2].sub(c[1].scale(2.0)).add(c[0]);
+        let d2 = c[3].sub(c[2].scale(2.0)).add(c[1]);
+        d1.scale(6.0 * (1.0 - t)).add(d2.scale(6.0 * t))
+    };
+    let mut best: Option<(f64, usize, f64)> = None;
+    for span in 0..(controls.len() - 1) / 3 {
+        let c = &controls[span * 3..span * 3 + 4];
+        for i in 0..=SCAN {
+            let t = i as f64 / SCAN as f64;
+            let d = value(c, t).sub(target).length();
+            if best.map_or(true, |(bd, _, _)| d < bd) {
+                best = Some((d, span, t));
+            }
+        }
+    }
+    let Some((_, span, mut t)) = best else { return target };
+    let c = &controls[span * 3..span * 3 + 4];
+    for _ in 0..8 {
+        let offset = value(c, t).sub(target);
+        let d1 = first(c, t);
+        let denominator = d1.dot(d1) + offset.dot(second(c, t));
+        if denominator.abs() <= 1e-14 {
+            break;
+        }
+        t = (t - offset.dot(d1) / denominator).clamp(0.0, 1.0);
+    }
+    value(c, t)
 }
 
 impl Atom {
     fn rows(&self) -> usize {
         match self {
-            Atom::Coincide(..) | Atom::Lateral(..) | Atom::DirCross(..) | Atom::AxisCross(..) => 3,
+            Atom::Coincide(..) | Atom::Lateral(..) | Atom::DirCross(..) | Atom::AxisCross(..) | Atom::Midpoint(..) | Atom::OnBezier(..) => 3,
+            Atom::Symmetric(..) => 4,
             Atom::Distance(..)
             | Atom::LineDistance(..)
             | Atom::PlaneOffset(..)
@@ -498,8 +554,8 @@ impl Atom {
 
     fn eff_rows(&self) -> usize {
         match self {
-            Atom::Coincide(..) => 3,
-            Atom::Lateral(..) | Atom::DirCross(..) | Atom::AxisCross(..) => 2,
+            Atom::Coincide(..) | Atom::Midpoint(..) | Atom::Symmetric(..) => 3,
+            Atom::Lateral(..) | Atom::DirCross(..) | Atom::AxisCross(..) | Atom::OnBezier(..) => 2,
             _ => 1,
         }
     }
@@ -555,6 +611,22 @@ impl Atom {
             Atom::InArcPlane(a0, a1, c, s, e) => {
                 let n = unit(p[s].sub(p[c]).cross(p[e].sub(p[c])));
                 out.push(unit(p[a1].sub(p[a0])).dot(n));
+            }
+            Atom::Midpoint(pt, a, b) => {
+                let d = p[pt].sub(p[a].add(p[b]).scale(0.5));
+                out.extend([d.x, d.y, d.z]);
+            }
+            Atom::Symmetric(a, b, o, t) => {
+                let n = unit(p[t].sub(p[o]));
+                out.push(n.dot(p[a].add(p[b]).scale(0.5).sub(p[o])));
+                let v = p[a].sub(p[b]);
+                let lateral = v.sub(n.scale(n.dot(v)));
+                out.extend([lateral.x, lateral.y, lateral.z]);
+            }
+            Atom::OnBezier(pt, ref controls) => {
+                let positions: Vec<Vec3> = controls.iter().map(|&i| p[i]).collect();
+                let d = p[pt].sub(nearest_on_bezier(&positions, p[pt]));
+                out.extend([d.x, d.y, d.z]);
             }
         }
     }
@@ -617,8 +689,13 @@ fn prepare(doc: &Sketch3dDoc, options: &Sketch3dSolveOptions) -> Result<Prepared
             ));
         }
         let what = format!("constraint '{ctype}'");
-        let mut idx = Vec::with_capacity(spec.arity);
-        for id in &ids[..spec.arity] {
+        // A bezier chain takes every control point it was given.
+        let taken = if ctype == "onCurve" { ids.len() } else { spec.arity };
+        if ctype == "onCurve" && (taken - 2) % 3 != 0 {
+            return Err(format!("sketch3d: constraint 'onCurve' needs a point and 3n + 1 control points, got {taken} ids"));
+        }
+        let mut idx = Vec::with_capacity(taken);
+        for id in &ids[..taken] {
             idx.push(lookup(&what, id)?);
         }
         let value = || -> Result<f64, String> {
@@ -687,6 +764,19 @@ fn prepare(doc: &Sketch3dDoc, options: &Sketch3dSolveOptions) -> Result<Prepared
                 push(Atom::TangentTouch(a0, a1, c, touch));
                 push(Atom::InArcPlane(a0, a1, c, s, e));
             }
+            "midpoint" => push(Atom::Midpoint(idx[0], idx[1], idx[2])),
+            "onArc" => {
+                let (pt, c, s, e) = (idx[0], idx[1], idx[2], idx[3]);
+                push(Atom::EqualLength(c, pt, c, s));
+                push(Atom::InArcPlane(c, pt, c, s, e));
+            }
+            "onCircle" => {
+                let (pt, c, tip) = (idx[0], idx[1], idx[2]);
+                push(Atom::PlaneOffset(pt, c, tip, 0.0));
+                push(Atom::EqualLength(c, pt, c, tip));
+            }
+            "symmetric" => push(Atom::Symmetric(idx[0], idx[1], idx[2], idx[3])),
+            "onCurve" => push(Atom::OnBezier(idx[0], idx[1..].to_vec().into_boxed_slice())),
             other => return Err(format!("sketch3d: unknown constraint type '{other}'")),
         }
     }

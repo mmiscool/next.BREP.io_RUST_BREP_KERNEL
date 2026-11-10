@@ -890,7 +890,31 @@ impl EngineState {
                 }
             },
         };
+        let solved = self.snap_dragged_poses(solved);
         self.component_commit_solved(&drag.members, &solved, frame.anchor);
+    }
+
+    /// The released poses on the 0.001 drag grid, each number judged against
+    /// what the document stores, so a partner the mates left alone stays
+    /// unmoved. Only a drag comes through here; a typed move stays exact.
+    fn snap_dragged_poses(
+        &self,
+        solved: std::collections::BTreeMap<String, ([f64; 3], [f64; 3])>,
+    ) -> std::collections::BTreeMap<String, ([f64; 3], [f64; 3])> {
+        use crate::formatting::snap_drag_moved;
+        solved
+            .into_iter()
+            .map(|(id, (translate, rotate_deg))| {
+                let snapped = match self.component_info(&id) {
+                    Some(info) => (
+                        std::array::from_fn(|i| snap_drag_moved(info.translate[i], translate[i])),
+                        std::array::from_fn(|i| snap_drag_moved(info.rotate_deg[i], rotate_deg[i])),
+                    ),
+                    None => (translate, rotate_deg),
+                };
+                (id, snapped)
+            })
+            .collect()
     }
 
     /// Write the solved poses of a drag or a typed move: every component that

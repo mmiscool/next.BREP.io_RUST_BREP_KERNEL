@@ -276,6 +276,7 @@ fn ruled_cylinder_support(
     face: &FaceRecord,
     tolerance: f64,
     allow_cone: bool,
+    allow_apex: bool,
 ) -> Result<Option<CylinderSupport>, KernelRefusal> {
     let surface = &face.surface;
     let debug = std::env::var("BREP_DEBUG_MERGE").is_ok();
@@ -320,15 +321,46 @@ fn ruled_cylinder_support(
         .map(|point| point.point().map(|p| p.length()).unwrap_or(0.0))
         .fold(1.0f64, f64::max);
     let circle_tolerance = (tolerance * 100.0).max(1e-7 * scale);
-    let Some((center0, normal0, radius0)) = arc_circle_support(&iso_curve(0)?, circle_tolerance)?
+    // An apex iso is one point: a circle of radius zero about it. Its plane is
+    // the far circle's, so the checks below read that normal against the axis.
+    let apex_of = |curve: &NurbsCurve| -> Result<Option<Vec3>, KernelRefusal> {
+        if !allow_apex {
+            return Ok(None);
+        }
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
+        let first = curve.evaluate(t0).or_refuse(KernelStage::Sew, "evaluate")?;
+        for index in 1..=8 {
+            let point = curve.evaluate(t0 + (t1 - t0) * index as f64 / 8.0).or_refuse(KernelStage::Sew, "evaluate")?;
+            if point.sub(first).length() > circle_tolerance {
+                return Ok(None);
+            }
+        }
+        Ok(Some(first))
+    };
+    let (iso0, iso1) = (iso_curve(0)?, iso_curve(last)?);
+    let (apex0, apex1) = (apex_of(&iso0)?, apex_of(&iso1)?);
+    let far_circle = match (apex0, apex1) {
+        (Some(_), None) => arc_circle_support(&iso1, circle_tolerance)?,
+        (None, Some(_)) => arc_circle_support(&iso0, circle_tolerance)?,
+        _ => None,
+    };
+    let apex_circle = |apex: Vec3| far_circle.map(|(_, normal, _)| (apex, normal, 0.0));
+    let circle0 = match apex0 {
+        Some(apex) => apex_circle(apex),
+        None => arc_circle_support(&iso0, circle_tolerance)?,
+    };
+    let circle1 = match apex1 {
+        Some(apex) => apex_circle(apex),
+        None => arc_circle_support(&iso1, circle_tolerance)?,
+    };
+    let Some((center0, normal0, radius0)) = circle0
     else {
         if debug {
             eprintln!("  support face {}: first iso not circular", face.id);
         }
         return Ok(None);
     };
-    let Some((center1, normal1, radius1)) =
-        arc_circle_support(&iso_curve(last)?, circle_tolerance)?
+    let Some((center1, normal1, radius1)) = circle1
     else {
         if debug {
             eprintln!("  support face {}: last iso not circular", face.id);
@@ -418,7 +450,7 @@ fn cosurface_cylinder_pair(
     lanes: MergeLanes<'_>,
 ) -> Result<Option<CylinderSupport>, KernelRefusal> {
     let debug = std::env::var("BREP_DEBUG_MERGE").is_ok();
-    let Some(support_a) = ruled_cylinder_support(first, tolerance, lanes.cones)? else {
+    let Some(support_a) = ruled_cylinder_support(first, tolerance, lanes.cones, false)? else {
         if debug {
             eprintln!(
                 "merge {}x{}: first not a ruled cylinder",
@@ -427,7 +459,7 @@ fn cosurface_cylinder_pair(
         }
         return Ok(None);
     };
-    let Some(support_b) = ruled_cylinder_support(second, tolerance, lanes.cones)? else {
+    let Some(support_b) = ruled_cylinder_support(second, tolerance, lanes.cones, false)? else {
         if debug {
             eprintln!(
                 "merge {}x{}: second not a ruled cylinder",
@@ -894,6 +926,67 @@ fn reproject_loops(
         });
     }
     Ok(projected_loops)
+}
+
+/// Put the one degenerate `apex` coedge back into the loop that passes through
+/// its vertex: a parameter line at the pole from the arriving trim's longitude
+/// to the leaving trim's. Each trim's pole end takes the longitude of its next
+/// control point, since projection cannot read a longitude at the pole. False
+/// when no single loop passes through the apex.
+fn stitch_cone_apex(
+    surface: &NurbsSurface,
+    loops: &mut [LoopRecord],
+    apex: &CoedgeRecord,
+    edges: &HashMap<u64, &EdgeRecord>,
+) -> Result<bool, KernelRefusal> {
+    let vertex = edges[&apex.edge_id].start_vertex_id;
+    let mut sites = Vec::new();
+    for (loop_index, loop_record) in loops.iter().enumerate() {
+        for (index, coedge) in loop_record.coedges.iter().enumerate() {
+            let next = &loop_record.coedges[(index + 1) % loop_record.coedges.len()];
+            if traversal_vertices(edges[&coedge.edge_id], coedge).1 == vertex
+                && traversal_vertices(edges[&next.edge_id], next).0 == vertex
+            {
+                sites.push((loop_index, index));
+            }
+        }
+    }
+    let [(loop_index, index)] = sites[..] else {
+        return Ok(false);
+    };
+    let coedges = &mut loops[loop_index].coedges;
+    let next_index = (index + 1) % coedges.len();
+    let (u_domain, _) = surface_domains(surface)?;
+    let [_, t1] = coedges[index].pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let pole = coedges[index].pcurve.evaluate(t1).or_refuse(KernelStage::Sew, "evaluate")?;
+    let apex_point = surface.evaluate(pole.x, pole.y).or_refuse(KernelStage::Sew, "evaluate")?;
+    let across = surface
+        .evaluate((u_domain[0] + u_domain[1]) / 2.0, pole.y)
+        .or_refuse(KernelStage::Sew, "evaluate")?;
+    let angle_is_u = across.sub(apex_point).length() <= 1e-7 * (1.0 + apex_point.length());
+    let snapped = |pcurve: &mut NurbsCurve, at_end: bool| -> Result<Vec3, KernelRefusal> {
+        let count = pcurve.control_points.len();
+        if count < 2 {
+            return Err(KernelRefusal::internal(KernelStage::Sew, "face_merge", "cone apex: trim has one control point"));
+        }
+        let (slot, inner) = if at_end { (count - 1, count - 2) } else { (0, 1) };
+        let from = pcurve.control_points[inner].point().or_refuse(KernelStage::Sew, "point")?;
+        let weight = pcurve.control_points[slot].w;
+        let mut point = pcurve.control_points[slot].point().or_refuse(KernelStage::Sew, "point")?;
+        if angle_is_u {
+            point.x = from.x;
+        } else {
+            point.y = from.y;
+        }
+        pcurve.control_points[slot] = Vec4::from_point(point, weight);
+        Ok(point)
+    };
+    let arriving = snapped(&mut coedges[index].pcurve, true)?;
+    let leaving = snapped(&mut coedges[next_index].pcurve, false)?;
+    let mut bridge = apex.clone();
+    bridge.pcurve = make_line(arriving, leaving).or_refuse(KernelStage::Sew, "healing.face_merge")?;
+    coedges.insert(index + 1, bridge);
+    Ok(true)
 }
 
 fn traversal_vertices(edge: &EdgeRecord, coedge: &CoedgeRecord) -> (u64, u64) {
@@ -2864,6 +2957,105 @@ pub(crate) fn absorb_faces_into_carriers(
         }
     }
     finish_merge(solid, result, true, None)
+}
+
+/// Rebuild the cone face `id` on one carrier holding all its trims, every trim
+/// re-read from its 3D edge, with its apex pole stitched back. A blend end grows
+/// such a face past its old chart. False when it is not a ruled cone patch or the
+/// rebuilt face does not close.
+pub(crate) fn recarry_cone_apex_face(solid: &mut BrepSolid, id: u64, tolerance: f64) -> Result<bool, KernelRefusal> {
+    let Some(face) = solid.shells.iter().flat_map(|shell| &shell.faces).find(|face| face.id == id).cloned() else {
+        return Ok(false);
+    };
+    let Some(support) = ruled_cylinder_support(&face, tolerance, true, true)? else {
+        return Ok(false);
+    };
+    let edges = solid.edges.iter().map(|edge| (edge.id, edge)).collect::<HashMap<_, _>>();
+    let mut apex = None;
+    let mut loops = face.loops.clone();
+    for loop_record in &mut loops {
+        loop_record.coedges.retain(|coedge| {
+            let pole = edges[&coedge.edge_id].degenerate;
+            if pole && apex.is_none() {
+                apex = Some(coedge.clone());
+            }
+            !pole
+        });
+    }
+    let seed = {
+        let Some(point) = loops.iter().flat_map(|l| &l.coedges).find_map(|coedge| {
+            let edge = edges[&coedge.edge_id];
+            let [a, b] = [edge.curve.evaluate(edge.t0).ok()?, edge.curve.evaluate(edge.t1).ok()?];
+            let radial = |p: Vec3| { let d = p.sub(support.origin); d.sub(support.axis.scale(d.dot(support.axis))) };
+            if radial(a).length() > radial(b).length() { Some(radial(a)) } else { Some(radial(b)) }
+        }) else {
+            return Ok(false);
+        };
+        point.normalized().or_refuse(KernelStage::Sew, "normalized")?
+    };
+    let y_reference = support.axis.cross(seed);
+    let mut angles = Vec::new();
+    let mut axial_range = [f64::INFINITY, f64::NEG_INFINITY];
+    for coedge in loops.iter().flat_map(|l| &l.coedges) {
+        let edge = edges[&coedge.edge_id];
+        let curve = trimmed_curve(&edge.curve, edge.t0, edge.t1)?;
+        let [c0, c1] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
+        let hull = axial_hull(&curve, &support);
+        axial_range[0] = axial_range[0].min(hull[0]);
+        axial_range[1] = axial_range[1].max(hull[1]);
+        for index in 0..=32 {
+            let delta = curve.evaluate(c0 + (c1 - c0) * index as f64 / 32.0).or_refuse(KernelStage::Sew, "evaluate")?.sub(support.origin);
+            let radial = delta.sub(support.axis.scale(delta.dot(support.axis)));
+            if radial.length() > (support.radius * 1e-6).max(tolerance) {
+                angles.push(radial.dot(y_reference).atan2(radial.dot(seed)).rem_euclid(std::f64::consts::TAU));
+            }
+        }
+    }
+    if angles.len() < 3 {
+        return Ok(false);
+    }
+    angles.sort_by(f64::total_cmp);
+    let (mut gap_start, mut largest) = (angles.len() - 1, angles[0] + std::f64::consts::TAU - angles[angles.len() - 1]);
+    for index in 0..angles.len() - 1 {
+        if angles[index + 1] - angles[index] > largest {
+            largest = angles[index + 1] - angles[index];
+            gap_start = index;
+        }
+    }
+    let span = std::f64::consts::TAU - largest;
+    if span <= tolerance || span >= std::f64::consts::TAU - 1e-6 {
+        return Ok(false);
+    }
+    let start = angles[(gap_start + 1) % angles.len()];
+    let direction = seed.scale(start.cos()).add(y_reference.scale(start.sin()));
+    let end_radius = |axial: f64| { let radius = support.radius_at(axial); if radius.abs() <= tolerance { 0.0 } else { radius } };
+    let at = |axial: f64| support.origin.add(support.axis.scale(axial)).add(direction.scale(end_radius(axial)));
+    let generatrix = make_line(at(axial_range[0]), at(axial_range[1])).or_refuse(KernelStage::Sew, "healing.face_merge")?;
+    let surface = make_revolution(support.origin, support.axis, &generatrix, span).or_refuse(KernelStage::Sew, "make_revolution")?;
+    let (u_domain, v_domain) = surface_domains(&surface)?;
+    let (mid_u, mid_v) = ((u_domain[0] + u_domain[1]) / 2.0, (v_domain[0] + v_domain[1]) / 2.0);
+    let delta = surface.evaluate(mid_u, mid_v).or_refuse(KernelStage::Sew, "evaluate")?.sub(support.origin);
+    let radial = delta.sub(support.axis.scale(delta.dot(support.axis))).normalized().or_refuse(KernelStage::Sew, "normalized")?;
+    let same_sense = surface.normal(mid_u, mid_v).or_refuse(KernelStage::Sew, "normal")?.dot(radial).signum() == support.outward_radial_sign;
+    let mut projected = reproject_loops(&surface, loops, &edges)?;
+    if let Some(apex) = &apex {
+        if !stitch_cone_apex(&surface, &mut projected, apex, &edges)? {
+            return Ok(false);
+        }
+    }
+    let rebuilt = FaceRecord { id, surface, same_sense, loops: projected, name: face.name.clone() };
+    let area = parameter_space_area(&rebuilt).or_refuse(KernelStage::Sew, "parameter_space_area")?;
+    if area.abs() <= tolerance * tolerance || area.is_sign_positive() != rebuilt.same_sense {
+        return Ok(false);
+    }
+    drop(edges);
+    for shell in &mut solid.shells {
+        if let Some(slot) = shell.faces.iter_mut().find(|face| face.id == id) {
+            *slot = rebuilt;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Merge edge-adjacent faces of `group` that ride the same carrier — the

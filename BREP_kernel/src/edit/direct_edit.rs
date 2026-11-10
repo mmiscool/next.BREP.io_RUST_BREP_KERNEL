@@ -173,6 +173,10 @@ mod corner_heal;
 mod closed_band;
 #[path = "direct_edit/split_band.rs"]
 mod split_band;
+#[path = "direct_edit/conical_cap.rs"]
+mod conical_cap;
+#[path = "direct_edit/prism_ring.rs"]
+mod prism_ring;
 #[path = "direct_edit/blend_network_heal.rs"]
 mod blend_network_heal;
 
@@ -180,6 +184,7 @@ mod blend_network_heal;
 use blend_network_heal::*;
 use closed_band::*;
 use split_band::*;
+use prism_ring::*;
 use closed_heal::*;
 use closed_heal_census::*;
 use corner_heal::*;
@@ -273,7 +278,7 @@ pub(crate) use face_rotate::rotate_faces_rigid;
 pub use face_move_carrier::{route_reading, RouteReading};
 // The RE-CUT road: the same edit performed from the original body and the
 // motion, for a translation whose answer needs the topology to change.
-pub use face_move_recut::{recut_moved_planes, recut_moved_planes_rigid};
+pub use face_move_recut::{recut_moved_planes, recut_moved_planes_rigid, reblend_lost_fillets};
 pub use face_offset::offset_ruled_face;
 pub use face_offset_sphere::offset_sphere_face;
 pub use face_offset_torus::offset_torus_face;

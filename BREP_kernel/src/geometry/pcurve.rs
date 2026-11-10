@@ -3525,6 +3525,15 @@ pub(crate) fn common_station_read(
 /// foot's own distance at that probe (the part over the edge's standoff
 /// there, which the every-use controls bar at the original 1e-7). Returns
 /// `[tracking, deviation, excess]` for the legacy and the candidate.
+/// `BREP_TRACKING_CLOSED_FOOT` (default on, `=0` restores the seeded Newton
+/// feet): [`common_station_read_with_excess`] reads a curve against itself on
+/// an analytic carrier at the closed-form foot when that foot is admitted.
+fn tracking_closed_foot_enabled() -> bool {
+    let enabled = crate::switch!("BREP_TRACKING_CLOSED_FOOT", true);
+    enabled
+}
+
+
 pub(crate) fn common_station_read_with_excess(
     surface: &NurbsSurface,
     evaluate_edge: &dyn Fn(f64) -> Result<Vec3, String>,
@@ -3550,6 +3559,26 @@ pub(crate) fn common_station_read_with_excess(
     // stands for all three feet (2026-11-03: two thirds of the
     // elephant's tracking projections).
     let ellipsoid = if same && surface.analytic().is_none() { surface.affine_sphere() } else { None };
+    // On a recognised analytic carrier the global projector IS the closed
+    // form (`projection::project_point_to_surface`), the exact nearest point,
+    // and the seeded Newton converges to that same foot (the carriers' feet are
+    // unique off their focal sets, where the closed form declines), so it can
+    // only win `common_foot`'s minimum by rounding. A self-read
+    // therefore takes the closed form for all three feet when it is admitted, and
+    // otherwise reads as before. brep-bench boolean/cross-drilled-cube: every
+    // cylinder-cylinder crossing an operand hands on is read once, 11 000
+    // probes of a 480-control pcurve, a seeded Newton each (5.2 s of 20 s).
+    // `BREP_TRACKING_CLOSED_FOOT` (default on; `=0` restores the Newton feet).
+    // Curved carriers only: a plane's Newton foot is cheap, and on a weighted
+    // plane far from the origin its two evaluation paths part by more than the
+    // floor (`step_import::builder::loops::derived_floor_tracking_tests`).
+    // On a curved carrier a self-read is no longer the two-object read of the
+    // same trim to the bit; the two differ by the Newton feet's rounding.
+    let analytic = if same && ellipsoid.is_none() && tracking_closed_foot_enabled() {
+        surface.analytic().filter(|analytic| !matches!(analytic, crate::AnalyticSurface::Plane { .. }))
+    } else {
+        None
+    };
     for &fraction in probes {
         let point = evaluate_edge(fraction)?;
         let old_uv = legacy.evaluate(fraction)?;
@@ -3559,7 +3588,11 @@ pub(crate) fn common_station_read_with_excess(
         if !(finite(point) && finite(old_image) && finite(new_image)) {
             return Err(format!("common station read: non-finite point at fraction {fraction}"));
         }
-        let closed_form = ellipsoid.and_then(|ellipsoid| ellipsoid.project(surface, point));
+        let closed_form = ellipsoid.and_then(|ellipsoid| ellipsoid.project(surface, point)).or_else(|| {
+            analytic
+                .and_then(|analytic| analytic.project(surface, point))
+                .filter(|foot| foot_admitted(foot, domain_u, domain_v))
+        });
         let foot = if let Some(foot) = closed_form {
             common_foot(Some(foot), Some(foot), Some(foot), domain_u, domain_v)
         } else {
@@ -4544,5 +4577,6 @@ fn station_residual(
     }
     Ok(worst)
 }
+
 
 

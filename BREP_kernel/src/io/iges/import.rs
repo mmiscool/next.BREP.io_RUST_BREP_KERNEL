@@ -1,462 +1,574 @@
-//! IGES trimmed-NURBS-surface → kernel `BrepSolid` import.
+//! IGES to kernel `BrepSolid`, by way of the STEP importer.
 //!
-//! Reads every **144** Trimmed Surface as one kernel face: the **128** surface,
-//! and one loop per **142** Curve-on-Surface. For each loop coedge the primary
-//! path reads the parameter-space boundary (`BPTR`) directly as the coedge
-//! pcurve and the model-space boundary (`CPTR`) as the 3D edge curve — a
-//! lossless round-trip of our own exports. When those disagree (a foreign file
-//! whose parameter and model curves don't correspond one-to-one) it falls back
-//! to deriving the pcurve by projecting the 3D curve onto the carrier surface
-//! with [`crate::build_pcurve_on_surface_range`], mirroring the STEP importer.
-//!
-//! The reconstructed faces form a face soup that [`crate::sew_solid`] pairs into
-//! a coherently oriented, outward-facing solid; unsupported entities (bare
-//! untrimmed surfaces, MSBO 186) yield a precise error rather than a panic.
+//! Solids (186) and trimmed-surface sets (144, 143) are translated to Part 21
+//! ([`super::to_step`]) so they get the STEP builder, closure gate and refusals.
+//! Anything that cannot be read correctly is refused by name; a file never
+//! imports short.
 
-use crate::topology::{
-    BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord, VertexRecord,
-};
-use crate::{build_pcurve_on_surface_range, sew_solid, NurbsCurve, NurbsSurface, Vec3};
+use crate::topology::BrepSolid;
+use crate::{BodyAppearance, StepAssembly, StepOccurrence, StepProduct};
+use rustc_hash::FxHashMap as HashMap;
 
-use super::entities::{
-    composite_members, curve_from_126, curve_on_surface_from_142, surface_from_128,
-    trimmed_surface_from_144,
-};
 use super::reader::{parse_iges, IgesFile};
+use super::structure::{self, Matrix, Placed};
+use super::to_step::{analyse_face_sets, free_shell_to_step, manifold_solid_to_step, FaceSets};
 
 /// Parse an IGES document and reconstruct one or more `BrepSolid`s.
 pub fn import_iges(text: &str) -> Result<Vec<BrepSolid>, String> {
+    Ok(import_iges_report(text)?.solids)
+}
+
+/// What [`import_iges_report`] returns: the solids, and the diagnostics the
+/// STEP lane measured while building them, merged over every body.
+#[derive(Clone, Debug)]
+pub struct IgesImportReport {
+    /// The solids, in file order: solids standing on their own, then each
+    /// subfigure instance's (408), placed.
+    pub solids: Vec<BrepSolid>,
+    /// Each solid's name (its 406 name property, else its directory label, else
+    /// the name of the instance that placed it), parallel to `solids`; empty
+    /// when the file gives none.
+    pub names: Vec<String>,
+    /// Each solid's colour (314, or the directory colour number), parallel to
+    /// `solids`, in the shape the STEP lane returns colours in.
+    pub appearances: Vec<BodyAppearance>,
+    /// Each solid's level (layer) number from its directory entry, parallel to
+    /// `solids`; 0 when unset, negative for a 406 list of levels.
+    pub levels: Vec<i64>,
+    /// The file's stated minimum resolution in mm (Global field 19), when it
+    /// states one.
+    pub stated_resolution_mm: Option<f64>,
+    /// Measurements and warnings, as `import_step_report` gives for STEP:
+    /// stated-precision consistency, bounded trims, closure readings.
+    pub diagnostics: crate::KernelDiagnostics,
+}
+
+/// [`import_iges`] with the import's diagnostics, the IGES counterpart of
+/// [`crate::import_step_report`].
+pub fn import_iges_report(text: &str) -> Result<IgesImportReport, String> {
     let file = parse_iges(text)?;
     let scale = file.global.length_scale_mm()?;
+    let stated = file.global.min_resolution * scale;
+    let mut diagnostics = crate::KernelDiagnostics::default();
+    let bodies = solids_with_diagnostics(&file, scale, &mut diagnostics)?;
+    let mut report = IgesImportReport {
+        solids: Vec::with_capacity(bodies.len()),
+        names: Vec::with_capacity(bodies.len()),
+        appearances: Vec::with_capacity(bodies.len()),
+        levels: Vec::with_capacity(bodies.len()),
+        stated_resolution_mm: (stated > 0.0 && stated.is_finite()).then_some(stated),
+        diagnostics,
+    };
+    for body in bodies {
+        report.solids.push(body.solid);
+        report.names.push(body.name.unwrap_or_default());
+        report.appearances.push(BodyAppearance { body: body.color, faces: Vec::new() });
+        report.levels.push(body.level);
+    }
+    Ok(report)
+}
 
-    let mut soup = SoupBuilder::new();
-    let mut faces: Vec<FaceRecord> = Vec::new();
-    for entity in file.entities_of_type(144) {
-        let ts = trimmed_surface_from_144(entity)?;
-        let face = soup.build_face(&file, &ts, scale)?;
-        faces.push(face);
+/// One imported solid and what the file said about it.
+struct Body {
+    solid: BrepSolid,
+    name: Option<String>,
+    color: Option<crate::ImportedColor>,
+    level: i64,
+}
+
+impl Body {
+    fn bare(solid: BrepSolid) -> Self {
+        Self { solid, name: None, color: None, level: 0 }
+    }
+}
+
+/// Each 186 built once, through the STEP lane, in its definition frame.
+type SolidCache = HashMap<i64, Vec<BrepSolid>>;
+
+fn built_solid<'c>(
+    cache: &'c mut SolidCache,
+    file: &IgesFile,
+    pointer: i64,
+    scale: f64,
+    diagnostics: &mut crate::KernelDiagnostics,
+) -> Result<&'c [BrepSolid], String> {
+    if !cache.contains_key(&pointer) {
+        let (built, measured) = manifold_solid(file, pointer, scale)?;
+        merge_diagnostics(diagnostics, measured);
+        cache.insert(pointer, built);
+    }
+    Ok(&cache[&pointer])
+}
+
+/// A built solid moved by a placement; a mirroring placement turns it inside
+/// out unless the orientation is reversed with it.
+fn place(solid: &BrepSolid, placement: &Matrix) -> Result<BrepSolid, String> {
+    if structure::is_identity(placement) {
+        return Ok(solid.clone());
+    }
+    let transform = crate::AffineTransform::new(*placement)?;
+    let mirrored = transform.determinant3() < 0.0;
+    crate::transform_brep(solid, transform, mirrored)
+}
+
+fn solids_with_diagnostics(
+    file: &IgesFile,
+    scale: f64,
+    diagnostics: &mut crate::KernelDiagnostics,
+) -> Result<Vec<Body>, String> {
+    // A file with explicit solids or shells goes down the STEP lane whole: same
+    // builder, same closure gate, same refusals. A solid a subfigure defines
+    // comes in once per instance, where the instance puts it; a shell no solid
+    // uses comes in as the STEP lane reads a surface model.
+    if file.entities_of_type(186).next().is_some() || file.entities_of_type(514).next().is_some() {
+        refuse_uncovered_geometry(file)?;
+        let mut cache = SolidCache::default();
+        let mut bodies = Vec::new();
+        for Placed { solid, placement, name, color, level } in structure::placed_solids(file, scale)? {
+            for built in built_solid(&mut cache, file, solid, scale, diagnostics)? {
+                bodies.push(Body { solid: place(built, &placement)?, name: name.clone(), color, level });
+            }
+        }
+        bodies.extend(free_shell_bodies(file, scale, diagnostics)?);
+        if bodies.is_empty() {
+            let sheets = diagnostics.counters.get(crate::step_import::SHEETS_SKIPPED).copied().unwrap_or(0);
+            return Err(format!(
+                "iges_import: the file has no solids: its {sheets} shell(s) are sheets (open, or a single untrimmed face), not solids"
+            ));
+        }
+        return Ok(bodies);
+    }
+    if file.entities_of_type(408).next().is_some() {
+        return Err(
+            "iges_import: the file places subfigures (408) of trimmed surfaces, which this import cannot build yet"
+                .into(),
+        );
     }
 
-    if faces.is_empty() {
-        // Precise diagnostics for the common unsupported representations.
-        if file.entities_of_type(186).next().is_some() {
-            return Err(
-                "iges_import: file uses Manifold Solid B-Rep Object (entity 186), which is not yet supported"
-                    .into(),
-            );
-        }
+    if file.entities_of_type(144).next().is_none() && file.entities_of_type(143).next().is_none() {
         if file.entities_of_type(128).next().is_some() {
             return Err(
                 "iges_import: file has untrimmed B-spline surfaces (entity 128) but no trimmed surfaces (entity 144) to form faces"
                     .into(),
             );
         }
-        return Err("iges_import: no trimmed NURBS surfaces (entity 144) found".into());
+        return Err("iges_import: the file has no solids (186) or trimmed surfaces (144, 143) to import".into());
     }
-
-    // Characteristic size for sew tolerance.
-    let diag = soup.bounding_diagonal();
-    let sew_tol = (1e-6 * diag).max(1e-9);
-
-    // IGES has no body grouping, so the file is a flat face set. Partition it
-    // into connected components (faces sharing a welded vertex belong to the
-    // same body) and sew each into its own solid — matching the STEP importer's
-    // one-solid-per-body contract. A single body is one component, so this is
-    // behaviour-identical to a single sew for the common case.
-    let mut next_id = soup.next_id;
-    let SoupBuilder { vertices, edges, .. } = soup;
-    let components = partition_faces_into_bodies(&faces, &edges);
-
-    let mut solids = Vec::with_capacity(components.len());
-    for face_indices in components {
-        let body_faces: Vec<FaceRecord> =
-            face_indices.iter().map(|&i| faces[i].clone()).collect();
-        let mut edge_ids: rustc_hash::FxHashSet<u64> = Default::default();
-        for face in &body_faces {
-            for loop_record in &face.loops {
-                for coedge in &loop_record.coedges {
-                    edge_ids.insert(coedge.edge_id);
-                }
-            }
-        }
-        let body_edges: Vec<EdgeRecord> =
-            edges.iter().filter(|e| edge_ids.contains(&e.id)).cloned().collect();
-        let mut vertex_ids: rustc_hash::FxHashSet<u64> = Default::default();
-        for edge in &body_edges {
-            vertex_ids.insert(edge.start_vertex_id);
-            vertex_ids.insert(edge.end_vertex_id);
-        }
-        let body_vertices: Vec<VertexRecord> =
-            vertices.iter().filter(|v| vertex_ids.contains(&v.id)).cloned().collect();
-
-        let shell_id = next_id;
-        let solid_id = next_id + 1;
-        next_id += 2;
-        let solid = BrepSolid {
-            mass_properties_cache: Default::default(),
-            cells: Default::default(),
-            id: solid_id,
-            vertices: body_vertices,
-            edges: body_edges,
-            shells: vec![ShellRecord {
-                id: shell_id,
-                faces: body_faces,
-            }],
-            genus: 0,
-            kind: crate::BodyKind::Solid,
-        };
-        let (sewn, _report) = sew_solid(&solid, sew_tol)?;
-        let issues = sewn.validate();
-        if !issues.is_empty() {
-            return Err(format!(
-                "iges_import: reconstructed solid failed validation: {issues:?}"
-            ));
-        }
-        solids.push(sewn);
+    let (solids, measured) = face_set_solids(file, scale)?;
+    for each in measured {
+        merge_diagnostics(diagnostics, each);
     }
-    Ok(solids)
+    Ok(solids.into_iter().map(Body::bare).collect())
 }
 
-/// Group faces into bodies by shared welded vertices (union-find). Each returned
-/// vector holds the indices (into `faces`) of one connected component.
-fn partition_faces_into_bodies(faces: &[FaceRecord], edges: &[EdgeRecord]) -> Vec<Vec<usize>> {
-    use rustc_hash::FxHashMap as HashMap;
-
-    let edge_vertices: HashMap<u64, (u64, u64)> = edges
-        .iter()
-        .map(|e| (e.id, (e.start_vertex_id, e.end_vertex_id)))
+/// The file's subfigure structure, the IGES counterpart of
+/// [`crate::read_step_assembly`]: one product for the file itself holding the
+/// solids that stand on their own, one per instanced subfigure (308) holding
+/// its own solids in its own frame, and one occurrence per instance (408) with
+/// its placement in millimetres. `Ok(None)` when the file places no
+/// subfigures, so the caller takes the flat import as for STEP.
+///
+/// Every solid is built once, as in the flat import, and a file the flat
+/// import refuses is refused here with the same words: an assembly never
+/// comes in short.
+pub fn read_iges_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
+    let file = parse_iges(text)?;
+    let members = structure::subfigure_member_set(&file)?;
+    let top_instances: Vec<i64> = file
+        .pointers_of_type(408)
+        .into_iter()
+        .map(|(pointer, _)| pointer)
+        .filter(|pointer| !members.contains(pointer))
         .collect();
-
-    let mut parent: Vec<usize> = (0..faces.len()).collect();
-    fn find(parent: &mut Vec<usize>, x: usize) -> usize {
-        crate::union_find::find_root(parent, x)
+    if top_instances.is_empty() {
+        return Ok(None);
     }
+    // The flat import's checks and refusals, once, before any structure.
+    let scale = file.global.length_scale_mm()?;
+    if file.entities_of_type(186).next().is_none() {
+        return Err(
+            "iges_import: the file places subfigures (408) of trimmed surfaces, which this import cannot build yet"
+                .into(),
+        );
+    }
+    refuse_uncovered_geometry(&file)?;
+    structure::placed_solids(&file, scale)?;
 
-    // First face that referenced a given vertex; union subsequent faces to it.
-    let mut vertex_owner: HashMap<u64, usize> = HashMap::default();
-    for (face_index, face) in faces.iter().enumerate() {
-        for loop_record in &face.loops {
-            for coedge in &loop_record.coedges {
-                if let Some(&(a, b)) = edge_vertices.get(&coedge.edge_id) {
-                    for vertex in [a, b] {
-                        match vertex_owner.get(&vertex) {
-                            Some(&owner) => {
-                                let ra = find(&mut parent, owner);
-                                let rb = find(&mut parent, face_index);
-                                parent[ra] = rb;
-                            }
-                            None => {
-                                vertex_owner.insert(vertex, face_index);
-                            }
+    let mut cache = SolidCache::default();
+    let mut diagnostics = crate::KernelDiagnostics::default();
+    let root_name = {
+        let product = file.global.product_id.trim();
+        if product.is_empty() { "IGES".to_string() } else { product.to_string() }
+    };
+    let mut assembly = StepAssembly {
+        products: vec![StepProduct {
+            pd_ref: 0,
+            name: root_name,
+            id: String::new(),
+            bodies: Vec::new(),
+            appearances: Vec::new(),
+            failed_bodies: 0,
+            pmi: None,
+        }],
+        occurrences: Vec::new(),
+        roots: vec![0],
+        first_error: None,
+        pmi: None,
+        pmi_diagnostics: Vec::new(),
+        sheets_skipped: 0,
+    };
+    for (pointer, solid) in file.pointers_of_type(186) {
+        if !members.contains(&pointer) {
+            let color = structure::entity_color(&file, solid);
+            for built in built_solid(&mut cache, &file, pointer, scale, &mut diagnostics)? {
+                assembly.products[0].bodies.push(built.clone());
+                assembly.products[0].appearances.push(BodyAppearance { body: color, faces: Vec::new() });
+            }
+        }
+    }
+    for body in free_shell_bodies(&file, scale, &mut diagnostics)? {
+        assembly.products[0].bodies.push(body.solid);
+        assembly.products[0].appearances.push(BodyAppearance { body: body.color, faces: Vec::new() });
+    }
+    assembly.sheets_skipped = diagnostics.counters.get(crate::step_import::SHEETS_SKIPPED).copied().unwrap_or(0) as usize;
+    let mut products: HashMap<i64, usize> = HashMap::default();
+    for pointer in top_instances {
+        add_instance(&file, scale, pointer, 0, &mut assembly, &mut products, &mut cache, &mut diagnostics, 0)?;
+    }
+    Ok(Some(assembly))
+}
+
+/// One 408 as an occurrence under `parent`, its subfigure as a product (added
+/// once, however many instances place it), and the subfigure's own instances
+/// beneath it.
+#[allow(clippy::too_many_arguments)]
+fn add_instance(
+    file: &IgesFile,
+    scale: f64,
+    pointer: i64,
+    parent: usize,
+    assembly: &mut StepAssembly,
+    products: &mut HashMap<i64, usize>,
+    cache: &mut SolidCache,
+    diagnostics: &mut crate::KernelDiagnostics,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 64 {
+        return Err(format!("iges_import: instance DE {pointer} nests deeper than 64 levels"));
+    }
+    let instance = file.entity(pointer)?;
+    let (definition_pointer, definition) = structure::instanced_subfigure(file, pointer)?;
+    let child = match products.get(&definition_pointer) {
+        Some(&index) => index,
+        None => {
+            let index = assembly.products.len();
+            products.insert(definition_pointer, index);
+            assembly.products.push(StepProduct {
+                pd_ref: definition_pointer as usize,
+                name: structure::entity_name(file, definition).unwrap_or_else(|| format!("subfigure#{definition_pointer}")),
+                id: String::new(),
+                bodies: Vec::new(),
+                appearances: Vec::new(),
+                failed_bodies: 0,
+                pmi: None,
+            });
+            for member in structure::subfigure_members(definition)? {
+                let entity = file.entity(member)?;
+                match entity.de.entity_type {
+                    186 => {
+                        let color = structure::entity_color(file, entity);
+                        let built = built_solid(cache, file, member, scale, diagnostics)?.to_vec();
+                        let product = &mut assembly.products[index];
+                        for solid in built {
+                            product.bodies.push(solid);
+                            product.appearances.push(BodyAppearance { body: color, faces: Vec::new() });
                         }
                     }
+                    408 => add_instance(file, scale, member, index, assembly, products, cache, diagnostics, depth + 1)?,
+                    _ => {}
                 }
             }
+            index
         }
-    }
-
-    let mut groups: HashMap<usize, Vec<usize>> = HashMap::default();
-    for face_index in 0..faces.len() {
-        let root = find(&mut parent, face_index);
-        groups.entry(root).or_default().push(face_index);
-    }
-    let mut components: Vec<Vec<usize>> = groups.into_values().collect();
-    // Deterministic order: by smallest face index in each component.
-    components.sort_by_key(|c| c.iter().copied().min().unwrap_or(0));
-    components
+    };
+    let placement = structure::instance_matrix(file, instance, scale)?;
+    let rigid = crate::AffineTransform::new(placement).is_ok_and(|transform| transform.is_rigid(1e-9));
+    assembly.occurrences.push(StepOccurrence {
+        edge_ref: pointer as usize,
+        parent,
+        child,
+        designator: structure::entity_name(file, instance).unwrap_or_else(|| format!("instance#{pointer}")),
+        placement,
+        rigid,
+    });
+    Ok(())
 }
 
-/// Accumulates the shared vertex/edge pools while building faces, welding
-/// coincident vertices so loops close and adjacent faces share endpoints.
-struct SoupBuilder {
-    next_id: u64,
-    vertices: Vec<VertexRecord>,
-    edges: Vec<EdgeRecord>,
-}
-
-impl SoupBuilder {
-    fn new() -> Self {
-        Self {
-            next_id: 1,
-            vertices: Vec::new(),
-            edges: Vec::new(),
-        }
+/// Fold one body's diagnostics into the file's: events and counts add up, and
+/// each measurement keeps its worst reading, as `measure_max` does.
+fn merge_diagnostics(into: &mut crate::KernelDiagnostics, from: crate::KernelDiagnostics) {
+    into.events.extend(from.events);
+    for (key, count) in from.counters {
+        *into.counters.entry(key).or_insert(0) += count;
     }
-
-    fn fresh(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
-    fn weld_vertex(&mut self, point: Vec3) -> u64 {
-        let tol = 1e-7 * (1.0 + point.length());
-        if let Some(existing) = self
-            .vertices
-            .iter()
-            .find(|v| v.point.sub(point).length() <= tol)
-        {
-            return existing.id;
+    for (key, value) in from.measurements {
+        let slot = into.measurements.entry(key).or_insert(value);
+        if value > *slot {
+            *slot = value;
         }
-        let id = self.fresh();
-        self.vertices.push(VertexRecord { id, point });
-        id
-    }
-
-    fn bounding_diagonal(&self) -> f64 {
-        if self.vertices.is_empty() {
-            return 1.0;
-        }
-        let mut lo = self.vertices[0].point;
-        let mut hi = self.vertices[0].point;
-        for v in &self.vertices {
-            lo.x = lo.x.min(v.point.x);
-            lo.y = lo.y.min(v.point.y);
-            lo.z = lo.z.min(v.point.z);
-            hi.x = hi.x.max(v.point.x);
-            hi.y = hi.y.max(v.point.y);
-            hi.z = hi.z.max(v.point.z);
-        }
-        hi.sub(lo).length().max(1.0)
-    }
-
-    fn build_face(
-        &mut self,
-        file: &IgesFile,
-        ts: &super::entities::TrimmedSurface,
-        scale: f64,
-    ) -> Result<FaceRecord, String> {
-        let surface_entity = file.entity(ts.surface)?;
-        if surface_entity.de.entity_type != 128 {
-            return Err(format!(
-                "iges_import: trimmed surface points to entity type {} (expected 128)",
-                surface_entity.de.entity_type
-            ));
-        }
-        let surface = surface_from_128(surface_entity, scale)?;
-
-        let mut loops: Vec<LoopRecord> = Vec::new();
-        // Outer boundary first (kernel convention), then holes. `N1=0` means the
-        // outer boundary is the surface's natural parameter domain (no explicit
-        // outer loop); reconstructing that would need a synthetic domain-edge
-        // loop, so it is refused loudly rather than yielding a hole-only face.
-        if ts.outer.is_none() {
-            return Err(
-                "iges_import: trimmed surface with an implicit (natural-domain) outer boundary (144 N1=0) is not supported"
-                    .into(),
-            );
-        }
-        let mut boundary_ptrs: Vec<i64> = Vec::new();
-        boundary_ptrs.extend(ts.outer);
-        boundary_ptrs.extend(ts.inner.iter().copied());
-        for ptr in boundary_ptrs {
-            loops.push(self.build_loop(file, ptr, ts.surface, &surface, scale)?);
-        }
-
-        // Orientation is encoded by `same_sense` together with loop winding:
-        // flipping a face toggles `same_sense` and reverses its loops, so a
-        // valid outward face has `same_sense == (outer-loop parameter-space
-        // winding is CCW)`. The pcurves are preserved faithfully, so recover
-        // the original sense directly rather than leaving it to sew heuristics
-        // (which mis-resolve concave inner-loop walls).
-        let same_sense = loops
-            .first()
-            .map(|outer| loop_param_signed_area(outer) >= 0.0)
-            .unwrap_or(true);
-
-        let id = self.fresh();
-        Ok(FaceRecord {
-            id,
-            surface,
-            same_sense,
-            loops,
-            name: None,
-        })
-    }
-
-    fn build_loop(
-        &mut self,
-        file: &IgesFile,
-        boundary_ptr: i64,
-        surface_ptr: i64,
-        surface: &NurbsSurface,
-        scale: f64,
-    ) -> Result<LoopRecord, String> {
-        let cos_entity = file.entity(boundary_ptr)?;
-        if cos_entity.de.entity_type != 142 {
-            return Err(format!(
-                "iges_import: boundary points to entity type {} (expected 142 curve-on-surface)",
-                cos_entity.de.entity_type
-            ));
-        }
-        let cos = curve_on_surface_from_142(cos_entity)?;
-        if cos.surface != surface_ptr {
-            return Err(format!(
-                "iges_import: curve-on-surface references surface DE {} but its trimmed surface is DE {surface_ptr}",
-                cos.surface
-            ));
-        }
-        let model_curves = resolve_curve_list(file, cos.model_curve, Some(scale))?;
-        let param_curves = resolve_curve_list(file, cos.param_curve, None)?;
-
-        let use_faithful =
-            !param_curves.is_empty() && param_curves.len() == model_curves.len() && {
-                // Sanity: parameter and model boundary must agree at a midpoint.
-                faithful_pcurves_agree(surface, &model_curves[0], &param_curves[0])
-            };
-
-        let mut coedges: Vec<CoedgeRecord> = Vec::new();
-        for (index, model_curve) in model_curves.iter().enumerate() {
-            let pcurve = if use_faithful {
-                param_curves[index].clone()
-            } else {
-                derive_pcurve(surface, model_curve)?
-            };
-            coedges.push(self.build_coedge(model_curve, pcurve)?);
-        }
-        let id = self.fresh();
-        Ok(LoopRecord { id, coedges })
-    }
-
-    fn build_coedge(
-        &mut self,
-        model_curve: &NurbsCurve,
-        pcurve: NurbsCurve,
-    ) -> Result<CoedgeRecord, String> {
-        let [t0, t1] = model_curve.domain()?;
-        let p_start = model_curve.evaluate(t0)?;
-        let p_end = model_curve.evaluate(t1)?;
-        let start_vertex_id = self.weld_vertex(p_start);
-        let end_vertex_id = self.weld_vertex(p_end);
-        let degenerate = start_vertex_id == end_vertex_id && curve_collapsed(model_curve, p_start);
-        let edge_id = self.fresh();
-        self.edges.push(EdgeRecord {
-            id: edge_id,
-            curve: model_curve.clone(),
-            t0,
-            t1,
-            start_vertex_id,
-            end_vertex_id,
-            degenerate,
-            name: None,
-        });
-        let coedge_id = self.fresh();
-        Ok(CoedgeRecord {
-            id: coedge_id,
-            edge_id,
-            forward: true,
-            pcurve,
-        })
     }
 }
 
-/// Resolve a boundary pointer (a 102 composite or a bare 126) into its ordered
-/// list of NURBS curves. `coord_scale` is `Some` for 3D model curves, `None`
-/// for parameter-space curves.
-fn resolve_curve_list(
+/// Build a file of trimmed surfaces: one solid per connected, closed set of
+/// faces, and a set lying inside another becomes its cavity.
+fn face_set_solids(
     file: &IgesFile,
-    ptr: i64,
-    coord_scale: Option<f64>,
-) -> Result<Vec<NurbsCurve>, String> {
-    let entity = file.entity(ptr)?;
-    match entity.de.entity_type {
-        102 => {
-            let members = composite_members(entity)?;
-            let mut curves = Vec::with_capacity(members.len());
-            for m in members {
-                let member = file.entity(m)?;
-                if member.de.entity_type != 126 {
-                    return Err(format!(
-                        "iges_import: composite member is entity type {} (expected 126)",
-                        member.de.entity_type
-                    ));
-                }
-                curves.push(curve_from_126(member, coord_scale)?);
-            }
-            Ok(curves)
+    scale: f64,
+) -> Result<(Vec<BrepSolid>, Vec<crate::KernelDiagnostics>), String> {
+    let sets = analyse_face_sets(file, scale)?;
+    for body in &sets.bodies {
+        if let Some(reason) = sets.open_reason(body) {
+            return Err(reason);
         }
-        126 => Ok(vec![curve_from_126(entity, coord_scale)?]),
-        other => Err(format!(
-            "iges_import: boundary curve is entity type {other} (expected 102 or 126)"
-        )),
     }
+    let mut built = Vec::with_capacity(sets.bodies.len());
+    for body in &sets.bodies {
+        built.push(face_set_body(&sets, file, scale, body, &[])?);
+    }
+    // Largest first, so a cavity is always tested against what can hold it.
+    let mut order: Vec<usize> = (0..built.len()).collect();
+    order.sort_by(|&a, &b| built[b].volume.total_cmp(&built[a].volume));
+    let mut cavities: Vec<Vec<usize>> = vec![Vec::new(); built.len()];
+    let mut is_cavity = vec![false; built.len()];
+    for (rank, &inner) in order.iter().enumerate() {
+        for &outer in &order[..rank] {
+            if !is_cavity[outer] && inside(&built[inner].solid, &built[outer].solid)? {
+                cavities[outer].push(inner);
+                is_cavity[inner] = true;
+                break;
+            }
+        }
+    }
+    let mut solids = Vec::with_capacity(built.len());
+    let mut measured = Vec::with_capacity(built.len());
+    for index in 0..built.len() {
+        if is_cavity[index] {
+            continue;
+        }
+        if cavities[index].is_empty() {
+            solids.push(built[index].solid.clone());
+            measured.push(built[index].diagnostics.clone());
+            continue;
+        }
+        let voids: Vec<(&[usize], bool)> = cavities[index]
+            .iter()
+            .map(|&cavity| (sets.bodies[cavity].as_slice(), !built[cavity].flip))
+            .collect();
+        let with_cavities = face_set_body(&sets, file, scale, &sets.bodies[index], &voids)?;
+        solids.push(with_cavities.solid);
+        measured.push(with_cavities.diagnostics);
+    }
+    Ok((solids, measured))
 }
 
-/// Check that a parameter-space curve evaluated on the surface reproduces the
-/// model-space curve at their common midpoint.
-fn faithful_pcurves_agree(surface: &NurbsSurface, model: &NurbsCurve, param: &NurbsCurve) -> bool {
-    let evaluate = || -> Result<bool, String> {
-        let [pt0, pt1] = param.domain()?;
-        let mid = 0.5 * (pt0 + pt1);
-        let uv = param.evaluate(mid)?;
-        let on_surface = surface.evaluate(uv.x, uv.y)?;
-        let [mt0, mt1] = model.domain()?;
-        let model_mid = model.evaluate(0.5 * (mt0 + mt1))?;
-        let tol = 1e-4 * (1.0 + model_mid.length());
-        Ok(on_surface.sub(model_mid).length() <= tol)
+struct BuiltBody {
+    solid: BrepSolid,
+    volume: f64,
+    flip: bool,
+    diagnostics: crate::KernelDiagnostics,
+}
+
+/// One closed face set through the STEP lane, in whichever sense gives it a
+/// positive volume; a twice-walked edge is read as written first.
+fn face_set_body(
+    sets: &FaceSets,
+    file: &IgesFile,
+    scale: f64,
+    body: &[usize],
+    voids: &[(&[usize], bool)],
+) -> Result<BuiltBody, String> {
+    let mut first_failure = None;
+    for split in [false, true] {
+        for flip in [false, true] {
+            let text = sets.to_step(file, scale, body, voids, flip, split)?;
+            match solids_or_refusal(&text) {
+                Ok((mut solids, diagnostics)) if solids.len() == 1 => {
+                    let solid = solids.remove(0);
+                    let volume = crate::solid_signed_volume(&solid)?;
+                    if volume > 0.0 {
+                        return Ok(BuiltBody { solid, volume, flip, diagnostics });
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    first_failure.get_or_insert(error);
+                }
+            }
+        }
+    }
+    Err(first_failure.unwrap_or_else(|| {
+        format!("iges_import: a set of {} trimmed surfaces built no solid with positive volume", body.len())
+    }))
+}
+
+/// Whether `inner` lies inside `outer`, judged at one vertex.
+fn inside(inner: &BrepSolid, outer: &BrepSolid) -> Result<bool, String> {
+    let Some(vertex) = inner.vertices.first() else {
+        return Ok(false);
     };
-    evaluate().unwrap_or(false)
+    let reading = crate::classify_point(vertex.point, outer, 1e-6)?;
+    Ok(reading.class == crate::PointClass::In)
 }
 
-/// Derive a pcurve for a foreign file by projecting the 3D curve onto the
-/// carrier surface.
-fn derive_pcurve(surface: &NurbsSurface, model: &NurbsCurve) -> Result<NurbsCurve, String> {
-    let [t0, t1] = model.domain()?;
-    let magnitude = model.evaluate(0.5 * (t0 + t1)).map(|p| p.length()).unwrap_or(1.0);
-    let tol = 1e-6 * (1.0 + magnitude);
-    build_pcurve_on_surface_range(surface, model, t0, t1, true, tol)
+/// The 514 shells no 186 uses, in file order. An OCC-written file carries a
+/// STEP SHELL_BASED_SURFACE_MODEL this way.
+fn free_shells(file: &IgesFile) -> Result<Vec<i64>, String> {
+    let mut used_shells: rustc_hash::FxHashSet<i64> = Default::default();
+    for (_, solid) in file.pointers_of_type(186) {
+        used_shells.insert(solid.int(0)?);
+        for index in 0..solid.int(2)?.max(0) as usize {
+            used_shells.insert(solid.int(3 + index * 2)?);
+        }
+    }
+    Ok(file
+        .pointers_of_type(514)
+        .into_iter()
+        .map(|(pointer, _)| pointer)
+        .filter(|pointer| !used_shells.contains(pointer))
+        .collect())
 }
 
-/// Signed area of a loop in surface parameter space (shoelace over sampled
-/// pcurve points). Positive = counter-clockwise in `(u, v)`.
-fn loop_param_signed_area(loop_record: &LoopRecord) -> f64 {
-    let mut pts: Vec<(f64, f64)> = Vec::new();
-    for coedge in &loop_record.coedges {
-        let curve = &coedge.pcurve;
-        let [t0, t1] = match curve.domain() {
-            Ok(d) => d,
-            Err(_) => continue,
+/// Refuse a file holding trimmed surfaces beside its solids. Importing only
+/// the solids would drop them and look like a complete import.
+fn refuse_uncovered_geometry(file: &IgesFile) -> Result<(), String> {
+    let free_faces = [144, 143]
+        .iter()
+        .flat_map(|&kind| file.pointers_of_type(kind))
+        .filter(|(_, entity)| entity.de.subordinate == 0)
+        .count();
+    if free_faces > 0 {
+        return Err(format!(
+            "iges_import: the file holds {free_faces} trimmed surface(s) outside its solids, which this import cannot build yet; importing the solids alone would leave them out"
+        ));
+    }
+    Ok(())
+}
+
+/// Each free shell through the STEP lane: a closed shell of several faces as
+/// the solid a 186 would make of it, refused by name if it fails as one; a
+/// sheet (open, or a single untrimmed face) is not a solid and is counted in
+/// `SHEETS_SKIPPED`, never dropped silently.
+fn free_shell_bodies(
+    file: &IgesFile,
+    scale: f64,
+    diagnostics: &mut crate::KernelDiagnostics,
+) -> Result<Vec<Body>, String> {
+    let mut bodies = Vec::new();
+    for pointer in free_shells(file)? {
+        let entity = file.entity(pointer)?;
+        let whole_text = free_shell_to_step(file, pointer, scale, false)?;
+        let report = match surface_model_report(&whole_text) {
+            Ok(report) => report,
+            Err(first_failure) => {
+                let split_text = free_shell_to_step(file, pointer, scale, true)?;
+                if split_text == whole_text {
+                    return Err(format!("shell DE {pointer}: {first_failure}"));
+                }
+                surface_model_report(&split_text).map_err(|_| format!("shell DE {pointer}: {first_failure}"))?
+            }
         };
-        // Sample the interior of each pcurve; endpoints are shared with
-        // neighbours so the concatenation forms the closed loop polygon.
-        const SAMPLES: usize = 8;
-        for i in 0..SAMPLES {
-            let t = t0 + (t1 - t0) * i as f64 / SAMPLES as f64;
-            if let Ok(p) = curve.evaluate(t) {
-                pts.push((p.x, p.y));
-            }
+        if report.solids.is_empty() && report.sheets_skipped == 0 {
+            // The STEP lane skips a single-face surface model as reference
+            // geometry without counting it; here it is counted with the sheets.
+            diagnostics.count_n(crate::step_import::SHEETS_SKIPPED, 1);
+        }
+        merge_diagnostics(diagnostics, report.diagnostics);
+        for solid in report.solids {
+            bodies.push(Body {
+                solid,
+                name: structure::entity_name(file, entity),
+                color: structure::entity_color(file, entity),
+                level: entity.de.level,
+            });
         }
     }
-    if pts.len() < 3 {
-        return 0.0;
-    }
-    let mut area = 0.0;
-    for i in 0..pts.len() {
-        let (x0, y0) = pts[i];
-        let (x1, y1) = pts[(i + 1) % pts.len()];
-        area += x0 * y1 - x1 * y0;
-    }
-    0.5 * area
+    Ok(bodies)
 }
 
-/// Multi-station collapse test: true when the curve stays within tolerance of a
-/// single point (a pole/degenerate edge), distinguishing it from a closed loop.
-fn curve_collapsed(curve: &NurbsCurve, at: Vec3) -> bool {
-    let tol = 1e-7 * (1.0 + at.length());
-    let [t0, t1] = match curve.domain() {
-        Ok(d) => d,
-        Err(_) => return false,
+/// A surface model through the STEP lane: what it built, refusing a shell that
+/// reached the solid builder and failed there.
+fn surface_model_report(step: &str) -> Result<crate::StepImportReport, String> {
+    let report = crate::import_step_report(step).map_err(|error| format!("iges_import: {error}"))?;
+    if report.failed > 0 {
+        return Err(format!(
+            "iges_import: {}",
+            report.first_error.as_deref().unwrap_or("the shell did not import")
+        ));
+    }
+    for solid in &report.solids {
+        collapsed_face_refusal(solid)?;
+    }
+    Ok(report)
+}
+
+/// One 186 through the STEP lane. A twice-walked edge on a quadric is told apart
+/// by its position; elsewhere it is read as written first, because it is usually
+/// a seam the builder handles, and as a bridge (`split_at_repeated_edges`) only
+/// when that reading is refused. The first refusal is the one reported.
+fn manifold_solid(file: &IgesFile, pointer: i64, scale: f64) -> Result<Built, String> {
+    let whole_text = manifold_solid_to_step(file, pointer, scale, false)?;
+    let first_failure = match solids_or_refusal(&whole_text) {
+        Ok(built) => return Ok(built),
+        Err(error) => error,
     };
-    for index in 1..8 {
-        let t = t0 + (t1 - t0) * index as f64 / 8.0;
-        match curve.evaluate(t) {
-            Ok(p) => {
-                if p.sub(at).length() > tol {
-                    return false;
-                }
-            }
-            Err(_) => return false,
+    let split_text = manifold_solid_to_step(file, pointer, scale, true)?;
+    if split_text == whole_text {
+        return Err(format!("solid DE {pointer}: {first_failure}"));
+    }
+    solids_or_refusal(&split_text).map_err(|_| format!("solid DE {pointer}: {first_failure}"))
+}
+
+/// Import translated STEP, refusing when the body did not build. The STEP lane
+/// skips a body that fails with text and returns the rest, but a file that
+/// comes in short looks like a complete import.
+/// Solids that built, with the diagnostics the STEP lane measured on them.
+type Built = (Vec<BrepSolid>, crate::KernelDiagnostics);
+
+fn solids_or_refusal(step: &str) -> Result<Built, String> {
+    let report = crate::import_step_report(step).map_err(|error| format!("iges_import: {error}"))?;
+    if report.failed > 0 {
+        return Err(format!(
+            "iges_import: {}",
+            report.first_error.as_deref().unwrap_or("the body did not import")
+        ));
+    }
+    if report.solids.is_empty() {
+        return Err("iges_import: the solid produced no body".into());
+    }
+    for solid in &report.solids {
+        collapsed_face_refusal(solid)?;
+    }
+    Ok((report.solids, report.diagnostics))
+}
+
+/// Area over boundary length squared below which a face has collapsed. Measured
+/// on foreign files: collapsed faces read a few times 1e-6. A 1 mm by 100 mm
+/// sliver reads 2.4e-3 and a 0.01 by 100 one 2.5e-5, so real faces clear it.
+const COLLAPSED_FACE_RATIO: f64 = 1e-5;
+
+/// A face with a real boundary that encloses almost nothing is a loop the
+/// builder read the wrong way round the carrier. It validates, and the solid
+/// then quietly lacks that face, so it is refused here.
+fn collapsed_face_refusal(solid: &BrepSolid) -> Result<(), String> {
+    for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+        let (Ok(area), Ok(length)) = (crate::face_area(face), crate::face_boundary_length(solid, face)) else {
+            continue;
+        };
+        if length > 0.0 && area < COLLAPSED_FACE_RATIO * length * length {
+            return Err(format!(
+                "iges_import: a face collapsed on import, enclosing {area:.3e} mm2 inside a boundary {length:.3e} mm long"
+            ));
         }
     }
-    true
+    Ok(())
 }

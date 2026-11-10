@@ -8,6 +8,7 @@ mod keep;
 mod open;
 pub(super) use open::{RailWindowReader, network_rail_reuse_on};
 mod support;
+mod split_floor;
 
 pub use closed::{blend_closed_edge, blend_closed_edge_knot_aware, blend_edge_variable, is_pcurve_floor_refusal, with_pcurve_knot_retry};
 pub use open::blend_open_edge;

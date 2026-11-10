@@ -1358,6 +1358,90 @@ pub(super) fn point_adrift_of_its_own_offset(
         .is_some_and(|departure| departure > tolerance)
 }
 
+/// The carrier's fragments that hold true offset skin, judged from the source
+/// face rather than one test point per fragment: points of the trimmed face,
+/// moved the distance into the solid along the normal, are skin where no other
+/// retained face is nearer in true distance. A fragment is kept when most of the moved points
+/// landing on it are skin. Empty when none is, so the carrier owns no skin.
+pub(super) fn fragments_holding_true_skin(
+    face: &FaceRecord,
+    source: &BrepSolid,
+    fragments: &[FaceFragmentRecord],
+    retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
+    distance: f64,
+    tolerance: f64,
+) -> Result<Vec<FaceFragmentRecord>, KernelRefusal> {
+    const SAMPLES: usize = 64;
+    let u_domain = face.surface.domain_u().or_refuse(KernelStage::Select, "domain_u")?;
+    let v_domain = face.surface.domain_v().or_refuse(KernelStage::Select, "domain_v")?;
+    let classify_tolerance = 1e-8 * crate::solid_scale(source).max(1.0);
+    let trims = fragments.iter().map(fragment_as_trim).collect::<Vec<_>>();
+    let mut votes = vec![(0usize, 0usize); fragments.len()];
+    for i in 0..SAMPLES {
+        for j in 0..SAMPLES {
+            let uv = Vec2 {
+                x: u_domain[0] + (u_domain[1] - u_domain[0]) * (i as f64 + 0.5) / SAMPLES as f64,
+                y: v_domain[0] + (v_domain[1] - v_domain[0]) * (j as f64 + 0.5) / SAMPLES as f64,
+            };
+            if parameter_point_in_face(face, uv, 1e-9).or_refuse(KernelStage::Select, "parameter_point_in_face")? != PolygonClass::Inside {
+                continue;
+            }
+            let on_face = face.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Select, "evaluate")?;
+            let normal = face.surface.normal(uv.x, uv.y).or_refuse(KernelStage::Select, "normal")?;
+            let mut moved = None;
+            for sign in [1.0, -1.0] {
+                let candidate = on_face.add(normal.scale(sign * distance));
+                if classify_point(candidate, source, classify_tolerance).or_refuse(KernelStage::Select, "classify_point")?.class == PointClass::In {
+                    moved = Some(candidate);
+                    break;
+                }
+            }
+            let Some(point) = moved else { continue };
+            // Euclidean, not the shell's mitered reading: a miter extends a
+            // planar wall past its trim and would read this skin as covered.
+            // A tie is not skin either: two offsets on one plane are the medial
+            // axis, wall through its thickness, and keeping them is a membrane.
+            let mut skin = true;
+            for (other, edges) in retained_faces {
+                if other.id == face.id {
+                    continue;
+                }
+                let reach = distance_to_trimmed_face(other, edges, point)?;
+                // The tie is exact, so its band is the classifier's: at the skin
+                // band it would take half of a real fragment's points.
+                if reach < distance - tolerance || (reach - distance).abs() <= classify_tolerance {
+                    skin = false;
+                    break;
+                }
+            }
+            for (index, fragment) in fragments.iter().enumerate() {
+                let projection = project_point_to_surface(&fragment.surface, point).or_refuse(KernelStage::Select, "project_point_to_surface")?;
+                if projection.distance > tolerance {
+                    continue;
+                }
+                let foot = Vec2 { x: projection.u, y: projection.v };
+                if parameter_point_in_face(&trims[index], foot, 1e-8).or_refuse(KernelStage::Select, "parameter_point_in_face")? != PolygonClass::Outside {
+                    if skin {
+                        votes[index].0 += 1;
+                    } else {
+                        votes[index].1 += 1;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    os_debug!("  true skin votes for source face {}: {:?}", face.id, votes);
+    Ok(fragments.iter().zip(&votes).filter(|(_, (on, off))| *on > *off).map(|(fragment, _)| fragment.clone()).collect())
+}
+
+/// Whether a point's projection onto the face's surface lands inside its trim.
+pub(super) fn foot_inside_trim(face: &FaceRecord, point: Vec3) -> Result<bool, KernelRefusal> {
+    let projection = project_point_to_surface(&face.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+    let uv = Vec2 { x: projection.u, y: projection.v };
+    Ok(parameter_point_in_face(face, uv, 1e-9).or_refuse(KernelStage::Refine, "parameter_point_in_face")? == PolygonClass::Inside)
+}
+
 /// [`distance_to_trimmed_face`] with the foot it measured to. No foot and an
 /// infinite distance when the projection leaves the trim and the face has no
 /// real edge to fall back on.
@@ -1485,6 +1569,62 @@ pub(super) fn tangent_touch(
         }
     }
     Ok(farther)
+}
+
+/// `BREP_OFFSET_COINCIDE_DEBRIS` (default on; `=0` restores the refusal): a selected
+/// fragment that reads coincident with another offset but is no wider than
+/// the skin band is corner debris, not a sheet, and is left out of the skin
+/// instead of refusing the shell.
+///
+/// Cause (a reported box and pin model at 2.24, 2.34, 2.36, 2.42-2.48): where the
+/// offsets of the tilted floor and of the wall or the bore cross at a shallow
+/// angle next to the trim line y = 2.5, the arrangement leaves a sliver
+/// narrower than the band between the crossing and that line (parameter areas
+/// 2e-8 to 2.3e-6; on the bore's carrier a band-squared area test misses it,
+/// since the sliver is long). Its test point sits
+/// within the band of the other offset, so the whole shell was refused as a
+/// cavity pinched to zero thickness. Selecting the sliver instead leaves
+/// zero-thickness membrane shells in the result, so it is dropped.
+pub(super) fn coincide_debris_on() -> bool {
+    switch!("BREP_OFFSET_COINCIDE_DEBRIS", true)
+}
+
+/// Whether `fragment` is no wider than `band`: twice its area in 3D over its
+/// boundary length in 3D. The area is its parameter-space area times the
+/// surface's area element at its test point, capped by the isoperimetric
+/// bound; the boundary is each coedge's pcurve sampled 24 times and lifted
+/// onto the surface.
+pub(super) fn fragment_is_band_debris(fragment: &FaceFragmentRecord, band: f64) -> Result<bool, KernelRefusal> {
+    let area = parameter_space_area(&fragment_as_trim(fragment))
+        .or_refuse(KernelStage::Select, "parameter_space_area")?
+        .abs();
+    let partials = fragment
+        .surface
+        .derivatives(fragment.test_uv.x, fragment.test_uv.y, 1)
+        .or_refuse(KernelStage::Select, "derivatives")?;
+    let element = partials[1][0].cross(partials[0][1]).length();
+    let mut perimeter = 0.0;
+    for coedge in fragment.loops.iter().flat_map(|l| &l.coedges) {
+        let [t0, t1] = coedge.pcurve.domain().or_refuse(KernelStage::Select, "pcurve domain")?;
+        let mut previous: Option<Vec3> = None;
+        for step in 0..=24 {
+            let uv = coedge
+                .pcurve
+                .evaluate(t0 + (t1 - t0) * step as f64 / 24.0)
+                .or_refuse(KernelStage::Select, "pcurve")?;
+            let point = fragment.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Select, "surface")?;
+            if let Some(last) = previous {
+                perimeter += point.sub(last).length();
+            }
+            previous = Some(point);
+        }
+    }
+    // No region encloses more than its boundary's circle (P^2 / 4 pi); on a
+    // rational carrier the area element at one point can overstate a sliver.
+    let area = (area * element).min(perimeter * perimeter / (4.0 * std::f64::consts::PI));
+    let width = if perimeter > 0.0 { 2.0 * area / perimeter } else { f64::INFINITY };
+    os_debug!("  debris test: area {area:.3e} boundary {perimeter:.4} width {width:.3e} against band {band:.1e}");
+    Ok(width <= band)
 }
 
 /// `BREP_OFFSET_SEALED_HOLLOW` (default on; `=0` restores): an assembly that

@@ -228,6 +228,36 @@ pub fn segment_intersection(
     }
 }
 
+/// Where the ends of `end` touch the interior of `bar`, for a pair the line
+/// crossing rejected. `segment_intersection` measures its tolerance ALONG each
+/// segment, so a stem meeting a bar at a shallow angle overruns it: a gap `g`
+/// is `g / sin(angle)` along the stem. An end within tolerance of the bar then
+/// gets no node on it, keeps degree 1, and pruning removes the whole stem
+/// (a reported box and pin model: a 9.8e-8 gap at sin 0.035 against a 1.4e-6 tolerance).
+/// Parallel pairs stay excluded, as they are from the crossing test, and the
+/// caller keeps only an end no other segment shares: a chain's interior point
+/// riding within tolerance of a nearly collinear curve is not a T, and noding
+/// it would pinch the two together.
+/// `BREP_ARRANGE_END_ON_SEGMENT=0` turns this off.
+fn end_on_segment_parameters(end: &Segment2, bar: &Segment2, tolerance: f64) -> Vec<(Vec2, f64)> {
+    let (stem, span) = (end.b.sub(end.a), bar.b.sub(bar.a));
+    let squared = span.dot(span);
+    if squared <= 0.0 || stem.cross(span).abs() <= PARALLEL_THRESHOLD * stem.length() * span.length() {
+        return Vec::new();
+    }
+    let margin = tolerance_parameter(bar, tolerance);
+    [end.a, end.b]
+        .into_iter()
+        .filter_map(|point| {
+            let parameter = point.sub(bar.a).dot(span) / squared;
+            (parameter > margin
+                && parameter < 1.0 - margin
+                && point_segment_distance(point, bar.a, bar.b) <= tolerance)
+                .then_some((point, parameter))
+        })
+        .collect()
+}
+
 pub use crate::polygon::PolygonClass;
 
 fn point_segment_distance(point: Vec2, a: Vec2, b: Vec2) -> f64 {
@@ -675,6 +705,7 @@ fn arrange_segments_impl(
     indexed_nodes: bool,
 ) -> Result<Vec<ArrangementRegion>, String> {
     let defer_tags = switch!("BREP_ARRANGE_DEFER_TAGS", true);
+    let end_on_segment = switch!("BREP_ARRANGE_END_ON_SEGMENT", true);
     let mut cuts = vec![Vec::<f64>::new(); segments.len()];
     let mut intersect_pair = |first: usize, second: usize| {
         let Some([first_parameter, second_parameter]) = segment_intersection(
@@ -684,6 +715,18 @@ fn arrange_segments_impl(
             segments[second].b,
             tolerance,
         ) else {
+            if end_on_segment {
+                for (end, bar) in [(first, second), (second, first)] {
+                    for (point, parameter) in end_on_segment_parameters(&segments[end], &segments[bar], tolerance) {
+                        let shared = segments.iter().enumerate().any(|(index, other)| {
+                            index != end && (other.a.distance(point) <= tolerance || other.b.distance(point) <= tolerance)
+                        });
+                        if !shared {
+                            cuts[bar].push(parameter);
+                        }
+                    }
+                }
+            }
             return;
         };
         let first_tolerance = tolerance_parameter(&segments[first], tolerance);

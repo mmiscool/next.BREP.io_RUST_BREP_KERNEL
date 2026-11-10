@@ -1,5 +1,5 @@
 use crate::{KernelRefusal, KernelStage, OrRefuse};
-use crate::fit::solve_dense;
+use crate::fit::{solve_dense, solve_dense_shared};
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, VertexRecord};
 use crate::{
     interpolate_curve, measure_edge_against_pcurve_image,
@@ -114,32 +114,26 @@ fn interpolate_tensor(
     if let Some((weights_u, weights_v)) = separable_weights(weights) {
         let matrix_u = collocation_matrix(knot_u, parameters_u, &weights_u);
         let matrix_v = collocation_matrix(knot_v, parameters_v, &weights_v);
+        // Each column's three coordinates share one elimination
+        // (`solve_dense_shared`, the bits of three `solve_dense` calls on
+        // clones). The collocation matrix is banded, and the dense solve spent
+        // `n^3` on products with zero: ABC 00027566 offsets 82 extruded cubics
+        // whose fit refines to 1239 x 2, 13.7 s a face, and the STEP import
+        // never finished (2026-11-10).
         let mut intermediate = vec![vec![Vec3::default(); count_v]; count_u];
         for column in 0..count_v {
-            let solve_axis = |axis: fn(Vec3) -> f64| {
-                solve_dense(
-                    matrix_u.clone(),
-                    samples.iter().map(|row| axis(row[column])).collect(),
-                )
-            };
-            let x = solve_axis(|point| point.x).or_refuse(KernelStage::Refine, "solve_axis")?;
-            let y = solve_axis(|point| point.y).or_refuse(KernelStage::Refine, "solve_axis")?;
-            let z = solve_axis(|point| point.z).or_refuse(KernelStage::Refine, "solve_axis")?;
+            let side = |axis: fn(Vec3) -> f64| samples.iter().map(|row| axis(row[column])).collect::<Vec<_>>();
+            let [x, y, z] = solve_dense_shared(matrix_u.clone(), [side(|point| point.x), side(|point| point.y), side(|point| point.z)])
+                .or_refuse(KernelStage::Refine, "solve_axis")?;
             for row in 0..count_u {
                 intermediate[row][column] = Vec3::new(x[row], y[row], z[row]);
             }
         }
         let mut controls = vec![vec![Vec4::from_point(Vec3::default(), 1.0); count_v]; count_u];
         for row in 0..count_u {
-            let solve_axis = |axis: fn(Vec3) -> f64| {
-                solve_dense(
-                    matrix_v.clone(),
-                    intermediate[row].iter().copied().map(axis).collect(),
-                )
-            };
-            let x = solve_axis(|point| point.x).or_refuse(KernelStage::Refine, "solve_axis")?;
-            let y = solve_axis(|point| point.y).or_refuse(KernelStage::Refine, "solve_axis")?;
-            let z = solve_axis(|point| point.z).or_refuse(KernelStage::Refine, "solve_axis")?;
+            let side = |axis: fn(Vec3) -> f64| intermediate[row].iter().copied().map(axis).collect::<Vec<_>>();
+            let [x, y, z] = solve_dense_shared(matrix_v.clone(), [side(|point| point.x), side(|point| point.y), side(|point| point.z)])
+                .or_refuse(KernelStage::Refine, "solve_axis")?;
             for column in 0..count_v {
                 controls[row][column] = Vec4::from_point(
                     Vec3::new(x[column], y[column], z[column]),
@@ -2901,6 +2895,7 @@ fn offset_face_carrier_impl(
         lane,
     })
 }
+
 
 
 

@@ -65,7 +65,21 @@ pub fn offset_solid(
     };
     match corners {
         OffsetCorners::Sharp => Ok(sharp),
-        OffsetCorners::Rounded => round_offset_joins(sharp, distance),
+        OffsetCorners::Rounded => match round_offset_joins(sharp, distance) {
+            Ok(rounded) => Ok(rounded),
+            // A mitred body cannot carry the ball over a vertex of degree four
+            // or more; a convex polyhedron's parallel body is built directly.
+            Err(error) => match crate::blend::convex_parallel::convex_polyhedron_parallel(source, distance) {
+                Ok(Some((solid, images))) if solid.validate().is_empty() => {
+                    let face_images = images
+                        .into_iter()
+                        .map(|image| OffsetShellFaceImageRecord { role: OffsetFaceRole::Offset, source_face_id: image.unwrap_or(0) })
+                        .collect();
+                    Ok(OffsetShellResultRecord { solid, face_images })
+                }
+                _ => Err(error),
+            },
+        },
     }
 }
 
@@ -428,11 +442,25 @@ pub(super) fn direct_refusal_takes_the_boolean_lane(refusal: &KernelRefusal) -> 
         RefusalClass::UnsupportedGeometry { what } | RefusalClass::Internal { what } => {
             what.starts_with("offset_shell_")
         }
-        RefusalClass::NonIntegralGenus { .. } | RefusalClass::DegenerateArrangement { .. } => {
+        RefusalClass::NonIntegralGenus { .. } => {
             refusal.message.starts_with("offset_shell")
+                || (bare_genus_takes_the_boolean_lane() && refusal.message.starts_with("boolean assembly:"))
         }
+        RefusalClass::DegenerateArrangement { .. } => refusal.message.starts_with("offset_shell"),
         _ => false,
     }
+}
+
+/// `BREP_OFFSET_BARE_GENUS_BOOLEAN_LANE` (default on; `=0` restores): the
+/// direct pipeline's assembly refusing a non-integral genus takes the boolean
+/// lane even with no shell cause put in front of it. Which sentence a refusal
+/// carries says nothing about whether the lane can answer:
+/// `inbox_20261017_negative_shell` only reached the lane through the note of
+/// an omission, and the omission was a misread fillet's true skin; reading
+/// that skin correctly (`BREP_OFFSET_TANGENT_EDGE_EUCLID`) left the same
+/// failed assembly with no note, and the shell was refused.
+fn bare_genus_takes_the_boolean_lane() -> bool {
+    crate::switch!("BREP_OFFSET_BARE_GENUS_BOOLEAN_LANE", true)
 }
 
 /// The cut planes: every planar face's plane parallel to a THIN PAIR, two

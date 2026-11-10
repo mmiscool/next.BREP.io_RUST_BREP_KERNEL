@@ -57,7 +57,7 @@
 
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::column_tree::RowAction;
-use crate::form_view::{form_view, FormViewSpec};
+use crate::form_view::{form_view, FormBanner, FormViewSpec};
 use crate::panels::tree::{self, TreeRow};
 use crate::panels::update_components::UpdateComponents;
 use crate::store::ModelStore;
@@ -900,7 +900,11 @@ impl AssemblyConstraintsPanel {
             title: &row.title,
             subtitle: None,
             fields: &fields,
-            banner: Some((status_label, egui::Color32::from_rgb(r, g, b))),
+            banner: Some(FormBanner {
+                text: status_label,
+                color: egui::Color32::from_rgb(r, g, b),
+                is_error: assembly_status::status_severity(&row.status) == 3,
+            }),
             // A constraint produces no named outputs — nothing to trail.
             trailing: None,
             // Q12: the constraint list is drawn by the SAME `panels::tree`
