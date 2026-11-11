@@ -93,6 +93,28 @@ where F: FnMut(&AutoInput<'_>) -> Result<Plan, CamError> {
         // face/kind/key-dimension identity used by Binding::matches.
         let prefix = format!("auto{}:", axis.name());
         for feature in &mut recognized.features { feature.id = format!("{prefix}{}", feature.id); }
+        // Face accounting follows the narrowing: claims by dropped features go,
+        // and a face left unclaimed that the first setup's features cover is
+        // body in this setup (the other setup covers it).
+        if let Some(accounting) = &mut recognized.accounting {
+            crate::features::accounting::retain_claims(accounting, |id| pairs.iter().any(|(_, kept)| kept == id).then(|| format!("{prefix}{id}")));
+            for a in accounting.iter_mut().filter(|a| a.features.is_empty() && a.body.is_none()) {
+                if let Some(first) = input.recognized.features.iter().find(|f| f.solid == a.solid && f.faces.contains(&a.face)) {
+                    a.body = Some(crate::features::BodyReason::OtherSetup { axis: "first".into(), feature: first.id.clone() });
+                    a.settle();
+                }
+            }
+        }
+        // In the first setup, a face no feature of its own claims and no body
+        // reason explains is body when this setup's programmed features cover it.
+        if let Some(accounting) = &mut setups[0].recognized.accounting {
+            for a in accounting.iter_mut().filter(|a| a.features.is_empty() && a.body.is_none()) {
+                if let Some(cover) = recognized.features.iter().find(|f| f.solid == a.solid && f.faces.contains(&a.face)) {
+                    a.body = Some(crate::features::BodyReason::OtherSetup { axis: axis.name().into(), feature: cover.id.clone() });
+                    a.settle();
+                }
+            }
+        }
         for op in &mut plan.operations {
             op.feature = format!("{prefix}{}", op.feature);
             op.operation.id = format!("{prefix}{}", op.operation.id).into();

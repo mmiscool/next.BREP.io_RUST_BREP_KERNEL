@@ -218,7 +218,7 @@ pub fn session_tools(cx: Arc<ServerContext>) -> Vec<ToolSpec> {
                         let text = session.host.platform.read_text(path.clone()).await?;
                         session.host.call_ok("doc_load", json!({ "json": text, "name": file_name(&path) })).await?;
                     }
-                    let describe = session.host.call_ok("describe_commands", json!({})).await?.result.unwrap_or(Value::Null);
+                    let describe = session.host.call_ok("describe_commands", json!({ "full": true })).await?.result.unwrap_or(Value::Null);
                     let was_live = cx.slot.read().await.is_some();
                     *cx.slot.write().await = Some(session.clone());
                     let after = after_wait(&session, 60_000).await?;
@@ -1643,6 +1643,11 @@ fn feature_result_schema(describe: &Value, name: &str) -> Option<Value> {
     let properties = result["properties"].as_object_mut()?;
     properties.insert("warnings".into(), json!({"type":"array","items":{"type":"string"}}));
     properties.insert("after".into(), after_result_schema());
+    if name == "feature_set_params" {
+        // Present only when the edited feature fails to build.
+        properties.insert("ok".into(), json!({"const":false}));
+        properties.insert("error".into(), json!({"type":"string"}));
+    }
     if name == "feature_add" {
         // The native handler appends these to Report. feature_id_at returns
         // Option<String>, so its null case must not be strengthened away.
@@ -1947,6 +1952,11 @@ async fn seed_feature(
     known: Option<&std::collections::HashSet<String>>,
 ) -> Result<(String, Value, Vec<String>), String> {
     let ty = s(item, "type").ok_or("missing `type`")?;
+    // The native feature record spells these `inputParams` / `persistentData`;
+    // a caller copying a history listing writes them that way. Either spelling
+    // reaches the same field (was: silently dropped, so an Extrude ran with no
+    // profile and the add "succeeded" with a feature error).
+    let item = &feature_item_aliases(item)?;
     let entry = super::session_feature_entry(session, &ty).await?;
     let id_ = schema::identity(&entry);
     let mut params = validate::merge_params(&schema::defaults_from_entry(&entry), item.get("params").unwrap_or(&json!({})));
@@ -1971,6 +1981,69 @@ async fn seed_feature(
         feature["persistentData"] = pd.clone();
     }
     Ok((id, feature, v.warnings))
+}
+
+/// `inputParams` → `params`, `persistentData` → `persistent_data` (the native
+/// record's spellings), refusing an item that gives both spellings.
+fn feature_item_aliases(item: &Value) -> Result<Value, String> {
+    let mut item = item.clone();
+    if let Some(o) = item.as_object_mut() {
+        for (alias, key) in [("inputParams", "params"), ("persistentData", "persistent_data")] {
+            if let Some(v) = o.remove(alias) {
+                if o.contains_key(key) { return Err(format!("invalid_arguments: give `{key}` or `{alias}`, not both")); }
+                o.insert(key.into(), v);
+            }
+        }
+    }
+    Ok(item)
+}
+
+/// Refuse a top-level argument the tool does not take, naming every one it
+/// does: an ignored key used to read as success (`feature_set_params({id,
+/// params})` changed nothing). `aliases` are renamed first.
+fn checked_args(tool: &str, args: &Value, accepted: &[&str], aliases: &[(&str, &str)]) -> Result<Value, String> {
+    let mut args = args.clone();
+    let o = args.as_object_mut().ok_or_else(|| format!("invalid_arguments: {tool} takes an object"))?;
+    for (alias, key) in aliases {
+        if let Some(v) = o.remove(*alias) {
+            if o.contains_key(*key) { return Err(format!("invalid_arguments: {tool}: give `{key}` or `{alias}`, not both")); }
+            o.insert((*key).into(), v);
+        }
+    }
+    if let Some(k) = o.keys().find(|k| !accepted.contains(&k.as_str())) {
+        return Err(format!("invalid_arguments: {tool}: unknown field `{k}`; it takes {{{}}}", accepted.join(", ")));
+    }
+    Ok(args)
+}
+
+/// The errors the run report holds for feature `id` itself (its
+/// `featureErrors` lines, else its typed refusal), not a later feature's.
+fn own_feature_errors(result: &Value, id: &str) -> Vec<String> {
+    let report = result.get("after").and_then(|a| a.get("report")).filter(|r| r.is_object()).or_else(|| result.get("report"));
+    let Some(report) = report else { return vec![] };
+    let prefix = format!("{id}: ");
+    let mut errors: Vec<String> = report["featureErrors"].as_array().into_iter().flatten()
+        .filter_map(Value::as_str).filter(|e| e.starts_with(&prefix)).map(str::to_string).collect();
+    if errors.is_empty() {
+        if let Some(message) = report["featureRefusals"].get(id).and_then(|r| r["message"].as_str()) {
+            errors.push(format!("{id}: {message}"));
+        }
+    }
+    errors
+}
+
+/// The next step for a feature that built nothing: the fix for the usual
+/// mistakes, then how to edit or remove it.
+fn feature_failure_hint(id: &str, errors: &[String]) -> String {
+    let text = errors.join(" ");
+    let mut hint = String::new();
+    if text.contains("missing `profile`") {
+        hint.push_str("Give params.profile the sketch feature's id, e.g. feature_add({type: \"E\", params: {profile: \"S1\", distance: 10}}); the sketch must hold a closed loop. ");
+    } else if text.contains("not found") {
+        hint.push_str("A reference names nothing in the scene: read brep.scene.scene_entities({}) for the names that exist. ");
+    }
+    hint.push_str(&format!("Feature `{id}` stays in the history: fix it with brep.features.feature_set_params({{id: \"{id}\", patch: {{...}}}}) or remove it with brep.history.feature_delete({{id: \"{id}\"}})."));
+    hint
 }
 
 /// Reuse feature_add's schema validator without reserving live IDs. The native
@@ -2008,18 +2081,21 @@ pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
             "feature_add",
             "features",
             "Add a feature by catalogue type with a partial params object: every schema key is seeded from its default, `params` is overlaid (nested keys such as boolean.operation allowed), an id is assigned unless given, the result is validated against the kernel schema, then the feature is appended and run. Returns id, index, the run report and the listing. \
-             The SOLID a feature produced is `after.report.featureOutputs[<feature id>]` — read it rather than assuming a name: a boolean names its result after its target when subtracting, but after its FIRST TOOL when unioning or intersecting.",
+             The SOLID a feature produced is `after.report.featureOutputs[<feature id>]` — read it rather than assuming a name: a boolean names its result after its target when subtracting, but after its FIRST TOOL when unioning or intersecting. \
+             If the new feature fails to build (an Extrude with no `params.profile`, say) the call fails, naming the feature, which stays in the history; `allow_errors: true` returns the report instead.",
             {
                 let mut props = feature_item_schema();
                 let o = props.as_object_mut().expect("object");
                 o.insert("wait".into(), json!({ "type": "boolean", "default": true }));
                 o.insert("timeout_ms".into(), json!({ "type": "integer", "default": 60000 }));
+                o.insert("allow_errors".into(), json!({ "type": "boolean", "default": false, "description": "return the run report when the new feature fails to build, instead of failing the call (the feature is added either way)" }));
                 object_schema(props, &["type"])
             },
             Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
             move |args| {
                 let slot = add_slot.clone();
                 Box::pin(async move {
+                    let args = checked_args("feature_add", &args, &["type", "params", "id", "persistent_data", "wait", "timeout_ms", "allow_errors"], &[("inputParams", "params"), ("persistentData", "persistent_data")])?;
                     let session = current(&slot).await?;
                     let known = known_names(&session).await;
                     let (id, feature, warnings) = seed_feature(&session, &args, known.as_ref()).await?;
@@ -2031,6 +2107,13 @@ pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                         crate::tools::app::settled_result(&mut r, after_wait(&session, u(&args, "timeout_ms", 60_000)).await?);
                     }
                     session.record("feature_add", &args, true, json!({ "id": id }));
+                    // A feature that failed to build is a failed call unless the
+                    // caller asked for the report: "succeeded" with an error
+                    // buried in after.report cost agents several calls each.
+                    let errors = own_feature_errors(&r, &id);
+                    if !errors.is_empty() && !b(&args, "allow_errors", false) {
+                        return Err(format!("feature `{id}` was added but failed to build: {}. {}", errors.join("; "), feature_failure_hint(&id, &errors)));
+                    }
                     Ok(ToolOutput::json(r))
                 })
             },
@@ -2135,12 +2218,13 @@ pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
         ToolSpec::new(
             "feature_set_params",
             "features",
-            "Merge a patch into a feature's inputParams (nested keys such as boolean.operation allowed), validate, and rerun from it.",
+            "Merge a patch into a feature's inputParams (nested keys such as boolean.operation allowed), validate, and rerun from it. `params` is accepted as another name for `patch`. When the edited feature then fails to build, the reply carries `ok: false` and `error` at its top.",
             object_schema(json!({ "id": { "type": "string" }, "patch": { "type": "object" }, "wait": { "type": "boolean", "default": true }, "timeout_ms": { "type": "integer", "default": 60000 } }), &["id", "patch"]),
             Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
             move |args| {
                 let slot = set_slot.clone();
                 Box::pin(async move {
+                    let args = checked_args("feature_set_params", &args, &["id", "patch", "wait", "timeout_ms"], &[("params", "patch"), ("inputParams", "patch")])?;
                     let session = current(&slot).await?;
                     let id = s(&args, "id").ok_or("missing `id`")?;
                     let cur = session.host.call_ok("feature_params", json!({ "id": id })).await?.result.unwrap_or(Value::Null);
@@ -2161,6 +2245,13 @@ pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                         crate::tools::app::settled_result(&mut r, after_wait(&session, u(&args, "timeout_ms", 60_000)).await?);
                     }
                     session.record("feature_set_params", &args, true, json!({}));
+                    // The edit is kept (a refusal is often the point of the
+                    // edit), but say at the top that this feature now fails.
+                    let errors = own_feature_errors(&r, &id);
+                    if !errors.is_empty() && r.is_object() {
+                        r["ok"] = json!(false);
+                        r["error"] = json!(format!("feature `{id}` failed to build: {}. {}", errors.join("; "), feature_failure_hint(&id, &errors)));
+                    }
                     Ok(ToolOutput::json(r))
                 })
             },

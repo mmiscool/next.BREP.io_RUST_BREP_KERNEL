@@ -128,6 +128,32 @@ export const cad = {{
     search: async (args) => unwrap(await service.discovery.search(args)),
     describe: async (args) => unwrap(await service.discovery.describe(args)),
   }},
+  session: {{
+    /** One call for "what is open": documents, the active one, its features, solids and errors. */
+    async summary() {{
+      const docs = await brep.document.docs_list({{}});
+      const h = await brep.history.history_listing({{}});
+      const active = docs.tabs[docs.active] || null;
+      const errors = (h.report && h.report.featureErrors) || [];
+      return {{
+        documents: docs.tabs.map((t) => ({{ id: t.id, title: t.title, dirty: t.dirty, active: t.index === docs.active }})),
+        active: active && {{ id: active.id, title: active.title, revision: active.revision }},
+        units: "mm",
+        featureCount: h.listing.features.length,
+        features: h.listing.features.map((f) => f.id + " (" + f.type + ")"),
+        rollbackStep: h.listing.step,
+        solidCount: h.model.solidCount,
+        solids: h.model.solids.map((x) => x.name),
+        featureErrors: errors,
+        idle: h.idle,
+      }};
+    }},
+  }},
+  docs: {{
+    list: async () => unwrap(await call("cad.docs.list", {{}})).guides,
+    read: async (name) => unwrap(await call("cad.docs.read", typeof name === "string" ? {{ name }} : name)).text,
+    sdk: async (group) => {{ const r = unwrap(await call("cad.docs.sdk", group === undefined ? {{}} : typeof group === "string" ? {{ group }} : group)); return r.declarations !== undefined ? r.declarations : r; }},
+  }},
 {free_groups}
 }};
 

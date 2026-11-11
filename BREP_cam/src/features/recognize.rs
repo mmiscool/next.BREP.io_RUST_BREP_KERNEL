@@ -1,5 +1,6 @@
 //! The recognition rules (see the module documentation of [`super`]).
 
+use super::accounting::{BodyReason, FaceAccount, Refusal};
 use super::graph::{Adjacency, FaceGraph};
 use super::{Carrier, FaceCarrier};
 use crate::holes::{Hole, Recognition};
@@ -133,6 +134,24 @@ pub struct Recognized {
     pub features: Vec<Feature>,
     /// Faces that belong to no feature, with why.
     pub unassigned: Vec<(String, String)>,
+    /// One entry per face of every target body (see [`super::accounting`]).
+    /// `None` (documents written before accounting) means unknown.
+    #[serde(default)]
+    pub accounting: Option<Vec<FaceAccount>>,
+}
+
+/// What recognition noted while declining candidates.
+#[derive(Default)]
+struct Notes {
+    refusals: BTreeMap<u32, Vec<Refusal>>,
+    /// Floors taken as the bottom of a recognised hole: (face, hole index).
+    hole_bottoms: Vec<(u32, usize)>,
+}
+
+impl Notes {
+    fn refuse(&mut self, face: u32, candidate: &str, reason: impl Into<String>) {
+        self.refusals.entry(face).or_default().push(Refusal { candidate: candidate.to_string(), reason: reason.into() });
+    }
 }
 
 /// Classification of a face's carrier against the tool axis.
@@ -202,6 +221,7 @@ pub fn recognize(input: &RecognitionInput<'_>) -> Result<Recognized, CamError> {
     }
     let ctx = Ctx { input, graph, class, carrier, region, hole_of };
     let mut out = Recognized::default();
+    let mut notes = Notes::default();
     let mut assigned = vec![false; n];
     // Holes first: their walls are never pocket walls.
     for (hi, h) in input.holes.holes.iter().enumerate() {
@@ -241,7 +261,7 @@ pub fn recognize(input: &RecognitionInput<'_>) -> Result<Recognized, CamError> {
             if (normal.z > 1.0 - 1e-6) != upward_pass {
                 continue;
             }
-            if let Some(feats) = floor_features(&ctx, f, normal, top_z, &mut assigned)? {
+            if let Some(feats) = floor_features(&ctx, f, normal, top_z, &mut assigned, &mut notes)? {
                 out.features.extend(feats);
             }
         }
@@ -253,15 +273,21 @@ pub fn recognize(input: &RecognitionInput<'_>) -> Result<Recognized, CamError> {
         }
         match ctx.class[f as usize] {
             Class::Plane(normal) if normal.z > 1e-6 && normal.z < 1.0 - 1e-6 && normal.x.hypot(normal.y) > 1e-6 => {
-                if let Some(feat) = chamfer_feature(&ctx, f, normal) {
-                    assigned[f as usize] = true;
-                    out.features.push(feat);
+                match chamfer_feature(&ctx, f, normal) {
+                    Ok(feat) => {
+                        assigned[f as usize] = true;
+                        out.features.push(feat);
+                    }
+                    Err(why) => notes.refuse(f, "chamfer", why),
                 }
             }
             Class::HorizontalCylinder(radius) => {
-                if let Some(feat) = fillet_feature(&ctx, f, radius) {
-                    assigned[f as usize] = true;
-                    out.features.push(feat);
+                match fillet_feature(&ctx, f, radius) {
+                    Ok(feat) => {
+                        assigned[f as usize] = true;
+                        out.features.push(feat);
+                    }
+                    Err(why) => notes.refuse(f, "fillet", why),
                 }
             }
             _ => {}
@@ -275,18 +301,111 @@ pub fn recognize(input: &RecognitionInput<'_>) -> Result<Recognized, CamError> {
     }
     for f in 0..n {
         if !assigned[f] && !mesh.faces[f].protected_only {
-            let why = match ctx.class[f] {
-                Class::Plane(nn) if nn.z < -1.0 + 1e-6 => "a horizontal face facing away from the tool",
-                Class::Plane(nn) if nn.z.abs() <= 1e-6 => "a vertical wall",
-                Class::Plane(_) => "an inclined face that is not a chamfer",
-                Class::VerticalCylinder(_) => "a vertical cylinder that is neither a hole nor a pocket corner",
-                Class::HorizontalCylinder(_) => "a horizontal cylinder that is not a top-edge fillet",
-                Class::Other => "a surface with no 2.5D carrier",
-            };
-            out.unassigned.push((mesh.faces[f].face.clone(), why.to_string()));
+            out.unassigned.push((mesh.faces[f].face.clone(), describe(ctx.class[f]).to_string()));
         }
     }
+    out.accounting = Some(account(&ctx, &out.features, notes));
     Ok(out)
+}
+
+/// What a face is relative to the tool axis (the `unassigned` wording).
+fn describe(class: Class) -> &'static str {
+    match class {
+        Class::Plane(nn) if nn.z < -1.0 + 1e-6 => "a horizontal face facing away from the tool",
+        Class::Plane(nn) if nn.z.abs() <= 1e-6 => "a vertical wall",
+        Class::Plane(_) => "an inclined face that is not a chamfer",
+        Class::VerticalCylinder(_) => "a vertical cylinder that is neither a hole nor a pocket corner",
+        Class::HorizontalCylinder(_) => "a horizontal cylinder that is not a top-edge fillet",
+        Class::Other => "a surface with no 2.5D carrier",
+    }
+}
+
+/// [`describe`], naming an upward plane (which `describe` files under
+/// inclined faces, a wording kept for `unassigned` compatibility).
+fn describe_face(class: Class) -> &'static str {
+    match class {
+        Class::Plane(nn) if nn.z > 1.0 - 1e-6 => "a horizontal face facing the tool",
+        _ => describe(class),
+    }
+}
+
+/// Build the face accounting (see [`super::accounting`]). Feature claims come
+/// from the features' face lists plus the floors taken as hole bottoms; body
+/// reasons are positive tests against the body's machine-axis bounding box.
+fn account(ctx: &Ctx<'_>, features: &[Feature], mut notes: Notes) -> Vec<FaceAccount> {
+    let mesh = ctx.input.mesh;
+    let tol = &ctx.input.tolerance;
+    let n = mesh.faces.len();
+    // Machine-axis bounds per solid, over target faces only.
+    let mut bounds: BTreeMap<&str, (Point3, Point3)> = BTreeMap::new();
+    for t in &mesh.triangles {
+        let src = &mesh.faces[t.face as usize];
+        if src.protected_only {
+            continue;
+        }
+        let e = bounds.entry(src.solid.as_str()).or_insert((Point3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), Point3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY)));
+        for v in t.vertices() {
+            e.0 = Point3::new(e.0.x.min(v.x), e.0.y.min(v.y), e.0.z.min(v.z));
+            e.1 = Point3::new(e.1.x.max(v.x), e.1.y.max(v.y), e.1.z.max(v.z));
+        }
+    }
+    let mut claims: BTreeMap<(&str, &str), Vec<String>> = BTreeMap::new();
+    for feat in features {
+        for face in &feat.faces {
+            claims.entry((feat.solid.as_str(), face.as_str())).or_default().push(feat.id.clone());
+        }
+    }
+    let hole_ids: Vec<&Feature> = features.iter().filter(|f| matches!(f.kind, FeatureKind::Hole(_))).collect();
+    for &(f, hi) in &notes.hole_bottoms {
+        if let Some(h) = hole_ids.get(hi) {
+            let src = &mesh.faces[f as usize];
+            claims.entry((src.solid.as_str(), src.face.as_str())).or_default().push(h.id.clone());
+        }
+    }
+    // Faces hole recognition declined, by "solid/face: reason".
+    for (f, src) in mesh.faces.iter().enumerate() {
+        let prefix = format!("{}/{}: ", src.solid, src.face);
+        for r in &ctx.input.holes.rejected {
+            if let Some(reason) = r.strip_prefix(&prefix) {
+                notes.refuse(f as u32, "hole", reason);
+            }
+        }
+    }
+    let eps = tol.distance_eps.max(1e-6) * 10.0;
+    let mut out = Vec::new();
+    for f in 0..n {
+        let src = &mesh.faces[f];
+        if src.protected_only {
+            continue;
+        }
+        let mut a = FaceAccount::new(src.solid.clone(), src.face.clone(), describe_face(ctx.class[f]).to_string());
+        a.features = claims.remove(&(src.solid.as_str(), src.face.as_str())).unwrap_or_default();
+        a.refusals = notes.refusals.remove(&(f as u32)).unwrap_or_default();
+        let stats = &ctx.graph.faces[f];
+        if let (Some((lo, hi)), Class::Plane(nn)) = (bounds.get(src.solid.as_str()), ctx.class[f]) {
+            let point = match ctx.carrier[f] {
+                Some(Carrier::Plane { point, .. }) => *point,
+                _ => stats.centroid,
+            };
+            a.body = if nn.z < -1.0 + 1e-6 && (stats.z_max - lo.z).abs() <= eps {
+                Some(BodyReason::StockBottom)
+            } else if nn.z > 1.0 - 1e-6 && (stats.z_min - hi.z).abs() <= eps {
+                Some(BodyReason::StockTop)
+            } else if nn.z.abs() <= 1e-6
+                && ((nn.x > 1.0 - 1e-6 && (point.x - hi.x).abs() <= eps)
+                    || (nn.x < -1.0 + 1e-6 && (point.x - lo.x).abs() <= eps)
+                    || (nn.y > 1.0 - 1e-6 && (point.y - hi.y).abs() <= eps)
+                    || (nn.y < -1.0 + 1e-6 && (point.y - lo.y).abs() <= eps))
+            {
+                Some(BodyReason::StockSide)
+            } else {
+                None
+            };
+        }
+        a.settle();
+        out.push(a);
+    }
+    out
 }
 
 fn tol_vertical(axis: Point3, tol: &Tolerance) -> bool {
@@ -394,7 +513,7 @@ pub(crate) fn floor_access_refusal(floor: &Region, z: f64, mesh: &MeshSnapshot, 
     None
 }
 
-fn floor_features(ctx: &Ctx<'_>, f: u32, normal: Point3, top_z: f64, assigned: &mut [bool]) -> Result<Option<Vec<Feature>>, CamError> {
+fn floor_features(ctx: &Ctx<'_>, f: u32, normal: Point3, top_z: f64, assigned: &mut [bool], notes: &mut Notes) -> Result<Option<Vec<Feature>>, CamError> {
     let tol = &ctx.input.tolerance;
     let mesh = ctx.input.mesh;
     let solid = mesh.faces[f as usize].solid.clone();
@@ -437,6 +556,9 @@ fn floor_features(ctx: &Ctx<'_>, f: u32, normal: Point3, top_z: f64, assigned: &
         let holes: Vec<Option<usize>> = walls.iter().map(|w| ctx.hole_of[w.face as usize]).collect();
         if holes.iter().all(|h| h.is_some()) && holes.windows(2).all(|w| w[0] == w[1]) {
             assigned[f as usize] = true;
+            if let Some(hi) = holes[0] {
+                notes.hole_bottoms.push((f, hi));
+            }
             return Ok(None);
         }
     }
@@ -444,7 +566,10 @@ fn floor_features(ctx: &Ctx<'_>, f: u32, normal: Point3, top_z: f64, assigned: &
         if !upward {
             return Ok(None);
         }
-        let Some(r) = region else { return Ok(None) };
+        let Some(r) = region else {
+            notes.refuse(f, "face-or-boss", "the upward planar face has no exact planar region");
+            return Ok(None);
+        };
         assigned[f as usize] = true;
         let z = stats.z_max;
         if (z - top_z).abs() <= tol.distance_eps || drops.is_empty() {
@@ -761,12 +886,12 @@ fn upper_neighbour<'a>(ctx: &'a Ctx<'_>, f: u32) -> Option<(u32, &'a Adjacency)>
         .max_by(|a, b| a.1.length().total_cmp(&b.1.length()))
 }
 
-fn chamfer_feature(ctx: &Ctx<'_>, f: u32, normal: Point3) -> Option<Feature> {
+fn chamfer_feature(ctx: &Ctx<'_>, f: u32, normal: Point3) -> Result<Feature, &'static str> {
     let tol = &ctx.input.tolerance;
     let solid = ctx.input.mesh.faces[f as usize].solid.clone();
-    let (upper, adj) = upper_neighbour(ctx, f)?;
+    let (upper, adj) = upper_neighbour(ctx, f).ok_or(NO_UPPER)?;
     let stats = &ctx.graph.faces[f as usize];
-    let upper_chain = shared_chain(adj, tol)?;
+    let upper_chain = shared_chain(adj, tol).ok_or(NO_CHAIN)?;
     // The lower edge (with the steeper face below) is the wall line the
     // chamfer replaces; its direction keeps the part interior (the upper
     // edge's side) on the left.
@@ -777,7 +902,7 @@ fn chamfer_feature(ctx: &Ctx<'_>, f: u32, normal: Point3) -> Option<Feature> {
         .filter(|(nf, a)| *nf != upper && a.convex_length > a.concave_length && ctx.graph.faces[*nf as usize].z_min < stats.z_min + tol.distance_eps)
         .max_by(|a, b| a.1.length().total_cmp(&b.1.length()));
     let mut chain = match lower {
-        Some((_, a)) => shared_chain(a, tol)?,
+        Some((_, a)) => shared_chain(a, tol).ok_or("the edge with the face below is not one connected chain")?,
         None => upper_chain.clone(),
     };
     let interior = upper_chain.segments[0].midpoint().sub(chain.segments[0].nearest(upper_chain.segments[0].midpoint()).0);
@@ -786,7 +911,7 @@ fn chamfer_feature(ctx: &Ctx<'_>, f: u32, normal: Point3) -> Option<Feature> {
     }
     let horizontal = normal.x.hypot(normal.y);
     let width = (stats.z_max - stats.z_min) * normal.z / horizontal;
-    Some(Feature {
+    Ok(Feature {
         id: String::new(),
         solid,
         kind: FeatureKind::Chamfer { chain, width, z: ctx.graph.faces[upper as usize].z_max, length: adj.length() },
@@ -797,12 +922,15 @@ fn chamfer_feature(ctx: &Ctx<'_>, f: u32, normal: Point3) -> Option<Feature> {
     })
 }
 
-fn fillet_feature(ctx: &Ctx<'_>, f: u32, radius: f64) -> Option<Feature> {
+const NO_UPPER: &str = "no upward horizontal face above it across a convex edge";
+const NO_CHAIN: &str = "the edge with the face above is not one connected chain";
+
+fn fillet_feature(ctx: &Ctx<'_>, f: u32, radius: f64) -> Result<Feature, &'static str> {
     let tol = &ctx.input.tolerance;
     let solid = ctx.input.mesh.faces[f as usize].solid.clone();
-    let (upper, adj) = upper_neighbour(ctx, f)?;
-    let chain = shared_chain(adj, tol)?;
-    Some(Feature {
+    let (upper, adj) = upper_neighbour(ctx, f).ok_or(NO_UPPER)?;
+    let chain = shared_chain(adj, tol).ok_or(NO_CHAIN)?;
+    Ok(Feature {
         id: String::new(),
         solid,
         kind: FeatureKind::Fillet { chain, radius, z: ctx.graph.faces[upper as usize].z_max, length: adj.length() },

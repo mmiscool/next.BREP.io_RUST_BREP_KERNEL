@@ -147,6 +147,32 @@ impl CadService {
         Ok(json!({"manifest":self.catalogue.identity(),"methods":methods,"nextCursor":if next < hits.len() { json!(format!("{next}:{binding}")) } else { Value::Null }}))
     }
 
+    /// `cad.docs.sdk`: without a group, the groups a script can call and
+    /// how many functions each holds; `cad`, the `cad` client's declarations;
+    /// any other group, that group's `brep.<group>.*` declarations.
+    pub async fn sdk_declarations(&self, group: Option<&str>) -> Result<serde_json::Value, wire::ApiError> {
+        use serde_json::json;
+        let tools = match self.server_state() {
+            Some(state) => crate::script_sdk::script_tools(&state.tools.read().await.specs),
+            None => vec![],
+        };
+        match group {
+            None => {
+                let mut groups: std::collections::BTreeMap<String, usize> = Default::default();
+                for t in &tools { *groups.entry(sdk::ident(&t.group)).or_default() += 1; }
+                Ok(json!({ "groups": groups, "note": "cad.docs.sdk(\"<group>\") gives that group's brep.<group>.* TypeScript declarations; cad.docs.sdk(\"cad\") the cad client's" }))
+            }
+            Some("cad") => Ok(json!({ "group": "cad", "declarations": declarations::module(&self.catalogue, &[]) })),
+            Some(group) => {
+                let picked: Vec<ScriptTool> = tools.into_iter().filter(|t| sdk::ident(&t.group) == group).collect();
+                if picked.is_empty() {
+                    return Err(wire::ApiError::new("invalid_arguments", "lookup", format!("no script group `{group}`; cad.docs.sdk() lists them")));
+                }
+                Ok(json!({ "group": group, "declarations": declarations::group_declarations(&picked) }))
+            }
+        }
+    }
+
     pub async fn describe(&self, paths: &[String]) -> Result<serde_json::Value, wire::ApiError> {
         use serde_json::json;
         if paths.is_empty() || paths.len() > 8 { return Err(wire::ApiError::new("invalid_arguments", "validation", "describe takes 1..8 paths")); }
@@ -155,9 +181,23 @@ impl CadService {
             if let Some(d) = self.catalogue.get(path) { methods.push(d.to_json()); continue; }
             let state = self.server_state().ok_or_else(|| wire::ApiError::new("method_unknown", "lookup", "no application registry"))?;
             let set = state.tools.read().await;
-            let t = set.specs.iter().find(|t| script_callable(t.group, &t.name) && format!("brep.{}.{}",sdk::ident(t.group),crate::script_sdk::method_name(t.group, &t.name)) == *path)
-                .ok_or_else(|| wire::ApiError::new("method_unknown", "lookup", format!("no function {path}")))?;
-            methods.push(json!({"path":path,"summary":t.doc,"documentation":t.doc,"inputSchema":t.input_schema,"outputSchema":t.output_schema,"readOnly":t.annotations.read_only,"destructive":t.annotations.destructive}));
+            let full = |t: &&crate::tools::ToolSpec| format!("brep.{}.{}", sdk::ident(t.group), crate::script_sdk::method_name(t.group, &t.name));
+            let callable: Vec<&crate::tools::ToolSpec> = set.specs.iter().filter(|t| script_callable(t.group, &t.name)).collect();
+            let exact = callable.iter().find(|t| full(t) == *path);
+            // A shortened path (`feature_add`, `features.feature_add`) or the
+            // registry name names the function when exactly one matches;
+            // the answer carries the full path to call.
+            let loose = || {
+                let suffix = format!(".{path}");
+                let mut hits = callable.iter().filter(|t| full(t).ends_with(&suffix) || t.name == *path);
+                let catalogue = self.catalogue.descriptors.iter().filter(|d| d.path.ends_with(&suffix)).count();
+                match (hits.next(), hits.next(), catalogue) { (Some(t), None, 0) => Some(t), _ => None }
+            };
+            let Some(t) = exact.or_else(loose) else {
+                if let Some(d) = self.catalogue.descriptors.iter().find(|d| d.path.ends_with(&format!(".{path}"))) { methods.push(d.to_json()); continue; }
+                return Err(wire::ApiError::new("method_unknown", "lookup", format!("no function {path}; paths are exact (brep.<group>.<tool> or cad.<group>.<verb>): find one with cad.discovery.search({{query: \"{}\"}})", path.rsplit('.').next().unwrap_or(path))));
+            };
+            methods.push(json!({"path":full(t),"summary":t.doc,"documentation":t.doc,"inputSchema":t.input_schema,"outputSchema":t.output_schema,"readOnly":t.annotations.read_only,"destructive":t.annotations.destructive}));
         }
         let result = json!({"manifest":self.catalogue.identity(),"methods":methods});
         if result.to_string().len() > 64 << 10 { return Err(wire::ApiError::new("resource_limit", "validation", "describe fewer paths")); }

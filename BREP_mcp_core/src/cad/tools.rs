@@ -25,9 +25,28 @@ fn string<'a>(req: &'a Value, key: &str) -> Result<&'a str, ApiError> {
 fn only(req: &Value, allowed: &[&str]) -> Result<(), ApiError> {
     let obj = req.as_object().ok_or_else(|| ApiError::new("invalid_arguments", "validation", "the request must be an object"))?;
     if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
-        return Err(ApiError::new("invalid_arguments", "validation", format!("unknown field `{k}`")));
+        let takes = if allowed.is_empty() { "it takes no fields".to_string() } else { format!("it takes {{{}}}", allowed.join(", ")) };
+        return Err(ApiError::new("invalid_arguments", "validation", format!("unknown field `{k}`; {takes}")));
     }
     Ok(())
+}
+
+/// `describe`'s paths: `paths` (an array), or one path or an array of them
+/// under the names agents reach for first (`path`, `name`, `method`, `tool`).
+fn describe_paths(req: &Value) -> Result<Vec<String>, ApiError> {
+    const NAMES: &[&str] = &["paths", "path", "name", "names", "method", "tool"];
+    let obj = req.as_object().ok_or_else(|| ApiError::new("invalid_arguments", "validation", "the request must be an object"))?;
+    if let Some(k) = obj.keys().find(|k| !NAMES.contains(&k.as_str())) {
+        return Err(ApiError::new("invalid_arguments", "validation", format!("unknown field `{k}`; describe takes {{paths: string[]}}, e.g. cad.discovery.describe({{paths: [\"brep.features.feature_add\"]}})")));
+    }
+    let given: Vec<&Value> = NAMES.iter().filter_map(|k| obj.get(*k)).collect();
+    let [value] = given[..] else {
+        return Err(ApiError::new("invalid_arguments", "validation", "describe takes {paths: string[]}, e.g. cad.discovery.describe({paths: [\"brep.features.feature_add\"]})"));
+    };
+    let items: Vec<&Value> = match value { Value::Array(a) => a.iter().collect(), v => vec![v] };
+    items.into_iter()
+        .map(|p| p.as_str().map(str::to_string).ok_or_else(|| ApiError::new("invalid_arguments", "validation", "paths holds strings: exact paths such as brep.features.feature_add or cad.sketch.create")))
+        .collect()
 }
 
 /// Every logical service method, by its exact name.
@@ -44,15 +63,30 @@ pub async fn call_service(service: &CadService, caller: &Caller, method: &str, r
         }
         "cad.discovery.describe" => {
             caller.require(&["catalogue.read"])?;
-            only(req, &["paths"])?;
-            let paths: Vec<String> = req
-                .get("paths")
-                .and_then(Value::as_array)
-                .ok_or_else(|| ApiError::new("invalid_arguments", "validation", "paths must be an array of exact paths"))?
-                .iter()
-                .map(|p| p.as_str().map(str::to_string).ok_or_else(|| ApiError::new("invalid_arguments", "validation", "paths holds strings")))
-                .collect::<Result<_, _>>()?;
+            let paths = describe_paths(req)?;
             service.describe(&paths).await
+        }
+        // The guides and declarations, for a client that cannot read MCP
+        // resources: tools-only runs never saw skill://design-part, and
+        // guessed the API one failed call at a time.
+        "cad.docs.list" => {
+            only(req, &[])?;
+            Ok(json!({ "guides": crate::skills::SKILLS.iter().map(|s| json!({ "name": s.name, "description": s.description })).collect::<Vec<_>>() }))
+        }
+        "cad.docs.read" => {
+            only(req, &["name"])?;
+            let name = string(req, "name")?;
+            let name = name.strip_prefix("skill://").unwrap_or(name);
+            let name = name.strip_suffix("/SKILL.md").unwrap_or(name);
+            let skill = crate::skills::SKILLS.iter().find(|s| s.name == name).ok_or_else(|| {
+                let names: Vec<&str> = crate::skills::SKILLS.iter().map(|s| s.name).collect();
+                ApiError::new("invalid_arguments", "lookup", format!("no guide `{name}`; the guides are {}", names.join(", ")))
+            })?;
+            Ok(json!({ "name": skill.name, "text": skill.text }))
+        }
+        "cad.docs.sdk" => {
+            only(req, &["group"])?;
+            service.sdk_declarations(req.get("group").and_then(Value::as_str)).await
         }
         "cad.documents.list" => {
             only(req, &[])?;
@@ -233,7 +267,7 @@ pub fn front_door_tools(service: Arc<CadService>, slot: crate::tools::app::Sessi
         ToolSpec::new(
             "run_script",
             "script",
-            "Run a JavaScript (or TypeScript) program on the CAD app: `export default async function main()` returning JSON. Every app tool is a script function, `await brep.<group>.<tool>(args)` (see the generated brep-cad.d.ts / commands reference), beside the `cad` client of `@brep/cad`. Awaits the completed result on this same tool call by default. An explicit wait_ms opts into a bounded wait/status response; retrying the same source and key recovers that same execution. script_result remains an optional recovery tool; script_halt cancels work. Starts a headless session if none is live.",
+            "Run a JavaScript (or TypeScript) program on the CAD app: `export default async function main()` returning JSON. Every app tool is a script function, `await brep.<group>.<tool>(args)`, beside the `cad` client of `@brep/cad`. Before modelling, return `await cad.docs.read('design-part')` once: it is the modelling guide; `cad.docs.sdk(group)` gives a group's typed signatures. Awaits the completed result on this same tool call by default. An explicit wait_ms opts into a bounded wait/status response; retrying the same source and key recovers that same execution. script_result remains an optional recovery tool; script_halt cancels work. Starts a headless session if none is live.",
             json!({ "type": "object", "properties": { "source": { "type": "string", "minLength": 1, "maxLength": 262144, "description": "UTF-8 source, at most 256 KiB" }, "language": { "enum": ["javascript", "typescript"], "default": "javascript", "description": "TypeScript requires explicitly provisioned Node and TypeScript 7.0.2; tools/list reports this host's compiler availability. Strict checking precedes execution." }, "wait_ms": wait, "key": { "type": "string", "minLength": 1, "maxLength": 128, "description": "a retry key of your choosing: the same key with the same program answers the SAME execution (submitted once), so a run whose reply was lost is found again; the same key with another program is refused" } }, "required": ["source"], "additionalProperties": false }),
             Annotations { read_only: false, destructive: true, idempotent: false, waits: false },
             move |args| {

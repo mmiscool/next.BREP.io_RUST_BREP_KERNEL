@@ -24,6 +24,8 @@ pub(super) fn result() -> Value {
     ready.as_object_mut().unwrap().extend(json!({"stale":boolean,"setup":text,"setups":array(reference("PreviewSetup")),"setupCount":uint,
         "unreached":array(closed_object_optional(json!({"feature":text,"kind":text,"reason":text}), &[])),"features":array(reference("Feature")),"featureCount":uint,
         "selectedCount":uint,"operationCount":uint,"unassignedFaces":{"type":"array","items":{"type":"array","items":text,"minItems":2,"maxItems":2}},
+        "faceGroups":{"anyOf":[closed_object_optional(json!({"feature":uint,"refused":uint,"body":uint,"unexplained":uint}), &[]),{"type":"null"}]},
+        "unexplainedFaces":{"anyOf":[{"type":"array","items":{"type":"array","items":text,"minItems":2,"maxItems":2}},{"type":"null"}]},
         "material":{"const":"aluminium"},"notice":text}).as_object().unwrap().clone());
     json!({"type":"object","oneOf":[closed_object_optional(pending,&[]),closed_object_optional(ready,&[]),closed_object_optional(json!({"created":strings}), &[])],"$defs":defs})
 }

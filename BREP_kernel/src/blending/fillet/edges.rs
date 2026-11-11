@@ -1012,6 +1012,7 @@ pub fn fillet_edges_reported(
     // Nor can dropping another edge close a tangential end whose taper failed.
     if crate::blend::is_wall_fold(&group_err) || crate::blend::is_miter_support_overrun(&group_err)
         || crate::blend::is_tangential_transverse_end(&group_err)
+        || matches!(&group_err.class, RefusalClass::UnsupportedGeometry { what } if what == "canal_footprint_bound")
     {
         return Err(group_err);
     }
@@ -3340,6 +3341,13 @@ fn fillet_edges_group_lanes(
                             Err(_) => break,
                         }
                     }
+                }
+                // Independent stripe cutters cannot close a corner whose ball
+                // exceeds the canal footprint. Preserve the requested radius
+                // and its named refusal instead of searching partial selections.
+                if matches!(&refusal.class, RefusalClass::UnsupportedGeometry { what }
+                    if what == "canal_footprint_bound") {
+                    return Err(refusal);
                 }
                 // The runout composition reads the ring's own classification
                 // back when the ring stage falls through to the cutter and

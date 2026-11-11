@@ -1111,6 +1111,16 @@ fn blend_star_network_building(
                          the horn-torus closure at a varying radius is not in this lane"
                     )));
                 }
+                if !chamfer && canal_corner_on() && selected_convex {
+                    for (floor, wall) in [(other_a, other_b), (other_b, other_a)] {
+                        let rho = faces.iter().find(|(face, _, _)| face.id == wall.id).unwrap().1;
+                        if let Some(refusal) = cylindrical_corner_footprint_limit(
+                            shared, floor, wall, point, corner_radius, rho, sharp.id,
+                        ) {
+                            return Err(refusal);
+                        }
+                    }
+                }
                 corners.push((
                     *vertex_id,
                     stripe_indices.clone(),
@@ -3236,8 +3246,11 @@ fn blend_star_network_building(
         let pole_gap = ends[1].3.sub(pole).length();
         // A corner the exact torus cannot close is closed by the ball's
         // envelope, when the cap is a plane and the section is the ball's arc.
+        // A chamfer takes the same closure with the ball's CHORD for its arc
+        // (a pocket rim with one wall tilted
+        // 9 degrees left every corner as an uncut notch from the cutter).
         let canal_allowed = canal_corner_on()
-            && !chamfer
+            && (!chamfer || chamfer_canal_corner_on())
             && matches!(cap.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. }));
         let mut canal = pole_gap > 1e-6 * (1.0 + radius) && canal_allowed;
         if pole_gap > 1e-6 * (1.0 + radius) && !canal {
@@ -4428,7 +4441,8 @@ fn blend_star_network_building(
             Some(canal) => {
                 let sharp = solid.edges.iter().find(|edge| edge.id == horn.sharp_edge)
                     .ok_or(KernelRefusal::internal(KernelStage::Refine, "canal_sharp", "blend network: the concave edge is missing"))?;
-                Some(canal_corner_patch(sharp, [canal.poles[0].2, canal.poles[1].2], center_a, center_b, cap_point_a, radius, solid)?)
+                let chamfer_ends = chamfer.then_some([(canal.poles[0].1, cap_point_a), (canal.poles[1].1, cap_point_b)]);
+                Some(canal_corner_patch(sharp, [canal.poles[0].2, canal.poles[1].2], center_a, center_b, cap_point_a, radius, chamfer_ends, solid)?)
             }
             None => None,
         };
@@ -6184,9 +6198,87 @@ pub(in crate::blend) fn canal_corner_on() -> bool {
     switch!(live "BREP_BLEND_CANAL_CORNER", true)
 }
 
+/// Whether a CHAMFER's re-entrant corner the exact cone cannot close is
+/// closed by [`canal_corner_patch`] with the ball's chords: on unless
+/// `BREP_CHAMFER_CANAL_CORNER=0`/`off` (then it refuses by name and the
+/// cutter composition answers, leaving the corner uncut).
+pub(in crate::blend) fn chamfer_canal_corner_on() -> bool {
+    switch!(live "BREP_CHAMFER_CANAL_CORNER", true)
+}
+
 /// The largest height of the envelope's foot on the concave edge above or
 /// below the ball centres' plane, as a fraction of the radius.
 const CANAL_MAX_FOOT_HEIGHT: f64 = 0.25;
+
+/// A radial planar cap cutting a cylindrical wall and a perpendicular plane.
+/// The inward-offset cylinder has radius R-r. A centre on the cap's offset
+/// plane is r from the axial plane, so its radial contact on the cylinder is
+/// h = r²/(R-r) from the centres' plane. The canal footprint requires h <= B*r,
+/// hence r <= B*R/(1+B). Check this before marching: beyond R/2 the centre
+/// planes do not even meet the offset cylinder, and Newton cannot reach the
+/// later footprint check. This is a construction bound, not proof that no
+/// exact-radius fillet exists. Other carriers retain the measured check.
+fn cylindrical_corner_footprint_limit(
+    cap: &FaceRecord,
+    floor: &FaceRecord,
+    wall: &FaceRecord,
+    corner: Vec3,
+    radius: f64,
+    rho: f64,
+    sharp_edge: u64,
+) -> Option<KernelRefusal> {
+    use crate::AnalyticSurface;
+    let plane = |face: &FaceRecord| match face.surface.analytic()? {
+        AnalyticSurface::Plane { origin, u_dir, v_dir, .. } =>
+            Some((*origin, u_dir.cross(*v_dir).normalized().ok()?)),
+        _ => None,
+    };
+    let (cap_origin, cap_normal) = plane(cap)?;
+    let (_, floor_normal) = plane(floor)?;
+    let (frame, cylinder_radius) = match wall.surface.analytic()? {
+        AnalyticSurface::RuledRevolution { frame, rho0, rho1, .. }
+            if (rho0 - rho1).abs() <= 1e-9 * rho0.abs().max(1.0) => (frame, *rho0),
+        AnalyticSurface::Revolution { frame, generatrix, .. } => {
+            if generatrix.degree != 1 || generatrix.control_points.len() != 2 { return None; }
+            let [a, b] = generatrix.domain().ok()?;
+            let first = generatrix.evaluate(a).ok()?.sub(frame.origin);
+            let last = generatrix.evaluate(b).ok()?.sub(frame.origin);
+            let radial = |p: Vec3| p.sub(frame.axis.scale(p.dot(frame.axis)));
+            let first = radial(first);
+            if first.sub(radial(last)).length() > 1e-9 * first.length().max(1.0) { return None; }
+            (frame, first.length())
+        }
+        _ => return None,
+    };
+    let band = 1e-8 * cylinder_radius.max(1.0);
+    if cylinder_radius <= 0.0
+        || cap_normal.dot(frame.axis).abs() > 1e-9
+        || floor_normal.dot(frame.axis).abs() < 1.0 - 1e-9
+        || frame.origin.sub(cap_origin).dot(cap_normal).abs() > band
+    { return None; }
+    let radial = corner.sub(frame.origin);
+    let radial = radial.sub(frame.axis.scale(radial.dot(frame.axis)));
+    if (radial.length() - cylinder_radius).abs() > band { return None; }
+    let uv = crate::project_point_to_surface(&wall.surface, corner).ok()?;
+    if raw_normal(&wall.surface, uv.u, uv.v).ok()?.scale(rho).dot(radial) >= 0.0 {
+        return None;
+    }
+    let bound = CANAL_MAX_FOOT_HEIGHT * cylinder_radius / (1.0 + CANAL_MAX_FOOT_HEIGHT);
+    if radius <= bound + band { return None; }
+    // A conservative, readable suggestion; never substitute it in the result.
+    let step = 10.0_f64.powf(bound.log10().floor());
+    let suggested = (bound / step).floor() * step;
+    Some(KernelRefusal::unsupported(
+        KernelStage::Classify,
+        "canal_footprint_bound",
+        format!(
+            "blend network: the corner ball at radius {radius} exceeds the canal footprint bound at edge \
+             {sharp_edge} (radius bound {bound:.6}). Try radius {suggested:.6} or less; this is the largest \
+             one-significant-digit radius below the bound. The requested radius has not been changed. \
+             This corner needs an exact-radius construction beyond the current footprint limit",
+        ),
+    ))
+}
 
 /// The two stops of a re-entrant corner closed by [`canal_corner_patch`]:
 /// `(vertex, point, parameter on the concave edge)`, in stripe order.
@@ -6221,6 +6313,16 @@ fn sharp_piece(sharp: &EdgeRecord, from: f64, to: f64) -> Result<NurbsCurve, Ker
 /// `u` runs stop a -> stop b, `v` the ball's arc from the concave edge (v = 0)
 /// to the cap (v = 1). Returns the patch and its v = 1 boundary. Refused by
 /// name when a station does not solve or the fit misses the true envelope.
+///
+/// A chamfer (`chamfer_ends`: each stop's pole and cap point, in stripe
+/// order) sweeps the same pivoting ball's CHORD between its two contacts
+/// instead of its arc — the section the chamfer's stripes stop on (§6.11) —
+/// so the patch is ruled in `v`; where the stops share a torus it is the cone
+/// the exact closure builds. The stops' chords come from the stripes' FITTED
+/// rails, a few fit tolerances off the exact family (6.9e-6 on the report's
+/// corner, r = 0.5), so the rows carry the end gaps blended linearly in `u`
+/// and the patch passes through both end chords exactly.
+#[allow(clippy::too_many_arguments)]
 fn canal_corner_patch(
     sharp: &EdgeRecord,
     poles: [f64; 2],
@@ -6228,9 +6330,11 @@ fn canal_corner_patch(
     center_b: Vec3,
     cap_point_a: Vec3,
     radius: f64,
+    chamfer_ends: Option<[(Vec3, Vec3); 2]>,
     solid: &BrepSolid,
 ) -> Result<(crate::NurbsSurface, NurbsCurve), KernelRefusal> {
-    let unsolved = |what: &'static str| KernelRefusal::unsupported(KernelStage::Refine, what, "blend network: the corner's ball envelope does not solve");
+    let chamfer = chamfer_ends.is_some();
+    let unsolved = |what: &'static str| KernelRefusal::unsupported(KernelStage::Refine, what, format!("blend network: the corner's ball envelope does not solve ({what})"));
     let cap_up = cap_point_a.sub(center_a).normalized().or_refuse(KernelStage::Refine, "canal_cap_normal")?;
     if center_b.sub(center_a).dot(cap_up).abs() > 1e-6 * (1.0 + radius) {
         return Err(unsolved("canal_centres_off_plane"));
@@ -6280,7 +6384,26 @@ fn canal_corner_patch(
         Err(unsolved("canal_no_convergence"))
     };
     // The arc's three homogeneous control points, concave edge to cap.
-    let arc_controls = |p: Vec3, centre: Vec3| -> Result<[crate::Vec4; 3], KernelRefusal> {
+    let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+    // A chamfer's end gaps (pole, cap point) at stop a and stop b; a gap far
+    // over the fit tolerance means the stop is not on this family at all.
+    let end_gaps = match chamfer_ends {
+        Some([(pole_a, cap_a), (pole_b, cap_b)]) => {
+            let (_, p0, c0) = station(0.0, poles[0])?;
+            let (_, p1, c1) = station(1.0, poles[1])?;
+            let gaps = [pole_a.sub(p0), cap_a.sub(c0.add(cap_up.scale(radius))), pole_b.sub(p1), cap_b.sub(c1.add(cap_up.scale(radius)))];
+            let worst = gaps.iter().map(|gap| gap.length()).fold(0.0, f64::max);
+            if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                eprintln!("canal chamfer corner: stops {worst:.3e} off the ball family (bar {bar:.3e})");
+            }
+            if !(worst <= 100.0 * bar) {
+                return Err(unsolved("canal_chamfer_stop_off_family"));
+            }
+            Some(gaps)
+        }
+        None => None,
+    };
+    let arc_controls = |u: f64, p: Vec3, centre: Vec3| -> Result<[crate::Vec4; 3], KernelRefusal> {
         let cap = centre.add(cap_up.scale(radius));
         let (from, to) = (p.sub(centre), cap.sub(centre));
         let cosine = (from.dot(to) / (radius * radius)).clamp(-1.0, 1.0);
@@ -6292,15 +6415,27 @@ fn canal_corner_patch(
         // slightly past the ball's pivot axis, and that short run rotates
         // backwards: a fold about h^2 / (2 r) deep, inherent to the envelope
         // because the stop arcs are the stripes' own sections. Bounded here
-        // (0.004 at r = 0.3 on the reported model's corners); deeper, the corner stays
-        // with the miter composition.
-        if p.sub(center_a).dot(cap_up).abs() > CANAL_MAX_FOOT_HEIGHT * radius {
+        // (0.004 at r = 0.3 on the reported model's corners). Beyond this
+        // bound this canal is not usable for a fillet. The analytic inward-cylinder
+        // footprint check above refuses before marching; other configurations
+        // may still use their existing capped-corner construction. A chamfer's
+        // row is the CHORD, which has no stretch running backwards past the
+        // pivot: it is not bounded.
+        let height = p.sub(center_a).dot(cap_up).abs();
+        if !chamfer && height > CANAL_MAX_FOOT_HEIGHT * radius {
             return Err(unsolved("canal_foot_height"));
+        }
+        if let Some([pole_a, cap_a, pole_b, cap_b]) = end_gaps {
+            // The chord, as the same degree-2 row with its middle control at
+            // the midpoint and unit weight, moved by the end gaps.
+            let p = p.add(pole_a.scale(1.0 - u)).add(pole_b.scale(u));
+            let cap = cap.add(cap_a.scale(1.0 - u)).add(cap_b.scale(u));
+            let middle = p.add(cap).scale(0.5);
+            return Ok([crate::Vec4::from_point(p, 1.0), crate::Vec4::from_point(middle, 1.0), crate::Vec4::from_point(cap, 1.0)]);
         }
         let middle = centre.add(from.add(to).normalized().or_refuse(KernelStage::Refine, "canal_middle")?.scale(radius / half.cos()));
         Ok([crate::Vec4::from_point(p, 1.0), crate::Vec4::from_point(middle, half.cos()), crate::Vec4::from_point(cap, 1.0)])
     };
-    let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
     for count in [16usize, 32, 64] {
         let parameters: Vec<f64> = (0..=count).map(|k| k as f64 / count as f64).collect();
         let mut columns: [Vec<crate::Vec4>; 3] = std::array::from_fn(|_| Vec::with_capacity(count + 1));
@@ -6308,7 +6443,7 @@ fn canal_corner_patch(
         for &u in &parameters {
             let (t, p, centre) = station(u, guess)?;
             guess = t;
-            let controls = arc_controls(p, centre)?;
+            let controls = arc_controls(u, p, centre)?;
             for (column, control) in columns.iter_mut().zip(controls) {
                 column.push(control);
             }
@@ -6329,7 +6464,7 @@ fn canal_corner_patch(
             let u = (k as f64 + 0.5) / count as f64;
             let (t, p, centre) = station(u, guess)?;
             guess = t;
-            let exact = arc_controls(p, centre)?;
+            let exact = arc_controls(u, p, centre)?;
             let row = NurbsCurve::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], exact.to_vec()).or_refuse(KernelStage::Refine, "canal_row")?;
             for j in 0..=8 {
                 let v = j as f64 / 8.0;

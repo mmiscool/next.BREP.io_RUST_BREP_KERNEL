@@ -985,9 +985,16 @@ async fn serve(service: &CadService, caller: &Caller, method: &str, body: &str) 
                             None => value = json!({ "value": value, "images": refs }),
                         }
                     }
-                    respond(Ok(value))
+                    let reply = wire::respond(Ok(value)).to_string();
+                    // A reply this large would exhaust the program's worker
+                    // (64 MiB) when parsed: refuse it softly, by size.
+                    if reply.len() > MAX_TOOL_REPLY {
+                        return respond(Err(ApiError::new("resource_limit", "evaluation", format!("{name}'s result is {} bytes, more than a script can take ({MAX_TOOL_REPLY}); ask for less (a filter, a page, one entity)", reply.len()))));
+                    }
+                    Ok(reply)
                 }
                 Err(e) => {
+                    let e = with_signature(&e, &spec);
                     let mut error = ApiError::from_app(&e, "evaluation");
                     // An unclassified tool failure may follow a partial mutation.
                     if error.code == "evaluation_failed" { error.effects = super::wire::Effects::unknown(); }
@@ -1000,6 +1007,42 @@ async fn serve(service: &CadService, caller: &Caller, method: &str, body: &str) 
         }
         _ => respond(super::tools::call_service(service, caller, method, &req).await),
     }
+}
+
+/// The largest script-function reply handed to a program: well under the
+/// worker's 64 MiB once parsed into JavaScript values.
+const MAX_TOOL_REPLY: usize = 12 << 20;
+
+/// An argument error from a script function, completed with the fields the
+/// function takes: `unknown field `kind`, there are no fields` alone sent
+/// agents guessing one round trip per spelling.
+fn with_signature(error: &str, spec: &crate::tools::ToolSpec) -> String {
+    let argument_error = ["unknown field", "missing field", "invalid type", "unknown variant", "there are no fields"]
+        .iter().any(|m| error.contains(m));
+    if !argument_error || error.contains(" takes {") { return error.to_string(); }
+    let path = format!("brep.{}.{}", crate::script_sdk::ident(spec.group), crate::script_sdk::method_name(spec.group, &spec.name));
+    format!("{error} — {path} takes {}", signature(&spec.input_schema))
+}
+
+/// `{id: string, patch?: object}` from an input schema, at most ~600 bytes.
+pub(crate) fn signature(schema: &Value) -> String {
+    let Some(props) = schema.get("properties").and_then(Value::as_object).filter(|p| !p.is_empty()) else { return "{} (no arguments)".into() };
+    let required: Vec<&str> = schema["required"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let mut fields = Vec::new();
+    let mut len = 0;
+    for (name, p) in props {
+        let ty = match &p["type"] {
+            Value::String(t) => t.clone(),
+            Value::Array(ts) => ts.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("|"),
+            _ if p.get("enum").is_some() => p["enum"].as_array().into_iter().flatten().take(6).map(|v| v.to_string()).collect::<Vec<_>>().join("|"),
+            _ => "any".into(),
+        };
+        let field = format!("{name}{}: {ty}", if required.contains(&name.as_str()) { "" } else { "?" });
+        len += field.len() + 2;
+        if len > 600 { fields.push("…".to_string()); break; }
+        fields.push(field);
+    }
+    format!("{{{}}}", fields.join(", "))
 }
 
 /// The TypeScript compiler a TypeScript program is checked with: exactly

@@ -251,7 +251,7 @@ fn convenience(catalogue: &Catalogue) -> String {
         m.iter().map(|(g, ms)| format!("    {g}: {{ {} }};", ms.join("; "))).collect::<Vec<_>>().join("\n")
     };
     format!(
-        "  export interface BoundDocument {{\n    readonly context: DocumentContext;\n{}\n  }}\n  export interface CadClient {{\n    discovery: {{ search(args: SearchRequest): Promise<SearchPage>; describe(args: DescribeRequest): Promise<DescribeResult> }};\n{}\n  }}",
+        "  export interface BoundDocument {{\n    readonly context: DocumentContext;\n{}\n  }}\n  export interface CadClient {{\n    discovery: {{ search(args: SearchRequest): Promise<SearchPage>; describe(args: DescribeRequest): Promise<DescribeResult> }};\n    /** The guides (design-part, inspect-model, ...) and per-group declarations, for clients that cannot read MCP resources. */\n    /** One call for \"what is open\": documents, the active one, its features, solids and errors (lengths in mm). */\n    session: {{ summary(): Promise<{{ documents: {{ id: string; title: string; dirty: boolean; active: boolean }}[]; active: {{ id: string; title: string; revision: string }} | null; units: \"mm\"; featureCount: number; features: string[]; rollbackStep: number; solidCount: number; solids: string[]; featureErrors: string[]; idle: boolean }}> }};\n    docs: {{ list(): Promise<{{ name: string; description: string }}[]>; read(name: string): Promise<string>; sdk(group?: string): Promise<string | {{ groups: Record<string, number>; note: string }}> }};\n{}\n  }}",
         block(&bound),
         block(&free)
     )
@@ -274,6 +274,12 @@ fn tool_declarations(tools: &[super::ScriptTool]) -> String {
     }
     let body = groups.iter().map(|(g, ms)| format!("    {g}: {{\n{}\n    }};", ms.join("\n"))).collect::<Vec<_>>().join("\n");
     format!("{aliases}  /** The app's tool registry as script functions: each runs the tool's own handler. */\n  export const brep: {{\n{body}\n  }};")
+}
+
+/// One group's `brep.<group>.*` declarations (with the aliases they use),
+/// for `cad.docs.sdk(group)`: the whole module is ~300 KB.
+pub fn group_declarations(tools: &[super::ScriptTool]) -> String {
+    tool_declarations(tools)
 }
 
 /// The whole module declaration.

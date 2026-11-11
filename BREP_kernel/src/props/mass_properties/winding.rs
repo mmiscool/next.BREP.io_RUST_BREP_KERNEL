@@ -57,6 +57,19 @@ pub(super) fn winding_band_integral_with(
     kinds: &[Integrand],
     refine: usize,
 ) -> Result<Option<Vec<f64>>, String> {
+    static POLE_GAUGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let pole_gauge = *POLE_GAUGE.get_or_init(|| {
+        std::env::var("BREP_MASS_SPHERE_POLE_GAUGE").as_deref() == Ok("1")
+    });
+    winding_band_integral_with_pole_gauge(face, kinds, refine, pole_gauge)
+}
+
+pub(super) fn winding_band_integral_with_pole_gauge(
+    face: &FaceRecord,
+    kinds: &[Integrand],
+    refine: usize,
+    pole_gauge: bool,
+) -> Result<Option<Vec<f64>>, String> {
     let (closed_u, closed_v) = face.surface.closed_directions()?;
     if closed_u == closed_v {
         return Ok(None);
@@ -64,6 +77,7 @@ pub(super) fn winding_band_integral_with(
     let [u0, u1] = face.surface.domain_u()?;
     let [v0, v1] = face.surface.domain_v()?;
     let (mut winds_u, mut winds_v) = (false, false);
+    let mut net_u = 0;
     for loop_record in &face.loops {
         let (mut travel_u, mut travel_v) = (0.0, 0.0);
         for coedge in &loop_record.coedges {
@@ -75,7 +89,10 @@ pub(super) fn winding_band_integral_with(
         }
         match (winding(travel_u, u1 - u0), winding(travel_v, v1 - v0)) {
             (Some(0), Some(0)) => {}
-            (Some(_), Some(0)) if closed_u => winds_u = true,
+            (Some(w), Some(0)) if closed_u => {
+                winds_u = true;
+                net_u += w;
+            }
             (Some(0), Some(_)) if closed_v => winds_v = true,
             _ => return Ok(None),
         }
@@ -85,6 +102,23 @@ pub(super) fn winding_band_integral_with(
         (false, true) => false,
         _ => return Ok(None),
     };
+    if pole_gauge && p_is_u && net_u != 0 && complete_sphere(face)? {
+        // A rim enclosing a pole is closed on the sphere but open in its
+        // chart. Base the primitive at the retained pole: taking the sign
+        // of a primitive based at v0 always selects the v0 cap. Choosing v1
+        // is equivalent to adding the whole-carrier gauge contribution,
+        // without cancellation when the retained cap is very small.
+        // Balanced rims, including explicit pole lines, need no correction.
+        let sign = if face.same_sense { 1.0 } else { -1.0 };
+        if net_u.abs() == 1 {
+            let from_upper = sign * net_u as f64 > 0.0;
+            let mut values = winding_loops_integral_oriented(face, kinds, true, refine, false, from_upper)?;
+            for value in &mut values {
+                *value *= sign;
+            }
+            return Ok(Some(values));
+        }
+    }
     Ok(Some(winding_loops_integral(face, kinds, p_is_u, refine)?))
 }
 
@@ -106,6 +140,17 @@ pub(super) fn winding_loops_integral(
     kinds: &[Integrand],
     p_is_u: bool,
     refine: usize,
+) -> Result<Vec<f64>, String> {
+    winding_loops_integral_oriented(face, kinds, p_is_u, refine, true, false)
+}
+
+fn winding_loops_integral_oriented(
+    face: &FaceRecord,
+    kinds: &[Integrand],
+    p_is_u: bool,
+    refine: usize,
+    normalize: bool,
+    from_upper: bool,
 ) -> Result<Vec<f64>, String> {
     let [u0, u1] = face.surface.domain_u()?;
     let [v0, v1] = face.surface.domain_v()?;
@@ -149,7 +194,7 @@ pub(super) fn winding_loops_integral(
                     for (parameter, weight) in panel.stations() {
                         let (uv, tangent) = coedge.pcurve.deriv1(parameter)?;
                         if p_is_u {
-                            antiderivative(face, &all_kinds, uv.x, v0, uv.y, &v_breaks, sign, true, &mut inner, &mut rules)?;
+                            antiderivative(face, &all_kinds, uv.x, if from_upper { v1 } else { v0 }, uv.y, &v_breaks, sign, true, &mut inner, &mut rules)?;
                             for (total, value) in totals.iter_mut().zip(&inner) {
                                 *total -= weight * tangent.x * value;
                             }
@@ -164,8 +209,24 @@ pub(super) fn winding_loops_integral(
             }
         }
     }
-    let orientation = totals[kinds.len()].signum();
+    let orientation = if normalize { totals[kinds.len()].signum() } else { 1.0 };
     Ok(totals[..kinds.len()].iter().map(|v| v * orientation).collect())
+}
+
+/// The gauge correction requires both poles of the spherical support, in
+/// increasing latitude order. Partial carriers keep their existing reading.
+fn complete_sphere(face: &FaceRecord) -> Result<bool, String> {
+    let Some(crate::AnalyticSurface::Sphere { frame, radius }) = face.surface.analytic() else {
+        return Ok(false);
+    };
+    let [u0, _] = face.surface.domain_u()?;
+    let [v0, v1] = face.surface.domain_v()?;
+    let south = face.surface.evaluate(u0, v0)?;
+    let north = face.surface.evaluate(u0, v1)?;
+    let pole = frame.axis.scale(*radius);
+    let tolerance = 1e-8 * radius;
+    Ok(south.sub(frame.origin.sub(pole)).length() <= tolerance
+        && north.sub(frame.origin.add(pole)).length() <= tolerance)
 }
 
 /// The pcurve's spans cut further wherever its `u` (`take_u`) or `v`

@@ -180,7 +180,7 @@ fn scale_of(outline: &[OutlinePiece]) -> f64 {
 }
 
 /// Signed distance to a closed outline (negative inside).
-fn outline_signed_distance(outline: &[OutlinePiece], p: [f64; 2]) -> f64 {
+pub(crate) fn outline_signed_distance(outline: &[OutlinePiece], p: [f64; 2]) -> f64 {
     let distance = outline
         .iter()
         .map(|piece| piece.distance(p))

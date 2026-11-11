@@ -163,17 +163,35 @@ fn ping_result_schema() -> Value {
 }
 
 fn describe_commands_result_schema() -> Value {
+    // `name` and `group` always; `summary` in the default listing; the rest
+    // with `filter` or `full`.
     serde_json::json!({"type":"array","items":{
         "type":"object","properties":{
-            "name":{"type":"string"},"group":{"type":"string"},"doc":{"type":"string"},
+            "name":{"type":"string"},"group":{"type":"string"},"summary":{"type":"string"},"doc":{"type":"string"},
             "phase":{"type":"string","enum":["input","mutate","read"]},
             "annotations":{"type":"object","properties":{
                 "read_only":{"type":"boolean"},"destructive":{"type":"boolean"},
                 "idempotent":{"type":"boolean"},"waits":{"type":"boolean"}
             },"required":["read_only","destructive","idempotent","waits"],"additionalProperties":false},
             "argsSchema":{},"resultSchema":{}
-        },"required":["name","group","doc","phase","annotations","argsSchema","resultSchema"],"additionalProperties":false
+        },"required":["name","group"],"additionalProperties":false
     }})
+}
+
+/// `describe_commands`' arguments. The whole registry with every schema is
+/// about 800 KB, which a script cannot hold (agents ran out of worker
+/// memory), so the default is a listing.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DescribeCommandsArgs {
+    /// Only the commands whose name or group contains this text (any case),
+    /// each with its doc, phase, annotations and schemas.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Every command with everything (about 800 KB). Default false: each
+    /// command's name, group and one-line summary.
+    #[serde(default)]
+    pub full: bool,
 }
 
 fn ping(_ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -187,8 +205,28 @@ fn frame_info_cmd(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 fn describe_commands(_ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
-    let _: NoArgs = parse_args(args)?;
-    Ok(Outcome::Done(crate::automation::command::describe()))
+    let args: DescribeCommandsArgs = parse_args(args)?;
+    Ok(Outcome::Done(described_commands(crate::automation::command::describe(), &args)))
+}
+
+/// The registry as `args` asks for it: everything (`full`), the full entries
+/// a `filter` matches, or by default each command's name, group and first
+/// sentence.
+fn described_commands(all: Value, args: &DescribeCommandsArgs) -> Value {
+    let Value::Array(commands) = all else { return all };
+    if let Some(filter) = args.filter.as_deref().map(str::to_lowercase) {
+        return Value::Array(commands.into_iter().filter(|c| {
+            [&c["name"], &c["group"]].iter().any(|v| v.as_str().is_some_and(|s| s.to_lowercase().contains(&filter)))
+        }).collect());
+    }
+    if args.full {
+        return Value::Array(commands);
+    }
+    Value::Array(commands.iter().map(|c| {
+        let doc = c["doc"].as_str().unwrap_or_default();
+        let summary: String = doc.split(". ").next().unwrap_or(doc).trim().chars().take(200).collect();
+        serde_json::json!({"name": c["name"], "group": c["group"], "summary": summary})
+    }).collect())
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -312,7 +350,7 @@ fn settle(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
-    app_command!("frame", "describe_commands", "The app's command registry: every command with its group, doc, phase, annotations and derived argument/result schemas. A host generates its tool list from this.", NoArgs, describe_commands, Read, READ, describe_commands_result_schema),
+    app_command!("frame", "describe_commands", "The app's command registry: each command's name, group and one-line summary. `filter` gives the matching commands' doc, phase, annotations and derived argument/result schemas; `full: true` gives every command's (about 800 KB). A host generates its tool list from the full form.", DescribeCommandsArgs, describe_commands, Read, READ, describe_commands_result_schema),
     app_command!("frame", "ping", "Liveness, and one frame: replies from the next pass's read phase (a drawn frame, or on an undrawn desktop window a pass the app runs itself). The composite tools step the app with it (`wait_frames`, `wait_state`, a dwell).", NoArgs, ping, Read, READ, ping_result_schema),
     app_command!("frame", "settle", "Wait, in the app, until it has been idle (`frame_info`'s `idle`) for `settle` further checks, then answer with the frame info and the settled history listing, report and model. The wait every mutating tool ends with; no polling.", SettleArgs, settle, Read, READ, settle_result_schema),
     app_command!("frame", "frame_info", "Frame counter, pixels-per-point, surface and viewport rects (egui points), pending runner work, run progress, history length and rollback step. `idle` is the wait condition for mutating tools.", NoArgs, frame_info_cmd, Read, READ, schema_of::<FrameInfo>),

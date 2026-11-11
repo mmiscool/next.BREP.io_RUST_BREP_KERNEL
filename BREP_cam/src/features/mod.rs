@@ -31,12 +31,14 @@
 use crate::model::Point3;
 use serde::{Deserialize, Serialize};
 
+pub mod accounting;
 pub mod graph;
 pub mod recognize;
 pub mod techdb;
 
 pub use recognize::{recognize, Feature, FeatureKind, Recognized, RecognitionInput, WallLine, ProfileWalls};
 pub use techdb::TechDb;
+pub use accounting::{BodyReason, FaceAccount, FaceGroup, Refusal};
 
 /// The exact analytic surface of one face, in machine space.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

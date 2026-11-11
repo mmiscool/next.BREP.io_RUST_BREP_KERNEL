@@ -395,7 +395,7 @@ impl BrepServer {
         let describe = {
             let session = self.state.slot.read().await.clone();
             match session {
-                Some(s) => s.host.call_ok("describe_commands", serde_json::json!({})).await.ok().and_then(|r| r.result),
+                Some(s) => s.host.call_ok("describe_commands", serde_json::json!({ "full": true })).await.ok().and_then(|r| r.result),
                 None => None,
             }
         };

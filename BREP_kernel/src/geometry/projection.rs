@@ -758,6 +758,10 @@ fn projection_dense_grid(surface: &NurbsSurface) -> Result<&SampleGrid, String> 
 /// Samples per block of a [`SampleGrid`].
 const SAMPLE_BLOCK: usize = 32;
 
+/// Runs per group: the scan's second level, a box over [`GROUP_BLOCKS`]
+/// consecutive runs ([`SampleGrid::groups`]).
+const GROUP_BLOCKS: usize = 32;
+
 /// A cached `(u, v, point)` sample grid, with the axis-aligned box of each run
 /// of [`SAMPLE_BLOCK`] consecutive samples, so the nearest-sample scan
 /// ([`nearest_sample`]) skips a run none of whose samples can beat the answer
@@ -766,6 +770,11 @@ const SAMPLE_BLOCK: usize = 32;
 pub(crate) struct SampleGrid {
     samples: Vec<(f64, f64, Vec3)>,
     blocks: Vec<SampleBlock>,
+    /// The union box of each [`GROUP_BLOCKS`] consecutive runs, prunable only
+    /// when every run in it is. A union box's floor is at most each of its
+    /// runs' floors as computed (the box faces are the runs' own, and the gap
+    /// to a face farther out is no larger, IEEE rounding being monotone).
+    groups: Vec<SampleBlock>,
 }
 
 /// One run's box. `prunable` is false when a sample has a non-finite
@@ -792,8 +801,20 @@ impl SampleGrid {
                 }
                 SampleBlock { low, high, prunable }
             })
+            .collect::<Vec<_>>();
+        let groups = blocks
+            .chunks(GROUP_BLOCKS)
+            .map(|chunk| {
+                let mut group = chunk[0];
+                for block in chunk {
+                    group.low = Vec3::new(group.low.x.min(block.low.x), group.low.y.min(block.low.y), group.low.z.min(block.low.z));
+                    group.high = Vec3::new(group.high.x.max(block.high.x), group.high.y.max(block.high.y), group.high.z.max(block.high.z));
+                    group.prunable &= block.prunable;
+                }
+                group
+            })
             .collect();
-        Self { samples, blocks }
+        Self { samples, blocks, groups }
     }
 }
 
@@ -832,28 +853,122 @@ fn pruned_scan() -> bool {
 /// the first such in scan order: the bits of the linear scan, which this was
 /// until 2026-11-10. A run is skipped only when its box's floor is not below
 /// the distance held, so none of its samples could have replaced it (the
-/// strict `<`), and the runs are visited in scan order. ABC 00027566's
+/// strict `<`), or lies above the bound read first ([`bound_first_scan`]),
+/// and the runs are visited in scan order. ABC 00027566's
 /// 166-span rational faces take the dense fallback on 71% of their pcurve
 /// probes (the first Newton not converged), each scanning 22.7k samples: 9.1 s
 /// of a face's 11.5 s of local answers.
 fn nearest_sample(grid: &SampleGrid, point: Vec3, best: &mut NewtonResult) {
-    nearest_sample_with(grid, point, best, pruned_scan());
+    nearest_sample_with(grid, point, best, pruned_scan(), bound_first_scan());
 }
 
-fn nearest_sample_with(grid: &SampleGrid, point: Vec3, best: &mut NewtonResult, pruned: bool) {
-    for (block, chunk) in grid.blocks.iter().zip(grid.samples.chunks(SAMPLE_BLOCK)) {
-        if pruned && block.prunable && block.lower_bound(point) >= best.distance_squared {
-            continue;
+/// `BREP_PROJECTION_BOUND_FIRST=0` prunes against the distance held alone, as
+/// on 2026-11-10 before this pass, for a same-binary A/B. Read once per
+/// process.
+///
+/// With it on, the runs are boxed again in groups of [`GROUP_BLOCKS`]. The scan
+/// first reads the run of lowest floor inside the group of lowest floor and
+/// takes the nearest of its samples as a BOUND, then visits the groups and
+/// their runs in scan order, skipping any whose floor is at or above the
+/// distance held or strictly above that bound. The runs alone started the seed
+/// scan from no answer (its incoming distance is infinite), so every run ahead
+/// of the nearest sample was read before the held distance fell, and every
+/// scan computed one floor per run: on ABC 00027566 the seed
+/// scans averaged 63k samples (361 s over 5M calls) and the dense ones 180k
+/// (167 s over 3.5M), while a bound over the runs alone cut the first to 190 s
+/// but doubled the second to 311 s with its extra pass of floors.
+fn bound_first_scan() -> bool {
+    switch!("BREP_PROJECTION_BOUND_FIRST", true)
+}
+
+/// The scan behind [`nearest_sample`]. With `bound_first`, the bound is the
+/// smaller of the incoming distance and one real sample distance, so it is
+/// never below the grid's least distance `m`. The first sample at `m` lies in
+/// a run whose floor is at most `m`, hence not above the bound and not at or
+/// above the distance held when the scan reaches it (every sample before it is
+/// strictly farther than `m`): that run is read and the sample taken, as the
+/// linear scan takes it, and nothing after it is strictly nearer. A run whose
+/// floor is above the bound holds no sample at `m`. The bound pass reads only
+/// prunable runs, and updates on a strict `<`, so a NaN never enters it.
+fn nearest_sample_with(grid: &SampleGrid, point: Vec3, best: &mut NewtonResult, pruned: bool, bound_first: bool) {
+    if !(pruned && bound_first) {
+        for (block, chunk) in grid.blocks.iter().zip(grid.samples.chunks(SAMPLE_BLOCK)) {
+            if pruned && block.prunable && block.lower_bound(point) >= best.distance_squared {
+                continue;
+            }
+            scan_run(chunk, point, best);
         }
-        for &(u, v, sample) in chunk {
-            let distance_squared = sample.sub(point).length_squared();
-            if distance_squared < best.distance_squared {
-                best.u = u;
-                best.v = v;
-                best.distance_squared = distance_squared;
+        return;
+    }
+    // The bound: one real sample distance (or the incoming one), from the run
+    // of lowest floor inside the group of lowest floor.
+    let mut bound = best.distance_squared;
+    let lowest_group = lowest_floor(&grid.groups, 0..grid.groups.len(), point);
+    if let Some(group) = lowest_group {
+        let runs = group * GROUP_BLOCKS..((group + 1) * GROUP_BLOCKS).min(grid.blocks.len());
+        if let Some(run) = lowest_floor(&grid.blocks, runs, point) {
+            let start = run * SAMPLE_BLOCK;
+            let end = (start + SAMPLE_BLOCK).min(grid.samples.len());
+            for &(_, _, sample) in &grid.samples[start..end] {
+                let distance_squared = sample.sub(point).length_squared();
+                if distance_squared < bound {
+                    bound = distance_squared;
+                }
             }
         }
     }
+    let skip = |box_: &SampleBlock, held: f64| {
+        if !box_.prunable {
+            return false;
+        }
+        let floor = box_.lower_bound(point);
+        floor >= held || floor > bound
+    };
+    for (group_index, group) in grid.groups.iter().enumerate() {
+        if skip(group, best.distance_squared) {
+            continue;
+        }
+        let first = group_index * GROUP_BLOCKS;
+        let last = (first + GROUP_BLOCKS).min(grid.blocks.len());
+        for run in first..last {
+            if skip(&grid.blocks[run], best.distance_squared) {
+                continue;
+            }
+            let start = run * SAMPLE_BLOCK;
+            let end = (start + SAMPLE_BLOCK).min(grid.samples.len());
+            scan_run(&grid.samples[start..end], point, best);
+        }
+    }
+}
+
+/// The linear scan of one run: strict `<`, so the first of equal samples
+/// stands.
+fn scan_run(run: &[(f64, f64, Vec3)], point: Vec3, best: &mut NewtonResult) {
+    for &(u, v, sample) in run {
+        let distance_squared = sample.sub(point).length_squared();
+        if distance_squared < best.distance_squared {
+            best.u = u;
+            best.v = v;
+            best.distance_squared = distance_squared;
+        }
+    }
+}
+
+/// The index, within `range`, of the prunable box of least floor (the first
+/// on a tie), or None when none is prunable.
+fn lowest_floor(boxes: &[SampleBlock], range: std::ops::Range<usize>, point: Vec3) -> Option<usize> {
+    let mut lowest: Option<(usize, f64)> = None;
+    for index in range {
+        let box_ = &boxes[index];
+        if !box_.prunable {
+            continue;
+        }
+        let floor = box_.lower_bound(point);
+        if lowest.is_none_or(|(_, held)| floor < held) {
+            lowest = Some((index, floor));
+        }
+    }
+    lowest.map(|(index, _)| index)
 }
 
 // Boundary-ring cache geometry: 4 sides × 22 exponents × 33 indices. The scan

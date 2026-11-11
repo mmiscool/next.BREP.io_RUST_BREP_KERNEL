@@ -168,14 +168,29 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     if !text.contains("ISO-10303-21") {
         return Err("step_import: not an ISO-10303-21 Part 21 file".into());
     }
+    let debug_timing = std::env::var("BREP_DEBUG_STEP_LOOP").is_ok();
+    let parse_started = debug_timing.then(web_time::Instant::now);
     let entities = parse_data_section(text)?;
+    if let Some(started) = parse_started {
+        eprintln!("PHASE parse: {:?} ({} entities)", started.elapsed(), entities.len());
+    }
+    let mut phase_clock = debug_timing.then(web_time::Instant::now);
+    let mut phase = |name: &str| {
+        if let Some(started) = phase_clock.as_mut() {
+            eprintln!("PHASE assembly {name}: {:?}", started.elapsed());
+            *started = web_time::Instant::now();
+        }
+    };
     let global_scale = derive_length_scale_mm(&entities);
     let edges = structure_edges(&entities, &Resolver::new(&entities, global_scale));
+    phase("structure edges");
     if edges.is_empty() {
         return Ok(None); // no product structure: the flat lane is the answer
     }
 
-    let mut scales = ProductScales::new(&entities, global_scale);
+    let structure = StructureIndex::new(&entities);
+    phase("structure index");
+    let mut scales = ProductScales::new(&structure, global_scale);
 
     // Each edge's placement, read at the scale of the representation each of its
     // frames is an item of: an ITEM_DEFINED_TRANSFORMATION's AXIS2_PLACEMENT_3D
@@ -202,7 +217,8 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
         edges,
         transforms,
         refusals,
-    } = resolve_structure_edges(&entities, &edges, |node| scales.get(node));
+    } = resolve_structure_edges(&structure, &edges, |node| scales.get(node));
+    phase("resolve edges");
     let mut first_error: Option<String> = refusals.first().map(ToString::to_string);
     let mut sheets_skipped = 0usize;
     if edges.is_empty() {
@@ -229,8 +245,57 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     // not, the second product gets its own build instead of the first's.
     // The file's presentation entities, read ONCE for the whole document.
     let styles = StyleTable::read(&entities);
+    let build_part = |(body, scale_key): (StepBody, u64)| {
+        let resolver = Resolver::new(&entities, f64::from_bits(scale_key));
+        build_step_body(&resolver, body)
+            .map(|(solid, _readings)| {
+                let appearance = step_body_appearance(&resolver, &styles, body, &solid);
+                (solid, appearance)
+            })
+            .map_err(|error| format!("step_import: part body {body:?} failed to build: {error}"))
+    };
+    // Every distinct (body, scale) the product loop below asks for, in the
+    // order it asks, built up front -- in parallel under the `parallel`
+    // feature. The loop then only reads the cache.
+    let product_scales: Vec<f64> = pd_refs.iter().map(|&pd| scales.get(pd)).collect();
+    let mut part_keys: Vec<(StepBody, u64)> = Vec::new();
+    {
+        let mut seen: HashSet<(StepBody, u64)> = HashSet::default();
+        for (&pd, &scale) in pd_refs.iter().zip(&product_scales) {
+            let resolver = Resolver::new(&entities, scale);
+            for body in pd_step_bodies(&structure, &resolver, pd) {
+                if seen.insert((body, scale.to_bits())) {
+                    part_keys.push((body, scale.to_bits()));
+                }
+            }
+        }
+    }
+    phase(&format!("body keys ({} distinct bodies)", part_keys.len()));
+    // Under the PHASE switch, each body's own build time too, slowest first:
+    // which parts an import is waiting on.
+    let body_times: std::sync::Mutex<Vec<(std::time::Duration, StepBody)>> = Default::default();
+    let timed_build = |key: (StepBody, u64)| {
+        let started = debug_timing.then(web_time::Instant::now);
+        let built = build_part(key);
+        if let Some(started) = started {
+            body_times.lock().expect("timing lock").push((started.elapsed(), key.0));
+        }
+        built
+    };
     let mut solid_cache: HashMap<(StepBody, u64), Result<(BrepSolid, BodyAppearance), String>> =
-        HashMap::default();
+        build_distinct_bodies(
+            part_keys,
+            |(body, scale_key)| step_body_face_count(&Resolver::new(&entities, f64::from_bits(scale_key)), body),
+            &timed_build,
+        ).into_iter().collect();
+    phase("body builds");
+    if debug_timing {
+        let mut times = body_times.into_inner().expect("timing lock");
+        times.sort_by(|a, b| b.0.cmp(&a.0));
+        for (elapsed, body) in times.iter().take(15) {
+            eprintln!("PHASE assembly   slow body {body:?}: {elapsed:?}");
+        }
+    }
     let mut products: Vec<StepProduct> = Vec::with_capacity(pd_refs.len());
     // The face refs of every body that built, in `bodies` order — the pairing
     // an annotation's `ADVANCED_FACE` is mapped to `IMPORT3D1_Face_i` through
@@ -238,25 +303,17 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     // so a plain assembly pays nothing for it.
     let wants_pmi = super::pmi::file_mentions_pmi(text);
     let mut face_refs: super::assembly_pmi::ProductFaceRefs = Vec::with_capacity(pd_refs.len());
-    for &pd in &pd_refs {
-        let scale = scales.get(pd);
+    for (&pd, &scale) in pd_refs.iter().zip(&product_scales) {
         let resolver = Resolver::new(&entities, scale);
         let scale_key = scale.to_bits();
         let mut bodies = Vec::new();
         let mut appearances = Vec::new();
         let mut product_face_refs = Vec::new();
         let mut failed_bodies = 0usize;
-        for body in pd_step_bodies(&entities, &resolver, pd) {
-            let built = solid_cache.entry((body, scale_key)).or_insert_with(|| {
-                build_step_body(&resolver, body)
-                    .map(|(solid, _readings)| {
-                        let appearance = step_body_appearance(&resolver, &styles, body, &solid);
-                        (solid, appearance)
-                    })
-                    .map_err(|error| {
-                        format!("step_import: part body {body:?} failed to build: {error}")
-                    })
-            });
+        for body in pd_step_bodies(&structure, &resolver, pd) {
+            let built = solid_cache
+                .entry((body, scale_key))
+                .or_insert_with(|| build_part((body, scale_key)));
             match built {
                 // Pushed together, so `bodies` and `appearances` stay parallel
                 // through every skip arm below.
@@ -299,6 +356,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     //
     // (One corner differs harmlessly: a body that builds but fails
     // `transform_brep` yields no flat solid, yet counts as reached here.)
+    phase("products");
     let mut reached: HashSet<usize> = HashSet::default();
     {
         let resolver = Resolver::new(&entities, global_scale);
@@ -342,6 +400,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     // here rather than by the consumer because this is where the file text,
     // the parse and each product's own face pairing are all in hand at once —
     // the same reason the geometry is built here.
+    phase("walk + occurrences");
     let mut pmi = super::assembly_pmi::AssemblyPmi::default();
     if wants_pmi {
         pmi = super::assembly_pmi::lift(
@@ -359,6 +418,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
         }
     }
 
+    phase("pmi");
     Ok(Some(StepAssembly {
         products,
         occurrences,
@@ -383,15 +443,15 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
 /// single-context file resolves to the identical scale everywhere and the
 /// structured lane's geometry stays byte-identical to the flat lane's.
 pub(super) struct ProductScales<'a> {
-    entities: &'a HashMap<usize, Entity>,
+    structure: &'a StructureIndex<'a>,
     global: f64,
     cache: HashMap<usize, f64>,
 }
 
 impl<'a> ProductScales<'a> {
-    pub(super) fn new(entities: &'a HashMap<usize, Entity>, global: f64) -> Self {
+    pub(super) fn new(structure: &'a StructureIndex<'a>, global: f64) -> Self {
         Self {
-            entities,
+            structure,
             global,
             cache: HashMap::default(),
         }
@@ -405,10 +465,10 @@ impl<'a> ProductScales<'a> {
         if let Some(&scale) = self.cache.get(&pd) {
             return scale;
         }
-        let scale = pd_root_srs(self.entities, pd)
+        let scale = pd_root_srs(self.structure, pd)
             .into_iter()
-            .filter_map(|sr| self.entities.get(&sr).and_then(representation_context))
-            .find_map(|context| context_length_scale_mm(self.entities, context))
+            .filter_map(|sr| self.structure.entities.get(&sr).and_then(representation_context))
+            .find_map(|context| context_length_scale_mm(self.structure.entities, context))
             .unwrap_or(self.global);
         self.cache.insert(pd, scale);
         scale

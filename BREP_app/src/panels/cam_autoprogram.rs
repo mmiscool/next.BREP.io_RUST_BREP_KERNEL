@@ -242,7 +242,7 @@ fn build_preview(state: &EngineState, doc: CamDocument, setup_id: &str) -> Resul
     let fallback = extra.iter().map(|t| t.id.to_string()).collect();
     let mut tools = doc.tools.clone(); tools.extend(extra);
     Ok(Preview { setup: setup_id.into(), enabled: true, additional, unreached: multi.unreached,
-        document: doc, revisions, recognized, plan, tools, fallback, selected })
+        document: doc, revisions, recognized: first.recognized, plan, tools, fallback, selected })
 }
 
 impl AutoProgramPanel {
@@ -406,7 +406,12 @@ impl AutoProgramPanel {
         json!({ "open": self.open, "busy": false, "error": self.error, "stale": self.current(state).is_err(), "allProgrammedOk": all_programmed_ok, "programmed": programmed,
             "setup": p.setup, "setups": setups, "setupCount": setups.len(), "unreached": p.unreached, "features": features, "featureCount": features.len(),
             "selectedCount": p.selected.len(), "operationCount": operation_count,
-            "unassignedFaces": p.recognized.unassigned, "material": "aluminium",
+            "unassignedFaces": p.recognized.unassigned,
+            "faceGroups": p.recognized.accounting.as_ref().map(|a| { let c = brep_cam::features::accounting::group_counts(a);
+                json!({ "feature": c[0], "refused": c[1], "body": c[2], "unexplained": c[3] }) }),
+            "unexplainedFaces": p.recognized.accounting.as_ref().map(|a| a.iter().filter(|f| f.group == brep_cam::features::FaceGroup::Unexplained)
+                .map(|f| json!([f.face, f.why])).collect::<Vec<_>>()),
+            "material": "aluminium",
             "notice": "Document tools are preferred. Tools labelled Builtin are proposed fallback tools. Cutting data assumes aluminium." })
     }
 
@@ -450,6 +455,19 @@ impl AutoProgramPanel {
                 });
             }
             for refusal in &p.unreached { ui.label(format!("Not reached: {}", refusal.reason)); }
+            match &p.recognized.accounting {
+                None => { ui.small("Face accounting: unknown (recognised before accounting existed)."); }
+                Some(accounting) => {
+                    let c = brep_cam::features::accounting::group_counts(accounting);
+                    ui.label(format!("Faces: {} in features · {} refused · {} body · {} unexplained", c[0], c[1], c[2], c[3]));
+                    let unexplained: Vec<_> = accounting.iter().filter(|f| f.group == brep_cam::features::FaceGroup::Unexplained).collect();
+                    if !unexplained.is_empty() {
+                        egui::CollapsingHeader::new(format!("Unexplained faces ({})", unexplained.len())).id_salt("cam:auto:unexplained").show(ui, |ui| {
+                            for f in unexplained { ui.small(format!("{} · {}", f.face, f.why)); }
+                        });
+                    }
+                }
+            }
         }
         if let Err(why) = self.current(state) {
             if self.preview.is_some() { ui.colored_label(egui::Color32::YELLOW, why); }

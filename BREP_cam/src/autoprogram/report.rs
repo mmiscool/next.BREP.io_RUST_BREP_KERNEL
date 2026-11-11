@@ -48,6 +48,9 @@ pub struct Report {
     pub skipped: Vec<Skipped>,
     pub tool_changes: u32,
     pub unassigned_faces: Vec<(String, String)>,
+    /// Per-face accounting (see `features::accounting`); `None` is unknown.
+    #[serde(default)]
+    pub face_accounting: Option<Vec<crate::features::FaceAccount>>,
     pub generated: u32,
     pub failed: u32,
 }
@@ -101,6 +104,7 @@ pub fn report(recognized: &Recognized, plan: &Plan, generated: &[GeneratedOperat
         skipped: plan.skipped.clone(),
         tool_changes: plan.tool_changes,
         unassigned_faces: recognized.unassigned.clone(),
+        face_accounting: recognized.accounting.clone(),
         generated: ok,
         failed,
     }

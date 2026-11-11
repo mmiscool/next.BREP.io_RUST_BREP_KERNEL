@@ -243,6 +243,9 @@ mod solid_sweep;
 pub use solid_sweep::{
     sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
 };
+#[path = "construction/solid_sweep_caps.rs"]
+mod solid_sweep_caps;
+pub use solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, FrameCurve, RisingTurn, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
 #[path = "construction/sweep_topology.rs"]
 mod sweep_topology;
 pub(crate) use sweep_topology::is_sweep_tight_bend;

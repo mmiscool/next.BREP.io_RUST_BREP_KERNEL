@@ -747,8 +747,15 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     // Vendor face senses can leave the whole shell pointing inward; a closed
     // shell's material side is defined by its signed volume, so restore the
     // outward convention.
+    //
+    // Only the SIGN is read, so the sign reader answers it: its verdict against
+    // zero is the exact integral's (it integrates exactly itself inside its
+    // margin), without the full mass properties, which were most of a large
+    // part's import time. A reading that fails falls back to the exact
+    // integral, as the orientation read always did.
     let _caller = crate::mass_caller("step_import.face_sense_flip");
-    if let Ok(volume) = crate::solid_signed_volume(&solid) {
+    let signed = crate::solid_signed_volume_for_sign(&solid, 0.0).or_else(|_| crate::solid_signed_volume(&solid));
+    if let Ok(volume) = signed {
         if volume < 0.0 {
             crate::offset_shell::flip_all_faces(&mut solid)?;
         }

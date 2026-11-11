@@ -101,6 +101,49 @@ pub(super) fn build_step_body(
     build_step_body_captured_or_not(resolver, body, false).map(|(solid, _, readings)| (solid, readings))
 }
 
+/// Build every distinct part body of an assembly ONCE, before the occurrence
+/// walk that places them.
+///
+/// Each body reconstructs from the shared read-only `Resolver` into its own
+/// `BrepSolid` with no cross-body state (the flat lane's argument), so under
+/// the `parallel` feature the builds fan out across rayon's pool. `keys` is in
+/// first-encounter order and `collect` keeps it, so the walk that consumes the
+/// results meets every success and failure in the order the sequential build
+/// did: `failed`, `first_error` and the refusal lists come out the same.
+///
+/// The builds are STARTED largest first (by `cost`, a face count) and each is
+/// its own task, so one big part does not start last behind a run of small
+/// ones and leave the other threads idle while it finishes. Only the order
+/// the work starts in moves; the results come back in `keys` order.
+pub(super) fn build_distinct_bodies<K, T>(
+    keys: Vec<K>,
+    cost: impl Fn(K) -> usize,
+    build: impl Fn(K) -> T + Sync + Send,
+) -> Vec<(K, T)>
+where
+    K: Copy + Send + Sync,
+    T: Send,
+{
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        let mut order: Vec<(usize, usize)> = keys.iter().enumerate().map(|(index, &key)| (cost(key), index)).collect();
+        order.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut built: Vec<(usize, T)> = order
+            .into_par_iter()
+            .with_max_len(1)
+            .map(|(_, index)| (index, build(keys[index])))
+            .collect();
+        built.sort_by_key(|(index, _)| *index);
+        built.into_iter().map(|(index, value)| (keys[index], value)).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = cost;
+        keys.into_iter().map(|key| (key, build(key))).collect()
+    }
+}
+
 fn build_step_body_captured_or_not(
     resolver: &Resolver,
     body: StepBody,
@@ -307,6 +350,17 @@ pub(super) struct ImportedBodies {
 /// [`shell_face_refs`] for the PMI reader (a sibling module).
 pub(super) fn shell_face_refs_pub(resolver: &Resolver, shell_ref: usize) -> Option<Vec<usize>> {
     shell_face_refs(resolver, shell_ref)
+}
+
+/// How many faces a body's shells list: the build-cost estimate
+/// [`build_distinct_bodies`] schedules by. Zero when the shells do not read.
+pub(super) fn step_body_face_count(resolver: &Resolver, body: StepBody) -> usize {
+    step_body_claimed_shells(resolver, body)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|shell| shell_face_refs(resolver, shell))
+        .map(|faces| faces.len())
+        .sum()
 }
 
 /// Shared core. Either RESOLVES THE ASSEMBLY — positioning each solid-bearing
@@ -797,7 +851,7 @@ fn representation_owner_index(entities: &HashMap<usize, Entity>) -> HashMap<usiz
 
 /// representation → representations joined to it by an IDENTITY
 /// SHAPE_REPRESENTATION_RELATIONSHIP, built in one pass. The whole-file form of
-/// [`identity_related_srs`]; with-transform relationships (assembly placements
+/// per-representation identity lookup; with-transform relationships (assembly placements
 /// between different products) are excluded there and here.
 fn identity_relation_index(entities: &HashMap<usize, Entity>) -> HashMap<usize, Vec<usize>> {
     let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::default();
@@ -829,13 +883,9 @@ fn identity_relation_index(entities: &HashMap<usize, Entity>) -> HashMap<usize, 
 /// [`pd_step_bodies`] (which reads their solids) and [`structure_edges`] (which
 /// reads their mapped items), so a representation cannot contribute geometry to
 /// one and mappings to neither.
-pub(super) fn node_representations(
-    entities: &HashMap<usize, Entity>,
-    resolver: &Resolver,
-    node: usize,
-) -> Vec<usize> {
+pub(super) fn node_representations(structure: &StructureIndex, resolver: &Resolver, node: usize) -> Vec<usize> {
     let mut visited: HashSet<usize> = HashSet::default();
-    let mut queue: VecDeque<usize> = pd_root_srs(entities, node).into_iter().collect();
+    let mut queue: VecDeque<usize> = pd_root_srs(structure, node).into_iter().collect();
     let mut reps = Vec::new();
     while let Some(sr) = queue.pop_front() {
         if !visited.insert(sr) {
@@ -844,7 +894,7 @@ pub(super) fn node_representations(
         if resolver.get(sr).is_ok() {
             reps.push(sr);
         }
-        for other in identity_related_srs(entities, sr) {
+        for &other in structure.identity.get(&sr).into_iter().flatten() {
             if !visited.contains(&other) {
                 queue.push_back(other);
             }
@@ -879,75 +929,104 @@ pub(super) fn representation_context(entity: &Entity) -> Option<usize> {
 
 /// The root SHAPE_REPRESENTATION(s) that directly define a PRODUCT_DEFINITION's
 /// shape (via PRODUCT_DEFINITION_SHAPE → SHAPE_DEFINITION_REPRESENTATION).
-pub(super) fn pd_root_srs(entities: &HashMap<usize, Entity>, pd: usize) -> Vec<usize> {
+pub(super) fn pd_root_srs(structure: &StructureIndex, pd: usize) -> Vec<usize> {
     // A structure node that IS a representation (a mapped representation with no
     // PRODUCT_DEFINITION of its own — see `representation_owner_index`) is its own root
     // shape representation. A PRODUCT_DEFINITION never carries representation
     // arguments, so the two cases cannot be confused.
-    if entities
+    if structure
+        .entities
         .get(&pd)
         .is_some_and(|entity| representation_args(entity).is_some())
     {
         return vec![pd];
     }
-    let pds_ids: Vec<usize> = entities
-        .iter()
-        .filter_map(|(id, entity)| {
-            let args = entity.find("PRODUCT_DEFINITION_SHAPE")?;
-            (args.get(2)?.as_ref_id().ok()? == pd).then_some(*id)
-        })
-        .collect();
-    let mut srs: Vec<usize> = entities
-        .values()
-        .filter_map(|entity| {
-            let args = entity.find("SHAPE_DEFINITION_REPRESENTATION")?;
-            let definition = args.first()?.as_ref_id().ok()?;
-            let used = args.get(1)?.as_ref_id().ok()?;
-            pds_ids.contains(&definition).then_some(used)
-        })
+    let mut srs: Vec<usize> = structure
+        .shapes_of_definition
+        .get(&pd)
+        .into_iter()
+        .flatten()
+        .filter_map(|shape| structure.reps_of_shape.get(shape))
+        .flatten()
+        .copied()
         .collect();
     srs.sort_unstable();
     srs.dedup();
     srs
 }
 
-/// SRs joined to `sr` by an IDENTITY SHAPE_REPRESENTATION_RELATIONSHIP (a
-/// product's alternative representations of the same geometry). With-transform
-/// relationships (assembly placements between different products) are excluded.
-fn identity_related_srs(entities: &HashMap<usize, Entity>, sr: usize) -> Vec<usize> {
-    let mut out = Vec::new();
-    for entity in entities.values() {
-        if entity.has("REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION") {
-            continue;
+/// The whole-file lookups the product-structure walk asks once per product or
+/// once per edge, each built in ONE pass over the entities.
+///
+/// Answering them by scanning the file per question made an assembly import
+/// quadratic: a few full scans per product and per placement, which on a
+/// 336k-entity, 642-occurrence assembly is about a billion record comparisons.
+/// Each list keeps the entity map's iteration order, which is the order the
+/// per-question scans met the same records in, so every answer is unchanged.
+pub(super) struct StructureIndex<'a> {
+    pub(super) entities: &'a HashMap<usize, Entity>,
+    /// PRODUCT_DEFINITION → the PRODUCT_DEFINITION_SHAPEs that define it.
+    shapes_of_definition: HashMap<usize, Vec<usize>>,
+    /// PRODUCT_DEFINITION_SHAPE → the representations SHAPE_DEFINITION_REPRESENTATION
+    /// says are its shape.
+    reps_of_shape: HashMap<usize, Vec<usize>>,
+    /// Representation → representations joined to it by an IDENTITY relationship.
+    identity: HashMap<usize, Vec<usize>>,
+    /// NEXT_ASSEMBLY_USAGE_OCCURRENCE → the representation relationships its
+    /// CONTEXT_DEPENDENT_SHAPE_REPRESENTATIONs name as its placement.
+    placements_of_occurrence: HashMap<usize, Vec<usize>>,
+}
+
+impl<'a> StructureIndex<'a> {
+    pub(super) fn new(entities: &'a HashMap<usize, Entity>) -> Self {
+        let mut shapes_of_definition: HashMap<usize, Vec<usize>> = HashMap::default();
+        let mut reps_of_shape: HashMap<usize, Vec<usize>> = HashMap::default();
+        let mut placements_of_occurrence: HashMap<usize, Vec<usize>> = HashMap::default();
+        for (&id, entity) in entities.iter() {
+            if let Some(definition) = entity
+                .find("PRODUCT_DEFINITION_SHAPE")
+                .and_then(|args| args.get(2)?.as_ref_id().ok())
+            {
+                shapes_of_definition.entry(definition).or_default().push(id);
+            }
+            if let Some(args) = entity.find("SHAPE_DEFINITION_REPRESENTATION") {
+                if let (Some(Ok(definition)), Some(Ok(used))) = (
+                    args.first().map(Value::as_ref_id),
+                    args.get(1).map(Value::as_ref_id),
+                ) {
+                    reps_of_shape.entry(definition).or_default().push(used);
+                }
+            }
+            if let Some(args) = entity.find("CONTEXT_DEPENDENT_SHAPE_REPRESENTATION") {
+                let occurrence = args
+                    .get(1)
+                    .and_then(|value| value.as_ref_id().ok())
+                    .and_then(|shape| entities.get(&shape))
+                    .and_then(|shape| shape.find("PRODUCT_DEFINITION_SHAPE"))
+                    .and_then(|shape_args| shape_args.get(2))
+                    .and_then(|value| value.as_ref_id().ok());
+                let relationship = args.first().and_then(|value| value.as_ref_id().ok());
+                if let (Some(occurrence), Some(relationship)) = (occurrence, relationship) {
+                    placements_of_occurrence.entry(occurrence).or_default().push(relationship);
+                }
+            }
         }
-        let Some(args) = entity.find("SHAPE_REPRESENTATION_RELATIONSHIP") else {
-            continue;
-        };
-        if args.len() < 4 {
-            continue;
-        }
-        let (Ok(rep1), Ok(rep2)) = (args[2].as_ref_id(), args[3].as_ref_id()) else {
-            continue;
-        };
-        if rep1 == sr {
-            out.push(rep2);
-        } else if rep2 == sr {
-            out.push(rep1);
+        Self {
+            entities,
+            shapes_of_definition,
+            reps_of_shape,
+            identity: identity_relation_index(entities),
+            placements_of_occurrence,
         }
     }
-    out
 }
 
 /// Solid-brep entity ids belonging to a PRODUCT_DEFINITION (in the part's own
 /// local frame), gathered from its shape representation and every identity-
 /// related representation.
-pub(super) fn pd_step_bodies(
-    entities: &HashMap<usize, Entity>,
-    resolver: &Resolver,
-    pd: usize,
-) -> Vec<StepBody> {
+pub(super) fn pd_step_bodies(structure: &StructureIndex, resolver: &Resolver, pd: usize) -> Vec<StepBody> {
     let mut bodies = Vec::new();
-    for sr in node_representations(entities, resolver, pd) {
+    for sr in node_representations(structure, resolver, pd) {
         let Ok(entity) = resolver.get(sr) else {
             continue;
         };
@@ -990,7 +1069,7 @@ pub(super) struct ResolvedEdges {
 }
 
 pub(super) fn resolve_structure_edges(
-    entities: &HashMap<usize, Entity>,
+    structure: &StructureIndex,
     edges: &[AssemblyEdge],
     mut scale_for: impl FnMut(usize) -> f64,
 ) -> ResolvedEdges {
@@ -1006,13 +1085,13 @@ pub(super) fn resolve_structure_edges(
         let parent_scale = scale_for(edge.parent_pd);
         let transform = match edge.kind {
             StructureEdgeKind::Nauo => {
-                let parent = Resolver::new(entities, parent_scale);
-                Ok(nauo_edge_transform(entities, &parent, edge))
+                let parent = Resolver::new(structure.entities, parent_scale);
+                Ok(nauo_edge_transform(structure, &parent, edge))
             }
             StructureEdgeKind::Mapped => {
                 let child_scale = scale_for(edge.child_pd);
                 match &edge.mapped {
-                    Some(item) => mapped_item_transform(entities, item, child_scale, parent_scale),
+                    Some(item) => mapped_item_transform(structure.entities, item, child_scale, parent_scale),
                     // Unreachable: a Mapped edge is only built from a MappedItem.
                     None => Ok(mat4_identity()),
                 }
@@ -1033,33 +1112,9 @@ pub(super) fn resolve_structure_edges(
 /// CONTEXT_DEPENDENT_SHAPE_REPRESENTATION. Returns identity when any link of the
 /// transform chain is absent — a robust graceful fallback per the spec's option
 /// that the transform entities may be partial.
-pub(crate) fn nauo_edge_transform(
-    entities: &HashMap<usize, Entity>,
-    resolver: &Resolver,
-    edge: &AssemblyEdge,
-) -> Mat4 {
-    let child_srs = pd_root_srs(entities, edge.child_pd);
-    for entity in entities.values() {
-        let Some(args) = entity.find("CONTEXT_DEPENDENT_SHAPE_REPRESENTATION") else {
-            continue;
-        };
-        let Some(pds_id) = args.get(1).and_then(|value| value.as_ref_id().ok()) else {
-            continue;
-        };
-        let Ok(pds) = resolver.get(pds_id) else {
-            continue;
-        };
-        let owns_nauo = pds
-            .find("PRODUCT_DEFINITION_SHAPE")
-            .and_then(|pds_args| pds_args.get(2))
-            .and_then(|value| value.as_ref_id().ok())
-            == Some(edge.edge_id);
-        if !owns_nauo {
-            continue;
-        }
-        let Some(rep_rel_id) = args.first().and_then(|value| value.as_ref_id().ok()) else {
-            continue;
-        };
+pub(crate) fn nauo_edge_transform(structure: &StructureIndex, resolver: &Resolver, edge: &AssemblyEdge) -> Mat4 {
+    let child_srs = pd_root_srs(structure, edge.child_pd);
+    for &rep_rel_id in structure.placements_of_occurrence.get(&edge.edge_id).into_iter().flatten() {
         if let Some(transform) = resolve_rep_rel_transform(resolver, rep_rel_id, &child_srs) {
             return transform;
         }
@@ -1232,11 +1287,12 @@ pub(super) fn resolve_assembly(
     // and the reason a mixed-unit file is only correct through the structured
     // lane.
     let scale = resolver.length_scale;
+    let structure = StructureIndex::new(entities);
     let ResolvedEdges {
         edges,
         transforms,
         refusals,
-    } = resolve_structure_edges(entities, edges, |_| scale);
+    } = resolve_structure_edges(&structure, edges, |_| scale);
     let edges = edges.as_slice();
 
     let mut result = AssemblyResult {
@@ -1264,8 +1320,36 @@ pub(super) fn resolve_assembly(
     // Build each distinct part solid once — with its appearance, which is a
     // property of the PART, not of the placement — then re-use both for every
     // occurrence.
+    let build_part = |body: StepBody| {
+        build_step_body(resolver, body)
+            .map(|(solid, _readings)| {
+                let appearance = step_body_appearance(resolver, styles, body, &solid);
+                let face_refs = super::pmi::body_face_refs(resolver, body, &solid);
+                (solid, appearance, face_refs)
+            })
+            .map_err(|error| {
+                error.with_context(|text| format!("step_import: part body {body:?} failed to build: {text}"))
+            })
+    };
+    // Every distinct part body the walk below will reach, in the order it
+    // reaches them (a dry walk, one body list per distinct product), built up
+    // front -- in parallel under the `parallel` feature.
+    let mut part_bodies: Vec<StepBody> = Vec::new();
+    {
+        let mut seen_products: HashSet<usize> = HashSet::default();
+        let mut seen_bodies: HashSet<StepBody> = HashSet::default();
+        walk_occurrences(resolver, edges, &transforms, |node| {
+            if seen_products.insert(node.pd) {
+                for body in pd_step_bodies(&structure, resolver, node.pd) {
+                    if seen_bodies.insert(body) {
+                        part_bodies.push(body);
+                    }
+                }
+            }
+        });
+    }
     let mut solid_cache: HashMap<StepBody, Result<(BrepSolid, BodyAppearance, Vec<usize>), StepBodyError>> =
-        HashMap::default();
+        build_distinct_bodies(part_bodies, |body| step_body_face_count(resolver, body), &build_part).into_iter().collect();
     let debug_on = std::env::var("BREP_DEBUG_STEP_ASM").is_ok();
     // Sheet part bodies already counted as skipped: once per part, like the
     // refusal lists below, not once per placement.
@@ -1274,20 +1358,8 @@ pub(super) fn resolve_assembly(
     walk_occurrences(resolver, edges, &transforms, |node| {
         // Emit this product's own solids (leaf parts carry geometry; a pure
         // assembly node carries none, so this is a no-op there).
-        for body in pd_step_bodies(entities, resolver, node.pd) {
-            let base = solid_cache.entry(body).or_insert_with(|| {
-                build_step_body(resolver, body)
-                    .map(|(solid, _readings)| {
-                        let appearance = step_body_appearance(resolver, styles, body, &solid);
-                        let face_refs = super::pmi::body_face_refs(resolver, body, &solid);
-                        (solid, appearance, face_refs)
-                    })
-                    .map_err(|error| {
-                        error.with_context(|text| {
-                            format!("step_import: part body {body:?} failed to build: {text}")
-                        })
-                    })
-            });
+        for body in pd_step_bodies(&structure, resolver, node.pd) {
+            let base = solid_cache.entry(body).or_insert_with(|| build_part(body));
             let (base_solid, base_appearance, base_refs) = match base {
                 Ok((solid, appearance, refs)) => (solid.clone(), appearance.clone(), refs.clone()),
                 // An OPEN SHELL_BASED_SURFACE_MODEL sheet is not a solid body, so
