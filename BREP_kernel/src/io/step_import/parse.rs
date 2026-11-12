@@ -392,10 +392,9 @@ pub(super) struct Resolver<'a> {
     /// `CONVERSION_BASED_UNIT` measure); 1.0 (assume mm) when absent.
     pub(super) length_scale: f64,
     /// Radians per one of the file's `PLANE_ANGLE_UNIT`, or `None` when the
-    /// file declares none this parser can resolve. Only supplied pcurves read
-    /// it: every angle the importer reads from a geometric entity is either
-    /// already dimensionless or range-disambiguated, while a supplied pcurve's
-    /// angular coordinate is neither. See `supplied::derive_angle_scale`.
+    /// file declares none this parser can resolve. Read by supplied pcurves
+    /// (whose angular coordinate is in this unit) and by a cone's semi-angle
+    /// (`cone_semi_angle`). See `supplied::derive_angle_scale`.
     ///
     /// LAZY, and that is load-bearing rather than tidy. Deriving it sweeps
     /// every entity in the file — twice, when the first sweep finds no
@@ -405,6 +404,10 @@ pub(super) struct Resolver<'a> {
     /// reads. `OnceLock` rather than `OnceCell` because `bodies.rs` hands a
     /// `&Resolver` to a rayon `par_iter`, which requires `Sync`.
     angle_scale: std::sync::OnceLock<Option<f64>>,
+    /// Whether a body built through this resolver reads its derived trims
+    /// for the report (`builder::readings::BoundedTrim`). On by default; off
+    /// for builds whose readings are dropped, where the reads only cost time.
+    pub(super) trim_readings: bool,
 }
 
 impl<'a> Resolver<'a> {
@@ -415,6 +418,17 @@ impl<'a> Resolver<'a> {
             entities,
             length_scale,
             angle_scale: std::sync::OnceLock::new(),
+            trim_readings: true,
+        }
+    }
+
+    /// The same context with the trim readings off, for builds that drop them.
+    pub(super) fn without_trim_readings(&self) -> Self {
+        Self {
+            entities: self.entities,
+            length_scale: self.length_scale,
+            angle_scale: self.angle_scale.clone(),
+            trim_readings: false,
         }
     }
 
@@ -424,6 +438,40 @@ impl<'a> Resolver<'a> {
         *self
             .angle_scale
             .get_or_init(|| derive_angle_scale(self.entities))
+    }
+
+    /// A `CONICAL_SURFACE` semi-angle in radians, from the raw attribute.
+    ///
+    /// The attribute is a plane-angle measure in the file's declared
+    /// `PLANE_ANGLE_UNIT` (ISO 10303-42), so a file declaring degrees writes a
+    /// 0.5 degree draft cone as `0.5`. Read as radians that cone opens at 28.6
+    /// degrees, its radius goes negative a short way along the axis, and the
+    /// face is refused as crossing the apex. When the file declares no
+    /// resolvable unit, a value that reaches pi/2 cannot be a semi-angle in
+    /// radians, so it is taken as degrees (producers that write degrees under
+    /// no stated unit); a smaller value stays radians.
+    ///
+    /// Both cone readers (`analytic_surface` and the supplied-pcurve surface)
+    /// go through here so the two constructions agree on the same entity.
+    ///
+    /// Producers write the degree as a truncated constant (`0.0174532925`,
+    /// `0.01745329252`); a factor within 1e-8 of pi/180 is the degree, and
+    /// the value is converted exactly as the range fallback converts it.
+    pub(super) fn cone_semi_angle(&self, raw: f64) -> f64 {
+        if let Some(scale) = self.angle_scale() {
+            let degree = std::f64::consts::PI / 180.0;
+            if ((scale - degree) / degree).abs() <= 1e-8 {
+                return raw.to_radians();
+            }
+            if (scale - 1.0).abs() > 1e-12 {
+                return raw * scale;
+            }
+        }
+        if raw.abs() >= std::f64::consts::FRAC_PI_2 {
+            raw.to_radians()
+        } else {
+            raw
+        }
     }
 }
 
@@ -717,15 +765,7 @@ impl<'a> Resolver<'a> {
         if let Some(args) = entity.find("CONICAL_SURFACE") {
             let frame = reseam_cone(&self.placement(args[1].as_ref_id()?)?, samples);
             let radius = self.length(args[2].as_real()?);
-            let mut semi_angle = args[3].as_real()?;
-            // Some AP214 producers write angular entity attributes in the
-            // file's conversion-based degree unit (rather than normalizing
-            // them to radians).  A cone semi-angle cannot reach pi/2, so this
-            // range check is unambiguous and avoids constructing wildly sized
-            // carrier surfaces from values such as `59.` degrees.
-            if semi_angle.abs() >= std::f64::consts::FRAC_PI_2 {
-                semi_angle = semi_angle.to_radians();
-            }
+            let semi_angle = self.cone_semi_angle(args[3].as_real()?);
             let (base, height, c_start) = axial_extent(&frame, samples);
             let tan = semi_angle.tan();
             let mut radius_bottom = radius + c_start * tan;
@@ -949,6 +989,32 @@ impl<'a> Resolver<'a> {
                     // The vertices are authoritative for direction here; the
                     // stored same_sense flag described the FULL curve.
                     return if reversed { piece.reversed() } else { Ok(piece) };
+                }
+                // An authored-closed curve under two DISTINCT vertices, one of
+                // them further off the curve than the gate above trusts. The
+                // whole curve cannot be this edge: it starts and ends at one
+                // point, so it would leave both vertices that far from that one
+                // point. The arc between the vertices' nearest parameters is the
+                // edge whenever it fits them better than the whole curve does.
+                // Read as the whole curve, an arc whose vertex sits a little
+                // outside the gate (an NX tube face: 0.0185 mm off at 1300 mm
+                // from the origin, against a 0.013 mm gate) became a full turn
+                // and tore its face's loop open at the curve's seam.
+                if !on_curve
+                    && authored_closed
+                    && (t_start.u - t_end.u).abs() > periodic_tol
+                    && curve_is_geometrically_closed(&curve)?
+                {
+                    let closure = curve.evaluate(dom0)?;
+                    let whole_misfit = p_start.sub(closure).length().max(p_end.sub(closure).length());
+                    let arc_misfit = t_start.distance.max(t_end.distance);
+                    if arc_misfit < whole_misfit {
+                        if let Ok(piece) =
+                            directed_periodic_curve_piece(&curve, t_start.u, t_end.u, same_sense, periodic_tol)
+                        {
+                            return Ok(piece);
+                        }
+                    }
                 }
             }
             return if same_sense {

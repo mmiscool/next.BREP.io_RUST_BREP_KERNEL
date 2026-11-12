@@ -31,11 +31,27 @@ fn only(req: &Value, allowed: &[&str]) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// A call whose request has one obvious field, made with that field's value
+/// alone (`search("fillet")`, `read("design-part")`): the request it means.
+/// The first call an agent writes is the positional one; refusing it bought
+/// a failed run and a retry, never a different program.
+fn positional(req: &Value, field: &str) -> Value {
+    match req {
+        Value::String(_) => json!({ field: req }),
+        _ => req.clone(),
+    }
+}
+
 /// `describe`'s paths: `paths` (an array), or one path or an array of them
-/// under the names agents reach for first (`path`, `name`, `method`, `tool`).
+/// under the names agents reach for first (`path`, `name`, `method`, `tool`),
+/// or the path or paths alone (`describe("brep.features.feature_add")`).
 fn describe_paths(req: &Value) -> Result<Vec<String>, ApiError> {
     const NAMES: &[&str] = &["paths", "path", "name", "names", "method", "tool"];
-    let obj = req.as_object().ok_or_else(|| ApiError::new("invalid_arguments", "validation", "the request must be an object"))?;
+    let req = match req {
+        Value::String(_) | Value::Array(_) => &json!({ "paths": req }),
+        _ => req,
+    };
+    let obj = req.as_object().ok_or_else(|| ApiError::new("invalid_arguments", "validation", "describe takes {paths: string[]} or a path, e.g. cad.discovery.describe(\"brep.features.feature_add\")"))?;
     if let Some(k) = obj.keys().find(|k| !NAMES.contains(&k.as_str())) {
         return Err(ApiError::new("invalid_arguments", "validation", format!("unknown field `{k}`; describe takes {{paths: string[]}}, e.g. cad.discovery.describe({{paths: [\"brep.features.feature_add\"]}})")));
     }
@@ -49,6 +65,61 @@ fn describe_paths(req: &Value) -> Result<Vec<String>, ApiError> {
         .collect()
 }
 
+/// The `brep://` references the guides cite, readable from a script with
+/// `cad.docs.read(uri)` (a client that lists no MCP resources has no other
+/// way to them); `{type}`, `{group}` and `{path}` take a feature type, a
+/// script group and a function path.
+const REFERENCES: &[(&str, &str)] = &[
+    ("brep://schema/sketch", "the sketch persistentData schema (points, geometries, constraints) with a working example"),
+    ("brep://schema/features/{type}", "one feature's inputParams JSON Schema and defaults, e.g. brep://schema/features/E"),
+    ("brep://schema/features", "every feature's inputParams schema (large; prefer one type)"),
+    ("brep://api/group/{group}", "one script group's functions with argument and result schemas"),
+    ("brep://api/function/{path}", "one function's contract, e.g. brep://api/function/brep.features.feature_add"),
+    ("brep://api/commands", "every application function (large; prefer one group)"),
+    ("brep://cad/sdk.d.ts", "TypeScript declarations of the cad client"),
+];
+
+/// The one field among `names` a request gives, as a string.
+fn one_of<'a>(req: &'a Value, names: &[&str], usage: &str) -> Result<&'a str, ApiError> {
+    let obj = req.as_object().ok_or_else(|| ApiError::new("invalid_arguments", "validation", usage))?;
+    if let Some(k) = obj.keys().find(|k| !names.contains(&k.as_str())) {
+        return Err(ApiError::new("invalid_arguments", "validation", format!("unknown field `{k}`; {usage}")));
+    }
+    let given: Vec<&Value> = names.iter().filter_map(|k| obj.get(*k)).collect();
+    match given[..] {
+        [Value::String(s)] => Ok(s),
+        _ => Err(ApiError::new("invalid_arguments", "validation", usage)),
+    }
+}
+
+/// A guide name as agents write it: `Design Part`, `design_part.md`,
+/// `skill://design-part/SKILL.md` all name `design-part`.
+fn guide_key(name: &str) -> String {
+    let name = name.trim();
+    let name = name.strip_prefix("skill://").unwrap_or(name);
+    let name = name.strip_suffix("/SKILL.md").or_else(|| name.strip_suffix(".md")).unwrap_or(name);
+    name.to_ascii_lowercase().replace([' ', '_'], "-")
+}
+
+/// `cad.docs.read`: a guide by name, or one of the [`REFERENCES`] (with or
+/// without its `brep://`).
+async fn read_doc(service: &CadService, name: &str) -> Result<Value, ApiError> {
+    let key = guide_key(name);
+    if let Some(skill) = crate::skills::SKILLS.iter().find(|s| s.name == key) {
+        return Ok(json!({ "name": skill.name, "text": skill.text }));
+    }
+    let uri = if name.starts_with("brep://") { name.to_string() } else if name.contains('/') { format!("brep://{}", name.trim_start_matches('/')) } else { String::new() };
+    let readable = REFERENCES.iter().any(|(r, _)| match r.split_once('{') { Some((prefix, _)) => uri.starts_with(prefix) && uri.len() > prefix.len(), None => uri == *r });
+    if readable {
+        if let Some(text) = service.reference_text(&uri).await? {
+            return Ok(json!({ "name": uri, "text": text }));
+        }
+    }
+    let guides: Vec<&str> = crate::skills::SKILLS.iter().map(|s| s.name).collect();
+    let references: Vec<&str> = REFERENCES.iter().map(|(r, _)| *r).collect();
+    Err(ApiError::new("invalid_arguments", "lookup", format!("no guide or reference `{name}`; the guides are {}; the references are {}", guides.join(", "), references.join(", "))))
+}
+
 /// Every logical service method, by its exact name.
 pub async fn call_service(service: &CadService, caller: &Caller, method: &str, req: &Value) -> Result<Value, ApiError> {
     if req.to_string().len() > 1 << 20 {
@@ -58,6 +129,7 @@ pub async fn call_service(service: &CadService, caller: &Caller, method: &str, r
         "cad.inputs.exportOptions" => service.code.export_options(caller, req).await,
         "cad.discovery.search" => {
             caller.require(&["catalogue.read"])?;
+            let req = &positional(req, "query");
             only(req, &["query", "limit", "cursor"])?;
             service.search(req).await
         }
@@ -71,22 +143,20 @@ pub async fn call_service(service: &CadService, caller: &Caller, method: &str, r
         // guessed the API one failed call at a time.
         "cad.docs.list" => {
             only(req, &[])?;
-            Ok(json!({ "guides": crate::skills::SKILLS.iter().map(|s| json!({ "name": s.name, "description": s.description })).collect::<Vec<_>>() }))
+            let guides = crate::skills::SKILLS.iter().map(|s| json!({ "name": s.name, "description": s.description }));
+            let references = REFERENCES.iter().map(|(uri, what)| json!({ "name": uri, "description": what }));
+            Ok(json!({ "guides": guides.chain(references).collect::<Vec<_>>() }))
         }
         "cad.docs.read" => {
-            only(req, &["name"])?;
-            let name = string(req, "name")?;
-            let name = name.strip_prefix("skill://").unwrap_or(name);
-            let name = name.strip_suffix("/SKILL.md").unwrap_or(name);
-            let skill = crate::skills::SKILLS.iter().find(|s| s.name == name).ok_or_else(|| {
-                let names: Vec<&str> = crate::skills::SKILLS.iter().map(|s| s.name).collect();
-                ApiError::new("invalid_arguments", "lookup", format!("no guide `{name}`; the guides are {}", names.join(", ")))
-            })?;
-            Ok(json!({ "name": skill.name, "text": skill.text }))
+            let req = &positional(req, "name");
+            let name = one_of(req, &["name", "uri", "guide", "path"], "read takes a guide name or a brep:// reference, e.g. cad.docs.read(\"design-part\") or cad.docs.read(\"brep://schema/sketch\")")?;
+            read_doc(service, name).await
         }
         "cad.docs.sdk" => {
+            let req = &positional(req, "group");
             only(req, &["group"])?;
-            service.sdk_declarations(req.get("group").and_then(Value::as_str)).await
+            let group = req.get("group").and_then(Value::as_str).map(|g| g.trim_start_matches("brep.").trim_end_matches(".*").trim_end_matches('.'));
+            service.sdk_declarations(group).await
         }
         "cad.documents.list" => {
             only(req, &[])?;
@@ -267,7 +337,7 @@ pub fn front_door_tools(service: Arc<CadService>, slot: crate::tools::app::Sessi
         ToolSpec::new(
             "run_script",
             "script",
-            "Run a JavaScript (or TypeScript) program on the CAD app: `export default async function main()` returning JSON. Every app tool is a script function, `await brep.<group>.<tool>(args)`, beside the `cad` client of `@brep/cad`. Before modelling, return `await cad.docs.read('design-part')` once: it is the modelling guide; `cad.docs.sdk(group)` gives a group's typed signatures. Awaits the completed result on this same tool call by default. An explicit wait_ms opts into a bounded wait/status response; retrying the same source and key recovers that same execution. script_result remains an optional recovery tool; script_halt cancels work. Starts a headless session if none is live.",
+            "Run a JavaScript (or TypeScript) program on the CAD app: `export default async function main()` returning JSON. Every app tool is a script function, `await brep.<group>.<tool>(args)`, beside the `cad` client of `@brep/cad`. Before modelling, return `await cad.docs.read('design-part')` once: it is the modelling guide; `cad.docs.sdk(group)` gives a group's typed signatures. Each function takes one object argument; pass `context` from docs_list to check the document revision. Put multi-line text in template literals (`...`): a quoted string cannot hold the line break a JSON \\n becomes. Awaits the completed result on this same tool call by default. An explicit wait_ms opts into a bounded wait/status response; retrying the same source and key recovers that same execution. script_result remains an optional recovery tool; script_halt cancels work. Starts a headless session if none is live.",
             json!({ "type": "object", "properties": { "source": { "type": "string", "minLength": 1, "maxLength": 262144, "description": "UTF-8 source, at most 256 KiB" }, "language": { "enum": ["javascript", "typescript"], "default": "javascript", "description": "TypeScript requires explicitly provisioned Node and TypeScript 7.0.2; tools/list reports this host's compiler availability. Strict checking precedes execution." }, "wait_ms": wait, "key": { "type": "string", "minLength": 1, "maxLength": 128, "description": "a retry key of your choosing: the same key with the same program answers the SAME execution (submitted once), so a run whose reply was lost is found again; the same key with another program is refused" } }, "required": ["source"], "additionalProperties": false }),
             Annotations { read_only: false, destructive: true, idempotent: false, waits: false },
             move |args| {

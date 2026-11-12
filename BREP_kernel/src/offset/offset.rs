@@ -1185,7 +1185,10 @@ fn offset_surface_constructed(
             far_mean += far_len / samples.len() as f64;
         }
         if inverted {
-            let retrim_far = far_mean <= near_mean;
+            let retrim_far = match pinch_side_by_source(source, &parameters_u, &parameters_v, &samples, near_centroid, far_centroid)? {
+                Some(far) => far,
+                None => far_mean <= near_mean,
+            };
             // WHOSE fold is it?  The retrim exists so a cavity that ends at the
             // offset cone's own apex ends there in the TOPOLOGY too, instead of
             // running past the pinch into a mirrored ring no weld can use.  It
@@ -2508,6 +2511,60 @@ pub fn offset_face_carrier(
 }
 
 /// [`offset_face_carrier`] with a per-side [`CarrierExtension`].
+/// `BREP_OFFSET_PINCH_SIDE_BY_SOURCE` (default on; `=0` restores the size rule): which end of an inverted
+/// ruled offset is past its pinch, read by direction rather than by size.
+///
+/// Cause (brep-bench probe, a cone r 3 h 4 shelled open at its base, walls 1.9
+/// to 2.5 refused "unwelded rim leaves a non-watertight shell"): the pinch
+/// retrim took the end with the SMALLER offset ring as the crossed one. Shrunk
+/// by t, the base ring offsets to radius 3 − 0.8 t and the apex ring, crossed
+/// through the axis, to 0.8 t; from t = 1.875 the true base ring is the smaller,
+/// so the retrim pulled the cavity wall back to the pinch and kept the mirrored
+/// sheet, which no weld can use. The crossed end is the one whose offset ring
+/// points opposite to the source's own radial direction (read at the source's
+/// wider ring, the other may be an apex). `None` when that reading does not
+/// single out one end; the size rule stands.
+fn pinch_side_by_source_enabled() -> bool {
+    switch!("BREP_OFFSET_PINCH_SIDE_BY_SOURCE", true)
+}
+
+fn pinch_side_by_source(
+    source: &NurbsSurface,
+    parameters_u: &[f64],
+    parameters_v: &[f64],
+    samples: &[Vec<Vec3>],
+    near_centroid: Vec3,
+    far_centroid: Vec3,
+) -> Result<Option<bool>, KernelRefusal> {
+    if !pinch_side_by_source_enabled() || parameters_v.len() != 2 {
+        return Ok(None);
+    }
+    let mut source_rows = [Vec::new(), Vec::new()];
+    for &u in parameters_u {
+        for (end, &v) in parameters_v.iter().enumerate() {
+            source_rows[end].push(source.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?);
+        }
+    }
+    let centroid = |row: &[Vec3]| row.iter().fold(Vec3::default(), |sum, p| sum.add(*p)).scale(1.0 / row.len() as f64);
+    let spread = |row: &[Vec3]| {
+        let middle = centroid(row);
+        row.iter().map(|p| p.sub(middle).length()).fold(0.0f64, f64::max)
+    };
+    let reference = if spread(&source_rows[0]) >= spread(&source_rows[1]) { 0 } else { 1 };
+    let reference_centroid = centroid(&source_rows[reference]);
+    let (mut near_sign, mut far_sign) = (0.0f64, 0.0f64);
+    for (k, row) in samples.iter().enumerate() {
+        let radial = source_rows[reference][k].sub(reference_centroid);
+        near_sign += row[0].sub(near_centroid).dot(radial);
+        far_sign += row[1].sub(far_centroid).dot(radial);
+    }
+    Ok(match (near_sign > 0.0, far_sign > 0.0) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    })
+}
+
 pub fn offset_face_carrier_sided(
     solid: &BrepSolid,
     face_id: u64,

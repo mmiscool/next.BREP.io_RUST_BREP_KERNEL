@@ -39,6 +39,15 @@ pub struct ImportArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OpenWithArgs {
+    /// The file's name or path; its extension picks the importer.
+    pub name: String,
+    /// File content, base64.
+    pub base64: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportFormat {
     /// The native document (`history_request_json`).
@@ -444,6 +453,18 @@ fn doc_import(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     Ok(Outcome::Done(json!({ "name": a.name, "report": parse(&report) })))
 }
 
+/// What the OS "Open with" hands the app for a file that is not a model
+/// document: the File > Import importer for its extension, into a NEW untitled
+/// tab named after the file (`BrepApp::open_path_from_command_line`'s import
+/// lane). An import that runs on (a STEP probe, a mesh preview) is still
+/// running when this answers; the tabs say where it went.
+fn doc_open_with(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: OpenWithArgs = parse_args(args)?;
+    let bytes = base64_decode(&a.base64)?;
+    ctx.app.import_file_into_new_tab(&a.name, bytes)?;
+    Ok(Outcome::Done(serde_json::to_value(tabs(ctx)).map_err(|e| e.to_string())?))
+}
+
 fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: ExportArgs = parse_args(args)?;
     if a.solids.is_some() && !matches!(a.format, ExportFormat::Step | ExportFormat::Iges) {
@@ -678,6 +699,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     app_command!("document", "doc_load", "Open a `.nbrep` document (passed as text) in a new tab, run its history and fit the camera. Returns the run report.", LoadArgs, doc_load, Mutate, MUTATE, doc_load_result_schema),
     app_command!("document", "doc_json", "The active document as `.nbrep` (the history request with metadata).", NoArgs, doc_json, Read, READ, doc_json_result_schema),
     app_command!("document", "doc_import", "Append an Import 3D Model feature from STEP / IGES text or STL / OBJ / 3MF bytes (base64). STL, OBJ and 3MF go through mesh reconstruction on the runner; a 3MF is read to the 3MF core specification and its build instances are flattened first.", ImportArgs, doc_import, Mutate, MUTATE, doc_import_result_schema),
+    app_command!("document", "doc_open_with", "Open a file the way the OS \"Open with\" / a double click hands it to the app, when it is not a model document: a STEP (.step/.stp/.p21), IGES, STL, 3MF, OBJ or KiCad file (`name` with its extension, content as `base64`) goes through the File > Import importer for its extension into a NEW untitled tab labelled with the file's stem (a plain Save then asks for a name). STEP assemblies raise the import-as-assembly choice and meshes the reconstruction preview, as from the menu. Any other extension is refused. Returns the tabs.", OpenWithArgs, doc_open_with, Mutate, MUTATE, schema_of::<Tabs>),
     app_command!("document", "doc_export", "Export the active document: brep (native JSON), step, stl, obj, iges, the sheet-metal flat pattern as dxf / svg, or the open drawing sheet as sheet_svg, all as `text`; glb (binary glTF 2.0 of the display mesh), 3mf (a 3MF package of the display mesh: one object per body, the document's colours as base materials) and EVERY drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order, with the count in `pages`) and the same set with the live 3D model as sheet_pdf_3d (PDF 1.7: a 3D box over every placement marked `threeD` and a last page given over to the model, read back in `model3d`) as `base64`. The two sheet formats also answer `texts`: every text string the file shows, read back from the bytes written. For a document whose PCB board has parts: fabrication (one zip of Gerber X2 layers, Excellon drills, the pick-and-place and parts-BOM CSVs and a README) as `base64`, with its `files` read back from the archive's directory, `readBack` (top/bottom copper flashes, plated/unplated drill hits, the outline's size in mm and the CSVs' row counts, counted from the files) and `warnings`; and the CSVs alone as pick_place_csv (JLCPCB CPL columns) and ecad_bom_csv (JLCPCB BOM columns), as `text` with their data `rows`. For a document with components or harness wires: bom_csv / bom_json, the assembly BOM the File menu exports (part rows carry material, densityGcm3, volumeMm3, massKg and totalMassKg read off each PART; waits for the measurements). For a document whose PCB schematic has parts: kicad_netlist, its KiCad netlist (`.net`, export version \"E\": the parts and every net with its pins, under the Connectivity panel's net names) as `text`.", ExportArgs, doc_export, Read, READ, schema_of::<Exported>),
     app_command!("document", "part_attributes_get", "The active document's own BOM part attributes (`partAttributes`) — the record the toolbar's Part Properties dialog edits, and the one an assembly's BOM reads off this part — with `record` (Mass in kg and Volume in mm³ computed from the document's geometry and density, Density in g/cm³ resolved from the Material when none is typed) and `massProperties`, the reading behind it. Waits for the measurement.", NoArgs, part_attributes_get, Read, READ, super::assembly_output_schema::part_attributes),
     app_command!("document", "part_attribute_set", "Write ONE of the active document's own BOM part attributes (Part_Number, Material, Density in g/cm³, or any custom field); a null or empty value removes it. One undo step per field. Mass is computed from the geometry and refused while there is any; Volume is never written.", PartAttributeArgs, part_attribute_set, Mutate, MUTATE, document_attributes_result_schema),

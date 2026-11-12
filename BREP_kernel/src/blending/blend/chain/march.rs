@@ -224,6 +224,10 @@ pub(in crate::blend) fn march_chain_typed(
     fold: FoldPolicy,
 ) -> Result<Vec<ChainSample>, ChainMarchError> {
     let mut samples = Vec::new();
+    let path: Vec<(&crate::topology::EdgeRecord, bool, [u64; 2])> = segments
+        .iter()
+        .map(|segment| (segment.edge, segment.forward, [segment.first.face.id, segment.second.face.id]))
+        .collect();
     for (index, segment) in segments.iter().enumerate() {
         let per_segment = budget.count(index);
         // Signs from this segment's own cross-section seed.
@@ -267,6 +271,9 @@ pub(in crate::blend) fn march_chain_typed(
         // march's own chord (`march_section`).
         let station_step = span.abs() / per_segment as f64;
         let section_at = |t: f64| -> Result<(Vec3, Vec3), KernelRefusal> {
+            if let Some(section) = crate::blend::setback::continued_section(&path, index, open, t)? {
+                return Ok(section);
+            }
             march_section(edge, t, station_step, "blend chain march")
         };
         let solve_centered = |t: f64, seed: [f64; 4]| -> Result<([f64; 4], Vec3), KernelRefusal> {

@@ -5,7 +5,7 @@
 //! boundary — the R1 promise.
 
 use crate::scene::{solid_display_from_payload, RenderScene, SolidDisplay};
-use brep_kernel::{display_payload_handle_native, execute_history, HistoryRequest};
+use brep_kernel::{display_payloads_handles_native, execute_history, HistoryRequest};
 use std::collections::HashMap;
 
 /// Non-fatal diagnostics from a scene build (mirrors the previous app's run-history
@@ -808,9 +808,27 @@ impl SceneRunner {
             Vec::with_capacity(layout.order.len());
         let mut next_sent: HashMap<String, u32> = HashMap::with_capacity(layout.order.len());
 
-        for name in &layout.order {
+        // Which solids changed since the last emit, meshed as ONE batch: the
+        // kernel spreads the batch across its pool on native (an imported
+        // assembly emits hundreds of new instances in one run) and walks it in
+        // order elsewhere. Results come back in `fresh` order, and every solid
+        // keeps its place in `layout.order`.
+        let fresh: Vec<(usize, u32)> = layout
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| {
+                let handle = layout.handles[name];
+                (self.last_sent.get(name) != Some(&handle)).then_some((index, handle))
+            })
+            .collect();
+        let fresh_handles: Vec<u32> = fresh.iter().map(|(_, handle)| *handle).collect();
+        let mut payloads = display_payloads_handles_native(&fresh_handles, lod).into_iter();
+        let mut fresh_indices = fresh.iter().map(|(index, _)| *index).peekable();
+
+        for (index, name) in layout.order.iter().enumerate() {
             let handle = layout.handles[name];
-            if self.last_sent.get(name) == Some(&handle) {
+            if fresh_indices.peek() != Some(&index) {
                 // Handle unchanged since last emit ⇒ same resident geometry ⇒ the
                 // applier keeps its existing display. This is EXACTLY the old
                 // `reused && source_handle == handle` fast path (monotonic handles):
@@ -823,7 +841,9 @@ impl SceneRunner {
                 next_sent.insert(name.clone(), handle);
                 continue;
             }
-            match display_payload_handle_native(handle, lod) {
+            fresh_indices.next();
+            let payload = payloads.next().expect("one payload per fresh solid");
+            match payload {
                 Ok(payload) => {
                     let mut solid = solid_display_from_payload(name, payload);
                     solid.source_handle = handle;

@@ -28,6 +28,13 @@ pub(in crate::blend) use march::{assign_chain_parameters, chain_dense_contacts, 
 use march::{ladder_trend, ChainStationFailure, CHAIN_CARVE_MAX_PER_SEGMENT};
 use open::blend_open_smooth_chain;
 
+/// The edges of the smooth (G1) chain through `edge_id`, in chain order, and
+/// whether it closes: the selection a chamfer that walks whole chains reads.
+pub(crate) fn smooth_chain_members(solid: &BrepSolid, edge_id: u64) -> Result<(Vec<u64>, bool), crate::KernelRefusal> {
+    let chain = collect_smooth_chain(solid, edge_id)?;
+    Ok((chain.segments.iter().map(|segment| segment.edge.id).collect(), chain.closed))
+}
+
 
 /// The declared wall reading, shared with the closed-edge lane's wall verdict.
 pub(in crate::blend) use closed::{

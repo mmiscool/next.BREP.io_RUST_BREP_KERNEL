@@ -255,86 +255,92 @@ impl<'a> SolidBuilder<'a> {
                             refitted = true;
                         }
                     }
-                    // The band-free read between the fit's stations
-                    // (`trim_floor_reading`): the residual at the pcurve's
-                    // knot-span quarter points and the edge curve's knot-span
-                    // midpoints, taken on EVERY derived trim so a miss the
-                    // fit's own grid cannot see (edge 237: 7.4e-4 inside a
-                    // 6e-5-wide knot span, read 6.8e-5 by the fit) is booked
-                    // as the band it is. The refit trigger above stays on the
-                    // fit's own residual: this read reports, it does not yet
-                    // act (2026-10-03).
-                    let floor = trim_floor_reading(surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward, false)?;
-                    // NaN-preserving: an unread reading is reported, never
-                    // folded into a clean maximum.
-                    let residual = fold_reading(fit.report.residual, floor.residual);
-                    // A non-finite bar (an unread station standoff) is no bar:
-                    // `x <= inf` would suppress an unread trim.
-                    let bar = trim_detector_bar(&fit.report);
-                    if !(bar.is_finite() && residual <= bar) {
-                        let report = fit.report;
-                        let (image_to_foot, image_to_global_foot) =
-                            image_to_foot(surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward)?;
-                        // The file curve's standoff BETWEEN the stations, on
-                        // the same grid the residual was read on; the bar's
-                        // standoff term is the larger of it and the nodes'.
-                        let between = trim_floor_reading(
-                            surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward, true,
-                        )?;
-                        let standoff = fold_reading(report.off_surface, between.standoff);
-                        // Whose miss: the residual is within the floor of the
-                        // file curve's own standoff (the file's), or over it
-                        // (the fitter's).
-                        // Unread (NaN) is not exempted as the file's.
-                        let fitter = !(residual <= crate::PCURVE_REFINEMENT_TOLERANCE + standoff);
-                        // Accepted whatever it reads, and named: the importer
-                        // before the bar returned this fit unmeasured, so a
-                        // refusal here loses a body it imported. `abc 00008080`
-                        // face #163 edge 476 shipped at 3.794e-3 (a line 3.6e-4
-                        // off its 2×1 carrier, 514 nodes) before the bar and
-                        // after; the fitter's miss is the next slice's to fix,
-                        // not the body's to lose (2026-09-26 ruling).
-                        self.bounded.push(readings::BoundedTrim {
-                            face_ref,
-                            surface_ref,
-                            edge_id: *edge_id,
-                            residual,
-                            standoff,
-                            fit_residual: report.residual,
-                            fit_standoff: report.off_surface,
-                            image_to_foot,
-                            image_to_global_foot,
-                            samples: report.samples,
-                            exit: format!("{:?}", report.exit),
-                            fitter,
-                            clamped_excursion: report.clamped_excursion,
-                            clamped_distance: report.clamped_distance,
-                        });
-                        self.capture_stage(*edge_id, || {
-                            format!(
-                                "trim off its bar on face #{face_ref}: {:.3e} against a floor of {:.1e}, the file's curve {:.3e} off the carrier, image {:.3e} off its feet, {:.3e} off the global projector's ({}; {:?} at {} samples{}{}; the fit read {:.3e} with its stations {:.3e} off; the reading is the maximum at {} sampled probes, not a certified maximum)",
+                    // What follows only READS the trim (the import report's bounded-trim
+                    // diagnostics and the trim-readings capture): the pcurve is already
+                    // chosen. A build whose readings nobody takes (every assembly part)
+                    // skips it; on a large duct body these reads were half the face time.
+                    if self.resolver.trim_readings || self.readings.is_some() {
+                        // The band-free read between the fit's stations
+                        // (`trim_floor_reading`): the residual at the pcurve's
+                        // knot-span quarter points and the edge curve's knot-span
+                        // midpoints, taken on EVERY derived trim so a miss the
+                        // fit's own grid cannot see (edge 237: 7.4e-4 inside a
+                        // 6e-5-wide knot span, read 6.8e-5 by the fit) is booked
+                        // as the band it is. The refit trigger above stays on the
+                        // fit's own residual: this read reports, it does not yet
+                        // act (2026-10-03).
+                        let floor = trim_floor_reading(surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward, false)?;
+                        // NaN-preserving: an unread reading is reported, never
+                        // folded into a clean maximum.
+                        let residual = fold_reading(fit.report.residual, floor.residual);
+                        // A non-finite bar (an unread station standoff) is no bar:
+                        // `x <= inf` would suppress an unread trim.
+                        let bar = trim_detector_bar(&fit.report);
+                        if !(bar.is_finite() && residual <= bar) {
+                            let report = fit.report;
+                            let (image_to_foot, image_to_global_foot) =
+                                image_to_foot(surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward)?;
+                            // The file curve's standoff BETWEEN the stations, on
+                            // the same grid the residual was read on; the bar's
+                            // standoff term is the larger of it and the nodes'.
+                            let between = trim_floor_reading(
+                                surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward, true,
+                            )?;
+                            let standoff = fold_reading(report.off_surface, between.standoff);
+                            // Whose miss: the residual is within the floor of the
+                            // file curve's own standoff (the file's), or over it
+                            // (the fitter's).
+                            // Unread (NaN) is not exempted as the file's.
+                            let fitter = !(residual <= crate::PCURVE_REFINEMENT_TOLERANCE + standoff);
+                            // Accepted whatever it reads, and named: the importer
+                            // before the bar returned this fit unmeasured, so a
+                            // refusal here loses a body it imported. `abc 00008080`
+                            // face #163 edge 476 shipped at 3.794e-3 (a line 3.6e-4
+                            // off its 2×1 carrier, 514 nodes) before the bar and
+                            // after; the fitter's miss is the next slice's to fix,
+                            // not the body's to lose (2026-09-26 ruling).
+                            self.bounded.push(readings::BoundedTrim {
+                                face_ref,
+                                surface_ref,
+                                edge_id: *edge_id,
                                 residual,
-                                crate::PCURVE_REFINEMENT_TOLERANCE,
                                 standoff,
+                                fit_residual: report.residual,
+                                fit_standoff: report.off_surface,
                                 image_to_foot,
                                 image_to_global_foot,
-                                if fitter { "the fitter's miss" } else { "the file's residual" },
-                                report.exit,
-                                report.samples,
-                                if refitted { ", refitted at the floor" } else { "" },
-                                if report.clamped_excursion > 0.0 {
-                                    format!(
-                                        "; clamped into the chart by {:.3e} in parameter, {:.3e} mm",
-                                        report.clamped_excursion, report.clamped_distance
-                                    )
-                                } else {
-                                    String::new()
-                                },
-                                report.residual,
-                                report.off_surface,
-                                floor.probes,
-                            )
-                        });
+                                samples: report.samples,
+                                exit: format!("{:?}", report.exit),
+                                fitter,
+                                clamped_excursion: report.clamped_excursion,
+                                clamped_distance: report.clamped_distance,
+                            });
+                            self.capture_stage(*edge_id, || {
+                                format!(
+                                    "trim off its bar on face #{face_ref}: {:.3e} against a floor of {:.1e}, the file's curve {:.3e} off the carrier, image {:.3e} off its feet, {:.3e} off the global projector's ({}; {:?} at {} samples{}{}; the fit read {:.3e} with its stations {:.3e} off; the reading is the maximum at {} sampled probes, not a certified maximum)",
+                                    residual,
+                                    crate::PCURVE_REFINEMENT_TOLERANCE,
+                                    standoff,
+                                    image_to_foot,
+                                    image_to_global_foot,
+                                    if fitter { "the fitter's miss" } else { "the file's residual" },
+                                    report.exit,
+                                    report.samples,
+                                    if refitted { ", refitted at the floor" } else { "" },
+                                    if report.clamped_excursion > 0.0 {
+                                        format!(
+                                            "; clamped into the chart by {:.3e} in parameter, {:.3e} mm",
+                                            report.clamped_excursion, report.clamped_distance
+                                        )
+                                    } else {
+                                        String::new()
+                                    },
+                                    report.residual,
+                                    report.off_surface,
+                                    floor.probes,
+                                )
+                            });
+                        }
                     }
                     fit.curve
                 }

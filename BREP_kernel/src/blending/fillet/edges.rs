@@ -69,6 +69,14 @@ fn apply_chamfer_offsets_profile(
         EdgePath::Straight { direction, length } => {
             extrude_profile_brep(profile, *direction, *length)?
         }
+        // A circular edge between carriers rotationally symmetric about its
+        // axis with straight meridians (`analyze_edge` admits nothing else):
+        // the legs lie on the meridians, so the chordal setbacks are also the
+        // distances along the faces, and the same section revolved about the
+        // axis is the exact tool (`BREP_CHAMFER_ASYM_CURVED`, default on).
+        EdgePath::Circular { .. } if chamfer_asym_curved_on() => {
+            super::tool::build_exact_tool(cross, profile, 0.0, ToolEnds::default(), name)?
+        }
         EdgePath::Circular { .. } => {
             return Err(KernelRefusal::unsupported(
                 KernelStage::Classify,
@@ -97,6 +105,13 @@ fn apply_chamfer_offsets_profile(
     apply_tool(solid, &tool, cross.convex).map(settle_cutter_scaffold)
 }
 
+/// Asymmetric chamfers on curved edges (two-distance and distance-angle):
+/// on by default; `BREP_CHAMFER_ASYM_CURVED=0` restores the refusal
+/// `asymmetric_curved_edge`.
+pub(crate) fn chamfer_asym_curved_on() -> bool {
+    switch!("BREP_CHAMFER_ASYM_CURVED", true)
+}
+
 /// Asymmetric (two-distance) chamfer of one STRAIGHT edge between two planar
 /// faces (Golovanov §6.11): setback `d1` along face 1 and `d2` along face 2 —
 /// the standard CAD "d1 × d2" bevel.  General/curved edges are out of scope for
@@ -120,9 +135,113 @@ pub fn chamfer_edge_asymmetric(
     }
     // `analyze_edge` only uses the radius to size the orientation probe step;
     // the smaller setback keeps that probe inside both faces.
-    let cross = analyze_edge(solid, edge_id, d1.min(d2))?;
+    let cross = match analyze_edge(solid, edge_id, d1.min(d2)) {
+        Ok(cross) => cross,
+        Err(refusal) if chamfer_asym_curved_on() => {
+            let faces = setback_faces(solid, edge_id).map_err(|_| refusal)?;
+            let law = crate::blend::setback::SetbackLaw::Distances { faces, distances: [d1, d2] };
+            return chamfer_by_setback_law(solid, edge_id, law, name, "chamfer_edge_asymmetric", false);
+        }
+        Err(refusal) => return Err(refusal),
+    };
     let profile = chamfer_cross_section_offsets(&cross, d1, d2)?;
     apply_chamfer_offsets_profile(solid, &cross, &profile, name, edge_id)
+}
+
+/// The ids of the edge's two faces in `analyze_edge`'s order (face 1 first):
+/// the faces the setbacks `d1` and `d2` are measured on.
+fn setback_faces(solid: &BrepSolid, edge_id: u64) -> Result<[u64; 2], KernelRefusal> {
+    let (_, faces) = super::analyze::edge_and_faces(solid, edge_id)?;
+    match faces.as_slice() {
+        [first, second] if first.id != second.id => Ok([first.id, second.id]),
+        _ => Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "edge_faces",
+            format!("asymmetric chamfer: edge {edge_id} does not join two faces"),
+        )),
+    }
+}
+
+/// The input positions of the selected points that resolve onto the smooth
+/// chain through `edge_id`, when the chain has two or more edges and the
+/// not-yet-chamfered selection covers every one of them; else `None`.
+fn selected_chain(
+    solid: &BrepSolid,
+    edge_id: u64,
+    edge_points: &[Vec3],
+    done: &[bool],
+) -> Result<Option<Vec<usize>>, KernelRefusal> {
+    let Ok((members, _closed)) = crate::blend::smooth_chain_members(solid, edge_id) else {
+        return Ok(None);
+    };
+    if members.len() < 2 {
+        return Ok(None);
+    }
+    let mut positions = Vec::new();
+    for member in &members {
+        let position = edge_points.iter().enumerate().position(|(index, point)| {
+            !done[index] && resolve_edge_by_point(solid, *point).is_ok_and(|id| id == *member)
+        });
+        match position {
+            Some(position) => positions.push(position),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(positions))
+}
+
+/// An asymmetric chamfer the exact cutters do not cover (a curved edge on
+/// carriers that are not coaxial straight-meridian revolutions): the closed
+/// rim's march with its stations solved from the setback law
+/// (`blend/setback.rs`): a closed edge as its own rim, an open edge as the
+/// closed smooth chain it lies on or else alone, and with `walk_chain` the
+/// whole smooth chain (open or closed) a selection covers.
+fn chamfer_by_setback_law(
+    solid: &BrepSolid,
+    edge_id: u64,
+    law: crate::blend::setback::SetbackLaw,
+    name: Option<&str>,
+    entry: &str,
+    walk_chain: bool,
+) -> Result<BrepSolid, KernelRefusal> {
+    let edge = solid
+        .edges
+        .iter()
+        .find(|edge| edge.id == edge_id)
+        .ok_or_else(|| KernelRefusal::input(KernelStage::Collect, "edge", format!("{entry}: edge {edge_id} not found")))?;
+    let closed = edge.start_vertex_id == edge.end_vertex_id;
+    // The operand heal the symmetric ladder runs first (ids preserved).
+    let mut healed = solid.clone();
+    let policy = crate::KernelTolerances::for_solid(&healed, 1e-7);
+    crate::heal::heal_operands(&mut healed, &policy)?;
+    let reach = law.reach();
+    let mut result = crate::blend::setback::with_setback_law(law, || {
+        if walk_chain {
+            crate::blend::blend_smooth_chain(&healed, edge_id, reach, true, name)
+        } else if closed {
+            crate::blend::blend_closed_edge(&healed, edge_id, reach, true, name)
+        } else {
+            // An arc of a closed smooth chain (a rim the carriers' seams
+            // split) is chamfered as the whole rim; a lone open edge on its
+            // own.  An open tangent chain is not walked from one of its edges
+            // (`chamfer_edges_asymmetric` takes a whole selected chain).
+            crate::blend::blend_smooth_chain_if_closed(&healed, edge_id, reach, true, name).or_else(|refusal| {
+                let lone = matches!(&refusal.class, RefusalClass::Internal { what } if what == "chain_single_segment");
+                if lone {
+                    crate::blend::blend_open_edge(&healed, edge_id, reach, true, name)
+                } else {
+                    Err(refusal)
+                }
+            })
+        }
+    })?;
+    heal_edge_vertex_gaps(&mut result, reach)?;
+    crate::blend::fit_planar_charts_to_trims(&healed, &mut result)?;
+    let result = settle_cutter_scaffold(result);
+    refuse_invalid_result(&result, entry)?;
+    super::analyze::check_blend_interference(&healed, &result, &[edge_id], "chamfer")?;
+    super::analyze::check_blend_wall_loops(&result, "chamfer")?;
+    Ok(result)
 }
 
 /// Distance-angle chamfer of one STRAIGHT edge between two planar faces
@@ -147,7 +266,22 @@ pub fn chamfer_edge_angle(
             "chamfer_edge_angle: setback distance d1 must be positive",
         ));
     }
-    let cross = analyze_edge(solid, edge_id, d1)?;
+    let cross = match analyze_edge(solid, edge_id, d1) {
+        Ok(cross) => cross,
+        Err(refusal) if chamfer_asym_curved_on() => {
+            let [first, _] = setback_faces(solid, edge_id).map_err(|_| refusal)?;
+            if !(angle_rad > 1e-9) || !(angle_rad < std::f64::consts::PI) {
+                return Err(KernelRefusal::input(
+                    KernelStage::Collect,
+                    "chamfer_angle",
+                    format!("chamfer_edge_angle: angle {angle_rad} must be positive"),
+                ));
+            }
+            let law = crate::blend::setback::SetbackLaw::Angle { first, distance: d1, angle: angle_rad };
+            return chamfer_by_setback_law(solid, edge_id, law, name, "chamfer_edge_angle", false);
+        }
+        Err(refusal) => return Err(refusal),
+    };
     let d2 = chamfer_angle_second_distance(&cross, d1, angle_rad)?;
     let profile = chamfer_cross_section_offsets(&cross, d1, d2)?;
     apply_chamfer_offsets_profile(solid, &cross, &profile, name, edge_id)
@@ -185,9 +319,50 @@ fn refuse_invalid_result(result: &BrepSolid, entry: &str) -> Result<(), KernelRe
     ))
 }
 
+/// `BREP_FILLET_PICK_SKIPS_SEAM` (default on; `=0` restores): a pick point that lies as near a
+/// SEAM (an edge one face uses on both sides) as a blendable edge picks the
+/// blendable one.
+///
+/// Cause (brep-bench probe, a ball r 5 bored through by a cylinder r 2, its rim
+/// filleted or chamfered from the point (0, 2, √21), refused "edge 4 borders 1
+/// faces"): the point is the vertex where the rim meets the bore's seam, both
+/// edges read distance 0, and the first found, the seam, was taken. A seam has
+/// one face on both sides and can never be blended, so it loses every tie.
+fn pick_skips_seam_on() -> bool {
+    switch!("BREP_FILLET_PICK_SKIPS_SEAM", true)
+}
+
+/// Whether `edge_id` is a seam: every coedge of it lies on one face.
+fn is_seam(solid: &BrepSolid, edge_id: u64) -> bool {
+    let users = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter(|face| face.loops.iter().flat_map(|loop_record| &loop_record.coedges).any(|coedge| coedge.edge_id == edge_id))
+        .count();
+    users == 1
+}
+
 /// Resolve a point within 1e-3 of a trimmed edge.
 pub(super) fn resolve_edge_by_point(solid: &BrepSolid, point: Vec3) -> Result<u64, KernelRefusal> {
-    match crate::topology::nearest_edge(solid, point) {
+    let nearest = crate::topology::nearest_edge(solid, point);
+    if pick_skips_seam_on() {
+        if let Some((edge_id, distance)) = nearest {
+            if distance <= 1e-3 && is_seam(solid, edge_id) {
+                let tie = distance + 1e-9 * (1.0 + point.length());
+                let blendable = solid.edges.iter().filter(|edge| edge.id != edge_id && !edge.degenerate).find(|edge| {
+                    crate::project_point_to_curve(&edge.curve, point).ok().is_some_and(|projection| {
+                        let at = projection.u.clamp(edge.t0.min(edge.t1), edge.t0.max(edge.t1));
+                        edge.curve.evaluate(at).is_ok_and(|sample| sample.sub(point).length() <= tie)
+                    }) && !is_seam(solid, edge.id)
+                });
+                if let Some(edge) = blendable {
+                    return Ok(edge.id);
+                }
+            }
+        }
+    }
+    match nearest {
         Some((edge_id, distance)) if distance <= 1e-3 => Ok(edge_id),
         Some((_, distance)) => Err(KernelRefusal::input(
             KernelStage::Collect,
@@ -1013,6 +1188,7 @@ pub fn fillet_edges_reported(
     if crate::blend::is_wall_fold(&group_err) || crate::blend::is_miter_support_overrun(&group_err)
         || crate::blend::is_tangential_transverse_end(&group_err)
         || matches!(&group_err.class, RefusalClass::UnsupportedGeometry { what } if what == "canal_footprint_bound")
+        || crate::blend::is_ball_does_not_fit(&group_err)
     {
         return Err(group_err);
     }
@@ -3346,7 +3522,7 @@ fn fillet_edges_group_lanes(
                 // exceeds the canal footprint. Preserve the requested radius
                 // and its named refusal instead of searching partial selections.
                 if matches!(&refusal.class, RefusalClass::UnsupportedGeometry { what }
-                    if what == "canal_footprint_bound") {
+                    if what == "canal_footprint_bound") || crate::blend::is_ball_does_not_fit(&refusal) {
                     return Err(refusal);
                 }
                 // The runout composition reads the ring's own classification
@@ -5087,13 +5263,31 @@ pub fn chamfer_edges_asymmetric(
         ));
     }
     let mut result = solid.clone();
+    let mut done = vec![false; edge_points.len()];
     // `edge_names[index]` is keyed by INPUT position; the loop resolves each
     // point on the EVOLVING `result`, but enumerates the input points in order,
     // so the index alignment holds.
     for (index, point) in edge_points.iter().enumerate() {
+        if done[index] {
+            continue;
+        }
         let edge_id = resolve_edge_by_point(&result, *point)?;
         let edge_name = per_edge_name(edge_names, name, index);
+        // A smooth chain the selection covers whole is chamfered as one unit
+        // (its setbacks run on through the tangent joins).
+        if chamfer_asym_curved_on() {
+            if let Some(members) = selected_chain(&result, edge_id, edge_points, &done)? {
+                let faces = setback_faces(&result, edge_id)?;
+                let law = crate::blend::setback::SetbackLaw::Distances { faces, distances: [d1, d2] };
+                result = chamfer_by_setback_law(&result, edge_id, law, edge_name, "chamfer_edges_asymmetric", true)?;
+                for member in members {
+                    done[member] = true;
+                }
+                continue;
+            }
+        }
         result = chamfer_edge_asymmetric(&result, edge_id, d1, d2, edge_name)?;
+        done[index] = true;
     }
     refuse_invalid_result(&result, "chamfer_edges_asymmetric")?;
     Ok(result)
@@ -5121,10 +5315,28 @@ pub fn chamfer_edges_angle(
         ));
     }
     let mut result = solid.clone();
+    let mut done = vec![false; edge_points.len()];
     for (index, point) in edge_points.iter().enumerate() {
+        if done[index] {
+            continue;
+        }
         let edge_id = resolve_edge_by_point(&result, *point)?;
         let edge_name = per_edge_name(edge_names, name, index);
+        // A smooth chain the selection covers whole is chamfered as one unit,
+        // as `chamfer_edges_asymmetric` does.
+        if chamfer_asym_curved_on() && d1 > 0.0 && d1.is_finite() && angle_rad > 1e-9 && angle_rad < std::f64::consts::PI {
+            if let Some(members) = selected_chain(&result, edge_id, edge_points, &done)? {
+                let [first, _] = setback_faces(&result, edge_id)?;
+                let law = crate::blend::setback::SetbackLaw::Angle { first, distance: d1, angle: angle_rad };
+                result = chamfer_by_setback_law(&result, edge_id, law, edge_name, "chamfer_edges_angle", true)?;
+                for member in members {
+                    done[member] = true;
+                }
+                continue;
+            }
+        }
         result = chamfer_edge_angle(&result, edge_id, d1, angle_rad, edge_name)?;
+        done[index] = true;
     }
     refuse_invalid_result(&result, "chamfer_edges_angle")?;
     Ok(result)

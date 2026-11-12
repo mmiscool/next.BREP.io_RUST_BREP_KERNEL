@@ -960,6 +960,9 @@ async fn serve(service: &CadService, caller: &Caller, method: &str, body: &str) 
             let Some(spec) = service.script_tool(name).await else {
                 return respond(Err(ApiError::new("method_unknown", "lookup", format!("no script function for tool `{name}`"))));
             };
+            if let Some(message) = crate::script_sdk::undeclared_context(name, &spec.input_schema, &req) {
+                return respond(Err(ApiError::new("invalid_arguments", "validation", message)));
+            }
             let result = if spec.group == "files" {
                 match name.strip_prefix("files_").ok_or_else(|| "invalid file method".to_string())
                     .and_then(|op| crate::files::operation_request(op, req)) {
@@ -1306,7 +1309,8 @@ fn type_check_and_emit(source: &str, declarations: &str, limits: &Limits, deadli
     let prefix = format!("{}/", dir.0.display());
     let text = format!("{}{}", String::from_utf8_lossy(&stdout), String::from_utf8_lossy(&stderr)).replace(&prefix, "");
     let diagnostics: Vec<String> = text.lines().filter(|l| !l.trim().is_empty()).map(|l| wire::sanitize(l.trim())).take(50).collect();
-    Err(ApiError::new("compile_failed", "compilation", format!("type errors:\n{}", diagnostics.join("\n"))).context(json!({ "diagnostics": diagnostics })))
+    let message = brep_script_core::worker::syntax_help(source, &format!("type errors:\n{}", diagnostics.join("\n")));
+    Err(ApiError::new("compile_failed", "compilation", message).context(json!({ "diagnostics": diagnostics })))
 }
 
 /// Run the resolved launcher the way compilation will (`node tsc --version`,

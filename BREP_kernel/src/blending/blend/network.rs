@@ -3178,8 +3178,8 @@ fn blend_star_network_building(
         axis: Vec3,
         /// Per stripe (in `stripe_indices` order): its index, the stored
         /// section arc (pole <-> cap point), its cap-rail vertex and point,
-        /// and its ball centre at the stop.
-        ends: Vec<(usize, EdgeRecord, u64, Vec3, Vec3)>,
+        /// its ball centre at the stop, and the stop's parameter on the stripe.
+        ends: Vec<(usize, EdgeRecord, u64, Vec3, Vec3, f64)>,
         name: Option<String>,
         /// A near-tangent crease whose stop sections are not exact meridians
         /// (`tilted_horn_on`): closed by the ruled patch between the two
@@ -3349,7 +3349,7 @@ fn blend_star_network_building(
             pole_vertex
         };
         let deeper_second = if sharp.start_vertex_id == *vertex_id { ends[1].2 > ends[0].2 } else { ends[1].2 < ends[0].2 };
-        let mut committed: Vec<(usize, EdgeRecord, u64, Vec3, Vec3)> = Vec::new();
+        let mut committed: Vec<(usize, EdgeRecord, u64, Vec3, Vec3, f64)> = Vec::new();
         for (end_number, (index, u_stop, _, end_pole, cap_point, center)) in ends.iter().enumerate() {
             let (pole, pole_vertex) = if end_number == 0 { (*end_pole, pole_vertex) } else { (*end_pole, second_pole_vertex) };
             let stripe = &stripes[*index];
@@ -3409,7 +3409,7 @@ fn blend_star_network_building(
                 arc_edge_id,
                 arc_blend_pcurve,
             }));
-            committed.push((*index, record, cap_vertex, *cap_point, *center));
+            committed.push((*index, record, cap_vertex, *cap_point, *center, *u_stop));
         }
         pending_horns.push(PendingHorn {
             vertex: *vertex_id,
@@ -4430,24 +4430,35 @@ fn blend_star_network_building(
             .find(|vertex| vertex.id == horn.vertex)
             .ok_or(KernelRefusal::internal(KernelStage::Refine, "reentrant_vertex", "blend network: re-entrant vertex missing"))?
             .point;
-        let [(index_a, arc_a, cap_a, cap_point_a, center_a), (index_b, arc_b, cap_b, cap_point_b, center_b)] =
+        let [(index_a, arc_a, cap_a, cap_point_a, center_a, stop_a), (index_b, arc_b, cap_b, cap_point_b, center_b, stop_b)] =
             <[_; 2]>::try_from(horn.ends).map_err(|_| KernelRefusal::internal(KernelStage::Refine, "horn_ends", "blend network: a horn needs two ends"))?;
         // The cap arc: the torus's tangency with the cap, a circle of one
         // radius about the re-entrant vertex from one cap point to the other.
         // Tilted: the ball's contact with the cap runs only the pivot's
         // length (radius x crease angle); its chord stands on the cap to the
         // cap's curvature over that length, read by the pcurve's projection.
-        let canal_patch = match &horn.canal {
+        let mut canal_patch = match &horn.canal {
             Some(canal) => {
                 let sharp = solid.edges.iter().find(|edge| edge.id == horn.sharp_edge)
                     .ok_or(KernelRefusal::internal(KernelStage::Refine, "canal_sharp", "blend network: the concave edge is missing"))?;
                 let chamfer_ends = chamfer.then_some([(canal.poles[0].1, cap_point_a), (canal.poles[1].1, cap_point_b)]);
-                Some(canal_corner_patch(sharp, [canal.poles[0].2, canal.poles[1].2], center_a, center_b, cap_point_a, radius, chamfer_ends, solid)?)
+                let crease_stripe = |index: usize, stop: f64| {
+                    let stripe = &stripes[index];
+                    stripe.rows.center.as_ref().filter(|_| !chamfer && canal_crease_on()).map(|centre| CreaseStripe {
+                        centre,
+                        stop,
+                        rows_above_stop: stripe.at_start(horn.vertex),
+                    })
+                };
+                Some(canal_corner_patch(
+                    sharp, [canal.poles[0].2, canal.poles[1].2], center_a, center_b, cap_point_a, radius, chamfer_ends,
+                    [crease_stripe(index_a, stop_a), crease_stripe(index_b, stop_b)], solid,
+                )?)
             }
             None => None,
         };
-        let cap_arc = if let Some((_, cap_curve)) = &canal_patch {
-            cap_curve.clone()
+        let cap_arc = if let Some(patch) = &canal_patch {
+            patch.cap_curve.clone()
         } else if horn.tilted {
             crate::make_line(cap_point_a, cap_point_b).or_refuse(KernelStage::Refine, "make_line")?
         } else {
@@ -4586,8 +4597,9 @@ fn blend_star_network_building(
         } else {
             corner_section_arc(center_a, radius, horn.pole, cap_point_a)?
         };
-        let surface = if let Some((patch, _)) = canal_patch {
-            patch
+        let creases = canal_patch.as_mut().map_or(Vec::new(), |patch| std::mem::take(&mut patch.creases));
+        let surface = if let Some(patch) = canal_patch {
+            patch.surface
         } else if horn.tilted {
             tilted_horn_patch(&generatrix, &corner_section_arc(center_b, radius, horn.pole, cap_point_b)?, center_a, center_b, radius, solid)?
         } else {
@@ -4730,8 +4742,9 @@ fn blend_star_network_building(
         let surface_normal = surface.normal(0.5, 1.0).or_refuse(KernelStage::Refine, "normal")?;
         let same_sense = surface_normal.dot(outward) > 0.0;
         let loop_id = take_id();
+        let face_id = take_id();
         let face = FaceRecord {
-            id: take_id(),
+            id: face_id,
             surface,
             same_sense,
             loops: vec![crate::topology::LoopRecord {
@@ -4746,6 +4759,10 @@ fn blend_star_network_building(
             .position(|shell| !shell.faces.is_empty())
             .ok_or(KernelRefusal::internal(KernelStage::Sew, "shell", "blend network: the solid has no shell to sew the horn torus into"))?;
         result.shells[shell_index].faces.push(face);
+        for crease in &creases {
+            let (arc_id, pole) = if crease.stop == 0 { (arc_a.id, pole_vertex_a) } else { (arc_b.id, pole_vertex_b) };
+            sew_canal_crease(&mut result, face_id, arc_id, pole, crease, &mut take_id)?;
+        }
     }
     for pending in pending_mixed {
         sew_mixed_star(&mut result, solid, &mut take_id, &stripes, &sewn, pending.vertex, &pending.mixed, &pending.arcs, [pending.v_a, pending.v_b, pending.w_a, pending.w_b], pending.name)?;
@@ -6210,14 +6227,23 @@ pub(in crate::blend) fn chamfer_canal_corner_on() -> bool {
 /// below the ball centres' plane, as a fraction of the radius.
 const CANAL_MAX_FOOT_HEIGHT: f64 = 0.25;
 
+/// Whether a fillet's canal corner is trimmed at its crease with the
+/// neighbouring stripe ([`canal_stop_crease`]) instead of being bounded by
+/// [`CANAL_MAX_FOOT_HEIGHT`]: on unless `BREP_BLEND_CANAL_CREASE=0`/`off`
+/// (then the folded patch is admitted up to that bound, and refused past it).
+pub(in crate::blend) fn canal_crease_on() -> bool {
+    switch!(live "BREP_BLEND_CANAL_CREASE", true)
+}
+
 /// A radial planar cap cutting a cylindrical wall and a perpendicular plane.
 /// The inward-offset cylinder has radius R-r. A centre on the cap's offset
-/// plane is r from the axial plane, so its radial contact on the cylinder is
-/// h = r²/(R-r) from the centres' plane. The canal footprint requires h <= B*r,
-/// hence r <= B*R/(1+B). Check this before marching: beyond R/2 the centre
-/// planes do not even meet the offset cylinder, and Newton cannot reach the
-/// later footprint check. This is a construction bound, not proof that no
-/// exact-radius fillet exists. Other carriers retain the measured check.
+/// plane is r from the axial plane, so no centre exists past r = R/2: no
+/// ball touches both the cap and the wall, and the fillet is refused by name
+/// (`fillet_ball_does_not_fit`) before marching. Below that, with the crease
+/// off ([`canal_crease_on`]), the canal's footprint is bounded: the radial
+/// contact on the cylinder is h = r²/(R-r) from the centres' plane and the
+/// bound h <= B*r gives r <= B*R/(1+B), a limit of the folded patch, not of
+/// the geometry. Other carriers retain the measured check.
 fn cylindrical_corner_footprint_limit(
     cap: &FaceRecord,
     floor: &FaceRecord,
@@ -6263,6 +6289,23 @@ fn cylindrical_corner_footprint_limit(
     if raw_normal(&wall.surface, uv.u, uv.v).ok()?.scale(rho).dot(radial) >= 0.0 {
         return None;
     }
+    // No ball fits at all: its centre is r from the cap, which contains the
+    // axis, so it is at least r from the axis, and inside the wall it is at
+    // most R - r from it. Hence 2r <= R for any fillet of this edge.
+    if radius > 0.5 * cylinder_radius + band {
+        return Some(KernelRefusal::input(
+            KernelStage::Classify,
+            "fillet_ball_does_not_fit",
+            format!(
+                "blend network: no ball of radius {radius} touches both the cap (face {}) and the cylindrical \
+                 wall (face {}, radius {cylinder_radius:.6}) at the corner on edge {sharp_edge}: the cap contains the wall's axis, \
+                 so such a ball needs a radius of at most half the wall's ({:.6}). The requested radius has not \
+                 been changed",
+                cap.id, wall.id, 0.5 * cylinder_radius,
+            ),
+        ));
+    }
+    if canal_crease_on() { return None; }
     let bound = CANAL_MAX_FOOT_HEIGHT * cylinder_radius / (1.0 + CANAL_MAX_FOOT_HEIGHT);
     if radius <= bound + band { return None; }
     // A conservative, readable suggestion; never substitute it in the result.
@@ -6278,6 +6321,14 @@ fn cylindrical_corner_footprint_limit(
              This corner needs an exact-radius construction beyond the current footprint limit",
         ),
     ))
+}
+
+/// Whether `refusal` is [`cylindrical_corner_footprint_limit`]'s proof that
+/// no ball of the requested radius touches both faces of a selected edge.
+/// Terminal: neither a smaller selection nor an independent cutter can
+/// build a fillet the geometry does not admit.
+pub(crate) fn is_ball_does_not_fit(refusal: &KernelRefusal) -> bool {
+    matches!(&refusal.class, crate::RefusalClass::InvalidInput { what } if what == "fillet_ball_does_not_fit")
 }
 
 /// The two stops of a re-entrant corner closed by [`canal_corner_patch`]:
@@ -6331,9 +6382,11 @@ fn canal_corner_patch(
     cap_point_a: Vec3,
     radius: f64,
     chamfer_ends: Option<[(Vec3, Vec3); 2]>,
+    stripes: [Option<CreaseStripe<'_>>; 2],
     solid: &BrepSolid,
-) -> Result<(crate::NurbsSurface, NurbsCurve), KernelRefusal> {
+) -> Result<CanalPatch, KernelRefusal> {
     let chamfer = chamfer_ends.is_some();
+    let crease = !chamfer && stripes.iter().any(Option::is_some);
     let unsolved = |what: &'static str| KernelRefusal::unsupported(KernelStage::Refine, what, format!("blend network: the corner's ball envelope does not solve ({what})"));
     let cap_up = cap_point_a.sub(center_a).normalized().or_refuse(KernelStage::Refine, "canal_cap_normal")?;
     if center_b.sub(center_a).dot(cap_up).abs() > 1e-6 * (1.0 + radius) {
@@ -6403,6 +6456,7 @@ fn canal_corner_patch(
         }
         None => None,
     };
+    let highest = std::cell::Cell::new(0.0_f64);
     let arc_controls = |u: f64, p: Vec3, centre: Vec3| -> Result<[crate::Vec4; 3], KernelRefusal> {
         let cap = centre.add(cap_up.scale(radius));
         let (from, to) = (p.sub(centre), cap.sub(centre));
@@ -6412,17 +6466,17 @@ fn canal_corner_patch(
             return Err(unsolved("canal_wide_arc"));
         }
         // Where the edge leaves the centres' plane (height `h`) the arc starts
-        // slightly past the ball's pivot axis, and that short run rotates
-        // backwards: a fold about h^2 / (2 r) deep, inherent to the envelope
-        // because the stop arcs are the stripes' own sections. Bounded here
-        // (0.004 at r = 0.3 on the reported model's corners). Beyond this
-        // bound this canal is not usable for a fillet. The analytic inward-cylinder
-        // footprint check above refuses before marching; other configurations
-        // may still use their existing capped-corner construction. A chamfer's
-        // row is the CHORD, which has no stretch running backwards past the
-        // pivot: it is not bounded.
+        // slightly past the ball's pivot axis, and the envelope folds back
+        // into the neighbouring stripe's balls next to that stop (about
+        // h^2 / (2 r) deep: 0.004 at r = 0.3 on the reported model's corners).
+        // With the crease on, the fold is trimmed away ([`canal_stop_crease`])
+        // and no bound applies to a canal that folds; one that does not keeps
+        // the bound (checked once the creases are known). Without the crease,
+        // the folded patch is admitted only up to this bound. A chamfer's row is the CHORD, which has no
+        // stretch running backwards past the pivot: it is not bounded.
         let height = p.sub(center_a).dot(cap_up).abs();
-        if !chamfer && height > CANAL_MAX_FOOT_HEIGHT * radius {
+        highest.set(highest.get().max(height));
+        if !chamfer && !crease && height > CANAL_MAX_FOOT_HEIGHT * radius {
             return Err(unsolved("canal_foot_height"));
         }
         if let Some([pole_a, cap_a, pole_b, cap_b]) = end_gaps {
@@ -6476,10 +6530,327 @@ fn canal_corner_patch(
             eprintln!("canal corner: {count} stations, {worst:.3e} off the envelope (bar {bar:.3e})");
         }
         if worst <= bar {
-            return Ok((surface, fitted[2].clone()));
+            let mut creases = Vec::new();
+            for (stop, stripe) in stripes.iter().enumerate() {
+                let Some(stripe) = stripe else { continue };
+                let exact = |u: f64, guess: f64| -> Result<(f64, NurbsCurve), KernelRefusal> {
+                    let (t, p, centre) = station(u, guess)?;
+                    let controls = arc_controls(u, p, centre)?;
+                    Ok((t, NurbsCurve::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], controls.to_vec()).or_refuse(KernelStage::Refine, "canal_row")?))
+                };
+                if let Some(found) = canal_stop_crease(&exact, stop, poles[stop], stripe, radius, bar)? {
+                    creases.push(found);
+                }
+            }
+            // A canal that does not fold keeps the footprint bound: past it
+            // the corner keeps its existing closure (a flat cap, say).
+            if !chamfer && creases.is_empty() && highest.get() > CANAL_MAX_FOOT_HEIGHT * radius {
+                return Err(unsolved("canal_foot_height"));
+            }
+            return Ok(CanalPatch { surface, cap_curve: fitted[2].clone(), creases });
         }
     }
     Err(unsolved("canal_fit_off_envelope"))
+}
+
+/// The neighbouring stripe at one stop of a fillet's canal corner: its ball
+/// centre path, the stop's parameter on it, and which side of the stop the
+/// stripe's own rows lie.
+pub(super) struct CreaseStripe<'a> {
+    pub(super) centre: &'a NurbsCurve,
+    pub(super) stop: f64,
+    pub(super) rows_above_stop: bool,
+}
+
+/// [`canal_corner_patch`]'s result: the patch, its cap boundary (v = 1), and
+/// the crease at each stop where the envelope folds back into the
+/// neighbouring stripe's balls.
+pub(super) struct CanalPatch {
+    pub(super) surface: crate::NurbsSurface,
+    pub(super) cap_curve: NurbsCurve,
+    pub(super) creases: Vec<CanalCrease>,
+}
+
+/// Where the canal's outer sheet crosses the neighbouring stripe's envelope
+/// next to stop `stop` (0: u = 0, 1: u = 1). The crease runs from `k_point`,
+/// the cusp of the envelope on the stop's section arc at row parameter
+/// `v_k`, to the pole (v = 0); `points` and `uv` (the patch parameters of
+/// each point, from the solve) are listed in that order.
+pub(super) struct CanalCrease {
+    pub(super) stop: usize,
+    pub(super) v_k: f64,
+    pub(super) points: Vec<Vec3>,
+    pub(super) uv: Vec<(f64, f64)>,
+}
+
+/// The crease of a fillet's canal corner at one stop.
+///
+/// The canal is the envelope of the ball touching the cap and the concave
+/// edge. Where the edge is curved and leaves the centres' plane, the spine
+/// of that envelope bends more tightly than 1/r next to a stop, and the
+/// envelope folds there (on a cylinder of radius R meeting a perpendicular
+/// plane, r times the spine's curvature at the cylinder's stop is
+/// (R-r)/sqrt((R-r)^2-r^2), more than 1 at every radius). The folded band
+/// and the stripe's balls just beyond the stop are inside the union of the
+/// balls. The true rolling-ball surface there is the canal's outer sheet,
+/// meeting the stripe's surface along a concave crease. That crease closes
+/// on the stop's section arc at the pole and at the envelope's cusp `K`.
+///
+/// For each row parameter v below the cusp, the crease's pivot u is the
+/// first root, past the stop, of the distance from the canal's exact arc
+/// point to the stripe's centre path, less r. `None` when the envelope does
+/// not fold at this stop.
+fn canal_stop_crease(
+    exact: &dyn Fn(f64, f64) -> Result<(f64, NurbsCurve), KernelRefusal>,
+    stop: usize,
+    pole: f64,
+    stripe: &CreaseStripe<'_>,
+    radius: f64,
+    bar: f64,
+) -> Result<Option<CanalCrease>, KernelRefusal> {
+    let unsolved = |what: &'static str| KernelRefusal::unsupported(KernelStage::Refine, what, format!("blend network: the canal corner's crease does not solve ({what})"));
+    let [w0, w1] = stripe.centre.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let stop_centre = stripe.centre.evaluate(stripe.stop).or_refuse(KernelStage::Refine, "evaluate")?;
+    // Distance from `point` to the stripe's balls (its centre path on the
+    // rows' side of the stop), less the radius: negative inside them.
+    let covered = |point: Vec3| -> Result<f64, KernelRefusal> {
+        let foot = crate::project_point_to_curve(stripe.centre, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
+        let inside = if stripe.rows_above_stop { foot.u >= stripe.stop } else { foot.u <= stripe.stop };
+        let distance = if inside && foot.u > w0 && foot.u < w1 { foot.distance } else { point.sub(stop_centre).length() };
+        Ok(distance - radius)
+    };
+    // The pivot measured from this stop into the patch.
+    let pivot = |away: f64| if stop == 0 { away } else { 1.0 - away };
+    // A coarse march of the stations from the stop for Newton's seeds.
+    const MARCH: usize = 128;
+    let mut seeds = Vec::with_capacity(MARCH + 1);
+    let mut guess = pole;
+    for k in 0..=MARCH {
+        let (t, _) = exact(pivot(k as f64 / MARCH as f64), guess)?;
+        seeds.push(t);
+        guess = t;
+    }
+    let seed = |away: f64| seeds[((away * MARCH as f64).round() as usize).min(MARCH)];
+    let gap = |away: f64, v: f64| -> Result<f64, KernelRefusal> {
+        let (_, row) = exact(pivot(away), seed(away))?;
+        covered(row.evaluate(v).or_refuse(KernelStage::Refine, "evaluate")?)
+    };
+    // The envelope's own fold at the stop: next to the stop its rows run
+    // inside the stop's ball. The envelope is tangent to that ball along the
+    // stop's arc, so the first order vanishes; the second, extrapolated from
+    // two steps, is negative across the folded band.
+    let (_, stop_row) = exact(pivot(0.0), seed(0.0))?;
+    let stop_ball = {
+        let [a, b] = stop_row.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let (p, q) = (stop_row.evaluate(a).or_refuse(KernelStage::Refine, "evaluate")?, stop_row.evaluate(b).or_refuse(KernelStage::Refine, "evaluate")?);
+        let middle = stop_row.evaluate(0.5 * (a + b)).or_refuse(KernelStage::Refine, "evaluate")?;
+        circle_centre(p, middle, q).ok_or_else(|| unsolved("canal_crease_stop_ball"))?
+    };
+    const STEP: f64 = 1e-3;
+    let inside_stop_ball = |away: f64, v: f64| -> Result<f64, KernelRefusal> {
+        let (_, row) = exact(pivot(away), seed(away))?;
+        Ok(row.evaluate(v).or_refuse(KernelStage::Refine, "evaluate")?.sub(stop_ball).length() - radius)
+    };
+    let bend = |v: f64| -> Result<f64, KernelRefusal> {
+        Ok((8.0 * inside_stop_ball(STEP, v)? - inside_stop_ball(2.0 * STEP, v)?) / (4.0 * STEP * STEP))
+    };
+    let fold_at = |v: f64| -> Result<bool, KernelRefusal> { Ok(bend(v)? < -1e-6 * radius) };
+    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+        let bends: Vec<String> = [1.0 / 256.0, 0.1, 0.5, 0.9].iter().map(|v| bend(*v).map(|b| format!("{b:.3e}")).unwrap_or_default()).collect();
+        eprintln!("canal crease probe at stop {stop} (rows above stop {}): bends {bends:?}", stripe.rows_above_stop);
+    }
+    if !fold_at(1.0 / 256.0)? {
+        return Ok(None);
+    }
+    // The cusp: the band's far end, where the bend changes sign.
+    let mut v_out = None;
+    for j in 2..=64 {
+        let v = j as f64 / 64.0;
+        if !fold_at(v)? {
+            v_out = Some(v);
+            break;
+        }
+    }
+    let Some(mut high) = v_out else { return Err(unsolved("canal_crease_whole_section")); };
+    let mut low = high - 1.0 / 64.0;
+    for _ in 0..48 {
+        let middle = 0.5 * (low + high);
+        if fold_at(middle)? { low = middle } else { high = middle }
+    }
+    let v_k = 0.5 * (low + high);
+    // The crease's pivot at row parameter `v`: the first sign change of the
+    // gap past the stop, refined by bisection.
+    // Next to the stop the two surfaces part only at second order; a root
+    // inside the first march step is taken at the stop.
+    let root = |v: f64| -> Result<f64, KernelRefusal> {
+        let mut previous = 1.0 / MARCH as f64;
+        if gap(previous, v)? >= 0.0 {
+            return Ok(0.0);
+        }
+        for k in 2..=MARCH {
+            let away = k as f64 / MARCH as f64;
+            if gap(away, v)? >= 0.0 {
+                let (mut low, mut high) = (previous, away);
+                for _ in 0..60 {
+                    let middle = 0.5 * (low + high);
+                    if gap(middle, v)? < 0.0 { low = middle } else { high = middle }
+                }
+                return Ok(0.5 * (low + high));
+            }
+            previous = away;
+        }
+        Err(unsolved("canal_crease_no_root"))
+    };
+    for count in [24usize, 48, 96] {
+        // Cosine spacing: the crease leaves the stop tangentially at both ends.
+        let rows: Vec<f64> = (0..=count).map(|j| v_k * 0.5 * (1.0 + (std::f64::consts::PI * j as f64 / count as f64).cos())).collect();
+        let mut points = Vec::with_capacity(count + 1);
+        let mut uv = Vec::with_capacity(count + 1);
+        for (j, &v) in rows.iter().enumerate() {
+            let away = if j == 0 || j == count { 0.0 } else { root(v)? };
+            let (_, row) = exact(pivot(away), seed(away))?;
+            points.push(row.evaluate(v).or_refuse(KernelStage::Refine, "evaluate")?);
+            uv.push((pivot(away), v));
+        }
+        // The fit against the exact crease between the samples.
+        let curve = crease_curve(&points)?;
+        let mut worst = 0.0_f64;
+        for j in 0..count {
+            let v = 0.5 * (rows[j] + rows[j + 1]);
+            let away = root(v)?;
+            let (_, row) = exact(pivot(away), seed(away))?;
+            let point = row.evaluate(v).or_refuse(KernelStage::Refine, "evaluate")?;
+            let foot = crate::project_point_to_curve(&curve, point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
+            worst = worst.max(foot.distance);
+        }
+        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+            eprintln!("canal crease at stop {stop}: cusp at v = {v_k:.6}, {count} rows, {worst:.3e} off the crease (bar {bar:.3e})");
+        }
+        if worst <= bar {
+            return Ok(Some(CanalCrease { stop, v_k, points, uv }));
+        }
+    }
+    Err(unsolved("canal_crease_fit"))
+}
+
+/// The centre of the circle through three points, `None` when collinear.
+fn circle_centre(a: Vec3, b: Vec3, c: Vec3) -> Option<Vec3> {
+    let (u, v) = (b.sub(a), c.sub(a));
+    let normal = u.cross(v);
+    let denominator = 2.0 * normal.dot(normal);
+    if denominator <= f64::MIN_POSITIVE { return None; }
+    let offset = v.cross(normal).scale(u.dot(u)).add(normal.cross(u).scale(v.dot(v))).scale(1.0 / denominator);
+    Some(a.add(offset))
+}
+
+/// The cubic through crease samples, chord-length parametrised on [0, 1].
+fn crease_curve(points: &[Vec3]) -> Result<NurbsCurve, KernelRefusal> {
+    let parameters = chord_parameters(points);
+    let samples: Vec<crate::Vec4> = points.iter().map(|point| crate::Vec4::from_point(*point, 1.0)).collect();
+    crate::fit::interpolate_homogeneous(&samples, 3, &parameters).or_refuse(KernelStage::Refine, "canal_crease_fit")
+}
+
+/// Chord-length parameters on [0, 1] for a polyline.
+fn chord_parameters(points: &[Vec3]) -> Vec<f64> {
+    let mut lengths = vec![0.0];
+    for pair in points.windows(2) {
+        lengths.push(lengths.last().copied().unwrap_or(0.0) + pair[1].sub(pair[0]).length());
+    }
+    let total = lengths.last().copied().unwrap_or(0.0).max(f64::MIN_POSITIVE);
+    lengths.iter().map(|length| length / total).collect()
+}
+
+/// Split a canal corner's stop section arc `arc_id` at the crease's cusp K:
+/// the arc keeps its cap..K piece (the seam the canal shares with the
+/// stripe), and a new edge K..pole carries the crease. Both faces that use
+/// the arc, the canal (`canal_face`, whose crease parameters come from the
+/// solve) and the stripe (by projection), take the two edges in its place.
+fn sew_canal_crease(
+    result: &mut BrepSolid,
+    canal_face: u64,
+    arc_id: u64,
+    pole_vertex: u64,
+    crease: &CanalCrease,
+    take_id: &mut impl FnMut() -> u64,
+) -> Result<(), KernelRefusal> {
+    let internal = |what: &'static str, message: &'static str| KernelRefusal::internal(KernelStage::Sew, what, message);
+    let arc = result.edges.iter().find(|edge| edge.id == arc_id).cloned()
+        .ok_or(internal("canal_crease_arc", "blend network: the stop's section arc is missing"))?;
+    let pole_at_start = arc.start_vertex_id == pole_vertex;
+    if !pole_at_start && arc.end_vertex_id != pole_vertex {
+        return Err(internal("canal_crease_pole", "blend network: the stop's section arc does not end at its pole"));
+    }
+    let k_point = crease.points[0];
+    let t_k = crate::project_point_to_curve(&arc.curve, k_point).or_refuse(KernelStage::Refine, "project_point_to_curve")?.u;
+    let (head, tail) = arc.curve.split(t_k).or_refuse(KernelStage::Refine, "split")?;
+    let piece = if pole_at_start { tail } else { head };
+    let k_vertex = take_id();
+    result.vertices.push(VertexRecord { id: k_vertex, point: k_point });
+    {
+        let piece_domain = piece.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let edge = result.edges.iter_mut().find(|edge| edge.id == arc_id)
+            .ok_or(internal("canal_crease_arc", "blend network: the stop's section arc is missing"))?;
+        edge.curve = piece;
+        edge.t0 = piece_domain[0];
+        edge.t1 = piece_domain[1];
+        if pole_at_start { edge.start_vertex_id = k_vertex } else { edge.end_vertex_id = k_vertex }
+    }
+    let curve = crease_curve(&crease.points)?;
+    let curve_domain = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let crease_id = take_id();
+    result.edges.push(EdgeRecord {
+        id: crease_id,
+        curve,
+        t0: curve_domain[0],
+        t1: curve_domain[1],
+        start_vertex_id: k_vertex,
+        end_vertex_id: pole_vertex,
+        degenerate: false,
+        name: None,
+    });
+    let parameters = chord_parameters(&crease.points);
+    let line = |from: (f64, f64), to: (f64, f64)| crate::sweep_topology::parameter_line(from.0, from.1, to.0, to.1).or_refuse(KernelStage::Refine, "parameter_line");
+    let mut uses = 0;
+    for face in result.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
+        for position in 0..face.loops.len() {
+            let Some(at) = face.loops[position].coedges.iter().position(|coedge| coedge.edge_id == arc_id) else { continue };
+            uses += 1;
+            let coedge = face.loops[position].coedges[at].clone();
+            let walks_to_pole = coedge.forward != pole_at_start;
+            let [q0, q1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let cap_end = coedge.pcurve.evaluate(if walks_to_pole { q0 } else { q1 }).or_refuse(KernelStage::Refine, "evaluate")?;
+            let pole_end = coedge.pcurve.evaluate(if walks_to_pole { q1 } else { q0 }).or_refuse(KernelStage::Refine, "evaluate")?;
+            let mut chart: Vec<(f64, f64)> = if face.id == canal_face {
+                crease.uv.clone()
+            } else {
+                crease.points.iter().map(|point| {
+                    crate::project_point_to_surface(&face.surface, *point).map(|foot| (foot.u, foot.v))
+                }).collect::<Result<_, _>>().or_refuse(KernelStage::Refine, "project_point_to_surface")?
+            };
+            // The pole keeps the chart point the loop already gives it.
+            if let Some(last) = chart.last_mut() { *last = (pole_end.x, pole_end.y); }
+            let k_uv = chart[0];
+            let samples: Vec<crate::Vec4> = chart.iter().map(|(u, v)| crate::Vec4::from_point(Vec3::new(*u, *v, 0.0), 1.0)).collect();
+            let along = crate::fit::interpolate_homogeneous(&samples, 3, &parameters).or_refuse(KernelStage::Refine, "canal_crease_pcurve")?;
+            let cap_uv = (cap_end.x, cap_end.y);
+            let replacement = if walks_to_pole {
+                [
+                    CoedgeRecord { id: take_id(), edge_id: arc_id, forward: coedge.forward, pcurve: line(cap_uv, k_uv)? },
+                    CoedgeRecord { id: take_id(), edge_id: crease_id, forward: true, pcurve: along },
+                ]
+            } else {
+                [
+                    CoedgeRecord { id: take_id(), edge_id: crease_id, forward: false, pcurve: along.reversed().or_refuse(KernelStage::Refine, "reversed")? },
+                    CoedgeRecord { id: take_id(), edge_id: arc_id, forward: coedge.forward, pcurve: line(k_uv, cap_uv)? },
+                ]
+            };
+            face.loops[position].coedges.splice(at..=at, replacement);
+        }
+    }
+    if uses != 2 {
+        return Err(internal("canal_crease_uses", "blend network: the stop's section arc is not shared by exactly two faces"));
+    }
+    Ok(())
 }
 
 /// Put the concave-edge piece between the two poles into the loop of the wall

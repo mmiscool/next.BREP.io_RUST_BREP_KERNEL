@@ -159,12 +159,69 @@ pub fn transform_brep(
             }
         }
     }
+    let mode = carry_verdict_mode();
+    let carried = mode != crate::env_read::Mode::Off
+        && carries_clean_verdict(solid, transform, reverse_orientation);
+    if carried && mode == crate::env_read::Mode::On {
+        CARRIED_VERDICTS.with(|count| count.set(count.get() + 1));
+        if crate::profile::profile_enabled() {
+            profile_line!("transform.verdict carried=1");
+        }
+        return Ok(result);
+    }
     let issues = result.validate();
+    if mode == crate::env_read::Mode::Check && crate::profile::profile_enabled() {
+        // What carrying would have answered, against the copy's own verdict.
+        profile_line!(
+            "transform.verdict check carried={} issues={} disagree={}",
+            u8::from(carried),
+            issues.len(),
+            u8::from(carried && !issues.is_empty())
+        );
+    }
     if issues.is_empty() {
         Ok(result)
     } else {
         Err(format!("transformed BREP is invalid: {issues:?}"))
     }
+}
+
+/// Whether a rigid placement may keep its source's clean validation verdict
+/// instead of validating the moved copy. A proper rigid map (the shared
+/// `RIGID_TOL` band components are placed under) changes no distance, angle,
+/// parameter or topology. It does change one input of `validate`: the
+/// identity and pcurve bands are sized from the AXIS-ALIGNED bounding box of
+/// the vertices, whose diagonal moves under a rotation, so a copy read with
+/// its own (narrower) bands could report an issue its source does not. The
+/// carried verdict is the source's, read in the source's frame. The source's
+/// verdict comes from the content-keyed validate memo: the first placement of
+/// a part validates the part once, each further placement of the same
+/// content reads the memo. A source with issues is never carried; its copy is
+/// validated as before. `BREP_TRANSFORM_CARRY_VERDICT`: off by default, `1`
+/// carries, `check` validates every copy anyway and prints (`BREP_PROFILE`)
+/// whether carrying would have disagreed.
+fn carries_clean_verdict(
+    solid: &BrepSolid,
+    transform: AffineTransform,
+    reverse_orientation: bool,
+) -> bool {
+    !reverse_orientation
+        && transform.is_rigid(crate::RIGID_TOL)
+        && solid.validate_memoised().is_empty()
+}
+
+thread_local! {
+    /// Placements on this thread that kept their source's verdict.
+    static CARRIED_VERDICTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many placements on this thread have kept their source's verdict.
+pub(crate) fn carried_verdicts() -> u64 {
+    CARRIED_VERDICTS.with(|count| count.get())
+}
+
+fn carry_verdict_mode() -> crate::env_read::Mode {
+    crate::mode_switch!("BREP_TRANSFORM_CARRY_VERDICT", false)
 }
 
 /// Reflect an exact BREP across the plane through `plane_point` with unit

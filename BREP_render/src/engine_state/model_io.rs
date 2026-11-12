@@ -1205,6 +1205,17 @@ impl EngineState {
         // ONE writer for the whole import, so identical content is written to
         // the store exactly once however many products or LEVELS share it.
         let mut writer = PartWriter::new(sink);
+        // Phase wall-clock on stderr under the kernel importer's own switch
+        // (never set in the browser, where the clock is not read at all).
+        let mut phase_clock = std::env::var("BREP_DEBUG_STEP_LOOP")
+            .is_ok()
+            .then(std::time::Instant::now);
+        let mut phase = |name: &str| {
+            if let Some(started) = phase_clock.as_mut() {
+                eprintln!("PHASE consume {name}: {:?}", started.elapsed());
+                *started = std::time::Instant::now();
+            }
+        };
 
         // --- what to build ------------------------------------------------
         // One row per component the USER'S document gets, each naming the
@@ -1223,6 +1234,7 @@ impl EngineState {
             mut failed_products,
             baked_below_root,
         } = plan;
+        phase("plan");
 
         // --- build the library entries -------------------------------------
         // In (pd_ref, factor) order so an import is deterministic regardless of
@@ -1270,6 +1282,7 @@ impl EngineState {
                 }
             }
         }
+        phase(&format!("library entries ({} keys)", keys.len()));
         if entry_names.is_empty() {
             return Consumed::NoComponents {
                 failed_products,
@@ -1346,7 +1359,9 @@ impl EngineState {
         self.pending_fit = true;
         let instances = features.len();
         let baked_nonrigid = baked_nonrigid + baked_below_root;
+        phase(&format!("instance features + parts library ({instances})"));
         self.add_features(&features);
+        phase("add_features (rebuild)");
 
         // The file's ASSEMBLY-level PMI — annotations it pinned to an
         // occurrence, annotations spanning two parts, free notes — merged into
@@ -1369,6 +1384,7 @@ impl EngineState {
         // place it — the exporter's rule, which is what makes the round trip
         // land the same annotations on the same parts.
         let pmi_unplaced = self.merge_assembly_pmi(&assembly, &namespaces);
+        phase("assembly pmi");
         for line in &assembly.pmi_diagnostics {
             note(&mut first_error, line.clone());
         }

@@ -13,7 +13,7 @@ pub type SessionSlot = Arc<RwLock<Option<Arc<Session>>>>;
 
 /// Tool names the server implements itself (compositions and file halves);
 /// the app command of the same name is not exposed twice.
-pub const SERVER_OWNED: &[&str] = &["files", "illustration_presentation", "screenshot", "feature_add", "feature_add_many", "feature_set_params", "doc_import", "doc_export", "doc_load", "cam_post_text"];
+pub const SERVER_OWNED: &[&str] = &["files", "illustration_presentation", "screenshot", "feature_add", "feature_add_many", "feature_set_params", "doc_import", "doc_open_with", "doc_export", "doc_load", "cam_post_text"];
 
 /// The server-owned tool that WRAPS an app command under a different name.
 ///
@@ -27,6 +27,7 @@ pub const SERVER_TOOL_FOR: &[(&str, &str)] = &[
     ("doc_load", "document_open"),
     ("doc_json", "document_save"),
     ("doc_import", "document_import"),
+    ("doc_open_with", "document_open_with"),
     ("doc_export", "document_export"),
     ("cam_post_text", "cam_post"),
 ];
@@ -298,6 +299,16 @@ pub fn app_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                 props.insert("timeout_ms".into(), json!({ "type": "integer", "default": 60000 }));
             }
         }
+        // Every command takes the document context at the root of its
+        // arguments (the frame thread checks it); the schema says so, so the
+        // declarations type it and the script bridge can tell a tool that
+        // checks a context from one that would ignore it.
+        if let Some(o) = schema.as_object_mut() {
+            o.entry("properties").or_insert_with(|| json!({}));
+        }
+        if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            props.entry("context").or_insert_with(context_schema);
+        }
         let output_schema = desc["resultSchema"].clone();
         let slot = slot.clone();
         let cmd = name.clone();
@@ -324,7 +335,7 @@ pub fn app_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                     reply.result.clone().unwrap_or(Value::Null)
                 } else {
                     let e = reply.error.clone().unwrap_or_else(|| "command failed".into());
-                    session.record(&cmd, &args, false, json!({ "error": e }));
+                    session.record(&cmd, &without_context(&args), false, json!({ "error": e }));
                     return Err(e);
                 };
                 // A reply that is not an object (describe_commands is an array)
@@ -336,8 +347,9 @@ pub fn app_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                 result["frame"] = json!(reply.frame);
                 if wait {
                     settled_result(&mut result, after_wait(&session, timeout_ms).await?);
+                    settled_context(&session, &mut result, &args).await;
                 }
-                session.record(&cmd, &args, true, json!({ "frame": reply.frame }));
+                session.record(&cmd, &without_context(&args), true, json!({ "frame": reply.frame }));
                 let mut out = ToolOutput::json(result);
                 if let Some(png) = reply.blob {
                     out.images.push(ToolImage { png, mime: "image/png" });
@@ -350,5 +362,42 @@ pub fn app_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
         }
     }
     out
+}
+
+/// The document context every app command takes at the root of its
+/// arguments (`docs_list` describes it); every native command declares it and the
+/// tools composed over one forward it, so the frame thread checks it right before the write.
+pub(crate) fn context_schema() -> Value {
+    json!({ "type": "object", "properties": { "documentId": { "type": "string" }, "expectedRevision": { "type": "string" } }, "required": ["documentId", "expectedRevision"], "additionalProperties": false,
+        "description": "optional {documentId, expectedRevision} from docs_list or an earlier reply: the write is refused (revision_conflict, document_not_active) unless it names the visible document at that revision; the reply carries the context after the write" })
+}
+
+/// `request` with the caller's `context`, when it gave one.
+pub(crate) fn with_context(mut request: Value, args: &Value) -> Value {
+    if let (Some(o), Some(ctx)) = (request.as_object_mut(), args.get("context")) {
+        o.insert("context".into(), ctx.clone());
+    }
+    request
+}
+
+/// What a session recording keeps of the arguments: a context names one
+/// run's document handle and revision, which a replay never has.
+pub(crate) fn without_context(args: &Value) -> Value {
+    let mut args = args.clone();
+    if let Some(o) = args.as_object_mut() { o.remove("context"); }
+    args
+}
+
+/// After a settle wait the geometry run has landed and moved the revision
+/// again: answer the context as it is now, so the caller's next write can
+/// pass it unchanged.
+pub(crate) async fn settled_context(session: &Session, r: &mut Value, args: &Value) {
+    let Some(id) = args.get("context").and_then(|c| c["documentId"].as_str()) else { return };
+    let Ok(reply) = session.host.call_ok("docs_list", json!({})).await else { return };
+    let tabs = reply.result.unwrap_or(Value::Null);
+    let revision = tabs["tabs"].as_array().into_iter().flatten().find(|t| t["id"] == id).map(|t| t["revision"].clone());
+    if let (Some(o), Some(revision)) = (r.as_object_mut(), revision) {
+        o.insert("context".into(), json!({ "documentId": id, "expectedRevision": revision }));
+    }
 }
 

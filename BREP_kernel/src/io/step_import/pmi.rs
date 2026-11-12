@@ -886,8 +886,14 @@ pub fn read_step_pmi(text: &str, feature_name: &str) -> Result<Option<PmiState>,
 
 /// The cheap text test that keeps a PMI-less file off the parse. A superset of
 /// the entity test — a mention inside a comment merely costs one parse.
+///
+/// `DIMENSIONAL_EXPONENTS` does not count: it is part of a unit definition,
+/// which nearly every file carries, and no annotation is read from it. Counting
+/// it sent almost every file through the whole PMI lift (and, on the
+/// structured lane, a face pairing per body) to find nothing.
 pub(super) fn file_mentions_pmi(text: &str) -> bool {
-    text.contains("DIMENSIONAL_")
+    text.match_indices("DIMENSIONAL_")
+        .any(|(at, _)| !text[at..].starts_with("DIMENSIONAL_EXPONENTS"))
         || text.contains("_TOLERANCE(")
         || text.contains("DATUM(")
         || text.contains("CAMERA_MODEL_D3(")

@@ -1598,6 +1598,41 @@ fn boundary_identified(
 ///
 /// The widest-separated qualifying pair is reported, with every margin it
 /// cleared.
+fn fold_pole_exempt_enabled() -> bool {
+    switch!("BREP_FOLD_POLE_EXEMPT", true)
+}
+
+/// The face's POLES: the 3D point of every boundary coedge whose pcurve spans
+/// parameter length but whose image on the surface stays within `band` of one
+/// point (sampled at 17 points along the pcurve).
+fn trim_poles(face: &crate::topology::FaceRecord, band: f64) -> Vec<Vec3> {
+    let mut poles = Vec::new();
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let Ok([t0, t1]) = coedge.pcurve.domain() else { continue };
+        let mut uv = Vec::with_capacity(17);
+        for k in 0..=16 {
+            let Ok(p) = coedge.pcurve.evaluate(t0 + (t1 - t0) * k as f64 / 16.0) else { break };
+            uv.push(p);
+        }
+        if uv.len() != 17 {
+            continue;
+        }
+        let span = uv.windows(2).map(|pair| (pair[1].x - pair[0].x).hypot(pair[1].y - pair[0].y)).sum::<f64>();
+        if !(span > 0.0) {
+            continue;
+        }
+        let images: Vec<Vec3> = uv.iter().filter_map(|p| face.surface.evaluate(p.x, p.y).ok()).collect();
+        if images.len() != 17 {
+            continue;
+        }
+        let first = images[0];
+        if images.iter().all(|q| q.sub(first).length() <= band) {
+            poles.push(first);
+        }
+    }
+    poles
+}
+
 fn confirm_fold(
     face: &crate::topology::FaceRecord,
     grid: &FoldGrid,
@@ -1730,6 +1765,18 @@ fn confirm_fold(
         return FoldVerdict::Rejected;
     }
 
+    // POLE OF THE TRIM (`BREP_FOLD_POLE_EXEMPT`, default on; `=0` restores): where a boundary coedge spans
+    // the parameter plane but its image is one point (a cone's apex the carve trims a carrier
+    // at), feet on either side of it are close in 3D because the surface converges there,
+    // not because it folds; under a mesh whose chord band reaches across the pole they read
+    // as one point (a cone r 3 h 4 shrunk by 0.99..1.05: feet 8.7e-3 apart in a 7e-3 band,
+    // normals 92.6 degrees apart near the apex). A pair whose feet both lie within the band
+    // of such a pole is not a fold.
+    let poles = if fold_pole_exempt_enabled() { trim_poles(face, coincidence) } else { Vec::new() };
+    let near_pole = |foot: &crate::projection::SurfaceProjection| {
+        poles.iter().any(|pole| foot.point.sub(*pole).length() <= 2.0 * coincidence)
+    };
+    let mut pole_pairs = 0usize;
     let mut chosen: Option<(f64, usize, usize, f64)> = None;
     let mut worst_sine = 0.0f64;
     let mut identified = 0usize;
@@ -1738,6 +1785,10 @@ fn confirm_fold(
         for second in (first + 1)..inside.len() {
             if inside[first].2 && inside[second].2 {
                 trim_pairs += 1;
+                continue;
+            }
+            if near_pole(inside[first].0) && near_pole(inside[second].0) {
+                pole_pairs += 1;
                 continue;
             }
             // Two feet with the TRIM between them — the uv segment joining
@@ -1795,7 +1846,7 @@ fn confirm_fold(
     }
     let Some((separation, first, second, sine)) = chosen else {
         fold_trace!(
-            "fold face {}: no pair of feet is a fold (widest sine {worst_sine:.3e}, {identified} pair(s) are one locus across an undeclared seam, {trim_pairs} pair(s) both on the trim's own boundary) — a degenerate parameterization or the trim's own seam, not a fold",
+            "fold face {}: no pair of feet is a fold (widest sine {worst_sine:.3e}, {identified} pair(s) are one locus across an undeclared seam, {trim_pairs} pair(s) both on the trim's own boundary, {pole_pairs} pair(s) at a pole of the trim) — a degenerate parameterization or the trim's own seam, not a fold",
             face.id
         );
         return FoldVerdict::Rejected;

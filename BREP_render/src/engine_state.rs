@@ -296,6 +296,11 @@ pub struct EngineState {
     pub(crate) pmi_balloon_stale: Option<String>,
     /// `(world_per_pixel, view direction)` the PMI overlay was last baked at.
     pub(crate) pmi_overlay_key: Option<(f64, [f64; 3])>,
+    /// The center marks the last PMI overlay bake drew, for automation
+    /// ([`Self::pmi_center_marks_json`]): `(annotation id, per mark its two
+    /// cross arms as unit world directions)`, read in f64 before the
+    /// overlay's f32 buffers, with the bake's view direction.
+    pub(crate) pmi_center_marks_drawn: (Vec<(String, Vec<[[f64; 3]; 2]>)>, [f64; 3]),
     pub(crate) pmi_hovered: Option<String>,
     pub(crate) pmi_label_hover_active: bool,
     /// The sheet the sheet viewport shows (engine memory, never persisted).
@@ -824,6 +829,7 @@ impl Default for EngineState {
             pmi_state_cache: Default::default(),
             pmi_balloon_stale: None,
             pmi_overlay_key: None,
+            pmi_center_marks_drawn: Default::default(),
             pmi_hovered: None,
             pmi_label_hover_active: false,
             spline_overlay_key: None,

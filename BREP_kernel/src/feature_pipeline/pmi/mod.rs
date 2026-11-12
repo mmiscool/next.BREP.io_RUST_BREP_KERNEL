@@ -1024,6 +1024,50 @@ pub enum PmiGeometry {
         normal: [f64; 3],
         frame: FcfFrame,
     },
+    /// Centre crosses on round features, the dashes reaching `extension`
+    /// (model units) past each circle.
+    CenterMark {
+        marks: Vec<CenterCircle>,
+        extension: f64,
+    },
+    /// A chain line from `a` to `b` (its extension already included).
+    CenterLine {
+        a: [f64; 3],
+        b: [f64; 3],
+    },
+}
+
+/// One centre mark: the circle it marks. `axis` is the circle's normal, or
+/// zero for a sphere (its mark lies in the model's XY plane, or in a picked
+/// annotation plane). A cylinder or cone face is marked at the end its axis
+/// points to, `depth` the face's length back along the axis to its other
+/// end: the layout draws the mark on whichever end faces the viewer (zero
+/// for an edge's or a sphere's mark).
+///
+/// `x_dir` fixes the cross in the model: one arm runs along it, the other
+/// along `axis × x_dir`. It is a unit vector in the circle's plane (for a
+/// sphere, the direction the layout projects into the mark's plane), taken
+/// from the annotation's orientation reference or, without one, the model X
+/// axis (Y where X is along the circle's axis). Zero (a row resolved before
+/// the field existed) applies the same default in the layout; the camera
+/// never turns the cross.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CenterCircle {
+    pub center: [f64; 3],
+    pub axis: [f64; 3],
+    pub radius: f64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub depth: f64,
+    #[serde(default, rename = "xDir", skip_serializing_if = "is_zero_vector")]
+    pub x_dir: [f64; 3],
+}
+
+fn is_zero_vector(value: &[f64; 3]) -> bool {
+    value.iter().all(|c| *c == 0.0)
+}
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
 }
 
 /// The cells of a feature control frame.
@@ -1447,6 +1491,17 @@ fn annotation_plane(
         PmiGeometry::Radial { axis, sphere: false, .. } => {
             if v3(*axis).cross(normal).length() > PARALLEL {
                 return Err(format!("annotation plane '{name}' is not parallel to the circle's plane"));
+            }
+        }
+        PmiGeometry::CenterMark { marks, .. } => {
+            if marks.iter().any(|mark| v3(mark.axis).length() > 1e-12 && v3(mark.axis).cross(normal).length() > PARALLEL) {
+                return Err(format!("annotation plane '{name}' is not parallel to the marked circle's plane"));
+            }
+        }
+        PmiGeometry::CenterLine { a, b } => {
+            let span = v3(*b).sub(v3(*a));
+            if span.length() > 1e-9 && span.normalized().map(|d| d.dot(normal).abs()).unwrap_or(0.0) > PARALLEL {
+                return Err(format!("annotation plane '{name}' is not parallel to the centerline"));
             }
         }
         _ => {}

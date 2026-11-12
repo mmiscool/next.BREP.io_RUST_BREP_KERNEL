@@ -127,6 +127,57 @@ fn frame_rect(left: Vec3, width: f64, height: f64, right: Vec3, up: Vec3) -> Vec
     ]
 }
 
+/// A centre mark: a short cross at `center` (its arms a quarter of the
+/// radius), a gap, then a long dash along each arm out to `extension` past
+/// the circle. Sized by the feature, so it scales with the part.
+fn center_cross(center: Vec3, u: Vec3, v: Vec3, radius: f64, extension: f64) -> Vec<Vec<[f64; 3]>> {
+    let arm = radius * 0.25;
+    let gap = radius * 0.12;
+    let reach = radius + extension;
+    let mut out = vec![
+        vec![a3(center.sub(u.scale(arm))), a3(center.add(u.scale(arm)))],
+        vec![a3(center.sub(v.scale(arm))), a3(center.add(v.scale(arm)))],
+    ];
+    for dir in [u, u.scale(-1.0), v, v.scale(-1.0)] {
+        out.push(vec![a3(center.add(dir.scale(arm + gap))), a3(center.add(dir.scale(reach)))]);
+    }
+    out
+}
+
+/// A chain line from `a` to `b`: long dashes and short dashes separated by
+/// gaps, a long dash at each end. The pattern is sized from the arrowhead
+/// (`unit`), and the long dashes stretch so a whole number of cycles fills
+/// the line; a line too short for one cycle is drawn solid.
+pub(crate) fn chain_line(a: Vec3, b: Vec3, unit: f64) -> Vec<Vec<[f64; 3]>> {
+    let span = b.sub(a);
+    let length = span.length();
+    if length < 1e-12 {
+        return Vec::new();
+    }
+    let d = span.scale(1.0 / length);
+    let long = unit * 6.0;
+    let short = unit * 1.2;
+    let gap = unit * 0.6;
+    let cycles = if unit > 0.0 { ((length - long) / (long + short + 2.0 * gap)).floor() } else { 0.0 };
+    if !(cycles >= 1.0) {
+        return vec![vec![a3(a), a3(b)]];
+    }
+    let cycles = cycles as usize;
+    let long = (length - cycles as f64 * (short + 2.0 * gap)) / (cycles + 1) as f64;
+    let mut out = Vec::with_capacity(2 * cycles + 1);
+    let mut at = 0.0;
+    for k in 0..=cycles {
+        out.push(vec![a3(a.add(d.scale(at))), a3(a.add(d.scale((at + long).min(length))))]);
+        at += long;
+        if k < cycles {
+            at += gap;
+            out.push(vec![a3(a.add(d.scale(at))), a3(a.add(d.scale(at + short)))]);
+            at += short + gap;
+        }
+    }
+    out
+}
+
 /// Lay out `geometry` with its label at `label`.
 pub fn present(geometry: &PmiGeometry, label: [f64; 3], text: &str, style: &LayoutStyle) -> Presentation {
     let mut out = Presentation {
@@ -325,6 +376,43 @@ pub fn present(geometry: &PmiGeometry, label: [f64; 3], text: &str, style: &Layo
                 up: a3(up),
                 height: style.text_height,
             });
+        }
+        PmiGeometry::CenterMark { marks, extension } => {
+            for mark in marks {
+                let axis = v3(mark.axis);
+                // A hole's or a shaft's mark goes on the end facing the
+                // viewer, not on the rim behind the part.
+                let mut center = v3(mark.center);
+                if mark.depth > 0.0 && axis.dot(view) > 0.0 {
+                    center = center.sub(axis.scale(mark.depth));
+                }
+                // The cross is fixed in the model, never turned by the
+                // camera: it lies in the circle's plane (a sphere's in the
+                // model XY plane), one arm along the resolved `x_dir`, the
+                // other square to it. In a plane (a picked one, parallel to
+                // the circle; or the view-parallel plane a file export lays
+                // a row in) each point is projected onto it, so the file
+                // carries the cross as the view shows it.
+                let axis = if axis.length() < 1e-12 { Vec3::new(0.0, 0.0, 1.0) } else { axis };
+                let x_dir = v3(mark.x_dir);
+                let x_dir = if x_dir.length() > 1e-12 {
+                    x_dir
+                } else if axis.cross(Vec3::new(1.0, 0.0, 0.0)).length() > 1e-6 {
+                    Vec3::new(1.0, 0.0, 0.0)
+                } else {
+                    Vec3::new(0.0, 1.0, 0.0)
+                };
+                let u = perpendicular_in_plane(axis, x_dir);
+                let v = unit_or(axis.cross(u), up);
+                out.polylines.extend(
+                    center_cross(center, u, v, mark.radius, *extension)
+                        .into_iter()
+                        .map(|line| line.into_iter().map(|p| a3(project(v3(p)))).collect::<Vec<_>>()),
+                );
+            }
+        }
+        PmiGeometry::CenterLine { a, b } => {
+            out.polylines.extend(chain_line(project(v3(*a)), project(v3(*b)), style.arrow));
         }
         PmiGeometry::Fcf { anchor, frame, .. } => {
             let anchor = v3(*anchor);

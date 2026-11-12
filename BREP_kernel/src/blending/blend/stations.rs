@@ -292,6 +292,9 @@ pub(super) fn tangency_residual(
     section_point: Vec3,
     section_tangent: Vec3,
 ) -> Result<([f64; 4], Vec3, Vec3, Vec3), KernelRefusal> {
+    if let Some(law) = super::setback::sides() {
+        return super::setback::residual_by_sides(law, [first, second], uv, section_point, section_tangent);
+    }
     let state = tangency_state(first, second, rho, uv, section_point, section_tangent)?;
     Ok((state.residual, state.p1, state.p2, state.center))
 }
@@ -802,6 +805,9 @@ pub(super) fn solve_station_centered(
     section_tangent: Vec3,
     scale: f64,
 ) -> Result<([f64; 4], Vec3), KernelRefusal> {
+    if let Some(law) = super::setback::sides() {
+        return super::setback::solve_centered_by_sides(law, [first, second], rho, seed, section_point, section_tangent, scale);
+    }
     solve_station_state(
         first,
         second,

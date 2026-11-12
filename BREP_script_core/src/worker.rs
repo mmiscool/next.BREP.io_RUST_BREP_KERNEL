@@ -109,6 +109,102 @@ fn fail(code: &str, e: JsError, cx: &mut Context) -> Value {
     done_error(if limit || message.contains("RuntimeLimitError") { "resource_limit" } else { code }, message)
 }
 
+/// A parse error made actionable: the parser's message, the source lines
+/// it points at with a caret, and the fix for the mistakes that produce it
+/// when a program travels inside JSON (a `\n` escape decoded to a real line
+/// break inside a quoted string; a whole program escaped twice).
+pub fn syntax_help(source: &str, message: &str) -> String {
+    let mut out = message.to_string();
+    let unterminated = message.to_ascii_lowercase().contains("unterminated string literal");
+    // Boa names no position for an unterminated string: find the quote
+    // that opens a string the line ends inside.
+    let (row, col) = position(message).or_else(|| if unterminated { open_quote(source) } else { None }).unwrap_or((0, 0));
+    let lines: Vec<&str> = source.lines().collect();
+    if (1..=lines.len()).contains(&row) {
+        out.push_str("\n");
+        for n in row.saturating_sub(1).max(1)..=(row + 1).min(lines.len()) {
+            let text: String = lines[n - 1].chars().take(160).collect();
+            out.push_str(&format!("\n{n:>4} | {text}"));
+            if n == row && col > 0 && col <= 161 {
+                out.push_str(&format!("\n     | {}^", " ".repeat(col - 1)));
+            }
+        }
+    }
+    if !source.contains('\n') && source.contains("\\n") {
+        out.push_str("\n\nhint: the program arrived as ONE line holding literal \\n sequences: it was escaped twice. Send real line breaks (one JSON string escape, not two).");
+    } else if unterminated {
+        out.push_str("\n\nhint: a '...' or \"...\" string cannot span lines. A program sent inside JSON turns each \\n into a real line break: write \\\\n in the JSON for the two-character escape, or use a template literal `...` for multi-line text (an expressions_set script, say).");
+        if lines.iter().any(|l| l.contains("n't") || l.contains("'s ")) {
+            out.push_str(" An apostrophe also ends a '...' string early: use \"...\" or `...` for text containing one.");
+        }
+    }
+    out
+}
+
+/// Where the first '...' or "..." string still open at its line's end
+/// begins (1-based row and column), skipping comments and template literals
+/// (a `${...}` inside one is skipped with it; a regex literal can mislead the
+/// scan, which only places a hint).
+fn open_quote(source: &str) -> Option<(usize, usize)> {
+    let (mut row, mut col) = (1usize, 0usize);
+    let mut quote: Option<(char, usize, usize)> = None;
+    let (mut template, mut line_comment, mut block_comment, mut escaped) = (false, false, false, false);
+    let mut prev = '\0';
+    for ch in source.chars() {
+        col += 1;
+        if ch == '\n' {
+            if quote.is_some() && !escaped { return quote.map(|(_, r, c)| (r, c)); }
+            row += 1;
+            col = 0;
+            line_comment = false;
+            escaped = false;
+            prev = ch;
+            continue;
+        }
+        if line_comment {
+        } else if block_comment {
+            if prev == '*' && ch == '/' { block_comment = false; }
+        } else if let Some((q, _, _)) = quote {
+            if escaped { escaped = false } else if ch == '\\' { escaped = true } else if ch == q { quote = None }
+        } else if template {
+            if escaped { escaped = false } else if ch == '\\' { escaped = true } else if ch == '`' { template = false }
+        } else if prev == '/' && ch == '/' {
+            line_comment = true;
+        } else if prev == '/' && ch == '*' {
+            block_comment = true;
+        } else if ch == '\'' || ch == '"' {
+            quote = Some((ch, row, col));
+        } else if ch == '`' {
+            template = true;
+        }
+        prev = if block_comment && prev == '/' && ch == '*' { '\0' } else { ch };
+    }
+    quote.map(|(_, r, c)| (r, c))
+}
+
+/// The first source position a parser message names: Boa's `line N, col M`
+/// or the TypeScript checker's `(N,M)`.
+fn position(message: &str) -> Option<(usize, usize)> {
+    let digits = |s: &str| -> Option<(usize, usize)> {
+        let n: String = s.chars().take_while(char::is_ascii_digit).collect();
+        Some((n.parse().ok()?, n.len()))
+    };
+    for (at, _) in message.match_indices("line ") {
+        let rest = &message[at + 5..];
+        let Some((row, used)) = digits(rest) else { continue };
+        let col = rest[used..].find("col").and_then(|c| digits(rest[used + c..].trim_start_matches(|ch: char| !ch.is_ascii_digit()))).map_or(0, |(c, _)| c);
+        return Some((row, col));
+    }
+    for (at, _) in message.match_indices('(') {
+        let rest = &message[at + 1..];
+        let Some((row, used)) = digits(rest) else { continue };
+        if !rest[used..].starts_with(',') { continue }
+        let Some((col, used2)) = digits(&rest[used + 1..]) else { continue };
+        if rest[used + 1 + used2..].starts_with(')') { return Some((row, col)); }
+    }
+    None
+}
+
 /// One execution, driven by its host's messages.
 pub struct Realm {
     cx: Context,
@@ -170,7 +266,13 @@ impl Realm {
     /// Evaluate the module and call its `main`: its Promise, or the `done`
     /// line when it cannot start.
     fn start_main(source: &str, cx: &mut Context) -> Result<JsPromise, Value> {
-        let module = Module::parse(Source::from_bytes(source).with_path(std::path::Path::new("main.js")), None, cx).map_err(|e| fail("compile_failed", e, cx))?;
+        let module = Module::parse(Source::from_bytes(source).with_path(std::path::Path::new("main.js")), None, cx).map_err(|e| {
+            let mut line = fail("compile_failed", e, cx);
+            if let Some(message) = line["done"]["error"]["message"].as_str() {
+                line["done"]["error"]["message"] = Value::String(syntax_help(source, message));
+            }
+            line
+        })?;
         let evaluated = module.load_link_evaluate(cx);
         cx.run_jobs().map_err(|e| fail("job_failed", e, cx))?;
         match evaluated.state() {
@@ -285,3 +387,4 @@ pub fn main() {
         }
     }
 }
+

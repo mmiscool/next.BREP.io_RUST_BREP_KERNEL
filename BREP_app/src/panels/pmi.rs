@@ -7,7 +7,7 @@
 //! # Tree mode
 //!
 //! Header: **Capture view** (snapshot the camera + visibility into a new,
-//! active view), **+ Add annotation** (the ten types, enabled while a view
+//! active view), **+ Add annotation** (the twelve types, enabled while a view
 //! is active — creation is gated on an active view), the active view's
 //! **Text size** (points) and a summary.
 //!
@@ -469,8 +469,12 @@ impl PmiPanel {
             let can_add = active.is_some();
             let mut add_type: Option<String> = None;
             ui.add_enabled_ui(can_add, |ui| {
+                // Every type listed at once: the combo's default ~200 pt cap
+                // scrolled the list once a twelfth type joined, clipping the
+                // last entries (Explode, Hide) out of reach of a click.
                 let combo = egui::ComboBox::from_id_salt("pmi-add")
                     .selected_text("+ Add annotation")
+                    .height((ui.ctx().content_rect().height() - 80.0).max(200.0))
                     .show_ui(ui, |ui| {
                         for def in PMI_TYPES.iter() {
                             let item = crate::icon_text::selectable_icon_label(ui, false, def.long_name);

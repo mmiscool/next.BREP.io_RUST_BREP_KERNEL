@@ -516,6 +516,14 @@ fn carve_folded_support_impl(
         )));
     }
 
+    // A PINCH ends the cavity at the point the offset collapses to, so its
+    // boundary is re-carved at the collapse itself (`pinch_at_collapse`).
+    let carved = if !shielded && pinch_at_collapse_on() {
+        pinch_at_collapse(source, face, &loops, displacement, distance, carved)?
+    } else {
+        carved
+    };
+
     let mut fold_boundary = 0usize;
     let mut new_loops = Vec::with_capacity(carved.kept[0].len());
     for carved_loop in &carved.kept[0] {
@@ -604,6 +612,56 @@ fn carve_folded_support_impl(
         fold_boundary,
         shielded_cusp: shielded,
     }))
+}
+
+/// `BREP_OFFSET_PINCH_AT_COLLAPSE` (default on; `=0` restores): a pinch's
+/// boundary is carved at `1 − δ·κ = 0`, not at [`COLLAPSE_FACTOR`].
+///
+/// The carve traces the factor's level `COLLAPSE_FACTOR` so that a generic
+/// fold's boundary keeps clear of the collapse; but a PINCH's boundary has one
+/// point for its offset image, and at that level the image is instead a circle
+/// of radius `ρ·COLLAPSE_FACTOR` short of it. The cavity then closed on a
+/// vertex beside its apex: brep-bench shell/tall-frustum-sealed-below-its-
+/// opening put it 2.7e-6 from the apex (1.33e-6 of the wall at every wall and
+/// scale), and a reader that integrates without pcurves cannot tell that loop
+/// reaches the apex — the bench's STEP measurer read the cavity as 10.5π, not
+/// 12π. At level 0 the boundary IS the collapse, and its image is the apex to
+/// the crossing's tolerance.
+fn pinch_at_collapse_on() -> bool {
+    switch!("BREP_OFFSET_PINCH_AT_COLLAPSE", true)
+}
+
+/// The carve of a PINCH re-read at the collapse level, or the carve at
+/// [`COLLAPSE_FACTOR`] unchanged where that re-carve does not come back as the
+/// same division (one kept piece, the same loops and pieces, a pinch still).
+fn pinch_at_collapse(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    loops: &[Vec<crate::NurbsCurve>],
+    displacement: f64,
+    distance: f64,
+    carved: crate::offset_carve::CarvedTrim,
+) -> Result<crate::offset_carve::CarvedTrim, KernelRefusal> {
+    let Ok(mut exact) = carve_folded_trim_scanned(&face.surface, loops, &[displacement], 0.0, ScanBudget::SHELL_FACE) else {
+        os_debug!("carve of source face {}: pinch re-carve at the collapse refused; kept at the collapse bar", face.id);
+        return Ok(carved);
+    };
+    let Some(at_collapse) = exact.carved.take() else {
+        return Ok(carved);
+    };
+    let shape = |trim: &crate::offset_carve::CarvedTrim| {
+        trim.kept.iter().map(|piece| piece.iter().map(|lp| lp.origin.clone()).collect::<Vec<_>>()).collect::<Vec<_>>()
+    };
+    if at_collapse.kept.len() != 1 || shape(&at_collapse) != shape(&carved) {
+        os_debug!("carve of source face {}: pinch re-carve at the collapse divides differently; kept at the collapse bar", face.id);
+        return Ok(carved);
+    }
+    let (extent, bar) = fold_image_extent(source, face, &at_collapse.kept[0], distance)?;
+    if extent > bar {
+        return Ok(carved);
+    }
+    os_debug!("carve of source face {}: pinch boundary re-carved at the collapse (image extent {extent:.3e})", face.id);
+    Ok(at_collapse)
 }
 
 fn support_over_trim(face: &FaceRecord) -> Result<NurbsSurface, KernelRefusal> {
@@ -1094,16 +1152,176 @@ fn skin_distance_to_trimmed_face(
     retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
 ) -> Result<f64, KernelRefusal> {
     let measured = if tangent_edge_euclid_on() {
-        miter_distance_with_tangent_edges(face, edges, point, &mut |edge| {
-            edge_is_tangent_to_a_retained_face(face, edge, retained_faces)
-        })?
+        let gauge = miter_neighbour_gauge_on();
+        miter_distance_with_neighbours(
+            face,
+            edges,
+            point,
+            &mut |edge| edge_is_tangent_to_a_retained_face(face, edge, retained_faces),
+            &mut |edge, at| if gauge { neighbour_outward_normal(face, edge, at, retained_faces) } else { Ok(None) },
+        )?
     } else {
         miter_distance_to_trimmed_face(face, edges, point)?
     };
     match measured {
         Some(measured) => Ok(measured),
-        None => distance_to_trimmed_face(face, edges, point),
+        None => match if ruled_miter_on() {
+            ruled_miter_distance(face, edges, point, &retained_faces.iter().map(|(other, _)| *other).collect::<Vec<_>>())?
+        } else {
+            None
+        } {
+            Some(measured) => Ok(measured),
+            None => distance_to_trimmed_face(face, edges, point),
+        },
     }
+}
+
+// The opening rim edges where an opening face meets a retained face SHARPLY, for the shell
+// being built ([`ruled_miter_distance`] reads it; the pipeline sets it for the call).
+thread_local! {
+    static SHARP_OPENING_RIMS: std::cell::RefCell<Option<HashSet<u64>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) struct SharpOpeningRims(Option<HashSet<u64>>);
+
+impl SharpOpeningRims {
+    pub(super) fn set(rims: HashSet<u64>) -> Self {
+        Self(SHARP_OPENING_RIMS.with(|cell| cell.replace(Some(rims))))
+    }
+    fn holds(edge: u64) -> bool {
+        SHARP_OPENING_RIMS.with(|cell| cell.borrow().as_ref().is_some_and(|rims| rims.contains(&edge)))
+    }
+}
+
+impl Drop for SharpOpeningRims {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        SHARP_OPENING_RIMS.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
+/// The edges an opening face shares with a retained face where their outward normals differ
+/// (read at the edge's middle on both): a sharp opening rim.
+pub(super) fn sharp_opening_rims(source: &BrepSolid, opening_face_ids: &[u64]) -> HashSet<u64> {
+    let faces = source.shells.iter().flat_map(|shell| &shell.faces).collect::<Vec<_>>();
+    let mut rims = HashSet::default();
+    for edge in &source.edges {
+        if edge.degenerate {
+            continue;
+        }
+        let users = faces
+            .iter()
+            .filter(|face| face.loops.iter().flat_map(|loop_record| &loop_record.coedges).any(|coedge| coedge.edge_id == edge.id))
+            .collect::<Vec<_>>();
+        let [a, b] = users[..] else { continue };
+        if opening_face_ids.contains(&a.id) == opening_face_ids.contains(&b.id) {
+            continue;
+        }
+        let Ok(middle) = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)) else { continue };
+        let normal = |face: &FaceRecord| {
+            crate::project_point_to_surface(&face.surface, middle)
+                .ok()
+                .and_then(|foot| super::smooth_sync::face_normal(face, foot.u, foot.v).ok())
+        };
+        if let (Some(na), Some(nb)) = (normal(a), normal(b)) {
+            if na.dot(nb) < 1.0 - 1e-6 {
+                rims.insert(edge.id);
+            }
+        }
+    }
+    rims
+}
+
+/// `BREP_OFFSET_RULED_MITER` (default on; `=0` restores): a full cone or cylinder of
+/// revolution is read in the mitered metric the planar faces use, along its
+/// rulings: where the point's foot on the generatrix line runs past the trim's
+/// ruling range, the reading is `max(height, past)` — the height over the
+/// generatrix extended, and how far past the trim the foot went.
+///
+/// Cause (brep-bench probe, a frustum r 10 to 4, height 5, shelled open at its
+/// top with wall 4, refused "non-integral genus"): the slant's offset is
+/// extended up to the opening plane, so the shell is mitered there, but the
+/// skin test read the slant by its EUCLIDEAN distance to the trimmed face,
+/// which past the top rim is the distance to the rim. The grown base's skin at
+/// the axis, (0, 0, 4), read 4.12 from the rim and so On, though it is 3.33
+/// from the slant's extended plane and no cavity is left (the mitered cavity
+/// ends at wall 3.8); the slant read shadowed, was omitted, and the base's
+/// lone disk was assembled as a sealed skin.
+pub(super) fn ruled_miter_on() -> bool {
+    switch!("BREP_OFFSET_RULED_MITER", true)
+}
+
+pub(super) fn ruled_miter_distance(
+    face: &FaceRecord,
+    edges: &[&EdgeRecord],
+    point: Vec3,
+    retained: &[&FaceRecord],
+) -> Result<Option<f64>, KernelRefusal> {
+    let Some(crate::AnalyticSurface::RuledRevolution { frame, rho0, rho1, height }) = face.surface.analytic() else {
+        return Ok(None);
+    };
+    let (rho0, rho1, height) = (*rho0, *rho1, *height);
+    let length = (rho1 - rho0).hypot(height);
+    if !(length > 0.0) {
+        return Ok(None);
+    }
+    // The trim's range along the ruling (v is linear along the generatrix over [0, 1]), and
+    // whether it goes all the way round (else the u sides decide, and they are not read here).
+    let ([u0, u1], [v0, v1]) = (
+        face.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?,
+        face.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?,
+    );
+    let (mut u_low, mut u_high, mut v_low, mut v_high) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let [t0, t1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        for k in 0..=16 {
+            let p = coedge.pcurve.evaluate(t0 + (t1 - t0) * k as f64 / 16.0).or_refuse(KernelStage::Refine, "evaluate")?;
+            (u_low, u_high, v_low, v_high) = (u_low.min(p.x), u_high.max(p.x), v_low.min(p.y), v_high.max(p.y));
+        }
+    }
+    let span_u = u1 - u0;
+    if !(u_high - u_low >= span_u * (1.0 - 1e-9)) || !(v1 > v0) {
+        return Ok(None);
+    }
+    let (s_low, s_high) = ((v_low - v0) / (v1 - v0), (v_high - v0) / (v1 - v0));
+    // The point in the half-plane: radius and height along the axis.
+    let d = point.sub(frame.origin);
+    let axial = d.dot(frame.axis);
+    let radius = d.sub(frame.axis.scale(axial)).length();
+    let (dr, dz) = (rho1 - rho0, height);
+    let s = ((radius - rho0) * dr + axial * dz) / (length * length);
+    let (past, end) = if s < s_low { ((s_low - s) * length, v_low) } else if s > s_high { ((s - s_high) * length, v_high) } else { return Ok(None) };
+    // Only past a rim that bounds an OPENING (no other retained face uses its edge): there the
+    // face's offset runs on to the opening plane, so the miter is the generatrix extended. Past a
+    // rim shared with a retained face that face's own offset closes the skin.
+    let band = 1e-9 * (v1 - v0).abs().max(1.0);
+    let mut opening_rim = false;
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let [t0, t1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let at_end = (0..=4).all(|k| {
+            coedge.pcurve.evaluate(t0 + (t1 - t0) * k as f64 / 4.0).is_ok_and(|p| (p.y - end).abs() <= band)
+        });
+        if !at_end {
+            continue;
+        }
+        let shared = retained
+            .iter()
+            .any(|other| other.id != face.id && other.loops.iter().flat_map(|loop_record| &loop_record.coedges).any(|use_| use_.edge_id == coedge.edge_id));
+        if shared || !edges.iter().any(|edge| edge.id == coedge.edge_id) {
+            return Ok(None);
+        }
+        // A pole (an apex) is no rim, and past a rim its opening meets TANGENTLY (a cylinder under
+        // a hemispherical dome opened) the offset does not run on along the ruling.
+        if edges.iter().any(|edge| edge.id == coedge.edge_id && edge.degenerate) || !SharpOpeningRims::holds(coedge.edge_id) {
+            return Ok(None);
+        }
+        opening_rim = true;
+    }
+    if !opening_rim {
+        return Ok(None);
+    }
+    let normal_height = ((radius - rho0) * dz - axial * dr).abs() / length;
+    Ok(Some(normal_height.max(past)))
 }
 
 /// `BREP_OFFSET_TANGENT_EDGE_EUCLID` (default on; `=0` restores): the skin
@@ -1199,6 +1417,72 @@ fn miter_distance_with_tangent_edges(
     point: Vec3,
     tangent: &mut dyn FnMut(&EdgeRecord) -> Result<bool, KernelRefusal>,
 ) -> Result<Option<f64>, KernelRefusal> {
+    miter_distance_with_neighbours(face, edges, point, tangent, &mut |_, _| Ok(None))
+}
+
+/// `BREP_OFFSET_MITER_NEIGHBOUR_GAUGE` (default on; `=0` restores): past a SHARP edge
+/// (interior, not at a vertex) the mitered distance to a planar face reads
+/// `max(height, h_N)`, `h_N` the point's height over the neighbour's tangent
+/// plane at the nearest edge point, along the neighbour's outward normal.
+///
+/// Cause (brep-bench probe, a cone r 3 h 4 grown by 2 refused "completed shell
+/// has invalid topology"): `max(height, past)` is the sharp join's distance
+/// only where the neighbour is square to the plane. At the cone's base the
+/// slant meets the base at 53.13 degrees, and a point of the slant's offset
+/// skin at (rho 4.30, z 1.6) read `max(1.6, 1.30)` = 1.6 from the base face,
+/// under the distance 2: the true wall fragment was dropped as SHADOWED and the
+/// one below the grown base kept. Its height over the slant's tangent plane is
+/// 0.8 x 1.30 + 0.6 x 1.6 = 2.00, on the skin. A square neighbour keeps the
+/// old reading bit for bit (there `h_N` is `past`).
+pub(super) fn miter_neighbour_gauge_on() -> bool {
+    switch!("BREP_OFFSET_MITER_NEIGHBOUR_GAUGE", true)
+}
+
+/// `BREP_OFFSET_MITER_VERTEX_GAUGE` (default on; `=0` restores): the neighbour gauge of
+/// [`miter_neighbour_gauge_on`] at a convex VERTEX, over every neighbour across
+/// the face's edges that meet there.
+///
+/// Cause (the triangular prism (0,0), (3,0), (0,4) extruded 5, grown by 2.5 or
+/// 3, refused "a rim vacated by an omitted support was left open"): a skin
+/// point of the vertical side past the acute corner's vertex read `max(h,
+/// past)` = 1.92 from the slant, under 2.5, so the whole side read shadowed and
+/// was omitted. A vertex whose neighbours are all square keeps the old reading.
+pub(super) fn miter_vertex_gauge_on() -> bool {
+    switch!("BREP_OFFSET_MITER_VERTEX_GAUGE", true)
+}
+
+/// The outward normal, at `at`, of the retained face other than `face` that
+/// uses `edge`, if there is one.
+fn neighbour_outward_normal(
+    face: &FaceRecord,
+    edge: &EdgeRecord,
+    at: Vec3,
+    retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
+) -> Result<Option<(Vec3, bool)>, KernelRefusal> {
+    for (other, _) in retained_faces {
+        if other.id == face.id {
+            continue;
+        }
+        let uses = other.loops.iter().flat_map(|loop_record| &loop_record.coedges).any(|coedge| coedge.edge_id == edge.id);
+        if uses {
+            let foot = crate::project_point_to_surface(&other.surface, at).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+            let planar = other.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")?;
+            return Ok(Some((super::smooth_sync::face_normal(other, foot.u, foot.v)?, planar)));
+        }
+    }
+    Ok(None)
+}
+
+/// [`miter_distance_with_tangent_edges`] with the neighbour gauge of
+/// [`miter_neighbour_gauge_on`]: `neighbour` gives the outward normal of the
+/// face across a sharp edge at its nearest point, or `None` to keep `past`.
+fn miter_distance_with_neighbours(
+    face: &FaceRecord,
+    edges: &[&EdgeRecord],
+    point: Vec3,
+    tangent: &mut dyn FnMut(&EdgeRecord) -> Result<bool, KernelRefusal>,
+    neighbour: &mut dyn FnMut(&EdgeRecord, Vec3) -> Result<Option<(Vec3, bool)>, KernelRefusal>,
+) -> Result<Option<f64>, KernelRefusal> {
     if !face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(None);
     }
@@ -1282,7 +1566,59 @@ fn miter_distance_with_tangent_edges(
         if !at_vertex && tangent(edge)? {
             best = best.min(height.hypot(past));
         } else {
-            best = best.min(height.max(past));
+            let mut reading = height.max(past);
+            // NEIGHBOUR GAUGE (`BREP_OFFSET_MITER_NEIGHBOUR_GAUGE`): across the interior of a
+            // convex sharp edge that is not square, the miter is the neighbour's offset plane.
+            if !at_vertex && past > 0.0 {
+                let projection = crate::project_point_to_curve(&edge.curve, foot).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
+                let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
+                let at = edge.curve.evaluate(projection.u.clamp(low, high)).or_refuse(KernelStage::Refine, "evaluate")?;
+                if let Some((across, _)) = neighbour(edge, at)? {
+                    let beyond = foot.sub(at);
+                    let square = across.dot(normal).abs() <= 1e-12;
+                    if !square && across.dot(beyond) > 0.0 {
+                        reading = height.max(point.sub(at).dot(across));
+                    }
+                }
+            } else if at_vertex && past > 0.0 && miter_vertex_gauge_on() {
+                // At a convex VERTEX the miter is every neighbour's offset plane across the
+                // face's edges that meet there (a triangular prism grown by 2.5: a skin point past
+                // the acute corner read max(h, past) = 1.92 from the slant and its face was
+                // dropped as shadowed). All square: the old reading stands.
+                let projection = crate::project_point_to_curve(&edge.curve, foot).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
+                let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
+                let at = edge.curve.evaluate(projection.u.clamp(low, high)).or_refuse(KernelStage::Refine, "evaluate")?;
+                let band = 1e-9 * (1.0 + at.length());
+                let mut heights = Vec::new();
+                let mut skew = false;
+                for other in edges.iter().copied() {
+                    if other.degenerate {
+                        continue;
+                    }
+                    let ends = [other.curve.evaluate(other.t0), other.curve.evaluate(other.t1)];
+                    if !ends.iter().any(|end| end.as_ref().is_ok_and(|end| end.sub(at).length() <= band)) {
+                        continue;
+                    }
+                    match neighbour(other, at).unwrap_or(Some((Vec3::default(), false))) {
+                        Some((across, true)) => {
+                            if across.dot(foot.sub(at)) > 0.0 {
+                                skew |= across.dot(normal).abs() > 1e-12;
+                                heights.push(point.sub(at).dot(across));
+                            }
+                        }
+                        // A curved neighbour at the vertex: its tangent plane is no miter there.
+                        Some((_, false)) => {
+                            skew = false;
+                            break;
+                        }
+                        None => {}
+                    }
+                }
+                if skew {
+                    reading = heights.into_iter().fold(height, f64::max);
+                }
+            }
+            best = best.min(reading);
             break;
         }
     }
@@ -1657,6 +1993,8 @@ pub(super) struct SealedSkin {
     /// The middle of each edge of its fragments' loops, with the source face
     /// whose offset that fragment lies on.
     pub(super) edge_middles: Vec<(u64, Vec3)>,
+    /// How many of the selected skin fragments it holds.
+    pub(super) fragments: usize,
 }
 
 /// The parts of the selected cavity skin (`offsets`, kept skin fragments)
@@ -1727,7 +2065,7 @@ pub(super) fn sealed_skins(
         .map(|(mut sources, sum, count, edge_middles)| {
             sources.sort_unstable();
             sources.dedup();
-            SealedSkin { sources, centre: sum.scale(1.0 / count as f64), edge_middles }
+            SealedSkin { sources, centre: sum.scale(1.0 / count as f64), edge_middles, fragments: count }
         })
         .collect())
 }

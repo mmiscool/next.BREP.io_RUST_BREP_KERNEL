@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 2400 2384" width="2400" height="2384" brep:glyph-name="feature_control_frame" brep:unicode="E0D5">
+  <!-- A feature control frame: three cells, a tolerance symbol in the first. -->
+  <path fill-rule="evenodd" d="M100 760H2300V1680H100ZM220 880V1560H2180V880Z" fill="#111"/>
+  <path d="M860 880H970V1560H860ZM1620 880H1730V1560H1620Z" fill="#111"/>
+  <path fill-rule="evenodd" d="M540 1000A220 220 0 1 1 540 1440A220 220 0 1 1 540 1000ZM540 1090A130 130 0 1 0 540 1350A130 130 0 1 0 540 1090Z" fill="#111"/>
+  <path d="M505 940H575V1500H505ZM300 1185H780V1255H300Z" fill="#111"/>
+  <path d="M1080 1160H1510V1280H1080Z" fill="#111"/>
+  <path d="M1955 960 2110 1480H1990L1955 1360 1920 1480H1800ZM1955 1120 1925 1260H1985Z" fill="#111"/>
+</svg>

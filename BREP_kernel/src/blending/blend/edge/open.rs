@@ -101,7 +101,19 @@ pub(super) fn blend_open_edge_impl(
         // The open-edge surgery locates its ends by support crossings, not by
         // the marched vertex stations; the snapped indices only break the fit
         // where the carriers' extension starts (`fit_open_rows`).
-        let (stations, vertex_indices, refinement, dense) = march_open_stations_core(
+        let law = crate::blend::setback::active();
+        let (stations, vertex_indices, refinement, dense) = if let Some(law) = law {
+            // An asymmetric chamfer's stations: the setback law's sections at
+            // the march's own parameters, refined by doubling to its bar.
+            let parameters = |count: usize| {
+                open_station_parameters(edge, overshoot_fraction, [edge.t0, edge.t1], count, [false, false])
+            };
+            let (stations, vertex_indices) = crate::blend::setback::march_open(
+                solid, edge, &first_mate, &second_mate, &law, station_count, &parameters, rail_bar,
+            )?;
+            let refinement = StationRefinement { exit: StationRefineExit::Converged, ..Default::default() };
+            (stations, vertex_indices, refinement, OpenDenseCentres::default())
+        } else { march_open_stations_core(
             edge,
             &first_mate,
             &second_mate,
@@ -114,7 +126,7 @@ pub(super) fn blend_open_edge_impl(
             crate::blend::station_refinement_on().then_some(rail_bar),
             if wall_check { OPEN_WALL_CENTRES } else { 0 },
             true,
-        )?;
+        )? };
         let parameters = station_parameters(&stations);
         let rows = fit_open_rows(
             &stations,

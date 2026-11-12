@@ -60,6 +60,18 @@ pub fn validate_front_door(name: &str, args: &serde_json::Value) -> Result<(), S
     Ok(())
 }
 
+/// A script call that passes `context` to a tool whose schema does not
+/// declare one: such a tool would drop it, and the caller would believe a
+/// revision check ran. Every native app command declares it (the frame
+/// thread checks it); a tool composed by the server declares it only when it
+/// forwards it. Shared by the native bridge and the browser's.
+pub fn undeclared_context(name: &str, input_schema: &serde_json::Value, args: &serde_json::Value) -> Option<String> {
+    if args.get("context").is_none() || input_schema.pointer("/properties/context").is_some() {
+        return None;
+    }
+    Some(format!("`{name}` does not check a document context, so it cannot honour `context`: call it without one. It acts on the visible document; brep.document.docs_list() names that document and its revision"))
+}
+
 /// One registry tool as a script sees it.
 #[derive(Debug, Clone)]
 pub struct ScriptTool {
@@ -123,9 +135,58 @@ pub fn tool_bindings(tools: &[ScriptTool]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "// The app's tool registry as functions: each call runs that tool's own\n// handler on the host, exactly as an MCP tool call would.\nasync function tool(name, args) {{\n  return unwrap(await call(\"tool.\" + name, args === undefined ? {{}} : args));\n}}\n\nexport const brep = {{\n{body}\n}};\n"
+        "// The app's tool registry as functions: each call runs that tool's own\n// handler on the host, exactly as an MCP tool call would.\nasync function tool(name, args) {{\n  return unwrap(await call(\"tool.\" + name, args === undefined ? {{}} : args));\n}}\n{GUARD}\nexport const brep = guardTree({{\n{body}\n}}, \"brep\");\n"
     )
 }
+
+/// `guardTree(object, path)`: the namespace a script reaches through, so a
+/// name that is not there says what is. A member spelled another way
+/// (`featureAdd`, `Feature-Add`) that matches exactly one member is that
+/// member; any other unknown member throws a TypeError naming the closest
+/// members and, for a function in another group, its full path. Without it
+/// Boa answers `brep.history.feature_add(...)` with "not a callable
+/// function" and the agent guesses again.
+const GUARD: &str = r#"
+const passThrough = new Set(["then", "toJSON", "constructor", "valueOf", "toString", "inspect", "prototype", "__proto__", "length", "name"]);
+const squash = (k) => k.toLowerCase().replace(/[^a-z0-9]/g, "");
+function distance(a, b) {
+  const row = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const next = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = row[j];
+      row[j] = next;
+    }
+  }
+  return row[b.length];
+}
+function guardTree(target, path, root) {
+  const top = root || target;
+  for (const [k, v] of Object.entries(target)) {
+    if (v && typeof v === "object" && Object.getPrototypeOf(v) === Object.prototype) target[k] = guardTree(v, path + "." + k, top);
+  }
+  return new Proxy(target, {
+    get(t, key, receiver) {
+      if (typeof key !== "string" || key in t || passThrough.has(key)) return Reflect.get(t, key, receiver);
+      const same = Object.keys(t).filter((k) => squash(k) === squash(key));
+      if (same.length === 1) return t[same[0]];
+      const near = Object.keys(t).map((k) => [distance(squash(k), squash(key)), k]).filter(([d]) => d <= Math.max(2, Math.floor(key.length / 3))).sort((a, b) => a[0] - b[0]).slice(0, 3).map(([, k]) => path + "." + k);
+      const elsewhere = [];
+      if (t !== top) {
+        for (const [g, members] of Object.entries(top)) {
+          if (members && typeof members === "object") for (const m of Object.keys(members)) if (squash(m) === squash(key)) elsewhere.push(path.split(".")[0] + "." + g + "." + m);
+        }
+      }
+      const hints = elsewhere.concat(near);
+      const group = path.split(".").slice(1).join(".");
+      const listing = path.startsWith("brep") ? (group ? "cad.docs.sdk(\"" + group + "\") lists " + path + ".*" : "cad.docs.sdk() lists the groups") : "cad.docs.sdk(\"cad\") declares the cad client";
+      throw new TypeError(path + "." + key + " does not exist" + (hints.length ? "; did you mean " + hints.join(" or ") + "?" : "") + " (" + listing + ")");
+    },
+  });
+}
+"#;
 
 /// The browser's `@brep/cad`: the bridge, `ApiFailure`, and [`tool_bindings`].
 /// The `cad` operation client and `service` are the native server's (its

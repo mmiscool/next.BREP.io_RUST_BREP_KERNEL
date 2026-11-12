@@ -15,8 +15,8 @@ use crate::Vec3;
 pub const DEF: PmiTypeDef = PmiTypeDef {
     type_id: "fcf",
     short_name: "FCF",
-    icon: "\u{2316}",
-    long_name: "\u{2316} Feature control frame",
+    icon: "\u{E0D5}",
+    long_name: "\u{E0D5} Feature control frame",
     label: "Feature control frame",
     applicable,
     schema,

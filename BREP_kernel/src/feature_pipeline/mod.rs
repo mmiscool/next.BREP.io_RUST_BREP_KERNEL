@@ -2123,6 +2123,8 @@ pub fn execute_history_observed(
     observe: &mut dyn FnMut(HistoryProgress<'_>) -> bool,
 ) -> HistoryResult {
     let _plugin_scope = extension::enter(&request.plugins);
+    // Part snapshots decoded once per run, however many instances place them.
+    let _decodes = features::assembly_component::DecodeMemoScope::open();
     let env = Env::build(&request.expressions, &request.configurator)
         .unwrap_or_else(Env::poisoned);
 

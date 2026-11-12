@@ -6,7 +6,9 @@ description: Design a BREP part or assembly well: modelling order, expressions, 
 How to build parts and assemblies that are correct, editable and survive later changes. Every function below is a
 script call (`await brep.<group>.<tool>(args)` inside `run_script`); read a feature's parameters with
 `brep.features.feature_schema({type})` (or `brep://schema/features/{type}`) before you set them, and the sketch
-format at `brep://schema/sketch`. Lengths are millimetres, angles degrees.
+format at `brep://schema/sketch`; a script reads any `brep://` reference with `await cad.docs.read("brep://schema/sketch")`.
+Every function takes ONE object argument; multi-line text inside a quoted string needs `\n`, or use a template literal.
+Lengths are millimetres, angles degrees.
 
 ## Rules
 

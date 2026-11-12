@@ -1320,8 +1320,10 @@ pub(super) fn resolve_assembly(
     // Build each distinct part solid once — with its appearance, which is a
     // property of the PART, not of the placement — then re-use both for every
     // occurrence.
+    // The readings are dropped below, so the builds do not take them.
+    let part_resolver = resolver.without_trim_readings();
     let build_part = |body: StepBody| {
-        build_step_body(resolver, body)
+        build_step_body(&part_resolver, body)
             .map(|(solid, _readings)| {
                 let appearance = step_body_appearance(resolver, styles, body, &solid);
                 let face_refs = super::pmi::body_face_refs(resolver, body, &solid);

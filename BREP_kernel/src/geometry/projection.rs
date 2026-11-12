@@ -1578,6 +1578,14 @@ pub(crate) struct ProjectionCells {
     boxes: Vec<CellBox>,
     /// The tree's root is the LAST node.
     tree: Vec<CellTreeNode>,
+    /// One box per tree node: a leaf's is its cell's box, an internal node's
+    /// holds both children's boxes grown by `node_margin` on every side (see
+    /// [`hull_candidates`]). Empty when the surface has no usable scale.
+    node_boxes: Vec<CellBox>,
+    /// The growth of each internal node's box over its children's.
+    node_margin: f64,
+    /// The largest control-point coordinate magnitude.
+    scale: f64,
     resolution: f64,
 }
 
@@ -1722,14 +1730,74 @@ fn enclosing_sphere(a: (Vec3, f64), b: (Vec3, f64)) -> (Vec3, f64) {
     (centre, radius)
 }
 
+/// What [`build_cell_tree`] reads besides the spheres: the cells' boxes and
+/// the lattice points (row-major, `lattice_columns` per row) that frame each
+/// internal node's box, and the margin each internal box grows by.
+struct NodeBoxInputs<'a> {
+    boxes: &'a [CellBox],
+    nodes: &'a [Vec3],
+    lattice_columns: usize,
+    margin: f64,
+}
+
+/// The box of an internal node: framed like a cell's (along u, then the
+/// normal of the region's lattice corners), spanning every corner of both
+/// children's boxes, grown by `margin` on every side. Unbounded when a frame or
+/// an extent is not finite, so it never prunes.
+fn enclosing_node_box(corners: [Vec3; 4], children: [&CellBox; 2], margin: f64) -> CellBox {
+    let unbounded = || CellBox {
+        axes: [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)],
+        low: [f64::NEG_INFINITY; 3],
+        high: [f64::INFINITY; 3],
+    };
+    let [c00, c10, c01, c11] = corners;
+    let along_u = c10.sub(c00).add(c11.sub(c01));
+    let along_v = c01.sub(c00).add(c11.sub(c10));
+    let e1 = unit_or(along_u, unit_or(along_v, Vec3::new(1.0, 0.0, 0.0)));
+    let Ok(fallback) = e1.perpendicular() else {
+        return unbounded();
+    };
+    let normal = unit_or(e1.cross(along_v), fallback);
+    let e2 = unit_or(normal.cross(e1), fallback);
+    let e3 = e1.cross(e2);
+    let axes = [e1, e2, e3];
+    let mut low = [f64::INFINITY; 3];
+    let mut high = [f64::NEG_INFINITY; 3];
+    for child in children {
+        for corner in 0..8 {
+            let mut point = Vec3::default();
+            for axis in 0..3 {
+                let value = if corner >> axis & 1 == 0 { child.low[axis] } else { child.high[axis] };
+                point = point.add(child.axes[axis].scale(value));
+            }
+            for axis in 0..3 {
+                let coordinate = point.dot(axes[axis]);
+                low[axis] = low[axis].min(coordinate);
+                high[axis] = high[axis].max(coordinate);
+            }
+        }
+    }
+    for axis in 0..3 {
+        low[axis] -= margin;
+        high[axis] += margin;
+    }
+    if !low.iter().chain(high.iter()).all(|value| value.is_finite()) {
+        return unbounded();
+    }
+    CellBox { axes, low, high }
+}
+
 fn build_cell_tree(
     tree: &mut Vec<CellTreeNode>,
+    node_boxes: &mut Vec<CellBox>,
+    inputs: &NodeBoxInputs<'_>,
     spheres: &[(Vec3, f64)],
     columns: usize,
     [row_low, row_high, column_low, column_high]: [usize; 4],
 ) -> u32 {
     if row_high - row_low == 1 && column_high - column_low == 1 {
         let cell = row_low * columns + column_low;
+        node_boxes.push(inputs.boxes[cell].clone());
         tree.push(CellTreeNode {
             centre: spheres[cell].0,
             radius: spheres[cell].1,
@@ -1751,10 +1819,21 @@ fn build_cell_tree(
             [row_low, row_high, middle, column_high],
         )
     };
-    let first = build_cell_tree(tree, spheres, columns, first);
-    let second = build_cell_tree(tree, spheres, columns, second);
+    let first = build_cell_tree(tree, node_boxes, inputs, spheres, columns, first);
+    let second = build_cell_tree(tree, node_boxes, inputs, spheres, columns, second);
     let a = tree[first as usize];
     let b = tree[second as usize];
+    let lattice = |row: usize, column: usize| inputs.nodes[row * inputs.lattice_columns + column];
+    node_boxes.push(enclosing_node_box(
+        [
+            lattice(row_low, column_low),
+            lattice(row_high, column_low),
+            lattice(row_low, column_high),
+            lattice(row_high, column_high),
+        ],
+        [&node_boxes[first as usize], &node_boxes[second as usize]],
+        inputs.margin,
+    ));
     // The resolution-inflated leaf spheres already absorb rounding; the merge
     // adds one more rounding of the same order, absorbed by growing the radius
     // by the larger child's own ulp.
@@ -1872,13 +1951,26 @@ fn build_projection_cells(surface: &NurbsSurface) -> Result<Option<ProjectionCel
         }
     }
     let mut tree = Vec::with_capacity(2 * boxes.len());
-    build_cell_tree(&mut tree, &spheres, cell_columns, [0, cell_rows, 0, cell_columns]);
+    let mut node_boxes = Vec::with_capacity(2 * boxes.len());
+    // Each internal box grows by a billionth of the surface's scale over its
+    // children: far above the rounding of the corners it spans and of the
+    // bound read from it, so a box that excludes a point excludes every cell
+    // under it (see `hull_candidates`).
+    let node_margin = NODE_BOX_MARGIN * scale;
+    let inputs = NodeBoxInputs { boxes: &boxes, nodes: &nodes, lattice_columns: vs.len(), margin: node_margin };
+    build_cell_tree(&mut tree, &mut node_boxes, &inputs, &spheres, cell_columns, [0, cell_rows, 0, cell_columns]);
+    if !(node_margin > 0.0 && node_margin.is_finite()) {
+        node_boxes = Vec::new();
+    }
     Ok(Some(ProjectionCells {
         us,
         vs,
         nodes,
         boxes,
         tree,
+        node_boxes,
+        node_margin,
+        scale,
         resolution,
     }))
 }
@@ -2051,6 +2143,77 @@ fn confined_descent(
     Ok((result, on_edge))
 }
 
+/// The growth of an internal node's box over its children's, per unit of
+/// the surface's scale.
+const NODE_BOX_MARGIN: f64 = 1e-9;
+
+/// `BREP_PROJECTION_NODE_BOXES` (default on): the cell-tree walk also reads
+/// each internal node's box, not only its sphere. `=0` walks on spheres alone,
+/// as before. Read once.
+fn node_boxes_enabled() -> bool {
+    switch!("BREP_PROJECTION_NODE_BOXES", true)
+}
+
+/// The walk of the global stage: every cell whose box comes nearer `point`
+/// than `bound`, with its box bound, in the walk's order, and the least bound
+/// over everything the walk excluded.
+///
+/// A node is excluded when its sphere is no nearer than `bound`, and, with
+/// `node_boxes`, when its box is not either. Cell spheres are loose on long,
+/// thin cells (a 16 × 5632 lattice: about 3000 nodes visited and 200 cells
+/// read per query to admit one), and an internal box is not. The box test
+/// only removes subtrees whose every cell the cell test would reject, in the
+/// same order, so the candidates are the same list to the bit with and
+/// without it. Each internal box holds its children's boxes grown by
+/// `node_margin` (`m`), and both bounds are read within `e` of their exact
+/// value, `e` (below) set by the point's and the surface's magnitudes. A
+/// box read at `b ≥ bound` with `b > 2e` is truly at least `b − e > 0` away,
+/// so each cell box under it is truly at least `b − e + m` away and reads at
+/// least `b − 2e + m ≥ bound` whenever `m ≥ 2e`; the test is skipped for a
+/// point so far out that `4e > m` (beyond about 3·10⁴ scales), keeping half
+/// of `m` for the rounding of the box corners themselves. Only the excluded
+/// bound (the certificate in `GlobalStats::hull_lower_bound`) can differ: it
+/// is still a lower bound, read from a tighter box.
+fn hull_candidates(cells: &ProjectionCells, point: Vec3, bound: f64, node_boxes: bool) -> (Vec<(f64, usize)>, f64) {
+    let read_error = 32.0 * f64::EPSILON * (point.x.abs() + point.y.abs() + point.z.abs() + 4.0 * cells.scale);
+    let boxes = node_boxes && !cells.node_boxes.is_empty() && 4.0 * read_error <= cells.node_margin;
+    let mut candidates: Vec<(f64, usize)> = Vec::new();
+    let mut excluded = f64::INFINITY;
+    let mut stack: Vec<u32> = Vec::with_capacity(64);
+    stack.push((cells.tree.len() - 1) as u32);
+    while let Some(index) = stack.pop() {
+        let node = cells.tree[index as usize];
+        let sphere_bound = (point.sub(node.centre).length() - node.radius).max(0.0);
+        if sphere_bound >= bound {
+            excluded = excluded.min(sphere_bound);
+            continue;
+        }
+        match node.children {
+            Some((first, second)) => {
+                if boxes {
+                    let box_bound = cells.node_boxes[index as usize].lower_bound(point);
+                    if box_bound >= bound && box_bound > 2.0 * read_error {
+                        excluded = excluded.min(box_bound);
+                        continue;
+                    }
+                }
+                stack.push(first);
+                stack.push(second);
+            }
+            None => {
+                let cell = node.cell as usize;
+                let box_bound = cells.boxes[cell].lower_bound(point);
+                if box_bound < bound {
+                    candidates.push((box_bound, cell));
+                } else {
+                    excluded = excluded.min(box_bound);
+                }
+            }
+        }
+    }
+    (candidates, excluded)
+}
+
 /// The global stage of [`project_point_to_surface_general`]: replace `best`
 /// with the least local minimum over every cell the hull bound admits.
 #[allow(clippy::too_many_arguments)]
@@ -2076,33 +2239,7 @@ fn global_minimum(
 
     // Every cell whose box comes nearer than the answer; the least bound over
     // what the walk excluded is the certificate.
-    let mut candidates: Vec<(f64, usize)> = Vec::new();
-    let mut excluded = f64::INFINITY;
-    let mut stack: Vec<u32> = Vec::with_capacity(64);
-    stack.push((cells.tree.len() - 1) as u32);
-    while let Some(index) = stack.pop() {
-        let node = cells.tree[index as usize];
-        let sphere_bound = (point.sub(node.centre).length() - node.radius).max(0.0);
-        if sphere_bound >= bound {
-            excluded = excluded.min(sphere_bound);
-            continue;
-        }
-        match node.children {
-            Some((first, second)) => {
-                stack.push(first);
-                stack.push(second);
-            }
-            None => {
-                let cell = node.cell as usize;
-                let box_bound = cells.boxes[cell].lower_bound(point);
-                if box_bound < bound {
-                    candidates.push((box_bound, cell));
-                } else {
-                    excluded = excluded.min(box_bound);
-                }
-            }
-        }
-    }
+    let (mut candidates, excluded) = hull_candidates(cells, point, bound, node_boxes_enabled());
     stats.candidates = candidates.len();
     candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
     stats.hull_lower_bound = candidates
@@ -2309,4 +2446,5 @@ pub(crate) fn curve_foot_newton(
     let (_, nearest, squared) = curve_foot_newton_state(curve, point, seed, bracket, policy)?;
     Ok((nearest, squared))
 }
+
 

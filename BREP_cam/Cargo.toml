@@ -1,6 +1,6 @@
 [package]
 name = "BREP_cam"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -33,13 +33,13 @@ serde = { version = "1", features = ["derive"] }
 # The kernel is OPTIONAL: only `kernel_adapter` (BREP body -> mesh snapshot)
 # needs it, so every other CAM build and test compiles serde and this crate
 # alone. Linked WITHOUT default features, as the wasm app does.
-brep_kernel = { package = "BREP_kernel", version = "0.16.0", path = "../BREP_kernel", default-features = false, optional = true }
+brep_kernel = { package = "BREP_kernel", version = "0.17.0", path = "../BREP_kernel", default-features = false, optional = true }
 # Lane C4: the program stream is handed to post-processor scripts as JSON.
 # Preserve every finite f64 bit pattern when native documents are re-imported.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 # Lane C4: post-processor scripts run on the shared Boa interpreter (feature
 # `post-runtime`); the types and the built-in post sources need no engine.
-brep-script-core = { package = "BREP_script_core", version = "0.1.3", path = "../BREP_script_core", optional = true }
+brep-script-core = { package = "BREP_script_core", version = "0.1.4", path = "../BREP_script_core", optional = true }
 # Feature `parallel`: contact solves (push-cutter fibers, adaptive drop-path
 # spans) on rayon's pool, results assembled in input order — byte-identical to
 # the serial build. Same pattern and version as BREP_kernel's `parallel`; the

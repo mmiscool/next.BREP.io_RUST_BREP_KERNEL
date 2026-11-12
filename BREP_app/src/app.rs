@@ -361,6 +361,51 @@ pub(crate) fn app_style(style: &mut egui::Style) {
     style.text_styles.insert(egui::TextStyle::Small, egui::FontId::new(SMALL_TEXT_SIZE, egui::FontFamily::Proportional));
 }
 
+/// Land a `?loadModel=<url>` fetch (`result`: the fetched text, or why the
+/// fetch failed) on the active document.
+///
+/// The model REPLACES the active document in place rather than adding a tab.
+///
+/// A fetch that fails, or a document the engine rejects (it does not parse,
+/// or the history is locked), is shown to the user as an error toast with
+/// the reason; it used to be dropped silently, leaving the seed cube on
+/// screen as if it were the linked model. The untouched boot seed (clean
+/// and unnamed) is then emptied, so nothing on screen passes for the model
+/// that did not open. A named document (a file the user opened while the
+/// fetch was pending) or one with unsaved edits is left as it is: emptying
+/// a named one would let its next Save overwrite the user's file.
+/// A document that loads with some features in error is NOT a failure: it
+/// opens with those features marked in the tree.
+pub(crate) fn apply_linked_model(docs: &mut crate::document::Documents, result: Result<String, String>) {
+    // Read before the load: a rejected document can already have reset parts
+    // of the engine (its metadata, its workbench) on the way to the refusal.
+    let untouched_seed = !docs.active().is_dirty() && docs.active().name().is_none();
+    let failure = match result {
+        // Text that is not JSON at all (an HTML page served 200, a truncated
+        // body) is refused before the engine sees it: `set_history_json`
+        // resets per-document state before its own parse fails.
+        Ok(json) => match serde_json::from_str::<serde::de::IgnoredAny>(&json) {
+            Err(error) => format!("the document could not be opened: history parse: {error}"),
+            Ok(_) => match docs.engine_mut().load_model_and_fit(&json) {
+                Ok(_) => {
+                    docs.active_mut().mark_clean();
+                    return;
+                }
+                Err(error) => format!("the document could not be opened: {error}"),
+            },
+        },
+        Err(error) => format!("the download failed: {error}"),
+    };
+    docs.engine_mut().push_notice(format!("Could not open the linked model: {failure}"));
+    if untouched_seed {
+        if let Err(error) = docs.engine_mut().set_history_json(crate::document::EMPTY_DOCUMENT) {
+            log::error!("Clearing the seed after a failed linked model: {error}");
+        }
+        docs.active_mut().mark_clean();
+    }
+}
+
+
 
 /// How long a close waits for writes still on their way to the store (a PLM
 /// server that stopped answering must not keep the app open forever).
@@ -443,15 +488,24 @@ impl BrepApp {
         &self.automation
     }
 
-    /// Open a `.nbrep` file named on the command line — `brep-app model.nbrep`,
-    /// which is also what a desktop file association hands us (`Exec=… %f`).
+    /// Open a file named on the command line — `brep-app model.nbrep`, which
+    /// is also what a desktop file association hands us (`Exec=… %f`).
     ///
-    /// The path goes through the same `FileDialog::open_document` door as
-    /// File>Open, so the document keeps the full path as its identity and a
-    /// later plain Save writes back to the file the user double-clicked, rather
-    /// than to a copy in the app's own models directory. A path that does not
-    /// parse leaves the status line saying so and the seed document in place —
-    /// a bad argument must not cost the user a window.
+    /// Routed by extension (any case):
+    /// * a model document (`.nbrep`, `.fbrep`, `.tbrep`, or a name with no
+    ///   extension) goes through the same `FileDialog::open_document` door as
+    ///   File>Open, so the document keeps the full path as its identity and a
+    ///   later plain Save writes back to the file the user double-clicked,
+    ///   rather than to a copy in the app's own models directory;
+    /// * a file File > Import takes (STEP, IGES, STL, 3MF, OBJ, KiCad — the
+    ///   import table in `panels/file.rs`) is imported by that same importer
+    ///   into a NEW untitled tab named after the file's stem, so a plain Save
+    ///   asks for a name instead of writing a document over the STEP file;
+    /// * anything else is refused by name.
+    ///
+    /// A path that does not open or import leaves the status line and a
+    /// notice saying so, and the seed document in place — a bad argument must
+    /// not cost the user a window.
     ///
     /// Native only: called once, before the first frame.
     #[cfg(not(target_arch = "wasm32"))]
@@ -464,10 +518,42 @@ impl BrepApp {
             log::warn!("brep-app: {} is not valid UTF-8; not opening it", path.display());
             return;
         };
-        // Field-by-field, because `open_document` borrows the documents and the
-        // store while `self.file` is borrowed mutably.
+        match command_line_lane(name) {
+            CommandLineLane::Open => {
+                // Field-by-field, because `open_document` borrows the documents
+                // and the store while `self.file` is borrowed mutably.
+                let Self { file, docs, model_store, .. } = self;
+                file.open_document(docs, model_store.as_ref(), name);
+            }
+            CommandLineLane::Import => match std::fs::read(&path) {
+                Ok(bytes) => {
+                    if let Err(e) = self.import_file_into_new_tab(name, bytes) {
+                        log::warn!("brep-app: {e}");
+                    }
+                }
+                Err(e) => self.refuse_command_line_path(format!("import failed: cannot read {name}: {e}")),
+            },
+            CommandLineLane::Refuse => self.refuse_command_line_path(format!(
+                "cannot open {name}: not a BREP document (.nbrep, .fbrep, .tbrep) or a file BREP imports (STEP, IGES, STL, 3MF, OBJ, KiCad)"
+            )),
+        }
+    }
+
+    /// Import a file (its path or name, and its bytes) as File > Import does,
+    /// into a new untitled tab named after it: the door a STEP or mesh file
+    /// opened from the OS takes, and the automation's `doc_open_with`.
+    pub(crate) fn import_file_into_new_tab(&mut self, name: &str, bytes: Vec<u8>) -> Result<(), String> {
         let Self { file, docs, model_store, .. } = self;
-        file.open_document(docs, model_store.as_ref(), name);
+        file.import_into_new_tab(docs, model_store.as_ref(), name, bytes)
+    }
+
+    /// Say why a command-line path was not opened: the status line and a
+    /// notice on the seed document, which stays as it was.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn refuse_command_line_path(&mut self, message: String) {
+        log::warn!("brep-app: {message}");
+        self.docs.engine_mut().push_notice(message.clone());
+        self.file.status = message;
     }
 
     /// The 3D viewport rect of the last frame, in egui points.
@@ -2254,19 +2340,7 @@ impl eframe::App for BrepApp {
                 .and_then(|rx| rx.try_recv().ok());
             if let Some(result) = received {
                 self.pending_boot_load = None;
-                match result {
-                    Ok(json) => {
-                        // REPLACES the seed in place rather than adding a tab.
-                        // It lands on the document that is already active,
-                        // whatever the session restored.
-                        let _ = self.docs.engine_mut().load_model_and_fit(&json);
-                        self.docs.active_mut().mark_clean();
-                    }
-                    Err(e) => self
-                        .docs
-                        .engine_mut()
-                        .push_notice(format!("Could not load model from URL: {e}")),
-                }
+                apply_linked_model(&mut self.docs, result);
             }
         }
 
@@ -3412,3 +3486,32 @@ fn model_signature_key(engine: &EngineState) -> ModelSignatureKey {
         .collect();
     (engine.history_rollback(), solids)
 }
+
+/// Which door a file named on the command line goes through
+/// ([`BrepApp::open_path_from_command_line`]).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandLineLane {
+    /// A model document: File > Open's door.
+    Open,
+    /// A file File > Import takes: its importer, into a new untitled tab.
+    Import,
+    /// Neither: said so, nothing opened.
+    Refuse,
+}
+
+/// The lane for a command-line path, by its extension (any case). A name with
+/// no extension keeps today's Open (the store adds `.nbrep`).
+#[cfg(not(target_arch = "wasm32"))]
+fn command_line_lane(path: &str) -> CommandLineLane {
+    if crate::panels::file::import_kind(path).is_some() {
+        return CommandLineLane::Import;
+    }
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    match base.rsplit_once('.') {
+        None => CommandLineLane::Open,
+        Some((_, ext)) if crate::store::MODEL_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) => CommandLineLane::Open,
+        Some(_) => CommandLineLane::Refuse,
+    }
+}
+

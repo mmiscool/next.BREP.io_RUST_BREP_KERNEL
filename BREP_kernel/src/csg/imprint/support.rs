@@ -2000,7 +2000,146 @@ pub(super) fn planar_iso_section(
             }
         }
     }
+    if plane_pair_section_enabled() {
+        return plane_pair_section(first, second, tolerance);
+    }
     Ok(None)
+}
+
+/// PLANE PAIR SECTION (`BREP_PLANE_PAIR_SECTION`, default on, `=0` off). Two affine
+/// planar patches that cross meet in a straight line. The iso readings above
+/// take that line only where it is an iso-line of one patch (an axis-aligned
+/// box against another); any other crossing went to the marcher, which for two
+/// planes a small angle apart traces a curve that stays within the band of
+/// both planes but wanders along them: a cube against a copy turned 0.1 deg
+/// about a skew axis gave a cubic section whose middle stood 0.62 off the
+/// chord of its ends, 1.2e-3 off its own face, and a solid whose measure was
+/// 2.3e-5 out though its vertices were exact.
+///
+/// The line is computed from the first patch's origin, `p = o1 + c (d x n1) /
+/// |d|^2` with `d = n1 x n2` and `c` the second plane's offset from `o1`, so
+/// no term cancels as the planes approach parallel; it is clipped to both
+/// patches' parameter squares, and its pcurves are the straight images of the
+/// segment in each patch's own parameters, on the curve's parameter. A pair
+/// crossing at under 1e-5 rad, a segment that does not run through the
+/// interior of both patches, or one no longer than the tolerance, is left to
+/// the paths below.
+pub(crate) fn plane_pair_section_enabled() -> bool {
+    crate::switch!("BREP_PLANE_PAIR_SECTION", true)
+}
+
+/// An affine patch `S(u, v) = o + a (u - u0) / (u1 - u0) + b (v - v0) / (v1 - v0)`.
+struct AffinePatch {
+    origin: Vec3,
+    a: Vec3,
+    b: Vec3,
+    normal: Vec3,
+    u: [f64; 2],
+    v: [f64; 2],
+}
+
+impl AffinePatch {
+    fn read(surface: &NurbsSurface) -> Option<Self> {
+        if !surface.is_affine().ok()? {
+            return None;
+        }
+        let u = surface.domain_u().ok()?;
+        let v = surface.domain_v().ok()?;
+        let origin = surface.control_points[0][0].point().ok()?;
+        let a = surface.control_points[1][0].point().ok()?.sub(origin);
+        let b = surface.control_points[0][1].point().ok()?.sub(origin);
+        let normal = a.cross(b).normalized().ok()?;
+        Some(Self { origin, a, b, normal, u, v })
+    }
+
+    /// The unit-square coordinates `(s, t)` of a point in the patch's plane.
+    fn square(&self, point: Vec3) -> (f64, f64) {
+        let r = point.sub(self.origin);
+        let (aa, ab, bb) = (self.a.dot(self.a), self.a.dot(self.b), self.b.dot(self.b));
+        let (ra, rb) = (r.dot(self.a), r.dot(self.b));
+        let det = aa * bb - ab * ab;
+        ((ra * bb - rb * ab) / det, (rb * aa - ra * ab) / det)
+    }
+
+    /// The interval of `p0 + x d` (x in the line's own parameter) inside the
+    /// patch's square, or `None` when the line misses it.
+    fn clip(&self, p0: Vec3, d: Vec3, interval: [f64; 2]) -> Option<[f64; 2]> {
+        let (s0, t0) = self.square(p0);
+        let (s1, t1) = self.square(p0.add(d));
+        let (ds, dt) = (s1 - s0, t1 - t0);
+        let mut range = interval;
+        for (start, rate) in [(s0, ds), (t0, dt)] {
+            if rate.abs() <= 1e-300 {
+                if !(0.0..=1.0).contains(&start) {
+                    return None;
+                }
+                continue;
+            }
+            let (x0, x1) = ((0.0 - start) / rate, (1.0 - start) / rate);
+            range[0] = range[0].max(x0.min(x1));
+            range[1] = range[1].min(x0.max(x1));
+        }
+        (range[0] < range[1]).then_some(range)
+    }
+
+    /// The straight pcurve in this patch's parameters of the segment from
+    /// `start` to `end`, on the parameter `[0, 1]`.
+    fn pcurve(&self, start: Vec3, end: Vec3) -> Option<NurbsCurve> {
+        let uv = |point: Vec3| {
+            let (s, t) = self.square(point);
+            Vec4 { x: self.u[0] + s * (self.u[1] - self.u[0]), y: self.v[0] + t * (self.v[1] - self.v[0]), z: 0.0, w: 1.0 }
+        };
+        NurbsCurve::new(1, vec![0.0, 0.0, 1.0, 1.0], vec![uv(start), uv(end)]).ok()
+    }
+}
+
+fn plane_pair_section(first: &NurbsSurface, second: &NurbsSurface, tolerance: f64) -> Result<Option<IsoSection>, KernelRefusal> {
+    let (Some(one), Some(two)) = (AffinePatch::read(first), AffinePatch::read(second)) else {
+        return Ok(None);
+    };
+    let d = one.normal.cross(two.normal);
+    let sine = d.length();
+    // Planes crossing at under 1e-5 rad stay with the feature-scale planar
+    // iso and grazing-crossing lanes, which own that regime (brep-bench
+    // tangent/wedge-a-millionth-steep crosses at 1e-6) and the parallel band.
+    if sine <= 1e-5 {
+        return Ok(None);
+    }
+    let offset = two.origin.sub(one.origin).dot(two.normal);
+    let p0 = one.origin.add(d.cross(one.normal).scale(offset / (sine * sine)));
+    let direction = d.scale(1.0 / sine);
+    let reach = one.a.length() + one.b.length() + two.a.length() + two.b.length() + p0.sub(one.origin).length() + p0.sub(two.origin).length();
+    let Some(range) = one.clip(p0, direction, [-reach, reach]).and_then(|range| two.clip(p0, direction, range)) else {
+        return Ok(None);
+    };
+    if range[1] - range[0] <= tolerance.max(1e-12) {
+        return Ok(None);
+    }
+    let start = p0.add(direction.scale(range[0]));
+    let end = p0.add(direction.scale(range[1]));
+    // A line that runs along a patch's boundary (two boxes meeting along an
+    // edge) or only touches a patch at a corner is a contact the iso readings
+    // and the boundary exchange already decline or own: the section must run
+    // through the interior of both patches.
+    let middle = start.add(end).scale(0.5);
+    let inside = |patch: &AffinePatch| {
+        let (s, t) = patch.square(middle);
+        let margin = 1e-9;
+        s > margin && s < 1.0 - margin && t > margin && t < 1.0 - margin
+    };
+    if !inside(&one) || !inside(&two) {
+        return Ok(None);
+    }
+    let curve = NurbsCurve::new(1, vec![0.0, 0.0, 1.0, 1.0], vec![
+        Vec4 { x: start.x, y: start.y, z: start.z, w: 1.0 },
+        Vec4 { x: end.x, y: end.y, z: end.z, w: 1.0 },
+    ])
+    .or_refuse(KernelStage::Intersect, "plane pair line")?;
+    let pcurves = match (one.pcurve(start, end), two.pcurve(start, end)) {
+        (Some(on_first), Some(on_second)) => Some([on_first, on_second]),
+        _ => None,
+    };
+    Ok(Some(IsoSection { curve, pcurves }))
 }
 
 /// The straight pcurve of an iso-curve on its own carrier, on the curve's

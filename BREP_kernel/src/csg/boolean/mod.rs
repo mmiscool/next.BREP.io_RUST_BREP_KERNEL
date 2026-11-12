@@ -220,8 +220,25 @@ pub fn boolean_operation(
     options: &BooleanOptions,
 ) -> Result<BrepSolid, KernelRefusal> {
     match boolean_operation_with_diagnostics(first, second, operation, options) {
-        Ok(outcome) => Ok(outcome.value),
+        Ok(outcome) => {
+            // An empty difference or common part of two solids whose faces only
+            // nearly coincide is the near pair read as one, not the answer.
+            if below_tolerance_refusal_enabled()
+                && outcome.value.shells.iter().all(|shell| shell.faces.is_empty())
+                && !matches!(operation, BooleanOperation::Union)
+            {
+                if let Some(refusal) = below_tolerance_refusal(first, second, None) {
+                    return Err(refusal);
+                }
+            }
+            Ok(outcome.value)
+        }
         Err(error) => {
+            if below_tolerance_refusal_enabled() {
+                if let Some(refusal) = below_tolerance_refusal(first, second, Some(&error)) {
+                    return Err(refusal);
+                }
+            }
             // Perturbation-fallback lane (Simulation of Simplicity). The exact
             // arrangement only errs on a DEGENERACY here (coincident /
             // near-tangent carrier faces make it structurally inconsistent) —
@@ -1014,6 +1031,104 @@ impl MirrorTrend {
 }
 
 /// Non-degenerate edges a solid's faces use exactly once.
+/// BELOW-TOLERANCE REFUSAL (`BREP_BELOW_TOLERANCE_REFUSAL`, default on, `=0` off). Two
+/// planar faces, one of each operand, that are nearly parallel and stand no
+/// farther apart over their shared extent than [`BELOW_TOLERANCE_BAND`] but not
+/// exactly on one another are a configuration the kernel cannot resolve: its
+/// weld floor is 1e-5 and its face arrangements resolve a few 1e-5, so the
+/// slivers between such faces fall under the modelling tolerance. A cube
+/// against a copy turned 1e-4 deg moves its corners 1.2e-5 to 2.5e-5: the exact
+/// arrangement failed, and the perturbation ladder then answered a nudged pair
+/// 8.5e-5 out in volume; at 1e-6 deg the face pairs read as coincident and the
+/// difference came back empty. Consulted only where the exact lane failed or
+/// returned an empty difference or common part, so nothing that answers today
+/// changes; the refusal names the pair and the modelling tolerance instead of
+/// shipping a nudged or empty solid.
+pub(crate) fn below_tolerance_refusal_enabled() -> bool {
+    crate::switch!("BREP_BELOW_TOLERANCE_REFUSAL", true)
+}
+
+/// Ten weld floors: the separation under which two near-coincident planar faces
+/// are read as below the modelling tolerance.
+const BELOW_TOLERANCE_BAND: f64 = 10.0 * crate::tolerance::WELD_FLOOR;
+
+fn below_tolerance_refusal(first: &BrepSolid, second: &BrepSolid, error: Option<&KernelRefusal>) -> Option<KernelRefusal> {
+    let (face_a, face_b, separation) = near_coincident_planar_faces(first, second)?;
+    let message = format!(
+        "boolean: face {face_a} of the first operand and face {face_b} of the second are planes nearly on one \
+         another, {separation:.3e} apart at most over their shared extent: the slivers between them are below the \
+         modelling tolerance ({BELOW_TOLERANCE_BAND:.0e}), so the kernel cannot resolve them{}",
+        error.map(|error| format!(" (the exact arrangement said: {})", error.message.chars().take(160).collect::<String>())).unwrap_or_default()
+    );
+    Some(KernelRefusal::unsupported(KernelStage::Intersect, "below_modelling_tolerance", message))
+}
+
+/// The first pair of planar faces (one per operand) whose planes are nearly
+/// parallel and whose boundaries stand within [`BELOW_TOLERANCE_BAND`] of the
+/// other's plane, with overlapping extents, but which are not one plane.
+fn near_coincident_planar_faces(first: &BrepSolid, second: &BrepSolid) -> Option<(u64, u64, f64)> {
+    struct Planar {
+        id: u64,
+        origin: Vec3,
+        normal: Vec3,
+        corners: Vec<Vec3>,
+        bounds: crate::spatial::Aabb,
+    }
+    let read = |solid: &BrepSolid| -> Vec<Planar> {
+        let at = |id: u64| solid.vertices.iter().find(|vertex| vertex.id == id).map(|vertex| vertex.point);
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter_map(|face| {
+                if !face.surface.is_affine().ok()? {
+                    return None;
+                }
+                let origin = face.surface.control_points[0][0].point().ok()?;
+                let a = face.surface.control_points[1][0].point().ok()?.sub(origin);
+                let b = face.surface.control_points[0][1].point().ok()?.sub(origin);
+                let normal = a.cross(b).normalized().ok()?;
+                let corners: Vec<Vec3> = face
+                    .loops
+                    .iter()
+                    .flat_map(|lp| &lp.coedges)
+                    .filter_map(|coedge| solid.edges.iter().find(|edge| edge.id == coedge.edge_id))
+                    .flat_map(|edge| [at(edge.start_vertex_id), at(edge.end_vertex_id)])
+                    .flatten()
+                    .collect();
+                if corners.is_empty() {
+                    return None;
+                }
+                let bounds = crate::spatial::Aabb::from_points(corners.clone());
+                Some(Planar { id: face.id, origin, normal, corners, bounds })
+            })
+            .collect()
+    };
+    let (faces_a, faces_b) = (read(first), read(second));
+    let scale = crate::tolerance::solid_scale(first).max(crate::tolerance::solid_scale(second)).max(1.0);
+    let floor = 1e-9 * scale;
+    for a in &faces_a {
+        for b in &faces_b {
+            if a.normal.cross(b.normal).length() > 1e-3 {
+                continue;
+            }
+            if !a.bounds.intersects(b.bounds, BELOW_TOLERANCE_BAND) {
+                continue;
+            }
+            let separation = a
+                .corners
+                .iter()
+                .map(|corner| corner.sub(b.origin).dot(b.normal).abs())
+                .chain(b.corners.iter().map(|corner| corner.sub(a.origin).dot(a.normal).abs()))
+                .fold(0.0f64, f64::max);
+            if separation > floor && separation <= BELOW_TOLERANCE_BAND {
+                return Some((a.id, b.id, separation));
+            }
+        }
+    }
+    None
+}
+
 fn one_use_edges(solid: &BrepSolid) -> usize {
     let mut uses: HashMap<u64, usize> = HashMap::default();
     for coedge in solid

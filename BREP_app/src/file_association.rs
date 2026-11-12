@@ -1,5 +1,9 @@
 //! Register this executable as the system's opener for its three document
-//! classes: `.nbrep` parts, `.fbrep` family seeds and `.tbrep` templates.
+//! classes: `.nbrep` parts, `.fbrep` family seeds and `.tbrep` templates —
+//! the DEFAULT opener for those — and as one AVAILABLE opener ("Open With")
+//! for the files it imports (STEP, IGES, STL, 3MF, OBJ), never their default.
+//! A file of an import type opened this way is imported into a new untitled
+//! tab (`BrepApp::open_path_from_command_line`).
 //!
 //! `brep-app --install-file-associations` writes the platform's own association
 //! records and points them at the RUNNING executable's path
@@ -32,6 +36,27 @@ pub const CLASSES: [(&str, &str, &str, &str); 3] = [
     ("fbrep", "application/x-fbrep", "BREP part family", "BREP.Family"),
     ("tbrep", "application/x-tbrep", "BREP part template", "BREP.Template"),
 ];
+
+/// The files the app imports that the OS may offer it for, never as their
+/// default opener: `(MIME type, its globs, what a file manager calls it)`.
+/// The standard `model/*` types (IANA registers `model/step`, `model/iges`,
+/// `model/stl`, `model/3mf`, `model/obj`); the install declares them with
+/// their globs too, because an older shared-mime-info has no `model/step`
+/// and a desktop entry naming an unknown type routes nothing. Declaring a
+/// type the system already has merges the globs; it replaces nothing.
+/// KiCad files are imported too but have no registered type, and KiCad's own
+/// association owns them, so they are not offered here.
+pub const IMPORT_TYPES: [(&str, &[&str], &str); 5] = [
+    ("model/step", &["step", "stp", "p21"], "STEP 3D model"),
+    ("model/iges", &["iges", "igs"], "IGES 3D model"),
+    ("model/stl", &["stl"], "STL mesh"),
+    ("model/3mf", &["3mf"], "3MF mesh package"),
+    ("model/obj", &["obj"], "OBJ mesh"),
+];
+
+/// The Windows ProgID the import types are offered under (`OpenWithProgids`).
+#[allow(dead_code)] // Windows only
+const IMPORT_PROG_ID: &str = "BREP.Import";
 
 /// The desktop entry's file name (Linux) — also the id `xdg-mime` takes.
 const DESKTOP_FILE: &str = "brep-app.desktop";
@@ -90,8 +115,10 @@ pub fn report(action: &str, steps: &[Step]) -> String {
              xdg-mime default {DESKTOP_FILE} {MIME_TYPE}\n"
         ),
         ("install", 0) => format!(
-            "\n.nbrep, .fbrep and .tbrep documents now open in this build. MIME types {}.\n",
-            CLASSES.map(|(_, mime, _, _)| mime).join(", ")
+            "\n.nbrep, .fbrep and .tbrep documents now open in this build. MIME types {}.\n\
+             It is also offered (Open With, not the default) for {}: they are imported into a new tab.\n",
+            CLASSES.map(|(_, mime, _, _)| mime).join(", "),
+            IMPORT_TYPES.map(|(mime, _, _)| mime).join(", ")
         ),
         ("install", _) => format!(
             "\n{failed} step(s) failed. What was written still counts: a desktop entry that could not be \
@@ -217,16 +244,32 @@ mod platform {
                 )
             })
             .collect();
+        let import_types: String = IMPORT_TYPES
+            .iter()
+            .map(|(mime, globs, comment)| {
+                let globs: String = globs.iter().map(|ext| format!("    <glob pattern=\"*.{ext}\"/>\n")).collect();
+                format!("  <mime-type type=\"{mime}\">\n    <comment>{comment}</comment>\n{globs}  </mime-type>\n")
+            })
+            .collect();
         steps.push(write(
             &mime_dir.join("packages/brep-app.xml"),
             &format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                  <mime-info xmlns=\"http://www.freedesktop.org/standards/shared-mime-info\">\n\
-                 {types}</mime-info>\n"
+                 {types}{import_types}</mime-info>\n"
             ),
             "declare the .nbrep / .fbrep / .tbrep MIME types",
         ));
-        let mime_types: String = CLASSES.iter().map(|(_, mime, _, _)| format!("{mime};")).collect();
+        // The native classes first, then the import types: listing a type
+        // here makes the app an available opener for it; only the
+        // `xdg-mime default` calls below (native classes only) make it the
+        // default.
+        let mime_types: String = CLASSES
+            .iter()
+            .map(|(_, mime, _, _)| mime)
+            .chain(IMPORT_TYPES.iter().map(|(mime, _, _)| mime))
+            .map(|mime| format!("{mime};"))
+            .collect();
 
         // The application. `%f` (a single local path) rather than `%F`: the
         // window opens one document per launch, and `%U` would hand us URLs we
@@ -316,6 +359,17 @@ mod platform {
             steps.push(reg(&["add", &format!(r"HKCU\Software\Classes\.{ext}"), "/ve", "/d", prog_id, "/f"]));
             steps.push(reg(&["add", &format!(r"HKCU\Software\Classes\.{ext}"), "/v", "Content Type", "/d", mime, "/f"]));
         }
+        // The import types: an "Open with" choice, never the default. Only
+        // the extension's OpenWithProgids list gains a value; its default
+        // ProgID (whatever owns .step today) is left alone.
+        steps.push(reg(&["add", &format!(r"HKCU\Software\Classes\{IMPORT_PROG_ID}"), "/ve", "/d", "BREP import", "/f"]));
+        steps.push(reg(&["add", &format!(r"HKCU\Software\Classes\{IMPORT_PROG_ID}\DefaultIcon"), "/ve", "/d", &icon, "/f"]));
+        steps.push(reg(&["add", &format!(r"HKCU\Software\Classes\{IMPORT_PROG_ID}\shell\open\command"), "/ve", "/d", &open, "/f"]));
+        for (_, globs, _) in IMPORT_TYPES {
+            for ext in globs {
+                steps.push(reg(&["add", &format!(r"HKCU\Software\Classes\.{ext}\OpenWithProgids"), "/v", IMPORT_PROG_ID, "/t", "REG_NONE", "/f"]));
+            }
+        }
         steps
     }
 
@@ -325,6 +379,14 @@ mod platform {
             steps.push(reg(&["delete", &format!(r"HKCU\Software\Classes\.{ext}"), "/f"]));
             steps.push(reg(&["delete", &format!(r"HKCU\Software\Classes\{prog_id}"), "/f"]));
         }
+        // Only the values the install added: another program's association
+        // of the same extension stays.
+        for (_, globs, _) in IMPORT_TYPES {
+            for ext in globs {
+                steps.push(reg(&["delete", &format!(r"HKCU\Software\Classes\.{ext}\OpenWithProgids"), "/v", IMPORT_PROG_ID, "/f"]));
+            }
+        }
+        steps.push(reg(&["delete", &format!(r"HKCU\Software\Classes\{IMPORT_PROG_ID}"), "/f"]));
         steps
     }
 }

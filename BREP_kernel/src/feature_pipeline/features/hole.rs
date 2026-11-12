@@ -337,17 +337,31 @@ fn build_master_cutter(
     ctx: &FeatureContext,
     master_prefix: &str,
 ) -> Result<BrepSolid, String> {
+    // The cutter's base sits BACK_OFFSET behind the sketch plane (see `build`),
+    // but every depth the user typed is measured FROM the sketch plane. So each
+    // axial length grows by BACK_OFFSET, and the countersink cone is extended
+    // back along its own slope, which leaves its diameter at the plane unchanged.
+    // Without this a blind hole stopped BACK_OFFSET short. A 6 deep hole in a
+    // 6 thick tab then left a 0.001 skin over its exit and never broke through.
+    let straight_depth = straight_depth + BACK_OFFSET;
     match hole_type {
         // THREADED is SYMBOLIC (plain cylinder core) — identical build to SIMPLE.
         "SIMPLE" | "THREADED" => build_simple_cutter(radius, straight_depth, master_prefix),
         "COUNTERSINK" => {
             let sink_dia = ctx.number("countersinkDiameter").unwrap_or(0.0).abs();
             let sink_angle = ctx.number("countersinkAngle").unwrap_or(82.0).clamp(1.0, 179.0);
+            let half_angle = sink_angle * std::f64::consts::PI / 360.0;
+            let sink_dia = if sink_dia * 0.5 > radius {
+                sink_dia + 2.0 * BACK_OFFSET * half_angle.tan()
+            } else {
+                sink_dia
+            };
             build_countersink_cutter(radius, straight_depth, sink_dia, sink_angle, master_prefix)
         }
         "COUNTERBORE" => {
             let bore_dia = ctx.number("counterboreDiameter").unwrap_or(0.0).abs();
             let bore_depth = ctx.number("counterboreDepth").unwrap_or(0.0).abs();
+            let bore_depth = if bore_depth > 0.0 { bore_depth + BACK_OFFSET } else { bore_depth };
             build_counterbore_cutter(radius, straight_depth, bore_dia, bore_depth, master_prefix)
         }
         other => Err(format!("hole: unknown holeType '{other}'")),

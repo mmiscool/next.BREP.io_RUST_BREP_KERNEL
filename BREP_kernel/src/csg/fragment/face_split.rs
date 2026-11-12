@@ -291,6 +291,14 @@ fn thin_boundary_resolution(
                 }
                 strip => strip,
             });
+            if end_gap_enabled() {
+                let gap = end_gap(face, &cut, &boundary.pcurve, search);
+                if gap.is_some() && env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
+                    eprintln!("feature_scale: face {} end gap cut p{piece_id} / boundary e{} -> {gap:?}", face.id, boundary.edge_id);
+                }
+                feature_found |= gap.is_some();
+                take(gap);
+            }
         }
     }
     if crate::feature_scale::fragment_enabled() {
@@ -307,6 +315,68 @@ fn thin_boundary_resolution(
         }
     }
     (resolution, feature_found)
+}
+
+/// FEATURE SCALE, end gap (`BREP_FEATURE_SCALE_END_GAP`, default on, `=0` off): an
+/// open cut that ENDS near a boundary edge of the face without ending on it.
+/// `near_touch` declines every approach at a cut's end, because a marched cut
+/// stops a few 1e-6 short of the boundary it ends on and resolving to that
+/// slack kept its end from snapping to its junction. A section that ends at a
+/// genuine vertex a small but real distance off the boundary is another
+/// thing: a cube against a copy turned 0.01 deg has a section on the cube's
+/// side that ends where the turned top edge pierces it, 3.9e-4 below the
+/// side's own top edge, inside the chart's wide bands (1.4e-3 image band and
+/// 2.1e-2 junction radius on a 10-wide face), and the arrangement joined that
+/// end to the top edge: a vertex the solid does not have, and a valid shell
+/// 1.9e-5 out in volume. An end is a gap when it stands off the boundary by
+/// more than the weld floor in model space (so a marched cut's slack is not
+/// one) and within the wide bands in the chart; the face's resolutions are
+/// then taken to that gap, as for a near touch.
+pub(crate) fn end_gap_enabled() -> bool {
+    crate::switch!("BREP_FEATURE_SCALE_END_GAP", true)
+}
+
+fn end_gap(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f64) -> Option<(f64, f64)> {
+    // Planar faces whose cut and boundary are both straight: the regime the
+    // measure was read on. Curved faces and curved trims keep their bands
+    // (fillet corners, pole bridges and rim strips are tuned to them).
+    let straight = |curve: &NurbsCurve| curve.degree == 1 && curve.control_points.len() == 2;
+    if !face.surface.is_affine().ok()? || !straight(cut) || !straight(other) {
+        return None;
+    }
+    let [lo, hi] = cut.domain().ok()?;
+    let start = cut.evaluate(lo).ok()?;
+    let end = cut.evaluate(hi).ok()?;
+    if start.sub(end).length() <= search {
+        return None;
+    }
+    let u_domain = face.surface.domain_u().ok()?;
+    let v_domain = face.surface.domain_v().ok()?;
+    let diagonal = ((u_domain[1] - u_domain[0]).powi(2) + (v_domain[1] - v_domain[0]).powi(2)).sqrt();
+    let reach = (search * 100.0).max(diagonal * 1.5e-3);
+    let mut found: Option<(f64, f64)> = None;
+    for point in [start, end] {
+        let Ok(foot) = project_point_to_curve(other, point) else { continue };
+        if foot.distance > reach {
+            continue;
+        }
+        let (Ok(here), Ok(there)) = (face.surface.evaluate(point.x, point.y), face.surface.evaluate(foot.point.x, foot.point.y)) else {
+            continue;
+        };
+        if here.sub(there).length() <= crate::tolerance::WELD_FLOOR {
+            continue;
+        }
+        let identity = crate::classification::surface_uv_band(&face.surface, point.x, point.y, 1e-7);
+        if foot.distance <= identity * 8.0 {
+            continue;
+        }
+        let resolution = (search.min((foot.distance / 128.0).max(identity)), search.min(foot.distance / 8.0));
+        found = Some(match found {
+            Some((a, s)) => (a.min(resolution.0), s.min(resolution.1)),
+            None => resolution,
+        });
+    }
+    found
 }
 
 /// FEATURE SCALE B4, near touch (`BREP_FEATURE_SCALE_FRAGMENT`): the
@@ -871,6 +941,45 @@ fn fragment_face_arranged(
         (distances[index] <= arrangement_tolerance * 50.0).then_some(index)
     };
 
+    // RIM BRIDGE (`BREP_RIM_BRIDGE`, default on, `=0` off; the imprint mints the
+    // bridge): a straight section a few `tol / |tan·n|` long between two
+    // rim pierces, one end on a vertex of this face's rim (within the weld)
+    // and the other a distinct vertex just inside it. The far end lies far closer to the rim in the chart
+    // than in space, so rule 3 below (a cut end onto a same-side boundary
+    // image, no 3-D check) would fold the bridge onto the rim vertex and the
+    // sections meeting it would skip it. Its ends keep their own images.
+    let bridge_keys: HashSet<String> = if rim_bridge_enabled() {
+        let weld = crate::tolerance::assembler_weld(1e-7);
+        // The face's own boundary vertices: a bridge has one end on its rim.
+        let mut rim_points = Vec::new();
+        for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+            if let Some(edge) = solid.edges.iter().find(|edge| edge.id == coedge.edge_id) {
+                for vertex_id in [edge.start_vertex_id, edge.end_vertex_id] {
+                    rim_points.push(vertex_point(solid, vertex_id)?);
+                }
+            }
+        }
+        let on_rim = |point: &Vec3| rim_points.iter().any(|rim| rim.sub(*point).length() <= weld);
+        piece_ids
+            .iter()
+            .filter_map(|piece_id| pieces_by_id.get(piece_id))
+            .filter(|piece| {
+                piece.start_vertex_id != piece.end_vertex_id
+                    && piece.curve.degree == 1
+                    && piece.curve.control_points.len() == 2
+                    && match (index.vertex_points.get(&piece.start_vertex_id), index.vertex_points.get(&piece.end_vertex_id)) {
+                        (Some(a), Some(b)) => {
+                            let gap = a.sub(*b).length();
+                            gap > weld && gap <= 1e-3 && (on_rim(a) || on_rim(b))
+                        }
+                        _ => false,
+                    }
+            })
+            .flat_map(|piece| [format!("i:{}", piece.start_vertex_id), format!("i:{}", piece.end_vertex_id)])
+            .collect()
+    } else {
+        HashSet::default()
+    };
     let mut add_chain = |mut points: Vec<Vec2>,
                          source: ChainSource,
                          vertex_start_key: String,
@@ -884,6 +993,7 @@ fn fragment_face_arranged(
             (points.len() - 1, vertex_end_key, vertex_end_point),
         ] {
             let point = points[at];
+            let bridged = bridge_keys.contains(&key);
             let images = vertex_images.entry(key).or_default();
             let canonical = images
                 .iter()
@@ -899,6 +1009,9 @@ fn fragment_face_arranged(
                         .map(|candidate| candidate.1)
                 })
                 .or_else(|| {
+                    if bridged {
+                        return None;
+                    }
                     boundary_side(point).and_then(|side| {
                         boundary_images
                             .iter()
@@ -1385,8 +1498,14 @@ fn fragment_face_arranged(
             }
         };
         let last = points.len() - 1;
-        points[0] = snap_endpoint_to_domain(points[0]);
-        points[last] = snap_endpoint_to_domain(points[last]);
+        // A rim bridge's ends keep their own place (see RIM BRIDGE above): the
+        // end inside the face is a distinct vertex a chart hair from the edge.
+        if !bridge_keys.contains(&format!("i:{}", piece.start_vertex_id)) {
+            points[0] = snap_endpoint_to_domain(points[0]);
+        }
+        if !bridge_keys.contains(&format!("i:{}", piece.end_vertex_id)) {
+            points[last] = snap_endpoint_to_domain(points[last]);
+        }
         for point in &mut points {
             *point = rebase_point(*point);
         }
@@ -3024,3 +3143,9 @@ pub(super) fn fragment_solid_profiled(
     Ok(fragments)
 }
 
+
+/// `BREP_RIM_BRIDGE` (default on, `=0` off): the fragment side of the imprint's rim
+/// bridge (see RIM BRIDGE in `fragment_face_arranged`).
+fn rim_bridge_enabled() -> bool {
+    crate::switch!("BREP_RIM_BRIDGE", true)
+}

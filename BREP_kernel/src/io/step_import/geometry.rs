@@ -1314,6 +1314,56 @@ fn conic_vertex_band(semi_axis: f64) -> f64 {
     (semi_axis * 1e-3).max(crate::VERTEX_MATCH_FLOOR)
 }
 
+/// The parameter of the point of the ellipse `(a cos t, b sin t)` nearest to
+/// `(x, y)` in its plane.
+///
+/// `atan2(y / b, x / a)` is exact for a point ON the ellipse and for a
+/// circle, but for a point slightly off a very eccentric ellipse it is not the
+/// nearest point: on a cylinder's shallow section (a = 145 inch, b = 0.079
+/// inch) a vertex 2.8 microns off the curve was placed 0.86 mm away from it,
+/// and the edge's end tore its face's parameter loop open. When that estimate
+/// misses the point by more than `VERTEX_MATCH_FLOOR`, it is refined by Newton on `(P - E(t)) . E'(t) = 0`, each step
+/// halved until the distance decreases.
+pub(super) fn nearest_ellipse_angle(a: f64, b: f64, x: f64, y: f64) -> f64 {
+    let mut theta = (y / b).atan2(x / a);
+    if (a - b).abs() <= 1e-12 * a.max(b) {
+        return theta;
+    }
+    let distance = |t: f64| (x - a * t.cos()).hypot(y - b * t.sin());
+    let mut current = distance(theta);
+    // Within the vertex-match floor the atan2 point already meets the vertex
+    // as closely as validation asks, so it is kept bit for bit.
+    if current <= crate::VERTEX_MATCH_FLOOR {
+        return theta;
+    }
+    for _ in 0..64 {
+        let (sin, cos) = theta.sin_cos();
+        let (ex, ey) = (a * cos, b * sin);
+        let (dx, dy) = (-a * sin, b * cos);
+        let f = (x - ex) * dx + (y - ey) * dy;
+        let slope = (x - ex) * -ex + (y - ey) * -ey - (dx * dx + dy * dy);
+        if !(slope.abs() > 0.0) {
+            break;
+        }
+        let mut step = (f / slope).clamp(-0.5, 0.5);
+        let mut accepted = false;
+        for _ in 0..40 {
+            let candidate = distance(theta - step);
+            if candidate < current {
+                theta -= step;
+                current = candidate;
+                accepted = true;
+                break;
+            }
+            step *= 0.5;
+        }
+        if !accepted || step.abs() <= 1e-15 {
+            break;
+        }
+    }
+    theta
+}
+
 /// Build a circle (`a == b`) or ellipse arc on `frame`, oriented so
 /// `evaluate(t0) == p_start` and `evaluate(t1) == p_end`. The STEP conic is
 /// parameterised CCW in the placement plane; `same_sense` picks the direction.
@@ -1329,7 +1379,7 @@ pub(super) fn build_conic_edge(
 ) -> Result<NurbsCurve, String> {
     let angle = |p: Vec3| {
         let delta = p.sub(frame.origin);
-        (delta.dot(frame.y) / b).atan2(delta.dot(frame.x) / a)
+        nearest_ellipse_angle(a, b, delta.dot(frame.x), delta.dot(frame.y))
     };
     let theta_start = angle(p_start);
     let theta_end = angle(p_end);
@@ -1377,9 +1427,83 @@ pub(super) fn build_conic_edge(
     if curve.evaluate(t0)?.sub(p_start).length() > tolerance
         || curve.evaluate(t1)?.sub(p_end).length() > tolerance
     {
-        return Err("step_import: conic edge endpoints do not match its vertices".into());
+        return conic_onto_vertices(&curve, a.max(b), p_start, p_end, closed)?
+            .ok_or_else(|| "step_import: conic edge endpoints do not match its vertices".into());
     }
     Ok(curve)
+}
+
+/// Largest vertex miss [`conic_onto_vertices`] carries the conic onto, as a
+/// fraction of the smaller of the semi-axis and (for an open arc) the chord.
+///
+/// Ten times the relative term of [`conic_vertex_band`]. The misses this
+/// admits are vendor imprecision measured on real exports: vertices out of a
+/// circle's plane by 1.0e-3 to 1.9e-3 of the radius (0.0055 mm on a 5.5 mm
+/// arc, 0.0066 mm on a 4.25 mm arc, 0.0123 mm on a 6.35 mm arc), where the
+/// neighbouring edges meet the vertex exactly. A vertex 6% of the radius off (two parallel circles 0.41 inch
+/// apart ending on one vertex between them) is broken geometry and stays
+/// refused, as does the identity band's own `1.2 * VERTEX_MATCH_FLOOR` miss on
+/// a 0.15 mm arc (4% of its radius).
+const CONIC_VERTEX_FIT_FRACTION: f64 = 1e-2;
+
+/// Carry an exact conic arc onto edge vertices it misses by more than
+/// [`conic_vertex_band`] but by less than [`CONIC_VERTEX_FIT_FRACTION`] of its
+/// size, or `None` when the miss is larger.
+///
+/// The curve ends at the vertices' projections onto the conic; a vertex off
+/// the conic's plane (or radius) by vendor imprecision leaves that miss as an
+/// edge-end vs vertex gap the validator refuses. The spline heal
+/// (`heal_imported_edge_endpoints`) moves end control points, which would
+/// deform a conic; instead the WHOLE arc is mapped by the similarity (uniform
+/// scale, the minimal rotation, a translation) that takes its two ends onto the
+/// two vertices. A similarity maps a circle to a circle and an ellipse to an
+/// ellipse, so the edge stays an exact conic, moved and resized by at most the
+/// miss. A closed conic (one vertex) is translated.
+fn conic_onto_vertices(
+    curve: &NurbsCurve,
+    semi_axis: f64,
+    p_start: Vec3,
+    p_end: Vec3,
+    closed: bool,
+) -> Result<Option<NurbsCurve>, String> {
+    let [t0, t1] = curve.domain()?;
+    let (q_start, q_end) = (curve.evaluate(t0)?, curve.evaluate(t1)?);
+    let miss = q_start.sub(p_start).length().max(q_end.sub(p_end).length());
+    let chord = q_end.sub(q_start);
+    let size = if closed {
+        semi_axis
+    } else {
+        semi_axis.min(chord.length())
+    };
+    if !(miss <= CONIC_VERTEX_FIT_FRACTION * size) {
+        return Ok(None);
+    }
+    let map: Box<dyn Fn(Vec3) -> Vec3> = if closed {
+        let shift = p_start.sub(q_start);
+        Box::new(move |point: Vec3| point.add(shift))
+    } else {
+        let target = p_end.sub(p_start);
+        let scale = target.length() / chord.length();
+        let (from, to) = (chord.normalized()?, target.normalized()?);
+        // Rodrigues rotation taking `from` onto `to` about their common normal.
+        let axis = from.cross(to);
+        let (sin_sq, cos) = (axis.dot(axis), from.dot(to));
+        let rotate = move |v: Vec3| {
+            if sin_sq <= 1e-30 {
+                return v;
+            }
+            v.scale(cos)
+                .add(axis.cross(v))
+                .add(axis.scale(axis.dot(v) * (1.0 - cos) / sin_sq))
+        };
+        Box::new(move |point: Vec3| p_start.add(rotate(point.sub(q_start)).scale(scale)))
+    };
+    let control_points = curve
+        .control_points
+        .iter()
+        .map(|control| Ok(Vec4::from_point(map(control.point()?), control.w)))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(Some(NurbsCurve::new(curve.degree, curve.knots.clone(), control_points)?))
 }
 
 /// Build the bounded positive branch of a STEP HYPERBOLA. ISO 10303 places the

@@ -27,6 +27,14 @@ const NEAR_AXIS_RELATIVE_TOLERANCE: f64 = 1e-4;
 /// stack-resident either way.
 pub(crate) const TENSOR_MAX_BLOCK: usize = 24;
 
+/// `BREP_SURFACE_TENSOR_FUSED` (default on): [`NurbsSurface::deriv1_tensor_each`]
+/// runs a patch of degrees 1 to 3 in each direction through its
+/// constant-degree loop, the same bits; `=0` keeps the run-time-degree loop,
+/// for a same-binary A/B.
+fn tensor_fused_on() -> bool {
+    switch!("BREP_SURFACE_TENSOR_FUSED", true)
+}
+
 /// A rational B-spline surface.
 ///
 /// **Invariant: do not mutate the public fields after the surface has been
@@ -892,6 +900,22 @@ impl NurbsSurface {
                 &mut basis_v[index][..=dv],
             );
         }
+        if tensor_fused_on() {
+            let (count_u, count_v) = (us.len(), vs.len());
+            let tables = (&span_u, &span_v, &basis_u, &basis_v);
+            match (self.degree_u, self.degree_v) {
+                (1, 1) => return self.deriv1_tensor_fused::<1, 1, F>(count_u, count_v, tables, &mut f),
+                (1, 2) => return self.deriv1_tensor_fused::<1, 2, F>(count_u, count_v, tables, &mut f),
+                (1, 3) => return self.deriv1_tensor_fused::<1, 3, F>(count_u, count_v, tables, &mut f),
+                (2, 1) => return self.deriv1_tensor_fused::<2, 1, F>(count_u, count_v, tables, &mut f),
+                (2, 2) => return self.deriv1_tensor_fused::<2, 2, F>(count_u, count_v, tables, &mut f),
+                (2, 3) => return self.deriv1_tensor_fused::<2, 3, F>(count_u, count_v, tables, &mut f),
+                (3, 1) => return self.deriv1_tensor_fused::<3, 1, F>(count_u, count_v, tables, &mut f),
+                (3, 2) => return self.deriv1_tensor_fused::<3, 2, F>(count_u, count_v, tables, &mut f),
+                (3, 3) => return self.deriv1_tensor_fused::<3, 3, F>(count_u, count_v, tables, &mut f),
+                _ => {}
+            }
+        }
         let zero = Vec4 {
             x: 0.0,
             y: 0.0,
@@ -941,6 +965,65 @@ impl NurbsSurface {
                 } else {
                     Vec3::default()
                 };
+                f(i, j, point, partial_u, partial_v)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::deriv1_tensor_each`]'s station loop for a patch of degrees
+    /// `DEGREE_U × DEGREE_V`, both at least 1, from the block's span and basis
+    /// tables. The same bits as the run-time-degree loop: each of the three
+    /// homogeneous sums (`S`, `∂_v`, `∂_u`) gets the same products
+    /// `basis_u · basis_v` of the same control points, scaled and then added in
+    /// the same row-outer, column-inner order from the same zero `Vec4`, and
+    /// the dehomogenization is that loop's line for line. What changes is only
+    /// that the three sums share one walk over the control points, and the trip
+    /// counts are constants the compiler unrolls. A mass integral's adaptive
+    /// area reads spend most of their time here: on a fitted bicubic offset
+    /// shell, about a billion stations for one solid.
+    #[allow(clippy::type_complexity)]
+    #[inline(always)]
+    fn deriv1_tensor_fused<const DEGREE_U: usize, const DEGREE_V: usize, F>(
+        &self,
+        count_u: usize,
+        count_v: usize,
+        (span_u, span_v, basis_u, basis_v): (
+            &[usize; TENSOR_MAX_BLOCK],
+            &[usize; TENSOR_MAX_BLOCK],
+            &[[[f64; MAX_STACK_ORDER]; 2]; TENSOR_MAX_BLOCK],
+            &[[[f64; MAX_STACK_ORDER]; 2]; TENSOR_MAX_BLOCK],
+        ),
+        f: &mut F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(usize, usize, Vec3, Vec3, Vec3) -> Result<(), String>,
+    {
+        let zero = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+        for i in 0..count_u {
+            let rows = &self.control_points[span_u[i] - DEGREE_U..=span_u[i]];
+            let (value_u, slope_u) = (&basis_u[i][0], &basis_u[i][1]);
+            for j in 0..count_v {
+                let column = span_v[j] - DEGREE_V;
+                let (value_v, slope_v) = (&basis_v[j][0], &basis_v[j][1]);
+                let (mut h00, mut h01, mut h10) = (zero, zero, zero);
+                for row_index in 0..=DEGREE_U {
+                    let row = &rows[row_index][column..=column + DEGREE_V];
+                    for column_index in 0..=DEGREE_V {
+                        let control = row[column_index];
+                        h00 = h00.add(control.scale(value_u[row_index] * value_v[column_index]));
+                        h01 = h01.add(control.scale(value_u[row_index] * slope_v[column_index]));
+                        h10 = h10.add(control.scale(slope_u[row_index] * value_v[column_index]));
+                    }
+                }
+                let weight = h00.w;
+                if weight.abs() <= EPS {
+                    return Err("NurbsSurface: zero evaluated weight".into());
+                }
+                let inverse = 1.0 / weight;
+                let point = Vec3::new(h00.x, h00.y, h00.z).scale(inverse);
+                let partial_v = Vec3::new(h01.x, h01.y, h01.z).sub(point.scale(h01.w)).scale(inverse);
+                let partial_u = Vec3::new(h10.x, h10.y, h10.z).sub(point.scale(h10.w)).scale(inverse);
                 f(i, j, point, partial_u, partial_v)?;
             }
         }
@@ -1793,6 +1876,7 @@ fn analytic_point_on() -> bool {
 pub(crate) fn small_derivatives_enabled() -> bool {
     switch!("BREP_SURFACE_SMALL_DERIVATIVES", true)
 }
+
 
 
 

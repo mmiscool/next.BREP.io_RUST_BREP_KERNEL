@@ -1692,6 +1692,9 @@ fn try_merge_pair_lanes(
             };
             let y_reference = support.axis.cross(x_reference);
             let mut angles = Vec::new();
+            // The angular sweep between consecutive samples of ONE edge: the
+            // edge itself covers it, so no gap can open inside it.
+            let mut swept: Vec<(f64, f64)> = Vec::new();
             let mut axial_range = [f64::INFINITY, f64::NEG_INFINITY];
             for coedge in loops.iter().flat_map(|loop_record| &loop_record.coedges) {
                 let edge = edges[&coedge.edge_id];
@@ -1700,6 +1703,7 @@ fn try_merge_pair_lanes(
                 let hull = axial_hull(&curve, support);
                 axial_range[0] = axial_range[0].min(hull[0]);
                 axial_range[1] = axial_range[1].max(hull[1]);
+                let mut previous: Option<f64> = None;
                 for index in 0..=8 {
                     let point = curve
                         .evaluate(c0 + (c1 - c0) * index as f64 / 8.0)
@@ -1714,10 +1718,22 @@ fn try_merge_pair_lanes(
                     if angle < 0.0 {
                         angle += std::f64::consts::TAU;
                     }
+                    if let Some(previous) = previous {
+                        swept.push((previous, angle_difference(previous, angle)));
+                    }
+                    previous = Some(angle);
                     angles.push(angle);
                 }
             }
             if angles.len() < 3 || axial_range[1] - axial_range[0] <= tolerance {
+                fall_through!(older, newer, 'partial_turn);
+            }
+            // The boundary sweeps the whole turn (two half-turn walls closing a
+            // ring between them): the largest gap between SAMPLES below would
+            // be one sample step inside an arc, not a gap in the region, and
+            // the carrier seamed there only fails the area check after a full
+            // reprojection. Leave for the full-turn lane at once.
+            if largest_uncovered_turn(&swept) <= 1e-6 {
                 fall_through!(older, newer, 'partial_turn);
             }
             angles.sort_by(f64::total_cmp);
@@ -2014,6 +2030,37 @@ fn cylinder_angle(
         angle = 0.0;
     }
     Some(angle)
+}
+
+
+/// The widest angle, in radians, that no `(start, signed sweep)` arc of
+/// `swept` covers; `TAU` for no arcs. Arcs are read the short way round, as
+/// [`angle_difference`] reports a sweep between two nearby samples.
+fn largest_uncovered_turn(swept: &[(f64, f64)]) -> f64 {
+    let tau = std::f64::consts::TAU;
+    let mut arcs: Vec<(f64, f64)> = Vec::with_capacity(swept.len() + 1);
+    for &(start, sweep) in swept {
+        let (low, length) = if sweep < 0.0 { (start + sweep, -sweep) } else { (start, sweep) };
+        let low = low.rem_euclid(tau);
+        if low + length > tau {
+            arcs.push((low, tau));
+            arcs.push((0.0, low + length - tau));
+        } else {
+            arcs.push((low, low + length));
+        }
+    }
+    if arcs.is_empty() {
+        return tau;
+    }
+    arcs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut largest = 0.0f64;
+    let mut reach = arcs[0].1;
+    for arc in &arcs[1..] {
+        largest = largest.max(arc.0 - reach);
+        reach = reach.max(arc.1);
+    }
+    // The wrap from the last reach round to the first arc's start.
+    largest.max(arcs[0].0 + tau - reach)
 }
 
 /// Signed angular distance from `from` to `to`, in `(-PI, PI]`.

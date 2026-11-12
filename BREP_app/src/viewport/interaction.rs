@@ -252,6 +252,9 @@ impl Viewport {
             // the verifier can locate, drag and click an annotation.
             crate::automation::registry::publish("__brepPmiLabels", "PMI label chips of the active view", &state.pmi_labels_json());
             crate::automation::registry::publish("__brepPmiLabelHit", "PMI label chip rects {id: [x,y,w,h]}", &self.pmi_label_hits_json());
+            // The center marks the overlay drew: each cross's two arms as
+            // unit world directions, with the bake's view direction.
+            crate::automation::registry::publish("__brepPmiCenterMarks", "center marks the PMI overlay drew {viewDir, marks: [{id, arms: [[u, v] per mark]}]} \u{2014} unit world directions of each cross's arms (f64), and the view direction of that bake", &state.pmi_center_marks_json());
             // The Move gizmo's typed-value card — `movecard/card`, `movecard/field:<axis>`.
             crate::automation::registry::publish("__brepMoveCardHit", "the Move gizmo's typed-value card rects in screen points (card, field:x|y|z|rx|ry|rz) while the component Move gizmo is armed", &crate::automation::hit_rects::hits_json(&self.move_card.hits));
             crate::automation::registry::publish("__brepComponentMenu", "the component right-click menu: {open: ACOMP id or null, last: the last right-click's hit and owning component}", &serde_json::json!({ "open": self.component_menu.as_ref().map(|(id, _)| id), "last": self.component_menu_probe }).to_string());

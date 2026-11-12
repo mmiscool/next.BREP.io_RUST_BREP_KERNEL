@@ -102,6 +102,42 @@ pub fn edge_endpoints(scene: &SceneMap, name: &str) -> Result<(Vec3, Vec3), Stri
     })
 }
 
+/// The span `(low, high)` a named face covers along the line `(origin,
+/// direction)` (unit direction): its boundary edges sampled and projected.
+/// What a centerline drawn along a cylinder's or cone's axis spans, since an
+/// axis frame carries a point on the axis and no extent.
+pub fn face_axial_span(scene: &SceneMap, name: &str, origin: Vec3, direction: Vec3) -> Result<(f64, f64), String> {
+    let face = scene
+        .resolve_face(name)
+        .ok_or_else(|| format!("'{name}' is not a face"))?;
+    crate::with_registered_solid_str(face.handle, |solid| {
+        let record = solid
+            .shells
+            .iter()
+            .flat_map(|shell| shell.faces.iter())
+            .find(|record| record.id == face.face_id)
+            .ok_or_else(|| format!("face '{name}' has no record"))?;
+        let mut low = f64::INFINITY;
+        let mut high = f64::NEG_INFINITY;
+        for coedge in record.loops.iter().flat_map(|lp| lp.coedges.iter()) {
+            let Some(edge) = solid.edges.iter().find(|edge| edge.id == coedge.edge_id) else {
+                continue;
+            };
+            const SAMPLES: usize = 8;
+            for k in 0..=SAMPLES {
+                let t = edge.t0 + (edge.t1 - edge.t0) * k as f64 / SAMPLES as f64;
+                let station = edge.curve.evaluate(t)?.sub(origin).dot(direction);
+                low = low.min(station);
+                high = high.max(station);
+            }
+        }
+        if !(high >= low) {
+            return Err(format!("face '{name}' has no boundary to measure along its axis"));
+        }
+        Ok((low, high))
+    })
+}
+
 /// Whether `name` resolves to a straight edge.
 pub fn is_straight_edge(geometry: &SelectionGeometry) -> bool {
     matches!(geometry, SelectionGeometry::Line { .. })

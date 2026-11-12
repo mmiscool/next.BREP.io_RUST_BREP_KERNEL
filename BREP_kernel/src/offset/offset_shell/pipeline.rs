@@ -712,6 +712,11 @@ fn offset_shell_impl(
     vacated_notes: &mut Vec<String>,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
     profile::attempt();
+    let _sharp_rims = super::carriers::SharpOpeningRims::set(if super::carriers::ruled_miter_on() {
+        super::carriers::sharp_opening_rims(source, opening_face_ids)
+    } else {
+        HashSet::default()
+    });
     let mut clock = web_time::Instant::now();
     omitted_supports.clone_from(shadowed_supports);
     vacated_notes.clear();
@@ -999,6 +1004,14 @@ fn offset_shell_impl(
         };
         profile::lap(&mut clock, profile::CARRIER_TRIM);
         let (mut carrier, lane) = carrier_solid_sided_lane(carrier_source, *face_id, distance, &extension)?;
+        os_debug!(
+            "carrier for src face {face_id}: lane {lane:?} carved {} surface u {:?} v {:?} source face u {:?} v {:?}",
+            carved.is_some(),
+            carrier.shells[0].faces[0].surface.domain_u().ok(),
+            carrier.shells[0].faces[0].surface.domain_v().ok(),
+            carrier_source.shells.iter().flat_map(|shell| &shell.faces).find(|f| f.id == *face_id).and_then(|f| f.surface.domain_u().ok()),
+            carrier_source.shells.iter().flat_map(|shell| &shell.faces).find(|f| f.id == *face_id).and_then(|f| f.surface.domain_v().ok()),
+        );
         profile::carrier_built(lane, clock.elapsed());
         clock = web_time::Instant::now();
         if (distance < 0.0 || reflex_extension.is_some()) && face.surface.is_affine().or_refuse(KernelStage::Sew, "is_affine")? {
@@ -2665,8 +2678,10 @@ fn offset_shell_impl(
                         )?
                 };
                 os_debug!(
-                    "  select[{index}.{fragment_index}] class={class:?} contact={contact} on_skin={} seed_in={:?} uv=({:.3},{:.3})",
+                    "  select[{index}.{fragment_index}] class={class:?} contact={contact} on_skin={} reading={:?} adrift={} seed_in={:?} uv=({:.3},{:.3})",
                     on_skin[fragment_index],
+                    readings[fragment_index],
+                    adrift[fragment_index],
                     parameter_point_in_face(&fragment_as_trim(fragment), seed, 1e-8),
                     fragment.test_uv.x, fragment.test_uv.y,
                 );
@@ -3275,6 +3290,19 @@ fn offset_shell_impl(
         )));
     }
     if chosen_offsets.is_empty() {
+        // NO SKIN, NONE SHADOWED (`BREP_OFFSET_SHELL_EMPTY_CAVITY`, default on; `=0` restores): every offset
+        // skin lies wholly outside the solid, so none was selected, though no support read
+        // shadowed (a cone r 3 h 4 open at its base at wall 2.5: its offset cone's own apex falls
+        // below the opening plane). That is the empty cavity the shadowed branch above answers
+        // with the solid unchanged; it is answered the same way, on the same two readings: no
+        // witness of a cavity, and no point of the solid farther than the wall from every
+        // retained face.
+        if matches!(body, Body::Shell) && empty_cavity_any_enabled() && cavity_witness(source, opening_face_ids, distance)?.is_none() {
+            if let Some(unchanged) = empty_cavity_shell(source, opening_face_ids, distance)? {
+                os_debug!("no offset skin was selected and no cavity remains: the solid is its own shell");
+                return Ok(unchanged);
+            }
+        }
         return Err(KernelRefusal::internal(KernelStage::Select, "offset_shell_no_boundary", "offset_shell: carrier intersections produced no offset boundary"));
     }
     // Opening-wall fragments can overlap at dense carrier junctions. The
@@ -3317,7 +3345,7 @@ fn offset_shell_impl(
             .map(|fragment| fragment.operand)
             .collect::<Vec<_>>(),
     );
-    let chosen_walls = manifold_walls;
+    let mut chosen_walls = manifold_walls;
     // A part of the selected cavity skin with no path to an opening wall is a
     // SEALED hollow; named only if the assembly then refuses.
     let sealed = if sealed_hollow_on() && body == Body::Shell {
@@ -3327,6 +3355,49 @@ fn offset_shell_impl(
     } else {
         Vec::new()
     };
+    // EVERY SKIN SEALED (`BREP_OFFSET_SHELL_SEALED_OPENINGS_WHOLE`, default on; `=0` restores): no selected
+    // skin reaches an opening, so the cavity is a closed void below them and each opening face
+    // stays as it is. Its wall fragments were cut by the skins' carriers PAST the cavity's own
+    // end (the 8 x 8 pyramid cut at 4, shelled open at its top at 1.9: the sides' offsets cross
+    // at z 3.75 and their mirrored continuations cut the opening in a square 0.25 across, which
+    // the wall selection dropped as the cavity's mouth and nothing filled). The opening faces
+    // are kept whole from the source instead of as wall fragments.
+    // A skin with an edge cut by an opening's wall carrier reaches that opening, whatever the
+    // fragment connectivity reads (a pinched lemon shelled through both caps reads sealed by it).
+    let reaches_an_opening = || {
+        chosen_offsets.iter().flat_map(|fragment| fragment.loops.iter().flat_map(|loop_record| &loop_record.coedges)).any(|coedge| {
+            let FragmentEdgeSource::Imprint { piece_id } = &coedge.source else { return false };
+            imprint.pieces.iter().find(|piece| piece.id == *piece_id).is_some_and(|piece| {
+                piece.support_faces.iter().any(|key| carriers.get(key.operand as usize).is_some_and(|carrier| carrier.kind == OffsetFaceRole::Wall))
+            })
+        })
+    };
+    // ... or whose edge lies on an opening face (a carrier reaching its opening plane meets it
+    // along its own boundary, not an imprint).
+    let touches_an_opening = || -> Result<bool, KernelRefusal> {
+        let openings = source.shells.iter().flat_map(|shell| &shell.faces).filter(|face| opening_face_ids.contains(&face.id)).collect::<Vec<_>>();
+        let band = 1e-7 * crate::solid_scale(source).max(1.0);
+        for (_, middle) in sealed.iter().flat_map(|skin| &skin.edge_middles) {
+            for face in &openings {
+                let Ok(foot) = crate::project_point_to_surface(&face.surface, *middle) else { continue };
+                if foot.distance <= band
+                    && parameter_point_in_face(face, Vec2 { x: foot.u, y: foot.v }, 1e-9).or_refuse(KernelStage::Select, "parameter_point_in_face")? != PolygonClass::Outside
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    };
+    let all_sealed = sealed_openings_whole_on()
+        && !chosen_offsets.is_empty()
+        && sealed.iter().map(|skin| skin.fragments).sum::<usize>() == chosen_offsets.len()
+        && !reaches_an_opening()
+        && !touches_an_opening()?;
+    if all_sealed {
+        os_debug!("every selected skin is sealed: the openings stay whole");
+        chosen_walls.clear();
+    }
     if !sealed.is_empty() {
         os_debug!(
             "sealed skins: {:?}",
@@ -3346,7 +3417,7 @@ fn offset_shell_impl(
     os_debug!("stage: source fragments {:.3}s", stage_clock.elapsed().as_secs_f64());
     let mut selected = source_fragments
         .into_iter()
-        .filter(|fragment| retained.contains(&fragment.source_face_id))
+        .filter(|fragment| retained.contains(&fragment.source_face_id) || (all_sealed && opening_face_ids.contains(&fragment.source_face_id)))
         .collect::<Vec<_>>();
     let mut face_images = selected
         .iter()
@@ -3920,6 +3991,18 @@ fn refuse_a_cascade_that_kept_the_cavity(
 }
 
 /// `BREP_OFFSET_SHELL_CAVITY_WITNESS` (default on; `=0` restores): [`cavity_witness`].
+fn retained_faces_of<'a>(retained: &[(&'a FaceRecord, Vec<&'a EdgeRecord>)]) -> Vec<&'a FaceRecord> {
+    retained.iter().map(|(face, _)| *face).collect()
+}
+
+fn sealed_openings_whole_on() -> bool {
+    switch!("BREP_OFFSET_SHELL_SEALED_OPENINGS_WHOLE", true)
+}
+
+fn empty_cavity_any_enabled() -> bool {
+    switch!("BREP_OFFSET_SHELL_EMPTY_CAVITY", true)
+}
+
 fn cavity_witness_enabled() -> bool {
     switch!("BREP_OFFSET_SHELL_CAVITY_WITNESS", true)
 }
@@ -3977,7 +4060,18 @@ pub(super) fn cavity_witness(
     let classify_tolerance = 1e-8 * scale;
     let margin = 1e-6 * scale;
     let readings = |point: Vec3| -> Result<Vec<(u64, f64)>, KernelRefusal> {
-        retained.iter().map(|(face, edges)| Ok((face.id, distance_to_trimmed_face(face, edges, point)?))).collect()
+        retained
+            .iter()
+            .map(|(face, edges)| {
+                // `BREP_OFFSET_RULED_MITER`: a ruled face reads the mitered metric the skin test
+                // reads it by, or the witness finds a cavity past a rim the skins never reach.
+                let ruled = if super::carriers::ruled_miter_on() { super::carriers::ruled_miter_distance(face, edges, point, &retained_faces_of(&retained))? } else { None };
+                Ok((face.id, match ruled {
+                    Some(mitered) => mitered,
+                    None => distance_to_trimmed_face(face, edges, point)?,
+                }))
+            })
+            .collect()
     };
     let clearance = |values: &[(u64, f64)]| values.iter().map(|(_, value)| *value).fold(f64::INFINITY, f64::min);
     let inside = |point: Vec3| -> Result<bool, KernelRefusal> {

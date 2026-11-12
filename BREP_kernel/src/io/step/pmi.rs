@@ -473,7 +473,9 @@ impl Emitter<'_, '_> {
             | PmiGeometry::Leader { .. }
             | PmiGeometry::Note { .. }
             | PmiGeometry::Explode { .. }
-            | PmiGeometry::Hide { .. } => Ok(None),
+            | PmiGeometry::Hide { .. }
+            | PmiGeometry::CenterMark { .. }
+            | PmiGeometry::CenterLine { .. } => Ok(None),
         }
     }
 

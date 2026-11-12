@@ -46,6 +46,65 @@ use crate::feature_pipeline::{
 };
 use crate::{restore_solids, AffineTransform, RestoredSnapshot};
 
+thread_local! {
+    /// Open [`DecodeMemoScope`]s on this thread, and the snapshots decoded
+    /// under them: part name -> (the payload decoded, its decode).
+    static DECODE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DECODED: std::cell::RefCell<std::collections::HashMap<String, (String, RestoredSnapshot)>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Keeps the instances of one history run from decoding the same part
+/// snapshot again: an imported assembly places each part many times (857
+/// instances of 174 parts), and every instance decoded its part's payload.
+/// A hit needs the stored payload to EQUAL the entry's, so it returns what a
+/// fresh decode of that payload would; failed decodes are not kept. Opened
+/// around a history run; the decodes are dropped when the outermost one ends.
+pub(crate) struct DecodeMemoScope(std::marker::PhantomData<*const ()>);
+
+impl DecodeMemoScope {
+    pub(crate) fn open() -> Self {
+        DECODE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl Drop for DecodeMemoScope {
+    fn drop(&mut self) {
+        let outermost = DECODE_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+            depth.get() == 0
+        });
+        if outermost {
+            DECODED.with(|decoded| decoded.borrow_mut().clear());
+        }
+    }
+}
+
+/// [`restore_solids`] through the open [`DecodeMemoScope`], if any.
+fn restore_solids_memoized(part_name: &str, payload: &str) -> Result<RestoredSnapshot, String> {
+    if DECODE_DEPTH.with(|depth| depth.get()) == 0 {
+        return restore_solids(payload);
+    }
+    let hit = DECODED.with(|decoded| {
+        decoded
+            .borrow()
+            .get(part_name)
+            .filter(|(stored, _)| stored == payload)
+            .map(|(_, snapshot)| snapshot.clone())
+    });
+    if let Some(snapshot) = hit {
+        return Ok(snapshot);
+    }
+    let snapshot = restore_solids(payload)?;
+    DECODED.with(|decoded| {
+        decoded
+            .borrow_mut()
+            .insert(part_name.to_string(), (payload.to_string(), snapshot.clone()))
+    });
+    Ok(snapshot)
+}
+
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     match build(ctx) {
         Ok(result) => result,
@@ -125,7 +184,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     } else if parts_library::needs_constraint_rows(&entry) {
         rebuild_stale(&part_name, &entry, Rebuild::ConstraintRows, &mut note)?
     } else {
-        match restore_solids(&entry.snapshot) {
+        match restore_solids_memoized(&part_name, &entry.snapshot) {
             Ok(snapshot) => (
                 snapshot,
                 entry.ports.clone(),

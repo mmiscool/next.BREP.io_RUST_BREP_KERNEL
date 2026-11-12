@@ -47,6 +47,33 @@ pub fn offset_solid(
     distance: f64,
     corners: OffsetCorners,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    let grown = offset_solid_joined(source, distance, corners)?;
+    if corners == OffsetCorners::Rounded && distance > 0.0 {
+        if let Some(carved) = super::bore_dimples::carve_bore_dimples(source, &grown.solid, distance) {
+            let operands = grown
+                .solid
+                .shells
+                .iter()
+                .flat_map(|shell| &shell.faces)
+                .zip(&grown.face_images)
+                .map(|(face, image)| (face, image.clone()))
+                .collect::<Vec<_>>();
+            let cap = OffsetShellFaceImageRecord { role: OffsetFaceRole::Offset, source_face_id: 0 };
+            if let Ok(face_images) = provenance_by_surface(&carved, &operands, Some(&cap)) {
+                return Ok(OffsetShellResultRecord { solid: carved, face_images });
+            }
+        }
+    }
+    Ok(grown)
+}
+
+/// [`offset_solid`] before the bore dimples ([`super::bore_dimples`]): the
+/// sharp body, or its rounding, or a decomposition's.
+fn offset_solid_joined(
+    source: &BrepSolid,
+    distance: f64,
+    corners: OffsetCorners,
+) -> Result<OffsetShellResultRecord, KernelRefusal> {
     if corners == OffsetCorners::Rounded && distance > 0.0 {
         if let Some(grown) = grown_across_reflex_edges(source, distance) {
             return Ok(grown);

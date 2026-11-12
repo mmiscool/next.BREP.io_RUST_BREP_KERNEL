@@ -747,57 +747,59 @@ impl ServerHandler for BrepServer {
                 let value = self.observed_resource(&request.uri).await.map_err(|e| McpError::resource_not_found(e, None))?;
                 return Ok(ReadResourceResult::new(vec![ResourceContents::text(value.to_string(), request.uri.clone())]).with_ttl_ms(0).with_cache_scope(CacheScope::Private).into());
             }
-            let dynamic = if let Some(path) = request.uri.strip_prefix("brep://api/function/") {
-                let value = self.state.cad.describe(&[path.to_string()]).await.map_err(|e| McpError::resource_not_found(e.message, None))?;
-                Some((value.to_string(), "application/json"))
-            } else if let Some(group) = request.uri.strip_prefix("brep://api/group/") {
-                let set = self.state.tools.read().await;
-                let specs = set.specs.iter().filter(|t| t.group == group && crate::script_sdk::script_callable(t.group, &t.name)).cloned().collect::<Vec<_>>();
-                if specs.is_empty() { return Err(McpError::resource_not_found("unknown function group", None)); }
-                Some((crate::generate::commands_json(&ToolSet::new(specs)).to_string(), "application/json"))
-            } else if request.uri == "brep://cad/sdk.d.ts" {
-                let set = self.state.tools.read().await;
-                Some((crate::cad::declarations::module(&self.state.cad.catalogue, &crate::script_sdk::script_tools(&set.specs)), "text/plain"))
-            } else if request.uri == "brep://api/commands" {
-                let set = self.state.tools.read().await;
-                Some((crate::generate::commands_json(&set).to_string(), "application/json"))
-            } else { None };
-            if let Some((text, mime)) = dynamic {
-                let mut contents = ResourceContents::text(text, request.uri.clone());
-                if let ResourceContents::TextResourceContents { mime_type, .. } = &mut contents { *mime_type = Some(mime.into()); }
-                return Ok(ReadResourceResult::new(vec![contents]).with_ttl_ms(LIST_TTL_MS).with_cache_scope(CacheScope::Private).into());
-            }
-            let session = self.state.slot.read().await.clone();
-            if let Some(session) = session {
-                let value = if request.uri == "brep://schema/features" {
-                    let catalogue = session.host.call_ok("plugin_feature_catalogue", serde_json::json!({})).await
-                        .map_err(|error| McpError::internal_error(error, None))?.result.unwrap_or(Value::Null);
-                    Some(crate::schema::all_from_catalogue(&catalogue))
-                } else if let Some(ty) = request.uri.strip_prefix("brep://schema/features/").filter(|ty| ty.contains('/')) {
-                    let entry = crate::tools::session_feature_entry(&session, ty).await
-                        .map_err(|error| McpError::resource_not_found(error, None))?;
-                    Some(serde_json::json!({"schema":crate::schema::to_json_schema(&entry),"defaults":crate::schema::defaults_from_entry(&entry)}))
-                } else { None };
-                if let Some(value) = value {
-                    let text = serde_json::to_string_pretty(&value).map_err(|error| McpError::internal_error(error.to_string(), None))?;
-                    let mut contents = ResourceContents::text(text, request.uri.clone());
-                    if let ResourceContents::TextResourceContents { mime_type, .. } = &mut contents {
-                        *mime_type = Some("application/json".into());
-                    }
-                    return Ok(ReadResourceResult::new(vec![contents]).with_ttl_ms(LIST_TTL_MS).with_cache_scope(CacheScope::Private).into());
-                }
-            }
-            let spec = self.state.resources.read().await.get(&request.uri).cloned();
-            let Some(spec) = spec else {
-                return Err(McpError::resource_not_found(format!("no resource `{}`", request.uri), None));
-            };
-            let text = (spec.read)().map_err(|e| McpError::internal_error(e, None))?;
-            let mut contents = ResourceContents::text(text, spec.uri.clone());
+            let (text, mime) = self.state.reference_text(&request.uri).await?
+                .ok_or_else(|| McpError::resource_not_found(format!("no resource `{}`", request.uri), None))?;
+            let mut contents = ResourceContents::text(text, request.uri.clone());
             if let ResourceContents::TextResourceContents { mime_type, .. } = &mut contents {
-                *mime_type = Some(spec.mime.to_string());
+                *mime_type = Some(mime.to_string());
             }
             Ok(ReadResourceResult::new(vec![contents]).with_ttl_ms(LIST_TTL_MS).with_cache_scope(CacheScope::Private).into())
         }
+    }
+}
+
+impl ServerState {
+    /// A reference resource's text and media type: the function and group
+    /// contracts, the declarations, the feature and sketch schemas, and every
+    /// listed resource. `None` when no resource has that URI. MCP's
+    /// resources/read and a script's `cad.docs.read` both read through here.
+    pub async fn reference_text(&self, uri: &str) -> Result<Option<(String, &'static str)>, McpError> {
+        let dynamic = if let Some(path) = uri.strip_prefix("brep://api/function/") {
+            let value = self.cad.describe(&[path.to_string()]).await.map_err(|e| McpError::resource_not_found(e.message, None))?;
+            Some((value.to_string(), "application/json"))
+        } else if let Some(group) = uri.strip_prefix("brep://api/group/") {
+            let set = self.tools.read().await;
+            let specs = set.specs.iter().filter(|t| t.group == group && crate::script_sdk::script_callable(t.group, &t.name)).cloned().collect::<Vec<_>>();
+            if specs.is_empty() { return Err(McpError::resource_not_found("unknown function group", None)); }
+            Some((crate::generate::commands_json(&ToolSet::new(specs)).to_string(), "application/json"))
+        } else if uri == "brep://cad/sdk.d.ts" {
+            let set = self.tools.read().await;
+            Some((crate::cad::declarations::module(&self.cad.catalogue, &crate::script_sdk::script_tools(&set.specs)), "text/plain"))
+        } else if uri == "brep://api/commands" {
+            let set = self.tools.read().await;
+            Some((crate::generate::commands_json(&set).to_string(), "application/json"))
+        } else { None };
+        if dynamic.is_some() { return Ok(dynamic); }
+        let session = self.slot.read().await.clone();
+        if let Some(session) = session {
+            let value = if uri == "brep://schema/features" {
+                let catalogue = session.host.call_ok("plugin_feature_catalogue", serde_json::json!({})).await
+                    .map_err(|error| McpError::internal_error(error, None))?.result.unwrap_or(Value::Null);
+                Some(crate::schema::all_from_catalogue(&catalogue))
+            } else if let Some(ty) = uri.strip_prefix("brep://schema/features/").filter(|ty| ty.contains('/')) {
+                let entry = crate::tools::session_feature_entry(&session, ty).await
+                    .map_err(|error| McpError::resource_not_found(error, None))?;
+                Some(serde_json::json!({"schema":crate::schema::to_json_schema(&entry),"defaults":crate::schema::defaults_from_entry(&entry)}))
+            } else { None };
+            if let Some(value) = value {
+                let text = serde_json::to_string_pretty(&value).map_err(|error| McpError::internal_error(error.to_string(), None))?;
+                return Ok(Some((text, "application/json")));
+            }
+        }
+        let spec = self.resources.read().await.get(uri).cloned();
+        let Some(spec) = spec else { return Ok(None) };
+        let text = (spec.read)().map_err(|e| McpError::internal_error(e, None))?;
+        Ok(Some((text, spec.mime)))
     }
 }
 

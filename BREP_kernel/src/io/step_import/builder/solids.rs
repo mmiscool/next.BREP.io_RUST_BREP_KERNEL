@@ -570,6 +570,19 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
         for volume in &mut shell_volumes {
             *volume = -*volume;
         }
+    } else if !authored_roles && shell_volumes[0] > tolerance {
+        // A void encloses positive volume: its base shell already faces into
+        // the void and the `.F.` wrapper turned it outward again (one CAD
+        // exporter writes every void this way), or a `.T.` wrapper was given a
+        // base shell authored as a void. A void can only remove material, so
+        // the shell is turned to face the void; the containment check below
+        // still refuses a "void" that does not lie inside the outer shell.
+        for (shell, volume) in solid.shells.iter_mut().zip(&mut shell_volumes).skip(1) {
+            if *volume > tolerance {
+                crate::offset_shell::flip_shell_faces(shell)?;
+                *volume = -*volume;
+            }
+        }
     } else if !authored_roles {
         return Err(brep_with_voids_input(format!(
             "step_import: BREP_WITH_VOIDS has mixed outer/void orientations {shell_volumes:?}"
@@ -694,13 +707,29 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     let mut faces = Vec::with_capacity(pending.len());
     // The planar split can have minted more pending faces than STEP faces, so
     // each pending face carries its own source reference.
-    for pending_face in pending {
+    let face_count = pending.len();
+    // `BREP_PROFILE_WALL` (profile-wall builds): the face loop's time split by
+    // what the pcurve work under it was doing.
+    let _wall = crate::wall_profile::Stage::open("step_finish_faces");
+    for (index, pending_face) in pending.into_iter().enumerate() {
         let face_ref = pending_face.face_ref;
-        faces.push(
-            builder
-                .finish_face(pending_face)
-                .map_err(|error| format!("step_import: face #{face_ref}: {error}"))?,
-        );
+        let face_started = profile.then(web_time::Instant::now);
+        let finished = builder.finish_face(pending_face);
+        // Under the profile switch, a face that takes over a second is named
+        // with its place in the shell, and so is a face that fails: how much of
+        // a refused body's time went before the face that refused it.
+        if let Some(started) = face_started {
+            let elapsed = started.elapsed();
+            if elapsed.as_secs_f64() > 1.0 || finished.is_err() {
+                profile_line!(
+                    "step_import.face shell=#{shell_ref} face=#{face_ref} index={index}/{face_count} ms={:.1} ok={} body_ms_so_far={:.1}",
+                    elapsed.as_secs_f64() * 1_000.0,
+                    finished.is_ok(),
+                    lap_started.elapsed().as_secs_f64() * 1_000.0
+                );
+            }
+        }
+        faces.push(finished.map_err(|error| format!("step_import: face #{face_ref}: {error}"))?);
     }
     lap("finish_faces", &mut lap_started, &mut laps);
 

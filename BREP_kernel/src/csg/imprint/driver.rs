@@ -542,6 +542,14 @@ fn distance_to_segment_sq(point: Vec3, from: Vec3, to: Vec3) -> f64 {
     point.distance_to_segment_squared(from, to)
 }
 
+/// The carrier miss, in fit tolerances, past which a section the mid-span
+/// refiner left unconverged goes to the 3-D Hermite lane
+/// (`BREP_SECTION_HERMITE_3D`). Measured on the lane's cases: a section that
+/// stalls near its floor (crossing cylinders, a tangent cone: 1.2e-8 to
+/// 1.3e-7 at a 1e-7 tolerance) keeps its fit; the swept rim walls' hairpin
+/// sections miss by 0.1 to 4.4e2.
+const HERMITE_3D_GROSS_MISS: f64 = 1e3;
+
 /// How a mid-span refinement left (`SECTION_MIDSPAN_*`), for the pair trace.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum MidspanExit {
@@ -1979,6 +1987,21 @@ fn build_imprints_with_carrier_seeds(
                             tangent_sections.push(section);
                         }
                     }
+                    // RIM BRIDGE (`BREP_RIM_BRIDGE`, default on, `=0` off). A pair
+                    // tangent along one stretch (two swept walls along the
+                    // join of the sweeps) can still cross elsewhere along a
+                    // section shorter than the march can see: where a rim of
+                    // each operand passes the other at a grazing angle, each
+                    // rim pierces the other operand's face a few
+                    // `tol / |tan·n|` from the other's pierce, and the section
+                    // between the two pierces lies on both faces of this pair.
+                    // Its neighbours end at the two pierces; without it the
+                    // shell tears there. The bridge is the straight segment
+                    // between a crossing pierce of each operand inside both
+                    // trims, mutual nearest and within the grazing reach.
+                    if rim_bridge_enabled() {
+                        rim_bridge(&mut builder, first, second, first_march, second_march, &face_edge_lists, options, debug_pairs)?;
+                    }
                     continue;
                 }
                 // A transverse curve EXISTS. What would make it unimprintable is
@@ -2946,6 +2969,8 @@ fn build_imprints_with_carrier_seeds(
                                 fit_split_timed(FitSplitLane::CarrierReadings, || fast_path_carrier_readings(&fit, &section, &first.face.surface, &second.face.surface));
                             carrier_miss_route(station_upper, midspan_upper, fit_tolerance)
                         });
+                        let mut refine_unconverged = false;
+                        let mut refine_worst = 0.0f64;
                         if let Some((gate, route)) = refine_route {
                             let stations_before = fit.kept.len();
                             let refine_census = std::env::var("BREP_SECTION_REFINE_CENSUS").ok();
@@ -2994,6 +3019,8 @@ fn build_imprints_with_carrier_seeds(
                                     first.face.id, second.face.id, exit, rounds, section.len(), worst
                                 );
                             }
+                            refine_unconverged = !matches!(exit, MidspanExit::Converged | MidspanExit::BelowGate);
+                            refine_worst = worst;
                             fit = refined;
                         }
                         span_census(|| {
@@ -3061,7 +3088,62 @@ fn build_imprints_with_carrier_seeds(
                         if let Some(census) = pair_census.as_mut() {
                             census.record_fit(&fit);
                         }
-                        (fit.curve, None)
+                        // HERMITE 3-D LANE (`BREP_SECTION_HERMITE_3D`, default on;
+                        // `imprint/hermite.rs`): a fit the refiner left unconverged and
+                        // still missing a carrier by more than [`HERMITE_3D_GROSS_MISS`]
+                        // fit tolerances, or one standing further from its own polyline
+                        // between stations than half the run's longest chord (ringing,
+                        // not chord sag), is
+                        // replaced by the C1 cubic through the march stations and their
+                        // tangents, bisected onto true intersection points until every
+                        // span holds the fit tolerance on both carriers. A run the lane
+                        // cannot bring within that keeps the fit.
+                        let mut lane_pcurves = None;
+                        if super::hermite::hermite_3d_enabled() {
+                            let longest = section.windows(2).map(|pair| pair[1].sub(pair[0]).length()).fold(0.0f64, f64::max);
+                            let ringing = !(fit.report.between_stations <= 0.5 * longest);
+                            let gross = refine_unconverged && !(refine_worst <= HERMITE_3D_GROSS_MISS * fit_tolerance);
+                            if gross || ringing {
+                                let emitted = super::hermite::hermite_section_3d(
+                                    &run[start..=end],
+                                    &branch,
+                                    &first.face.surface,
+                                    &second.face.surface,
+                                    fit_tolerance,
+                                )
+                                .or_refuse(KernelStage::Intersect, "csg.imprint.driver.hermite_3d")?;
+                                if debug_pairs {
+                                    eprintln!(
+                                        "pair {}x{}: hermite 3-D lane (gross {gross}, unconverged {refine_unconverged} worst {refine_worst:.3e}, ringing {ringing} between {:.3e} longest {longest:.3e}): {}",
+                                        first.face.id,
+                                        second.face.id,
+                                        fit.report.between_stations,
+                                        emitted.as_ref().map_or("declined".to_string(), |(curve, _)| format!("{} controls", curve.control_points.len()))
+                                    );
+                                }
+                                // `BREP_HERMITE_3D_CENSUS=<file>`: one line per section the
+                                // lane is asked to take, appended (debug only).
+                                if let Ok(path) = std::env::var("BREP_HERMITE_3D_CENSUS") {
+                                    use std::io::Write;
+                                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                                        let _ = writeln!(
+                                            file,
+                                            "hermite-3d census: label {} pair {}x{} gross {gross} ringing {ringing} worst {refine_worst:.3e} between {:.3e} -> {}",
+                                            std::env::var("BREP_CENSUS_LABEL").unwrap_or_default(),
+                                            first.face.id,
+                                            second.face.id,
+                                            fit.report.between_stations,
+                                            emitted.as_ref().map_or("declined".to_string(), |(curve, _)| format!("{} controls", curve.control_points.len()))
+                                        );
+                                    }
+                                }
+                                if let Some((curve, pcurves)) = emitted {
+                                    fit.curve = curve;
+                                    lane_pcurves = Some(pcurves);
+                                }
+                            }
+                        }
+                        (fit.curve, lane_pcurves)
                             }
                         };
                         let process_started = profile.enabled.then(Instant::now);
@@ -3548,6 +3630,97 @@ fn report_graze_contacts(
     Ok(())
 }
 
+/// `BREP_RIM_BRIDGE` (default on, `=0` off): see RIM BRIDGE in the pair loop.
+fn rim_bridge_enabled() -> bool {
+    crate::switch!("BREP_RIM_BRIDGE", true)
+}
+
+/// The rim pierces of a tangential-only pair, bridged (see RIM BRIDGE in the
+/// pair loop): every edge of each face that CROSSES the other carrier at a
+/// grazing angle (`|tan·n|` under the seed gate) inside both trims, and for
+/// each pierce of the first operand whose nearest pierce of the second is
+/// mutually nearest, farther apart than the assembler weld and within
+/// `4 tol / |tan·n|` (capped at 1e-3), the segment between them is imprinted.
+#[allow(clippy::too_many_arguments)]
+fn rim_bridge(
+    builder: &mut ImprintBuilder<'_>,
+    first: TaggedFace<'_>,
+    second: TaggedFace<'_>,
+    first_march: &NurbsSurface,
+    second_march: &NurbsSurface,
+    face_edge_lists: &HashMap<FaceKey, Vec<&EdgeRecord>>,
+    options: &ImprintOptions,
+    debug_pairs: bool,
+) -> Result<(), KernelRefusal> {
+    let mut pierces: [Vec<(Vec3, f64)>; 2] = [Vec::new(), Vec::new()];
+    for (side, (face, other, other_march)) in [(first, second, second_march), (second, first, first_march)].into_iter().enumerate() {
+        let edges = &face_edge_lists[&face.key()];
+        for edge in edges {
+            if edge.degenerate {
+                continue;
+            }
+            // An edge lying ON the other carrier (the rims along the join the
+            // pair is tangent across) reads a grazing hit per sample and
+            // crosses nowhere: skip its solve, as the seed loop does.
+            if super::support::curve_lies_on_surface(&edge_subcurve(edge)?, other_march, options.tolerance)? {
+                continue;
+            }
+            for hit in intersect_curve_surface(&edge.curve, other_march, options.tolerance).or_refuse(KernelStage::Intersect, "intersect_curve_surface")? {
+                if hit.t <= edge.t0 || hit.t >= edge.t1 {
+                    continue;
+                }
+                let Ok(tangent) = edge.curve.derivatives(hit.t, 1).or_refuse(KernelStage::Intersect, "derivatives")?[1].normalized() else {
+                    continue;
+                };
+                let Ok(normal) = other.chart().normal(hit.u, hit.v) else {
+                    continue;
+                };
+                let tangency = tangent.dot(normal).abs();
+                if !(tangency > 0.0 && tangency < 0.1) {
+                    continue;
+                }
+                if !edge_crosses_carrier(edge, edges, hit.t, other_march, options.tolerance)? {
+                    continue;
+                }
+                if !inside_both_trims(hit.point, first, second)? {
+                    continue;
+                }
+                pierces[side].push((hit.point, tangency));
+            }
+        }
+    }
+    let nearest = |point: Vec3, among: &[(Vec3, f64)]| -> Option<(Vec3, f64)> {
+        among.iter().copied().min_by(|a, b| a.0.sub(point).length().total_cmp(&b.0.sub(point).length()))
+    };
+    let weld = assembler_weld(options.tolerance);
+    for &(from, from_tangency) in &pierces[0] {
+        let Some((to, to_tangency)) = nearest(from, &pierces[1]) else {
+            continue;
+        };
+        let mutual = nearest(to, &pierces[0]).is_some_and(|(back, _)| back.sub(from).length() <= options.tolerance);
+        let gap = from.sub(to).length();
+        let reach = (4.0 * options.tolerance / from_tangency.min(to_tangency)).min(1e-3);
+        if debug_pairs {
+            eprintln!(
+                "pair {}x{}: rim bridge candidate ({:.7},{:.7},{:.7}) -> ({:.7},{:.7},{:.7}) gap {gap:.3e} reach {reach:.3e} mutual {mutual}",
+                first.face.id, second.face.id, from.x, from.y, from.z, to.x, to.y, to.z
+            );
+        }
+        if !mutual || gap <= weld || gap > reach {
+            continue;
+        }
+        let segment = crate::make_line(from, to).or_refuse(KernelStage::Intersect, "make_line")?;
+        builder.process_curve(segment, first, second, &[first, second], &[first, second], true, None)?;
+    }
+    Ok(())
+}
+
+/// `BREP_PIERCE_NEAR_END_STEP` (default on, `=0` off): [`edge_crosses_carrier`] reads
+/// a hit within its step of an open edge's end with the step shortened to it.
+fn pierce_near_end_step_enabled() -> bool {
+    crate::switch!("BREP_PIERCE_NEAR_END_STEP", true)
+}
+
 /// Does `edge` CROSS `carrier` at parameter `t` — leave one side of the
 /// surface for the other — rather than touch it or lie on it? Read from the
 /// signed distance of the edge to the carrier a step either side of `t`
@@ -3583,7 +3756,20 @@ fn edge_crosses_carrier(
     }
     let (t0, t1) = same_curve_chain_window(edge, siblings);
     let window = t1 - t0;
-    let delta = window * 1e-2;
+    let mut delta = window * 1e-2;
+    // A hit inside the step of an open edge's end is read with the step
+    // halved to the end (`BREP_PIERCE_NEAR_END_STEP`): the readings must still
+    // clear the band either side, so a hit at the end vertex itself is no
+    // crossing, while one a short real distance in from it is.
+    if pierce_near_end_step_enabled() && t > t0 && t < t1 {
+        let (start, end) = (
+            edge.curve.evaluate(t0).or_refuse(KernelStage::Intersect, "evaluate")?,
+            edge.curve.evaluate(t1).or_refuse(KernelStage::Intersect, "evaluate")?,
+        );
+        if start.sub(end).length() > tolerance {
+            delta = delta.min(0.5 * (t - t0)).min(0.5 * (t1 - t));
+        }
+    }
     let (mut before, mut after) = (t - delta, t + delta);
     if before < t0 || after > t1 {
         let start = edge.curve.evaluate(t0).or_refuse(KernelStage::Intersect, "evaluate")?;
@@ -4421,4 +4607,5 @@ fn pair_normals_parallel_at(
     }
     Ok(normals[0].cross(normals[1]).length() <= crate::TRANSVERSE_SEED_CROSS)
 }
+
 

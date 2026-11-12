@@ -32,6 +32,16 @@
 //! the K curves carried by quintic splines through the exact motion and its
 //! first two derivatives (error h⁶, 48 spans a turn), a row per quarter turn.
 //!
+//! Moving grazing loops: [`sweep_solid_along`] (a solid of revolution carried
+//! by a frame along a planar curve) and [`sweep_solid_tumbled`] (two turns
+//! about skew axes) split the tool at sample times, sample each piece of K
+//! exactly and loft the walls through time; a tumble that passes over a point
+//! twice is built from one-pass spans of its time, joined.
+//! [`sweep_prism_along`] sweeps a prism along a frame by the plane region the
+//! moving outline covers (an arrangement of its corners', grazing points' and
+//! end positions' paths), extruded. [`sweep_solid_parts`] returns a folding
+//! polyhedron's sweep as the sweeps of its halves through the motion's axis.
+//!
 //! [`sweep_solid_clipped`] adds the case the caller only needs inside a
 //! region: a polyhedron TURNED about the region's axis with both end positions
 //! outside the region's wedge fills the wedge with its (ρ, z) shadow turned,
@@ -68,6 +78,14 @@ fn refuse(what: &'static str, message: String) -> KernelRefusal {
     KernelRefusal::unsupported(KernelStage::Classify, what, format!("{SOLID_SWEEP_WHOLE_REFUSAL}: {message}"))
 }
 
+/// The stable slug of an unsupported-geometry refusal of this module.
+fn refused_as(error: &KernelRefusal) -> Option<&str> {
+    match &error.class {
+        crate::RefusalClass::UnsupportedGeometry { what } => Some(what.as_str()),
+        _ => None,
+    }
+}
+
 fn input(what: &'static str, message: String) -> KernelRefusal {
     KernelRefusal::input(KernelStage::Collect, what, format!("{SOLID_SWEEP_WHOLE_REFUSAL}: {message}"))
 }
@@ -91,10 +109,41 @@ struct Screw {
     /// frame's fixed up direction, `omega` a bound on its turning rate and `c`
     /// on its speed).
     frame: Option<Frame>,
+    /// Two turns about fixed axes instead (then `a` is the first axis' point).
+    turns: Option<Turns>,
     /// The time whose velocity field splits the tool (default: the middle).
     frozen: Option<f64>,
     /// How far the frame's origin travels from `a` (for speed bounds).
     extent: f64,
+}
+
+/// Two turns driven by one parameter: first `rates[0]·t` about the first
+/// axis, then `rates[1]·t` about the second; both axes fixed in the world.
+#[derive(Clone, Copy, Debug)]
+struct Turns {
+    points: [Vec3; 2],
+    directions: [Vec3; 2],
+    rates: [f64; 2],
+}
+
+impl Turns {
+    fn apply(&self, t: f64, x: Vec3) -> Vec3 {
+        let y = self.points[0].add(x.sub(self.points[0]).rotate_about(self.directions[0], self.rates[0] * t));
+        self.points[1].add(y.sub(self.points[1]).rotate_about(self.directions[1], self.rates[1] * t))
+    }
+    fn invert(&self, t: f64, y: Vec3) -> Vec3 {
+        let x = self.points[1].add(y.sub(self.points[1]).rotate_about(self.directions[1], -self.rates[1] * t));
+        self.points[0].add(x.sub(self.points[0]).rotate_about(self.directions[0], -self.rates[0] * t))
+    }
+    /// Velocity of the tool point x at t, read back in the tool's frame.
+    fn velocity(&self, t: f64, x: Vec3) -> Vec3 {
+        let first = x.sub(self.points[0]).rotate_about(self.directions[0], self.rates[0] * t);
+        let y = self.points[0].add(first);
+        let moved = y.sub(self.points[1]).rotate_about(self.directions[1], self.rates[1] * t);
+        let inner = self.directions[0].cross(first).scale(self.rates[0]);
+        let world = self.directions[1].cross(moved).scale(self.rates[1]).add(inner.rotate_about(self.directions[1], self.rates[1] * t));
+        world.rotate_about(self.directions[1], -self.rates[1] * t).rotate_about(self.directions[0], -self.rates[0] * t)
+    }
 }
 
 /// A frame riding a planar cubic Bézier curve: origin on the curve, first
@@ -161,7 +210,7 @@ impl Screw {
         if step.turn == 0.0 && step.advance == 0.0 {
             return Err(input("still", "the motion does not move".into()));
         }
-        Ok(Self { a: step.axis_origin, e, omega: step.turn, c: step.advance, c2: 0.0, t0: motion.from, t1: motion.to, frame: None, frozen: None, extent: 0.0 })
+        Ok(Self { a: step.axis_origin, e, omega: step.turn, c: step.advance, c2: 0.0, t0: motion.from, t1: motion.to, frame: None, turns: None, frozen: None, extent: 0.0 })
     }
 
     fn from_rising(motion: &RisingTurn) -> Result<Self, KernelRefusal> {
@@ -174,7 +223,7 @@ impl Screw {
         if rate(motion.from) * rate(motion.to) <= 0.0 {
             return Err(refuse("rise_turns", "the rise stops or turns back within the motion".into()));
         }
-        Ok(Self { a: motion.axis_origin, e, omega: 1.0, c: motion.rise[0], c2: motion.rise[1], t0: motion.from, t1: motion.to, frame: None, frozen: None, extent: 0.0 })
+        Ok(Self { a: motion.axis_origin, e, omega: 1.0, c: motion.rise[0], c2: motion.rise[1], t0: motion.from, t1: motion.to, frame: None, turns: None, frozen: None, extent: 0.0 })
     }
 
     fn advance(&self, t: f64) -> f64 {
@@ -187,6 +236,9 @@ impl Screw {
     }
 
     fn apply(&self, t: f64, x: Vec3) -> Vec3 {
+        if let Some(turns) = &self.turns {
+            return turns.apply(t, x);
+        }
         if let Some(frame) = &self.frame {
             return frame.point(t).add(x.sub(self.a).rotate_about(frame.up, frame.angle(t)));
         }
@@ -194,6 +246,9 @@ impl Screw {
     }
 
     fn invert(&self, t: f64, y: Vec3) -> Vec3 {
+        if let Some(turns) = &self.turns {
+            return turns.invert(t, y);
+        }
         if let Some(frame) = &self.frame {
             return self.a.add(y.sub(frame.point(t)).rotate_about(frame.up, -frame.angle(t)));
         }
@@ -208,6 +263,9 @@ impl Screw {
     }
 
     fn velocity_at(&self, t: f64, x: Vec3) -> Vec3 {
+        if let Some(turns) = &self.turns {
+            return turns.velocity(t, x);
+        }
         if let Some(frame) = &self.frame {
             // In the riding frame: the speed along the start tangent and the
             // turn about up through the frame's origin.
@@ -343,6 +401,64 @@ struct Cap {
     surface: NurbsSurface,
     front: bool,
     coedges: Vec<(usize, bool, NurbsCurve)>,
+    /// The surface's exact parameters of a point (in the tool's frame), where
+    /// known: a lofted edge's pcurve is then its exact image.
+    chart: Option<Chart>,
+}
+
+/// How a cap's surface is parameterized, to invert it exactly.
+#[derive(Clone, Copy, Debug)]
+enum Chart {
+    /// `plane_patch(origin, u, v, …)`: (x − origin)·u, (x − origin)·v.
+    Plane { origin: Vec3, u: Vec3, v: Vec3 },
+    /// `make_revolution(origin, w, generatrix, theta)` with the generatrix in the
+    /// meridian half-plane at angle `alpha` (from u1 towards u2).
+    Revolution { origin: Vec3, w: Vec3, u1: Vec3, u2: Vec3, alpha: f64, theta: f64, spans_u: usize, meridian: MeridianChart },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MeridianChart {
+    /// A segment from m0 to m1 in (ρ, z), parameter 0 -> 1.
+    Line { m0: [f64; 2], m1: [f64; 2] },
+    /// An arc about `centre` in (ρ, z) from angle `start` through `sweep`, as
+    /// `make_revolution` of a point makes it (`spans` arcs).
+    Arc { centre: [f64; 2], start: f64, sweep: f64, spans: usize },
+}
+
+impl Chart {
+    fn invert(&self, x: Vec3) -> [f64; 2] {
+        match *self {
+            Chart::Plane { origin, u, v } => {
+                let d = x.sub(origin);
+                [d.dot(u), d.dot(v)]
+            }
+            Chart::Revolution { origin, w, u1, u2, alpha, theta, spans_u, meridian } => {
+                let r = x.sub(origin);
+                let z = r.dot(w);
+                let rho = r.sub(w.scale(z)).length();
+                let mid = alpha + 0.5 * theta;
+                let psi = mid + (r.dot(u2).atan2(r.dot(u1)) - mid + PI).rem_euclid(TAU) - PI;
+                let u = crate::circle_angle_to_parameter(spans_u, theta, psi - alpha);
+                let v = match meridian {
+                    MeridianChart::Line { m0, m1 } => {
+                        let (a, b) = (m1[0] - m0[0], m1[1] - m0[1]);
+                        ((rho - m0[0]) * a + (z - m0[1]) * b) / (a * a + b * b)
+                    }
+                    MeridianChart::Arc { centre, start, sweep, spans } => {
+                        let mid = start + 0.5 * sweep;
+                        let angle = mid + ((z - centre[1]).atan2(rho - centre[0]) - mid + PI).rem_euclid(TAU) - PI;
+                        crate::circle_angle_to_parameter(spans, sweep, angle - start)
+                    }
+                };
+                [u, v]
+            }
+        }
+    }
+}
+
+/// The spans `make_revolution` gives a sweep of `theta`.
+fn spans_of(surface_knots_u: &[f64]) -> usize {
+    (surface_knots_u.len() - 6) / 2 + 1
 }
 
 /// The tool's boundary split along K, in the tool's own frame.
@@ -608,7 +724,7 @@ fn split_polyhedron(screw: &Screw, vertices: &[Vec3], faces: &[Vec<usize>]) -> R
             let forward = p == key.0;
             coedges.push((index, forward, plane_pcurve(origin, u, v, &curves[index].curve, forward)?));
         }
-        caps.push(Cap { surface, front, coedges });
+        caps.push(Cap { surface, front, coedges, chart: Some(Chart::Plane { origin, u, v }) });
     }
     Ok(Split { points, curves, caps, scale, shape: Shape::Planes(planes) })
 }
@@ -990,7 +1106,7 @@ fn split_revolved(
                 }
                 let r = junction(rim)[0];
                 corners.extend([centre.add(u.scale(r)).add(v.scale(r)), centre.sub(u.scale(r)).sub(v.scale(r))]);
-                caps.push(Cap { surface: plane_patch(centre, u, v, &corners)?, front, coedges });
+                caps.push(Cap { surface: plane_patch(centre, u, v, &corners)?, front, coedges, chart: Some(Chart::Plane { origin: centre, u, v }) });
             }
             Kind::Ruled(roots) => {
                 if on_axis(m0) || on_axis(m1) {
@@ -1017,7 +1133,8 @@ fn split_revolved(
                         (upper, false, uv_line([1.0, 1.0], [0.0, 1.0])?),
                         (g_alpha, false, uv_line([0.0, 1.0], [0.0, 0.0])?),
                     ];
-                    caps.push(Cap { surface, front, coedges });
+                    let chart = Chart::Revolution { origin, w, u1, u2, alpha, theta: beta - alpha, spans_u: spans_of(&surface.knots_u), meridian: MeridianChart::Line { m0, m1 } };
+                    caps.push(Cap { surface, front, coedges, chart: Some(chart) });
                 }
             }
             Kind::Moving => {
@@ -1115,7 +1232,8 @@ fn split_revolved(
                         (top, false, frag(rim_pcurve(top, 1.0)?.reversed(), "reversed")?),
                         (branch_curves[lo_which], false, frag(branch_pcurve(lo_which, 0.0)?.reversed(), "reversed")?),
                     ];
-                    caps.push(Cap { surface, front, coedges });
+                    let chart_spans = spans_of(&surface.knots_u);
+                    caps.push(Cap { surface, front, coedges, chart: Some(Chart::Revolution { origin, w, u1, u2, alpha, theta, spans_u: chart_spans, meridian: MeridianChart::Line { m0, m1 } }) });
                 }
             }
             Kind::TorusZone { psi_a, psi_b, at_end } => {
@@ -1213,7 +1331,7 @@ fn split_revolved(
                 };
                 // The band away from K: a natural patch over [ψb, ψa + 2π].
                 {
-                    let (surface, _, _) = patch(psi_b, psi_a + TAU)?;
+                    let (surface, _, band_spans_v) = patch(psi_b, psi_a + TAU)?;
                     let (bottom, top) = (rim_arcs[&(below, arc_index(below, psi_b)?)], rim_arcs[&(above, arc_index(above, psi_b)?)]);
                     let coedges = vec![
                         (bottom, true, uv_line([0.0, 0.0], [1.0, 0.0])?),
@@ -1222,7 +1340,8 @@ fn split_revolved(
                         (cut[1], false, uv_line([0.0, 1.0], [0.0, 0.0])?),
                     ];
                     let mid = psi_b + 0.5 * (psi_a + TAU - psi_b);
-                    caps.push(Cap { surface, front: label(mid, 0.5 * (start + end)), coedges });
+                    let chart_spans = spans_of(&surface.knots_u);
+                    caps.push(Cap { surface, front: label(mid, 0.5 * (start + end)), coedges, chart: Some(Chart::Revolution { origin, w, u1, u2, alpha: psi_b, theta: psi_a + TAU - psi_b, spans_u: chart_spans, meridian: MeridianChart::Arc { centre, start, sweep: end - start, spans: band_spans_v } }) });
                 }
                 // Over [ψa, ψb]: the lens between K and its rim, and the rest.
                 let (surface, spans_u, spans_v) = patch(psi_a, psi_b)?;
@@ -1236,24 +1355,24 @@ fn split_revolved(
                 if at_end {
                     // Lens: K (ψa -> ψb) under the end rim, then the end rim back.
                     let lens = vec![(k_curve, true, k_pc(true)?), (rim_arc, false, uv_line([1.0, 1.0], [0.0, 1.0])?)];
-                    caps.push(Cap { surface: surface.clone(), front: label(mid, lens_v), coedges: lens });
+                    caps.push(Cap { surface: surface.clone(), front: label(mid, lens_v), coedges: lens, chart: Some(Chart::Revolution { origin, w, u1, u2, alpha: psi_a, theta: psi_b - psi_a, spans_u, meridian: MeridianChart::Arc { centre, start, sweep: end - start, spans: spans_v } }) });
                     let rest = vec![
                         (other_arc, true, uv_line([0.0, 0.0], [1.0, 0.0])?),
                         (cut[1], true, uv_line([1.0, 0.0], [1.0, 1.0])?),
                         (k_curve, false, k_pc(false)?),
                         (cut[0], false, uv_line([0.0, 1.0], [0.0, 0.0])?),
                     ];
-                    caps.push(Cap { surface, front: label(mid, rest_v), coedges: rest });
+                    caps.push(Cap { surface, front: label(mid, rest_v), coedges: rest, chart: Some(Chart::Revolution { origin, w, u1, u2, alpha: psi_a, theta: psi_b - psi_a, spans_u, meridian: MeridianChart::Arc { centre, start, sweep: end - start, spans: spans_v } }) });
                 } else {
                     let lens = vec![(rim_arc, true, uv_line([0.0, 0.0], [1.0, 0.0])?), (k_curve, false, k_pc(false)?)];
-                    caps.push(Cap { surface: surface.clone(), front: label(mid, lens_v), coedges: lens });
+                    caps.push(Cap { surface: surface.clone(), front: label(mid, lens_v), coedges: lens, chart: Some(Chart::Revolution { origin, w, u1, u2, alpha: psi_a, theta: psi_b - psi_a, spans_u, meridian: MeridianChart::Arc { centre, start, sweep: end - start, spans: spans_v } }) });
                     let rest = vec![
                         (k_curve, true, k_pc(true)?),
                         (cut[1], true, uv_line([1.0, 0.0], [1.0, 1.0])?),
                         (other_arc, false, uv_line([1.0, 1.0], [0.0, 1.0])?),
                         (cut[0], false, uv_line([0.0, 1.0], [0.0, 0.0])?),
                     ];
-                    caps.push(Cap { surface, front: label(mid, rest_v), coedges: rest });
+                    caps.push(Cap { surface, front: label(mid, rest_v), coedges: rest, chart: Some(Chart::Revolution { origin, w, u1, u2, alpha: psi_a, theta: psi_b - psi_a, spans_u, meridian: MeridianChart::Arc { centre, start, sweep: end - start, spans: spans_v } }) });
                 }
             }
             Kind::Ball { centre, radius } => {
@@ -1309,7 +1428,7 @@ fn split_revolved(
                         (poles[1], true, uv_line([1.0, g1], [0.0, g1])?),
                         (k_a_index, !forward, uv_line([0.0, g1], [0.0, g0])?),
                     ];
-                    caps.push(Cap { surface, front, coedges });
+                    caps.push(Cap { surface, front, coedges, chart: None });
                 }
             }
             Kind::Sphere { centre, pole_at_start } => {
@@ -1376,7 +1495,7 @@ fn split_revolved(
                     ];
                     let mid_psi = if j == 0 { 0.5 * (angles[0] + angles[1]) } else { 0.5 * (angles[1] + angles[0] + TAU) };
                     let front = m.dot(at(1.0, 0.0, mid_psi).sub(origin)) > 0.0;
-                    caps.push(Cap { surface, front, coedges });
+                    caps.push(Cap { surface, front, coedges, chart: None });
                 }
             }
         }
@@ -1467,7 +1586,8 @@ fn split_torus(
             let (start, end) = (corner[&(seam_of_end(half, false), branch)], corner[&(seam_of_end(half, true), branch)]);
             xyz[0] = points[start];
             xyz[n] = points[end];
-            curves.push(ToolCurve { curve: frag(crate::interpolate_curve(&xyz, 5, &params), "ring_branch")?, start, end, degenerate: false, samples: None });
+            let exact = (n == LOFT_SAMPLES).then(|| xyz.clone());
+            curves.push(ToolCurve { curve: frag(crate::interpolate_curve(&xyz, 5, &params), "ring_branch")?, start, end, degenerate: false, samples: exact });
             branch_curve.insert((half, branch), curves.len() - 1);
         }
     }
@@ -1496,8 +1616,12 @@ fn split_torus(
             // The band's lower and upper edges (v), as branches.
             let (lo_branch, hi_branch, hi_turn) = if band == 0 { (0usize, 1usize, 0.0) } else { (1, 0, TAU) };
             let pick = |s: &(f64, f64, f64), b: usize| if b == 0 { s.1 } else { s.2 };
-            let v_low = samples[half].iter().map(|s| pick(s, lo_branch)).fold(f64::INFINITY, f64::min) - 1e-3;
-            let v_high = samples[half].iter().map(|s| pick(s, hi_branch) + hi_turn).fold(f64::NEG_INFINITY, f64::max) + 1e-3;
+            // A margin each side: an end cap may be carried a little across its
+            // grazing curve (see `end_trim`), as far as the tube leaves room.
+            let low = samples[half].iter().map(|s| pick(s, lo_branch)).fold(f64::INFINITY, f64::min);
+            let high = samples[half].iter().map(|s| pick(s, hi_branch) + hi_turn).fold(f64::NEG_INFINITY, f64::max);
+            let margin = (0.25 * (TAU - (high - low))).clamp(1e-3, 0.25);
+            let (v_low, v_high) = (low - margin, high + margin);
             let theta_v = v_high - v_low;
             if theta_v >= TAU {
                 return Err(refuse("ring_grazing", "a band of the ring wraps all the way round its tube".into()));
@@ -1546,7 +1670,7 @@ fn split_torus(
             ];
             let mid = &samples[half][n / 2];
             let front = g(mid.0, 0.5 * (pick(mid, lo_branch) + pick(mid, hi_branch) + hi_turn)) > 0.0;
-            caps.push(Cap { surface, front, coedges });
+            caps.push(Cap { surface, front, coedges, chart: Some(Chart::Revolution { origin, w, u1, u2, alpha: psi_a, theta: psi_b - psi_a, spans_u, meridian: MeridianChart::Arc { centre: [rho_c, z_c], start: v_low, sweep: theta_v, spans: spans_v } }) });
         }
     }
     Ok(Split {
@@ -1778,7 +1902,7 @@ pub fn sweep_solid_rising(tool: &SolidTool, motion: &RisingTurn, clip: &crate::S
 pub fn sweep_solid_parts(tool: &SolidTool, motion: &SolidMotion) -> Result<Vec<BrepSolid>, KernelRefusal> {
     let folded = match sweep_solid(tool, motion) {
         Ok(body) => return Ok(vec![body]),
-        Err(error) if error.message.contains("passes over a point twice") => error,
+        Err(error) if refused_as(&error) == Some("folds") => error,
         Err(error) => return Err(error),
     };
     let SolidTool::Polyhedron { vertices, faces } = tool else { return Err(folded) };
@@ -2463,7 +2587,7 @@ pub fn sweep_solid_along(tool: &SolidTool, path: &FrameCurve) -> Result<BrepSoli
         }
         previous = angle;
     }
-    let screw = Screw { a: base, e: up, omega: rate, c: speed, c2: 0.0, t0: 0.0, t1: 1.0, frame: Some(frame), frozen: None, extent };
+    let screw = Screw { a: base, e: up, omega: rate, c: speed, c2: 0.0, t0: 0.0, t1: 1.0, frame: Some(frame), turns: None, frozen: None, extent };
     let SolidTool::Revolved { axis_origin, axis_direction, radial, meridian } = tool else {
         return Err(refuse("along_tool", "a frame along a curve carries a solid of revolution only".into()));
     };
@@ -2475,7 +2599,7 @@ pub fn sweep_solid_along(tool: &SolidTool, path: &FrameCurve) -> Result<BrepSoli
     for k in 0..8 {
         let reference = radial.rotate_about(axis, PI * k as f64 / 4.0);
         match lofted(&screw, *axis_origin, axis, reference, meridian) {
-            Err(error) if error.message.contains("structure") => last = Some(error),
+            Err(error) if refused_as(&error) == Some("loft_structure") => last = Some(error),
             other => return other,
         }
     }
@@ -2831,6 +2955,102 @@ pub fn sweep_prism_along(outline: &[[f64; 2]], from: f64, to: f64, path: &FrameC
     Ok(body)
 }
 
+/// Two turns driven by one parameter t: first by `rates[0]·t` about the
+/// first axis (point, direction), then by `rates[1]·t` about the second; both
+/// axes fixed in the world; t from `from` to `to`.
+#[derive(Clone, Copy, Debug)]
+pub struct TwoTurns {
+    pub axes: [(Vec3, Vec3); 2],
+    pub rates: [f64; 2],
+    pub from: f64,
+    pub to: f64,
+}
+
+/// The whole sweep of a solid of revolution tumbled by two turns about skew
+/// axes. The grazing loop moves on the tool (the instantaneous screw changes
+/// with t), so the walls are lofted through exact samples. Where the tumble
+/// passes over a point twice (the one-pass probe), the time is bisected into
+/// spans each passing once, and the spans' sweeps are joined (consecutive
+/// spans meet along a grazing loop; distant ones overlap).
+pub fn sweep_solid_tumbled(tool: &SolidTool, motion: &TwoTurns) -> Result<BrepSolid, KernelRefusal> {
+    if !(motion.from.is_finite() && motion.to.is_finite() && motion.to > motion.from) {
+        return Err(input("range", "the motion's range must run forward".into()));
+    }
+    let mut points = [Vec3::new(0.0, 0.0, 0.0); 2];
+    let mut directions = [Vec3::new(0.0, 0.0, 1.0); 2];
+    for k in 0..2 {
+        points[k] = motion.axes[k].0;
+        directions[k] = motion.axes[k].1.normalized().map_err(|_| input("axis", "a turn's axis has no direction".into()))?;
+    }
+    let turns = Turns { points, directions, rates: motion.rates };
+    let SolidTool::Revolved { axis_origin, axis_direction, radial, meridian } = tool else {
+        return Err(refuse("tumble_tool", "a tumble sweeps a solid of revolution only".into()));
+    };
+    let axis = axis_direction.normalized().map_err(|_| input("axis", "the tool's axis has no direction".into()))?;
+    let base = Screw {
+        a: points[0],
+        e: directions[0],
+        omega: motion.rates[0].abs() + motion.rates[1].abs(),
+        c: 0.0,
+        c2: 0.0,
+        t0: motion.from,
+        t1: motion.to,
+        frame: None,
+        turns: Some(turns),
+        frozen: None,
+        extent: points[1].sub(points[0]).length(),
+    };
+    let span = |t0: f64, t1: f64| -> Result<BrepSolid, KernelRefusal> {
+        let mut screw = base;
+        screw.t0 = t0;
+        screw.t1 = t1;
+        let mut last = None;
+        for k in 0..8 {
+            let reference = radial.rotate_about(axis, PI * k as f64 / 4.0);
+            match lofted(&screw, *axis_origin, axis, reference, meridian) {
+                Err(error) if matches!(refused_as(&error), Some("loft_structure") | Some("end_trim_corner")) => last = Some(error),
+                other => return other,
+            }
+        }
+        Err(last.expect("tried"))
+    };
+    // Bisect where the sweep folds over itself.
+    let mut pending = vec![(motion.from, motion.to, 0usize)];
+    let mut spans: Vec<(f64, BrepSolid)> = Vec::new();
+    while let Some((t0, t1, depth)) = pending.pop() {
+        match span(t0, t1) {
+            Ok(body) => spans.push((t0, body)),
+            Err(error) if refused_as(&error) == Some("folds") && depth < 6 => {
+                let middle = 0.5 * (t0 + t1);
+                pending.push((middle, t1, depth + 1));
+                pending.push((t0, middle, depth + 1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut bodies: Vec<BrepSolid> = spans.into_iter().map(|(_, body)| body).collect();
+    if bodies.len() == 1 {
+        return Ok(bodies.pop().expect("one"));
+    }
+    crate::boolean_operation_nary(&bodies, crate::BooleanOperation::Union)
+}
+
+/// A cap's pcurve for a lofted edge through the cap's exact chart (the edge
+/// read back into the tool's frame at the cap's time).
+fn charted_pcurve(chart: &Chart, screw: &Screw, t: f64, curve: &NurbsCurve, forward: bool) -> Result<NurbsCurve, KernelRefusal> {
+    let [d0, d1] = frag(curve.domain(), "domain")?;
+    let ts: Vec<f64> = (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect();
+    let mut uv = Vec::with_capacity(ts.len());
+    for &tt in &ts {
+        let x = screw.invert(t, frag(curve.evaluate(tt), "point")?);
+        let [u, v] = chart.invert(x);
+        uv.push(Vec3::new(u, v, 0.0));
+    }
+    let fitted = frag(crate::interpolate_curve(&uv, 5, &ts), "charted_pcurve")?;
+    if forward { Ok(fitted) } else { frag(fitted.reversed(), "reversed") }
+}
+
 /// A cap's pcurve for a lofted edge: its dense image on the cap's surface.
 fn projected_pcurve(surface: &NurbsSurface, curve: &NurbsCurve, forward: bool) -> Result<NurbsCurve, KernelRefusal> {
     let [d0, d1] = frag(curve.domain(), "domain")?;
@@ -2876,9 +3096,14 @@ fn lofted(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[Out
         }
         Ok(world)
     };
-    let mut count = 63usize;
+    // Time breaks start even and are refined only in the spans whose middle
+    // misses, by the quintic's h^6 error: a smooth stretch of the motion keeps
+    // its long spans (doubling everywhere tripled the wall for one bend).
+    let mut fractions: Vec<f64> = (0..=63).map(|j| j as f64 / 63.0).collect();
     loop {
-        let times: Vec<f64> = (0..=count).map(|j| j as f64 / count as f64).collect();
+        let count = fractions.len() - 1;
+        // The walls' second parameter runs 0 -> 1 over the motion.
+        let times: Vec<f64> = fractions.iter().map(|&f| if f == 1.0 { screw.t1 } else { screw.t0 + (screw.t1 - screw.t0) * f }).collect();
         let splits: Vec<Split> = times.iter().map(|&t| split_at(t)).collect::<Result<_, _>>()?;
         let shape = signature(&splits[0])?;
         for split in &splits[1..] {
@@ -2891,6 +3116,7 @@ fn lofted(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[Out
             return Err(refuse("no_grazing", "the tool has no grazing loop under this motion".into()));
         }
         let scale = splits[0].scale + screw.extent;
+        let target = 5e-10 * scale;
         // Walls: per grazing curve, rows along it at each time, then across time.
         let mut walls = Vec::with_capacity(grazing.len());
         for &(c, back_forward) in &grazing {
@@ -2904,17 +3130,18 @@ fn lofted(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[Out
             let mut knots_v = Vec::new();
             for k in 0..rows[0].control_points.len() {
                 let column: Vec<Vec3> = rows.iter().map(|row| row.control_points[k].point()).collect::<Result<_, _>>().map_err(|e| refuse("loft", e))?;
-                let across = frag(crate::interpolate_curve(&column, 5, &times), "loft_column")?;
+                let across = frag(crate::interpolate_curve(&column, 5, &fractions), "loft_column")?;
                 knots_v = across.knots.clone();
                 net.push(across.control_points.clone());
             }
             let surface = frag(NurbsSurface::new(5, 5, knots_u, knots_v, net), "loft_wall")?;
             walls.push((c, back_forward, surface, rows.first().cloned().expect("rows"), rows.last().cloned().expect("rows")));
         }
-        // Against the exact loop between the sample times.
-        let mut worst = 0.0f64;
+        // Against the exact loop in the middle of each span, every sample.
+        let mut misses = vec![0.0f64; count];
         for j in 0..count {
             let t = 0.5 * (times[j] + times[j + 1]);
+            let fraction = 0.5 * (fractions[j] + fractions[j + 1]);
             let split = split_at(t)?;
             if signature(&split)? != shape {
                 return Err(refuse("loft_structure", "the grazing loop changes its structure along the curve".into()));
@@ -2922,15 +3149,26 @@ fn lofted(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[Out
             for (c, back_forward, surface, _, _) in &walls {
                 let exact = samples_of(&split, *c, *back_forward, t)?;
                 for (i, x) in exact.iter().enumerate() {
-                    worst = worst.max(frag(surface.evaluate(lambdas[i], t), "loft_check")?.sub(*x).length());
+                    misses[j] = misses[j].max(frag(surface.evaluate(lambdas[i], fraction), "loft_check")?.sub(*x).length());
                 }
             }
         }
-        if worst > 1e-10 * scale {
-            if count > 1000 {
+        let worst = misses.iter().copied().fold(0.0f64, f64::max);
+        if worst > target {
+            if count > 2000 {
                 return Err(refuse("loft_accuracy", format!("the lofted wall stays {worst:e} off the grazing loop")));
             }
-            count = 2 * count + 1;
+            // A span missing by more than half the target is cut into
+            // ceil((e / (target / 4))^(1/6)) pieces; the rest stay.
+            let mut refined = Vec::with_capacity(2 * fractions.len());
+            for j in 0..count {
+                let pieces = if misses[j] > 0.5 * target { ((misses[j] / (0.25 * target)).powf(1.0 / 6.0).ceil() as usize).max(2) } else { 1 };
+                for k in 0..pieces {
+                    refined.push(fractions[j] + (fractions[j + 1] - fractions[j]) * k as f64 / pieces as f64);
+                }
+            }
+            refined.push(1.0);
+            fractions = refined;
             continue;
         }
         // Each K corner's path through the sample times.
@@ -2940,8 +3178,514 @@ fn lofted(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[Out
                 paths.entry(r).or_insert_with(|| splits.iter().zip(&times).map(|(split, &t)| screw.apply(t, split.points[r])).collect());
             }
         }
-        return assemble_lofted(screw, &splits[0], &splits[count], &walls, &times, &paths);
+        return assemble_lofted(screw, &splits[0], &splits[count], &walls, &fractions, &paths);
     }
+}
+
+/// Refuse a lofted wall with an edge of regression: across one the wall's
+/// normal turns over, and the band beside it lies inside nearby poses (the
+/// sweep folds within a few degrees of the motion, which no probe walk is
+/// dense enough to be sure of seeing). Normals are compared between
+/// neighbours on every time row and between rows, outside what the end trims
+/// take away (`removed`, chart rings) and a few columns off its edge (a fold
+/// line meets the end at the cut's own ends).
+fn wall_regular(surface: &NurbsSurface, fractions: &[f64], removed: &[&[[f64; 2]]]) -> Result<(), KernelRefusal> {
+    const COLUMNS: usize = 4 * LOFT_SAMPLES;
+    let mut rows: Vec<f64> = Vec::with_capacity(2 * fractions.len());
+    for j in 0..fractions.len() {
+        rows.push(fractions[j]);
+        if j + 1 < fractions.len() {
+            rows.push(0.5 * (fractions[j] + fractions[j + 1]));
+        }
+    }
+    let normal = |u: f64, v: f64| -> Result<Option<Vec3>, KernelRefusal> {
+        let h = 1e-6;
+        let (ua, ub, va, vb) = ((u - h).max(0.0), (u + h).min(1.0), (v - h).max(0.0), (v + h).min(1.0));
+        let du = frag(surface.evaluate(ub, v), "regular")?.sub(frag(surface.evaluate(ua, v), "regular")?).scale(1.0 / (ub - ua));
+        let dv = frag(surface.evaluate(u, vb), "regular")?.sub(frag(surface.evaluate(u, va), "regular")?).scale(1.0 / (vb - va));
+        Ok(du.cross(dv).normalized().ok())
+    };
+    let mut previous: Option<Vec<Option<Vec3>>> = None;
+    for &v in &rows {
+        // What a trim takes away is not part of the body.
+        let row: Vec<Option<Vec3>> = (0..=COLUMNS)
+            .map(|i| {
+                let u = i as f64 / COLUMNS as f64;
+                if removed.iter().any(|ring| inside_ring(ring, [u, v]) || near_ring(ring, [u, v], 4.0 / COLUMNS as f64)) { Ok(None) } else { normal(u, v) }
+            })
+            .collect::<Result<_, _>>()?;
+        for i in 0..COLUMNS {
+            if let (Some(a), Some(b)) = (row[i], row[i + 1]) {
+                if a.dot(b) < -0.5 {
+                    return Err(refuse("wall_folds", format!("a lofted wall turns over (an edge of regression near parameter ({:.4}, {v:.4})); the sweep folds onto itself", i as f64 / COLUMNS as f64)));
+                }
+            }
+            if let Some(Some(Some(a))) = previous.as_ref().map(|p| p.get(i).copied()) {
+                if let Some(b) = row[i] {
+                    if a.dot(b) < -0.5 {
+                        return Err(refuse("wall_folds", format!("a lofted wall turns over (an edge of regression near parameter ({:.4}, {v:.4})); the sweep folds onto itself", i as f64 / COLUMNS as f64)));
+                    }
+                }
+            }
+        }
+        previous = Some(row);
+    }
+    Ok(())
+}
+
+/// A wall cut back where an end pose bulges past it: the wall parameter range
+/// [λa, λb] along the grazing loop where the trim leaves and rejoins it, the
+/// cut (from the point at λa to the point at λb, on both the wall and the
+/// pose), the loop's pieces before and after it, the wall's side of the trim
+/// from λa to λb (`chain`), and the part of the wall's chart it takes away
+/// (`removed`, (u, v) points around it).
+struct EndTrim {
+    lambdas: [f64; 2],
+    points: [Vec3; 2],
+    cut: NurbsCurve,
+    before: NurbsCurve,
+    after: NurbsCurve,
+    chain: Vec<(TrimPiece, bool, NurbsCurve)>,
+    slot: Option<(NurbsCurve, Vec3)>,
+    removed: Vec<[f64; 2]>,
+}
+
+/// Which edge a piece of a trimmed wall's end runs on: the cut it shares with
+/// the cap, or the wall's own double curve (both of the slot's sides).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TrimPiece {
+    Cut,
+    Slot,
+}
+
+/// The cut of a lofted wall (u along the grazing loop, v the motion's time
+/// fraction) by the pose at its end (`end` 0: v = 0, 1: v = 1), if the pose
+/// bulges past it, else None.
+///
+/// The wall meets the pose along K and leaves it to second order (K grazes),
+/// so with ε the time fraction from the end, f = d / ε² (d the pose's signed
+/// distance) is smooth up to the end. The part of the wall inside the pose is
+/// where f < 0; its boundary is traced as the curve f = 0 from the end and back
+/// to it. It need not be a graph over u: a tongue of it may run on past where
+/// it left the end.
+fn end_trim(screw: &Screw, split: &Split, t: f64, wall: &NurbsSurface, end: usize) -> Result<Option<EndTrim>, KernelRefusal> {
+    let v_of = |e: f64| if end == 1 { 1.0 - e } else { e };
+    let at = |u: f64, e: f64| -> Result<Vec3, KernelRefusal> { frag(wall.evaluate(u.clamp(0.0, 1.0), v_of(e)), "wall") };
+    let f = |u: f64, e: f64| -> Result<f64, KernelRefusal> { Ok(split.distance(screw.invert(t, at(u, e)?)) / (e * e)) };
+    // Below `floor` the walls' fit (5e-10 of the scale) swamps d / ε².
+    let floor = 1e-3;
+    let window = 0.25;
+    let noise = 1e-9 * split.scale / (floor * floor);
+    // Where the wall dips into the pose just off the end.
+    let n = 2000;
+    let edge: Vec<f64> = (0..=n).map(|i| f(i as f64 / n as f64, floor)).collect::<Result<_, _>>()?;
+    let inside: Vec<bool> = edge.iter().map(|&x| x < -noise).collect();
+    if !inside.iter().any(|&x| x) {
+        // Nothing near the end; a pocket deeper in is caught below.
+        return pierced(&f, floor, window, noise, None);
+    }
+    if inside[0] || inside[n] || inside[1] || inside[n - 1] {
+        return Err(refuse("end_trim_corner", "an end pose bulges past a wall across a corner of its grazing loop".into()));
+    }
+    // Crossings of the floor line, by bisection between samples of either sign.
+    let mut crossings: Vec<f64> = Vec::new();
+    for i in 0..n {
+        if inside[i] != inside[i + 1] {
+            let (mut a, mut b) = (i as f64 / n as f64, (i + 1) as f64 / n as f64);
+            let a_inside = inside[i];
+            for _ in 0..60 {
+                let mid = 0.5 * (a + b);
+                if (f(mid, floor)? < 0.0) == a_inside { a = mid } else { b = mid }
+            }
+            crossings.push(0.5 * (a + b));
+        }
+    }
+    if crossings.len() != 2 {
+        return Err(refuse("end_trim", format!("an end pose bulges past a wall in {} places", crossings.len() / 2)));
+    }
+    // Trace f = 0 from the first crossing into the wall until it returns to the
+    // floor; it must come back at the other crossing.
+    let gradient = |u: f64, e: f64| -> Result<[f64; 2], KernelRefusal> {
+        let h = 1e-6;
+        Ok([(f(u + h, e)? - f(u - h, e)?) / (2.0 * h), (f(u, e + h)? - f(u, e - h)?) / (2.0 * h)])
+    };
+    let settle = |mut p: [f64; 2]| -> Result<[f64; 2], KernelRefusal> {
+        for _ in 0..30 {
+            let value = f(p[0], p[1])?;
+            let g = gradient(p[0], p[1])?;
+            let norm = g[0] * g[0] + g[1] * g[1];
+            if norm == 0.0 {
+                return Err(refuse("end_trim", "the cut of an end pose has a flat point".into()));
+            }
+            p = [p[0] - value * g[0] / norm, p[1] - value * g[1] / norm];
+            if value.abs() * p[1] * p[1] < 1e-14 * split.scale {
+                break;
+            }
+        }
+        Ok(p)
+    };
+    let step = 1e-3;
+    let mut points: Vec<[f64; 2]> = vec![[crossings[0], floor]];
+    let mut heading = [0.0, 1.0];
+    loop {
+        let last = *points.last().expect("points");
+        let g = gradient(last[0], last[1])?;
+        let length = g[0].hypot(g[1]);
+        let mut tangent = [-g[1] / length, g[0] / length];
+        if tangent[0] * heading[0] + tangent[1] * heading[1] < 0.0 {
+            tangent = [-tangent[0], -tangent[1]];
+        }
+        let next = settle([last[0] + step * tangent[0], last[1] + step * tangent[1]])?;
+        if next[1] < floor {
+            break;
+        }
+        if next[0] <= 1e-3 || next[0] >= 1.0 - 1e-3 {
+            return Err(refuse("end_trim_corner", "an end pose bulges past a wall across a corner of its grazing loop".into()));
+        }
+        if next[1] > window {
+            return Err(refuse("end_trim", "an end pose holds a deep part of a wall".into()));
+        }
+        if points.len() > 20_000 {
+            return Err(refuse("end_trim", "the cut of an end pose does not close".into()));
+        }
+        heading = [next[0] - last[0], next[1] - last[1]];
+        points.push(next);
+    }
+    let back = *points.last().expect("points");
+    if (back[0] - crossings[1]).abs() > 2.0 * step {
+        return Err(refuse("end_trim", "the cut of an end pose does not come back where it should".into()));
+    }
+    points.push([crossings[1], floor]);
+    // Down to the end itself along the cut's direction at the floor.
+    let to_end = |p: [f64; 2], q: [f64; 2]| -> [f64; 2] {
+        let slope = (q[0] - p[0]) / (q[1] - p[1]);
+        [p[0] - slope * p[1], 0.0]
+    };
+    let (first, last) = (to_end(points[0], points[1]), to_end(points[points.len() - 1], points[points.len() - 2]));
+    points.insert(0, first);
+    points.push(last);
+    if points[0][0] > points[points.len() - 1][0] {
+        points.reverse();
+    }
+    pierced(&f, floor, window, noise, Some(&points))?;
+    let chart = |p: [f64; 2]| [p[0], v_of(p[1])];
+    // A curve on the wall through chart points and its pcurve, both on the
+    // given parameters (normalized to [0, 1]); chart-length parameters by
+    // default (the wall's own speed collapses near an edge of regression, so
+    // 3D chord lengths would bunch them).
+    let chart_lengths = |chart_points: &[[f64; 2]]| -> Vec<f64> {
+        let mut params = vec![0.0];
+        for k in 1..chart_points.len() {
+            let gap = (chart_points[k][0] - chart_points[k - 1][0]).hypot(chart_points[k][1] - chart_points[k - 1][1]);
+            params.push(params[k - 1] + gap.max(1e-15));
+        }
+        params
+    };
+    let curve_through = |chart_points: &[[f64; 2]], params: &[f64], what: &'static str| -> Result<(NurbsCurve, NurbsCurve), KernelRefusal> {
+        let total = *params.last().expect("params");
+        let params: Vec<f64> = params.iter().map(|x| x / total).collect();
+        let world: Vec<Vec3> = chart_points.iter().map(|p| at(p[0], p[1])).collect::<Result<_, _>>()?;
+        let uv: Vec<Vec3> = chart_points.iter().map(|p| Vec3::new(p[0], v_of(p[1]), 0.0)).collect();
+        let (curve, pcurve) = (frag(crate::interpolate_curve(&world, 5, &params), what)?, frag(crate::interpolate_curve(&uv, 5, &params), what)?);
+        // Between the points too: the pcurve's image stays on the curve.
+        let mut worst = 0.0f64;
+        for k in 0..params.len() - 1 {
+            let s = 0.5 * (params[k] + params[k + 1]);
+            let q = frag(pcurve.evaluate(s), "pcurve")?;
+            let e = if end == 1 { 1.0 - q.y } else { q.y };
+            worst = worst.max(at(q.x, e)?.sub(frag(curve.evaluate(s), "curve")?).length());
+        }
+        if worst > 1e-7 * split.scale {
+            return Err(refuse("end_trim", format!("a trim curve's pcurve leaves it by {worst:e} between its points")));
+        }
+        Ok((curve, pcurve))
+    };
+    let piece = |a: f64, b: f64| -> Result<NurbsCurve, KernelRefusal> {
+        let ts: Vec<f64> = (0..=128).map(|j| j as f64 / 128.0).collect();
+        let along: Vec<Vec3> = ts.iter().map(|&s| at(a + (b - a) * s, 0.0)).collect::<Result<_, _>>()?;
+        frag(crate::interpolate_curve(&along, 5, &ts), "loop_piece")
+    };
+    // Where the wall turns over near the end (a swallowtail), the cut passes
+    // through a point of the end's own loop K a second time, on the wall's far
+    // sheet: there the wall's double curve starts, and the trim follows it to
+    // the swallowtail's point and back instead of the cut's first stretch.
+    if let Some((k, ua, b)) = double_start(&at, &points, floor)? {
+        let (a_side, b_side) = double_curve(&at, [ua, 0.0], b, window)?;
+        // The cut keeps the stretch from the far sheet's point to its end away
+        // from where the double curve leaves K.
+        let low = ua < points[0][0];
+        if !low && ua <= points[points.len() - 1][0] {
+            return Err(refuse("end_trim", "the double curve of a wall leaves its end inside the cut".into()));
+        }
+        let mut kept: Vec<[f64; 2]> = if low { points[k..].to_vec() } else { points[..=k].to_vec() };
+        if low { kept[0] = b } else { *kept.last_mut().expect("kept") = b }
+        let (cut, cut_pcurve) = curve_through(&kept, &chart_lengths(&kept), "cut")?;
+        // Both sides on the continuation's own arc length, so the double
+        // curve and its two pcurves share one parameter.
+        let mut sigma = vec![0.0];
+        for k in 1..a_side.len() {
+            let step = (a_side[k][0] - a_side[k - 1][0]).hypot(a_side[k][1] - a_side[k - 1][1]).hypot((b_side[k][0] - b_side[k - 1][0]).hypot(b_side[k][1] - b_side[k - 1][1]));
+            sigma.push(sigma[k - 1] + step.max(1e-15));
+        }
+        let (slot, pa) = curve_through(&a_side, &sigma, "double_curve")?;
+        let (_, pb) = curve_through(&b_side, &sigma, "double_curve")?;
+        let tip = at(a_side[a_side.len() - 1][0], a_side[a_side.len() - 1][1])?;
+        // The wall's side of the trim from the low end to the high one.
+        let chain = if low {
+            vec![(TrimPiece::Slot, true, pa), (TrimPiece::Slot, false, frag(pb.reversed(), "reversed")?), (TrimPiece::Cut, true, cut_pcurve)]
+        } else {
+            vec![(TrimPiece::Cut, true, cut_pcurve), (TrimPiece::Slot, true, pb), (TrimPiece::Slot, false, frag(pa.reversed(), "reversed")?)]
+        };
+        let lambdas = if low { [ua, points[points.len() - 1][0]] } else { [points[0][0], ua] };
+        let mut removed: Vec<[f64; 2]> = Vec::new();
+        if low {
+            removed.extend(a_side.iter().map(|&p| chart(p)));
+            removed.extend(b_side.iter().rev().map(|&p| chart(p)));
+            removed.extend(kept.iter().map(|&p| chart(p)));
+        } else {
+            removed.extend(kept.iter().map(|&p| chart(p)));
+            removed.extend(b_side.iter().map(|&p| chart(p)));
+            removed.extend(a_side.iter().rev().map(|&p| chart(p)));
+        }
+        // Everything the end pose holds must be in what goes.
+        let dropped: Vec<[f64; 2]> = if low { points[..k].to_vec() } else { points[k + 1..].to_vec() };
+        for p in dropped.iter().filter(|p| p[1] > 2.0 * floor && (p[0] - b[0]).hypot(p[1] - b[1]) > 5e-3) {
+            if !inside_ring(&removed, chart(*p)) {
+                return Err(refuse("end_trim", "the cut of an end pose leaves the part of the wall its double curve takes away".into()));
+            }
+        }
+        let points3 = [at(lambdas[0], 0.0)?, at(lambdas[1], 0.0)?];
+        return Ok(Some(EndTrim { lambdas, points: points3, cut, before: piece(0.0, lambdas[0])?, after: piece(lambdas[1], 1.0)?, chain, slot: Some((slot, tip)), removed }));
+    }
+    let (cut, wall_pcurve) = curve_through(&points, &chart_lengths(&points), "cut")?;
+    let (la, lb) = (points[0][0], points[points.len() - 1][0]);
+    let removed: Vec<[f64; 2]> = points.iter().map(|&p| chart(p)).collect();
+    Ok(Some(EndTrim {
+        lambdas: [la, lb],
+        points: [at(la, 0.0)?, at(lb, 0.0)?],
+        cut,
+        before: piece(0.0, la)?,
+        after: piece(lb, 1.0)?,
+        chain: vec![(TrimPiece::Cut, true, wall_pcurve)],
+        slot: None,
+        removed,
+    }))
+}
+
+/// Is q within `reach` of the closed polygon `ring`'s sides?
+fn near_ring(ring: &[[f64; 2]], q: [f64; 2], reach: f64) -> bool {
+    (0..ring.len()).any(|k| {
+        let (a, b) = (ring[k], ring[(k + 1) % ring.len()]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let length = dx * dx + dy * dy;
+        let s = if length > 0.0 { (((q[0] - a[0]) * dx + (q[1] - a[1]) * dy) / length).clamp(0.0, 1.0) } else { 0.0 };
+        (q[0] - a[0] - s * dx).hypot(q[1] - a[1] - s * dy) < reach
+    })
+}
+
+/// Is q inside the closed polygon `ring` (its last point joins its first)?
+fn inside_ring(ring: &[[f64; 2]], q: [f64; 2]) -> bool {
+    let mut crossings = 0;
+    for k in 0..ring.len() {
+        let (a, b) = (ring[k], ring[(k + 1) % ring.len()]);
+        if (a[1] > q[1]) != (b[1] > q[1]) && q[0] < a[0] + (q[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1]) {
+            crossings += 1;
+        }
+    }
+    crossings % 2 == 1
+}
+
+/// The point of an end pose's cut (chart points (u, ε), ε the time fraction
+/// from the end) that lies on the end's own loop K a second time, away from
+/// the cut's ends: (its index along the cut, the loop parameter u of the point
+/// of K it meets, and the refined (u, ε) on the cut), if there is one.
+fn double_start(at: &dyn Fn(f64, f64) -> Result<Vec3, KernelRefusal>, points: &[[f64; 2]], floor: f64) -> Result<Option<(usize, f64, [f64; 2])>, KernelRefusal> {
+    let n = 4000;
+    let row: Vec<Vec3> = (0..=n).map(|i| at(i as f64 / n as f64, 0.0)).collect::<Result<_, _>>()?;
+    let scale = row.iter().fold(0.0f64, |m, p| m.max(p.sub(row[0]).length())).max(1e-300);
+    let mut best: Option<(f64, usize, usize)> = None;
+    for (k, p) in points.iter().enumerate() {
+        if p[1] < 4.0 * floor {
+            continue;
+        }
+        let x = at(p[0], p[1])?;
+        let (i, d) = row.iter().enumerate().map(|(i, q)| (i, q.sub(x).length())).fold((0, f64::INFINITY), |a, b| if b.1 < a.1 { b } else { a });
+        // The cut nears K at its own ends in proportion to ε; the second
+        // meeting is where that ratio drops to nothing.
+        if best.map_or(true, |b| d / p[1] < b.0 / points[b.1][1]) {
+            best = Some((d, k, i));
+        }
+    }
+    let Some((distance, k, i)) = best else { return Ok(None) };
+    // Coarse: the cut's points are a few thousandths of the chart apart.
+    if distance > 5e-3 * scale {
+        return Ok(None);
+    }
+    // Newton on at(b) = at(u, 0) for (b_u, b_ε, u).
+    let mut x = [points[k][0], points[k][1], i as f64 / n as f64];
+    let h = 1e-7;
+    for _ in 0..40 {
+        let g = at(x[0], x[1])?.sub(at(x[2], 0.0)?);
+        if g.length() < 1e-13 * scale {
+            // Not the trivial meeting of the end row with itself.
+            if x[1] < 2.0 * floor || !(0.0..=1.0).contains(&x[0]) || !(0.0..=1.0).contains(&x[2]) {
+                return Ok(None);
+            }
+            return Ok(Some((k, x[2], [x[0], x[1]])));
+        }
+        let c0 = at(x[0] + h, x[1])?.sub(at(x[0] - h, x[1])?).scale(0.5 / h);
+        let c1 = at(x[0], x[1] + h)?.sub(at(x[0], x[1] - h)?).scale(0.5 / h);
+        let c2 = at(x[2] + h, 0.0)?.sub(at(x[2] - h, 0.0)?).scale(-0.5 / h);
+        let det = c0.dot(c1.cross(c2));
+        if det.abs() < 1e-300 {
+            break;
+        }
+        // Cramer's rule for [c0 c1 c2] d = -g.
+        let r = g.scale(-1.0);
+        let d = [r.dot(c1.cross(c2)) / det, c0.dot(r.cross(c2)) / det, c0.dot(c1.cross(r)) / det];
+        x = [x[0] + d[0], x[1] + d[1], x[2] + d[2]];
+    }
+    if distance < 1e-6 * scale {
+        return Err(refuse("end_trim", "an end pose's cut meets its own loop, but not exactly enough to follow".into()));
+    }
+    Ok(None)
+}
+
+/// The double curve of a wall from where it leaves the end (a, on the end's
+/// loop) and its partner b on the far sheet, traced by continuation of
+/// at(a) = at(b) in (u, ε) for both, to the swallowtail point where the two
+/// sides meet. Returns both sides' chart points, ending at the same point.
+fn double_curve(at: &dyn Fn(f64, f64) -> Result<Vec3, KernelRefusal>, a: [f64; 2], b: [f64; 2], window: f64) -> Result<(Vec<[f64; 2]>, Vec<[f64; 2]>), KernelRefusal> {
+    let h = 1e-7;
+    let scale = at(0.0, 0.0)?.sub(at(1.0, 0.0)?).length().max(at(0.5, 0.0)?.sub(at(0.0, 0.0)?).length()).max(1e-300);
+    let jacobian = |x: [f64; 4]| -> Result<[Vec3; 4], KernelRefusal> {
+        Ok([
+            at(x[0] + h, x[1])?.sub(at(x[0] - h, x[1])?).scale(0.5 / h),
+            at(x[0], x[1] + h)?.sub(at(x[0], (x[1] - h).max(0.0))?).scale(1.0 / (h + x[1].min(h))),
+            at(x[2] + h, x[3])?.sub(at(x[2] - h, x[3])?).scale(-0.5 / h),
+            at(x[2], x[3] + h)?.sub(at(x[2], (x[3] - h).max(0.0))?).scale(-1.0 / (h + x[3].min(h))),
+        ])
+    };
+    let residual = |x: [f64; 4]| -> Result<Vec3, KernelRefusal> { Ok(at(x[0], x[1])?.sub(at(x[2], x[3])?)) };
+    // The null direction of the 3x4 Jacobian: its signed 3x3 minors.
+    let null = |j: &[Vec3; 4]| -> [f64; 4] {
+        let minor = |p: usize, q: usize, r: usize| j[p].dot(j[q].cross(j[r]));
+        let n = [minor(1, 2, 3), -minor(0, 2, 3), minor(0, 1, 3), -minor(0, 1, 2)];
+        let length = n.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-300);
+        [n[0] / length, n[1] / length, n[2] / length, n[3] / length]
+    };
+    // Minimum-norm Newton back onto at(a) = at(b).
+    let correct = |mut x: [f64; 4]| -> Result<Option<[f64; 4]>, KernelRefusal> {
+        for _ in 0..30 {
+            let g = residual(x)?;
+            if g.length() < 1e-13 * scale {
+                return Ok(Some(x));
+            }
+            let j = jacobian(x)?;
+            // J Jᵀ y = -g, step = Jᵀ y.
+            let mut m = [[0.0; 3]; 3];
+            let rows = [[j[0].x, j[1].x, j[2].x, j[3].x], [j[0].y, j[1].y, j[2].y, j[3].y], [j[0].z, j[1].z, j[2].z, j[3].z]];
+            for p in 0..3 {
+                for q in 0..3 {
+                    m[p][q] = (0..4).map(|c| rows[p][c] * rows[q][c]).sum();
+                }
+            }
+            let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+            if det.abs() < 1e-300 {
+                return Ok(None);
+            }
+            let r = [-g.x, -g.y, -g.z];
+            let solve = |col: usize| -> f64 {
+                let mut a = m;
+                for p in 0..3 {
+                    a[p][col] = r[p];
+                }
+                (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])) / det
+            };
+            let y = [solve(0), solve(1), solve(2)];
+            for c in 0..4 {
+                x[c] += (0..3).map(|p| rows[p][c] * y[p]).sum::<f64>();
+            }
+        }
+        Ok(None)
+    };
+    let step = 2e-3;
+    let mut x = [a[0], a[1], b[0], b[1]];
+    let mut a_side = vec![a];
+    let mut b_side = vec![b];
+    let mut heading: Option<[f64; 4]> = None;
+    loop {
+        let separation = (x[0] - x[2]).hypot(x[1] - x[3]);
+        if separation < 3.0 * step && a_side.len() > 2 {
+            let tip = [0.5 * (x[0] + x[2]), 0.5 * (x[1] + x[3])];
+            a_side.push(tip);
+            b_side.push(tip);
+            return Ok((a_side, b_side));
+        }
+        let mut t = null(&jacobian(x)?);
+        let reference = heading.unwrap_or([0.0, 1.0, 0.0, 0.0]);
+        if (0..4).map(|c| t[c] * reference[c]).sum::<f64>() < 0.0 {
+            t = [-t[0], -t[1], -t[2], -t[3]];
+        }
+        let mut next = None;
+        let mut length = step;
+        for _ in 0..6 {
+            let guess = [x[0] + length * t[0], x[1] + length * t[1], x[2] + length * t[2], x[3] + length * t[3]];
+            if let Some(y) = correct(guess)? {
+                next = Some(y);
+                break;
+            }
+            length *= 0.5;
+        }
+        let Some(y) = next else {
+            return Err(refuse("end_trim", format!("the double curve of a wall cannot be followed (sides {separation:e} apart)")));
+        };
+        if [y[0], y[2]].iter().any(|&u| u <= 1e-3 || u >= 1.0 - 1e-3) {
+            return Err(refuse("end_trim_corner", "the double curve of a wall reaches a corner of its grazing loop".into()));
+        }
+        if y[1] > window || y[3] > window || y[1] < 0.0 || y[3] < 0.0 {
+            return Err(refuse("end_trim", "the double curve of a wall runs deep into the motion or back past its end".into()));
+        }
+        if a_side.len() > 20_000 {
+            return Err(refuse("end_trim", "the double curve of a wall does not close".into()));
+        }
+        heading = Some([y[0] - x[0], y[1] - x[1], y[2] - x[2], y[3] - x[3]]);
+        x = y;
+        a_side.push([x[0], x[1]]);
+        b_side.push([x[2], x[3]]);
+    }
+}
+
+/// Refuse a wall the end pose holds a part of that the cut (if any) does not
+/// enclose: a pocket of the wall inside the pose away from the end.
+fn pierced(
+    f: &dyn Fn(f64, f64) -> Result<f64, KernelRefusal>,
+    floor: f64,
+    window: f64,
+    noise: f64,
+    cut: Option<&[[f64; 2]]>,
+) -> Result<Option<EndTrim>, KernelRefusal> {
+    let enclosed = |q: [f64; 2]| -> bool {
+        let Some(ring) = cut else { return false };
+        let mut crossings = 0;
+        for k in 0..ring.len() {
+            let (a, b) = (ring[k], ring[(k + 1) % ring.len()]);
+            if (a[1] > q[1]) != (b[1] > q[1]) && q[0] < a[0] + (q[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1]) {
+                crossings += 1;
+            }
+        }
+        crossings % 2 == 1
+    };
+    for i in 1..200 {
+        for j in 1..=40 {
+            let (u, e) = (i as f64 / 200.0, floor + (window - floor) * (j as f64 / 40.0).powi(2));
+            // d itself against the fit's noise: f grows as 1 / ε² near the end.
+            if f(u, e)? * e * e < -noise * floor * floor && !enclosed([u, e]) {
+                return Err(refuse("end_trim", "an end pose holds a part of a wall away from its end".into()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2955,6 +3699,19 @@ fn assemble_lofted(
 ) -> Result<BrepSolid, KernelRefusal> {
     let mut shell = Shell::new();
     let ends = [(first, screw.t0), (last, screw.t1)];
+    // Where an end pose bulges past a wall near its grazing loop (a saddle side
+    // curving past the wall it touches), cut the wall back to where it
+    // re-enters the pose and carry the end cap across the loop to there.
+    let mut trims: HashMap<(usize, usize), EndTrim> = HashMap::new();
+    for (index, (_, _, surface, _, _)) in walls.iter().enumerate() {
+        for end in 0..2 {
+            if let Some(trim) = end_trim(screw, ends[end].0, ends[end].1, surface, end)? {
+                trims.insert((index, end), trim);
+            }
+        }
+        let removed: Vec<&[[f64; 2]]> = (0..2).filter_map(|end| trims.get(&(index, end)).map(|trim| trim.removed.as_slice())).collect();
+        wall_regular(surface, times, &removed)?;
+    }
     let mut vertex_at: HashMap<(usize, usize), u64> = HashMap::new();
     let mut vertex = |shell: &mut Shell, end: usize, p: usize| -> u64 {
         *vertex_at.entry((end, p)).or_insert_with(|| shell.vertex(screw.apply(ends[end].1, ends[end].0.points[p])))
@@ -2964,12 +3721,38 @@ fn assemble_lofted(
     // curve's direction), the rest the end split's own curves moved.
     let mut edge_at: HashMap<(usize, usize), u64> = HashMap::new();
     let mut edge_curve: HashMap<(usize, usize), NurbsCurve> = HashMap::new();
+    let mut trim_edges: HashMap<(usize, usize), [u64; 4]> = HashMap::new();
     for end in 0..2 {
         let (split, t) = ends[end];
         for (c, tool_curve) in split.curves.iter().enumerate() {
             let used = split.caps.iter().any(|cap| cap.front == (end == 1) && cap.coedges.iter().any(|e| e.0 == c));
             if !used {
                 continue;
+            }
+            if let Some(&index) = grazing.get(&c) {
+                if let Some(trim) = trims.get(&(index, end)) {
+                    // Pieces in the wall's direction: K up to the cut, the cut, K after it.
+                    let back_forward = walls[index].1;
+                    let (from, to) = if back_forward { (tool_curve.end, tool_curve.start) } else { (tool_curve.start, tool_curve.end) };
+                    let (vf, vt) = (vertex(&mut shell, end, from), vertex(&mut shell, end, to));
+                    let (va, vb) = (shell.vertex(trim.points[0]), shell.vertex(trim.points[1]));
+                    let ka = shell.edge(trim.before.clone(), vf, va, false)?;
+                    let cut = shell.edge(trim.cut.clone(), va, vb, false)?;
+                    let kb = shell.edge(trim.after.clone(), vb, vt, false)?;
+                    // The double curve runs from where it leaves K (at the
+                    // low end of the trim if its chain starts with it) to the
+                    // swallowtail's point.
+                    let slot = match &trim.slot {
+                        Some((curve, tip)) => {
+                            let from = if trim.chain[0].0 == TrimPiece::Slot { va } else { vb };
+                            let tip = shell.vertex(*tip);
+                            shell.edge(curve.clone(), from, tip, false)?
+                        }
+                        None => u64::MAX,
+                    };
+                    trim_edges.insert((index, end), [ka, cut, kb, slot]);
+                    continue;
+                }
             }
             let curve = match grazing.get(&c) {
                 Some(&index) => {
@@ -2991,7 +3774,25 @@ fn assemble_lofted(
             let surface = screw.move_surface(t, &cap.surface)?;
             let mut coedges = Vec::with_capacity(cap.coedges.len());
             for (c, forward, pcurve) in &cap.coedges {
-                let pcurve = if grazing.contains_key(c) {
+                if let Some(&index) = grazing.get(c) {
+                    if let (Some(trim), Some(edges)) = (trims.get(&(index, end)), trim_edges.get(&(index, end))) {
+                        let Some(chart) = cap.chart.as_ref() else {
+                            return Err(refuse("end_trim", "an end pose bulges past a wall beside a cap without a chart".into()));
+                        };
+                        // The cap runs the tool's curve forward or back; the
+                        // pieces run the wall's way.
+                        let along = *forward != walls[index].1;
+                        let pieces = [(edges[0], &trim.before), (edges[1], &trim.cut), (edges[2], &trim.after)];
+                        let order: Vec<usize> = if along { vec![0, 1, 2] } else { vec![2, 1, 0] };
+                        for k in order {
+                            coedges.push((pieces[k].0, along, charted_pcurve(chart, screw, t, pieces[k].1, along)?));
+                        }
+                        continue;
+                    }
+                }
+                let pcurve = if grazing.contains_key(c) && cap.chart.is_some() {
+                    charted_pcurve(cap.chart.as_ref().expect("chart"), screw, t, &edge_curve[&(end, *c)], *forward)?
+                } else if grazing.contains_key(c) {
                     match projected_pcurve(&surface, &edge_curve[&(end, *c)], *forward) {
                         Ok(p) => p,
                         Err(error) => {
@@ -3002,7 +3803,11 @@ fn assemble_lofted(
                                     .fold(0.0f64, f64::max)
                             });
                             let line = split.curves[*c].curve.degree;
-                            return Err(refuse("loft_cap", format!("{} (curve {c} of degree {line}, end {end}, its exact samples off the cap by {samples:?}, cap degrees {}x{})", error.message, surface.degree_u, surface.degree_v)));
+                            return Err(KernelRefusal::unsupported(
+                                KernelStage::Classify,
+                                "loft_cap",
+                                format!("{} (curve {c} of degree {line}, end {end}, its exact samples off the cap by {samples:?}, cap degrees {}x{})", error.message, surface.degree_u, surface.degree_v),
+                            ));
                         }
                     }
                 } else {
@@ -3023,21 +3828,56 @@ fn assemble_lofted(
         let (a, b) = (vertex(&mut shell, 0, r), vertex(&mut shell, 1, r));
         orbits.insert(r, shell.edge(curve, a, b, false)?);
     }
-    for (c, back_forward, surface, _, _) in walls {
+    for (index, (c, back_forward, surface, _, _)) in walls.iter().enumerate() {
         let tool_curve = &first.curves[*c];
         let (from, to) = if *back_forward { (tool_curve.end, tool_curve.start) } else { (tool_curve.start, tool_curve.end) };
-        let coedges = vec![
-            (edge_at[&(0, *c)], !*back_forward, uv_line([0.0, 0.0], [1.0, 0.0])?),
-            (orbits[&to], true, uv_line([1.0, 0.0], [1.0, 1.0])?),
-            (edge_at[&(1, *c)], *back_forward, uv_line([1.0, 1.0], [0.0, 1.0])?),
-            (orbits[&from], false, uv_line([0.0, 1.0], [0.0, 0.0])?),
-        ];
+        let mut coedges = Vec::new();
+        match (trims.get(&(index, 0)), trim_edges.get(&(index, 0))) {
+            (Some(trim), Some(edges)) => {
+                coedges.push((edges[0], true, uv_line([0.0, 0.0], [trim.lambdas[0], 0.0])?));
+                for (piece, forward, pcurve) in &trim.chain {
+                    let edge = if *piece == TrimPiece::Cut { edges[1] } else { edges[3] };
+                    coedges.push((edge, *forward, pcurve.clone()));
+                }
+                coedges.push((edges[2], true, uv_line([trim.lambdas[1], 0.0], [1.0, 0.0])?));
+            }
+            _ => coedges.push((edge_at[&(0, *c)], !*back_forward, uv_line([0.0, 0.0], [1.0, 0.0])?)),
+        }
+        coedges.push((orbits[&to], true, uv_line([1.0, 0.0], [1.0, 1.0])?));
+        match (trims.get(&(index, 1)), trim_edges.get(&(index, 1))) {
+            (Some(trim), Some(edges)) => {
+                coedges.push((edges[2], false, uv_line([1.0, 1.0], [trim.lambdas[1], 1.0])?));
+                for (piece, forward, pcurve) in trim.chain.iter().rev() {
+                    let edge = if *piece == TrimPiece::Cut { edges[1] } else { edges[3] };
+                    coedges.push((edge, !*forward, frag(pcurve.reversed(), "reversed")?));
+                }
+                coedges.push((edges[0], false, uv_line([trim.lambdas[0], 1.0], [0.0, 1.0])?));
+            }
+            _ => coedges.push((edge_at[&(1, *c)], *back_forward, uv_line([1.0, 1.0], [0.0, 1.0])?)),
+        }
+        coedges.push((orbits[&from], false, uv_line([0.0, 1.0], [0.0, 0.0])?));
         shell.face(surface.clone(), coedges);
     }
     let body = shell.solid();
     let issues = body.validate();
     if !issues.is_empty() {
-        return Err(refuse("assembly", format!("the lofted sweep is not valid: {:?}", issues.first())));
+        // Name the faces whose coedges stray: their pcurves' ends on the surface
+        // against their edges' ends.
+        let mut notes = Vec::new();
+        for face in body.shells.iter().flat_map(|s| &s.faces) {
+            for coedge in &face.loops[0].coedges {
+                let edge = body.edges.iter().find(|e| e.id == coedge.edge_id).expect("edge");
+                let [p0, p1] = frag(coedge.pcurve.domain(), "domain")?;
+                let a = frag(coedge.pcurve.evaluate(p0), "uv")?;
+                let on = frag(face.surface.evaluate_extended(a.x, a.y), "on")?;
+                let at = frag(edge.curve.evaluate(if coedge.forward { edge.t0 } else { edge.t1 }), "at")?;
+                if on.sub(at).length() > 1e-6 {
+                    notes.push(format!("face {} (degrees {}x{}) coedge on edge {} starts {:?} on the surface, its edge {:?}", face.id, face.surface.degree_u, face.surface.degree_v, edge.id, on, at));
+                }
+                let _ = p1;
+            }
+        }
+        return Err(refuse("assembly", format!("the lofted sweep is not valid: {:?}; {}", issues.first(), notes.iter().take(4).cloned().collect::<Vec<_>>().join("; "))));
     }
     check_single_pass(screw, first, &body)?;
     Ok(body)
@@ -3130,8 +3970,11 @@ fn check_single_pass(screw: &Screw, split: &Split, body: &BrepSolid) -> Result<(
         for [u, v] in probes.into_iter().filter(|&q| inside(q)) {
             let p = frag(surface.evaluate(u, v), "probe")?;
             let (hu, hv) = (1e-6 * (u1 - u0), 1e-6 * (v1 - v0));
-            let du = frag(surface.evaluate((u + hu).min(u1), v), "probe")?.sub(frag(surface.evaluate((u - hu).max(u0), v), "probe")?);
-            let dv = frag(surface.evaluate(u, (v + hv).min(v1)), "probe")?.sub(frag(surface.evaluate(u, (v - hv).max(v0)), "probe")?);
+            // Derivatives, not raw differences: their cross product is
+            // measured against an absolute zero.
+            let (ua, ub, va, vb) = ((u - hu).max(u0), (u + hu).min(u1), (v - hv).max(v0), (v + hv).min(v1));
+            let du = frag(surface.evaluate(ub, v), "probe")?.sub(frag(surface.evaluate(ua, v), "probe")?).scale(1.0 / (ub - ua));
+            let dv = frag(surface.evaluate(u, vb), "probe")?.sub(frag(surface.evaluate(u, va), "probe")?).scale(1.0 / (vb - va));
             let Ok(n) = du.cross(dv).normalized() else { continue };
             let n = if face.same_sense { n } else { n.scale(-1.0) };
             if covered(screw, split, p.add(n.scale(step)), margin)? {

@@ -36,7 +36,9 @@ const USAGE: &str = "usage: brep-app [FILE] [--mcp] [--mcp-port PORT] [--session
 
   FILE                open this document in a tab at startup (what a file
                       association hands us on a double click): a part (.nbrep),
-                      a family seed (.fbrep) or a template (.tbrep)
+                      a family seed (.fbrep) or a template (.tbrep); a STEP,
+                      IGES, STL, 3MF, OBJ or KiCad file is IMPORTED (as File >
+                      Import does) into a new untitled tab named after it
   --mcp               embed the MCP server: agents drive this window over http://127.0.0.1:PORT/mcp
   --mcp-instance NAME named persistent MCP state (default desktop; also used by the editor)
   --mcp-state-dir DIR explicit MCP journal directory
@@ -53,8 +55,9 @@ const USAGE: &str = "usage: brep-app [FILE] [--mcp] [--mcp-port PORT] [--session
                       parts from the KiCad installed here, saving each as a document
   --install-file-associations
                       make THIS executable the opener for .nbrep, .fbrep and
-                      .tbrep files, for the current user, and print what was
-                      written
+                      .tbrep files, for the current user, offer it (not as the
+                      default) for STEP, IGES, STL, 3MF and OBJ files, and print
+                      what was written
   --uninstall-file-associations
                       remove that association again
   --plm-url URL       connect this session to the PLM server at URL (overrides

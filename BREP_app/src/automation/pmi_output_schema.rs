@@ -45,6 +45,7 @@ pub(super) fn pmi_state_schema() -> Value {
     }).collect();
     defs["BalloonAnchor"] = json!({"oneOf":anchors});
     defs["FcfFrame"] = closed_object_required(json!({"characteristic":text,"symbol":text,"zone":text,"datums":strings}), &["characteristic","symbol","zone","datums"]);
+    defs["CenterCircle"] = closed_object_required(json!({"center":v3,"axis":v3,"radius":number,"depth":number,"xDir":v3}), &["center","axis","radius"]);
     defs["Plane"] = closed_object_required(json!({"origin":v3,"normal":v3,"xAxis":v3}), &["origin","normal","xAxis"]);
     defs["Geometry"] = json!({"oneOf":[
         variant("none",json!({}), &[]),
@@ -57,7 +58,9 @@ pub(super) fn pmi_state_schema() -> Value {
         variant("hide",json!({"solids":strings}), &["solids"]),
         variant("explode",json!({"solids":strings,"translate":v3,"rotateDeg":v3,"scale":v3,"center":v3,"trace":boolean}), &["solids","translate","rotateDeg","scale","center","trace"]),
         variant("datum",json!({"anchor":v3,"normal":v3,"letter":text}), &["anchor","normal","letter"]),
-        variant("fcf",json!({"anchor":v3,"normal":v3,"frame":reference("FcfFrame")}), &["anchor","normal","frame"])
+        variant("fcf",json!({"anchor":v3,"normal":v3,"frame":reference("FcfFrame")}), &["anchor","normal","frame"]),
+        variant("centerMark",json!({"marks":array(reference("CenterCircle")),"extension":number}), &["marks","extension"]),
+        variant("centerLine",json!({"a":v3,"b":v3}), &["a","b"])
     ]});
     defs["AnnotationReport"] = closed_object_required(json!({"persistentData":{},"pluginReplay":reference("PluginReplay"),"id":text,"type":text,
         "enabled":boolean,"status":{"enum":["ok","error"]},"message":text,"text":text,"value":number,"unit":text,

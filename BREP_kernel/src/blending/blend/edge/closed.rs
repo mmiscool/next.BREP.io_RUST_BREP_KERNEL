@@ -379,13 +379,25 @@ fn blend_closed_edge_impl(
     }
     let march_timing = crate::blend::BlendTimer::start("timing.closed.march_ms");
     let attempt_timing = crate::blend::BlendTimer::start("timing.closed.march.anchored_fallback_ms");
-    let analytic = crate::blend::stations::analytic_rim::construct(
-        edge, &first_mate, &second_mate, constant, chamfer, anchor_u,
-    );
+    // An asymmetric chamfer's stations come from its setback law
+    // (`blend/setback.rs`): no analytic rim (those solve the rolling ball),
+    // and a station that does not solve is the answer, not a cue for the
+    // edge-preserving construction, which builds from the radius.
+    let setback = crate::blend::setback::active();
+    let analytic = if setback.is_some() {
+        None
+    } else {
+        crate::blend::stations::analytic_rim::construct(edge, &first_mate, &second_mate, constant, chamfer, anchor_u)
+    };
+    let setback_stations = match &setback {
+        Some(law) => Some(crate::blend::setback::march_closed(solid, edge, &first_mate, &second_mate, law, anchor_u, rail_bar)?),
+        None => None,
+    };
     let (analytic_stations, analytic_rows) = match analytic {
         Some((stations, rows)) => (Some(stations), Some(rows)),
         None => (None, None),
     };
+    let analytic_stations = setback_stations.or(analytic_stations);
     let marched = match analytic_stations.map(Ok).unwrap_or_else(|| march_stations_with_rail_bar(edge, &first_mate, &second_mate, radius_at, anchor_u, FoldPolicy::Refuse, depth_budget, rail_bar, wall_check)) {
         Ok(stations) => {
             std::mem::forget(attempt_timing);
@@ -580,6 +592,17 @@ fn blend_closed_edge_impl(
     };
     let exits = [exit_of(first_face, false), exit_of(second_face, true)];
     exits_timing.stop();
+    // The rollover and edge-preserving lanes below build from the ball's
+    // radius: a setback rail that leaves its face is refused here by name.
+    if setback.is_some() && (exits[0] || exits[1]) {
+        return Err(crate::blend::setback::unsupported(
+            "setback_rail_leaves_face",
+            format!(
+                "asymmetric chamfer: the rail on face {} runs off that face",
+                if exits[0] { first_face.id } else { second_face.id }
+            ),
+        ));
+    }
     if exits[0] || exits[1] {
         let scale = crate::blend::stations::march_model_scale(&edge.curve, edge.t0, edge.t1, radius_at(mid_t))?;
         match crate::blend::rollover::plan_closed(solid, edge, &stations, [&first_mate, &second_mate], radius_at, scale) {
@@ -604,8 +627,10 @@ fn blend_closed_edge_impl(
             }
         }
     }
-    if let Some(refusal) = concave_rim_overrun(solid, edge, [(first_face, first_loop), (second_face, second_loop)], radius_at(mid_t))? {
-        return Err(refusal);
+    if setback.is_none() {
+        if let Some(refusal) = concave_rim_overrun(solid, edge, [(first_face, first_loop), (second_face, second_loop)], radius_at(mid_t))? {
+            return Err(refusal);
+        }
     }
     if exits[1] {
         return blend_closed_edge_keep(
@@ -2010,7 +2035,21 @@ fn build_surgery(
     } else {
         n1.scale(-1.0)
     };
-    let same_sense = blend_normal.dot(out1) >= 0.0;
+    // A rolling ball's wall is tangent to F1 at the rim, so F1's outward
+    // normal settles its side.  An asymmetric chamfer's bevel is not: a steep
+    // one (a short chord on F1, a long one on F2) turns more than a right
+    // angle from F1, and F1's normal alone reads it backwards.  The bevel
+    // always lies between its two faces, so it is read against both.
+    let same_sense = if crate::blend::setback::active().is_some() {
+        let uv2 = rows.cs_pcurve.evaluate(mid_u).or_refuse(KernelStage::Refine, "evaluate")?;
+        let n2 = raw_normal(&second.face.surface, uv2.x, uv2.y)?;
+        let out2 = if second.face.same_sense { n2 } else { n2.scale(-1.0) };
+        let v_far = rows.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?[1];
+        let far_normal = raw_normal(&rows.surface, mid_u, v_far)?;
+        blend_normal.dot(out1) + far_normal.dot(out2) >= 0.0
+    } else {
+        blend_normal.dot(out1) >= 0.0
+    };
     let loop_id = take_id();
     let mut coedges = vec![
         CoedgeRecord {

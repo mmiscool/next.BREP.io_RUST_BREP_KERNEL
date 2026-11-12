@@ -6,7 +6,7 @@
 //! only where the composition itself is the point (click = move + down + up).
 use crate::host::{Backend, HostConfig};
 use crate::session::Session;
-use crate::tools::app::{after_wait, current, wait_idle, SessionSlot};
+use crate::tools::app::{after_wait, context_schema, current, settled_context, wait_idle, with_context, without_context, SessionSlot};
 use crate::tools::{object_schema, Annotations, ToolImage, ToolOutput, ToolSpec};
 use crate::{image, schema, validate};
 use serde_json::{json, Value};
@@ -1754,6 +1754,7 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
     let open_slot = slot.clone();
     let save_slot = slot.clone();
     let import_slot = slot.clone();
+    let open_with_slot = slot.clone();
     let export_slot = slot.clone();
     let post_slot = slot.clone();
     let mut tools = vec![
@@ -1827,6 +1828,26 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                     if r["report"].get("meshImport").is_some() { r["after"] = after; }
                     else { crate::tools::app::settled_result(&mut r, after); }
                     session.record("document_import", &args, true, json!({}));
+                    Ok(ToolOutput::json(r))
+                })
+            },
+        ),
+        ToolSpec::new(
+            "document_open_with",
+            "document",
+            "Open a file from the host's files as the OS \"Open with\" does when it is not a model document: a STEP (.step/.stp/.p21), IGES, STL, 3MF, OBJ or KiCad file goes through the File > Import importer for its extension into a NEW untitled tab labelled with the file's stem. Any other extension is refused. Returns the tabs once the import has settled (a mesh waits in its preview).",
+            object_schema(json!({ "path": { "type": "string" }, "timeout_ms": { "type": "integer", "default": 120000 } }), &["path"]),
+            Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
+            move |args| {
+                let slot = open_with_slot.clone();
+                Box::pin(async move {
+                    let session = current(&slot).await?;
+                    let path = s(&args, "path").ok_or("missing `path`")?;
+                    let bytes = session.host.platform.read_bytes(path.clone()).await?;
+                    let name = file_name(&path).unwrap_or_default();
+                    let mut r = session.host.call_ok("doc_open_with", json!({ "name": name, "base64": base64_encode(&bytes) })).await?.result.unwrap_or(Value::Null);
+                    r["after"] = after_wait(&session, u(&args, "timeout_ms", 120_000)).await?;
+                    session.record("document_open_with", &args, true, json!({}));
                     Ok(ToolOutput::json(r))
                 })
             },
@@ -1906,6 +1927,7 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
             "document_export" => if let Some(schema) = document_export_result_schema(describe) { tool.output_schema = schema; },
             "document_open" => if let Some(schema) = document_read_result_schema(describe, "doc_load") { tool.output_schema = schema; },
             "document_import" => if let Some(schema) = document_read_result_schema(describe, "doc_import") { tool.output_schema = schema; },
+            "document_open_with" => if let Some(schema) = document_read_result_schema(describe, "doc_open_with") { tool.output_schema = schema; },
             "cam_post" => if let Some(schema) = cam_post_result_schema(describe) { tool.output_schema = schema; },
             _ => {},
         }
@@ -2089,24 +2111,26 @@ pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                 o.insert("wait".into(), json!({ "type": "boolean", "default": true }));
                 o.insert("timeout_ms".into(), json!({ "type": "integer", "default": 60000 }));
                 o.insert("allow_errors".into(), json!({ "type": "boolean", "default": false, "description": "return the run report when the new feature fails to build, instead of failing the call (the feature is added either way)" }));
+                o.insert("context".into(), context_schema());
                 object_schema(props, &["type"])
             },
             Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
             move |args| {
                 let slot = add_slot.clone();
                 Box::pin(async move {
-                    let args = checked_args("feature_add", &args, &["type", "params", "id", "persistent_data", "wait", "timeout_ms", "allow_errors"], &[("inputParams", "params"), ("persistentData", "persistent_data")])?;
+                    let args = checked_args("feature_add", &args, &["type", "params", "id", "persistent_data", "wait", "timeout_ms", "allow_errors", "context"], &[("inputParams", "params"), ("persistentData", "persistent_data")])?;
                     let session = current(&slot).await?;
                     let known = known_names(&session).await;
                     let (id, feature, warnings) = seed_feature(&session, &args, known.as_ref()).await?;
-                    let mut r = session.host.call_ok("feature_add", json!({ "feature": feature })).await?.result.unwrap_or(Value::Null);
+                    let mut r = session.host.call_ok("feature_add", with_context(json!({ "feature": feature }), &args)).await?.result.unwrap_or(Value::Null);
                     if !warnings.is_empty() {
                         r["warnings"] = json!(warnings);
                     }
                     if b(&args, "wait", true) {
                         crate::tools::app::settled_result(&mut r, after_wait(&session, u(&args, "timeout_ms", 60_000)).await?);
+                        settled_context(&session, &mut r, &args).await;
                     }
-                    session.record("feature_add", &args, true, json!({ "id": id }));
+                    session.record("feature_add", &without_context(&args), true, json!({ "id": id }));
                     // A feature that failed to build is a failed call unless the
                     // caller asked for the report: "succeeded" with an error
                     // buried in after.report cost agents several calls each.
@@ -2135,7 +2159,8 @@ pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                 "rollback_on_error": {"type":"boolean", "default":false, "description":"Restore recipe, library, instances, constraints, metadata, counters and undo/redo on rebuild failure. Runtime generations/caches are invalidated."},
                 "structured": {"type":"boolean", "default":false, "description":"Return per-item evaluated/failed/not_evaluated results and dependency diagnostics"},
                 "wait": { "type": "boolean", "default": true },
-                "timeout_ms": { "type": "integer", "default": 60000 }
+                "timeout_ms": { "type": "integer", "default": 60000 },
+                "context": context_schema()
             }), &["features"]),
             Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
             move |args| {
@@ -2168,8 +2193,9 @@ pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                         request.as_object_mut().unwrap().remove("timeout_ms");
                         request["structured"] = json!(true);
                         wait_idle(&session, u(&args, "timeout_ms", 60_000), 2).await?;
-                        let r = session.host.call_ok("feature_add_many", request).await?.result.unwrap_or(Value::Null);
-                        session.record("feature_add_many", &args, r["success"] == true, r.clone());
+                        let mut r = session.host.call_ok("feature_add_many", request).await?.result.unwrap_or(Value::Null);
+                        settled_context(&session, &mut r, &args).await;
+                        session.record("feature_add_many", &without_context(&args), r["success"] == true, r.clone());
                         return Ok(ToolOutput::json(r));
                     }
                     // Seed and validate EVERY item before the history sees any of
@@ -2199,7 +2225,7 @@ pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                     }
                     let mut r = session
                         .host
-                        .call_ok("feature_add_many", json!({ "features": features }))
+                        .call_ok("feature_add_many", with_context(json!({ "features": features }), &args))
                         .await?
                         .result
                         .unwrap_or(Value::Null);
@@ -2209,8 +2235,9 @@ pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                     }
                     if b(&args, "wait", true) {
                         crate::tools::app::settled_result(&mut r, after_wait(&session, u(&args, "timeout_ms", 60_000)).await?);
+                        settled_context(&session, &mut r, &args).await;
                     }
-                    session.record("feature_add_many", &args, true, json!({ "ids": ids }));
+                    session.record("feature_add_many", &without_context(&args), true, json!({ "ids": ids }));
                     Ok(ToolOutput::json(r))
                 })
             },
@@ -2219,12 +2246,12 @@ pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
             "feature_set_params",
             "features",
             "Merge a patch into a feature's inputParams (nested keys such as boolean.operation allowed), validate, and rerun from it. `params` is accepted as another name for `patch`. When the edited feature then fails to build, the reply carries `ok: false` and `error` at its top.",
-            object_schema(json!({ "id": { "type": "string" }, "patch": { "type": "object" }, "wait": { "type": "boolean", "default": true }, "timeout_ms": { "type": "integer", "default": 60000 } }), &["id", "patch"]),
+            object_schema(json!({ "id": { "type": "string" }, "patch": { "type": "object" }, "wait": { "type": "boolean", "default": true }, "timeout_ms": { "type": "integer", "default": 60000 }, "context": context_schema() }), &["id", "patch"]),
             Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
             move |args| {
                 let slot = set_slot.clone();
                 Box::pin(async move {
-                    let args = checked_args("feature_set_params", &args, &["id", "patch", "wait", "timeout_ms"], &[("params", "patch"), ("inputParams", "patch")])?;
+                    let args = checked_args("feature_set_params", &args, &["id", "patch", "wait", "timeout_ms", "context"], &[("params", "patch"), ("inputParams", "patch")])?;
                     let session = current(&slot).await?;
                     let id = s(&args, "id").ok_or("missing `id`")?;
                     let cur = session.host.call_ok("feature_params", json!({ "id": id })).await?.result.unwrap_or(Value::Null);
@@ -2237,14 +2264,15 @@ pub fn feature_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                     if !v.ok() {
                         return Err(format!("invalid_arguments: invalid parameters for {ty}: {}", v.errors.join("; ")));
                     }
-                    let mut r = session.host.call_ok("feature_set_params", json!({ "id": id, "input_params": merged })).await?.result.unwrap_or(Value::Null);
+                    let mut r = session.host.call_ok("feature_set_params", with_context(json!({ "id": id, "input_params": merged }), &args)).await?.result.unwrap_or(Value::Null);
                     if !v.warnings.is_empty() {
                         r["warnings"] = json!(v.warnings);
                     }
                     if b(&args, "wait", true) {
                         crate::tools::app::settled_result(&mut r, after_wait(&session, u(&args, "timeout_ms", 60_000)).await?);
+                        settled_context(&session, &mut r, &args).await;
                     }
-                    session.record("feature_set_params", &args, true, json!({}));
+                    session.record("feature_set_params", &without_context(&args), true, json!({}));
                     // The edit is kept (a refusal is often the point of the
                     // edit), but say at the top that this feature now fails.
                     let errors = own_feature_errors(&r, &id);

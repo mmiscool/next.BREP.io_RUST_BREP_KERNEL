@@ -1,4 +1,4 @@
-//! The PMI annotation type table — eleven types, each a module exposing its
+//! The PMI annotation type table — twelve types, each a module exposing its
 //! [`PmiTypeDef`] (`DEF`), its `schema()` and its resolver. The table is the
 //! third applicability family beside the feature catalogue and the assembly
 //! constraint types: an annotation predicate accepts plain AND component
@@ -6,6 +6,7 @@
 
 pub mod balloon;
 pub mod angle;
+pub mod centerline;
 pub mod datum;
 pub mod explode;
 pub mod fcf;
@@ -44,7 +45,7 @@ pub struct PmiTypeDef {
 }
 
 /// Panel / `+` dropdown order.
-pub const PMI_TYPES: [PmiTypeDef; 11] = [
+pub const PMI_TYPES: [PmiTypeDef; 12] = [
     linear::DEF,
     radial::DEF,
     angle::DEF,
@@ -52,6 +53,7 @@ pub const PMI_TYPES: [PmiTypeDef; 11] = [
     balloon::DEF,
     note::DEF,
     hole_callout::DEF,
+    centerline::DEF,
     datum::DEF,
     fcf::DEF,
     explode::DEF,
@@ -63,7 +65,7 @@ pub fn pmi_type(type_id: &str) -> Option<&'static PmiTypeDef> {
     PMI_TYPES.iter().find(|def| def.type_id == type_id)
 }
 
-/// The eleven annotation schemas, table order.
+/// The twelve annotation schemas, table order.
 pub fn pmi_schema_catalogue() -> Value {
     Value::Array(PMI_TYPES.iter().map(|def| (def.schema)()).collect())
 }

@@ -751,34 +751,77 @@ fn assembly_import_message(name: &str, report: &StepAssemblyReport) -> String {
     message
 }
 
-/// Whether an imported file name is a STEP file (`.step` / `.stp`, any case) —
-/// the routing key in [`FileDialog::show`]. Model documents arrive
-/// extension-stripped (web) or as a stored model name, so this
-/// never mis-routes a `.nbrep` file.
+/// What an imported file is, by its extension: the ONE routing table every
+/// import door shares — File > Import's explorer, the upload poll, and a file
+/// the OS hands the app (`brep-app part.step`, a double click on a file the
+/// app is an opener for). Each kind names the importer the File menu already
+/// uses; nothing here imports by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImportKind {
+    /// A `.kicad_sym` / `.kicad_mod`: the KiCad dialog takes it from there.
+    Kicad,
+    /// STEP (Part 21): probe for an assembly, else the flat IMPORT3D lane.
+    Step,
+    /// IGES: the STEP lane's probe (subfigure instances raise the same choice).
+    Iges,
+    /// STL: the mesh reconstruction preview.
+    Stl,
+    /// 3MF: the STL lane — the same preview, tolerances and accept.
+    ThreeMf,
+    /// OBJ: reconstructed in the background into an IMPORT3D feature.
+    Obj,
+}
+
+/// Every extension the app imports, lowercase without the dot, and its kind.
+/// Model documents (`.nbrep`, `.fbrep`, `.tbrep`) are not here: they open.
+pub(crate) const IMPORT_TABLE: &[(&str, ImportKind)] = &[
+    ("step", ImportKind::Step),
+    ("stp", ImportKind::Step),
+    ("p21", ImportKind::Step),
+    ("iges", ImportKind::Iges),
+    ("igs", ImportKind::Iges),
+    ("stl", ImportKind::Stl),
+    ("3mf", ImportKind::ThreeMf),
+    ("obj", ImportKind::Obj),
+    ("kicad_sym", ImportKind::Kicad),
+    ("kicad_mod", ImportKind::Kicad),
+];
+
+/// The extensions of [`IMPORT_TABLE`], for the explorer's filter and the
+/// system file chooser (a test holds the two lists equal).
+const IMPORT_EXTENSIONS: &[&str] =
+    &["step", "stp", "p21", "iges", "igs", "stl", "3mf", "obj", "kicad_sym", "kicad_mod"];
+
+/// The import kind of a file name or path, by its last extension in any case;
+/// `None` for a model document or anything the app does not import. Model
+/// documents arrive extension-stripped (web) or as a stored model name, so
+/// this never mis-routes a `.nbrep` file.
+pub(crate) fn import_kind(name: &str) -> Option<ImportKind> {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let (_, ext) = base.rsplit_once('.')?;
+    let ext = ext.to_ascii_lowercase();
+    IMPORT_TABLE.iter().find(|(e, _)| *e == ext).map(|(_, kind)| *kind)
+}
+
+/// Whether an imported file name is a STEP file (`.step` / `.stp` / `.p21`,
+/// any case).
 fn is_step_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".step") || lower.ends_with(".stp")
+    import_kind(name) == Some(ImportKind::Step)
 }
 
-/// Whether an imported file name is an IGES file (`.iges` / `.igs`, any case) —
-/// the sibling routing key of [`is_step_name`].
+/// Whether an imported file name is an IGES file (`.iges` / `.igs`, any case).
 fn is_iges_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".iges") || lower.ends_with(".igs")
+    import_kind(name) == Some(ImportKind::Iges)
 }
 
-fn is_stl_name(name: &str) -> bool {
-    name.to_ascii_lowercase().ends_with(".stl")
-}
-
-fn is_obj_name(name: &str) -> bool {
-    name.to_ascii_lowercase().ends_with(".obj")
-}
-
-/// Whether an imported file name is a 3MF package. It takes the STL lane: the
-/// same reconstruction preview, the same tolerances, the same accept.
-fn is_3mf_name(name: &str) -> bool {
-    name.to_ascii_lowercase().ends_with(".3mf")
+/// The name a file imported into a tab of its own is shown under: the file's
+/// base name without its import extension (`/tmp/Bracket.STEP` -> `Bracket`).
+pub(crate) fn import_document_name(file_name: &str) -> String {
+    let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
+    match base.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() && import_kind(base).is_some() => stem.to_string(),
+        _ => base.to_string(),
+    }
 }
 
 mod component_part;
@@ -1288,21 +1331,10 @@ impl FileDialog {
             let bytes = imported.bytes;
             // CAD/mesh imports target the active document. STL waits for
             // preview acceptance; model documents open in a separate tab.
-            if KicadKind::of_file(&name).is_some() {
-                self.take_kicad_file(&name, &bytes, store);
-                return;
-            } else if is_step_name(&name) {
-                self.import_text(docs.engine_mut(), &name, &bytes, Self::import_step);
-            } else if is_iges_name(&name) {
-                // IGES takes the STEP lane's probe: a file of subfigure
-                // instances raises the same assembly choice.
-                self.import_text(docs.engine_mut(), &name, &bytes, Self::import_step);
-            } else if is_stl_name(&name) {
-                self.stage_mesh_preview(MeshImportFormat::Stl, name, bytes);
-            } else if is_3mf_name(&name) {
-                self.stage_mesh_preview(MeshImportFormat::ThreeMf, name, bytes);
-            } else if is_obj_name(&name) {
-                self.import_obj(docs.engine_mut(), &name, &bytes);
+            if let Some(kind) = import_kind(&name) {
+                if !self.import_file(kind, docs.engine_mut(), store, name, bytes) {
+                    return;
+                }
             } else if std::mem::take(&mut self.pending_component_import) {
                 // The insert-component modal's Upload fired this pick: the
                 // chosen document becomes a parts-library entry + an instance,
@@ -1396,8 +1428,7 @@ impl FileDialog {
         state: &mut EngineState,
         store: &dyn ModelStore,
     ) {
-        const EXTENSIONS: &[&str] =
-            &["step", "stp", "iges", "igs", "stl", "3mf", "obj", "kicad_sym", "kicad_mod"];
+        const EXTENSIONS: &[&str] = IMPORT_EXTENSIONS;
         let modal = egui::Modal::new(egui::Id::new("brep-file-import")).show(ctx, |ui| {
             file_explorer::dialog_body(ui, |ui| {
                 ui.heading("Import CAD file");
@@ -1430,25 +1461,14 @@ impl FileDialog {
         let output = modal.inner;
         if let Some(name) = output.activated {
             match browse_store(Purpose::Imports, store).read_external_file(&name) {
-                Some(bytes) if KicadKind::of_file(&name).is_some() => {
-                    // Not an import yet: the KiCad dialog takes it from here.
-                    self.take_kicad_file(&name, &bytes, store);
-                    return;
-                }
-                Some(bytes) if is_step_name(&name) => {
-                    self.import_text(state, &name, &bytes, Self::import_step)
-                }
-                Some(bytes) if is_iges_name(&name) => {
-                    self.import_text(state, &name, &bytes, Self::import_step)
-                }
-                Some(bytes) if is_stl_name(&name) => {
-                    self.stage_mesh_preview(MeshImportFormat::Stl, name, bytes)
-                }
-                Some(bytes) if is_3mf_name(&name) => {
-                    self.stage_mesh_preview(MeshImportFormat::ThreeMf, name, bytes)
-                }
-                Some(bytes) if is_obj_name(&name) => self.import_obj(state, &name, &bytes),
-                Some(_) => self.status = format!("unsupported import file: {name}"),
+                Some(bytes) => match import_kind(&name) {
+                    Some(kind) => {
+                        if !self.import_file(kind, state, store, name, bytes) {
+                            return;
+                        }
+                    }
+                    None => self.status = format!("unsupported import file: {name}"),
+                },
                 None => self.status = format!("import failed: '{name}' not found"),
             }
             self.close_after_import();
@@ -2463,9 +2483,10 @@ impl FileDialog {
     /// their name field from: the file's stem, never the full path a saved
     /// document is named by (whose `/`s became `_`s in every exported file
     /// name), and never the field's last contents, which belong to whichever
-    /// tab last used it.
+    /// tab last used it. An untitled tab with a label (a file imported into
+    /// a tab of its own, an agent's titled document) offers its label.
     fn document_name(docs: &Documents) -> String {
-        docs.active().name().map(model_display_name).unwrap_or_else(|| docs.active().untitled_title())
+        docs.active().name().map(model_display_name).unwrap_or_else(|| file_stem_of_title(&docs.active().title()))
     }
 
     /// **New** — a fresh document in a NEW TAB. Nothing is replaced, so there is
@@ -3852,6 +3873,66 @@ impl FileDialog {
             Ok(_) => self.status = format!("reconstructing {name} in background…"),
             Err(e) => self.status = format!("import failed: {e}"),
         }
+    }
+
+    /// Hand a file to the importer File > Import uses for its kind. `false`
+    /// when the file is not imported yet but has moved to a dialog of its own
+    /// (KiCad): the caller then leaves the dialog state alone.
+    fn import_file(
+        &mut self,
+        kind: ImportKind,
+        state: &mut EngineState,
+        store: &dyn ModelStore,
+        name: String,
+        bytes: Vec<u8>,
+    ) -> bool {
+        match kind {
+            ImportKind::Kicad => {
+                self.take_kicad_file(&name, &bytes, store);
+                return false;
+            }
+            ImportKind::Step | ImportKind::Iges => self.import_text(state, &name, &bytes, Self::import_step),
+            ImportKind::Stl => self.stage_mesh_preview(MeshImportFormat::Stl, name, bytes),
+            ImportKind::ThreeMf => self.stage_mesh_preview(MeshImportFormat::ThreeMf, name, bytes),
+            ImportKind::Obj => self.import_obj(state, &name, &bytes),
+        }
+        true
+    }
+
+    /// A file the OS handed the app that is not a model document — `brep-app
+    /// part.step`, or a double click on a file the app is an opener for —
+    /// imported exactly as File > Import would, into a NEW untitled tab shown
+    /// under the file's stem. The tab has no store identity, so a plain Save
+    /// asks for a name and never writes over the imported file. The tab is
+    /// opened BEFORE the import starts: the STEP probe and the mesh preview
+    /// bind to the active document. `file_name` is the path or the bare name;
+    /// the status line and the importer's notices name it.
+    ///
+    /// A name the table does not know is refused without a new tab.
+    pub fn import_into_new_tab(
+        &mut self,
+        docs: &mut Documents,
+        store: &dyn ModelStore,
+        file_name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        let Some(kind) = import_kind(file_name) else {
+            return Err(format!("{file_name} is not a BREP document or a file BREP imports"));
+        };
+        self.cancel_pending_step_import(docs.engine_mut());
+        self.new_document(docs, DocumentClass::Normal);
+        let title = import_document_name(file_name);
+        docs.active_mut().set_label(Some(title.clone()));
+        let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name).to_string();
+        self.status.clear();
+        if self.import_file(kind, docs.engine_mut(), store, base, bytes) {
+            self.close_after_import();
+        }
+        if self.status.starts_with("import failed") {
+            docs.engine_mut().push_notice(self.status.clone());
+            return Err(self.status.clone());
+        }
+        Ok(())
     }
 
     fn import_text(

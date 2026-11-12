@@ -88,6 +88,10 @@ impl Plane {
     }
 }
 
+fn grazing_cavity_on() -> bool {
+    switch!("BREP_OFFSET_SHELL_GRAZING_CAVITY", true)
+}
+
 fn plane_of(face: &FaceRecord) -> Option<(Vec3, f64)> {
     let Some(AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) = face.surface.analytic() else {
         return None;
@@ -115,6 +119,14 @@ fn cut_ball(centre: Vec3, radius: f64, axis: Vec3, planes: &[(Vec3, f64)], linea
             return if height >= radius + linear { Ok(None) } else { Err("a plane grazes the ball".into()) };
         }
         if (height + radius).abs() <= linear {
+            // GRAZING FROM THE KEPT SIDE (`BREP_OFFSET_SHELL_GRAZING_CAVITY`, default on; `=0` restores): the
+            // plane touches the ball at one point with the whole ball on its kept side, so it cuts
+            // nothing away. Cause (brep-bench probe, the ball r 5 below z 3 shelled open at its
+            // flat with wall 2): the cavity, the ball r 3, touches the opening plane at its top;
+            // the lane refused and the pipeline left the offset sphere's trim image as an open rim.
+            if grazing_cavity_on() {
+                continue;
+            }
             return Err("a plane grazes the ball".into());
         }
         let foot = centre.sub(normal.scale(height));
@@ -226,8 +238,20 @@ fn build(source: &BrepSolid, opening_face_ids: &[u64], distance: f64) -> Result<
     let cavity_planes = planes.iter().map(|plane| (plane.normal, plane.cavity_offset(distance))).collect::<Vec<_>>();
     let cavity = cut_ball(centre, inner, axis, &cavity_planes, linear)?.ok_or("the moved planes leave no cavity")?;
     let cavity_volume = solid_signed_volume(&cavity)?;
-    let result = boolean_operation(source, &cavity, BooleanOperation::Subtract, &BooleanOptions::default())
-        .map_err(|refusal| format!("the difference refused: {}", refusal.message))?;
+    // A WHOLE ball sealed below every opening (the grazing case: it touches an opening plane at
+    // one point) is the source with the ball as a void: the boolean reads a single point of
+    // contact wrong (the ball r 5 below z 3 at wall 2 read 222.006 for 356.047).
+    let whole_ball = cavity.shells.iter().flat_map(|shell| &shell.faces).all(|face| plane_of(face).is_none());
+    let sealed_below = !planes.iter().any(|plane| {
+        let height = plane.normal.dot(centre) - plane.offset;
+        plane.opening && height.abs() < inner - linear
+    });
+    let result = if grazing_cavity_on() && whole_ball && sealed_below {
+        with_void(source, &cavity)?
+    } else {
+        boolean_operation(source, &cavity, BooleanOperation::Subtract, &BooleanOptions::default())
+            .map_err(|refusal| format!("the difference refused: {}", refusal.message))?
+    };
     let issues = result.validate();
     if !issues.is_empty() {
         return Err(format!("the difference does not validate: {issues:?}"));
@@ -306,4 +330,46 @@ fn build(source: &BrepSolid, opening_face_ids: &[u64], distance: f64) -> Result<
         face_images.push(image);
     }
     Ok(OffsetShellResultRecord { solid: result, face_images })
+}
+
+/// `solid` with `void` added as an inner shell, its faces reversed and every id of it moved past
+/// `solid`'s own.
+fn with_void(solid: &BrepSolid, void: &BrepSolid) -> Result<BrepSolid, String> {
+    let mut hollow = void.clone();
+    crate::offset_shell::flip_all_faces(&mut hollow).map_err(|refusal| refusal.message)?;
+    let next = |ids: &mut dyn Iterator<Item = u64>| ids.max().unwrap_or(0) + 1;
+    let vertex_base = next(&mut solid.vertices.iter().map(|vertex| vertex.id));
+    let edge_base = next(&mut solid.edges.iter().map(|edge| edge.id));
+    let faces = solid.shells.iter().flat_map(|shell| &shell.faces);
+    let face_base = next(&mut faces.clone().map(|face| face.id));
+    let loop_base = next(&mut faces.clone().flat_map(|face| face.loops.iter().map(|loop_record| loop_record.id)));
+    let coedge_base = next(&mut faces.flat_map(|face| face.loops.iter().flat_map(|loop_record| loop_record.coedges.iter().map(|coedge| coedge.id))));
+    let shell_base = next(&mut solid.shells.iter().map(|shell| shell.id));
+    let mut result = solid.clone();
+    for mut vertex in hollow.vertices {
+        vertex.id += vertex_base;
+        result.vertices.push(vertex);
+    }
+    for mut edge in hollow.edges {
+        edge.id += edge_base;
+        edge.start_vertex_id += vertex_base;
+        edge.end_vertex_id += vertex_base;
+        result.edges.push(edge);
+    }
+    for mut shell in hollow.shells {
+        shell.id += shell_base;
+        for face in &mut shell.faces {
+            face.id += face_base;
+            for loop_record in &mut face.loops {
+                loop_record.id += loop_base;
+                for coedge in &mut loop_record.coedges {
+                    coedge.id += coedge_base;
+                    coedge.edge_id += edge_base;
+                }
+            }
+        }
+        result.shells.push(shell);
+    }
+    result.mass_properties_cache = Default::default();
+    Ok(result)
 }

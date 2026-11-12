@@ -90,6 +90,377 @@ fn key(point: Vec3) -> [u64; 3] {
     [point.x.to_bits(), point.y.to_bits(), point.z.to_bits()]
 }
 
+/// The 3-D section lane for a marched run whose fit rings
+/// (`BREP_SECTION_HERMITE_3D`, default on; `=0` restores the fit). A plane meeting two swept walls
+/// along the G1 junction between them cuts the one wall in a section that
+/// arrives square to the plane's other section and turns through a right
+/// angle within a radius far below the run's own length (a drum screwed
+/// across a ring sector: radius about 7e-5 on a section 2 long). The march
+/// samples the turn densely and the rest coarsely; the station pool drops the
+/// tip stations under its near-duplicate floor, and no global interpolant
+/// through what is left can follow the turn: the quintic rings between
+/// stations by hundreds of units while it reproduces every station. The
+/// carried-UV lane above does not take such a run either when it crosses a
+/// carrier's crease line (a knot of multiplicity at least the degree; at a
+/// rational arc's double knot the wall is C1 but its second derivative jumps):
+/// a parameter Hermite across the line converges as h^2, not h^4, and the
+/// emission refiner's depth runs out first.
+///
+/// This lane keeps every march station with its march tangent, measures each
+/// span's cubic Hermite against both carriers at its quarter points, and
+/// bisects a span that misses onto a true intersection point (the march's own
+/// Newton) until every span holds `budget`. Only the 3-D curve is emitted;
+/// pcurves are built from it as for a fitted section. `None` when a span
+/// cannot be brought within the budget.
+pub(crate) fn hermite_3d_enabled() -> bool {
+    switch!("BREP_SECTION_HERMITE_3D", true)
+}
+
+/// `BREP_HERMITE_END_WELD` (default on, `=0` off): [`hermite_section_3d`] reads an
+/// interior station within the weld floor of the run's end as that end.
+fn end_weld_enabled() -> bool {
+    switch!("BREP_HERMITE_END_WELD", true)
+}
+
+fn decline_3d(site: usize) {
+    if std::env::var("BREP_DEBUG_HERMITE_3D").is_ok() {
+        eprintln!("hermite 3-D decline at site {site}");
+    }
+}
+
+/// A [`hermite_section_3d`] station: point, unit tangent along the run, and
+/// its parameters on both carriers (unwrapped along the run).
+type Station3 = (Vec3, Vec3, [f64; 2], [f64; 2]);
+
+/// The interior parameter lines of `surface` at a knot of multiplicity at
+/// least the degree, per direction: C0 in general, and C1 at best with a jump
+/// in the second derivative (a rational arc's joint).
+fn crease_lines(surface: &NurbsSurface) -> [Vec<f64>; 2] {
+    let lines = |knots: &[f64], degree: usize| -> Vec<f64> {
+        let (low, high) = (knots[degree], knots[knots.len() - degree - 1]);
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < knots.len() {
+            let value = knots[index];
+            let run = knots[index..].iter().take_while(|knot| **knot == value).count();
+            if value > low && value < high && run >= degree.max(1) {
+                out.push(value);
+            }
+            index += run;
+        }
+        out
+    };
+    [lines(&surface.knots_u, surface.degree_u), lines(&surface.knots_v, surface.degree_v)]
+}
+
+/// The C1 cubic of [`hermite_3d_enabled`] through `run` with its two pcurves
+/// on the same knots, or `None`. A station is placed exactly on every crease
+/// line of either carrier the run crosses, and each span's parameter Hermites
+/// take their end velocities from inside the span, so no span's Hermite
+/// straddles a crease and a pcurve may turn at one where its carrier's
+/// parameterization does.
+pub(super) fn hermite_section_3d(
+    run: &[Vec3],
+    branch: &SurfaceIntersectionCurve,
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    budget: f64,
+) -> Result<Option<(NurbsCurve, [NurbsCurve; 2])>, String> {
+    if run.len() < 2 || !(budget > 0.0 && budget.is_finite()) {
+        { decline_3d(1); return Ok(None); }
+    }
+    let tangents = branch.tangents.as_ref();
+    let by_point: HashMap<[u64; 3], usize> = branch.points.iter().enumerate().map(|(i, p)| (key(*p), i)).collect();
+    let (closed_a, closed_b) = (first.closed_directions()?, second.closed_directions()?);
+    let (ua, va, ub, vb) = (first.domain_u()?, first.domain_v()?, second.domain_u()?, second.domain_v()?);
+    let in_a = |uv: [f64; 2]| [into_domain(uv[0], closed_a.0, ua), into_domain(uv[1], closed_a.1, va)];
+    let in_b = |uv: [f64; 2]| [into_domain(uv[0], closed_b.0, ub), into_domain(uv[1], closed_b.1, vb)];
+    let near_a = |uv: [f64; 2], near: [f64; 2]| [unwrap(uv[0], near[0], closed_a.0, ua), unwrap(uv[1], near[1], closed_a.1, va)];
+    let near_b = |uv: [f64; 2], near: [f64; 2]| [unwrap(uv[0], near[0], closed_b.0, ub), unwrap(uv[1], near[1], closed_b.1, vb)];
+    let frame = |point: Vec3, along: Vec3| -> Result<Option<Station3>, String> {
+        let (Ok(on_a), Ok(on_b)) = (project_point_to_surface(first, point), project_point_to_surface(second, point)) else {
+            return Ok(None);
+        };
+        let cross = first.normal(on_a.u, on_a.v)?.cross(second.normal(on_b.u, on_b.v)?);
+        if cross.length() <= 1e-9 {
+            return Ok(None);
+        }
+        let mut tangent = cross.normalized()?;
+        if tangent.dot(along) < 0.0 {
+            tangent = tangent.scale(-1.0);
+        }
+        Ok(Some((point, tangent, [on_a.u, on_a.v], [on_b.u, on_b.v])))
+    };
+    // Stations closer than this are one station (a march station beside the
+    // pierce seed that clips the run): a chord that short carries no direction.
+    let reach = 1e-7 * (1.0 + run[0].length());
+    let mut stations: Vec<Station3> = Vec::with_capacity(run.len());
+    // An interior station within the weld floor of the run's first or last
+    // point is that end: the assembler welds the two into one vertex, and the
+    // end, clipped at a pierce, is itself placed no better than that when the
+    // section meets the trim at a shallow angle. Kept, the pair is a span too
+    // short for the corrector to place a midpoint on.
+    let (head, tail) = (run[0], run[run.len() - 1]);
+    let end_weld = end_weld_enabled();
+    for (k, point) in run.iter().enumerate() {
+        if end_weld
+            && k > 0
+            && k + 1 < run.len()
+            && (point.sub(head).length() <= crate::tolerance::WELD_FLOOR || point.sub(tail).length() <= crate::tolerance::WELD_FLOOR)
+        {
+            continue;
+        }
+        if stations.last().is_some_and(|last: &Station3| last.0.sub(*point).length() <= reach) {
+            // The run's own end is kept exactly; an interior repeat is dropped.
+            if k + 1 < run.len() || stations.len() < 2 {
+                continue;
+            }
+            stations.pop();
+        }
+        let along = run[(k + 1).min(run.len() - 1)].sub(run[k.saturating_sub(1)]);
+        let marched = by_point.get(&key(*point)).and_then(|&i| Some((tangents?.get(i).copied()?, branch.params_a[i], branch.params_b[i])));
+        match marched {
+            Some((tangent, uv_a, uv_b)) if tangent.length() > 0.5 => stations.push((*point, tangent.normalized()?, uv_a, uv_b)),
+            _ => match frame(*point, along)? {
+                Some(station) => stations.push(station),
+                None => { decline_3d(2); return Ok(None); }
+            },
+        }
+    }
+    if stations.len() < 2 {
+        { decline_3d(4); return Ok(None); }
+    }
+    // Every tangent along the run, read against the chord to its first
+    // neighbour farther than the reach.
+    for i in 0..stations.len() {
+        let point = stations[i].0;
+        let ahead = stations[i + 1..].iter().find(|s| s.0.sub(point).length() > reach).map(|s| s.0.sub(point));
+        let behind = stations[..i].iter().rev().find(|s| point.sub(s.0).length() > reach).map(|s| point.sub(s.0));
+        let Some(chord) = ahead.or(behind) else {
+            { decline_3d(10); return Ok(None); }
+        };
+        if stations[i].1.dot(chord) < 0.0 {
+            stations[i].1 = stations[i].1.scale(-1.0);
+        }
+    }
+    // Parameters unwrapped along the run.
+    for i in 1..stations.len() {
+        let (pa, pb) = (stations[i - 1].2, stations[i - 1].3);
+        stations[i].2 = near_a(stations[i].2, pa);
+        stations[i].3 = near_b(stations[i].3, pb);
+    }
+    let creases = [crease_lines(first), crease_lines(second)];
+    let cubic = |a: &Station3, b: &Station3, s: f64| -> Vec3 {
+        let h = b.0.sub(a.0).length();
+        let (d0, d1) = (a.1.scale(h), b.1.scale(h));
+        let c = hermite_at([a.0.x, a.0.y, a.0.z], [d0.x, d0.y, d0.z], [b.0.x, b.0.y, b.0.z], [d1.x, d1.y, d1.z], s);
+        Vec3::new(c[0], c[1], c[2])
+    };
+    let cubic_tangent = |a: &Station3, b: &Station3, s: f64| -> Vec3 {
+        let (p, q) = (cubic(a, b, (s - 1e-6).max(0.0)), cubic(a, b, (s + 1e-6).min(1.0)));
+        q.sub(p)
+    };
+    // The span's parameter velocities, each read just inside the span.
+    let velocities = |a: &Station3, b: &Station3| -> Result<Option<[[f64; 2]; 4]>, String> {
+        let inside = |p: [f64; 2], q: [f64; 2]| [p[0] + 1e-9 * (q[0] - p[0]), p[1] + 1e-9 * (q[1] - p[1])];
+        let (Ok(a_on_a), Ok(b_on_a), Ok(a_on_b), Ok(b_on_b)) = (
+            parameter_velocity(first, in_a(inside(a.2, b.2)), a.1),
+            parameter_velocity(first, in_a(inside(b.2, a.2)), b.1),
+            parameter_velocity(second, in_b(inside(a.3, b.3)), a.1),
+            parameter_velocity(second, in_b(inside(b.3, a.3)), b.1),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some([a_on_a, b_on_a, a_on_b, b_on_b]))
+    };
+    // The worst of the span's 3-D Hermite against both carriers and of each
+    // parameter Hermite's image against the 3-D Hermite, at five points.
+    let span_miss = |a: &Station3, b: &Station3| -> Result<f64, String> {
+        let h = b.0.sub(a.0).length();
+        let Some([va0, va1, vb0, vb1]) = velocities(a, b)? else {
+            return Ok(f64::INFINITY);
+        };
+        let scale = |v: [f64; 2]| [v[0] * h, v[1] * h];
+        let mut worst = 0.0f64;
+        for s in [0.17, 0.33, 0.5, 0.67, 0.83] {
+            let c = cubic(a, b, s);
+            let pa = hermite_at(a.2, scale(va0), b.2, scale(va1), s);
+            let pb = hermite_at(a.3, scale(vb0), b.3, scale(vb1), s);
+            let (pa, pb) = (in_a(pa), in_b(pb));
+            let on_a = first.evaluate(pa[0], pa[1])?;
+            let on_b = second.evaluate(pb[0], pb[1])?;
+            let foot_a = crate::project_point_to_surface_seeded(first, c, pa[0], pa[1]).map_or(f64::INFINITY, |p| p.distance);
+            let foot_b = crate::project_point_to_surface_seeded(second, c, pb[0], pb[1]).map_or(f64::INFINITY, |p| p.distance);
+            worst = worst.max(on_a.sub(c).length()).max(on_b.sub(c).length()).max(foot_a).max(foot_b);
+        }
+        Ok(worst)
+    };
+    // The crease a span crosses first, as (carrier, direction, value), if any.
+    let crossed = |a: &Station3, b: &Station3| -> Option<(usize, usize, f64)> {
+        let mut best: Option<(f64, (usize, usize, f64))> = None;
+        for (carrier, (p, q)) in [(a.2, b.2), (a.3, b.3)].into_iter().enumerate() {
+            for direction in 0..2 {
+                let (x0, x1) = (p[direction], q[direction]);
+                let band = 1e-10 * (1.0 + x0.abs().max(x1.abs()));
+                for &line in &creases[carrier][direction] {
+                    if (line - x0) * (line - x1) < 0.0 && (line - x0).abs() > band && (line - x1).abs() > band {
+                        let fraction = (line - x0) / (x1 - x0);
+                        if best.is_none_or(|(f, _)| fraction < f) {
+                            best = Some((fraction, (carrier, direction, line)));
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(_, crease)| crease)
+    };
+    // The intersection point of the span on a crease line: the plane-
+    // constrained corrector at the 3-D Hermite's point s, s moved by secant
+    // until the carrier's parameter reads the line.
+    let on_crease = |a: &Station3, b: &Station3, (carrier, direction, line): (usize, usize, f64)| -> Result<Option<Station3>, String> {
+        let read = |station: &Station3| if carrier == 0 { station.2[direction] } else { station.3[direction] };
+        let (x0, x1) = (read(a), read(b));
+        let lerp = |p: [f64; 2], q: [f64; 2], s: f64| [p[0] + (q[0] - p[0]) * s, p[1] + (q[1] - p[1]) * s];
+        let at = |s: f64| -> Result<Option<Station3>, String> {
+            let predicted = cubic(a, b, s);
+            let direction3 = cubic_tangent(a, b, s).normalized()?;
+            let Some((point, uv_a, uv_b)) = crate::surface_surface_intersection::correct_in_plane(first, second, lerp(a.2, b.2, s), lerp(a.3, b.3, s), predicted, direction3, budget * 0.1)? else {
+                return Ok(None);
+            };
+            let cross = first.normal(uv_a[0], uv_a[1])?.cross(second.normal(uv_b[0], uv_b[1])?);
+            if cross.length() <= 1e-9 {
+                return Ok(None);
+            }
+            let tangent = if cross.dot(direction3) < 0.0 { cross.normalized()?.scale(-1.0) } else { cross.normalized()? };
+            Ok(Some((point, tangent, near_a(uv_a, a.2), near_b(uv_b, a.3))))
+        };
+        let (mut s0, mut f0, mut s1, mut f1) = (0.0, x0 - line, 1.0, x1 - line);
+        let mut s = f0 / (f0 - f1);
+        for _ in 0..40 {
+            let Some(station) = at(s)? else { return Ok(None) };
+            let f = read(&station) - line;
+            if f.abs() <= 1e-13 * (1.0 + line.abs()) {
+                let mut station = station;
+                if carrier == 0 { station.2[direction] = line } else { station.3[direction] = line }
+                return Ok(Some(station));
+            }
+            if f.signum() == f0.signum() { s0 = s; f0 = f } else { s1 = s; f1 = f }
+            let secant = s0 + (s1 - s0) * f0 / (f0 - f1);
+            s = if secant > s0 && secant < s1 { secant } else { 0.5 * (s0 + s1) };
+        }
+        Ok(None)
+    };
+    let mut pending: Vec<(Station3, Station3, usize)> = stations.windows(2).rev().map(|pair| (pair[0], pair[1], 0usize)).collect();
+    let mut out: Vec<Station3> = vec![stations[0]];
+    let mut inserted = 0usize;
+    while let Some((a, b, depth)) = pending.pop() {
+        if inserted >= 4096 {
+            { decline_3d(5); return Ok(None); }
+        }
+        if let Some(crease) = crossed(&a, &b) {
+            let Some(station) = on_crease(&a, &b, crease)? else {
+                { decline_3d(11); return Ok(None); }
+            };
+            inserted += 1;
+            pending.push((station, b, depth));
+            pending.push((a, station, depth));
+            continue;
+        }
+        let worst = span_miss(&a, &b)?;
+        if worst <= budget {
+            out.push(b);
+            continue;
+        }
+        let chord_vector = b.0.sub(a.0);
+        let chord = chord_vector.length();
+        if depth >= 24 || chord <= 4.0 * crate::KNOT_IDENTITY_TOL {
+            { decline_3d(5); return Ok(None); }
+        }
+        let predicted = cubic(&a, &b, 0.5);
+        let direction = a.1.add(b.1).normalized()?;
+        let lerp = |p: [f64; 2], q: [f64; 2]| [0.5 * (p[0] + q[0]), 0.5 * (p[1] + q[1])];
+        let Some((mid, uv_a, uv_b)) = crate::surface_surface_intersection::correct_in_plane(first, second, lerp(a.2, b.2), lerp(a.3, b.3), predicted, direction, budget * 0.1)? else {
+            { decline_3d(6); return Ok(None); }
+        };
+        let along = mid.sub(a.0).dot(chord_vector) / (chord * chord);
+        if !(0.1..=0.9).contains(&along) || mid.sub(predicted).length() > 0.25 * chord {
+            { decline_3d(7); return Ok(None); }
+        }
+        let cross = first.normal(uv_a[0], uv_a[1])?.cross(second.normal(uv_b[0], uv_b[1])?);
+        if cross.length() <= 1e-9 {
+            { decline_3d(8); return Ok(None); }
+        }
+        let mut tangent = cross.normalized()?;
+        if tangent.dot(direction) < 0.0 {
+            tangent = tangent.scale(-1.0);
+        }
+        let station = (mid, tangent, near_a(uv_a, a.2), near_b(uv_b, a.3));
+        inserted += 1;
+        pending.push((station, b, depth + 1));
+        pending.push((a, station, depth + 1));
+    }
+    let mut chords = Vec::with_capacity(out.len() - 1);
+    let mut span_velocities = Vec::with_capacity(out.len() - 1);
+    for pair in out.windows(2) {
+        let chord = pair[1].0.sub(pair[0].0).length();
+        if !(chord.is_finite() && chord > crate::KNOT_IDENTITY_TOL) {
+            { decline_3d(9); return Ok(None); }
+        }
+        let Some(velocity) = velocities(&pair[0], &pair[1])? else {
+            { decline_3d(12); return Ok(None); }
+        };
+        chords.push(chord);
+        span_velocities.push(velocity);
+    }
+    let points: Vec<[f64; 3]> = out.iter().map(|s| [s.0.x, s.0.y, s.0.z]).collect();
+    let velocity: Vec<[f64; 3]> = out.iter().map(|s| [s.1.x, s.1.y, s.1.z]).collect();
+    let curve = hermite_spline(&points, &velocity, &chords)?;
+    let uv_a: Vec<[f64; 2]> = out.iter().map(|s| s.2).collect();
+    let uv_b: Vec<[f64; 2]> = out.iter().map(|s| s.3).collect();
+    let pcurve_a = hermite_spline_split(&uv_a, &span_velocities.iter().map(|v| [v[0], v[1]]).collect::<Vec<_>>(), &chords)?;
+    let pcurve_b = hermite_spline_split(&uv_b, &span_velocities.iter().map(|v| [v[2], v[3]]).collect::<Vec<_>>(), &chords)?;
+    Ok(Some((curve, [pcurve_a, pcurve_b])))
+}
+
+/// [`hermite_spline`] with each span's own end velocities (`[start, end]`),
+/// so the curve is C0 where they differ at a station.
+fn hermite_spline_split<const N: usize>(points: &[[f64; N]], velocity: &[[[f64; N]; 2]], chords: &[f64]) -> Result<NurbsCurve, String> {
+    let n = points.len();
+    let mut knots = Vec::with_capacity(2 * n + 4);
+    let mut s = 0.0;
+    knots.extend([0.0; 4]);
+    for (i, chord) in chords.iter().enumerate() {
+        s += chord;
+        if i + 1 < chords.len() {
+            knots.extend([s, s]);
+        }
+    }
+    knots.extend([s; 4]);
+    let lift = |value: [f64; N]| Vec4 {
+        x: value[0],
+        y: if N > 1 { value[1] } else { 0.0 },
+        z: if N > 2 { value[2] } else { 0.0 },
+        w: 1.0,
+    };
+    let mut controls = Vec::with_capacity(2 * n);
+    for i in 0..n - 1 {
+        let h = chords[i];
+        let mut a = points[i];
+        let mut b = points[i + 1];
+        for k in 0..N {
+            a[k] += h * velocity[i][0][k] / 3.0;
+            b[k] -= h * velocity[i][1][k] / 3.0;
+        }
+        if i == 0 {
+            controls.push(lift(points[0]));
+        }
+        controls.push(lift(a));
+        controls.push(lift(b));
+    }
+    controls.push(lift(points[n - 1]));
+    NurbsCurve::new(3, knots, controls)
+}
+
 /// The parameter-plane image of a 3-D tangent at `uv`: the solution of the
 /// first fundamental form `[E F; F G] d = [S_u·t, S_v·t]`.
 fn parameter_velocity(surface: &NurbsSurface, uv: [f64; 2], tangent: Vec3) -> Result<[f64; 2], String> {
@@ -403,4 +774,5 @@ pub(super) fn piece_pcurve_on_chart(pcurve: &NurbsCurve, chart: &NurbsSurface, s
     }
     NurbsCurve::new(pcurve.degree, pcurve.knots.clone(), controls)
 }
+
 

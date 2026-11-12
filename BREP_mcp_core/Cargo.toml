@@ -1,6 +1,6 @@
 [package]
 name = "BREP_mcp_core"
-version = "0.11.3"
+version = "0.11.4"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -77,10 +77,10 @@ base64 = "0.22"
 sha2 = { version = "0.10", optional = true }
 # Code mode's worker (Boa, unchanged): a host binary runs it when started
 # with the hidden worker flag (`cad::code::worker_entry`).
-brep-script-core = { package = "BREP_script_core", version = "0.1.3", path = "../BREP_script_core", optional = true }
+brep-script-core = { package = "BREP_script_core", version = "0.1.4", path = "../BREP_script_core", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 # The feature catalogue (schema.rs) is read straight from the engine.
-brep-render = { package = "BREP_render", version = "0.15.0", path = "../BREP_render" }
+brep-render = { package = "BREP_render", version = "0.16.0", path = "../BREP_render" }
 # The streamable-HTTP transport is a tower service; hyper serves it on a
 # loopback listener (http.rs). hyper-util's `service` bridges tower to hyper.
 hyper = { version = "1", features = ["server", "http1"], optional = true }

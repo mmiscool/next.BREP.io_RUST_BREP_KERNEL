@@ -107,6 +107,8 @@ mod joint_offset;
 mod refusals;
 #[path = "offset_shell/torus_body.rs"]
 mod torus_body;
+#[path = "offset_shell/bore_dimples.rs"]
+mod bore_dimples;
 
 use carrier_rebuild::*;
 use carriers::*;

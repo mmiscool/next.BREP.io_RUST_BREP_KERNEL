@@ -102,6 +102,15 @@ impl CadService {
         crate::script_sdk::script_tools(&set.specs)
     }
 
+    /// A `brep://` reference resource's text, as MCP's resources/read
+    /// answers it (`None`: no such resource).
+    pub async fn reference_text(&self, uri: &str) -> Result<Option<String>, wire::ApiError> {
+        let state = self.server_state().ok_or_else(|| wire::ApiError::new("method_unknown", "lookup", "no server: references are unavailable"))?;
+        state.reference_text(uri).await
+            .map(|found| found.map(|(text, _)| text))
+            .map_err(|e| wire::ApiError::new("invalid_arguments", "lookup", format!("{uri}: {}", e.message)))
+    }
+
     /// One script-callable registry tool by name.
     pub async fn script_tool(&self, name: &str) -> Option<crate::tools::ToolSpec> {
         let state = self.server_state()?;

@@ -705,6 +705,9 @@ mod web {
             return fail("method_unknown", format!("no script function for tool `{name}`"));
         };
         let args: Value = serde_json::from_str(body).unwrap_or(json!({}));
+        if let Some(message) = brep_mcp_core::script_sdk::undeclared_context(name, &spec.input_schema, &args) {
+            return fail("invalid_arguments", message);
+        }
         match (spec.handler)(args).await {
             Ok(out) => {
                 let mut value = out.json;

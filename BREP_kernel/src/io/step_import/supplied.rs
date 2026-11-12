@@ -87,10 +87,11 @@ use super::*;
 ///
 /// A supplied pcurve on a cylinder, cone, sphere or torus carries ANGLES in its
 /// u (and, on a torus, v) coordinate. Unlike a cone's `semi_angle` — which
-/// `analytic_surface` can disambiguate by range, since a semi-angle cannot
-/// reach pi/2 — a pcurve angle admits no range heuristic: 1.5 is a legal value
-/// in radians and in degrees alike. An unreadable unit therefore DECLINES every
-/// angular supplied pcurve rather than guessing.
+/// falls back to a range check when no unit resolves, since a semi-angle
+/// cannot reach pi/2 (`Resolver::cone_semi_angle`) — a pcurve angle admits no
+/// range heuristic: 1.5 is a legal value in radians and in degrees alike. An
+/// unreadable unit therefore DECLINES every angular supplied pcurve rather than
+/// guessing.
 pub(super) fn derive_angle_scale(entities: &HashMap<usize, Entity>) -> Option<f64> {
     let resolve = |id: usize, depth: usize| -> Option<f64> { unit_angle_scale(entities, id, depth) };
     for entity in entities.values() {
@@ -700,13 +701,9 @@ impl<'a> Resolver<'a> {
             });
         }
         if let Some(args) = entity.find("CONICAL_SURFACE") {
-            let mut semi_angle = args.get(3)?.as_real().ok()?;
-            // Same disambiguation `analytic_surface` applies, so the two
-            // constructions agree on the same entity: a semi-angle cannot reach
-            // pi/2, so a larger value was written in the file's degree unit.
-            if semi_angle.abs() >= std::f64::consts::FRAC_PI_2 {
-                semi_angle = semi_angle.to_radians();
-            }
+            // The same reading `analytic_surface` takes, so the two
+            // constructions agree on the same entity.
+            let semi_angle = self.cone_semi_angle(args.get(3)?.as_real().ok()?);
             return Some(StepSurface::Cone {
                 frame: self.placement(args.get(1)?.as_ref_id().ok()?).ok()?,
                 radius: self.length(args.get(2)?.as_real().ok()?),

@@ -41,7 +41,7 @@ pub(super) fn blend_open_smooth_chain(
     // unmeasured: on the 20-degree crossing's notched exit arc that wall
     // stood 2.12e-6 off the exact sweep (4.43e-6 with the fat seam turned
     // 295), read input-free on 871581076 + the section-fit fix.
-    let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+    let bar = crate::blend::setback::chain_bar(solid, crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit);
     let mut budget = ChainBudget::for_chain(&chain.segments, CHAIN_PER_SEGMENT)?;
     // Every too-coarse rung's reading, for the refusal at the top.
     let mut trend: Vec<(usize, f64)> = Vec::new();
@@ -516,7 +516,16 @@ fn refit_open_piece_pcurve(
     // Every foot sought from the interpolated pcurve `old` at the same
     // fraction, on the branch it runs on (`pcurve_guide`).
     let guide = super::closed::pcurve_guide(old, surface)?;
-    let mut fitted = super::closed::project_piece_pcurve_from(&piece, surface, false, false, Some(&guide))?;
+    // Under a chamfer's side law the rails meet 1e-9 of the scale, and the
+    // ladder crowds stations where the chain's curvature jumps (a line into
+    // an arc): a track sampled uniformly cannot follow spans that fine, so a
+    // miss is retried on a track through the piece's own knots, as a closed
+    // edge's terminal support fit is.
+    let mut fitted = if crate::blend::setback::sides().is_some() {
+        super::closed::project_piece_pcurve_within_knot_retry(&piece, surface, false, false, Some(&guide), &[])?
+    } else {
+        super::closed::project_piece_pcurve_from(&piece, surface, false, false, Some(&guide))?
+    };
     let (closed_u, closed_v) = surface.closed_directions().or_refuse(KernelStage::Refine, "closed_directions")?;
     let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
     let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;

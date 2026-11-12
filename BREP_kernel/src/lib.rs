@@ -245,7 +245,7 @@ pub use solid_sweep::{
 };
 #[path = "construction/solid_sweep_caps.rs"]
 mod solid_sweep_caps;
-pub use solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, FrameCurve, RisingTurn, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
+pub use solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, sweep_solid_tumbled, FrameCurve, RisingTurn, TwoTurns, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
 #[path = "construction/sweep_topology.rs"]
 mod sweep_topology;
 pub(crate) use sweep_topology::is_sweep_tight_bend;
@@ -369,7 +369,7 @@ pub use feature_pipeline::pmi::{
     balloon_head as pmi_balloon_head, clamp_text_size, format_dimension, format_number,
     nearest_point_on_edge, nearest_point_on_solid, pmi_schema_catalogue, pmi_type,
     nearest_displayed_point, nearest_displayed_point_on_edge, pose_apply as pmi_pose_apply, pose_unapply as pmi_pose_unapply,
-    resolve_state as pmi_resolve_state, entry_names_solid, baseline_hide_id, BalloonAnchor, BalloonAnchorMode, FcfFrame, HalfSpace as PmiHalfSpace, HeadScope as PmiHeadScope, PmiAnnotation,
+    resolve_state as pmi_resolve_state, entry_names_solid, baseline_hide_id, BalloonAnchor, BalloonAnchorMode, CenterCircle, FcfFrame, HalfSpace as PmiHalfSpace, HeadScope as PmiHeadScope, PmiAnnotation,
     PmiAnnotationReport, PmiCamera, PmiDisplay, PmiGeometry, PmiPlane, PmiPose, PmiProjection, PmiReport,
     PmiState, PmiStatus, PmiTypeDef, PmiView, PmiViewReport, SolidPoses as PmiSolidPoses, ToleranceBlock, ToleranceMode, PMI_TYPES,
 };

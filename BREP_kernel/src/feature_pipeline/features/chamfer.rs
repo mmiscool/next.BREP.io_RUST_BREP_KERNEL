@@ -147,7 +147,7 @@ pub fn schema() -> serde_json::Value {
             "type": "number",
             "step": 0.1,
             "default_value": 0,
-            "hint": "Optional second setback for an ASYMMETRIC (two-distance) chamfer, measured along the second face. 0 = symmetric. When > 0, the edge gets a lopsided distance × distance2 bevel (kernel-exact path; straight edges on planar faces)."
+            "hint": "Optional second setback for an ASYMMETRIC (two-distance) chamfer, measured along the second face. 0 = symmetric. When > 0, the edge gets a lopsided distance × distance2 bevel, on straight or curved edges between planar or curved faces (setbacks are chords in the edge's normal plane, as OpenCASCADE measures them)."
         },
         "angle": {
             "type": "number",

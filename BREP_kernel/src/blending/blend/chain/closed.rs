@@ -32,6 +32,9 @@ pub fn blend_smooth_chain(
     if chain.segments.len() < 2 {
         return Err(KernelRefusal::internal(KernelStage::Refine, "chain_single_segment", "blend: chain collapsed to a single segment"));
     }
+    // An asymmetric chamfer's law, resolved onto the chain's sides.
+    let pairs: Vec<[u64; 2]> = chain.segments.iter().map(|segment| [segment.first.face.id, segment.second.face.id]).collect();
+    let _sides = crate::blend::setback::chain_sides(&pairs)?;
     if chain.closed {
         blend_closed_smooth_chain(solid, &chain.segments, radius, chamfer, name)
     } else {
@@ -62,6 +65,9 @@ pub fn blend_smooth_chain_if_closed(
     if chain.segments.len() < 2 {
         return Err(KernelRefusal::internal(KernelStage::Refine, "chain_single_segment", "blend: chain collapsed to a single segment"));
     }
+    // An asymmetric chamfer's law, resolved onto the chain's sides.
+    let pairs: Vec<[u64; 2]> = chain.segments.iter().map(|segment| [segment.first.face.id, segment.second.face.id]).collect();
+    let _sides = crate::blend::setback::chain_sides(&pairs)?;
     if !chain.closed {
         return Err(
             KernelRefusal::unsupported(KernelStage::Classify, "open_tangent_chain", "blend: the edge is one arc of an OPEN tangent chain; the unselected \
@@ -100,7 +106,8 @@ fn blend_closed_smooth_chain(
         Ok("verify") => (true, true),
         _ => (true, false),
     };
-    if !memo_on {
+    // An asymmetric chamfer's ladder is not the ball's: never memoized.
+    if !memo_on || crate::blend::setback::sides().is_some() {
         return blend_closed_smooth_chain_unmemoized(solid, segments, radius, chamfer, name);
     }
     let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
@@ -277,7 +284,7 @@ fn blend_closed_smooth_chain_unmemoized(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
-    let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+    let bar = crate::blend::setback::chain_bar(solid, crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit);
     // The plain collar climbs the same measured ladder the carve does, from the
     // same first rung: a budget picked once is a resolution request in disguise.
     let mut budget = ChainBudget::for_chain(segments, CHAIN_PER_SEGMENT)?;

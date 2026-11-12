@@ -646,7 +646,7 @@ impl ToolEnds {
 /// far this edge was trimmed back from a shared corner by an earlier blend in
 /// the same group, so the channel runs THROUGH the corner instead of stopping
 /// at a flush cap inside the material.
-fn build_exact_tool(
+pub(super) fn build_exact_tool(
     cross: &EdgeCross,
     profile: &[NurbsCurve],
     overshoot: f64,

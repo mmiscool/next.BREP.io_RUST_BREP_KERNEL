@@ -1201,6 +1201,33 @@ pub(crate) fn refine_emission_samples(
     Ok(Some(out))
 }
 
+/// The march's plane-constrained corrector from given parameters on both
+/// carriers: the intersection point in the plane through `predicted` square to
+/// `direction`, with its parameters, at the march residual (`tolerance * 0.01`).
+/// `None` when the Newton does not converge. For a section lane that bisects a
+/// span between two stations it already holds (`csg/imprint/hermite.rs`).
+pub(crate) fn correct_in_plane(
+    first_surface: &NurbsSurface,
+    second_surface: &NurbsSurface,
+    uv_a: [f64; 2],
+    uv_b: [f64; 2],
+    predicted: Vec3,
+    direction: Vec3,
+    tolerance: f64,
+) -> Result<Option<(Vec3, [f64; 2], [f64; 2])>, String> {
+    let first = surface_info(first_surface)?;
+    let second = surface_info(second_surface)?;
+    let seed = IntersectionPoint {
+        point: predicted,
+        ua: fit(uv_a[0], first.u0, first.u1, first.closed_u),
+        va: fit(uv_a[1], first.v0, first.v1, first.closed_v),
+        ub: fit(uv_b[0], second.u0, second.u1, second.closed_u),
+        vb: fit(uv_b[1], second.v0, second.v1, second.closed_v),
+    };
+    Ok(correct(first, second, seed, predicted, direction, tolerance)?
+        .map(|(point, _)| (point.point, [point.ua, point.va], [point.ub, point.vb])))
+}
+
 /// Refine `seed` onto the intersection of `first_surface` and `second_surface`:
 /// the closest point on each carrier seeds the same Newton the march uses
 /// ([`refine_point`]), so the answer is an INTERSECTION point at the march's own

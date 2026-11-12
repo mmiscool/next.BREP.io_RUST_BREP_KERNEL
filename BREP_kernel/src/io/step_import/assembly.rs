@@ -246,7 +246,8 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     // The file's presentation entities, read ONCE for the whole document.
     let styles = StyleTable::read(&entities);
     let build_part = |(body, scale_key): (StepBody, u64)| {
-        let resolver = Resolver::new(&entities, f64::from_bits(scale_key));
+        // The readings are dropped below, so the build does not take them.
+        let resolver = Resolver::new(&entities, f64::from_bits(scale_key)).without_trim_readings();
         build_step_body(&resolver, body)
             .map(|(solid, _readings)| {
                 let appearance = step_body_appearance(&resolver, &styles, body, &solid);
@@ -273,12 +274,13 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     phase(&format!("body keys ({} distinct bodies)", part_keys.len()));
     // Under the PHASE switch, each body's own build time too, slowest first:
     // which parts an import is waiting on.
-    let body_times: std::sync::Mutex<Vec<(std::time::Duration, StepBody)>> = Default::default();
+    let body_times: std::sync::Mutex<Vec<(std::time::Duration, StepBody, Option<String>)>> = Default::default();
     let timed_build = |key: (StepBody, u64)| {
         let started = debug_timing.then(web_time::Instant::now);
         let built = build_part(key);
         if let Some(started) = started {
-            body_times.lock().expect("timing lock").push((started.elapsed(), key.0));
+            let error = built.as_ref().err().map(|error| error.chars().take(300).collect());
+            body_times.lock().expect("timing lock").push((started.elapsed(), key.0, error));
         }
         built
     };
@@ -292,8 +294,15 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     if debug_timing {
         let mut times = body_times.into_inner().expect("timing lock");
         times.sort_by(|a, b| b.0.cmp(&a.0));
-        for (elapsed, body) in times.iter().take(15) {
-            eprintln!("PHASE assembly   slow body {body:?}: {elapsed:?}");
+        for (elapsed, body, error) in times.iter().take(15) {
+            let outcome = if error.is_some() { " (failed)" } else { "" };
+            eprintln!("PHASE assembly   slow body {body:?}: {elapsed:?}{outcome}");
+        }
+        let failed: Vec<_> = times.iter().filter(|(_, _, error)| error.is_some()).collect();
+        let failed_time: std::time::Duration = failed.iter().map(|(elapsed, _, _)| *elapsed).sum();
+        eprintln!("PHASE assembly   {} failed bodies took {failed_time:?} in all", failed.len());
+        for (elapsed, body, error) in failed {
+            eprintln!("PHASE assembly   failed body {body:?} after {elapsed:?}: {}", error.as_deref().unwrap_or(""));
         }
     }
     let mut products: Vec<StepProduct> = Vec::with_capacity(pd_refs.len());

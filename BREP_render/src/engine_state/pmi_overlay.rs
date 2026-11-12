@@ -118,6 +118,7 @@ impl EngineState {
         let mut tri_colors: Vec<f32> = Vec::new();
         let mut explode_step = 0;
         let mut arrows: Vec<([f64; 3], [f64; 3])> = Vec::new();
+        let mut center_marks: Vec<(String, Vec<[[f64; 3]; 2]>)> = Vec::new();
         // Part-way through playback, a balloon rides its moving target.
         let playback = self.explode_playback_poses();
         for row in &view.annotations {
@@ -158,6 +159,19 @@ impl EngineState {
                 continue;
             }
             let drawn = pmi_present(&geometry, label, &row.text, &row_style);
+            if let brep_kernel::PmiGeometry::CenterMark { marks, .. } = &geometry {
+                // Each mark is drawn as six polylines, its two short cross
+                // arms first.
+                let arm = |line: &Vec<[f64; 3]>| -> [f64; 3] {
+                    let d: [f64; 3] = std::array::from_fn(|k| line[1][k] - line[0][k]);
+                    let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                    if length > 0.0 { d.map(|c| c / length) } else { [0.0; 3] }
+                };
+                let arms = (0..marks.len())
+                    .filter_map(|k| Some([arm(drawn.polylines.get(6 * k)?), arm(drawn.polylines.get(6 * k + 1)?)]))
+                    .collect();
+                center_marks.push((row.id.clone(), arms));
+            }
             let rgb = PMI_RGB;
             for polyline in &drawn.polylines {
                 for pair in polyline.windows(2) {
@@ -223,7 +237,22 @@ impl EngineState {
         };
         let _ = self.set_overlay_json(&serde_json::json!({ "groups": [group] }).to_string());
         self.pmi_overlay_key = Some((if wpp > 0.0 { wpp } else { f64::MIN_POSITIVE }, view_dir));
+        self.pmi_center_marks_drawn = (center_marks, view_dir);
         self.dirty = true;
+    }
+
+    /// The center marks the PMI overlay last drew, for automation:
+    /// `{viewDir, marks: [{id, arms: [[u, v], …]}]}` — per mark the cross's
+    /// two arms as unit world directions (f64, before the overlay's f32
+    /// buffers) and the view direction of that bake, so a check can see the
+    /// overlay re-baked while the arms held still.
+    pub fn pmi_center_marks_json(&self) -> String {
+        let (marks, view_dir) = &self.pmi_center_marks_drawn;
+        serde_json::json!({
+            "viewDir": view_dir,
+            "marks": marks.iter().map(|(id, arms)| serde_json::json!({ "id": id, "arms": arms })).collect::<Vec<_>>(),
+        })
+        .to_string()
     }
 
     /// Whether a balloon row's target is hidden in the LIVE scene: every
@@ -245,6 +274,7 @@ impl EngineState {
     }
 
     fn clear_pmi_overlay(&mut self) {
+        self.pmi_center_marks_drawn.0.clear();
         if self.pmi_overlay_key.take().is_some() {
             let _ = self.set_overlay_json(
                 &serde_json::json!({ "groups": [ { "name": PMI_OVERLAY_GROUP } ] }).to_string(),
@@ -317,10 +347,15 @@ impl EngineState {
         // "I don't want to see the exploded labels at all"): its name lives
         // in the PMI tree and the Assembly workbench's step list, and while
         // its form is open the transform gizmo stands on its parts. A hide
-        // step draws nothing either: its bodies are not there to label.
+        // step draws nothing either: its bodies are not there to label. A
+        // center mark or centerline carries no text and draws no chip:
+        // its name lives in the PMI tree; only an
+        // unresolved one keeps its red chip, the one place its error shows
+        // in the view.
         view.annotations
             .iter()
             .filter(|row| !matches!(row.kind.as_str(), "explode" | "hide"))
+            .filter(|row| !(row.kind == "centerline" && row.status == PmiStatus::Ok))
             .map(|row| {
                 // A balloon whose target was hidden in the viewport AFTER
                 // the run (the view's hidden list not yet updated) is an

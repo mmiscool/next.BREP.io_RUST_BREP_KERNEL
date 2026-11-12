@@ -123,7 +123,8 @@ class BoundDocument {{
   }}
 }}
 
-export const cad = {{
+{tools}
+export const cad = guardTree({{
   discovery: {{
     search: async (args) => unwrap(await service.discovery.search(args)),
     describe: async (args) => unwrap(await service.discovery.describe(args)),
@@ -155,9 +156,8 @@ export const cad = {{
     sdk: async (group) => {{ const r = unwrap(await call("cad.docs.sdk", group === undefined ? {{}} : typeof group === "string" ? {{ group }} : group)); return r.declarations !== undefined ? r.declarations : r; }},
   }},
 {free_groups}
-}};
+}}, "cad");
 
-{tools}
 export default cad;
 "#,
         tools = tool_bindings(tools),

@@ -1,6 +1,6 @@
 [package]
 name = "BREP_app"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -72,16 +72,16 @@ default = ["mcp", "scripting"]
 scripting = ["dep:brep-script-core"]
 
 [dependencies]
-brep-plugins = { package = "BREP_plugins", version = "0.8.0", path = "../BREP_plugins" }
+brep-plugins = { package = "BREP_plugins", version = "0.9.0", path = "../BREP_plugins" }
 # The shared CAM model (setups, tools, operations, toolpaths) the CAM
 # workbench persists in the document's `cam` block and the dialogs edit. Pure
 # Rust, no features: the kernel adapter stays on the generation side.
 # `post-runtime`: C4's posts on the Boa interpreter, for the CAM pane's Post…
 # and cam_post (contract C19-27), in every build (the MCP host builds the app
 # without `scripting`), so posting is a Boa caller on wasm too.
-brep_cam = { package = "BREP_cam", version = "0.6.0", path = "../BREP_cam", features = ["post-runtime"] }
+brep_cam = { package = "BREP_cam", version = "0.7.0", path = "../BREP_cam", features = ["post-runtime"] }
 # The windowing-agnostic viewer brain + wgpu-29 render core we are hosting.
-brep-render = { package = "BREP_render", version = "0.15.0", path = "../BREP_render" }
+brep-render = { package = "BREP_render", version = "0.16.0", path = "../BREP_render" }
 # Manufacturing instructions: the block, the wizard, step edits and the player.
 brep_instructions = { package = "BREP_instructions", version = "0.3.0", path = "../BREP_instructions" }
 # Motion studies: the simulation block the Simulation pane edits.
@@ -165,7 +165,7 @@ BREP_ecad_core = { version = "0.3.2", path = "../BREP_ecad_core" }
 BREP_ecad_egui = { version = "0.3.1", path = "../BREP_ecad_egui" }
 # The script interpreter core shared with the PLM server (feature `scripting`).
 # It turns on Boa's wasm backend itself, so nothing about Boa is spelled here.
-brep-script-core = { package = "BREP_script_core", version = "0.1.3", path = "../BREP_script_core", optional = true }
+brep-script-core = { package = "BREP_script_core", version = "0.1.4", path = "../BREP_script_core", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # BREP_ecad_core makes v4 uuids, and uuid refuses to compile for wasm32-unknown-unknown
@@ -242,7 +242,7 @@ web-sys = { version = "0.3", features = [
 # WebMCP tools over the page's own platform (src/webmcp.rs). Declared per
 # target so the wasm build never resolves rmcp or hyper; the `mcp` feature's
 # `dep:brep-mcp-core` activates whichever entry the target has.
-brep-mcp-core = { package = "BREP_mcp_core", version = "0.11.3", path = "../BREP_mcp_core", default-features = false, optional = true }
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.11.4", path = "../BREP_mcp_core", default-features = false, optional = true }
 # The host protocol's channels (`tokio::sync` is the one tokio feature set
 # that compiles for wasm32); no runtime, no timers — the page's event loop
 # runs the tasks and `setTimeout` is the pause.
@@ -251,7 +251,7 @@ tokio = { version = "1", default-features = false, features = ["sync"], optional
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # The MCP server core (feature `mcp`): the same server `brep-mcp` hosts
 # headlessly, embedded here over the app's own automation queue.
-brep-mcp-core = { package = "BREP_mcp_core", version = "0.11.3", path = "../BREP_mcp_core", optional = true }
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.11.4", path = "../BREP_mcp_core", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"], optional = true }
 # The desktop event loop (src/desktop_loop.rs) wraps eframe's winit handler so
 # application commands dispatch without waiting for a frame. The version eframe

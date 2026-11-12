@@ -826,8 +826,9 @@ fn thicken_one_region(
         }
         // A sheet closed at BOTH poles (a whole sphere's skin, brep-bench
         // `thicken/sphere-skin`) thickens to two concentric spheres, a body
-        // with a void, which this path does not build: it keeps its pole
-        // walls (the path it had before).
+        // with a void, which `periodic::closed_poles_body` builds before this
+        // path is reached; with `BREP_THICKEN_CLOSED_POLES=0` it comes here and
+        // keeps its pole walls (the path it had before).
         if seam.is_some() && pole.iter().filter(|is_pole| **is_pole).count() > 1 {
             pole.fill(false);
         }

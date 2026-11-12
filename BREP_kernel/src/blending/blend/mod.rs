@@ -32,6 +32,7 @@ mod planar_chart;
 mod restrict;
 pub(super) mod rollover;
 mod rollover_surgery;
+pub(crate) mod setback;
 pub(crate) mod runout;
 pub(crate) mod split_rim;
 pub(crate) mod sheet_ends;
@@ -707,6 +708,7 @@ pub fn take_blend_approximations(bodies: &[(&str, &crate::BrepSolid)]) -> Vec<cr
 
 
 pub use chain::{blend_smooth_chain, blend_smooth_chain_if_closed};
+pub(crate) use chain::smooth_chain_members;
 pub(crate) use corner::round_concave_chain_corner;
 pub use corner::round_convex_corner;
 pub use edge::{blend_closed_edge, blend_closed_edge_knot_aware, blend_edge_variable, blend_open_edge, is_pcurve_floor_refusal, with_pcurve_knot_retry};
@@ -740,6 +742,7 @@ pub(crate) use stations::is_ball_off_carrier;
 // Lane D 2026-10-14 (appended): the inside-corner classification's name and
 // its opt-in miter switch, read by the runout composition and its tests.
 pub(crate) use network::is_reentrant_concave;
+pub(crate) use network::is_ball_does_not_fit;
 
 /// Off the switch every closed rim's two support pcurves are refitted to their
 /// rail's projected track (`edge/closed.rs::refit_closed_support_pcurve`, the
