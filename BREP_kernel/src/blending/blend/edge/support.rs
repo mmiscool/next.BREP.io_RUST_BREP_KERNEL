@@ -191,6 +191,39 @@ fn translated_stations(
     Some(TranslatedStations { direction, inverses: [inverse(&first.face.surface)?, inverse(&second.face.surface)?] })
 }
 
+/// `BREP_BLEND_REFINE_OVERSHOOT` (default on; `=0` restores the single pass): an end plan (a corner, a free end) can ship a
+/// stripe's rail past its vertex into the marched overshoot, which the local refinement never
+/// visits. On a cone stripe filleted at r 0.5..0.9, the rail shipped 0.0032 past
+/// its vertex station into a span 0.022 wide, 5.6e-6..1.34e-5 off its carrier against the 1e-6
+/// bar, every refined span inside the window under 1.3e-8. The network then re-marches, once,
+/// the stripes that overreach AND ship unaccepted, refined out to their shipped reach; a
+/// network whose walls are all accepted ships its first pass unchanged.
+pub(in crate::blend) fn refine_overshoot_on() -> bool {
+    switch!("BREP_BLEND_REFINE_OVERSHOOT", true)
+}
+
+thread_local! {
+    /// Per edge id, the native-parameter reach `[low, high]` the refinement extends to.
+    static OVERSHOOT_REACH: std::cell::RefCell<Option<rustc_hash::FxHashMap<u64, [f64; 2]>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn overshoot_reach(edge_id: u64) -> Option<[f64; 2]> {
+    OVERSHOOT_REACH.with(|cell| cell.borrow().as_ref().and_then(|reach| reach.get(&edge_id).copied()))
+}
+
+/// Runs `action` with `reach` as the refinement reach, restoring what was set before.
+pub(in crate::blend) fn with_overshoot_reach<T>(reach: rustc_hash::FxHashMap<u64, [f64; 2]>, action: impl FnOnce() -> T) -> T {
+    let previous = OVERSHOOT_REACH.with(|cell| cell.replace(Some(reach)));
+    let result = action();
+    OVERSHOOT_REACH.with(|cell| *cell.borrow_mut() = previous);
+    result
+}
+
+/// Whether a reach is being applied (a second pass), so no further pass is asked for.
+pub(in crate::blend) fn overshoot_reach_active() -> bool {
+    OVERSHOOT_REACH.with(|cell| cell.borrow().is_some())
+}
+
 pub(in crate::blend) fn march_open_stations_core(
     edge: &EdgeRecord,
     first: &BlendMate,
@@ -459,6 +492,12 @@ pub(in crate::blend) fn march_open_stations_core(
                 .collect::<Result<Vec<_>, _>>()?;
             let end_ts = [ts[vertex_indices[0]], ts[vertex_indices[1]]];
             let (low, high) = (end_ts[0].min(end_ts[1]), end_ts[0].max(end_ts[1]));
+            // OVERSHOOT REACH (`BREP_BLEND_REFINE_OVERSHOOT`): an edge whose shipped window a first
+            // network pass found past its vertex is refined out to that reach on the second pass.
+            let (low, high) = match overshoot_reach(edge.id) {
+                Some([a, b]) => (low.min(a), high.max(b)),
+                None => (low, high),
+            };
             let pole_t = |t: f64| (poles[0] && t == ts_first(&station_ts)) || (poles[1] && t == ts_last(&station_ts));
             // At a STATIONARY end (the edge's derivative vanishes at its
             // vertex) the edge parameter does not measure the wall, so a cubic

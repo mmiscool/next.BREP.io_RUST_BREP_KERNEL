@@ -158,6 +158,40 @@ fn nearest_image(surface: &NurbsSurface, mut uv: [f64; 2], reference: [f64; 2]) 
     uv
 }
 
+/// Setbacks that consume a whole face refuse by name (a rail on a pole of
+/// its face's carrier, or on that face's far edge): on by default;
+/// `BREP_SETBACK_CONSUMED_FACE_REFUSAL=0` restores the march through them.
+pub(crate) fn setback_consumed_face_refusal_on() -> bool {
+    switch!("BREP_SETBACK_CONSUMED_FACE_REFUSAL", true)
+}
+
+/// The chart's pinch below which a rail point is read as sitting on a pole:
+/// a partial this much shorter than the same partial at the edge.
+const POLE_PINCH: f64 = 1e-6;
+
+/// The refusal for a rail on a pole: the chord reaches the point where the
+/// face's carrier pinches to a pole (a ball's, a cone's apex), so the rail
+/// would shrink the whole face to that point, which the rim's surgery does
+/// not build.
+fn rail_to_pole() -> KernelRefusal {
+    unsupported(
+        "setback_rail_to_pole",
+        "asymmetric chamfer: a setback reaches a pole of its face's surface, which would shrink the whole face to \
+         a point — refusing",
+    )
+}
+
+/// Whether the chart at `uv` has pinched to a pole, read against its two
+/// partials' lengths at `reference` (the edge's own point on the face).
+fn at_pole(surface: &NurbsSurface, uv: [f64; 2], reference: [f64; 2]) -> bool {
+    match (frame(surface, uv), frame(surface, reference)) {
+        (Ok((_, su, sv)), Ok((_, ru, rv))) => {
+            su.length() <= POLE_PINCH * ru.length() || sv.length() <= POLE_PINCH * rv.length()
+        }
+        _ => false,
+    }
+}
+
 /// Newton for one face's rail point in the section plane at `(spine, tangent)`.
 fn solve_side(
     surface: &NurbsSurface,
@@ -166,7 +200,9 @@ fn solve_side(
     tangent: Vec3,
     pin: Pin,
     tolerance: f64,
+    reference: [f64; 2],
 ) -> Result<([f64; 2], Vec3), KernelRefusal> {
+    let guard = setback_consumed_face_refusal_on();
     let mut uv = seed;
     for _ in 0..NEWTON_ITERATIONS {
         let (point, su, sv) = frame(surface, uv)?;
@@ -184,6 +220,9 @@ fn solve_side(
             Pin::Ray { origin, normal } => (point.sub(origin).dot(normal), su.dot(normal), sv.dot(normal)),
         };
         if plane.abs().max(second.abs()) <= tolerance {
+            if guard && at_pole(surface, uv, reference) {
+                return Err(rail_to_pole());
+            }
             return Ok((uv, point));
         }
         let (a, b, c, d) = (su.dot(tangent), sv.dot(tangent), gu, gv);
@@ -196,6 +235,9 @@ fn solve_side(
         if !uv[0].is_finite() || !uv[1].is_finite() {
             break;
         }
+    }
+    if guard && uv[0].is_finite() && uv[1].is_finite() && at_pole(surface, uv, reference) {
+        return Err(rail_to_pole());
     }
     Err(KernelRefusal::non_convergence(
         KernelStage::Refine,
@@ -342,7 +384,8 @@ impl Marcher<'_> {
                     displaced_seed(surfaces[k], on_edge[k], into[k], guess)?
                 }
             };
-            let (mut solved, point) = solve_side(surfaces[k], seed, spine, tangent, pin, self.tolerance)?;
+            let reference = edge_uv_on_face(self.mates[k].coedge, self.edge, self.on_edge_parameter(t))?;
+            let (mut solved, point) = solve_side(surfaces[k], seed, spine, tangent, pin, self.tolerance, reference)?;
             // A closed carrier answers on any periodic image; the track
             // stays on the one nearest its last station.
             if let Some(previous) = previous {
@@ -810,7 +853,7 @@ fn side_station(
         } else {
             seeds[k]
         };
-        let (solved, point) = solve_side(surfaces[k], start, spine, tangent, pin, tolerance).map_err(|error| {
+        let (solved, point) = solve_side(surfaces[k], start, spine, tangent, pin, tolerance, feet[k]).map_err(|error| {
             if std::env::var("BREP_BLEND_STATION_TRACE").ok().as_deref() == Some("1") {
                 let feet_points: Vec<Vec3> = (0..2).filter_map(|j| frame(surfaces[j], feet[j]).ok().map(|f| f.0)).collect();
                 let seed_points: Vec<Vec3> = (0..2).filter_map(|j| frame(surfaces[j], seeds[j]).ok().map(|f| f.0)).collect();

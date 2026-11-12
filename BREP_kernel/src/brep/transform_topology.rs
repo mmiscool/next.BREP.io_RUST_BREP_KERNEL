@@ -197,9 +197,9 @@ pub fn transform_brep(
 /// verdict comes from the content-keyed validate memo: the first placement of
 /// a part validates the part once, each further placement of the same
 /// content reads the memo. A source with issues is never carried; its copy is
-/// validated as before. `BREP_TRANSFORM_CARRY_VERDICT`: off by default, `1`
-/// carries, `check` validates every copy anyway and prints (`BREP_PROFILE`)
-/// whether carrying would have disagreed.
+/// validated as before. `BREP_TRANSFORM_CARRY_VERDICT`: on by default (`0`
+/// validates every copy, as before), `check` validates every copy anyway and
+/// prints (`BREP_PROFILE`) whether carrying would have disagreed.
 fn carries_clean_verdict(
     solid: &BrepSolid,
     transform: AffineTransform,
@@ -221,7 +221,7 @@ pub(crate) fn carried_verdicts() -> u64 {
 }
 
 fn carry_verdict_mode() -> crate::env_read::Mode {
-    crate::mode_switch!("BREP_TRANSFORM_CARRY_VERDICT", false)
+    crate::mode_switch!("BREP_TRANSFORM_CARRY_VERDICT", true)
 }
 
 /// Reflect an exact BREP across the plane through `plane_point` with unit

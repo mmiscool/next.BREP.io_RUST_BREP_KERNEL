@@ -101,6 +101,18 @@ impl TrimPolygon {
 
     fn settle_pending(&mut self, next: [f64; 2]) {
         if let Some(end) = self.pending_end.take() {
+            if switch!("BREP_MASS_TRIM_JOINS", false) {
+                // The next coedge need not start at this coedge's end.
+                // Keep the complete arc, then a separate straight join;
+                // otherwise the polygon silently replaces its final chord.
+                if end != next && (self.points.last() != Some(&end)
+                    || self.arcs.last().is_some_and(Option::is_some))
+                {
+                    self.points.push(end);
+                    self.arcs.push(None);
+                }
+                return;
+            }
             let gap = ((next[0] - end[0]).powi(2) + (next[1] - end[1]).powi(2)).sqrt();
             if gap > self.jump_tolerance {
                 if let Some(last) = self.arcs.last_mut() {
@@ -132,10 +144,14 @@ impl TrimPolygon {
         let curve = &coedge.pcurve;
         let interior = interior_knots(&curve.knots, curve.degree);
         if is_straight_polyline(curve) {
-            let [start, _] = curve.domain()?;
+            let [start, end] = curve.domain()?;
             for parameter in std::iter::once(start).chain(interior.iter().copied()) {
                 let point = curve.evaluate(parameter)?;
                 self.push_point([point.x + offset[0], point.y + offset[1]]);
+            }
+            if switch!("BREP_MASS_TRIM_JOINS", false) {
+                let point = curve.evaluate(end)?;
+                self.pending_end = Some([point.x + offset[0], point.y + offset[1]]);
             }
             return Ok(());
         }
@@ -164,6 +180,10 @@ impl TrimPolygon {
             for &parameter in &spans[..last] {
                 let point = curve.evaluate(parameter)?;
                 self.push_point([point.x + offset[0], point.y + offset[1]]);
+            }
+            if !include_end && switch!("BREP_MASS_TRIM_JOINS", false) {
+                let point = curve.evaluate(end)?;
+                self.pending_end = Some([point.x + offset[0], point.y + offset[1]]);
             }
             return Ok(());
         }
@@ -629,6 +649,41 @@ pub(super) fn doubly_periodic_seam_band_polygons(
     Ok(Some(vec![polygon]))
 }
 
+/// A conservative proof that all trim arcs and their closing chords lie on
+/// the domain boundary. Positive rational weights keep each arc inside its
+/// control hull. Exact coordinate comparisons deliberately decline uncertain
+/// fits; those retain their authored boundary in the trimmed integrator.
+pub(super) fn trim_on_domain_boundary(face: &FaceRecord, domain: [f64; 4]) -> Result<bool, String> {
+    let [u0, u1, v0, v1] = domain;
+    let sides = |p: Vec3| -> u8 {
+        if !p.x.is_finite() || !p.y.is_finite()
+            || p.x < u0 || p.x > u1 || p.y < v0 || p.y > v1 {
+            return 0;
+        }
+        u8::from(p.x == u0) | (u8::from(p.x == u1) << 1)
+            | (u8::from(p.y == v0) << 2) | (u8::from(p.y == v1) << 3)
+    };
+    for rim in &face.loops {
+        if rim.coedges.is_empty() { return Ok(false); }
+        let mut ends = Vec::with_capacity(rim.coedges.len());
+        for coedge in &rim.coedges {
+            let curve = &coedge.pcurve;
+            let mut common = 15;
+            for control in &curve.control_points {
+                if !(control.w > 0.0) { return Ok(false); }
+                common &= sides(control.point()?);
+            }
+            if common == 0 || curve.control_points.is_empty() { return Ok(false); }
+            let [a, b] = curve.domain()?;
+            ends.push((sides(curve.evaluate(a)?), sides(curve.evaluate(b)?)));
+        }
+        for i in 0..ends.len() {
+            if ends[i].1 & ends[(i + 1) % ends.len()].0 == 0 { return Ok(false); }
+        }
+    }
+    Ok(true)
+}
+
 pub(super) fn is_untrimmed(face: &FaceRecord) -> Result<bool, String> {
     if face.loops.len() != 1 {
         return Ok(false);
@@ -638,10 +693,13 @@ pub(super) fn is_untrimmed(face: &FaceRecord) -> Result<bool, String> {
     let [u0, u1] = ku.domain();
     let [v0, v1] = kv.domain();
     let domain_area = (u1 - u0) * (v1 - v0);
-    // The loop's own joints closed: this asks whether the trim IS the domain, and a
-    // trim that misses its own joints by 8e-9 is still the domain. The bar is 1e-6 of
-    // the DOMAIN area, so on a small parameter box (1.4e-3 on a STEP import) it is
-    // 1.4e-9 — under the miss — and the face took the trimmed path though it is whole.
+    if switch!("BREP_MASS_EXACT_DOMAIN_COVER", false)
+        && !trim_on_domain_boundary(face, [u0, u1, v0, v1])? {
+        return Ok(false);
+    }
+    // With the boundary proof enabled this checks the winding of a loop
+    // confined to the domain boundary. The legacy path instead treats area
+    // closeness alone as evidence that a fitted trim covers the whole domain.
     Ok((closed_parameter_space_area_on_carrier(face)?.abs() - domain_area).abs() <= 1e-6 * domain_area)
 }
 
@@ -692,7 +750,12 @@ fn iso_rectangle_trim_impl(face: &FaceRecord) -> Result<Result<[f64; 4], &'stati
     // Pcurve ends meet and controls sit on their line to round-off on an
     // exact chart and to the fit's own residual on a fitted one: 1e-7 of the
     // span admits both and is a decade under the sign reading's own margin.
-    let (eps_u, eps_v) = (1e-7 * span_u, 1e-7 * span_v);
+    // An approximate axis classification can replace a real curved or
+    // oblique trim by a rectangle. Exact coverage also requires this second
+    // shortcut to preserve the boundary; uncertain fits take the trimmed
+    // route, including its arc corrections and open-domain extension.
+    let exact = switch!("BREP_MASS_EXACT_DOMAIN_COVER", false);
+    let (eps_u, eps_v) = if exact { (0.0, 0.0) } else { (1e-7 * span_u, 1e-7 * span_v) };
     let mut segments: Vec<([f64; 2], [f64; 2])> = Vec::with_capacity(4);
     for coedge in &face.loops[0].coedges {
         // A straight axis-parallel pcurve of ANY degree: every control point
@@ -789,7 +852,7 @@ fn iso_rectangle_trim_impl(face: &FaceRecord) -> Result<Result<[f64; 4], &'stati
     }
     // A corner outside the domain by more than round-off is not a sub-rectangle
     // of the knot grid; one inside it by round-off is clamped onto it.
-    let (slack_u, slack_v) = (1e-6 * span_u, 1e-6 * span_v);
+    let (slack_u, slack_v) = if exact { (0.0, 0.0) } else { (1e-6 * span_u, 1e-6 * span_v) };
     if u_lo < u0 - slack_u || u_hi > u1 + slack_u || v_lo < v0 - slack_v || v_hi > v1 + slack_v {
         return Ok(Err("a corner outside the domain"));
     }
@@ -861,6 +924,75 @@ pub(super) fn clip_polygon_to_cell_into(
         (1, v_low, false),
         (1, v_high, true),
     ] {
+        if out.len() < 3 {
+            out.clear();
+            return;
+        }
+        let inside = |point: &[f64; 2]| {
+            if keep_below {
+                point[axis] <= bound
+            } else {
+                point[axis] >= bound
+            }
+        };
+        scratch.clear();
+        scratch.reserve(out.len() + 4);
+        for index in 0..out.len() {
+            let a = out[index];
+            let b = out[(index + 1) % out.len()];
+            let a_in = inside(&a);
+            let b_in = inside(&b);
+            if a_in {
+                scratch.push(a);
+            }
+            if a_in != b_in {
+                let t = (bound - a[axis]) / (b[axis] - a[axis]);
+                let mut crossing = [0.0; 2];
+                crossing[axis] = bound;
+                crossing[1 - axis] = a[1 - axis] + t * (b[1 - axis] - a[1 - axis]);
+                scratch.push(crossing);
+            }
+        }
+        std::mem::swap(scratch, out);
+    }
+}
+
+/// The passes of [`clip_polygon_to_cell_into`] split in two, with the same
+/// arithmetic in the same order: [`clip_polygon_to_column_into`] runs the two
+/// u passes (they read only the cell's u bounds, so every cell of one grid
+/// column shares their result) and [`clip_column_to_cell_into`] runs the two v
+/// passes on that fragment. Chained, they leave in `out` exactly what the
+/// four-pass call leaves.
+pub(super) fn clip_polygon_to_column_into(
+    polygon: &[[f64; 2]],
+    u_low: f64,
+    u_high: f64,
+    scratch: &mut Vec<[f64; 2]>,
+    out: &mut Vec<[f64; 2]>,
+) {
+    out.clear();
+    out.extend_from_slice(polygon);
+    clip_passes(&[(0, u_low, false), (0, u_high, true)], scratch, out);
+}
+
+/// The two v passes of [`clip_polygon_to_cell_into`] on a column fragment
+/// from [`clip_polygon_to_column_into`].
+pub(super) fn clip_column_to_cell_into(
+    column: &[[f64; 2]],
+    v_low: f64,
+    v_high: f64,
+    scratch: &mut Vec<[f64; 2]>,
+    out: &mut Vec<[f64; 2]>,
+) {
+    out.clear();
+    out.extend_from_slice(column);
+    clip_passes(&[(1, v_low, false), (1, v_high, true)], scratch, out);
+}
+
+/// The half-plane passes of [`clip_polygon_to_cell_into`], verbatim: before
+/// each pass a fragment under three points clips to nothing.
+fn clip_passes(passes: &[(usize, f64, bool)], scratch: &mut Vec<[f64; 2]>, out: &mut Vec<[f64; 2]>) {
+    for &(axis, bound, keep_below) in passes {
         if out.len() < 3 {
             out.clear();
             return;

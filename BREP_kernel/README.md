@@ -2,7 +2,7 @@
 
 A native/WASM B-rep geometry kernel for building CAD applications, written in
 Rust. Published on crates.io as **`BREP_kernel`** with library name
-`brep_kernel`; this is version **0.17.0**.
+`brep_kernel`; this is version **0.18.0**.
 It is the authoritative geometry engine behind the BREP CAD application
 (`BREP_app` + `BREP_render` in this repository, re-exported as `brep::kernel` by
 the umbrella `BREP` crate), and is usable standalone as a
@@ -101,11 +101,24 @@ Current port coverage is intentionally capability-gated:
   plus a watertight chord-tolerance tessellator that samples every edge once
   (both adjacent faces reuse identical sample positions, so shared edges
   coincide exactly with no cracks or T-junctions) and refines face interiors
-  by conforming edge splits until chords meet the tolerance;
+  by conforming edge splits within a bounded refinement pass count;
 - public parameter-space area, sampled trim polygon, face area/volume
   contribution, and individual-face tessellation APIs;
 - indexed mesh representation, validation, and signed volume;
 - box and cylinder mesh generation;
+
+For typed boundary accuracy errors, use `tessellate_brep_watertight_checked`
+or `sample_edge_polyline_checked`. Positive-weight, clamped NURBS spans are
+bounded over their full curves, including displacement to shared topology
+vertices. Edge errors retain the edge id, requested tolerance, and failure
+reason; the checked mesh API wraps them in `TessellationError::EdgeChord`. Unsupported curves, exhausted safety caps, and insufficient
+numerical resolution fail explicitly. The safety limits are 65,536 spans per
+edge, degree 64, and 65,536 control points. Face interiors retain their existing
+refinement limits.
+
+The existing string-error APIs enforce these boundary checks by default.
+`BREP_TESS_CHORD_BUDGET=0` restores legacy sampling for comparison; the checked
+APIs always enforce the checks independently of the switch.
 
 ### Interop and infrastructure
 
@@ -136,7 +149,7 @@ is `BREP_kernel`, the Rust library is the idiomatic lowercase `brep_kernel`:
 
 ```toml
 [dependencies]
-brep_kernel = { package = "BREP_kernel", version = "0.17" }
+brep_kernel = { package = "BREP_kernel", version = "0.18" }
 ```
 
 ```rust

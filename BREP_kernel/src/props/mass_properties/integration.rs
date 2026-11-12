@@ -727,6 +727,9 @@ pub(super) fn biperiodic_band_integral(
     kinds: &[Integrand],
 ) -> Result<Option<Vec<f64>>, String> {
     let Some(band) = biperiodic_band_range(face)? else {
+        if switch!("BREP_MASS_TORUS_LIFT", false) {
+            return super::torus::lifted_band_integral(face, kinds);
+        }
         return Ok(None);
     };
     let [u0, u1] = face.surface.domain_u()?;

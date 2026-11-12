@@ -3,6 +3,20 @@ use super::*;
 /// Watertight tessellation of a closed solid: coincident triangulation along
 /// every shared edge, density driven by `chord_tolerance`.
 pub fn tessellate_brep_watertight(solid: &BrepSolid, chord_tolerance: f64) -> Result<Mesh, String> {
+    tessellate_with_samples(solid, chord_tolerance, None)
+}
+
+/// Tessellate with certified shared edge samples and typed edge failures.
+/// This opt-in entry point does not depend on environment switches.
+pub fn tessellate_brep_watertight_checked(solid: &BrepSolid, chord_tolerance: f64) -> Result<Mesh, TessellationError> {
+    if !chord_tolerance.is_finite() || chord_tolerance <= 0.0 {
+        return Err(TessellationError::Geometry("chord tolerance must be positive and finite".into()));
+    }
+    let samples = sample_all_edges_checked(solid, chord_tolerance, true)?;
+    tessellate_with_samples(solid, chord_tolerance, Some(&samples)).map_err(Into::into)
+}
+
+fn tessellate_with_samples(solid: &BrepSolid, chord_tolerance: f64, samples: Option<&HashMap<u64, EdgeSamples>>) -> Result<Mesh, String> {
     // A disconnected shell is not necessarily another exterior component: in
     // a BREP_WITH_VOIDS its authored winding is negative so its normal points
     // away from material and into the cavity. Preserve that sign through the
@@ -21,7 +35,11 @@ pub fn tessellate_brep_watertight(solid: &BrepSolid, chord_tolerance: f64) -> Re
     // The whole solid is stride 1 (every face). Validation (closed-shell,
     // no odd-use edges) only makes sense on the complete mesh.
     let profile = crate::watertight_tessellation::profile::begin();
-    let mut mesh = tessellate_brep_watertight_face_stride(solid, chord_tolerance, 1, 0)?;
+    let mut mesh = if let Some(samples) = samples {
+        super::stride_encode::tessellate_faces_stride(solid, samples, chord_tolerance, 1, 0)?
+    } else {
+        tessellate_brep_watertight_face_stride(solid, chord_tolerance, 1, 0)?
+    };
     if pinch_cusp_enabled() {
         drop_coincident_face_triangles(&mut mesh);
     }

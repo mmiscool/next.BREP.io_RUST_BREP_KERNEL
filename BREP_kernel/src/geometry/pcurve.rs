@@ -1042,6 +1042,7 @@ thread_local! {
 /// fit that follows sees every one of them. Deferral changes no answer: a
 /// lookup that misses recomputes the same pure function.
 struct FootMemo {
+    precision: bool,
     surface: *const NurbsSurface,
     global: rustc_hash::FxHashMap<[u64; 3], Option<crate::SurfaceProjection>>,
     seeded: rustc_hash::FxHashMap<[u64; 5], Option<crate::SurfaceProjection>>,
@@ -1051,7 +1052,7 @@ struct FootMemo {
 
 impl FootMemo {
     fn new(surface: *const NurbsSurface) -> Self {
-        Self { surface, global: Default::default(), seeded: Default::default(), pending_global: Vec::new(), pending_seeded: Vec::new() }
+        Self { precision: false, surface, global: Default::default(), seeded: Default::default(), pending_global: Vec::new(), pending_seeded: Vec::new() }
     }
 
     /// Fold the deferred feet into the maps (a later insert of the same key
@@ -1095,6 +1096,15 @@ pub(crate) struct FootMemoScope<'a> {
 }
 
 impl<'a> FootMemoScope<'a> {
+    /// A fresh memo isolates precision construction feet from ordinary reads,
+    /// including an enclosing importer scope on the same surface.
+    fn precision(surface: &'a NurbsSurface) -> Self {
+        let mut next = FootMemo::new(surface);
+        next.precision = true;
+        let previous = FOOT_MEMO.with(|memo| memo.replace(Some(next)));
+        Self { previous: Some(previous), _surface: std::marker::PhantomData, _thread_bound: std::marker::PhantomData }
+    }
+
     pub(crate) fn open(surface: &'a NurbsSurface) -> Self {
         let key = surface as *const NurbsSurface;
         let previous = FOOT_MEMO.with(|memo| {
@@ -1118,6 +1128,16 @@ impl Drop for FootMemoScope<'_> {
     }
 }
 
+fn precision_trim_feet(surface: &NurbsSurface) -> bool {
+    FOOT_MEMO.with(|memo| memo.borrow().as_ref().is_some_and(|m| m.precision && std::ptr::eq(m.surface, surface)))
+}
+
+fn refine_memo_foot(surface: &NurbsSurface, point: Vec3, foot: Option<crate::SurfaceProjection>) -> Option<crate::SurfaceProjection> {
+    if precision_trim_feet(surface) {
+        foot.and_then(|foot| crate::projection::refine_trim_foot(surface, point, foot).ok())
+    } else { foot }
+}
+
 fn point_bits(point: Vec3) -> [u64; 3] {
     [point.x.to_bits(), point.y.to_bits(), point.z.to_bits()]
 }
@@ -1130,7 +1150,7 @@ fn point_bits(point: Vec3) -> [u64; 3] {
 #[track_caller]
 fn memo_global_foot(surface: &NurbsSurface, point: Vec3) -> Option<crate::SurfaceProjection> {
     if crate::projection::global_site_filter_active() {
-        return project_point_to_surface(surface, point).ok();
+        return refine_memo_foot(surface, point, project_point_to_surface(surface, point).ok());
     }
     let key = point_bits(point);
     let deferring = DEFER_FOOT_INSERTS.with(|cell| cell.get());
@@ -1150,7 +1170,7 @@ fn memo_global_foot(surface: &NurbsSurface, point: Vec3) -> Option<crate::Surfac
     match hit {
         Some(Some(foot)) => foot,
         Some(None) => {
-            let foot = project_point_to_surface(surface, point).ok();
+            let foot = refine_memo_foot(surface, point, project_point_to_surface(surface, point).ok());
             FOOT_MEMO.with(|memo| {
         let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
                 if let Some(open) = memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)) {
@@ -1163,7 +1183,7 @@ fn memo_global_foot(surface: &NurbsSurface, point: Vec3) -> Option<crate::Surfac
             });
             foot
         }
-        None => project_point_to_surface(surface, point).ok(),
+        None => refine_memo_foot(surface, point, project_point_to_surface(surface, point).ok()),
     }
 }
 
@@ -1189,7 +1209,7 @@ fn memo_seeded_foot(surface: &NurbsSurface, point: Vec3, seed_u: f64, seed_v: f6
     match hit {
         Some(Some(foot)) => foot,
         Some(None) => {
-            let foot = project_point_to_surface_seeded(surface, point, seed_u, seed_v).ok();
+            let foot = refine_memo_foot(surface, point, project_point_to_surface_seeded(surface, point, seed_u, seed_v).ok());
             FOOT_MEMO.with(|memo| {
         let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
                 if let Some(open) = memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)) {
@@ -1202,7 +1222,7 @@ fn memo_seeded_foot(surface: &NurbsSurface, point: Vec3, seed_u: f64, seed_v: f6
             });
             foot
         }
-        None => project_point_to_surface_seeded(surface, point, seed_u, seed_v).ok(),
+        None => refine_memo_foot(surface, point, project_point_to_surface_seeded(surface, point, seed_u, seed_v).ok()),
     }
 }
 
@@ -2815,6 +2835,45 @@ pub fn fit_pcurve_on_surface_range(
     )
 }
 
+/// Refine a derived import trim against projected feet independently of normal
+/// standoff. The existing fit budgets and common-probe acceptance rule apply;
+/// a candidate that does not demonstrably improve the locus is discarded.
+pub(crate) fn refine_import_projected_range(
+    surface: &NurbsSurface,
+    curve: &NurbsCurve,
+    edge_start: f64,
+    edge_end: f64,
+    forward: bool,
+    legacy: PcurveFit,
+) -> PcurveFit {
+    let _feet = FootMemoScope::precision(surface);
+    let evaluate = |fraction: f64| {
+        let along = if forward { fraction } else { 1.0 - fraction };
+        curve.evaluate(edge_start + (edge_end - edge_start) * along)
+    };
+    let Ok(fixed) = range_use_probes(&[&legacy.curve], curve, edge_start, edge_end, forward) else { return legacy };
+    let Ok((old, _)) = common_station_read_with_excess(surface, &evaluate, &legacy.curve, &legacy.curve, &fixed) else { return legacy };
+    if old[0] <= PCURVE_REFINEMENT_TOLERANCE { return legacy; }
+    let breaks = range_breaks(curve, edge_start, edge_end, forward);
+    // A minimum parameter span protects the deviation fitter from chasing
+    // inherited standoff. Tracking does not chase that standoff. If that span
+    // alone blocks a verified candidate, retry once with finer construction
+    // resolution, retaining the same budgets and final physical acceptance bar.
+    for span_floor in [SPAN_FLOOR, SPAN_FLOOR * 0.01] {
+        let Ok(candidate) = fit_station_pcurve_mode(surface, &evaluate, &breaks, &breaks,
+            PCURVE_REFINEMENT_TOLERANCE * 0.1, 64, 3, 513, span_floor, true, Some(&legacy.curve), &fixed) else { return legacy };
+        let Ok(probes) = range_use_probes(&[&legacy.curve, &candidate.curve], curve, edge_start, edge_end, forward) else { return legacy };
+        let readings = common_station_read_with_excess(surface, &evaluate, &legacy.curve, &candidate.curve, &probes);
+        let accepted = matches!(&readings, Ok((old, new)) if floor_admits(*old, *new));
+        if station_fit_tracing() {
+            eprintln!("STATION-FIT import projected challenger: span_floor={span_floor:e} old={:?} candidate={:?} common={readings:?} accepted={accepted}", legacy.report, candidate.report);
+        }
+        if accepted { return candidate; }
+        if candidate.report.exit != PcurveFitExit::SpanFloor { break; }
+    }
+    legacy
+}
+
 /// [`fit_pcurve_on_surface_range`] for the callers that only need the curve:
 /// the fit is ACCEPTED or REFUSED on its bar (`accept_fit`), never returned
 /// off it.
@@ -4220,7 +4279,10 @@ fn fit_station_pcurve_mode(
     let mut raw = Vec::with_capacity(edge_points.len());
     let mut gaps = Vec::with_capacity(edge_points.len());
     for point in &edge_points {
-        let (parameter, gap) = invert_checked(surface, *point)?;
+        let (parameter, gap) = if track_projection && precision_trim_feet(surface) {
+            let foot = memo_global_foot(surface, *point).ok_or("precision trim has no foot")?;
+            ([foot.u, foot.v], foot.distance)
+        } else { invert_checked(surface, *point)? };
         off_surface = off_surface.max(gap);
         raw.push(parameter);
         gaps.push(gap);

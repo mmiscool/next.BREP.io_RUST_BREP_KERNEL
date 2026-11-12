@@ -6,21 +6,31 @@ use super::*;
 /// plane it stands on (lane L, 2026-10-16).
 pub(crate) const CONCAVE_RIM_OVERRUN_WHAT: &str = "concave_rim_overrun";
 
-/// Lane L (2026-10-16): a CONCAVE closed rim standing on a PLANE — the rim one
-/// of the plane's INNER loops (a boss on a plate) — whose fill reaches past
-/// the plane's OUTER loop is not a face consumed up to one preserved far edge:
-/// the fill overruns the plate, and the body owed is that fill clipped by the
-/// plate's neighbouring faces. The edge-preserving construction found four
-/// "far" edges there and said "ambiguous preserved boundary edge". Read
-/// geometrically: the rim sampled, each sample stepped `radius` into the plane
-/// square to the rim (the fill's contact for a boss standing square to the
-/// plane), tested against the outer loop as a polygon in the plane (the chart
-/// clamps; the loop does not).
+/// Lane L (2026-10-16): a CONCAVE closed rim standing on a PLANE — the rim one of
+/// the plane's INNER loops (a boss on a plate) — whose fill reaches past the
+/// plane's OUTER loop is not a face consumed up to one preserved far edge: the
+/// fill overruns the plate, and the body owed is that fill clipped by the plate's
+/// neighbouring faces. The edge-preserving construction found four "far" edges
+/// there and said "ambiguous preserved boundary edge". Read geometrically: the rim
+/// sampled, each sample stepped `radius` into the plane square to the rim (the
+/// fill's contact for a boss standing square to the plane), tested against the
+/// outer loop as a polygon in the plane (the chart clamps; the loop does not).
+/// `BREP_CONCAVE_RIM_TRUE_CONTACTS` (default on; `=0` restores the estimate): the
+/// overrun test reads the march's own contacts on the plate where it has them, not
+/// a point a whole radius from the rim. The radius is the contact's reach only
+/// where the wall stands square to the plate; against a ball (a ball standing on a
+/// plate, its rim rounded by 3) the contact lies nearer, at `√((R + r)² − r²) −
+/// R`, 2.416 against 3, and the fill that fits was refused.
+fn concave_rim_true_contacts_on() -> bool {
+    switch!("BREP_CONCAVE_RIM_TRUE_CONTACTS", true)
+}
+
 fn concave_rim_overrun(
     solid: &BrepSolid,
     edge: &EdgeRecord,
     mates: [(&FaceRecord, usize); 2],
     radius: f64,
+    contacts: Option<[Vec<Vec3>; 2]>,
 ) -> Result<Option<KernelRefusal>, KernelRefusal> {
     const RIM_SAMPLES: usize = 64;
     const LOOP_SAMPLES: usize = 256;
@@ -77,6 +87,29 @@ fn concave_rim_overrun(
             }
         }
         let mut overruns = false;
+        if let (true, Some(contacts)) = (concave_rim_true_contacts_on(), contacts.as_ref()) {
+            // A contact ON the outer loop (a fill that just touches the
+            // plate's edge, tangent to it) has not overrun it: the parity
+            // test cannot say which side such a point is on, so its distance
+            // to the loop decides.
+            let on_loop = |x: f64, y: f64| -> bool {
+                let band = 1e-7 * (1.0 + x.abs() + y.abs());
+                (0..outer.len()).any(|k| {
+                    let (a, b) = (outer[k], outer[(k + 1) % outer.len()]);
+                    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+                    let length2 = dx * dx + dy * dy;
+                    let t = if length2 > 0.0 { (((x - a.0) * dx + (y - a.1) * dy) / length2).clamp(0.0, 1.0) } else { 0.0 };
+                    (x - a.0 - t * dx).hypot(y - a.1 - t * dy) <= band
+                })
+            };
+            for contact in &contacts[index] {
+                let (x, y) = flat(*contact);
+                if !within(&outer, x, y) && !on_loop(x, y) {
+                    overruns = true;
+                    break;
+                }
+            }
+        } else {
         for k in 0..RIM_SAMPLES {
             let t = edge.t0 + (edge.t1 - edge.t0) * (k as f64 + 0.5) / RIM_SAMPLES as f64;
             let derivatives = edge.curve.derivatives(t, 1).or_refuse(KernelStage::Classify, "derivatives")?;
@@ -93,6 +126,7 @@ fn concave_rim_overrun(
                 overruns = true;
                 break;
             }
+        }
         }
         if overruns {
             return Ok(Some(KernelRefusal::unsupported(KernelStage::Classify, CONCAVE_RIM_OVERRUN_WHAT, format!(
@@ -521,7 +555,7 @@ fn blend_closed_edge_impl(
         Err(march_error) => {
             // Lane L (2026-10-16): a concave rim overrunning its plane is
             // named before the edge-preserving construction misreads it.
-            if let Some(refusal) = concave_rim_overrun(solid, edge, [(first_face, first_loop), (second_face, second_loop)], radius_at(mid_t))? {
+            if let Some(refusal) = concave_rim_overrun(solid, edge, [(first_face, first_loop), (second_face, second_loop)], radius_at(mid_t), None)? {
                 return Err(refusal);
             }
             // A non-converging march often means the rolling ball falls off
@@ -628,7 +662,11 @@ fn blend_closed_edge_impl(
         }
     }
     if setback.is_none() {
-        if let Some(refusal) = concave_rim_overrun(solid, edge, [(first_face, first_loop), (second_face, second_loop)], radius_at(mid_t))? {
+        let contacts = [
+            stations.iter().map(|station| station.p1).collect::<Vec<_>>(),
+            stations.iter().map(|station| station.p2).collect::<Vec<_>>(),
+        ];
+        if let Some(refusal) = concave_rim_overrun(solid, edge, [(first_face, first_loop), (second_face, second_loop)], radius_at(mid_t), Some(contacts))? {
             return Err(refusal);
         }
     }
@@ -1894,6 +1932,7 @@ fn build_surgery(
     let uv1_new = rows.cr_pcurve.evaluate(u_start).or_refuse(KernelStage::Refine, "evaluate")?;
     let v1_new = uv1_new.y;
     let cr_pieces = vec![(cr_edge_id, [u_start, u_end], rows.cr_pcurve.clone())];
+    SEAM_CONSUMED.with(|flag| flag.set(None));
     let mut repaired = replace_in_face(&mut result, first, &cr_pieces, [uv1_new.x, v1_new])?;
     let uv2_new = rows.cs_pcurve.evaluate(u_start).or_refuse(KernelStage::Refine, "evaluate")?;
     let v2_new = if second_split.is_some() {
@@ -2181,9 +2220,21 @@ fn build_surgery(
     // check does not run), so this cannot slow or change anything that already
     // works — and the new branch can never ship a plausible-looking wrong solid
     // the way the un-repaired trim did.
+    let consumed = SEAM_CONSUMED.with(|flag| flag.take());
     if repaired {
         let problems = result.validate_memoised();
         if !problems.is_empty() {
+            // A setback that consumed a whole face and left a body that does
+            // not stand is refused by name.
+            if let (Some(face_id), true) = (consumed, crate::blend::setback::setback_consumed_face_refusal_on()) {
+                return Err(crate::blend::setback::unsupported(
+                    "setback_consumes_face",
+                    format!(
+                        "asymmetric chamfer: the setback on face {face_id} reaches that face's far edge, which \
+                         would consume the whole face — refusing"
+                    ),
+                ));
+            }
             return Err(KernelRefusal::internal(KernelStage::Validate, "neighbour_trim_closure", format!(
                 "blend: the repaired neighbour trim did not close ({} issue(s), first: {})",
                 problems.len(),
@@ -2195,6 +2246,12 @@ fn build_surgery(
         }
     }
     Ok(result)
+}
+
+thread_local! {
+    /// The face whose seam a setback's trim shrank to a point during the
+    /// surgery in progress (`replace_rim_in_face`), if any.
+    static SEAM_CONSUMED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Replace the blended edge's coedge in one mate's loop with the support
@@ -2397,6 +2454,21 @@ pub(in crate::blend) fn replace_rim_in_face(
                 coedge.pcurve.control_points[target] = crate::Vec4::from_point(
                     Vec3::new(target_uv[0], target_uv[1], 0.0), w,
                 );
+            }
+            // An asymmetric chamfer whose setback reaches the far end of this
+            // seam consumes the whole face: the seam shrinks to a point. Noted
+            // here; the surgery's own validation decides whether the body
+            // stands (a ball's whole bore consumed does), and names the
+            // refusal where it does not.
+            if crate::blend::setback::active().is_some() {
+                let [p0, p1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+                let (a, b) = (
+                    coedge.pcurve.evaluate(p0).or_refuse(KernelStage::Refine, "evaluate")?,
+                    coedge.pcurve.evaluate(p1).or_refuse(KernelStage::Refine, "evaluate")?,
+                );
+                if a.sub(b).length() <= 1e-12 * (1.0 + a.length()) {
+                    SEAM_CONSUMED.with(|flag| flag.set(Some(face_id)));
+                }
             }
             repaired = true;
         }

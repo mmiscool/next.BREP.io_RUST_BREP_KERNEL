@@ -373,7 +373,7 @@ fn surface_newton(
     closed_v: bool,
 ) -> Result<NewtonResult, String> {
     surface_newton_impl(surface, point, seed_u, seed_v, domains, closed_u, closed_v,
-        switch!("BREP_PROJECTION_LAZY_DERIVATIVES", false))
+        switch!("BREP_PROJECTION_LAZY_DERIVATIVES", false), LINEAR_TOLERANCE)
 }
 
 /// Most seeded verification queries are already on the carrier. Row zero
@@ -389,6 +389,7 @@ fn surface_newton_impl(
     closed_u: bool,
     closed_v: bool,
     lazy: bool,
+    linear_tolerance: f64,
 ) -> Result<NewtonResult, String> {
     let [u0, u1, v0, v1] = domains;
     let mut u = seed_u;
@@ -411,7 +412,7 @@ fn surface_newton_impl(
             best.distance_squared = distance_squared;
         }
         let residual_length = distance_squared.sqrt();
-        if residual_length <= LINEAR_TOLERANCE {
+        if residual_length <= linear_tolerance {
             crate::imprint::work_profile::add(|c| { c.newton_unused += 1; c.newton_unused_first += u64::from(iteration == 0); });
             converged = true;
             break;
@@ -464,6 +465,22 @@ fn surface_newton_impl(
     }
     best.converged = converged;
     Ok(best)
+}
+
+/// Refine an existing branch foot for precision trim construction. The normal
+/// projector's distance exit is an on-carrier admission test, not a bound on
+/// tangential placement suitable for interpolating a more accurate trim.
+pub(crate) fn refine_trim_foot(
+    surface: &NurbsSurface, point: Vec3, foot: SurfaceProjection,
+) -> Result<SurfaceProjection, String> {
+    let [u0, u1] = surface.domain_u()?;
+    let [v0, v1] = surface.domain_v()?;
+    let (cu, cv) = surface.closed_directions()?;
+    let result = surface_newton_impl(surface, point, foot.u, foot.v,
+        [u0, u1, v0, v1], cu, cv, false, 1e-11)?;
+    let projected = surface.evaluate(result.u, result.v)?;
+    Ok(SurfaceProjection { u: result.u, v: result.v, point: projected,
+        distance: projected.sub(point).length() })
 }
 
 /// The point of `surface` nearest `point`, over the surface's whole domain.
@@ -752,7 +769,7 @@ fn projection_dense_grid(surface: &NurbsSurface) -> Result<&SampleGrid, String> 
             grid.push((u, v, surface.evaluate(u, v)?));
         }
     }
-    Ok(surface.projection_dense_grid.get_or_init(|| SampleGrid::new(grid)))
+    Ok(surface.projection_dense_grid.get_or_init(|| SampleGrid::with_tree(grid)))
 }
 
 /// Samples per block of a [`SampleGrid`].
@@ -775,6 +792,31 @@ pub(crate) struct SampleGrid {
     /// runs' floors as computed (the box faces are the runs' own, and the gap
     /// to a face farther out is no larger, IEEE rounding being monotone).
     groups: Vec<SampleBlock>,
+    /// The box tree over the runs ([`nearest_sample_tree`]): `tree[0]` boxes
+    /// each [`TREE_FANOUT`] consecutive runs, `tree[k]` each [`TREE_FANOUT`]
+    /// consecutive boxes of `tree[k - 1]`, up to a single root. Built only by
+    /// [`SampleGrid::with_tree`] (the dense grid), and empty when the grid has
+    /// at most one group of runs.
+    tree: Vec<Vec<SampleBlock>>,
+}
+
+/// Children per node of [`SampleGrid::tree`].
+const TREE_FANOUT: usize = 4;
+
+/// The union box of consecutive boxes, prunable only when each of them is.
+fn union_boxes(boxes: &[SampleBlock]) -> Vec<SampleBlock> {
+    boxes
+        .chunks(TREE_FANOUT)
+        .map(|chunk| {
+            let mut union = chunk[0];
+            for block in chunk {
+                union.low = Vec3::new(union.low.x.min(block.low.x), union.low.y.min(block.low.y), union.low.z.min(block.low.z));
+                union.high = Vec3::new(union.high.x.max(block.high.x), union.high.y.max(block.high.y), union.high.z.max(block.high.z));
+                union.prunable &= block.prunable;
+            }
+            union
+        })
+        .collect()
 }
 
 /// One run's box. `prunable` is false when a sample has a non-finite
@@ -814,7 +856,25 @@ impl SampleGrid {
                 group
             })
             .collect();
-        Self { samples, blocks, groups }
+        Self { samples, blocks, groups, tree: Vec::new() }
+    }
+
+    /// The grid with its box tree, for a scan that starts from a held answer
+    /// (the dense fallback after a Newton): there the tree reads few floors.
+    /// A scan from no answer reads its bound from a greedy descent, which on a
+    /// surface whose boxes mostly hold the point lands on an arbitrary run;
+    /// ABC 00027566's seed scans took 75 s through the tree against 44 s
+    /// through the groups, so the seed grid keeps the groups.
+    fn with_tree(samples: Vec<(f64, f64, Vec3)>) -> Self {
+        let mut grid = Self::new(samples);
+        if grid.blocks.len() > GROUP_BLOCKS {
+            grid.tree.push(union_boxes(&grid.blocks));
+            while grid.tree.last().is_some_and(|level| level.len() > 1) {
+                let next = union_boxes(grid.tree.last().unwrap());
+                grid.tree.push(next);
+            }
+        }
+        grid
     }
 }
 
@@ -859,7 +919,166 @@ fn pruned_scan() -> bool {
 /// probes (the first Newton not converged), each scanning 22.7k samples: 9.1 s
 /// of a face's 11.5 s of local answers.
 fn nearest_sample(grid: &SampleGrid, point: Vec3, best: &mut NewtonResult) {
+    if !grid.tree.is_empty() && scan_tree() && pruned_scan() && bound_first_scan() {
+        nearest_sample_tree(grid, point, best);
+        return;
+    }
     nearest_sample_with(grid, point, best, pruned_scan(), bound_first_scan());
+}
+
+/// `BREP_PROJECTION_SCAN_TREE=0` scans through the two levels of groups and
+/// runs alone, as before 2026-11-11, for a same-binary A/B. Read once per
+/// process.
+///
+/// With it on, a grid built with a tree ([`SampleGrid::with_tree`]: the dense
+/// grid, when it has more than one group) is scanned through
+/// [`SampleGrid::tree`]. ABC 00027566's dense fallback on its 166-span faces
+/// passed 52 of 287 group boxes per call (a group is a strip across the
+/// surface, and many strips' boxes hold a point on it) and then read 1680 run
+/// floors to scan 0.65 runs, never improving the answer it held: 26 s of floors
+/// at one pcurve site.
+fn scan_tree() -> bool {
+    switch!("BREP_PROJECTION_SCAN_TREE", true)
+}
+
+/// `BREP_PROJECTION_SCAN_HINT=0` reads the bound from the descent alone, as
+/// before 2026-11-11, for a same-binary A/B. Read once per process.
+///
+/// With it on, a bound-first scan also reads the run that held the answer of
+/// the last scan of the same grid on this thread. Consecutive queries are
+/// mostly neighbours (a pcurve's probes): ABC 00027566's busiest pcurve site
+/// found its answer in the previous answer's run on 98.8% of seed scans, while
+/// the descent's run held it on 40%; with the hint the bound is the answer on
+/// 99.4% and the seed scans there fell from 43.6 s to 18.4 s.
+fn scan_hint() -> bool {
+    switch!("BREP_PROJECTION_SCAN_HINT", true)
+}
+
+const HINT_SLOTS: usize = 8;
+
+thread_local! {
+    /// Direct-mapped by grid address: (grid samples address, run of its last answer).
+    static SCAN_HINTS: std::cell::Cell<[(usize, usize); HINT_SLOTS]> =
+        const { std::cell::Cell::new([(0, usize::MAX); HINT_SLOTS]) };
+}
+
+fn hint_slot(grid: &SampleGrid) -> (usize, usize) {
+    let address = grid.samples.as_ptr() as usize;
+    (address, (address >> 4) % HINT_SLOTS)
+}
+
+/// The bound lowered by the hinted run's samples. The hint is only a run
+/// index: it is range-checked and read from the grid in hand, so a stale one
+/// (another grid at a reused address) costs time, never bits. It lowers the
+/// BOUND alone, never the answer held: each value it can take is a real
+/// sample distance, at least the grid's least distance `m`, which is all the
+/// bound-first argument asks of it.
+fn hinted_bound(grid: &SampleGrid, point: Vec3, mut bound: f64) -> f64 {
+    if !scan_hint() {
+        return bound;
+    }
+    let (address, slot) = hint_slot(grid);
+    let (held, run) = SCAN_HINTS.with(|hints| hints.get()[slot]);
+    if held != address || run >= grid.blocks.len() || !grid.blocks[run].prunable {
+        return bound;
+    }
+    let start = run * SAMPLE_BLOCK;
+    let end = (start + SAMPLE_BLOCK).min(grid.samples.len());
+    for &(_, _, sample) in &grid.samples[start..end] {
+        let distance_squared = sample.sub(point).length_squared();
+        if distance_squared < bound {
+            bound = distance_squared;
+        }
+    }
+    bound
+}
+
+/// Remember the run that last improved the answer of a scan of `grid`.
+fn remember_hint(grid: &SampleGrid, run: Option<usize>) {
+    if let Some(run) = run.filter(|_| scan_hint()) {
+        let (address, slot) = hint_slot(grid);
+        SCAN_HINTS.with(|hints| {
+            let mut all = hints.get();
+            all[slot] = (address, run);
+            hints.set(all);
+        });
+    }
+}
+
+/// [`nearest_sample_with`]'s bound-first scan over the box tree: the bound is
+/// read from the run reached by descending from the root through the child of
+/// lowest floor (a real sample distance, or the incoming one, so never below
+/// the grid's least distance `m`), then the tree is visited depth first in
+/// scan order, skipping a box whose floor is at or above the distance held or
+/// strictly above the bound. A union box's floor is at most each of its
+/// children's as computed (the box faces are theirs, and IEEE rounding is
+/// monotone), so a box is skipped only when every run under it would have
+/// been, and the runs that are read are read in scan order: the bits of the
+/// linear scan, by the argument [`nearest_sample_with`] gives for its groups.
+fn nearest_sample_tree(grid: &SampleGrid, point: Vec3, best: &mut NewtonResult) {
+    let top = grid.tree.len() - 1;
+    let mut bound = best.distance_squared;
+    // Descend: at each level the child of lowest floor among the prunable ones.
+    let mut node = 0usize;
+    let mut reached = true;
+    for level in (0..=top).rev() {
+        let children = |count: usize| node * TREE_FANOUT..((node + 1) * TREE_FANOUT).min(count);
+        let below = if level == 0 { &grid.blocks } else { &grid.tree[level - 1] };
+        match lowest_floor(below, children(below.len()), point) {
+            Some(child) => node = child,
+            None => {
+                reached = false;
+                break;
+            }
+        }
+    }
+    if reached {
+        let start = node * SAMPLE_BLOCK;
+        let end = (start + SAMPLE_BLOCK).min(grid.samples.len());
+        for &(_, _, sample) in &grid.samples[start..end] {
+            let distance_squared = sample.sub(point).length_squared();
+            if distance_squared < bound {
+                bound = distance_squared;
+            }
+        }
+    }
+    let bound = hinted_bound(grid, point, bound);
+    let skip = |box_: &SampleBlock, held: f64| {
+        if !box_.prunable {
+            return false;
+        }
+        let floor = box_.lower_bound(point);
+        floor >= held || floor > bound
+    };
+    let mut answer_run = None;
+    // Depth first in scan order: (level, index), level 0 of the stack meaning a run.
+    let mut stack: Vec<(usize, usize)> = Vec::with_capacity(TREE_FANOUT * (top + 2));
+    stack.push((top + 1, 0));
+    while let Some((level, index)) = stack.pop() {
+        if level == 0 {
+            if skip(&grid.blocks[index], best.distance_squared) {
+                continue;
+            }
+            let start = index * SAMPLE_BLOCK;
+            let end = (start + SAMPLE_BLOCK).min(grid.samples.len());
+            let held = best.distance_squared;
+            scan_run(&grid.samples[start..end], point, best);
+            if best.distance_squared < held {
+                answer_run = Some(index);
+            }
+            continue;
+        }
+        if skip(&grid.tree[level - 1][index], best.distance_squared) {
+            continue;
+        }
+        let count = if level == 1 { grid.blocks.len() } else { grid.tree[level - 2].len() };
+        let children = index * TREE_FANOUT..((index + 1) * TREE_FANOUT).min(count);
+        // Pushed last-first so they pop in scan order.
+        for child in children.rev() {
+            stack.push((level - 1, child));
+        }
+    }
+    remember_hint(grid, answer_run);
 }
 
 /// `BREP_PROJECTION_BOUND_FIRST=0` prunes against the distance held alone, as
@@ -917,6 +1136,7 @@ fn nearest_sample_with(grid: &SampleGrid, point: Vec3, best: &mut NewtonResult, 
             }
         }
     }
+    let bound = hinted_bound(grid, point, bound);
     let skip = |box_: &SampleBlock, held: f64| {
         if !box_.prunable {
             return false;
@@ -924,6 +1144,7 @@ fn nearest_sample_with(grid: &SampleGrid, point: Vec3, best: &mut NewtonResult, 
         let floor = box_.lower_bound(point);
         floor >= held || floor > bound
     };
+    let mut answer_run = None;
     for (group_index, group) in grid.groups.iter().enumerate() {
         if skip(group, best.distance_squared) {
             continue;
@@ -936,9 +1157,14 @@ fn nearest_sample_with(grid: &SampleGrid, point: Vec3, best: &mut NewtonResult, 
             }
             let start = run * SAMPLE_BLOCK;
             let end = (start + SAMPLE_BLOCK).min(grid.samples.len());
+            let held = best.distance_squared;
             scan_run(&grid.samples[start..end], point, best);
+            if best.distance_squared < held {
+                answer_run = Some(run);
+            }
         }
     }
+    remember_hint(grid, answer_run);
 }
 
 /// The linear scan of one run: strict `<`, so the first of equal samples

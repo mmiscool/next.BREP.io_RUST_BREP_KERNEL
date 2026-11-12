@@ -446,6 +446,60 @@ pub fn offset_surface(
         .map(|(surface, _)| surface)
 }
 
+thread_local! {
+    static IMPORT_OFFSET_PRECISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Import needs the pointwise offset carrier, without the construction-fit
+/// floor becoming an accuracy limit for downstream surface integrals. Elevate
+/// the rational basis exactly before collocation: increasing approximation
+/// order resolves the normal field without a quadratic net's excessive span
+/// growth. The ordinary construction budget and acceptance gate still apply.
+pub(crate) fn offset_surface_for_import(face: &FaceRecord, distance: f64) -> Result<NurbsSurface, KernelRefusal> {
+    if face.surface.analytic().is_some() || face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        return offset_surface(face, distance, 0.0);
+    }
+    let source = &face.surface;
+    let mut rows = Vec::new();
+    let mut knots_v = source.knots_v.clone();
+    for row in &source.control_points {
+        let curve = NurbsCurve::new(source.degree_v, source.knots_v.clone(), row.clone()).or_refuse(KernelStage::Refine, "new")?;
+        let raised = crate::coons::compat::elevate_degree(&curve, source.degree_v.max(5)).or_refuse(KernelStage::Refine, "elevate_degree")?;
+        knots_v = raised.knots.clone();
+        rows.push(raised.control_points);
+    }
+    let mut columns = Vec::new();
+    let mut knots_u = source.knots_u.clone();
+    for column in 0..rows[0].len() {
+        let curve = NurbsCurve::new(source.degree_u, source.knots_u.clone(), rows.iter().map(|row| row[column]).collect()).or_refuse(KernelStage::Refine, "new")?;
+        let raised = crate::coons::compat::elevate_degree(&curve, source.degree_u.max(5)).or_refuse(KernelStage::Refine, "elevate_degree")?;
+        knots_u = raised.knots.clone();
+        columns.push(raised.control_points);
+    }
+    let controls = (0..columns[0].len()).map(|row| columns.iter().map(|column| column[row]).collect()).collect();
+    let mut elevated = face.clone();
+    elevated.surface = NurbsSurface::new(source.degree_u.max(5), source.degree_v.max(5), knots_u, knots_v, controls).or_refuse(KernelStage::Refine, "new")?;
+    // The normal differentiates the carrier once: a C^k source generally
+    // has a C^(k-1) offset field. Exact knot insertion leaves the source
+    // unchanged but lets collocation represent that lower continuity.
+    let interior = |knots: &[f64], degree: usize| {
+        let low = knots[degree];
+        let high = knots[knots.len() - degree - 1];
+        let mut values: Vec<f64> = knots.iter().copied().filter(|k| *k > low && *k < high).collect();
+        values.dedup();
+        values
+    };
+    elevated.surface = insert_offset_fit_knots(&elevated.surface,
+        &interior(&source.knots_u, source.degree_u),
+        &interior(&source.knots_v, source.degree_v))?;
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) { IMPORT_OFFSET_PRECISION.with(|state| state.set(self.0)); }
+    }
+    let _restore = Restore(IMPORT_OFFSET_PRECISION.with(|state| state.replace(true)));
+    offset_surface(&elevated, distance, 0.0)
+}
+
 /// [`offset_surface`], plus the deviation MEASURED between the carrier it built
 /// and the pointwise offset that carrier approximates.
 ///
@@ -1866,6 +1920,7 @@ fn refine_offset_fit(
             .filter_map(|point| point.point().ok()),
     );
     let bar = crate::KernelTolerances::for_scale(scale, 1e-7).intersection_fit;
+    let bar = if IMPORT_OFFSET_PRECISION.with(std::cell::Cell::get) { bar.min(1e-9) } else { bar };
     let trace = std::env::var("BREP_OFFSET_FIT_TRACE").ok();
     let started = web_time::Instant::now();
     let enabled = std::env::var("BREP_OFFSET_FIT_REFINE").as_deref() != Ok("0");

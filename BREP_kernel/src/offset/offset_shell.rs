@@ -109,6 +109,8 @@ mod refusals;
 mod torus_body;
 #[path = "offset_shell/bore_dimples.rs"]
 mod bore_dimples;
+#[path = "offset_shell/revolved_parallel.rs"]
+mod revolved_parallel;
 
 use carrier_rebuild::*;
 use carriers::*;

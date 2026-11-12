@@ -101,6 +101,72 @@ fn image_to_foot(
     Ok((worst, worst_global))
 }
 
+/// Construct the projected locus independently of the source edge's normal
+/// standoff. Analytic inversion supports a tighter construction contract than
+/// the general fit floor; source-knot probes also check spans that uniform
+/// interpolation stations could miss. A failed construction keeps the existing
+/// importer fit and its validation policy.
+fn projected_analytic_trim(surface: &NurbsSurface, edge: &EdgeRecord, forward: bool) -> Option<NurbsCurve> {
+    if !matches!(surface.analytic(), Some(crate::AnalyticSurface::Sphere { .. } | crate::AnalyticSurface::Torus { .. })) {
+        return None;
+    }
+    let target = 1e-9;
+    let stations = |fraction: f64| -> Result<Vec3, String> {
+        let along = if forward { fraction } else { 1.0 - fraction };
+        let point = edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * along)?;
+        Ok(crate::project_point_to_surface(surface, point)?.point)
+    };
+    let curve = crate::pcurve::analytic_station_pcurve(surface, &stations, target).ok()?;
+    let probes = crate::pcurve::range_use_probes(&[&curve], &edge.curve, edge.t0, edge.t1, forward).ok()?;
+    let [a, b] = curve.domain().ok()?;
+    for fraction in probes {
+        let uv = curve.evaluate(a + (b - a) * fraction).ok()?;
+        let error = surface.evaluate_extended(uv.x, uv.y).ok()?.sub(stations(fraction).ok()?).length();
+        if !error.is_finite() || error > target { return None; }
+    }
+    Some(curve)
+}
+
+/// Keep a standing analytic trim that already meets the precision contract.
+/// Otherwise compare both fits at the union of their native and source probes;
+/// changing serialized geometry requires a strictly better projected locus.
+fn improved_projected_analytic_trim(surface: &NurbsSurface, edge: &EdgeRecord, forward: bool, tolerance: f64) -> Option<NurbsCurve> {
+    if !matches!(surface.analytic(), Some(crate::AnalyticSurface::Sphere { .. } | crate::AnalyticSurface::Torus { .. })) {
+        return None;
+    }
+    let _feet = crate::pcurve::FootMemoScope::open(surface);
+    let mut standing = match crate::fit_pcurve_on_surface_range(surface, &edge.curve, edge.t0, edge.t1, forward, tolerance) {
+        Ok(fit) => fit,
+        Err(_) => return projected_analytic_trim(surface, edge, forward),
+    };
+    if standing.report.residual > trim_detector_bar(&standing.report) && tolerance > crate::PCURVE_REFINEMENT_TOLERANCE {
+        if let Ok(floor) = crate::fit_pcurve_on_surface_range(surface, &edge.curve, edge.t0, edge.t1, forward, crate::PCURVE_REFINEMENT_TOLERANCE) {
+            if floor.report.residual < standing.report.residual { standing = floor; }
+        }
+    }
+    let tracking = |curve: &NurbsCurve, probes: &[f64]| -> Option<f64> {
+        let [a,b] = curve.domain().ok()?;
+        let mut worst = 0.0_f64;
+        for &fraction in probes {
+            let along = if forward { fraction } else { 1.0-fraction };
+            let point = edge.curve.evaluate(edge.t0+(edge.t1-edge.t0)*along).ok()?;
+            let foot = crate::project_point_to_surface(surface,point).ok()?;
+            let uv = curve.evaluate(a+(b-a)*fraction).ok()?;
+            let error = surface.evaluate_extended(uv.x,uv.y).ok()?.sub(foot.point).length();
+            if !error.is_finite() { return None; }
+            worst = worst.max(error);
+        }
+        Some(worst)
+    };
+    let probes = crate::pcurve::range_use_probes(&[&standing.curve], &edge.curve, edge.t0, edge.t1, forward).ok()?;
+    if tracking(&standing.curve,&probes)? <= 1e-9 { return Some(standing.curve); }
+    let Some(candidate) = projected_analytic_trim(surface,edge,forward) else { return Some(standing.curve) };
+    let probes = crate::pcurve::range_use_probes(&[&standing.curve,&candidate], &edge.curve, edge.t0, edge.t1, forward).ok()?;
+    let old = tracking(&standing.curve,&probes)?;
+    let new = tracking(&candidate,&probes)?;
+    Some(if new <= 1e-9 && new < old { candidate } else { standing.curve })
+}
+
 impl<'a> SolidBuilder<'a> {
     /// Build a loop's coedges, deriving pcurves by projection, placing seam
     /// coedges on opposite domain boundaries and re-synthesising collapsed pole
@@ -213,7 +279,12 @@ impl<'a> SolidBuilder<'a> {
             let supplied =
                 self.supplied_loop_pcurve(surface, surface_ref, *edge_id, *forward, pcurve_tol)?;
             let edge = self.edge_record(*edge_id).clone();
-            let mut pcurve = match supplied {
+            let precision = if supplied.is_none() && switch!("BREP_STEP_MASS_TRIM_TRACKING", false) {
+                improved_projected_analytic_trim(surface, &edge, *forward, pcurve_tol)
+            } else {
+                None
+            };
+            let mut pcurve = match supplied.or(precision) {
                 Some(pcurve) => pcurve,
                 None => {
                     // Every read below (the floor fit's challenger, the
@@ -254,6 +325,10 @@ impl<'a> SolidBuilder<'a> {
                             fit = floor;
                             refitted = true;
                         }
+                    }
+                    if switch!("BREP_STEP_PROJECTED_FOOT_TRACKING", false) && surface.analytic().is_none() {
+                        fit = crate::pcurve::refine_import_projected_range(surface, &edge.curve,
+                            edge.t0, edge.t1, *forward, fit);
                     }
                     // What follows only READS the trim (the import report's bounded-trim
                     // diagnostics and the trim-readings capture): the pcurve is already

@@ -246,6 +246,33 @@ pub use solid_sweep::{
 #[path = "construction/solid_sweep_caps.rs"]
 mod solid_sweep_caps;
 pub use solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, sweep_solid_tumbled, FrameCurve, RisingTurn, TwoTurns, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
+#[path = "geometry/closed_curves.rs"]
+mod closed_curves;
+pub use closed_curves::{make_ellipse, make_ellipse_arc, make_ellipsoid_brep, make_periodic_bspline};
+#[path = "construction/surface_faces.rs"]
+mod surface_faces;
+pub use surface_faces::{face_from_surface, face_from_surface_trimmed, solid_from_sheets, SURFACE_FACE_REFUSAL};
+#[path = "construction/polygon_solids.rs"]
+mod polygon_solids;
+pub use polygon_solids::{make_pyramid_on_polygon, solid_from_polygons};
+#[path = "construction/loft_guides.rs"]
+mod loft_guides;
+pub use loft_guides::{loft_profile_brep_on_guides, LOFT_ON_GUIDES_REFUSAL};
+#[path = "construction/extrude_up_to.rs"]
+mod extrude_up_to;
+pub use extrude_up_to::{extrude_profile_up_to_face, solid_pieces, EXTRUDE_UP_TO_REFUSAL};
+#[path = "offset/thicken_faces.rs"]
+mod thicken_faces;
+pub use thicken_faces::{extrude_curves_to_sheet, thicken_sheet_faces, THICKEN_FACES_REFUSAL};
+#[path = "offset/shell_rounded.rs"]
+mod shell_rounded;
+pub use shell_rounded::{offset_shell_rounded, SHELL_ROUNDED_REFUSAL};
+#[path = "construction/sweep_round_corners.rs"]
+mod sweep_round_corners;
+pub use sweep_round_corners::{sweep_profile_round_corners, SWEEP_ROUND_CORNERS_REFUSAL};
+#[path = "construction/sweep_ellipsoid.rs"]
+mod sweep_ellipsoid;
+pub use sweep_ellipsoid::sweep_ellipsoid_along_line;
 #[path = "construction/sweep_topology.rs"]
 mod sweep_topology;
 pub(crate) use sweep_topology::is_sweep_tight_bend;
@@ -306,6 +333,8 @@ pub use tessellation::{tessellate_brep, tessellate_face, TessellationOptions};
 #[path = "meshing/watertight_tessellation/mod.rs"]
 mod watertight_tessellation;
 pub use watertight_tessellation::{
+    sample_edge_polyline_checked, EdgeChordError, EdgeChordFailure, TessellationError,
+    tessellate_brep_watertight_checked,
     sample_edge_polylines, sample_edges_encoded, tessellate_brep_watertight,
     tessellate_brep_watertight_face_stride, tessellate_brep_watertight_face_stride_with_samples,
 };

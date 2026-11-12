@@ -23,8 +23,24 @@
 //! along `v = v_a` the `L_u` and `T` terms differ by
 //! `sum_b alpha_b(u) (G_b(v_a) - P_ab)`, which vanishes when the curves meet.
 //!
-//! Two curves per family is degree-1 cardinal blending: the bilinear Coons
+//! For open networks, two curves per family is degree-1 cardinal blending: the bilinear Coons
 //! patch of [`crate::coons_bilinear`], reproduced to round-off.
+//!
+//! # Closed and periodic networks
+//!
+//! Either family may be closed, including both. Closed directions use cyclic
+//! cubic cardinal splines with matching first and second endpoint derivatives.
+//! They are stored as clamped NURBS, then elevated and knot-refined exactly
+//! onto the same vector as the inputs. A seam guide is optional; endpoint
+//! aliases of a crossing count once. Each family must be uniformly open or
+//! closed and use a common parameterisation (including the seam location).
+//!
+//! Closed networks require proportional homogeneous weight functions within
+//! each family. The cardinal functions are multiplied by that common weight
+//! function, so the Euclidean Boolean sum preserves the input seam continuity,
+//! including C2 when the inputs are C2. Incompatible weights refuse by name.
+//! As with open networks, interpolation does not imply reproduction of an
+//! intended analytic surface between the supplied network curves.
 //!
 //! # Orientation
 //!
@@ -44,7 +60,7 @@
 //!   [`GordonReport::interpolation_bound`] is that residual, measured on the
 //!   control nets; [`GordonReport::sampled_interpolation_residual`] measures
 //!   it again with the kernel's surface and curve evaluators.
-//! * **The four boundary curves, bit for bit** after orientation, weight
+//! * **The four boundary curves of an open network, bit for bit** after orientation, weight
 //!   reconciliation and compatibility, exactly as in the Coons fill: their
 //!   rows are ASSIGNED into the net, and the four corners take the midpoint of
 //!   the two incident boundary ends.
@@ -74,7 +90,7 @@
 //!
 //! Everything is checked BEFORE the solve, and every refusal carries the
 //! number it measured — see [`GordonRefusal`].  Out of scope, by name:
-//! closed (periodic) curves, a pair that crosses more than once, a family
+//! a pair that crosses more than once (seam aliases count once), a family
 //! that does not cross the other in one consistent order, curves that run
 //! past the network boundary, and crossings that do not share one parameter
 //! per curve across a family (that needs a re-parameterisation, which this
@@ -88,6 +104,10 @@ use crate::{
     intersect_curves, model_scale, solve_dense, KnotVector, NurbsCurve, NurbsSurface, Vec3, Vec4,
     KNOT_IDENTITY_TOL,
 };
+
+#[path = "gordon/periodic.rs"]
+mod periodic;
+use periodic::direction_cardinals;
 
 
 /// Largest degree of a cardinal interpolation across a family.  Cubic is the
@@ -124,9 +144,8 @@ pub enum GordonRefusal {
         extent: f64,
         band: f64,
     },
-    /// The curve's start and end meet: a closed curve.  Periodic networks are
-    /// out of scope — which of the coincident ends a crossing belongs to is
-    /// not decidable from the curves.
+    /// A closed curve in a family that also contains open curves.
+    /// Each family must have a consistent topology.
     ClosedCurve {
         family: char,
         curve: usize,
@@ -243,7 +262,7 @@ impl std::fmt::Display for GordonRefusal {
             } => write!(
                 formatter,
                 "gordon: {family}-curve {curve} is closed — its ends are {gap:.3e} apart, inside \
-                 the band {band:.3e}; periodic networks are not supported"
+                 the band {band:.3e}; its family mixes open and closed curves"
             ),
             Self::CurvesDoNotMeet {
                 u_curve,
@@ -353,6 +372,10 @@ impl From<GordonRefusal> for String {
 /// increasing for v-curves.
 #[derive(Clone, Debug)]
 pub struct GordonReport {
+    /// The u-running family is closed; the u skin uses cyclic cubic splines.
+    pub periodic_u: bool,
+    /// The v-running family is closed; the v skin uses cyclic cubic splines.
+    pub periodic_v: bool,
     /// Caller index of the u-curve at each network position (v increasing).
     pub u_order: Vec<usize>,
     /// Caller index of the v-curve at each network position (u increasing).
@@ -453,6 +476,7 @@ pub fn gordon_surface_reported(
 
 /// One family's curves in network order, oriented and weight-reconciled.
 struct Family {
+    periodic: bool,
     /// Caller index at each network position.
     order: Vec<usize>,
     /// Oriented, domain-normalised curves in network order (unscaled).
@@ -666,11 +690,13 @@ fn prepare(
         points.extend(samples(curve, CURVE_SAMPLES).map_err(geometry)?);
     }
     let band = crossing_band.unwrap_or_else(|| corner_band(model_scale(points.iter().copied())));
-    judge_curves('u', &u_curves, band)?;
-    judge_curves('v', &v_curves, band)?;
+    let u_open = u_curves.iter().map(|c| is_closed(c, band)).collect::<Result<Vec<_>, _>>()?.iter().all(|&c| !c);
+    let v_open = v_curves.iter().map(|c| is_closed(c, band)).collect::<Result<Vec<_>, _>>()?.iter().all(|&c| !c);
+    let periodic_u = judge_curves('u', &u_curves, band, v_open)?;
+    let periodic_v = judge_curves('v', &v_curves, band, u_open)?;
 
     let crossings = find_crossings(&u_curves, &v_curves, band)?;
-    let order = order_network(&crossings)?;
+    let order = order_network(&crossings, periodic_u, periodic_v)?;
 
     // Network order, oriented, crossings re-polished on the curves actually
     // used: a reversed curve's knots are `1 - k`, re-rounded.
@@ -688,15 +714,15 @@ fn prepare(
             let seed_t = if order.v_reversed[i] { 1.0 - t } else { t };
             let (polished_s, polished_t, _) =
                 polish_crossing(&f[a], &g[b], seed_s, seed_t).map_err(geometry)?;
-            own_s[a][b] = polished_s;
-            own_t[a][b] = polished_t;
+            own_s[a][b] = seam_parameter(if point_curve(&f[a]) { seed_s } else { polished_s }, periodic_u);
+            own_t[a][b] = seam_parameter(if point_curve(&g[b]) { seed_t } else { polished_t }, periodic_v);
         }
     }
 
     // Shared parameters: the network's ends by contract, the median of the
     // family's own crossings in between.
-    let u_parameters = shared_parameters(columns, |b| (0..rows).map(|a| own_s[a][b]).collect());
-    let v_parameters = shared_parameters(rows, |a| (0..columns).map(|b| own_t[a][b]).collect());
+    let u_parameters = shared_parameters(columns, periodic_u, |b| (0..rows).map(|a| own_s[a][b]).collect());
+    let v_parameters = shared_parameters(rows, periodic_v, |a| (0..columns).map(|b| own_t[a][b]).collect());
     for (family, parameters, network_order) in [
         ('v', &u_parameters, &order.v_order),
         ('u', &v_parameters, &order.u_order),
@@ -714,6 +740,8 @@ fn prepare(
         }
     }
     let shared = SharedCrossings {
+        periodic_u,
+        periodic_v,
         f: &f,
         g: &g,
         u_parameters: &u_parameters,
@@ -727,7 +755,7 @@ fn prepare(
     let (f_scales, g_scales, weight_closure) = reconcile_weights(&shared)?;
     let f_scaled = scaled(&f, &f_scales)?;
     let g_scaled = scaled(&g, &g_scales)?;
-    let grid = crossing_grid(&f_scaled, &g_scaled, &u_parameters, &v_parameters)?;
+    let grid = crossing_grid(&f_scaled, &g_scaled, &u_parameters, &v_parameters, periodic_u, periodic_v)?;
 
     // Report vectors go back to caller order.
     let mut u_weight_scales = vec![1.0f64; rows];
@@ -742,6 +770,7 @@ fn prepare(
     // elevation and insertion counts.
     Ok(Network {
         u: Family {
+            periodic: periodic_u,
             order: order.u_order,
             curves: f_scaled,
             reversed: order.u_reversed,
@@ -750,6 +779,7 @@ fn prepare(
             parameters: u_parameters,
         },
         v: Family {
+            periodic: periodic_v,
             order: order.v_order,
             curves: g_scaled,
             reversed: order.v_reversed,
@@ -780,8 +810,32 @@ fn normalise_domains(
     Ok((normalised, work))
 }
 
-/// Refuse a point-like or closed curve.
-fn judge_curves(family: char, curves: &[NurbsCurve], band: f64) -> Result<(), GordonRefusal> {
+/// Detect closure after domain normalisation.
+fn is_closed(curve: &NurbsCurve, band: f64) -> Result<bool, GordonRefusal> {
+    Ok(curve.evaluate(0.0).map_err(geometry)?
+        .sub(curve.evaluate(1.0).map_err(geometry)?).length() <= band)
+}
+
+fn seam_parameter(parameter: f64, periodic: bool) -> f64 {
+    if periodic && (1.0 - parameter).abs() <= KNOT_IDENTITY_TOL { 0.0 } else { parameter }
+}
+
+// A collapsed section is allowed only in a closed family crossed by open
+// guides. Its parameter is inherited from a non-collapsed section; all guide
+// endpoints still have to meet it at the shared crossing parameters.
+fn point_curve(curve: &NurbsCurve) -> bool {
+    let first = curve.control_points[0];
+    let origin = Vec3::new(first.x / first.w, first.y / first.w, first.z / first.w);
+    curve.control_points.iter().all(|p| {
+        let q = Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w);
+        q.sub(origin).length() <= 128.0 * f64::EPSILON * origin.length().max(1.0)
+    })
+}
+
+fn judge_curves(family: char, curves: &[NurbsCurve], band: f64, allow_poles: bool) -> Result<bool, GordonRefusal> {
+    let closed = curves.iter().map(|c| is_closed(c, band)).collect::<Result<Vec<_>, _>>()?;
+    let periodic = closed.iter().all(|&value| value);
+    let allow_poles = allow_poles && periodic && curves.iter().any(|c| !point_curve(c));
     for (index, curve) in curves.iter().enumerate() {
         let points = samples(curve, CURVE_SAMPLES).map_err(geometry)?;
         let spread = points
@@ -789,7 +843,7 @@ fn judge_curves(family: char, curves: &[NurbsCurve], band: f64) -> Result<(), Go
             .map(|point| point.sub(points[0]).length())
             .fold(0.0f64, f64::max);
         let extent = model_scale(points.iter().copied()).min(spread);
-        if extent <= band {
+        if extent <= band && !(allow_poles && point_curve(curve)) {
             return Err(GordonRefusal::DegenerateCurve {
                 family,
                 curve: index,
@@ -798,7 +852,7 @@ fn judge_curves(family: char, curves: &[NurbsCurve], band: f64) -> Result<(), Go
             });
         }
         let gap = points[0].sub(points[points.len() - 1]).length();
-        if gap <= band {
+        if gap <= band && !periodic {
             return Err(GordonRefusal::ClosedCurve {
                 family,
                 curve: index,
@@ -807,7 +861,7 @@ fn judge_curves(family: char, curves: &[NurbsCurve], band: f64) -> Result<(), Go
             });
         }
     }
-    Ok(())
+    Ok(periodic)
 }
 
 /// Every caller pair's single crossing.
@@ -835,7 +889,28 @@ fn find_crossings(
     };
     for (j, u_curve) in u_curves.iter().enumerate() {
         for (i, v_curve) in v_curves.iter().enumerate() {
-            let hits = intersect_curves(u_curve, v_curve, band).map_err(geometry)?;
+            if point_curve(u_curve) || point_curve(v_curve) {
+                let (s, t, gap) = closest_approach(u_curve, v_curve).map_err(geometry)?;
+                if gap > band {
+                    return Err(GordonRefusal::CurvesDoNotMeet { u_curve: j, v_curve: i, gap, band });
+                }
+                crossings.s[j][i] = s;
+                crossings.t[j][i] = t;
+                crossings.closest = crossings.closest.max(gap);
+                continue;
+            }
+            let periodic_u = is_closed(u_curve, band)?;
+            let periodic_v = is_closed(v_curve, band)?;
+            let mut hits = intersect_curves(u_curve, v_curve, band).map_err(geometry)?;
+            if periodic_u || periodic_v {
+                for hit in &mut hits {
+                    hit.s = seam_parameter(hit.s, periodic_u);
+                    hit.t = seam_parameter(hit.t, periodic_v);
+                }
+                hits.sort_by(|a, b| a.s.total_cmp(&b.s).then(a.t.total_cmp(&b.t)));
+                hits.dedup_by(|a, b| (a.s - b.s).abs() <= KNOT_IDENTITY_TOL
+                    && (a.t - b.t).abs() <= KNOT_IDENTITY_TOL);
+            }
             let (s, t, gap) = match hits.len() {
                 1 => polish_crossing(u_curve, v_curve, hits[0].s, hits[0].t).map_err(geometry)?,
                 0 => {
@@ -859,9 +934,21 @@ fn find_crossings(
                     })
                 }
             };
-            crossings.s[j][i] = s;
-            crossings.t[j][i] = t;
+            crossings.s[j][i] = seam_parameter(s, periodic_u);
+            crossings.t[j][i] = seam_parameter(t, periodic_v);
             crossings.closest = crossings.closest.max(gap);
+        }
+    }
+    if let Some(row) = u_curves.iter().position(|c| !point_curve(c)) {
+        for (j, curve) in u_curves.iter().enumerate() {
+            if point_curve(curve) { crossings.s[j] = crossings.s[row].clone(); }
+        }
+    }
+    if let Some(column) = v_curves.iter().position(|c| !point_curve(c)) {
+        for (i, curve) in v_curves.iter().enumerate() {
+            if point_curve(curve) {
+                for row in &mut crossings.t { row[i] = row[column]; }
+            }
         }
     }
     Ok(crossings)
@@ -880,7 +967,7 @@ struct NetworkOrder {
 /// Caller u-curve 0 names +u and orders the v-curves; caller v-curve 0 names
 /// +v and orders the u-curves.  Every other curve must see the other family in
 /// that order or its reverse.
-fn order_network(crossings: &Crossings) -> Result<NetworkOrder, GordonRefusal> {
+fn order_network(crossings: &Crossings, periodic_u: bool, periodic_v: bool) -> Result<NetworkOrder, GordonRefusal> {
     let (s, t) = (&crossings.s, &crossings.t);
     let (rows, columns) = (s.len(), s[0].len());
     let mut v_order: Vec<usize> = (0..columns).collect();
@@ -890,12 +977,12 @@ fn order_network(crossings: &Crossings) -> Result<NetworkOrder, GordonRefusal> {
     let mut u_reversed = vec![false; rows];
     for (j, reversed) in u_reversed.iter_mut().enumerate() {
         let sequence: Vec<f64> = v_order.iter().map(|&i| s[j][i]).collect();
-        *reversed = orientation('u', j, &sequence, 'v', &v_order)?;
+        *reversed = network_orientation('u', j, &sequence, 'v', &v_order, periodic_u)?;
     }
     let mut v_reversed = vec![false; columns];
     for (i, reversed) in v_reversed.iter_mut().enumerate() {
         let sequence: Vec<f64> = u_order.iter().map(|&j| t[j][i]).collect();
-        *reversed = orientation('v', i, &sequence, 'u', &u_order)?;
+        *reversed = network_orientation('v', i, &sequence, 'u', &u_order, periodic_v)?;
     }
     Ok(NetworkOrder {
         u_order,
@@ -903,6 +990,21 @@ fn order_network(crossings: &Crossings) -> Result<NetworkOrder, GordonRefusal> {
         u_reversed,
         v_reversed,
     })
+}
+
+// A seam crossing stays at zero when a closed curve is reversed.
+fn network_orientation(family: char, curve: usize, sequence: &[f64],
+    crossing_family: char, order: &[usize], periodic: bool) -> Result<bool, GordonRefusal> {
+    if periodic {
+        if sequence.windows(2).all(|p| p[1] - p[0] > KNOT_IDENTITY_TOL) {
+            return Ok(false);
+        }
+        let reversed: Vec<f64> = sequence.iter().map(|&t| seam_parameter(1.0 - t, true)).collect();
+        if reversed.windows(2).all(|p| p[1] - p[0] > KNOT_IDENTITY_TOL) {
+            return Ok(true);
+        }
+    }
+    orientation(family, curve, sequence, crossing_family, order)
 }
 
 /// The caller's curves in network order, reversed where the order says.
@@ -925,10 +1027,12 @@ fn oriented(
 
 /// `0.0`, then the median of each interior position's own crossings, then
 /// `1.0`.
-fn shared_parameters(count: usize, own: impl Fn(usize) -> Vec<f64>) -> Vec<f64> {
+fn shared_parameters(count: usize, periodic: bool, own: impl Fn(usize) -> Vec<f64>) -> Vec<f64> {
     (0..count)
         .map(|index| {
-            if index == 0 {
+            if periodic {
+                median(&own(index))
+            } else if index == 0 {
                 0.0
             } else if index == count - 1 {
                 1.0
@@ -941,6 +1045,8 @@ fn shared_parameters(count: usize, own: impl Fn(usize) -> Vec<f64>) -> Vec<f64> 
 
 /// The oriented network at its shared crossing parameters.
 struct SharedCrossings<'a> {
+    periodic_u: bool,
+    periodic_v: bool,
     f: &'a [NurbsCurve],
     g: &'a [NurbsCurve],
     u_parameters: &'a [f64],
@@ -972,7 +1078,7 @@ fn judge_shared_crossings(
             let gap = on_u.sub(on_v).length();
             let u_offset = (own_s - shared.u_parameters[b]).abs();
             let v_offset = (own_t - shared.v_parameters[a]).abs();
-            if b == 0 || b == columns - 1 {
+            if !shared.periodic_u && (b == 0 || b == columns - 1) {
                 let along = on_u.sub(shared.f[a].evaluate(own_s).map_err(geometry)?).length();
                 if along > band {
                     return Err(GordonRefusal::Overhang {
@@ -985,7 +1091,7 @@ fn judge_shared_crossings(
                     });
                 }
             }
-            if a == 0 || a == rows - 1 {
+            if !shared.periodic_v && (a == 0 || a == rows - 1) {
                 let along = on_v.sub(shared.g[b].evaluate(own_t).map_err(geometry)?).length();
                 if along > band {
                     return Err(GordonRefusal::Overhang {
@@ -1115,6 +1221,8 @@ fn crossing_grid(
     g: &[NurbsCurve],
     u_parameters: &[f64],
     v_parameters: &[f64],
+    periodic_u: bool,
+    periodic_v: bool,
 ) -> Result<Vec<Vec<Vec4>>, GordonRefusal> {
     let (last_row, last_column) = (f.len() - 1, g.len() - 1);
     let mut grid = Vec::with_capacity(f.len());
@@ -1123,8 +1231,8 @@ fn crossing_grid(
         for (b, v_curve) in g.iter().enumerate() {
             let on_u = u_curve.evaluate_homogeneous(u_parameters[b]).map_err(geometry)?;
             let on_v = v_curve.evaluate_homogeneous(v_parameters[a]).map_err(geometry)?;
-            let boundary_u = a == 0 || a == last_row;
-            let boundary_v = b == 0 || b == last_column;
+            let boundary_u = !periodic_v && (a == 0 || a == last_row);
+            let boundary_v = !periodic_u && (b == 0 || b == last_column);
             row.push(match (boundary_u, boundary_v) {
                 (true, false) => on_v,
                 (false, true) => on_u,
@@ -1227,18 +1335,24 @@ fn build(network: Network) -> Result<(NurbsSurface, GordonReport), GordonRefusal
 
     // alpha_b(u) skins the v-curves across u; beta_a(v) skins the u-curves
     // across v.
-    let (skin_degree_u, alphas) = cardinal_functions(&u.parameters).map_err(|detail| {
+    let (skin_degree_u, alphas) = direction_cardinals(&u.parameters, u.periodic).map_err(|detail| {
         GordonRefusal::Incompatible {
             family: 'v',
             detail,
         }
     })?;
-    let (skin_degree_v, betas) = cardinal_functions(&v.parameters).map_err(|detail| {
+    let (skin_degree_v, betas) = direction_cardinals(&v.parameters, v.periodic).map_err(|detail| {
         GordonRefusal::Incompatible {
             family: 'u',
             detail,
         }
     })?;
+    let (alphas, betas) = if u.periodic || v.periodic {
+        (periodic::weight_cardinals('u', &u.curves, alphas, &u.parameters)?,
+         periodic::weight_cardinals('v', &v.curves, betas, &v.parameters)?)
+    } else {
+        (alphas, betas)
+    };
     let (f, alpha, f_work) = compatible_direction('u', &u.curves, &alphas)?;
     let (g, beta, g_work) = compatible_direction('v', &v.curves, &betas)?;
     for (a, &j) in u.order.iter().enumerate() {
@@ -1286,26 +1400,28 @@ fn build(network: Network) -> Result<(NurbsSurface, GordonReport), GordonRefusal
     // The boundary rows are ASSIGNED, not summed, as in the Coons fill: the
     // four boundary curves come back bit for bit, the corners take the
     // midpoint of their two boundary ends.
-    let (last_row, last_column) = (rows - 1, columns - 1);
-    let (f_first, f_last) = (&f[0], &f[rows_in_network - 1]);
-    let (g_first, g_last) = (&g[0], &g[columns_in_network - 1]);
-    for (k, net_row) in net.iter_mut().enumerate() {
-        net_row[0] = f_first.control_points[k];
-        net_row[last_column] = f_last.control_points[k];
+    if !u.periodic && !v.periodic {
+        let (last_row, last_column) = (rows - 1, columns - 1);
+        let (f_first, f_last) = (&f[0], &f[rows_in_network - 1]);
+        let (g_first, g_last) = (&g[0], &g[columns_in_network - 1]);
+        for (k, net_row) in net.iter_mut().enumerate() {
+            net_row[0] = f_first.control_points[k];
+            net_row[last_column] = f_last.control_points[k];
+        }
+        for l in 0..columns {
+            net[0][l] = g_first.control_points[l];
+            net[last_row][l] = g_last.control_points[l];
+        }
+        net[0][0] = homogeneous_midpoint(f_first.control_points[0], g_first.control_points[0]);
+        net[last_row][0] =
+            homogeneous_midpoint(f_first.control_points[last_row], g_last.control_points[0]);
+        net[0][last_column] =
+            homogeneous_midpoint(f_last.control_points[0], g_first.control_points[last_column]);
+        net[last_row][last_column] = homogeneous_midpoint(
+            f_last.control_points[last_row],
+            g_last.control_points[last_column],
+        );
     }
-    for l in 0..columns {
-        net[0][l] = g_first.control_points[l];
-        net[last_row][l] = g_last.control_points[l];
-    }
-    net[0][0] = homogeneous_midpoint(f_first.control_points[0], g_first.control_points[0]);
-    net[last_row][0] =
-        homogeneous_midpoint(f_first.control_points[last_row], g_last.control_points[0]);
-    net[0][last_column] =
-        homogeneous_midpoint(f_last.control_points[0], g_first.control_points[last_column]);
-    net[last_row][last_column] = homogeneous_midpoint(
-        f_last.control_points[last_row],
-        g_last.control_points[last_column],
-    );
 
     let mut min_weight = f64::INFINITY;
     let mut worst = (0usize, 0usize);
@@ -1367,6 +1483,8 @@ fn build(network: Network) -> Result<(NurbsSurface, GordonReport), GordonRefusal
     }
 
     let report = GordonReport {
+        periodic_u: u.periodic,
+        periodic_v: v.periodic,
         u_order: u.order,
         v_order: v.order,
         u_reversed: u.reversed,

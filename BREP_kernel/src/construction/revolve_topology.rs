@@ -237,6 +237,12 @@ fn prepare_profile(
     axis_direction: Vec3,
     flatten_radial: bool,
 ) -> Result<RevolveProfile, String> {
+    // one closed curve (an ellipse, a periodic spline) is a loop: cut in two, it is a profile
+    if let [closed] = input {
+        if let Some(halves) = crate::closed_curves::closed_curve_halves(closed)? {
+            return prepare_profile(&halves, axis_point, axis_direction, flatten_radial);
+        }
+    }
     if input.len() < 2 {
         return Err("profile needs at least 2 curves".into());
     }

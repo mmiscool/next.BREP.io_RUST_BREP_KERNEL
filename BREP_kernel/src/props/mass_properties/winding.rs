@@ -112,7 +112,7 @@ pub(super) fn winding_band_integral_with_pole_gauge(
         let sign = if face.same_sense { 1.0 } else { -1.0 };
         if net_u.abs() == 1 {
             let from_upper = sign * net_u as f64 > 0.0;
-            let mut values = winding_loops_integral_oriented(face, kinds, true, refine, false, from_upper)?;
+            let mut values = winding_loops_integral_oriented(face, kinds, true, refine, false, from_upper, false)?;
             for value in &mut values {
                 *value *= sign;
             }
@@ -141,7 +141,11 @@ pub(super) fn winding_loops_integral(
     p_is_u: bool,
     refine: usize,
 ) -> Result<Vec<f64>, String> {
-    winding_loops_integral_oriented(face, kinds, p_is_u, refine, true, false)
+    winding_loops_integral_oriented(face, kinds, p_is_u, refine, true, false, false)
+}
+
+pub(super) fn lifted_loops_integral(face: &FaceRecord, kinds: &[Integrand], p_is_u: bool, refine: usize) -> Result<Vec<f64>, String> {
+    winding_loops_integral_oriented(face, kinds, p_is_u, refine, true, false, true)
 }
 
 fn winding_loops_integral_oriented(
@@ -151,11 +155,13 @@ fn winding_loops_integral_oriented(
     refine: usize,
     normalize: bool,
     from_upper: bool,
+    periodic_cross: bool,
 ) -> Result<Vec<f64>, String> {
     let [u0, u1] = face.surface.domain_u()?;
     let [v0, v1] = face.surface.domain_v()?;
     let sign = if face.same_sense { 1.0 } else { -1.0 };
     let (u_breaks, v_breaks) = surface_breaks(&face.surface)?;
+    let primitive = if periodic_cross { periodic_antiderivative } else { antiderivative };
     // Along a pcurve the integrand is `G(u(t), v(t))`, and `G` changes
     // polynomial piece wherever `u(t)` crosses one of the SURFACE's u-knots
     // (a rational sphere's four arcs, say); the pcurve's own knots know
@@ -175,8 +181,31 @@ fn winding_loops_integral_oriented(
     // weight roots are read once per cell here.
     let mut rules = rule::SurfaceRules::new(&face.surface)?;
     for loop_record in &face.loops {
-        for coedge in &loop_record.coedges {
-            let mut spans = split_at_surface_breaks(&coedge.pcurve, curve_breaks(&coedge.pcurve)?, level_breaks, level_period, p_is_u, true)?;
+        let mut joins = Vec::new();
+        if switch!("BREP_MASS_TRIM_JOINS", false) {
+            for (index, coedge) in loop_record.coedges.iter().enumerate() {
+                let next = &loop_record.coedges[(index + 1) % loop_record.coedges.len()];
+                let end = coedge.pcurve.evaluate(coedge.pcurve.domain()?[1])?;
+                let mut start = next.pcurve.evaluate(next.pcurve.domain()?[0])?;
+                // Reconnect in the covering chart. A whole-period seam jump
+                // is not a closing chord, but the remaining real gap is.
+                if p_is_u || periodic_cross {
+                    start.x += ((end.x - start.x) / (u1 - u0)).round() * (u1 - u0);
+                }
+                if !p_is_u || periodic_cross {
+                    start.y += ((end.y - start.y) / (v1 - v0)).round() * (v1 - v0);
+                }
+                // The primitive's differential is du (or dv). A join with
+                // exactly zero travel in that direction contributes zero.
+                if if p_is_u { end.x != start.x } else { end.y != start.y } {
+                    joins.push(crate::make_line(
+                        Vec3::new(end.x, end.y, 0.0), Vec3::new(start.x, start.y, 0.0),
+                    )?);
+                }
+            }
+        }
+        for curve in loop_record.coedges.iter().map(|coedge| &coedge.pcurve).chain(joins.iter()) {
+            let mut spans = split_at_surface_breaks(curve, curve_breaks(curve)?, level_breaks, level_period, p_is_u, true)?;
             if refine > 1 {
                 let coarse = std::mem::take(&mut spans);
                 for pair in coarse.windows(2) {
@@ -190,16 +219,16 @@ fn winding_loops_integral_oriented(
                 // The pcurve's own weights decide this span's panels and
                 // order; the antiderivative across the cross parameter asks
                 // the SURFACE's weights the same question.
-                for panel in rule::curve_panels(&coedge.pcurve, pair[0], pair[1])? {
+                for panel in rule::curve_panels(curve, pair[0], pair[1])? {
                     for (parameter, weight) in panel.stations() {
-                        let (uv, tangent) = coedge.pcurve.deriv1(parameter)?;
+                        let (uv, tangent) = curve.deriv1(parameter)?;
                         if p_is_u {
-                            antiderivative(face, &all_kinds, uv.x, if from_upper { v1 } else { v0 }, uv.y, &v_breaks, sign, true, &mut inner, &mut rules)?;
+                            primitive(face, &all_kinds, uv.x, if from_upper { v1 } else { v0 }, uv.y, &v_breaks, sign, true, &mut inner, &mut rules)?;
                             for (total, value) in totals.iter_mut().zip(&inner) {
                                 *total -= weight * tangent.x * value;
                             }
                         } else {
-                            antiderivative(face, &all_kinds, uv.y, u0, uv.x, &u_breaks, sign, false, &mut inner, &mut rules)?;
+                            primitive(face, &all_kinds, uv.y, u0, uv.x, &u_breaks, sign, false, &mut inner, &mut rules)?;
                             for (total, value) in totals.iter_mut().zip(&inner) {
                                 *total += weight * tangent.y * value;
                             }
@@ -269,6 +298,15 @@ pub(crate) fn split_at_surface_breaks(
     cut_on_level: bool,
 ) -> Result<Vec<f64>, String> {
     let interior: Vec<f64> = levels[1..levels.len().saturating_sub(1)].to_vec();
+    // The same levels, sorted, for the windowed walk below (`BREP_SURFACE_BREAKS_WINDOW`).
+    let window = surface_breaks_window();
+    let sorted: Vec<f64> = if window {
+        let mut sorted: Vec<f64> = interior.iter().copied().chain(levels.first().copied()).collect();
+        sorted.sort_by(f64::total_cmp);
+        sorted
+    } else {
+        Vec::new()
+    };
     let coordinate = |t: f64| -> Result<f64, String> {
         let uv = pcurve.evaluate(t)?;
         Ok(if take_u { uv.x } else { uv.y })
@@ -298,7 +336,27 @@ pub(crate) fn split_at_surface_breaks(
             let first = ((lo - levels[0]) / period).floor() as i64 - 1;
             let last = ((hi - levels[0]) / period).ceil() as i64 + 1;
             for n in first..=last {
-                for &l in interior.iter().chain(std::iter::once(&levels[0])) {
+                // Only a level whose image lies in [lo, hi] can pass either test
+                // below (equal to a sample, or strictly between two). The window
+                // walks just those, through the same tests in the same
+                // arithmetic; the full walk reads every level of the surface for
+                // every one of the 32 sub-spans of every span (most of the
+                // closure gate's time on a dense carrier). The margin covers the
+                // rounding of `l + n·period` against `l`.
+                let candidates: &[f64] = if window {
+                    let shift = n as f64 * period;
+                    let margin = 1e-9 * (hi - lo) + 16.0 * f64::EPSILON * (lo.abs() + hi.abs() + shift.abs() + period.abs() + 1.0);
+                    let (low, high) = (lo - shift - margin, hi - shift + margin);
+                    let start = sorted.partition_point(|value| *value < low);
+                    let end = sorted.partition_point(|value| *value <= high);
+                    &sorted[start..end.max(start)]
+                } else {
+                    &[]
+                };
+                // The full walk: every interior level, then the first.
+                let (head, tail): (&[f64], Option<&f64>) =
+                    if window { (candidates, None) } else { (&interior[..], Some(&levels[0])) };
+                for &l in head.iter().chain(tail) {
                     let level = l + n as f64 * period;
                     if c == level {
                         // A sample sitting on the level (a pole line's quarter
@@ -352,6 +410,15 @@ pub(crate) fn split_at_surface_breaks(
     Ok(out)
 }
 
+/// `BREP_SURFACE_BREAKS_WINDOW` (default on; `0` walks every level): [`split_at_surface_breaks`]
+/// walks, per sub-span, only the knot levels whose image can fall inside it
+/// (binary search on the sorted levels) instead of every level of the surface.
+/// The tests a level passes, the bisections and the cuts are the full walk's,
+/// so the breaks are the same numbers.
+fn surface_breaks_window() -> bool {
+    crate::switch!("BREP_SURFACE_BREAKS_WINDOW", true)
+}
+
 /// `∫_{from}^{to} g(fixed, s) ds` (or `g(s, fixed)` when `across_v` is false)
 /// for every kind, Gauss–Legendre over the surface's knot spans clipped to
 /// the range; a station past the domain wraps through the periodic extension.
@@ -397,6 +464,37 @@ pub(super) fn antiderivative(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Split the primitive at every periodic image of the domain seam, then use
+/// the base-domain knot grid and weight rules on each piece. Both parameters
+/// wrap: a translated trim must see the same rational quadrature as its image.
+#[allow(clippy::too_many_arguments)]
+fn periodic_antiderivative(
+    face: &FaceRecord, kinds: &[Integrand], fixed: f64, from: f64, to: f64,
+    breaks: &[f64], sign: f64, across_v: bool, out: &mut [f64],
+    rules: &mut rule::SurfaceRules,
+) -> Result<(), String> {
+    out.fill(0.0);
+    let domain = if across_v { face.surface.domain_u()? } else { face.surface.domain_v()? };
+    let fixed = domain[0] + (fixed - domain[0]).rem_euclid(domain[1] - domain[0]);
+    let base = breaks[0];
+    let period = breaks[breaks.len() - 1] - base;
+    let lo = from.min(to);
+    let hi = from.max(to);
+    let direction = if to >= from { 1.0 } else { -1.0 };
+    let mut part = vec![0.0; kinds.len()];
+    let first = ((lo - base) / period).floor() as i64;
+    let last = ((hi - base) / period).ceil() as i64;
+    for turn in first..last {
+        let shift = turn as f64 * period;
+        let a = lo.max(base + shift) - shift;
+        let b = hi.min(base + period + shift) - shift;
+        if b <= a { continue; }
+        antiderivative(face, kinds, fixed, a, b, breaks, sign, across_v, &mut part, rules)?;
+        for (total, value) in out.iter_mut().zip(&part) { *total += direction * value; }
     }
     Ok(())
 }

@@ -20,6 +20,7 @@ pub(super) use support::{
     MiterEnd, RimResolution, RowSew, SewnStripe, SpokeCrossings,
 };
 pub(super) use support::{locate_end_corner, resolve_free_end, splice_end_corner, RIM_MARGIN};
+pub(super) use support::{overshoot_reach_active, refine_overshoot_on, with_overshoot_reach};
 pub(super) use support::trim_parameter_at_point;
 pub(super) use closed::{refit_closed_support_pcurve, replace_rim_in_face, trim_seam_edges};
 pub(crate) use support::{

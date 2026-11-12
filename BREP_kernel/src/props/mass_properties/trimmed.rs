@@ -261,6 +261,28 @@ fn runs_past_domain(face: &FaceRecord, polygons: &[TrimPolygon], [u0, u1, v0, v1
     static OPEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let open = *OPEN.get_or_init(|| std::env::var("BREP_MASS_OPEN_EXTENSION").as_deref() != Ok("0"));
     let (closed_u, closed_v) = face.surface.closed_directions()?;
+    if switch!("BREP_MASS_EXACT_DOMAIN_COVER", false) {
+        // Sampled chord vertices cannot certify that the arcs stay inside:
+        // a trim can leave the carrier between two samples. Positive-weight
+        // control hulls provide the conservative certificate instead. An
+        // uncertain hull takes the existing extended evaluator; no geometry
+        // is replaced or clamped to make the shortcut applicable.
+        for coedge in face.loops.iter().flat_map(|rim| &rim.coedges) {
+            for control in &coedge.pcurve.control_points {
+                if control.w <= 0.0 { return Ok(true); }
+                let point = control.point()?;
+                if ((open || closed_u) && (point.x < u0 || point.x > u1))
+                    || ((open || closed_v) && (point.y < v0 || point.y > v1))
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        return Ok(polygons.iter().flat_map(|p| &p.points).any(|point| {
+            ((open || closed_u) && (point[0] < u0 || point[0] > u1))
+                || ((open || closed_v) && (point[1] < v0 || point[1] > v1))
+        }));
+    }
     Ok(polygons.iter().flat_map(|p| p.points.iter()).any(|point| {
         ((open || closed_u) && (point[0] < u0 - 1e-9 || point[0] > u1 + 1e-9))
             || ((open || closed_v) && (point[1] < v0 - 1e-9 || point[1] > v1 + 1e-9))
@@ -278,6 +300,14 @@ fn runs_past_domain(face: &FaceRecord, polygons: &[TrimPolygon], [u0, u1, v0, v1
 /// exactly, so the result does not depend on how finely the trim was
 /// sampled — a fitted sphere rim curved in uv, sampled at 128 chords, put the
 /// r = 1 two-sphere fillet 5e-2 above its closed form before this term.
+/// `BREP_MASS_COLUMN_CLIP` (default on; `0` clips every cell in four passes): the base grid's clip of every trim
+/// loop to every cell runs its u passes once per grid column instead of once
+/// per cell ([`clip_polygon_to_column_into`]); the fragments are the four-pass
+/// clip's, bit for bit.
+fn column_clip_on() -> bool {
+    crate::switch!("BREP_MASS_COLUMN_CLIP", true)
+}
+
 pub(super) fn integrate_trimmed_polys(
     face: &FaceRecord,
     kinds: &[Integrand],
@@ -387,11 +417,15 @@ pub(super) fn integrate_trimmed_polys(
     // a surviving fragment is handed to the stack as its own allocation.
     let mut clip_scratch: Vec<[f64; 2]> = Vec::new();
     let mut clip_result: Vec<[f64; 2]> = Vec::new();
+    let column_clip = column_clip_on();
     for upair in u_breaks.windows(2) {
+        // `BREP_MASS_COLUMN_CLIP`: each loop's u passes, once per grid column
+        // (filled the first time a cell of the column needs that loop).
+        let mut columns: Vec<Option<Vec<[f64; 2]>>> = vec![None; if column_clip { polygons.len() } else { 0 }];
         for vpair in v_breaks.windows(2) {
             let cell = [upair[0], upair[1], vpair[0], vpair[1]];
             let mut clipped: Vec<Vec<[f64; 2]>> = Vec::new();
-            for (polygon, bounds) in polygons.iter().zip(&loop_boxes) {
+            for (index, (polygon, bounds)) in polygons.iter().zip(&loop_boxes).enumerate() {
                 // A loop wholly outside the cell clips to nothing —
                 // unless it ENCLOSES the cell, which the bbox test
                 // keeps (an enclosing loop's bbox covers the cell).
@@ -402,12 +436,21 @@ pub(super) fn integrate_trimmed_polys(
                 {
                     continue;
                 }
-                clip_polygon_to_cell_into(
-                    &polygon.points,
-                    cell,
-                    &mut clip_scratch,
-                    &mut clip_result,
-                );
+                if column_clip {
+                    let column = columns[index].get_or_insert_with(|| {
+                        let mut column = Vec::new();
+                        clip_polygon_to_column_into(&polygon.points, cell[0], cell[1], &mut clip_scratch, &mut column);
+                        column
+                    });
+                    clip_column_to_cell_into(column, cell[2], cell[3], &mut clip_scratch, &mut clip_result);
+                } else {
+                    clip_polygon_to_cell_into(
+                        &polygon.points,
+                        cell,
+                        &mut clip_scratch,
+                        &mut clip_result,
+                    );
+                }
                 if clip_result.len() >= 3 {
                     // Copy the fragment out rather than donating the buffer:
                     // the ping-pong vectors carry the WHOLE trim loop's

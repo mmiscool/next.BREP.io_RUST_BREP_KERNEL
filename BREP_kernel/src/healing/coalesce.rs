@@ -351,6 +351,11 @@ pub(crate) fn merge_curve_continuation_edges_at(
     merge_curve_continuation_edges_impl(solid, tolerance, Some(at))
 }
 
+
+fn continuation_in_place_on() -> bool {
+    crate::switch!("BREP_CONTINUATION_IN_PLACE", true)
+}
+
 fn merge_curve_continuation_edges_impl(
     solid: &BrepSolid,
     tolerance: f64,
@@ -773,7 +778,16 @@ fn merge_curve_continuation_edges_impl(
         let before_mate = parameter_space_area(faces[first_mate.face]).or_refuse(KernelStage::Sew, "parameter_space_area")?;
         drop(faces);
         drop(edges);
-        let mut candidate = result.clone();
+        // IN PLACE (`BREP_CONTINUATION_IN_PLACE`, default on; `=0` restores the clone): the join edits the solid itself and
+        // a refused join puts back the one edge and the two loops it touched, instead of cloning
+        // the whole solid for every join (a 800-face part's closing merge joined 358 edge pairs at
+        // 8.7 ms a clone). The solid after each join, accepted or refused, is the clone's.
+        let in_place = continuation_in_place_on();
+        let mut cloned = if in_place { None } else { Some(result.clone()) };
+        let candidate: &mut BrepSolid = match cloned.as_mut() {
+            Some(cloned) => cloned,
+            None => &mut result,
+        };
         let new_edge_id = candidate
             .edges
             .iter()
@@ -848,6 +862,11 @@ fn merge_curve_continuation_edges_impl(
                 [face_splice, mate_splice]
             }
         };
+        let undo: Vec<(usize, usize, Vec<CoedgeRecord>)> = if in_place {
+            splices.iter().map(|(face, loop_index, _, _)| (*face, *loop_index, candidate_faces[*face].loops[*loop_index].coedges.clone())).collect()
+        } else {
+            Vec::new()
+        };
         for (splice_face, splice_loop, splice_index, replacement) in splices {
             replace_adjacent(
                 &mut candidate_faces[splice_face].loops[splice_loop].coedges,
@@ -863,7 +882,8 @@ fn merge_curve_continuation_edges_impl(
             (after - before).abs() <= 1e-9f64.max(before.abs() * area_tolerance_ratio)
                 && (before.abs() <= 1e-12 || before.is_sign_positive() == after.is_sign_positive())
         };
-        if !preserves_area(
+        let forced = false;
+        if forced || !preserves_area(
             before_face,
             parameter_space_area(candidate_faces[face_index]).or_refuse(KernelStage::Sew, "parameter_space_area")?,
         ) || !preserves_area(
@@ -877,6 +897,14 @@ fn merge_curve_continuation_edges_impl(
             } else {
                 (second_edge_id, first_edge_id)
             });
+            if in_place {
+                // Both saved loops predate both splices, so either order restores them.
+                for (face, loop_index, coedges) in undo {
+                    candidate_faces[face].loops[loop_index].coedges = coedges;
+                }
+                drop(candidate_faces);
+                candidate.edges.pop();
+            }
             continue;
         }
         drop(candidate_faces);
@@ -895,7 +923,9 @@ fn merge_curve_continuation_edges_impl(
         // intentionally still open. Requiring closed-solid validation here
         // misattributes those pre-existing one-use edges to this local
         // rewrite. The completed result is validated at the kernel boundary.
-        result = candidate;
+        if let Some(cloned) = cloned {
+            result = cloned;
+        }
     }
     Ok(result)
 }

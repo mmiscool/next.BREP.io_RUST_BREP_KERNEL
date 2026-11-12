@@ -44,6 +44,15 @@ pub fn extrude_profile_brep(
     direction: Vec3,
     distance: f64,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // one closed curve (an ellipse, a periodic spline) is a profile by itself: its prism's side
+    // is one face closed on a seam
+    if let [closed] = input_curves {
+        if distance.abs() > 1e-12 {
+            if let Some(prism) = crate::closed_curves::extrude_closed_curve(closed, direction, distance)? {
+                return Ok(prism);
+            }
+        }
+    }
     let mut profile = crate::loft_topology::ConstructionProfile::new("extrude");
     if input_curves.len() < 2 {
         return Err(KernelRefusal::input(

@@ -808,11 +808,42 @@ pub(crate) fn blend_star_network_laws(
 ) -> Result<BrepSolid, KernelRefusal> {
     // A network that refuses takes back the notes its stripes recorded.
     let mark = super::blend_notes_mark();
-    let result = blend_star_network_building(solid, edge_ids, laws, chamfer, edge_names, corner_name, wrap_concave);
+    let second_pass = super::edge::refine_overshoot_on() && !super::edge::overshoot_reach_active();
+    if second_pass {
+        OVERSHOOT_REQUESTS.with(|requests| requests.borrow_mut().clear());
+    }
+    let mut result = blend_star_network_building(solid, edge_ids, laws, chamfer, edge_names, corner_name, wrap_concave);
+    // OVERSHOOT RE-MARCH: the stripes whose shipped windows reached past their vertex, refined out
+    // to that reach, in one second pass; the first pass's notes are taken back first. A second
+    // pass that refuses keeps the first pass's body (rebuilt, for its notes).
+    if second_pass {
+        let requests = OVERSHOOT_REQUESTS.with(|requests| std::mem::take(&mut *requests.borrow_mut()));
+        if !requests.is_empty() && result.is_ok() {
+            super::record_count("count.network.overshoot_remarch", requests.len() as u64);
+            super::blend_notes_truncate(mark);
+            let retried = super::edge::with_overshoot_reach(requests, || {
+                blend_star_network_building(solid, edge_ids, laws, chamfer, edge_names, corner_name, wrap_concave)
+            });
+            result = match retried {
+                Ok(body) => Ok(body),
+                Err(_) => {
+                    super::blend_notes_truncate(mark);
+                    super::edge::with_overshoot_reach(Default::default(), || {
+                        blend_star_network_building(solid, edge_ids, laws, chamfer, edge_names, corner_name, wrap_concave)
+                    })
+                }
+            };
+        }
+    }
     if result.is_err() {
         super::blend_notes_truncate(mark);
     }
     result
+}
+
+thread_local! {
+    /// The first network pass's overshoot reach requests, per edge id.
+    static OVERSHOOT_REQUESTS: std::cell::RefCell<rustc_hash::FxHashMap<u64, [f64; 2]>> = std::cell::RefCell::new(Default::default());
 }
 
 /// The refusal code of a stripe pinched between a corner setback and the
@@ -4159,6 +4190,38 @@ fn blend_star_network_building(
             shipped_wall_report(stripe, spans, stripe.law.constant().unwrap_or(radius), solid)
         };
         report_timing.stop();
+        // OVERSHOOT REQUEST (`BREP_BLEND_REFINE_OVERSHOOT`): a wall that ships UNACCEPTED and whose
+        // shipped end lies past its vertex station records a refinement reach, in the edge's native
+        // parameter one station span beyond that end, for the network's second pass. An accepted
+        // wall (a model note included) asks nothing, so its body is the first pass's.
+        // A wall that is only UNREAD (its reader declined intervals) is not the overshoot's to mend:
+        // re-marched, a face-ring runout wall kept its unread intervals and paid a second pass.
+        let unaccepted = report.as_ref().is_some_and(|(budget, ..)| matches!(budget.reason, crate::BudgetReason::Unaccepted));
+        if unaccepted && super::edge::refine_overshoot_on() && !super::edge::overshoot_reach_active() {
+            let parameters = &stripe.measure.parameters;
+            let ts = &stripe.measure.dense.station_ts;
+            let [a, b] = stripe.measure.vertex_indices;
+            if ts.len() == parameters.len() && a < parameters.len() && b < parameters.len() {
+                let (low, high) = (parameters[a].min(parameters[b]), parameters[a].max(parameters[b]));
+                let to_t = |p: f64| -> Option<(f64, f64)> {
+                    let i = parameters.windows(2).position(|w| p >= w[0].min(w[1]) && p <= w[0].max(w[1]))?;
+                    let f = (p - parameters[i]) / (parameters[i + 1] - parameters[i]);
+                    Some((ts[i] + f * (ts[i + 1] - ts[i]), (ts[i + 1] - ts[i]).abs()))
+                };
+                let shipped = [start_plan.cr_parameter(), finish_plan.cr_parameter(), start_plan.cs_parameter(), finish_plan.cs_parameter()];
+                let mut reach = [f64::INFINITY, f64::NEG_INFINITY];
+                for p in shipped {
+                    if p < low - 1e-12 || p > high + 1e-12 {
+                        if let Some((t, span)) = to_t(p) {
+                            reach = [reach[0].min(t - span), reach[1].max(t + span)];
+                        }
+                    }
+                }
+                if reach[0] <= reach[1] {
+                    OVERSHOOT_REQUESTS.with(|requests| { requests.borrow_mut().insert(stripe.edge.id, reach); });
+                }
+            }
+        }
         sewn.push(build_open_surgery_with_tail(
             solid,
             &mut result,

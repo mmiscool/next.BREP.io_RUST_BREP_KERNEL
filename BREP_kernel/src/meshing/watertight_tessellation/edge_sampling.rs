@@ -1,5 +1,6 @@
 use super::*;
 
+
 pub(super) const MAX_EDGE_SPANS: usize = 512;
 pub(super) const MAX_REFINE_PASSES: usize = 12;
 
@@ -326,6 +327,14 @@ pub(super) fn sample_all_edges(
     solid: &BrepSolid,
     chord_tolerance: f64,
 ) -> Result<HashMap<u64, EdgeSamples>, String> {
+    sample_all_edges_checked(solid, chord_tolerance, chord_budget::enabled()).map_err(|e| e.to_string())
+}
+
+pub(super) fn sample_all_edges_checked(
+    solid: &BrepSolid,
+    chord_tolerance: f64,
+    strict: bool,
+) -> Result<HashMap<u64, EdgeSamples>, TessellationError> {
     // id -> point index built once; the linear `vertices.iter().find(id==)`
     // below was called ~2x per edge, i.e. O(E*V) on every display refresh.
     // Lookup-only, so it yields the exact same point the scan would.
@@ -382,12 +391,30 @@ pub(super) fn sample_all_edges(
         .collect();
     for edge in &solid.edges {
         let guard = guarded.contains(&edge.id) && edge.curve.degree >= 3;
-        let (mut fractions, capped) = if guard {
+        let (mut fractions, capped) = if strict && edge.curve.degree == 1 && edge.curve.control_points.len() == 2 {
+            // A single positive-weight linear span cannot turn between its
+            // endpoints. Let the full certificate validate it directly,
+            // including weights, trim endpoints and displaced shared vertices.
+            (vec![0.0, 1.0], false)
+        } else if guard {
             edge_fractions_with_guard(edge, chord_tolerance, true)?
         } else {
             edge_fractions(edge, chord_tolerance)?
         };
-        if let Some(atlases) = chart_atlases.get(&edge.id) {
+        // Discover chart crossings on the refined chain: a capped or aliased
+        // seed chain can hide crossings which the adjacent sphere must share.
+        let atlases = chart_atlases.get(&edge.id);
+        let certified = if strict {
+            let chain = chord_budget::refine_shared(edge, vertex_point(edge.start_vertex_id)?,
+                vertex_point(edge.end_vertex_id)?, chord_tolerance, &fractions)?;
+            // Only chart insertion needs a separate copy of the certified
+            // fractions. Otherwise consume the certified chain directly below.
+            if atlases.is_some() { fractions = chain.iter().map(|p| p.0).collect(); }
+            Some(chain)
+        } else {
+            None
+        };
+        if let Some(atlases) = atlases {
             let mut extra = Vec::new();
             for atlas in atlases {
                 extra.extend(chart_crossing_fractions(edge, atlas, &fractions)?);
@@ -401,6 +428,23 @@ pub(super) fn sample_all_edges(
                 fractions.dedup_by(|a, b| (*a - *b).abs() <= 1e-9);
                 fractions.retain(|fraction| *fraction >= 0.0 && *fraction <= 1.0);
             }
+        }
+        if let Some(chain) = certified {
+            let chain = if atlases.is_none() || (chain.len() == fractions.len()
+                && chain.iter().zip(&fractions).all(|(p, f)| p.0 == *f)) {
+                chain
+            } else {
+                // Chart insertion changes the chords; certify those actual
+                // chords too before any face consumes the shared positions.
+                chord_budget::refine_shared(edge, vertex_point(edge.start_vertex_id)?,
+                    vertex_point(edge.end_vertex_id)?, chord_tolerance, &fractions)?
+            };
+            samples.insert(edge.id, EdgeSamples {
+                fractions: chain.iter().map(|p| p.0).collect(),
+                positions: chain.into_iter().map(|p| p.1).collect(),
+                worst_sag: 0.0,
+            });
+            continue;
         }
         let fractions = fractions;
         let start = vertex_point(edge.start_vertex_id)?;

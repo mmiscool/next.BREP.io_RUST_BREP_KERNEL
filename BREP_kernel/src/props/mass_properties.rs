@@ -184,6 +184,8 @@ mod sphere_sign;
 mod trimmed;
 #[path = "mass_properties/winding.rs"]
 mod winding;
+#[path = "mass_properties/torus.rs"]
+mod torus;
 
 use integration::*;
 use measures::*;

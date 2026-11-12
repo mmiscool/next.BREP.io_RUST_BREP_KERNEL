@@ -901,6 +901,26 @@ impl<'a> Resolver<'a> {
         Ok((origin, axis))
     }
 
+    /// A LINE supplies its own carrier. Vertices choose the finite parameter
+    /// interval; their transverse export error must not tilt that carrier.
+    fn line_on_written_carrier(&self, args: &[Value], start: Vec3, end: Vec3) -> Result<Option<NurbsCurve>, String> {
+        let origin = self.point(args.get(1).ok_or("step_import: LINE missing origin")?.as_ref_id()?)?;
+        let vector = self.get(args.get(2).ok_or("step_import: LINE missing vector")?.as_ref_id()?)?;
+        let vector = vector.find("VECTOR").ok_or("step_import: LINE direction is not a VECTOR")?;
+        let direction = self.direction(vector.get(1).ok_or("step_import: VECTOR missing direction")?.as_ref_id()?)?;
+        let project = |point: Vec3| origin.add(direction.scale(point.sub(origin).dot(direction)));
+        let a = project(start);
+        let b = project(end);
+        // Preserve the standing representation when the difference is only
+        // arithmetic roundoff, or projection would collapse the finite edge.
+        let scale = origin.length().max(start.length()).max(end.length()).max(start.sub(end).length());
+        let roundoff = 32.0 * f64::EPSILON * scale;
+        if start.sub(a).length().max(end.sub(b).length()) <= roundoff || a.sub(b).length() <= roundoff {
+            return Ok(None);
+        }
+        make_line(a, b).map(Some)
+    }
+
     /// Resolve the geometry of an EDGE_CURVE, oriented so `evaluate(t0)` is
     /// `p_start` and `evaluate(t1)` is `p_end`. `closed` preserves the raw STEP
     /// endpoint identity: coordinate-close but ref-distinct conic endpoints are
@@ -1023,7 +1043,12 @@ impl<'a> Resolver<'a> {
                 curve.reversed()
             };
         }
-        if entity.has("LINE") {
+        if let Some(args) = entity.find("LINE") {
+            if switch!("BREP_STEP_LINE_CARRIER", false) {
+                if let Some(curve) = self.line_on_written_carrier(args, p_start, p_end)? {
+                    return Ok(curve);
+                }
+            }
             // The straight edge segment is exactly the chord between vertices.
             return make_line(p_start, p_end);
         }
@@ -1208,6 +1233,11 @@ impl<'a> Resolver<'a> {
                 loops: Vec::new(),
                 name: None,
             };
+            if switch!("BREP_STEP_OFFSET_PRECISION", false) {
+                if let Ok(surface) = crate::offset::offset_surface_for_import(&carrier, -distance) {
+                    return Ok(surface);
+                }
+            }
             return offset_surface(&carrier, -distance, 0.0).map_err(String::from);
         }
         if let Some(surface) = self.analytic_surface(entity, samples, sphere_seam, sphere_axis)? {
@@ -1612,3 +1642,4 @@ pub(super) fn reparameterize_collapsed_bezier_domain(
     }
     Ok(true)
 }
+

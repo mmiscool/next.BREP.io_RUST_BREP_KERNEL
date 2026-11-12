@@ -2941,13 +2941,29 @@ fn bounded_carrier(face: &FaceRecord) -> bool {
     // Extended trims may live outside the carrier hull. Positive pcurve
     // controls within both knot domains certify the whole trim stays inside;
     // otherwise retain the existing extension/seam handling, without epsilon.
+    // ROUNDING SLACK (`BREP_FRAGMENT_SCOPE_ULPS`, default on; `=0` restores the exact test): a trim that runs ALONG a domain
+    // border carries controls a few ulps past it (a hole wall's seam at u = -7.8e-16 or
+    // 1.0000000000000009, a bore's floor at 1.5200000000000002 of 1.52), and the exact test then
+    // called every such carrier unbounded: on a part of countersunk seats and blind bores no face
+    // was ever separated and each of 88 booleans arranged all ~500 faces to cut 6. A control within
+    // `SCOPE_ULPS` ulps of the border moves the trim off the hull by that many ulps of the
+    // carrier's size, orders below the separation band every caller adds.
+    let slack = |d: [f64; 2]| if scope_ulps_on() { SCOPE_ULPS * f64::EPSILON * d[0].abs().max(d[1].abs()).max(d[1] - d[0]) } else { 0.0 };
+    let (su, sv) = (slack(u), slack(v));
     face.surface.control_points.iter().flatten().all(positive_finite)
         && face.loops.iter().flat_map(|lp| &lp.coedges).all(|coedge| {
             coedge.pcurve.control_points.iter().all(|p| {
                 positive_finite(p) && p.point().is_ok_and(|p|
-                    p.x >= u[0] && p.x <= u[1] && p.y >= v[0] && p.y <= v[1])
+                    p.x >= u[0] - su && p.x <= u[1] + su && p.y >= v[0] - sv && p.y <= v[1] + sv)
             })
         })
+}
+
+/// The rounding slack of `bounded_carrier`'s trim test, in ulps of the domain.
+const SCOPE_ULPS: f64 = 64.0;
+
+fn scope_ulps_on() -> bool {
+    crate::switch!("BREP_FRAGMENT_SCOPE_ULPS", true)
 }
 
 /// Exact control-hull separation, including the extended-trim guard.

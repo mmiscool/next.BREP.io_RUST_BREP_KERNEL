@@ -232,7 +232,7 @@ fn net_extent(curve: &NurbsCurve) -> f64 {
 /// interior knot at its original multiplicity plus `target - degree`, which is
 /// the minimal knot vector of the elevated curve; a removal that does not
 /// verify is skipped, leaving a redundant knot rather than a wrong curve.
-pub(super) fn elevate_degree(curve: &NurbsCurve, target: usize) -> Result<NurbsCurve, String> {
+pub(crate) fn elevate_degree(curve: &NurbsCurve, target: usize) -> Result<NurbsCurve, String> {
     let degree = curve.degree;
     if target < degree {
         return Err(format!(

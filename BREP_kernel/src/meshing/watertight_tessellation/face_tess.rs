@@ -687,7 +687,13 @@ pub(super) fn tessellate_face_watertight(
             face.surface.analytic(),
             Some(crate::AnalyticSurface::RuledRevolution { .. })
         ) && developable_cdt_enabled();
-        defer_cdt = holes.is_empty() && polygon_is_simple(&outer) && !developable;
+        // Certified edges can carry far more stations than the legacy cap.
+        // A dense ear fan can exhaust the flip budget before it reaches the
+        // boundary ladder, leaving long diagonals for every refinement pass.
+        // The constrained triangulator preserves the same authored stations
+        // and declines regions whose constraints it cannot reproduce.
+        let dense_chord_boundary = chord_budget::enabled() && outer.len() > 4 * MAX_EDGE_SPANS;
+        defer_cdt = !dense_chord_boundary && holes.is_empty() && polygon_is_simple(&outer) && !developable;
         cdt_input = Some((outer.clone(), holes.clone()));
         tess_route(Route::Generic);
         Bridged::Pending(outer, holes)
