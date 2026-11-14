@@ -128,9 +128,7 @@ impl<'a> PcurveSampleScope<'a> {
         Self::open_limit(surface, curve, enabled, switch!("BREP_PCURVE_SAMPLE_ROLLOVER", false),
             if larger_working_set() { 65536 } else { PCURVE_SAMPLE_CACHE_LIMIT })
     }
-    fn open_config(surface: &'a NurbsSurface, curve: &'a NurbsCurve, enabled: bool, rollover: bool) -> Self {
-        Self::open_limit(surface, curve, enabled, rollover, PCURVE_SAMPLE_CACHE_LIMIT)
-    }
+
     fn open_limit(surface: &'a NurbsSurface, curve: &'a NurbsCurve, enabled: bool, rollover: bool, point_limit: usize) -> Self {
         let cache = enabled
             .then(|| PcurveSampleCache {
@@ -321,6 +319,21 @@ fn invert_checked_uncached(surface: &NurbsSurface, point: Vec3) -> Result<([f64;
         }
     }
     let projection = project_point_to_surface(surface, point)?;
+    // Retain the projector's actual result, before the ordinary inverter
+    // reduces it to parameters and distance. A later precision scope still
+    // refines this input; it does not reconstruct a foot from rounded data.
+    if crate::switch!("BREP_STEP_PRECISION_FOOT_REUSE", true) && !crate::projection::global_site_filter_active() {
+        FOOT_MEMO.with(|memo| {
+            if let Some(open) = memo.borrow_mut().as_mut().filter(|m| !m.precision && std::ptr::eq(m.surface,surface)) {
+                let key = point_bits(point);
+                if DEFER_FOOT_INSERTS.with(|cell|cell.get()) {
+                    open.pending_global.push((key,Some(projection)));
+                } else {
+                    open.global.insert(key,Some(projection));
+                }
+            }
+        });
+    }
     Ok(([projection.u, projection.v], projection.distance))
 }
 
@@ -1044,6 +1057,9 @@ thread_local! {
 struct FootMemo {
     precision: bool,
     surface: *const NurbsSurface,
+    /// Ordinary global feet are only starting points for precision Newton;
+    /// they never enter the precision answer map without refinement.
+    coarse_global: Option<rustc_hash::FxHashMap<[u64; 3], Option<crate::SurfaceProjection>>>,
     global: rustc_hash::FxHashMap<[u64; 3], Option<crate::SurfaceProjection>>,
     seeded: rustc_hash::FxHashMap<[u64; 5], Option<crate::SurfaceProjection>>,
     pending_global: Vec<([u64; 3], Option<crate::SurfaceProjection>)>,
@@ -1052,7 +1068,7 @@ struct FootMemo {
 
 impl FootMemo {
     fn new(surface: *const NurbsSurface) -> Self {
-        Self { precision: false, surface, global: Default::default(), seeded: Default::default(), pending_global: Vec::new(), pending_seeded: Vec::new() }
+        Self { precision: false, surface, coarse_global: None, global: Default::default(), seeded: Default::default(), pending_global: Vec::new(), pending_seeded: Vec::new() }
     }
 
     /// Fold the deferred feet into the maps (a later insert of the same key
@@ -1101,6 +1117,15 @@ impl<'a> FootMemoScope<'a> {
     fn precision(surface: &'a NurbsSurface) -> Self {
         let mut next = FootMemo::new(surface);
         next.precision = true;
+        if crate::switch!("BREP_STEP_PRECISION_FOOT_REUSE", true) && !crate::projection::global_site_filter_active() {
+            FOOT_MEMO.with(|memo| {
+                if let Some(parent) = memo.borrow().as_ref().filter(|m| !m.precision && std::ptr::eq(m.surface,surface)) {
+                    let mut coarse = parent.global.clone();
+                    coarse.extend(parent.pending_global.iter().copied());
+                    next.coarse_global = Some(coarse);
+                }
+            });
+        }
         let previous = FOOT_MEMO.with(|memo| memo.replace(Some(next)));
         Self { previous: Some(previous), _surface: std::marker::PhantomData, _thread_bound: std::marker::PhantomData }
     }
@@ -1123,9 +1148,25 @@ impl<'a> FootMemoScope<'a> {
 impl Drop for FootMemoScope<'_> {
     fn drop(&mut self) {
         if let Some(previous) = self.previous.take() {
+            if crate::profile::profile_enabled() {
+                FOOT_MEMO.with(|memo| {
+                    let memo = memo.borrow();
+                    if let Some(open) = memo.as_ref().filter(|m| m.precision) {
+                        if let Some(coarse) = &open.coarse_global {
+                            let reused = open.global.keys().filter(|key|coarse.contains_key(*key)).count();
+                            eprintln!("pcurve.precision_memo coarse={} reused_global={reused}",coarse.len());
+                        }
+                    }
+                });
+            }
             FOOT_MEMO.with(|memo| *memo.borrow_mut() = previous);
         }
     }
+}
+
+/// Whether a [`FootMemo`] is open on this thread (for any surface).
+pub(crate) fn foot_memo_open() -> bool {
+    FOOT_MEMO.with(|memo| memo.borrow().is_some())
 }
 
 fn precision_trim_feet(surface: &NurbsSurface) -> bool {
@@ -1154,23 +1195,29 @@ fn memo_global_foot(surface: &NurbsSurface, point: Vec3) -> Option<crate::Surfac
     }
     let key = point_bits(point);
     let deferring = DEFER_FOOT_INSERTS.with(|cell| cell.get());
+    let mut coarse = None;
     let hit = FOOT_MEMO.with(|memo| {
         let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
         memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)).map(|open| {
-            match open.global.get(&key).copied() {
+            let hit = match open.global.get(&key).copied() {
                 Some(foot) => Some(foot),
                 None if !deferring && !open.pending_global.is_empty() => {
                     open.fold_pending();
                     open.global.get(&key).copied()
                 }
                 None => None,
+            };
+            if hit.is_none() {
+                coarse = open.coarse_global.as_ref().and_then(|memo|memo.get(&key).copied());
             }
+            hit
         })
     });
     match hit {
         Some(Some(foot)) => foot,
         Some(None) => {
-            let foot = refine_memo_foot(surface, point, project_point_to_surface(surface, point).ok());
+            let raw = coarse.unwrap_or_else(||project_point_to_surface(surface,point).ok());
+            let foot = refine_memo_foot(surface, point, raw);
             FOOT_MEMO.with(|memo| {
         let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);
                 if let Some(open) = memo.borrow_mut().as_mut().filter(|open| std::ptr::eq(open.surface, surface)) {
@@ -1541,7 +1588,7 @@ fn tracking_acceptance_residual(
 
 /// Whether a projection-tracking candidate replaces the fit standing in
 /// [`refine_pcurve`], given the `reading` it is judged on (see
-/// [`judge_tracking_candidate`]). `standing_dense` says the standing fit's
+/// `judge_tracking_candidate`). `standing_dense` says the standing fit's
 /// reading is itself a nineteen-point one: a budget-exit candidate was taken.
 ///
 /// While the standing reading is the fitter's own, a `Converged` candidate is
@@ -1570,22 +1617,6 @@ fn tracking_candidate_accepted(standing: f64, standing_dense: bool, floor: f64, 
     reading.is_finite() && reading <= floor && reading < standing
 }
 
-/// The reading a tracking candidate is judged on, and whether it replaces the
-/// standing fit: `own` (the candidate's own residual) for a Converged
-/// candidate while the standing reading is the fitter's own; otherwise
-/// `dense` ([`tracking_acceptance_residual`]'s nineteen points per span), read
-/// only when the candidate could be taken. An error from `dense` declines.
-/// [`refine_pcurve`] decides and traces through this one function.
-fn judge_tracking_candidate(
-    standing: f64,
-    standing_dense: bool,
-    floor: f64,
-    exit: PcurveFitExit,
-    own: f64,
-    dense: impl FnOnce() -> Result<f64, String>,
-) -> (Result<Option<f64>, String>, bool) {
-    judge_tracking_candidate_with_bounds(standing, standing_dense, floor, exit, own, dense, false)
-}
 
 fn judge_tracking_candidate_with_bounds(
     standing: f64,
@@ -1686,7 +1717,7 @@ fn refine_pcurve(
         0
     };
     let reject_bounds = PCURVE_REJECT_BOUNDS.with(|state| state.get());
-    let mut best = refine_pcurve_pass(surface, curve, domain, u_domain, v_domain,
+    let best = refine_pcurve_pass(surface, curve, domain, u_domain, v_domain,
         floor, joins, parameters, raw, pcurve, off_surface, clamped, false, 1.0, false, &mut insert, false)?;
     if trace {
         eprintln!(
@@ -1775,7 +1806,7 @@ type RungState = (Vec<f64>, Vec<[f64; 2]>, NurbsCurve);
 /// The tracking rungs of [`refine_pcurve`] after an eligible first pass: for
 /// each tracking fraction, skip it if the standing fit is already that far
 /// inside the floor, otherwise run the candidate pass (`run_pass`), judge it
-/// ([`judge_tracking_candidate`], reading `dense` only when needed), trace
+/// (`judge_tracking_candidate`, reading `dense` only when needed), trace
 /// it, and either take it (`adopt` its state; it becomes the standing fit) or
 /// stop. `samples` is the candidate's station count, for the trace. Separated
 /// so the accepted-budget state can be driven with scripted passes;

@@ -101,7 +101,7 @@ use std::collections::HashSet;
 
 use crate::feature_pipeline::features::common;
 use crate::feature_pipeline::{AddedSolid, FeatureContext, FeatureRefusal, FeatureResult, SceneMap};
-use crate::{move_faces, rotate_faces, BrepSolid, KernelRefusal, KernelStage, Vec3};
+use crate::{move_faces_unchecked, rotate_faces_unchecked, BrepSolid, KernelRefusal, KernelStage, Vec3};
 
 /// Stations per boundary edge in [`selection_centre`]. A power of two, so a
 /// rational circle split into quarter spans is sampled at its span ends — the
@@ -367,17 +367,73 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
         refused.refused_step = Some(step.to_string());
         refused
     };
-    let moved = match turn {
-        None => match move_faces(&solid, &face_ids, translation) {
-            Ok(moved) => moved,
-            Err(error) => return Ok(refused_at(error, REFUSED_STEP_TRANSLATION)),
+    // A face beside a VARIABLE-RADIUS fillet has no road of its own: the band
+    // is a free-form carrier neither primitive re-intersects and the re-cut
+    // cannot bound a tool by — and where the re-cut is reached anyway (another
+    // fillet beside the face hands it the motion) it cuts the band where the
+    // moved plane crosses it and leaves it there, no longer tangent, under its
+    // name. The fillet is a derived face, so the motion is run on the body
+    // without it and the fillet is re-made on the edge the motion leaves,
+    // under its radius law (`edit/direct_edit/blend_rebuild.rs`). Offered
+    // first, and only where such a fillet borders the selection: without one
+    // it reads the selection's neighbours and steps aside.
+    let without = crate::rebuild_displaced_blends(&solid, &face_ids, "transformFace", |sharp| {
+        solve_motion(sharp, &face_ids, turn, translates, translation).map_err(|(error, _)| error)
+    });
+    let (moved, notes) = match without {
+        Some(Ok(solved)) => solved,
+        declined => match solve_motion(&solid, &face_ids, turn, translates, translation) {
+            Ok(solved) => solved,
+            Err((refusal, step)) => {
+                let refusal = match &declined {
+                    Some(Err(decline)) => crate::with_blend_rebuild_decline(refusal, decline),
+                    _ => refusal,
+                };
+                return match step {
+                    Some(step) => Ok(refused_at(refusal, step)),
+                    None => Err(refusal.into()),
+                };
+            }
         },
+    };
+    result.notes.extend(notes);
+
+    // Both roads preserve every name — collect, never re-stamp.
+    let face_names = common::collect_face_names(&moved);
+    let edge_names = common::collect_edge_names(&moved);
+    let handle = crate::register_solid_value(moved);
+    result.added.push(AddedSolid {
+        handle,
+        name: target_name.clone(),
+        face_names,
+        edge_names,
+        ..AddedSolid::default()
+    });
+    result.removed.push(target_name);
+    Ok(result)
+}
+
+/// The motion's whole road on one body: the direct re-solve, its acceptance,
+/// and the re-cut where either hands the motion on. `Ok` is the edited body
+/// and the notes the road left; `Err` is the refusal and, for a refusal of
+/// the re-solve itself, the step of the motion it names (`refused_step`).
+fn solve_motion(
+    solid: &BrepSolid,
+    face_ids: &[u64],
+    turn: Option<(Vec3, Vec3, f64)>,
+    translates: bool,
+    translation: Vec3,
+) -> Result<(BrepSolid, Vec<String>), (KernelRefusal, Option<&'static str>)> {
+    let mut notes = Vec::new();
+    let moved = match turn {
+        None => move_faces_unchecked(solid, face_ids, translation)
+            .map_err(|error| (error, Some(REFUSED_STEP_TRANSLATION)))?,
         Some((pivot, axis, angle)) => {
             let solved = if !translates {
-                rotate_faces(&solid, &face_ids, pivot, axis, angle)
+                rotate_faces_unchecked(solid, face_ids, pivot, axis, angle)
             } else {
                 crate::direct_edit::rotate_faces_rigid(
-                    &solid, &face_ids, pivot, axis, angle, translation,
+                    solid, face_ids, pivot, axis, angle, translation,
                 )
                 .map_err(|error| {
                     error.with_message(|error| {
@@ -394,15 +450,15 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                 // one refusal is offered to it directly. Its body still passes
                 // the acceptance below.
                 Err(error) if is_ruling_refusal(&error) => {
-                    match crate::recut_moved_planes_rigid(&solid, &face_ids, turn, translation) {
+                    match crate::recut_moved_planes_rigid(solid, face_ids, turn, translation) {
                         Ok(body) => {
-                            result.notes.push(format!(
+                            notes.push(format!(
                                 "transformFace: the turned face could not be re-solved against \
                                  the fillet beside it ({error}), so the selection was RE-CUT \
                                  from the original body instead"
                             ));
-                            let (body, lost) = crate::reblend_lost_fillets(&solid, &face_ids, body);
-                            result.notes.extend(lost);
+                            let (body, lost) = crate::reblend_lost_fillets(solid, face_ids, body);
+                            notes.extend(lost);
                             body
                         }
                         Err(reason) => {
@@ -411,11 +467,11 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                                     "{error}. The re-cut road was offered it too and declined: {reason}"
                                 )
                             });
-                            return Ok(refused_at(error, REFUSED_STEP_ROTATION));
+                            return Err((error, Some(REFUSED_STEP_ROTATION)));
                         }
                     }
                 }
-                Err(error) => return Ok(refused_at(error, REFUSED_STEP_ROTATION)),
+                Err(error) => return Err((error, Some(REFUSED_STEP_ROTATION))),
             }
         }
     };
@@ -440,46 +496,34 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let moved = match crate::accept_sound(moved, "transformFace") {
         Ok(body) => body,
         Err(refusal) => {
-            match recut_past_a_refusal(&solid, &face_ids, turn, translation) {
+            match recut_past_a_refusal(solid, face_ids, turn, translation) {
                 Ok((body, lost)) => {
-                    result.notes.push(format!(
+                    notes.push(format!(
                         "transformFace: the moved carriers could not be re-solved onto the body \
                          they left ({refusal}), so the selection was RE-CUT from the original \
                          body instead — the result is the boolean this motion defines, and a \
                          face whose carrier left the body is no longer on it"
                     ));
-                    result.notes.extend(lost);
+                    notes.extend(lost);
                     body
                 }
                 // The acceptance's refusal stays the primary one — its class
                 // is what the boundary reports — and the re-cut's decline is
                 // appended as context.
                 Err(reason) => {
-                    return Err(refusal
-                        .with_message(|refusal| {
+                    return Err((
+                        refusal.with_message(|refusal| {
                             format!(
                                 "{refusal}. The re-cut road was offered it too and declined: {reason}"
                             )
-                        })
-                        .into())
+                        }),
+                        None,
+                    ))
                 }
             }
         }
     };
-
-    // Both roads preserve every name — collect, never re-stamp.
-    let face_names = common::collect_face_names(&moved);
-    let edge_names = common::collect_edge_names(&moved);
-    let handle = crate::register_solid_value(moved);
-    result.added.push(AddedSolid {
-        handle,
-        name: target_name.clone(),
-        face_names,
-        edge_names,
-        ..AddedSolid::default()
-    });
-    result.removed.push(target_name);
-    Ok(result)
+    Ok((moved, notes))
 }
 
 /// The re-cut offered after the acceptance refused the moved body.

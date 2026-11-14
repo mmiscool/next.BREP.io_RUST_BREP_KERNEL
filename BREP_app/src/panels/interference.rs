@@ -1,5 +1,5 @@
-//! Interference results window — the floating window behind the Assembly
-//! workbench's `∩` toolbar button.
+//! Interference results window — the floating
+//! window behind the Assembly workbench's `∩` toolbar button.
 //!
 //! Follows the pinned Info-window idiom: a movable + resizable
 //! [`egui::Window`] drawn at ctx level, owning its own state (the last

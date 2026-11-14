@@ -67,8 +67,11 @@ impl RenderCore {
 
         // Refresh emphasis boundary buffers.
         let has_emphasis = !params.emphasis.is_empty();
-        // A solid a transparency clip made see-through draws in the blended pass.
-        let translucent = |solid: &SolidDisplay| solid.opacity.is_some_and(|opacity| opacity < 1.0);
+        // A see-through solid (a `transparency` attribute, or a motion study's
+        // clip) draws in the blended pass; one with both kinds of face draws
+        // its opaque faces here and the rest there.
+        let all_translucent = |gpu_solid: &GpuSolid| gpu_solid.base_translucent && !gpu_solid.mixed_translucency;
+        let any_translucent = |gpu_solid: &GpuSolid| gpu_solid.base_translucent || gpu_solid.mixed_translucency;
         for solid in scene.solids() {
             if let Some(gpu_solid) = gpu_scene.solids.get_mut(&solid.name) {
                 self.sync_boundary(gpu_solid, solid, params.emphasis);
@@ -203,7 +206,8 @@ impl RenderCore {
             if !params.settings.wireframe && params.settings.show_faces {
                 pass.set_pipeline(&self.mesh_pipeline);
                 for (solid, gpu_solid) in &visible_solids {
-                    if solid.mesh.indices.is_empty() || translucent(solid) {
+                    // A wholly see-through solid has nothing for this pass.
+                    if solid.mesh.indices.is_empty() || all_translucent(gpu_solid) {
                         continue;
                     }
                     bind_pose(&mut pass, gpu_scene.models.as_ref(), &self.identity_model, gpu_solid.model_slot);
@@ -244,7 +248,7 @@ impl RenderCore {
                     // to walk its faces to bind the right style per run.
                     let any_face_hidden = solid.visibility.any_face_hidden();
                     let any_face_colored = !gpu_solid.face_styles.is_empty();
-                    if !has_emphasis && !any_face_hidden && !any_face_colored {
+                    if !has_emphasis && !any_face_hidden && !any_face_colored && !any_translucent(gpu_solid) {
                         pass.set_bind_group(1, &gpu_solid.base_style.bind, &[]);
                         pass.draw_indexed(0..solid.mesh.indices.len() as u32, 0, 0..1);
                         continue;
@@ -283,6 +287,14 @@ impl RenderCore {
                             flush(&mut pass, &mut run);
                             continue;
                         }
+                        // A see-through face belongs to the blended pass,
+                        // picked or not: it stays see-through while selected
+                        // (its outline marks it), so a transparency being set
+                        // on the selection shows as it changes.
+                        if range.translucent {
+                            flush(&mut pass, &mut run);
+                            continue;
+                        }
                         let state = if has_emphasis {
                             params.emphasis.face_state(&solid.name, &face.name)
                         } else {
@@ -318,7 +330,7 @@ impl RenderCore {
             if let (Some(look), false) = (&scene.line_art, params.settings.wireframe) {
                 pass.set_pipeline(&self.hull_pipeline);
                 for (solid, gpu_solid) in &visible_solids {
-                    if solid.mesh.indices.is_empty() || translucent(solid) {
+                    if solid.mesh.indices.is_empty() || all_translucent(gpu_solid) {
                         continue;
                     }
                     let style = if look.placed.contains(&solid.name) { &self.styles.line_art_placed_outline } else { &self.styles.line_art_adding_outline };
@@ -346,7 +358,19 @@ impl RenderCore {
                     }
                     bind_pose(&mut pass, gpu_scene.models.as_ref(), &self.identity_model, gpu_solid.model_slot);
                     pass.set_vertex_buffer(0, edge_buf.slice(..));
-                    if solid.visibility.any_edge_hidden() {
+                    if !gpu_solid.edge_styles.is_empty() {
+                        // Edges with a look of their own dim in their own colour.
+                        draw_edge_runs(&mut pass, solid, gpu_solid, |index, edge| {
+                            if edge.aux || !solid.visibility.is_edge_visible(index) {
+                                return None;
+                            }
+                            Some(match gpu_solid.edges[index].style {
+                                Some(slot) => &gpu_solid.edge_styles[slot as usize].hidden.bind,
+                                None => &self.styles.edge_hidden.bind,
+                            })
+                        });
+                        pass.set_bind_group(1, &self.styles.edge_hidden.bind, &[]);
+                    } else if solid.visibility.any_edge_hidden() {
                         // Single style already bound: draw only visible edges.
                         draw_visible_edge_ranges(&mut pass, solid, gpu_solid, EdgeFilter::Real);
                     } else {
@@ -400,6 +424,30 @@ impl RenderCore {
                             pass.set_bind_group(1, bind, &[]);
                             pass.draw(0..6, range.first_instance..range.first_instance + range.instance_count);
                         }
+                        continue;
+                    }
+                    if !gpu_solid.edge_styles.is_empty() {
+                        // Some edge has its own colour or opacity: every edge
+                        // picks its bind group, runs of one coalesced.
+                        draw_edge_runs(&mut pass, solid, gpu_solid, |index, edge| {
+                            if !solid.visibility.is_edge_visible(index) || (edge.aux && !aux_shown) {
+                                return None;
+                            }
+                            let state = if has_emphasis {
+                                params.emphasis.edge_state(&solid.name, &edge.name)
+                            } else {
+                                EmphasisState::Base
+                            };
+                            Some(match (gpu_solid.edges[index].style, state) {
+                                (Some(slot), EmphasisState::Base) => &gpu_solid.edge_styles[slot as usize].base.bind,
+                                (Some(slot), EmphasisState::Selected) => &gpu_solid.edge_styles[slot as usize].selected.bind,
+                                (Some(slot), EmphasisState::Hovered) => &gpu_solid.edge_styles[slot as usize].hovered.bind,
+                                (None, EmphasisState::Base) if edge.aux => &self.styles.edge_aux.bind,
+                                (None, EmphasisState::Base) => &self.styles.edge_base.bind,
+                                (None, EmphasisState::Selected) => &self.styles.edge_selected.bind,
+                                (None, EmphasisState::Hovered) => &self.styles.edge_hovered.bind,
+                            })
+                        });
                         continue;
                     }
                     if !has_emphasis {
@@ -584,13 +632,18 @@ impl RenderCore {
                     }
                 }
             }
-            // Translucent solids (a motion study's transparency clip): after
-            // every opaque thing, through the blended context pipeline (depth
-            // test on, depth write off), each with its own base style, whose
-            // alpha `face_base_color` took from the display's opacity.
+            // See-through faces (a `transparency` attribute, or a motion
+            // study's clip): after every opaque thing, through the blended
+            // context pipeline (depth test on, depth write off), each in its
+            // own style, whose alpha is the face's opacity. A picked or
+            // hovered one keeps its own look; its outline marks it.
             if !params.settings.wireframe && params.settings.show_faces {
                 let mut any = false;
-                for (solid, gpu_solid) in visible_solids.iter().filter(|(solid, _)| translucent(solid) && !solid.mesh.indices.is_empty()) {
+                for (solid, gpu_solid) in visible_solids.iter().filter(|(solid, gpu_solid)| any_translucent(gpu_solid) && !solid.mesh.indices.is_empty()) {
+                    // A Line art step drew a part-opaque solid whole, flat.
+                    if scene.line_art.is_some() && !all_translucent(gpu_solid) {
+                        continue;
+                    }
                     if !any {
                         pass.set_pipeline(&self.context_pipeline);
                         any = true;
@@ -598,16 +651,43 @@ impl RenderCore {
                     bind_pose(&mut pass, gpu_scene.models.as_ref(), &self.identity_model, gpu_solid.model_slot);
                     pass.set_vertex_buffer(0, gpu_solid.vertex_buf.slice(..));
                     pass.set_index_buffer(gpu_solid.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.set_bind_group(1, &gpu_solid.base_style.bind, &[]);
-                    if !solid.visibility.any_face_hidden() {
-                        pass.draw_indexed(0..solid.mesh.indices.len() as u32, 0, 0..1);
+                    // One style, nothing to leave out: the whole mesh (or its
+                    // visible faces) in one go.
+                    if all_translucent(gpu_solid) && gpu_solid.face_styles.is_empty() {
+                        pass.set_bind_group(1, &gpu_solid.base_style.bind, &[]);
+                        draw_visible_faces(&mut pass, solid, gpu_solid);
                         continue;
                     }
-                    for (index, face) in gpu_solid.faces.iter().enumerate() {
-                        if solid.visibility.is_face_visible(index) {
-                            pass.draw_indexed(face.first_index..face.first_index + face.index_count, 0, 0..1);
+                    // Otherwise walk the faces, coalescing contiguous ones
+                    // that share a style.
+                    type Run = (Option<u32>, u32, u32); // slot, first, count
+                    let mut run: Option<Run> = None;
+                    let flush = |pass: &mut wgpu::RenderPass, run: &mut Option<Run>| {
+                        if let Some((slot, first, count)) = run.take() {
+                            let style = slot.and_then(|s| gpu_solid.face_styles.get(s as usize)).unwrap_or(&gpu_solid.base_style);
+                            pass.set_bind_group(1, &style.bind, &[]);
+                            pass.draw_indexed(first..first + count, 0, 0..1);
+                        }
+                    };
+                    for (index, range) in gpu_solid.faces.iter().enumerate() {
+                        if range.index_count == 0 {
+                            continue;
+                        }
+                        if !range.translucent || !solid.visibility.is_face_visible(index) {
+                            flush(&mut pass, &mut run);
+                            continue;
+                        }
+                        match &mut run {
+                            Some((slot, first, count)) if *slot == range.style && *first + *count == range.first_index => {
+                                *count += range.index_count;
+                            }
+                            _ => {
+                                flush(&mut pass, &mut run);
+                                run = Some((range.style, range.first_index, range.index_count));
+                            }
                         }
                     }
+                    flush(&mut pass, &mut run);
                 }
             }
             if let Some((gpu_context, context_scene)) = context {
@@ -996,6 +1076,42 @@ fn draw_visible_faces(pass: &mut wgpu::RenderPass<'_>, solid: &SolidDisplay, gpu
     }
     if let Some((first, count)) = run {
         pass.draw_indexed(first..first + count, 0, 0..1);
+    }
+}
+
+/// Draw a solid's edges each in the bind group `bind_for` gives it (`None`:
+/// not drawn), contiguous edges sharing one coalesced into a single call.
+fn draw_edge_runs<'a>(
+    pass: &mut wgpu::RenderPass<'_>,
+    solid: &SolidDisplay,
+    gpu_solid: &GpuSolid,
+    bind_for: impl Fn(usize, &crate::scene::EdgeDisplay) -> Option<&'a wgpu::BindGroup>,
+) {
+    let mut run: Option<(&wgpu::BindGroup, u32, u32)> = None; // bind, first_instance, count
+    for (index, edge) in solid.edges.iter().enumerate() {
+        let range = &gpu_solid.edges[index];
+        if range.instance_count == 0 {
+            continue;
+        }
+        let bind = bind_for(index, edge);
+        match (&mut run, bind) {
+            (Some((run_bind, first, count)), Some(bind))
+                if std::ptr::eq(*run_bind, bind) && *first + *count == range.first_instance =>
+            {
+                *count += range.instance_count;
+            }
+            _ => {
+                if let Some((run_bind, first, count)) = run.take() {
+                    pass.set_bind_group(1, run_bind, &[]);
+                    pass.draw(0..6, first..first + count);
+                }
+                run = bind.map(|bind| (bind, range.first_instance, range.instance_count));
+            }
+        }
+    }
+    if let Some((run_bind, first, count)) = run {
+        pass.set_bind_group(1, run_bind, &[]);
+        pass.draw(0..6, first..first + count);
     }
 }
 

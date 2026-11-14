@@ -44,8 +44,32 @@ button { font:inherit; color:var(--text); background:#2b3d4e; border:1px solid v
 button.primary { background:var(--accent); color:#111; border-color:var(--accent); font-weight:600; }
 button:disabled { opacity:.4; cursor:default; }
 #signoff { margin-top:16px; display:grid; gap:8px; }
-#signoff input { font:inherit; padding:10px; border-radius:8px; border:1px solid var(--line); background:#0e141b; color:var(--text); min-height:44px; }
 #message { color:var(--caution); min-height:1.4em; }
+/* The step's record (shop mode): the fields the author asked for, the part
+   ticks and the record's own controls. Touch-sized. */
+#record { margin-top:16px; display:grid; gap:12px; }
+#record h3 { font-size:13px; color:var(--dim); margin:0; text-transform:uppercase; }
+.field { display:grid; gap:6px; }
+.field > .name { font-weight:600; }
+.field.required > .name::after { content:" *"; color:var(--accent); }
+.field .hint, .field .limits { color:var(--dim); font-size:14px; }
+.field .flag { color:var(--caution); font-weight:600; }
+.field .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.field .pick { display:flex; gap:10px; align-items:center; min-height:44px; cursor:pointer; }
+.field input[type=checkbox], .add input.tick { width:24px; height:24px; flex:none; accent-color:var(--check); }
+.field input[type=text], .field select, .field textarea, #signoff input { font:inherit; padding:10px; border-radius:8px; border:1px solid var(--line); background:#0e141b; color:var(--text); min-height:44px; }
+.field input[type=text], .field select, .field textarea { width:100%; }
+.field input.number { width:9em; }
+.field input.bad { border-color:var(--caution); }
+.field textarea { resize:vertical; }
+.recorded { display:grid; grid-template-columns:auto 1fr; gap:2px 10px; font-size:15px; }
+.recorded dt { color:var(--dim); }
+.recorded dd { margin:0; word-break:break-word; }
+#record-tools { margin-top:18px; padding-top:12px; border-top:1px solid var(--line); display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+#record-tools button { min-height:40px; padding:6px 14px; font-size:14px; }
+#record-tools .note { color:var(--dim); font-size:13px; flex-basis:100%; }
+#record-tools .note.warn { color:var(--caution); }
+body.customer #record, body.customer #record-tools { display:none; }
 #signed { color:var(--check); }
 body.customer #notes { display:none; }
 #tools .tool { display:flex; align-items:center; gap:10px; margin:4px 0; }
@@ -140,7 +164,9 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
       <div class="section" id="callouts"></div>
       <div class="section" id="notes"></div>
       <div class="section" id="pmi-section"><h3>Annotations</h3><div id="pmi-list"></div></div>
+      <div id="record"></div>
       <div id="signoff"></div>
+      <div id="record-tools"></div>
     </section>
     <section id="part-info" aria-label="Part"></section>
   </main>
@@ -1104,8 +1130,23 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
     $('next').disabled = current === steps.length - 1;
     var adds = $('adds');
     adds.textContent = '';
-    step.adds.forEach(function (add) {
+    step.adds.forEach(function (add, addIndex) {
       var row = el('div', 'add');
+      // Shop mode: a tick per part, kept with the build's record.
+      if (mode === 'shop') {
+        var tick = el('input', 'tick');
+        tick.type = 'checkbox';
+        tick.setAttribute('data-add', String(addIndex));
+        tick.setAttribute('aria-label', 'Got ' + (add.name || add.part));
+        tick.checked = !!(record.ticks[step.id] && record.ticks[step.id][addIndex]);
+        tick.addEventListener('click', function (e) { e.stopPropagation(); });
+        tick.addEventListener('change', function () {
+          var ticks = record.ticks[step.id] || (record.ticks[step.id] = {});
+          if (tick.checked) ticks[addIndex] = true; else delete ticks[addIndex];
+          saveRecord();
+        });
+        row.appendChild(tick);
+      }
       var pic = safeImage(add.thumbnail);
       if (pic) { var img = el('img'); img.alt = ''; img.src = pic; row.appendChild(img); }
       if (add.findNumber) row.appendChild(el('span', 'find', add.findNumber));
@@ -1173,52 +1214,437 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
     }
   }
 
+  // ---------- The build's record (shop mode) ----------
+  // What the person doing the work enters: the step's fields (the author's:
+  // a box to tick, a choice, text, a measurement with limits, a serial
+  // number), a tick per part, a serial per unit of a serial-tracked part,
+  // and the steps done. A value is plain JSON, the same the app and a server
+  // read (a tick true, a choice its option or an array of them, text, a
+  // measurement as typed). With a job the record goes to the server at
+  // sign-off; without one it is kept in this browser's localStorage under
+  // the document's own key (data.recordKey: another document, or another
+  // revision, is another record), every access guarded: with storage
+  // blocked the page works and says the record is not being kept.
+  var record = { fields: {}, ticks: {}, serials: {}, done: done };
+  var storageKey = null, storageOk = true, OTHER = '\u0000other';
+
+  function hashText(text) {
+    var h = 0x811c9dc5;
+    for (var i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return ('0000000' + h.toString(16)).slice(-8);
+  }
+  function recordKey() {
+    if (typeof data.recordKey === 'string' && data.recordKey) return data.recordKey;
+    var t = data.target || {};
+    return hashText([data.title, t.sourceKey, t.revision, t.signature].concat(steps.map(function (st) { return st.id; })).join('|'));
+  }
+  function loadRecord() {
+    if (mode !== 'shop' || config.job) return;
+    storageKey = 'brep-instructions-record:' + recordKey();
+    try {
+      var text = window.localStorage.getItem(storageKey);
+      var saved = text ? JSON.parse(text) : null;
+      if (saved && typeof saved === 'object') {
+        ['fields', 'ticks', 'serials', 'done'].forEach(function (k) {
+          if (saved[k] && typeof saved[k] === 'object' && !Array.isArray(saved[k])) record[k] = saved[k];
+        });
+      }
+    } catch (e) { storageOk = false; }
+    done = record.done;
+  }
+  function saveRecord() {
+    if (!storageKey) return;
+    var was = storageOk;
+    try { window.localStorage.setItem(storageKey, JSON.stringify(record)); storageOk = true; } catch (e) { storageOk = false; }
+    if (was !== storageOk) renderRecordTools();
+  }
+  function clearRecord() {
+    done = {};
+    record = { fields: {}, ticks: {}, serials: {}, done: done };
+    if (storageKey) { try { window.localStorage.removeItem(storageKey); } catch (e) { storageOk = false; } }
+    renderStep();
+  }
+
+  function optionsOf(field) {
+    var out = [];
+    (field.options || []).forEach(function (o) { o = String(o).trim(); if (o && out.indexOf(o) < 0) out.push(o); });
+    return out;
+  }
+  function showNumber(v, decimals) { return (decimals === undefined || decimals === null) ? String(v) : v.toFixed(decimals); }
+  // `10.00 mm, 9.95–10.05`: the nominal and the limits, as the paper prints them.
+  function limitsText(field) {
+    if (field.kind !== 'number') return '';
+    var has = function (v) { return typeof v === 'number' && isFinite(v); };
+    var unit = String(field.unit || '').trim();
+    var withUnit = function (t) { return unit ? t + ' ' + unit : t; };
+    var show = function (v) { return showNumber(v, field.decimals); };
+    var range = has(field.min) && has(field.max) ? show(field.min) + '–' + show(field.max)
+      : has(field.min) ? 'min ' + show(field.min) : has(field.max) ? 'max ' + show(field.max) : null;
+    if (has(field.nominal)) return range ? withUnit(show(field.nominal)) + ', ' + range : withUnit(show(field.nominal));
+    return range ? withUnit(range) : '';
+  }
+  // One value read against its field: { value (undefined: nothing entered),
+  // inLimits (a measurement with a limit), error (a value the field cannot hold) }.
+  function evaluateField(field, raw) {
+    var name = String(field.label || '').trim() || field.id;
+    if (raw === undefined || raw === null) return {};
+    if (field.kind === 'check') return raw === true ? { value: true } : {};
+    if (field.kind === 'number') {
+      var text = String(raw).trim();
+      if (!text) return {};
+      var n = /^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(text) ? parseFloat(text) : NaN;
+      if (!isFinite(n)) return { error: "'" + name + "' takes a number" };
+      var out = { value: n };
+      var lo = typeof field.min === 'number', hi = typeof field.max === 'number';
+      if (lo || hi) out.inLimits = (!lo || n >= field.min) && (!hi || n <= field.max);
+      return out;
+    }
+    if (field.kind === 'choice' && field.multiple) {
+      var picked = [];
+      (Array.isArray(raw) ? raw : [raw]).forEach(function (v) { v = String(v).trim(); if (v && picked.indexOf(v) < 0) picked.push(v); });
+      return picked.length ? { value: picked } : {};
+    }
+    var t = String(raw).trim();
+    return t ? { value: t } : {};
+  }
+  // Why the field keeps its step open, or null.
+  function blockingReason(field, read) {
+    var name = String(field.label || '').trim() || field.id;
+    if (read.error) return read.error;
+    if (read.value === undefined) {
+      if (!field.required) return null;
+      return (field.kind === 'check' ? 'tick' : field.kind === 'choice' ? 'choose' : 'enter') + " '" + name + "'";
+    }
+    if (field.kind === 'number' && field.requiredInLimits !== false && read.inLimits === false) return "'" + name + "' is out of limits (" + limitsText(field) + ')';
+    return null;
+  }
+  function fieldRaw(step, field) { var m = record.fields[step.id]; return m ? m[field.id] : undefined; }
+  function setField(step, field, value) {
+    var m = record.fields[step.id] || (record.fields[step.id] = {});
+    if (value === undefined || value === null || value === '' || value === false || (Array.isArray(value) && !value.length)) delete m[field.id];
+    else m[field.id] = value;
+    saveRecord();
+    refreshGate();
+  }
+  // The serial-tracked units of a step: one serial each.
+  function serialUnits(step) {
+    var out = [];
+    (step.adds || []).forEach(function (add) {
+      if (!add.serialTracked) return;
+      (add.occurrences || []).forEach(function (occ, k) {
+        out.push({ occurrence: occ, part: add.part, label: (add.name || add.part) + (add.quantity > 1 ? ' #' + (k + 1) : '') });
+      });
+    });
+    return out;
+  }
+  // Everything that keeps the step from being signed off or marked done.
+  function gateReasons(step) {
+    var reasons = [];
+    if (serialUnits(step).some(function (u) { return !String(record.serials[u.occurrence] || '').trim(); })) reasons.push('enter every serial number');
+    (step.fields || []).forEach(function (field) {
+      var why = blockingReason(field, evaluateField(field, fieldRaw(step, field)));
+      if (why) reasons.push(why);
+    });
+    return reasons;
+  }
+  var gate = null;
+  function refreshGate() {
+    if (!gate) return;
+    var reasons = gateReasons(gate.step);
+    gate.button.disabled = reasons.length > 0;
+    gate.message.textContent = reasons.length ? 'First: ' + reasons.join('; ') + '.' : '';
+  }
+  // What a sign-off sends for the step's fields: every one with a value.
+  function fieldEntries(step) {
+    var out = [];
+    (step.fields || []).forEach(function (field) {
+      var read = evaluateField(field, fieldRaw(step, field));
+      if (read.value === undefined) return;
+      var entry = { id: field.id, label: field.label || '', value: read.value };
+      if (field.kind === 'number' && String(field.unit || '').trim()) entry.unit = String(field.unit).trim();
+      if (read.inLimits !== undefined) entry.in_limits = read.inLimits;
+      out.push(entry);
+    });
+    return out;
+  }
+  function valueText(v) {
+    if (v === true) return 'yes';
+    if (v === false || v === undefined || v === null) return '';
+    return Array.isArray(v) ? v.join('; ') : String(v);
+  }
+
+  // One field as an input. `locked`: the step is done, the value only shown.
+  function renderField(step, field, locked) {
+    var box = el('div', 'field' + (field.required ? ' required' : ''));
+    box.setAttribute('data-field', field.id);
+    box.setAttribute('data-kind', field.kind);
+    var raw = fieldRaw(step, field);
+    var name = String(field.label || '').trim() || 'Field';
+    var input;
+    if (field.kind === 'check') {
+      var pick = el('label', 'pick');
+      input = el('input');
+      input.type = 'checkbox';
+      input.checked = raw === true;
+      input.addEventListener('change', function () { setField(step, field, input.checked); });
+      pick.appendChild(input);
+      pick.appendChild(el('span', 'name', name + (field.required ? ' *' : '')));
+      box.appendChild(pick);
+      box.className = 'field';
+    } else {
+      box.appendChild(el('div', 'name', name));
+    }
+    if (field.kind === 'choice' && field.multiple) {
+      box.appendChild(el('div', 'hint', 'Mark all that apply'));
+      var options = optionsOf(field), picked = Array.isArray(raw) ? raw.slice() : [];
+      var boxes = [], otherInput = null;
+      var collect = function () {
+        var out = [];
+        boxes.forEach(function (b) { if (b.checked) out.push(b.value); });
+        if (otherInput && otherInput.value.trim()) out.push(otherInput.value.trim());
+        setField(step, field, out);
+      };
+      options.forEach(function (option) {
+        var line = el('label', 'pick'), b = el('input');
+        b.type = 'checkbox'; b.value = option; b.checked = picked.indexOf(option) >= 0; b.disabled = locked;
+        b.addEventListener('change', collect);
+        boxes.push(b);
+        line.appendChild(b);
+        line.appendChild(el('span', '', option));
+        box.appendChild(line);
+      });
+      if (field.other) {
+        otherInput = el('input', 'other');
+        otherInput.type = 'text'; otherInput.placeholder = 'Other'; otherInput.disabled = locked;
+        otherInput.value = picked.filter(function (v) { return options.indexOf(v) < 0; })[0] || '';
+        otherInput.addEventListener('input', collect);
+        box.appendChild(otherInput);
+      }
+    } else if (field.kind === 'choice') {
+      var opts = optionsOf(field), current = typeof raw === 'string' ? raw : '';
+      input = el('select');
+      var addOption = function (value, label) { var o = el('option', '', label); o.value = value; input.appendChild(o); };
+      addOption('', '—');
+      opts.forEach(function (option) { addOption(option, option); });
+      var free = el('input', 'other');
+      free.type = 'text'; free.placeholder = 'Other'; free.disabled = locked;
+      var isOther = !!field.other && current !== '' && opts.indexOf(current) < 0;
+      if (field.other) addOption(OTHER, 'Other…');
+      input.value = isOther ? OTHER : current;
+      free.value = isOther ? current : '';
+      free.hidden = !isOther;
+      input.addEventListener('change', function () {
+        free.hidden = input.value !== OTHER;
+        if (input.value === OTHER) { setField(step, field, free.value.trim()); free.focus(); } else setField(step, field, input.value);
+      });
+      free.addEventListener('input', function () { setField(step, field, free.value.trim()); });
+      box.appendChild(input);
+      if (field.other) box.appendChild(free);
+    } else if (field.kind === 'text' && field.lines > 1) {
+      input = el('textarea');
+      input.rows = Math.min(20, field.lines);
+      input.value = typeof raw === 'string' ? raw : '';
+      input.addEventListener('input', function () { setField(step, field, input.value); });
+      box.appendChild(input);
+    } else if (field.kind === 'text' || field.kind === 'serial') {
+      input = el('input');
+      input.type = 'text';
+      if (field.kind === 'serial') input.autocapitalize = 'characters';
+      input.value = typeof raw === 'string' ? raw : '';
+      input.addEventListener('input', function () { setField(step, field, input.value); });
+      box.appendChild(input);
+    } else if (field.kind === 'number') {
+      var row = el('div', 'row');
+      input = el('input', 'number');
+      input.type = 'text';
+      input.setAttribute('inputmode', 'decimal');
+      input.value = raw === undefined || raw === null ? '' : String(raw);
+      var flag = el('span', 'flag');
+      var judge = function () {
+        var read = evaluateField(field, fieldRaw(step, field));
+        var text = read.error ? 'Not a number' : read.inLimits === false ? 'Out of limits' : '';
+        flag.textContent = text;
+        input.className = 'number' + (text ? ' bad' : '');
+      };
+      input.addEventListener('input', function () { setField(step, field, input.value); judge(); });
+      row.appendChild(input);
+      var unit = String(field.unit || '').trim();
+      if (unit) row.appendChild(el('span', 'unit', unit));
+      var limits = limitsText(field);
+      if (limits) row.appendChild(el('span', 'limits', '(' + limits + ')'));
+      row.appendChild(flag);
+      box.appendChild(row);
+      judge();
+    }
+    if (input) {
+      input.id = 'field-' + field.id;
+      input.disabled = locked;
+      if (field.kind !== 'check') input.setAttribute('aria-label', name);
+    }
+    var hint = String(field.hint || '').trim();
+    if (hint) box.appendChild(el('div', 'hint', hint));
+    return box;
+  }
+
+  // The step's record and its completion: the fields, a serial per unit of
+  // a serial-tracked part, and the button (Sign off step with a job, Mark
+  // step done without). A step is completed when it needs a sign-off or
+  // carries fields. Customer mode shows none of it.
   function renderSignoff(step) {
-    var box = $('signoff');
+    var recordBox = $('record'), box = $('signoff');
+    recordBox.textContent = '';
     box.textContent = '';
-    if (mode !== 'shop' || !step.signoff) return;
+    gate = null;
+    renderRecordTools();
+    if (mode !== 'shop') return;
+    var fields = step.fields || [];
     var signedRecord = job && job.steps ? job.steps.filter(function (s) { return s.step === step.id && s.signed_by; })[0] : null;
     if (signedRecord) {
+      // The jobs floor's record of the step: what was entered at sign-off.
+      var kept = signedRecord.fields || [], serials = signedRecord.serials || [];
+      if (kept.length || serials.length) {
+        recordBox.appendChild(el('h3', '', 'Record'));
+        var list = el('dl', 'recorded');
+        kept.forEach(function (entry) {
+          list.appendChild(el('dt', '', entry.label || entry.id));
+          list.appendChild(el('dd', '', valueText(entry.value) + (entry.unit ? ' ' + entry.unit : '') + (entry.in_limits === false ? ' (out of limits)' : '')));
+        });
+        serials.forEach(function (entry) {
+          list.appendChild(el('dt', '', 'Serial'));
+          list.appendChild(el('dd', '', entry.serial));
+        });
+        recordBox.appendChild(list);
+      }
       box.appendChild(el('div', '', 'Signed by ' + signedRecord.signed_by + ' at ' + signedRecord.signed_at)).id = 'signed';
       return;
     }
-    if (done[step.id] && !config.job) {
+    var locked = !!done[step.id] && !config.job;
+    if (fields.length) {
+      recordBox.appendChild(el('h3', '', 'Record'));
+      fields.forEach(function (field) { recordBox.appendChild(renderField(step, field, locked)); });
+    }
+    if (!step.signoff && !fields.length) return;
+    var inputs = [];
+    serialUnits(step).forEach(function (unit) {
+      var input = el('input');
+      input.type = 'text';
+      input.placeholder = 'Serial: ' + unit.label;
+      input.setAttribute('data-occurrence', unit.occurrence);
+      input.setAttribute('data-part', unit.part);
+      input.value = record.serials[unit.occurrence] || '';
+      input.disabled = locked;
+      input.addEventListener('input', function () {
+        if (input.value.trim()) record.serials[unit.occurrence] = input.value; else delete record.serials[unit.occurrence];
+        saveRecord();
+        refreshGate();
+      });
+      inputs.push(input);
+      // Labelled like a field: a filled box no longer shows its placeholder.
+      var wrap = el('div', 'field required');
+      wrap.appendChild(el('div', 'name', 'Serial: ' + unit.label));
+      wrap.appendChild(input);
+      box.appendChild(wrap);
+    });
+    if (locked) {
       box.appendChild(el('div', '', 'Checked')).id = 'signed';
       var undo = el('button', '', 'Uncheck');
-      undo.addEventListener('click', function () { delete done[step.id]; renderStep(); });
+      undo.addEventListener('click', function () { delete done[step.id]; saveRecord(); renderStep(); });
       box.appendChild(undo);
       return;
-    }
-    var inputs = [];
-    if (config.job) {
-      step.adds.forEach(function (add) {
-        if (!add.serialTracked) return;
-        add.occurrences.forEach(function (occ, k) {
-          var input = el('input');
-          input.placeholder = 'Serial: ' + (add.name || add.part) + (add.quantity > 1 ? ' #' + (k + 1) : '');
-          input.setAttribute('data-occurrence', occ);
-          input.setAttribute('data-part', add.part);
-          inputs.push(input);
-          box.appendChild(input);
-        });
-      });
     }
     var button = el('button', 'primary', config.job ? 'Sign off step' : 'Mark step done');
     button.id = 'signoff-button';
     var message = el('div', '', '');
     message.id = 'message';
     button.addEventListener('click', function () {
-      if (!config.job) { done[step.id] = true; renderStep(); return; }
+      if (gateReasons(step).length) { refreshGate(); return; }
+      if (!config.job) { done[step.id] = new Date().toISOString(); saveRecord(); renderStep(); return; }
       var serials = inputs.map(function (i) { return { occurrence: i.getAttribute('data-occurrence'), part: i.getAttribute('data-part'), serial: i.value.trim() }; });
-      if (serials.some(function (s) { return !s.serial; })) { message.textContent = 'Enter every serial number first.'; return; }
       button.disabled = true;
-      signoff(step.id, serials).then(function () { button.disabled = false; renderStep(); }, function (err) {
+      signoff(step.id, serials, fieldEntries(step)).then(function () { renderStep(); }, function (err) {
         button.disabled = false;
         message.textContent = err.message;
       });
     });
     box.appendChild(button);
     box.appendChild(message);
+    gate = { step: step, button: button, message: message };
+    refreshGate();
+  }
+
+  // The record as a document: every step in order with its fields' values,
+  // serials, ticks and when it was marked done.
+  function recordDocument() {
+    return {
+      title: data.title || '', target: data.target || {}, recordKey: recordKey(), exported: new Date().toISOString(),
+      steps: steps.map(function (step) {
+        return {
+          id: step.id, number: step.number, title: step.title, done: typeof done[step.id] === 'string' ? done[step.id] : (done[step.id] ? true : null),
+          fields: (step.fields || []).map(function (field) {
+            var read = evaluateField(field, fieldRaw(step, field));
+            var row = { id: field.id, label: field.label || '', kind: field.kind, value: read.value === undefined ? null : read.value };
+            if (field.kind === 'number') { row.unit = String(field.unit || '').trim(); row.inLimits = read.inLimits === undefined ? null : read.inLimits; }
+            return row;
+          }),
+          serials: serialUnits(step).map(function (u) { return { occurrence: u.occurrence, part: u.part, label: u.label, serial: String(record.serials[u.occurrence] || '').trim() }; }),
+          ticked: (step.adds || []).map(function (_, i) { return !!(record.ticks[step.id] && record.ticks[step.id][i]); })
+        };
+      })
+    };
+  }
+  // One CSV cell: quoted, quotes doubled; text a spreadsheet would run as a
+  // formula is led by an apostrophe (a plain number is left alone).
+  function csvCell(v) {
+    var t = v === undefined || v === null ? '' : String(v);
+    if (/^[=+\-@\t\r]/.test(t) && !/^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(t)) t = "'" + t;
+    return '"' + t.replace(/"/g, '""') + '"';
+  }
+  function recordCsv() {
+    var lines = [['step', 'step title', 'field', 'value', 'unit', 'in limits', 'done']];
+    recordDocument().steps.forEach(function (step) {
+      var when = step.done === true ? 'yes' : (step.done || '');
+      step.fields.forEach(function (f) {
+        lines.push([step.number, step.title, f.label, valueText(f.value), f.unit || '', f.inLimits === true ? 'yes' : f.inLimits === false ? 'no' : '', when]);
+      });
+      step.serials.forEach(function (u) { lines.push([step.number, step.title, 'Serial: ' + u.label, u.serial, '', '', when]); });
+      if (!step.fields.length && !step.serials.length && step.done) lines.push([step.number, step.title, '', '', '', '', when]);
+    });
+    return lines.map(function (cells) { return cells.map(csvCell).join(','); }).join('\r\n') + '\r\n';
+  }
+  function download(name, type, text) {
+    var link = el('a');
+    var url = URL.createObjectURL(new Blob([text], { type: type }));
+    link.href = url;
+    link.download = name;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+  function recordFileName(extension) {
+    var stem = String(data.title || 'instructions').replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'instructions';
+    return stem + '-record.' + extension;
+  }
+  // The record's own controls, where the page keeps it (shop mode, no job):
+  // export it as JSON or CSV, or clear this build to start the next.
+  var clearArmed = 0;
+  function renderRecordTools() {
+    var box = $('record-tools');
+    box.textContent = '';
+    box.hidden = mode !== 'shop' || !!config.job || !steps.length;
+    if (box.hidden) return;
+    var tool = function (id, label, title, fn) { var b = el('button', '', label); b.id = id; b.title = title; b.addEventListener('click', fn); box.appendChild(b); return b; };
+    tool('record-json', 'Export record (JSON)', 'Download what was entered at every step', function () { download(recordFileName('json'), 'application/json', JSON.stringify(recordDocument(), null, 2)); });
+    tool('record-csv', 'Export record (CSV)', 'Download what was entered at every step, one row per field', function () { download(recordFileName('csv'), 'text/csv', recordCsv()); });
+    var armed = Date.now() - clearArmed < 5000;
+    tool('record-clear', armed ? 'Clear everything entered?' : 'Clear this build', 'Forget every value, tick, serial and done mark, for the next build', function () {
+      if (Date.now() - clearArmed < 5000) { clearArmed = 0; clearRecord(); return; }
+      clearArmed = Date.now();
+      renderRecordTools();
+    });
+    box.appendChild(el('div', 'note' + (storageOk ? '' : ' warn'), storageOk
+      ? 'What you enter is kept in this browser for this document until you clear it.'
+      : 'This browser is not keeping what you enter: export the record before closing the page.'));
   }
 
   // ---------- Model and Parts tabs ----------
@@ -1558,13 +1984,13 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
         (j.steps || []).forEach(function (s) { if (s.signed_by) done[s.step] = true; });
       });
   }
-  function signoff(stepId, serials) {
+  function signoff(stepId, serials, fields) {
     var path = '/api/jobs/' + encodeURIComponent(config.job) + '/steps/' + encodeURIComponent(stepId) + '/signoff';
-    return api('POST', path, { serials: serials }).then(function (record) {
+    return api('POST', path, { serials: serials, fields: fields }).then(function (signed) {
       done[stepId] = true;
       if (job) {
         var row = (job.steps || []).filter(function (s) { return s.step === stepId; })[0];
-        if (row && record) { row.signed_by = record.signed_by; row.signed_at = record.signed_at; }
+        if (row && signed) { row.signed_by = signed.signed_by; row.signed_at = signed.signed_at; row.serials = signed.serials || []; row.fields = signed.fields || []; }
       }
     });
   }
@@ -1588,7 +2014,7 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
     redraw();
   });
   document.addEventListener('keydown', function (e) {
-    if (e.target && e.target.tagName === 'INPUT') return;
+    if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
     if (tab !== 'steps') return;
     if (e.key === 'ArrowRight' || e.key === 'PageDown') go(current + 1);
     if (e.key === 'ArrowLeft' || e.key === 'PageUp') go(current - 1);
@@ -1615,6 +2041,13 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
         style: data.style || 'shaded', arrows: arrowsDrawn, held: held };
     },
     go: go,
+    // The build's record: what was entered (fields by step and field id,
+    // part ticks, serials, the steps done), where it is kept, what still
+    // keeps the shown step open, and the exports as text.
+    record: function () { return JSON.parse(JSON.stringify(record)); },
+    storage: function () { return { key: storageKey, ok: storageOk }; },
+    missing: function () { return steps[current] ? gateReasons(steps[current]) : []; },
+    exportRecord: function (kind) { return kind === 'csv' ? recordCsv() : JSON.stringify(recordDocument(), null, 2); },
     // For automation: hold the step's insertion at `fraction` (0 = where
     // the parts start, 1 = seated); null lets it play again.
     hold: function (fraction) { held = (fraction === null || fraction === undefined) ? null : Math.max(0, Math.min(1, +fraction)); anim.running = false; redraw(); return held; },
@@ -1647,6 +2080,7 @@ body.tab-parts #parts { display:block; overflow:auto; padding:16px; min-height:0
     document.title = data.title || 'Instructions';
     $('doc-sub').textContent = data.subtitle || '';
     flatten();
+    loadRecord();
     try { initGL(); } catch (e) { gl = null; }
     buildAssembly();
     document.body.classList.add('tab-steps');

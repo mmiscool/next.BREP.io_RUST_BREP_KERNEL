@@ -7,7 +7,6 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde::Serialize;
-use serde_json::json;
 
 #[path = "fragment/types.rs"]
 mod types;

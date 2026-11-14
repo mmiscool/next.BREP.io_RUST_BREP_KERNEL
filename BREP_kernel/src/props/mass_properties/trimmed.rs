@@ -68,10 +68,6 @@ fn note_sliver(update: impl FnOnce(&mut SliverMeasure)) {
     });
 }
 
-/// Chords whose correction was skipped on this thread since it started.
-pub(super) fn straight_corrections_skipped() -> u64 {
-    STRAIGHT_CORRECTIONS_SKIPPED.with(|cell| cell.get())
-}
 
 /// Integrate all `kinds` over the trimmed parameter region in ONE pass over
 /// a conforming cell decomposition (Golovanov §8.10): knot-span grid cells,
@@ -261,7 +257,7 @@ fn runs_past_domain(face: &FaceRecord, polygons: &[TrimPolygon], [u0, u1, v0, v1
     static OPEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let open = *OPEN.get_or_init(|| std::env::var("BREP_MASS_OPEN_EXTENSION").as_deref() != Ok("0"));
     let (closed_u, closed_v) = face.surface.closed_directions()?;
-    if switch!("BREP_MASS_EXACT_DOMAIN_COVER", false) {
+    if switch!("BREP_MASS_EXACT_DOMAIN_COVER", true) {
         // Sampled chord vertices cannot certify that the arcs stay inside:
         // a trim can leave the carrier between two samples. Positive-weight
         // control hulls provide the conservative certificate instead. An
@@ -385,6 +381,11 @@ pub(super) fn integrate_trimmed_polys(
     // covering-plane path keeps the per-station `deriv1_extended` (its wrap is
     // a per-station decision), and so does a patch above the stack-basis
     // degree.
+    let interior_fast = switch!("BREP_MASS_EXTENDED_INTERIOR", true);
+    let extension_partials = switch!("BREP_MASS_EXTENSION_PARTIALS", true);
+    let prepared_trim = if extended && switch!("BREP_MASS_TRIM_BASIS", true) {
+        crate::surface::PreparedTrimPartials::new(&face.surface).ok().flatten()
+    } else { None };
     let tensor_block = !extended && face.surface.deriv1_tensor_supported() && tensor_blocks_on();
     let mut totals = vec![0.0f64; kinds.len()];
     let station = |u: f64, v: f64, weight: f64, totals: &mut [f64]| -> Result<(), String> {
@@ -392,8 +393,12 @@ pub(super) fn integrate_trimmed_polys(
         // domain; the periodic extension wraps it back onto the real surface
         // (identical to `derivatives` in-domain, so the non-extended path is
         // bit-for-bit unchanged).
-        let (point, su, sv) = if extended {
-            face.surface.deriv1_extended(u, v)?
+        let in_domain = u >= u0 && u <= u1 && v >= v0 && v <= v1;
+        let (point, su, sv) = if let Some(prepared) = &prepared_trim {
+            prepared.deriv1(u,v)?
+        } else if extended && !(interior_fast && in_domain) {
+            if extension_partials { face.surface.deriv1_extended_trim(u,v)? }
+            else { face.surface.deriv1_extended(u,v)? }
         } else {
             face.surface.deriv1(u, v)?
         };
@@ -491,7 +496,15 @@ pub(super) fn integrate_trimmed_polys(
             }
             mass_profile(|p| p.full_cells += 1);
             let full_started = super::profile::profile_started();
-            if tensor_block {
+            let interior_stations = if extended && interior_fast && cell[0] >= u0 && cell[1] <= u1
+                && cell[2] >= v0 && cell[3] <= v1 {
+                super::integration::integrate_interior_cell_base(
+                    face, cell, winding * orientation, kinds, &mut totals, &mut rules,
+                )?
+            } else { None };
+            if let Some(stations) = interior_stations {
+                mass_profile(|p| p.full_stations += stations as u64);
+            } else if tensor_block {
                 // The cell's own tensor blocks: the same stations, order and
                 // weights as the one-block rule on a polynomial carrier, and
                 // the panels and orders a RATIONAL one's weights ask for

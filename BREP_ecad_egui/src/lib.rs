@@ -1,4 +1,12 @@
-//! An embeddable schematic and PCB editor. The host owns file I/O and application chrome.
+//! Embeddable egui editors for BREP_ecad_core documents: schematic and
+//! wiring-diagram sheets, the board, symbols and pads (footprints).
+//!
+//! The host owns file I/O and application chrome. [`Editor`] edits the
+//! [`Document`] it holds; call [`Editor::toolbar`] and [`Editor::show`] each
+//! frame and take [`Editor::take_change`] to learn that something changed.
+//! [`actions()`] lists every command, named and grouped, for a host's toolbar,
+//! menus and automation. [`SymbolEditor`] and [`FootprintEditor`] edit one
+//! symbol or one footprint. See the README for an example.
 use std::collections::BTreeMap;
 use brep_ecad_core::{
     Component, ConnectionTarget, Document, DocumentKind, Graphic, History, Label, PartSource,

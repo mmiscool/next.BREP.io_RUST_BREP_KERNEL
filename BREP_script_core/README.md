@@ -28,9 +28,8 @@ let source = r#"
 "#;
 
 // No host bindings beyond `console`: pass an `install` that adds nothing.
-let no_bindings = |_: &mut _, _: &_| Ok(());
 let input = json!({"number": "P-100", "revision": 1, "description": "Bracket"});
-match call(source, "hooks.js", "onRelease", &input, &no_bindings) {
+match call(source, "hooks.js", "onRelease", &input, &|_, _| Ok(())) {
     Ok(done) => println!("{} (log: {:?})", done.value, done.logs),
     Err(Failure { message, logs }) => eprintln!("refused: {message} (log: {logs:?})"),
 }
@@ -53,12 +52,35 @@ This prints `{"ok":true,"revision":2} (log: ["checking P-100"])`. Without a
 - **Failures are sentences.** A throw, a parse error, or a function the file
   does not define all return `Failure { message, logs }`; for
   `throw new Error("x")` and `throw "x"` the message is `x`.
-- **Bounded, honestly.** Each loop may run at most `LOOP_ITERATION_LIMIT`
-  (10,000,000) iterations and the call depth is at most `RECURSION_LIMIT`
-  (512), so `while (true) {}` and runaway recursion throw instead of hanging.
-  There is **no wall-clock limit**: Boa cannot pre-empt a running script, so
-  many individually bounded loops can still run long, and a script blocked in
-  a host function is bounded only by that function's own timeout.
+- **`console`.** `console.log`, `info`, `warn` and `error` write into the
+  call's log (`warn` and `error` lines are prefixed `warn: ` and `error: `);
+  `Success::logs` and `Failure::logs` return it.
+- **Bounded, honestly.** Each call frame may run at most
+  `LOOP_ITERATION_LIMIT` (10,000,000) loop iterations in total (Boa counts per
+  frame, not per loop) and the call depth is at most `RECURSION_LIMIT` (512),
+  so `while (true) {}` and runaway recursion throw instead of hanging. A loop
+  that calls a function whose own loops stay under the limit is not bounded in
+  total. There is **no wall-clock limit**: Boa cannot pre-empt a running
+  script, so many individually bounded loops can still run long, and a script
+  blocked in a host function is bounded only by that function's own timeout.
+- **Helpers.** `describe` turns a Boa `JsError` into the message a person
+  reads, and `text_of` formats one value as a log line shows it.
+
+## ES modules and the worker
+
+- `modules::with_module` evaluates a graph of ES modules held in memory
+  (a map of package-local paths to sources; only `./` and `../` imports
+  resolve) in a fresh, equally bounded context, then hands the evaluated entry
+  module to a callback. `modules::synchronous` rejects a Promise result from a
+  callback that must answer synchronously.
+- `worker` is a restricted execution protocol, one JSON message per line: a
+  program (an ES module with a default `main`) that can import only the SDK
+  module it is started with and reaches its host only through calls the host
+  answers. `worker::Realm` is the event-driven core (`begin`, `answer`,
+  `abandon`) a host drives with messages, for example from a browser Web
+  Worker; on native targets `worker::main` runs it over stdin and stdout, for
+  a host that starts it as a separate process and enforces CPU, memory and
+  time limits by killing that process.
 
 ## Feature flags
 

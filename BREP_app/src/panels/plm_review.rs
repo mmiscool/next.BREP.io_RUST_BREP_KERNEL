@@ -674,7 +674,7 @@ impl ReviewPanel {
         let waker = repaint_waker(ui.ctx());
         self.poll(&waker, server);
         self.hits.clear();
-        let mut events = Vec::new();
+        let events = Vec::new();
         // `recovery::wall_clock`, not `SystemTime::now`: std's clock PANICS on
         // wasm32 ("time not implemented on this platform"), which killed the
         // hosted app the first time this pane drew (verify_plm_review.mjs).

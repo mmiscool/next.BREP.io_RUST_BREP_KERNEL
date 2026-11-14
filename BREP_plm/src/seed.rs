@@ -1,5 +1,5 @@
 //! Family and template SEED documents, read and written the way the CAD app
-//! reads and writes them (§3.2, round 8).
+//! reads and writes them.
 //!
 //! The server never links the CAD app (it does link the kernel). This module
 //! reads and writes just the document fields families and templates use —

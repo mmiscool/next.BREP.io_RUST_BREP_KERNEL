@@ -52,7 +52,7 @@
 //! the kernel assigns that provenance whichever construction built the ring
 //! (`offset_shell::claim_bore_end_rings`), so a saved reference to it survives.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::feature_pipeline::features::common;
 use crate::feature_pipeline::{FeatureContext, FeatureRefusal, FeatureResult};

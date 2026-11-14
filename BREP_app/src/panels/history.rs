@@ -474,6 +474,11 @@ impl HistoryPanel {
         }
         let mut params: Value =
             serde_json::from_str(&state.feature_params_json(index)).unwrap_or(Value::Null);
+        // Older weld documents may omit the toggle. Display the schema default
+        // in the edit buffer without changing the document merely by opening it.
+        if ty == "WELD" && params.get("generateSolid").is_none() {
+            params["generateSolid"] = state.feature_default_params(&ty)["generateSolid"].clone();
+        }
         // The schema-driven field-visibility hook: which params this feature's
         // dialog should hide for its CURRENT values (e.g. a SIMPLE hole hides the
         // countersink/counterbore fields). Recomputed every frame from the live

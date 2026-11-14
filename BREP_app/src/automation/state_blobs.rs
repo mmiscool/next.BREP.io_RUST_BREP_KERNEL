@@ -12,7 +12,7 @@
 pub const STATE_BLOBS: &[(&str, &str)] = &[
     ("__brepCamera", "camera state: kind, eye, target, up, near/far, projection block, worldPerPixel"),
     ("__brepSettings", "render and UI settings"),
-    ("__brepSolidColors", "per-solid colour overrides"),
+    ("__brepSolidColors", "per-solid colour overrides, with each solid's edges that carry a colour or transparency of their own"),
     ("__brepHistory", "history listing {step, features:[{index,type,id}]}"),
     ("__brepGizmo", "transform gizmo state"),
     ("__brepFile", "file dialog state (mode, entries, current name)"),
@@ -30,7 +30,7 @@ pub const STATE_BLOBS: &[(&str, &str)] = &[
     ("__brepWireHarness", "wire harness connections and the last routing report"),
     ("__brepCam", "CAM state {setups: [{id, name, operations: [op id], record}], tools, operations, ncPrograms, idCounter, strategies, orientations, frames: {id: {origin, xAxis, zAxis, frameError, stock}}, selected, open, notice, error}"),
     ("__brepInstructions", "Instructions pane state {selected: the step selected in the pane, notice, error}"),
-    ("__brepInstructionsPlayer", "Player pane state {mode: shop|customer, step: the step shown, insertion: how far its parts have come home (null once they are), pending: a move waits for the next frame, checked: {step: [part index]}, serials: {occurrence: serial}, signed: [step], error}"),
+    ("__brepInstructionsPlayer", "Player pane state {mode: shop|customer, step: the step shown, insertion: how far its parts have come home (null once they are), pending: a move waits for the next frame, checked: {step: [part index]}, serials: {occurrence: serial}, fields: {step: {field id: value}} (the recorded step fields: true for a tick, a choice's option or an array of them, text and a measurement as typed), missing: [what still keeps the shown step from being signed off or marked done], signed: [step], error}"),
     ("__brepSimulation", "Simulation state {available: the document is an assembly a study can drive, block: the simulation block or null, mates: [{id, kind: distance|angle, value, enabled}] a motor can drive, pane: {notice, error}}"),
     ("__brepCamSim", "CAM simulation player state {loaded, speed, stopAtCollision, cell, showDeviation, notice, error, session: {setup, multiAxis, playing, motion, fraction, time, totalSeconds, progress, motions, completed, applied, caughtUp, removedVolume, stockVolume, unsupported, operation, operations, marks, collisionMotions, deviation, stockVersion}}"),
     ("__brepPorts", "the part's declared connection points (the `ports` block) and the ports tail's report of the last run"),

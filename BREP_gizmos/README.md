@@ -31,7 +31,7 @@ Defined in `src/lib.rs`:
 - `HandleId` — an opaque `u32` token returned by `hit` and echoed back by the
   host's interaction layer to start a drag (`0` = body / no specific handle).
 
-Conventions (shared with the engine): right-handed world space; column-major
+Conventions (shared with the engine): right-handed world space with +Y up; column-major
 4x4 world-to-clip matrices with z in 0..1, byte-identical to the engine's
 `Camera::view_proj`; screen coordinates top-left origin, y down, in CSS
 pixels.
@@ -43,7 +43,8 @@ pixels.
   It holds no interaction state; the host feeds the feature frame
   (`TransformGizmo::set_frame`) and start/current pick rays, and reads back
   frame-space drag deltas (`axis_translate`, `plane_translate`, `ring_rotate`,
-  `center_translate`).
+  `center_translate`, or `drag_delta`, which dispatches on the handle and
+  returns a `DragDelta`).
 - `view_cube` — the orientation cube that mirrors the main camera (via the
   camera's true up, not a forward-derived heuristic). Its 26 cube hit regions
   (6 faces + 12 edges + 8 corners) decode directly to the standard view
@@ -54,18 +55,23 @@ pixels.
 - `datum` — builders for datum display geometry: `datum_plane` /
   `datum_plane_screen` (world-sized or screen-constant plane cards),
   `datum_axis` (axis line with arrowhead), `datum_frame` (the screen-constant
-  X/Y/Z triad), and `world_axes`, each returning an `Overlay` plus hit-testing
-  where the visual is pickable.
+  X/Y/Z triad), and `world_axes`, each returning an `Overlay`; the pickable
+  `DatumPlane` and `DatumAxis` implement `Gizmo` for hit-testing.
 - `dimension` — CAD dimension leader geometry: `linear_dimension`,
   `angular_dimension`, and `radial_dimension` build the witness/extension
   lines, dimension line, arc, and arrowheads, and return a `label_anchor`
   world point where the host renders the numeric text (text itself is drawn by
-  the host, never here).
+  the host, never here). Each builder returns a `DimensionAnnotation`
+  (`overlay` + `label_anchor`); `*_colored` variants take an explicit color.
 - `curve_display` — turns already-sampled curve polylines into overlay
   segments (`polyline_display`), provides a parametric helix fallback
   (`helix_display` / `helix_points`), and optional spline control-point
   handles with hit-testing (`control_point_handles` / `hit_control_point`).
   No curve math beyond the helix — the engine samples kernel curves.
+- `hit_region` — screen-space pickable regions (`HitShape` capsules and
+  circles, built by `segment_region` / `point_region` through the
+  `RegionCamera` trait) that a gizmo's hit-test and its debug outline share;
+  `TransformGizmo::hit_regions` returns them per handle.
 - `raster` — a small CPU rasterizer (z-buffered flat-lit triangles,
   screen-space-width lines, PNG output) so a gizmo can be eyeballed headless
   during development. Not a production render path.
@@ -87,10 +93,10 @@ Each takes an optional output path argument.
 ## Place in the crate family
 
 `BREP_app` → `BREP_render` → { `BREP_kernel`, **`BREP_gizmos`**,
-`BREP_reconstruction` }.
+`BREP_reconstruction`, and other BREP crates }.
 `BREP_render` consumes this crate's `Overlay` output for its overlay pass; the
 gizmos themselves never touch the kernel or the GPU.
 
 - License: the Autodrop3d licence in `LICENSE.md`, shipped in the crate
   (`license-file` in the manifest).
-- Version: 0.2.4.
+- Version: 0.2.6.

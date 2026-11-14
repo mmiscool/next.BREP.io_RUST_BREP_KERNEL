@@ -2,8 +2,8 @@
 //! in the scripts directory, and test-run a function.
 //!
 //! Every route needs the admin group. The directory stays the source of truth
-//! — these routes read and write those same files, so an edit here shows up
-//! in `git status` and a `git pull` shows up here.
+//! — these routes read and write those same files, so an
+//! edit here shows up in `git status` and a `git pull` shows up here.
 //!
 //! # A test run is a real run
 //!

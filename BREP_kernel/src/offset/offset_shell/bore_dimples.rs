@@ -13,8 +13,8 @@
 //!
 //! The carve is exact only where nothing but the rim is within `d` of the
 //! dimple. A bore qualifies when its cylinder faces are concave of radius at
-//! most `d`, it is open at both ends onto end planes square to its axis that
-//! are material out to `r + d` around the rim, every other face and edge
+//! most `d`, each end it opens at (both of a through bore, the mouth of a
+//! blind one) is an end plane square to its axis that is material around the rim, every other face and edge
 //! stands at least `d` from both dimples (a box test in the bore's frame,
 //! conservative), and the grown body still fills the dimple. Anything else
 //! leaves the grown body as it was.
@@ -35,6 +35,9 @@ struct Bore {
     axis: Vec3,
     radius: f64,
     span: [f64; 2],
+    /// Whether the bore opens past the end at `span[0]` and at `span[1]`. A
+    /// blind bore is closed at its floor, where no rim rolls and no dimple is.
+    open: [bool; 2],
     faces: Vec<u64>,
 }
 
@@ -111,13 +114,14 @@ fn bores(source: &BrepSolid, distance: f64, scale: f64) -> Vec<Bore> {
                 bore.span = [bore.span[0].min(a.min(b)), bore.span[1].max(a.max(b))];
                 bore.faces.push(face.id);
             }
-            None => found.push(Bore { origin, axis, radius, span, faces: vec![face.id] }),
+            None => found.push(Bore { origin, axis, radius, span, open: [false; 2], faces: vec![face.id] }),
         }
     }
-    // Hollow along its whole length (concave, open at both ends): the axis is
-    // outside the body at the middle and just past each end, and the body is
-    // material just outside the cylinder at the middle.
-    found.retain(|bore| {
+    // Hollow along its whole length (concave): the axis is outside the body at
+    // the middle, the body is material just outside the cylinder there, and
+    // each end either opens (the axis is outside just past it) or is a blind
+    // bore's floor (material just past it). At least one end opens.
+    found.retain_mut(|bore| {
         let (x, y) = across(bore.axis);
         let at = |t: f64| bore.origin.add(bore.axis.scale(t));
         let middle = 0.5 * (bore.span[0] + bore.span[1]);
@@ -125,9 +129,12 @@ fn bores(source: &BrepSolid, distance: f64, scale: f64) -> Vec<Bore> {
         let eps = 1e-3 * length.min(bore.radius);
         let out = |p: Vec3| classify(source, p, scale) == Some(PointClass::Out);
         let inside = |p: Vec3| classify(source, p, scale) == Some(PointClass::In);
+        let (low, high) = (at(bore.span[0] - eps), at(bore.span[1] + eps));
+        bore.open = [out(low), out(high)];
         out(at(middle))
-            && out(at(bore.span[0] - eps))
-            && out(at(bore.span[1] + eps))
+            && (bore.open[0] || inside(low))
+            && (bore.open[1] || inside(high))
+            && (bore.open[0] || bore.open[1])
             && [x, y, x.scale(-1.0), y.scale(-1.0)].iter().all(|r| inside(at(middle).add(r.scale(bore.radius + eps))))
     });
     found
@@ -323,7 +330,10 @@ pub(super) fn carve_bore_dimples(source: &BrepSolid, grown: &BrepSolid, distance
     let found = bores(source, distance, scale);
     os_debug!("bore dimples: {} bore(s) of radius at most {distance}", found.len());
     for bore in found {
-        for (t, out) in [(bore.span[1], bore.axis), (bore.span[0], bore.axis.scale(-1.0))] {
+        for (t, out, open) in [(bore.span[1], bore.axis, bore.open[1]), (bore.span[0], bore.axis.scale(-1.0), bore.open[0])] {
+            if !open {
+                continue;
+            }
             if !flat_end(source, &bore, t, out, distance, scale) {
                 os_debug!("bore dimples: the end at {t} is not flat at its rim");
                 return None;

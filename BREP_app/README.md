@@ -1,7 +1,7 @@
 # BREP_app
 
 The BREP CAD application: one Rust egui/wgpu codebase for native desktop and
-WebAssembly. Package `BREP_app`, library `brep_app`, version 0.19.0.
+WebAssembly. Package `BREP_app`, library `brep_app`, version 0.20.0.
 The 3D engine is `BREP_render`; geometry comes from `BREP_kernel`.
 
 ## Build and run
@@ -44,10 +44,32 @@ The generated Exec argument quotes the actual executable path, including spaces.
 Avoid `%` in the installation path: some GLib desktop launchers check executable
 existence before expanding escaped percent characters and cannot discover that entry.
 Desktop launch starts the ordinary GUI, like `brep-app`, without implicitly
-starting another MCP listener. To attach to that window, use its Start MCP
-server action. Use `brep-app --mcp --session-root DIR` for a CLI-launched window
+starting another MCP listener. To attach to that window, use the **Start MCP
+server** button in its Info window. Use `brep-app --mcp --session-root DIR` for a CLI-launched window
 host and configure artifacts before opening the JavaScript editor. Do not
 launch another MCP host on the same port.
+
+## Command line
+
+`brep-app --help` prints the full list. The main switches:
+
+- `brep-app FILE` opens a part (`.nbrep`), family seed (`.fbrep`) or template
+  (`.tbrep`) in a tab; a STEP, IGES, STL, 3MF, OBJ or KiCad file is imported
+  into a new untitled tab.
+- `--mcp [--mcp-port PORT] [--session-root DIR]` embeds the MCP server (default
+  port 8765); `--mcp-instance NAME`, `--mcp-state-dir DIR` or `--mcp-ephemeral`
+  choose where its execution journal lives.
+- `--provision-typescript` and `--typescript-status` install or report the
+  pinned TypeScript compiler used for TypeScript scripts.
+- `--kicad-library` opens the KiCad library importer instead of the CAD window.
+- `--install-file-associations` / `--uninstall-file-associations` register or
+  remove this executable as the opener for BREP documents.
+- `--plm-url URL`, `--plm-token-file FILE`, `--plm-configure URL`,
+  `--plm-forget`, `--plm-show` and `--plm-check` connect to and configure a
+  [`BREP_plm`](https://crates.io/crates/BREP_plm) server.
+- `--bake-worker [--once | --poll SECS]` runs as the PLM server's headless
+  bake worker, with no window.
+- `--version` prints the version.
 
 ## Touch navigation in the 3D view
 
@@ -60,12 +82,14 @@ in a locked sketch view without changing its orientation.
 
 ## JavaScript editor
 
-Choose **JavaScript…** from the toolbar's workbench dropdown (beside **Plugins…**)
-to edit and run code in the active document.
-The editor starts with a box example. **Run script** executes the statements;
-console output, notifications, returned JSON, and errors appear below the editor.
-**Save draft** keeps the source locally, including in PLM mode. **Open .js…** and
-**Export .js…** exchange source files on desktop and in the browser.
+Choose **JavaScript** from the File menu (under **Settings**, beside
+**Plugins**) to edit and run code in the active document.
+The editor starts with the saved draft, or a box example when there is none.
+**Run script** executes the code; console output, notifications, returned JSON,
+and errors appear below the editor. **Cancel** stops a running script.
+**Save draft** keeps the source locally, including in PLM mode. **Export .js…**
+saves the source as a file on desktop and in the browser; **Open .js…** loads a
+file in the browser.
 
 ```js
 for (let i = 0; i < 3; i++) {
@@ -76,24 +100,29 @@ return { featuresBefore: cad.document.features.length };
 ```
 
 `cad.document` provides the history snapshot and `addFeature(type, params)`,
-`updateFeature(id, params)`, and `deleteFeature(id)`. `cad.selection` provides
-the selection snapshot. `ui.notify(text)` displays a message in the output.
+`updateFeature(id, params)`, and `deleteFeature(id)`; these document commands
+apply in order after the script returns. `cad.selection` provides the selection
+snapshot. `ui.notify(text)` displays a message in the output.
 Scripts can use JavaScript for calculations, loops, and inspecting the snapshot
 without changing a model. Feature types and parameters use the same schemas as
 the modeling UI; `P.CU`, `P.S`, and `P.CY` create boxes, spheres, and cylinders.
 
-Execution uses the history worker on desktop and in the browser. Successful
-changes create one undo step; failed scripts or failed model recomputes discard
-all staged edits. Cancel discards pending results. Run executes again each time
-it is pressed. Source is kept outside the model; generated built-in features
-save and replay normally. Scripts run synchronously with interpreter loop and
-recursion limits; DOM, Node, network, filesystem access, and Promises are
-unavailable. The JavaScript plugin API provides replayable custom geometry
-features for more advanced generators.
+With the default features, Run sends the script to the application's own
+script runner: on desktop the embedded MCP server's code runner, in the browser
+the page's Web Worker runner. The script body may `await`, and
+`await cad.brep.<group>.<tool>(args)` calls any application tool, the same
+functions an agent's `run_script` gets. A script that starts with
+`import { brep } from "@brep/cad"` and `export default async function main()`
+runs as written. A run's edits form one undo step; a failed or cancelled run is
+rolled back. Run executes again each time it is pressed. Source is kept outside
+the model; generated built-in features save and replay normally. The JavaScript
+plugin API provides replayable custom geometry features for more advanced
+generators.
 
 ## Feature flags
 
-- `mcp` (default, native only) — the embedded MCP server behind `--mcp`.
+- `mcp` (default) — natively, the embedded MCP server behind `--mcp`; in the
+  WebAssembly build, the WebMCP tool host (see below).
 - `scripting` (default) — scripts in the application, on the Boa interpreter
   from [`BREP_script_core`](https://crates.io/crates/BREP_script_core), native
   and wasm.
@@ -109,15 +138,22 @@ features for more advanced generators.
 | `src/viewport.rs`, `src/viewport/` | Offscreen 3D render, egui composition, input and labels |
 | `src/panels/` | History, scene, sketches, files, assemblies, PMI, harness and other panels |
 | `src/form.rs`, `src/form_view.rs` | Shared schema fields and complete forms |
-| `src/workbench/` | Six definitions, feature predicates, contributed actions and panel claims |
+| `src/workbench/` | Workbench definitions (All, Modeling, Sheet Metal, Wire harness, Assembly, Drawing, Diagram, PCB, Symbol, Pads, CAM, Instructions, Simulation), the PMI command set, feature predicates, contributed actions and panel claims |
 | `src/store.rs` | Native filesystem and browser persistence |
 | `src/recovery.rs` | Dirty-document autosave and startup recovery |
 | `src/automation/` | Command/state/hit-key registries, queue and virtual input |
 | `src/mcp.rs` | Native attached-window server host |
+| `src/webmcp.rs` | Browser WebMCP tool host |
+| `src/javascript.rs` | In-app JavaScript editor |
+| `src/plm/` | PLM client: connection, sign-in, change feed and bake worker |
 
 `EngineState` owns the editable history, undo, scene, camera, selections and
 editing modes. Panels borrow it and apply intents; they do not keep another
 feature list. Native and browser runners evaluate history off the UI thread.
+
+The workbench is chosen from the toolbar's workbench dropdown. PMI is not a
+workbench: Modeling, Sheet Metal and Assembly (and All) each show a **PMI**
+ribbon tab and the shared PMI panel.
 
 History has a tree and a separate form. The same form view serves features,
 assembly constraints, PMI annotations and dialog screenshots. Workbenches filter

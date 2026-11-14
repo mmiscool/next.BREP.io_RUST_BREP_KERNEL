@@ -401,7 +401,32 @@ fn surface_newton_impl(
         distance_squared: surface.evaluate(u, v)?.sub(point).length_squared(),
         converged,
     };
+    // A step is a function of (u, v) alone, so an iterate that returns to an
+    // earlier one bit for bit repeats that stretch until the iteration cap:
+    // no exit fires (none did on the first pass through it), the best point
+    // cannot improve (every state of the stretch has been read, and the
+    // comparison is strict), and the state the cap would leave is the stretch's
+    // state at the cap's index. Take that state now instead of walking there
+    // (`BREP_PROJECTION_NEWTON_CYCLE_EXIT`, default on; `=0` walks). Measured
+    // on one import with fitted high-degree carriers and the projected-foot
+    // refine on: about one Newton call in eighteen ran to the cap, those calls
+    // held half of all Newton iterations, and at least three in five of them
+    // were repeating a stretch of eight states or fewer.
+    let cycle_exit = switch!("BREP_PROJECTION_NEWTON_CYCLE_EXIT", true);
+    let mut trail = [(0u64, 0u64); MAX_NEWTON_ITERATIONS];
     for iteration in 0..MAX_NEWTON_ITERATIONS {
+        if cycle_exit {
+            let state = (u.to_bits(), v.to_bits());
+            if let Some(first) = trail[..iteration].iter().position(|earlier| *earlier == state) {
+                let period = iteration - first;
+                let (last_u, last_v) = trail[first + (MAX_NEWTON_ITERATIONS - first) % period];
+                u = f64::from_bits(last_u);
+                v = f64::from_bits(last_v);
+                crate::imprint::work_profile::add(|c| c.newton_iterations += (MAX_NEWTON_ITERATIONS - iteration) as u64);
+                break;
+            }
+            trail[iteration] = state;
+        }
         crate::imprint::work_profile::add(|c| c.newton_iterations += 1);
         let derivatives = surface.derivatives_small(u, v, if lazy { 0 } else { 2 })?;
         let residual = derivatives[0][0].sub(point);
@@ -2672,5 +2697,6 @@ pub(crate) fn curve_foot_newton(
     let (_, nearest, squared) = curve_foot_newton_state(curve, point, seed, bracket, policy)?;
     Ok((nearest, squared))
 }
+
 
 

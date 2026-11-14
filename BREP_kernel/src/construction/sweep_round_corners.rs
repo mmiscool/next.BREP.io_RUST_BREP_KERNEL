@@ -54,6 +54,7 @@ pub fn sweep_profile_round_corners(section: &[NurbsCurve], path: &[Vec3]) -> Res
     }
     let mut section = section.to_vec();
     let mut parts = Vec::new();
+    let mut fixed: Vec<Vec3> = Vec::new();
     for index in 0..path.len() - 1 {
         let run = path[index + 1].sub(path[index]);
         let along = run.normalized().map_err(|_| input("path", format!("run {index} has no length")))?;
@@ -106,7 +107,15 @@ pub fn sweep_profile_round_corners(section: &[NurbsCurve], path: &[Vec3]) -> Res
                     }
                     outline.push(if coedge.forward { piece } else { piece.reversed().or_refuse(stage, "sweepRoundCorners.reverse")? });
                 }
-                parts.push(revolve_profile_brep(&outline, corner, axis, angle).or_refuse(KernelStage::Fragment, "sweepRoundCorners.turn")?);
+                let turned = revolve_profile_brep(&outline, corner, axis, angle).or_refuse(KernelStage::Fragment, "sweepRoundCorners.turn")?;
+                // where the section crosses the corner's axis the turn has a point that does not move
+                for vertex in &turned.vertices {
+                    let d = vertex.point.sub(corner);
+                    if d.sub(axis.scale(d.dot(axis))).length() <= 1e-9 * reach {
+                        fixed.push(vertex.point);
+                    }
+                }
+                parts.push(turned);
             }
         }
         section = section.iter().map(|curve| moved(curve, &|point| corner.add(point.sub(corner).rotate_about(axis, angle)))).collect::<Result<_, _>>()?;
@@ -114,6 +123,40 @@ pub fn sweep_profile_round_corners(section: &[NurbsCurve], path: &[Vec3]) -> Res
     if parts.len() == 1 {
         return Ok(parts.remove(0));
     }
-    boolean_operation_nary(&parts, BooleanOperation::Union)
+    let mut solid = boolean_operation_nary(&parts, BooleanOperation::Union)?;
+    if axis_points_on() {
+        // Both runs and the turn touch along the section's tangents at a point
+        // on the corner's axis, so the union finds its vertex there only to the
+        // square root of round-off; the point itself is known.
+        let mut put = Vec::new();
+        for vertex in &mut solid.vertices {
+            if let Some(point) = fixed.iter().find(|point| point.sub(vertex.point).length() <= 1e-6 * reach) {
+                vertex.point = *point;
+                put.push((vertex.id, *point));
+            }
+        }
+        // and the edges that end there end there: an edge that is the whole of
+        // its curve has that end's control point at the vertex
+        for edge in &mut solid.edges {
+            let Ok([low, high]) = edge.curve.domain() else { continue };
+            let margin = 1e-12 * (high - low);
+            let last = edge.curve.control_points.len() - 1;
+            for (vertex, at_end, index) in [(edge.start_vertex_id, (edge.t0 - low).abs() <= margin, 0), (edge.end_vertex_id, (edge.t1 - high).abs() <= margin, last)] {
+                let Some((_, point)) = put.iter().find(|(id, _)| *id == vertex) else { continue };
+                if at_end {
+                    let control = &mut edge.curve.control_points[index];
+                    (control.x, control.y, control.z) = (point.x * control.w, point.y * control.w, point.z * control.w);
+                }
+            }
+        }
+    }
+    Ok(solid)
+}
+
+/// `BREP_SWEEP_CORNER_AXIS_POINTS` (default on, `=0` restores): the vertices
+/// of a sweep with round corners that lie where the section crosses a
+/// corner's axis are put on those points exactly.
+fn axis_points_on() -> bool {
+    crate::switch!("BREP_SWEEP_CORNER_AXIS_POINTS", true)
 }
 

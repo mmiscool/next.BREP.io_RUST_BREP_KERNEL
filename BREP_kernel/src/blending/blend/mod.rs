@@ -96,27 +96,6 @@ pub(in crate::blend) fn open_pad_network_on() -> bool {
     OPEN_PAD_NETWORK.with(|flag| flag.get())
 }
 
-/// Off, the network names the stripe `crossed_rails` and the selection
-/// falls through to the cutter composition, whose body is the union of the
-/// canal removals (a ridge). `BREP_BLEND_CROSSED_RAILS=0` is the escape
-/// hatch, `=1` forces it on; `set_crossed_rails_for_test` forces either way
-/// on a test's thread.
-const CROSSED_RAILS_DEFAULT: bool = true;
-
-pub(crate) fn crossed_rails_on() -> bool {
-    switch!(live "BREP_BLEND_CROSSED_RAILS", CROSSED_RAILS_DEFAULT)
-}
-
-/// Off, the network refuses `unequal_corner_radius` or `n_sided_corner` by
-/// name as before. `BREP_BLEND_RIBBON_STAR=0` is the escape hatch, `=1`
-/// forces it on; `set_no_common_ball_star_for_test` forces it on a test's
-/// thread.
-const NO_COMMON_BALL_STAR_DEFAULT: bool = true;
-
-pub(crate) fn no_common_ball_star_on() -> bool {
-    switch!(live "BREP_BLEND_RIBBON_STAR", NO_COMMON_BALL_STAR_DEFAULT)
-}
-
 /// An equal-radius convex star on four planar faces with no common ball closes
 /// as the rolling ball does: a ridge cylinder between two sphere triangles.
 /// `BREP_BLEND_RIDGE_STAR=0` restores the ribbon fill.
@@ -126,110 +105,18 @@ pub(crate) fn ridge_star_on() -> bool {
     switch!(live "BREP_BLEND_RIDGE_STAR", RIDGE_STAR_DEFAULT)
 }
 
-/// The corner has no common ball; the point both shared-face rails stop at is
-/// their rail/rail point (`solve_rail_rail_point`), the seam between the blends
-/// is marched on the larger stripe at the smaller stripe's own canal level, and
-/// — the seam leaving the smaller strip through its side rail — the larger
-/// stripe runs onto that side face and is closed by its section there (the
-/// asymmetric miter's connector), so the side face gets two rail vertices.
-/// `BREP_BLEND_UNEQUAL_MITER=0` is the escape hatch, `=1` forces it on;
-/// `set_unequal_miter_for_test` forces it on a test's thread.
-const UNEQUAL_MITER_DEFAULT: bool = true;
-
-pub(crate) fn unequal_miter_on() -> bool {
-    switch!(live "BREP_BLEND_UNEQUAL_MITER", UNEQUAL_MITER_DEFAULT)
-}
-
-/// Off, the closed lane names the rollover and declines as it did when the
-/// detection landed (`rollover.rs`), and the ladder falls through to the
-/// cutter, whose body carries a crease. `BREP_BLEND_ROLLOVER=0` is the
-/// escape hatch, `=1` forces it on; `set_rollover_for_test` forces either
-/// way on a test's own thread.
-const ROLLOVER_DEFAULT: bool = true;
-
-pub(crate) fn rollover_on() -> bool {
-    switch!(live "BREP_BLEND_ROLLOVER", ROLLOVER_DEFAULT)
-}
-
 /// The STOPPED-END rollover of an open stripe (user bug F10, 2026-11-02):
 /// a track that leaves its mate across a tangent edge before the stripe's
 /// own vertex and never comes back — the F10 fillet's rails run 1.1e-2 past
 /// faces 13/23's boundaries onto the F8 blend faces 19/26 — has its tail
 /// re-marched on the neighbour from the crossing station and the cap's
 /// legs drawn on the neighbours. Default OFF: `BREP_BLEND_STOPPED_END_ROLLOVER=1`
-/// turns it on, `set_stopped_end_rollover_for_test` forces it on a test's
-/// own thread. Promotion owes the blend/fillet filters and both censuses
+/// turns it on. Promotion owes the blend/fillet filters and both censuses
 /// with the switch on.
 const STOPPED_END_ROLLOVER_DEFAULT: bool = false;
 
 pub(crate) fn stopped_end_rollover_on() -> bool {
     switch!(live "BREP_BLEND_STOPPED_END_ROLLOVER", STOPPED_END_ROLLOVER_DEFAULT)
-}
-
-
-/// OPEN stripes: a straight edge between planar mates is one section
-/// extruded, so the network marches its stations once and skips the ladder's
-/// refinement, fold probe, dense centres and ball-resolve wall reading (the
-/// wall is read off the exact rows instead); the body is the ladder's, byte
-/// for byte. Landed behind this switch, off by default, until the census
-/// promotes it: `BREP_BLEND_EXACT_LANE=1` turns it on, `=0` off; a test
-/// forces either way on its own thread with `set_exact_lane_for_test`.
-const EXACT_LANE_DEFAULT: bool = true;
-
-/// The exact torus is not the fitted rows' body. `BREP_BLEND_EXACT_RIM=1` turns
-/// it on, `=0` off; `set_exact_rim_lane_for_test` forces it on a test's own
-/// thread.
-const EXACT_RIM_LANE_DEFAULT: bool = true;
-
-pub(crate) fn exact_rim_lane_on() -> bool {
-    switch!(live "BREP_BLEND_EXACT_RIM", EXACT_RIM_LANE_DEFAULT)
-}
-
-pub(crate) fn exact_lane_on() -> bool {
-    switch!(live "BREP_BLEND_EXACT_LANE", EXACT_LANE_DEFAULT)
-}
-
-/// The exact rows are not the fitted rows' bytes, so the lane landed behind
-/// this switch OFF and was promoted ON by its census (the whole kernel
-/// battery, the 96-case manifest at its baseline and the render HLR pins
-/// with the switch on). `BREP_BLEND_EXACT_REVOLUTION=0` is the hatch back to
-/// the fitted ladder, `=1` forces the lane; a test forces either way on its
-/// own thread with `set_exact_revolution_for_test`. The lane declines by
-/// name to the ladder (`count.march.exact_revolution_declined`) whenever its
-/// witness does not hold.
-const EXACT_REVOLUTION_DEFAULT: bool = true;
-
-pub(crate) fn exact_revolution_on() -> bool {
-    switch!(live "BREP_BLEND_EXACT_REVOLUTION", EXACT_REVOLUTION_DEFAULT)
-}
-
-/// The surgery lane's exact support trim (slice 1b of the box fillet's
-/// hotspots): on an EXACT EXTRUSION row whose mate is a plane, the rail is
-/// a straight line and the plane's (u, v) is affine, so the rail's support
-/// trim is the straight line in uv between the feet of the rail's two ends,
-/// read once as shipped at the pcurve floor (`exact_planar_trim`); the
-/// march trim's read, the track refit and its three reads are skipped. The
-/// line is not the refit's curve (two control points against its fitted
-/// knots), so the body's pcurve bits move on every box-like fixture; the
-/// lane shipped behind this switch, off, until its census (the surgery
-/// record of 2026-10-11: battery, suites and case gate unchanged, one HLR
-/// input digest moving in pcurve bytes with its drawing byte-identical)
-/// re-pinned what moves, and it is ON by default since 2026-10-12.
-/// `BREP_BLEND_EXACT_TRIM=0` is the escape hatch back to the refit road
-/// (`=1` the lane, as before); `set_exact_trim_for_test` forces either way
-/// on a test's own thread.
-const EXACT_TRIM_DEFAULT: bool = true;
-
-pub(crate) fn exact_trim_on() -> bool {
-    switch!(live "BREP_BLEND_EXACT_TRIM", EXACT_TRIM_DEFAULT)
-}
-
-/// Same landing rule and switch shape as [`exact_lane_on`]:
-/// `BREP_BLEND_ACCEPT_ONCE=1` / `=0`, default below.
-const ACCEPT_ONCE_DEFAULT: bool = true;
-
-pub(crate) fn accept_once_on() -> bool {
-    switch!(live "BREP_BLEND_ACCEPT_ONCE", ACCEPT_ONCE_DEFAULT)
 }
 
 /// Equal-length chains are unchanged either way; unequal ones move their
@@ -240,14 +127,6 @@ const CHAIN_ARC_STATIONS_DEFAULT: bool = false;
 
 pub(crate) fn chain_arc_stations_on() -> bool {
     switch!(live "BREP_BLEND_CHAIN_ARC_STATIONS", CHAIN_ARC_STATIONS_DEFAULT)
-}
-
-/// `BREP_BLEND_TAPER_NETWORK=0` is the escape hatch, `=1` forces it on;
-/// `set_taper_network_for_test` forces it on a test's own thread.
-const TAPER_NETWORK_DEFAULT: bool = true;
-
-pub(crate) fn taper_network_on() -> bool {
-    switch!(live "BREP_BLEND_TAPER_NETWORK", TAPER_NETWORK_DEFAULT)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -324,12 +203,6 @@ impl StripeRadius {
         }
     }
 }
-
-
-
-
-
-
 
 
 /// Record what a blend that SHIPS needs its feature to say about it — today,
@@ -719,8 +592,7 @@ pub(crate) use planar_chart::{
 pub(crate) use track_fit::PCURVE_OFF_FLOOR;
 pub(crate) use edge::{consumed_band, is_consumed_snap, is_rail_collapse};
 pub(crate) use network::{
-    blend_star_network, blend_star_network_laws, blend_star_network_with_corner_policy, degenerate_corner_setbacks, mixed_convexity_corner, mixed_convexity_corners, selection_convexity, DegenerateSetback,
-    MixedCorner,
+    blend_star_network, blend_star_network_laws, blend_star_network_with_corner_policy, degenerate_corner_setbacks, mixed_convexity_corner, mixed_convexity_corners, selection_convexity, MixedCorner,
 };
 pub(crate) use miter::{is_marched_fit_off_carriers, is_miter_support_overrun};
 /// The two faces each selected edge lies on, in the network's mate order
@@ -736,12 +608,9 @@ pub(crate) fn selection_mates<'a>(
         .collect())
 }
 
-pub(crate) use runout::{build_runout_walls, plan_runout, take_runout_reports, RunoutPlan, RunoutWallReport};
+pub(crate) use runout::{build_runout_walls, plan_runout, RunoutPlan};
 pub(crate) use fold::{is_rail_fold, is_wall_fold, wall_loop_refusal, WALL_FOLDS};
 pub(crate) use stations::is_ball_off_carrier;
-// Lane D 2026-10-14 (appended): the inside-corner classification's name and
-// its opt-in miter switch, read by the runout composition and its tests.
-pub(crate) use network::is_reentrant_concave;
 pub(crate) use network::is_ball_does_not_fit;
 
 /// Off the switch every closed rim's two support pcurves are refitted to their
@@ -790,7 +659,7 @@ pub(crate) fn closed_wall_predict_on() -> bool {
 
 
 // BREP lane L: begin keyway_floor_open_mixed_corner_20261014
-pub(crate) use corner::{open_mixed_corner_on, round_mixed_concave_open_corner};
+pub(crate) use corner::round_mixed_concave_open_corner;
 // BREP lane L: end keyway_floor_open_mixed_corner_20261014
 
 

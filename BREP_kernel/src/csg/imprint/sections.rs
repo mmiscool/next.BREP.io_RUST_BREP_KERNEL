@@ -2011,7 +2011,7 @@ fn join_trims(
         .or_refuse(KernelStage::Intersect, "closed_directions")?;
     let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Intersect, "domain_u")?;
     let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Intersect, "domain_v")?;
-    let [f0, f1] = first.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let [_, f1] = first.domain().or_refuse(KernelStage::Intersect, "domain")?;
     let [s0, _] = second.domain().or_refuse(KernelStage::Intersect, "domain")?;
     let end = first.evaluate(f1).or_refuse(KernelStage::Intersect, "evaluate")?;
     let start = second.evaluate(s0).or_refuse(KernelStage::Intersect, "evaluate")?;

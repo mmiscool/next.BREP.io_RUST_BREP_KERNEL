@@ -2,6 +2,20 @@
 //!
 //! This crate is a pure geometry leaf. It does not parse or write STEP, call
 //! subprocess oracles, download corpora, or depend on a BREP kernel.
+//!
+//! It finds plane, cylinder, cone, sphere and torus carriers in an indexed
+//! triangle [`Mesh`]. Main entry points:
+//!
+//! - [`recognize_surfaces`] / [`recognize_surfaces_with_unresolved`] for
+//!   mesh-wide recognition;
+//! - [`reconstruct_surface`] / [`reconstruct_surface_from_vertices`] to fit a
+//!   selected support, guided by a [`SurfaceHint`];
+//! - the `constrain_*` design-intent helpers, which build constrained hints
+//!   from neighbouring analytic geometry;
+//! - [`export_debug_obj`] for Wavefront OBJ debug output.
+//!
+//! Behaviour is configured through [`RecognitionOptions`]. See the README for
+//! an overview.
 
 mod debug_export;
 mod design_intent;

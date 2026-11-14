@@ -2288,11 +2288,11 @@ impl FileDialog {
         }
     }
 
-    /// The **Insert component** selector: the EXISTING parts-library entries
-    /// first (instant re-insert — no store read), then the model store's
-    /// document list, + Upload where the platform supports real-file
-    /// interchange. REUSES the Open modal's machinery (the same list +
-    /// `take_import` poll), routed to the engine's insert flow.
+    /// The **Insert component** selector: the
+    /// EXISTING parts-library entries first (instant re-insert — no store read),
+    /// then the model store's document list, + Upload where the platform
+    /// supports real-file interchange. REUSES the Open modal's machinery (the
+    /// same list + `take_import` poll), routed to the engine's insert flow.
     fn show_insert_component(
         &mut self,
         ctx: &egui::Context,
@@ -3638,10 +3638,10 @@ impl FileDialog {
         }
     }
 
-    /// Route an imported STEP file: **probe first**. The probe IS the parse —
-    /// it stashes the structure in the engine for the import to consume — so a
-    /// structured file arms the choice modal and is imported on the click,
-    /// never parsed a second time.
+    /// Route an imported STEP file: **probe first**. The probe
+    /// IS the parse — it stashes the structure in the engine for the import to
+    /// consume — so a structured file arms the choice modal and is imported on
+    /// the click, never parsed a second time.
     ///
     /// Everything else goes straight to today's flat lane, unchanged:
     ///
@@ -4741,7 +4741,7 @@ impl FileDialog {
     /// family first if asked (the write is queued, not waited for) and
     /// answers `Ok(None)` with its revision key — the caller then waits for
     /// the store's writes and runs [`crate::plm::family::generate`] as a task
-    /// on later frames, and hands the report to [`Self::record_generate_report`].
+    /// on later frames, and hands the report to `record_generate_report`.
     pub(crate) fn begin_generate_active_family(
         &mut self,
         docs: &mut Documents,
@@ -4765,6 +4765,7 @@ impl FileDialog {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn record_generate_report(&mut self, report: family_table::GenerateReport) -> family_table::GenerateReport {
         self.record_generate(report)
     }

@@ -12,8 +12,9 @@
 use wasm_bindgen::prelude::*;
 
 /// Assemble the catalogue from every feature's own `schema()`. The assembly
-/// constraint schemas join the export under their own `assemblyConstraints`
-/// namespace so the dialog engine renders them with the same machinery.
+/// constraint schemas join the export under their own
+/// `assemblyConstraints` namespace so the dialog engine renders them with the
+/// same machinery.
 pub fn feature_schema_catalogue() -> serde_json::Value {
     serde_json::json!({
         "version": 1,
@@ -33,6 +34,7 @@ pub fn feature_schema_catalogue() -> serde_json::Value {
             super::features::sketch3d::schema(),
             super::features::spline::schema(),
             super::features::waypoint::schema(),
+            super::features::weld::schema(),
             super::features::helix::schema(),
             super::features::extrude::schema(),
             super::features::boolean::schema(),

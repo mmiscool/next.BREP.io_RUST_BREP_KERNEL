@@ -7,8 +7,8 @@ use crate::tolerance::{
 use crate::topology::{BrepSolid, EdgeRecord, FaceRecord};
 use crate::{
     build_pcurve_on_surface, classify_surface_pair_cached,
-    fit_polyline, fit_polyline_of_degree, PolylineFit,
-    intersect_curves, intersect_surfaces, intersect_surfaces_supplemental, project_point_to_curve,
+    fit_polyline_of_degree, PolylineFit,
+    intersect_curves, project_point_to_curve,
     project_point_to_surface, project_point_to_surface_seeded, KnotVector, NurbsCurve, NurbsSurface,
     SurfaceClassifyData,
     SurfaceIntersectionOptions, SurfacePairClassification, SurfacePairRelation, Vec2, Vec3, Vec4,
@@ -552,7 +552,7 @@ impl TangentSectionRecord {
 
 #[path = "imprint/ruled_torus.rs"]
 mod ruled_torus;
-pub(crate) use ruled_torus::{circular_revolution_profile, construct_ruled_torus, RuledTorusBoundary};
+pub(crate) use ruled_torus::{circular_revolution_profile, construct_ruled_torus};
 
 #[path = "imprint/support.rs"]
 mod support;

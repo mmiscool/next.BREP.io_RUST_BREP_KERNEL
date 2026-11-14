@@ -426,36 +426,26 @@ pub(super) fn touch_rings_enabled() -> bool {
     switch!(live "BREP_LOOP_SPLIT_TOUCH_RINGS", true)
 }
 
-
-/// A measured extension for two interior arcs on an affine carrier. The
-/// extension passed the kernel, manifest and HLR census; `off` retains
-/// the original splitter for differential measurements.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn loop_split_face_with_cycles(
-    solid: &BrepSolid,
-    operand: u8,
-    face: &FaceRecord,
-    face_key: FaceKey,
-    piece_ids: &[u64],
-    index: &FragmentIndex,
-    cycles: bool,
-) -> Result<Result<Vec<FaceFragmentRecord>, Decline>, KernelRefusal> {
-    loop_split_face_with_options(solid, operand, face, face_key, piece_ids, index, cycles, false)
+/// `BREP_LOOP_SPLIT_MIXED_CHORDS`: junction
+/// chords on a face that ALSO carries ordinary open pieces. A small circle
+/// cut across a slot in a plate crosses the slot's two sides four times: one
+/// arc runs loop to loop (an open piece) and the other is minted as two
+/// pieces joined at the circle's seam vertex inside the face (a chord through
+/// an interior junction). The chord path used to run only on a face with no
+/// open piece, so that face went to the full arrangement, whose cost grows
+/// with the face's loop count: a watch bezel's top face with 46 loops paid
+/// ~0.1-0.3 s on each of 44 relief subtracts. The open pieces are inserted
+/// first, then the chords; a chord whose loop junction is also an open
+/// piece's end, or whose arcs do not meet in the chart, declines. On by
+/// default: `0`/`off` declines the class (it needs
+/// `BREP_LOOP_SPLIT_JUNCTION_CHORDS`).
+pub(super) fn mixed_chords_enabled() -> bool {
+    switch!(live "BREP_LOOP_SPLIT_MIXED_CHORDS", true)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn loop_split_face_with_options(
-    solid: &BrepSolid,
-    operand: u8,
-    face: &FaceRecord,
-    face_key: FaceKey,
-    piece_ids: &[u64],
-    index: &FragmentIndex,
-    cycles: bool,
-    shared_rings: bool,
-) -> Result<Result<Vec<FaceFragmentRecord>, Decline>, KernelRefusal> {
-    loop_split_face_impl(solid, operand, face, face_key, piece_ids, index, cycles, shared_rings, false, false)
-}
+
+
+
 
 #[allow(clippy::too_many_arguments)]
 fn loop_split_face_impl(
@@ -721,7 +711,10 @@ fn loop_split_face_impl(
     // more loop junctions, with no other piece on the face, leave the
     // one-junction ring path for the chord insertion below.
     let mut chord_arcs: Vec<(Entry<'_>, u64, u64)> = Vec::new();
-    if junction_chords && !touch_arcs.is_empty() && open_pieces.is_empty() && rings.is_empty() && interior_arcs.is_empty() {
+    // Mixed chords (`mixed_chords_enabled`): open pieces on the same face
+    // are inserted first; the chords follow through the same junction walk.
+    let mixed = !open_pieces.is_empty();
+    if junction_chords && !touch_arcs.is_empty() && (!mixed || mixed_chords_enabled()) && rings.is_empty() && interior_arcs.is_empty() {
         let mut junctions: Vec<u64> = Vec::new();
         for (entry, start_id, end_id) in &touch_arcs {
             for (id, point) in [(*start_id, entry.start_point), (*end_id, entry.end_point)] {
@@ -759,8 +752,23 @@ fn loop_split_face_impl(
                             || ((b_periodic - domain[0]).abs() <= uv_match && (a_periodic - domain[1]).abs() <= uv_match))
                 })
             };
-        if junctions.len() >= 2 || periodic_chord {
+        if junctions.len() >= 2 || (periodic_chord && !mixed) {
             chord_arcs = std::mem::take(&mut touch_arcs);
+        }
+        // Beside open pieces, a chord's loop junction must be its own: one
+        // shared with an open piece's end is a junction two sections meet
+        // at, which is the arrangement's.
+        if mixed && !chord_arcs.is_empty() {
+            for (entry, _, _) in &chord_arcs {
+                let id = match &entry.side { Side::Cut { piece_id, .. } => *piece_id, Side::Boundary { .. } => 0 };
+                for point in [entry.start_point, entry.end_point] {
+                    if on_a_loop(point, &regions) && open_pieces.iter().any(|piece| {
+                        piece.start_point.sub(point).length() <= vertex_band || piece.end_point.sub(point).length() <= vertex_band
+                    }) {
+                        return Ok(Err(Decline::EndTwiceUsed(id)));
+                    }
+                }
+            }
         }
     }
     let mut touch: Option<Ring<'_>> = None;
@@ -998,6 +1006,10 @@ fn loop_split_face_impl(
             return Ok(Err(Decline::EndNotOnLoop(first_id)));
         };
         let forward: Vec<Entry<'_>> = steps.iter().map(|(k, along)| if *along { remaining[*k].0.clone() } else { remaining[*k].0.reversed() }).collect();
+        // Beside open pieces, the chord's arcs also meet in the chart.
+        if mixed && forward.windows(2).any(|pair| pair[0].end().sub(pair[1].start()).length() > uv_match) {
+            return Ok(Err(Decline::SeamHop));
+        }
         let backward: Vec<Entry<'_>> = forward.iter().rev().map(Entry::reversed).collect();
         let mut used: Vec<usize> = steps.iter().map(|(k, _)| *k).collect();
         used.sort_unstable_by(|a, b| b.cmp(a));

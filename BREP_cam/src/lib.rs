@@ -1,4 +1,4 @@
-//! CAM toolpath engine for the BREP kernel: contracts and geometric core.
+//! CAM toolpath engine for the BREP kernel.
 //!
 //! This crate is pure Rust and builds for native targets and for
 //! `wasm32-unknown-unknown`. Algorithms work in MACHINE coordinates with the
@@ -8,20 +8,42 @@
 //! and the post-processors read, and the same inputs always produce a
 //! byte-identical stream.
 //!
-//! Module map:
-//! - [`model`]: setups, machines, tools, operations, targets, toolpaths and reports.
+//! Shared contract:
+//! - [`model`]: setups, machines, tools, operations ([`model::Strategy`]), targets, toolpaths and reports.
 //! - [`numeric`]: the tolerance object.
 //! - [`mesh`]: the immutable triangle snapshot with body/face identity.
 //! - [`index`]: broad-phase triangle queries.
 //! - [`cutter`]: validated cutter profiles.
 //! - [`cancel`]: cancellation and progress at bounded work chunks.
-//! - [`stock`]: the setup's stock resolved into machine coordinates.
-//! - [`stock_sim`]: the Z-dexel stock and exact 3-axis material removal.
+//! - [`error`]: the crate error type.
+//!
+//! Generation:
+//! - [`dispatch`]: one entry point over every strategy ([`dispatch::generate`]).
+//! - Strategy modules: 2.5D ([`planar`] and the face, pocket, contour, slot,
+//!   trace, chamfer, engrave, bore, circular and thread-mill strategies),
+//!   drilling ([`drill`], [`holes`]), 3D roughing ([`adaptive`], [`pocket3d`],
+//!   [`rest_rough`]), 3D finishing ([`parallel`], [`waterline`], [`scallop`],
+//!   [`pencil`], [`radial`], [`spiral`], [`project`], [`flow`], [`morph`],
+//!   [`rest_finish`] and others), multi-axis ([`kinematics`], [`multiaxis`],
+//!   [`swarf`], [`rotary`]), turning ([`turning`]) and probing ([`probe`]).
+//! - [`features`], [`autoprogram`]: 2.5D feature recognition and automatic programming.
+//! - [`library`], [`feeds`], [`template`], [`pattern`]: tool libraries,
+//!   feeds and speeds, operation templates, operation patterns and manual NC entries.
+//!
+//! Program and output:
+//! - [`filter`], [`arcfit`], [`link`], [`polish`]: line filtering, arc fitting, linking and smoothing.
+//! - [`program`]: one NC program from ordered operations across setups.
+//! - [`post`]: JavaScript post-processors and the built-in posts; running
+//!   one needs the `post-runtime` feature.
+//! - [`stock`], [`stock_sim`]: resolved stock and Z-dexel material removal.
 //! - [`collision`]: shank/holder/rapid collision checks during simulation.
 //! - [`verify`]: the stock-versus-part deviation map.
 //! - [`cycle_time`]: machining time estimates from the motion stream.
-//! - [`error`]: the crate error type.
 //! - `kernel_adapter` (feature `kernel`): BREP bodies to mesh snapshots, the only kernel dependency.
+//!
+//! Optional features: `schema` (JSON Schemas for persisted model types),
+//! `kernel`, `post-runtime` and `parallel` (rayon contact solves, output
+//! byte-identical to the serial build). See the README for detail.
 
 pub mod cancel;
 pub mod collision;

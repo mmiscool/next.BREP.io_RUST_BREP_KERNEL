@@ -1,7 +1,7 @@
-//! Assembly selection resolution — a selection reference resolved to an
-//! ANALYTIC frame read from the exact BREP surfaces/curves, never from
-//! tessellation (the retired app's polyline-PCA approximation is the wart
-//! this module kills):
+//! Assembly selection resolution — a selection reference
+//! resolved to an ANALYTIC frame read from the exact BREP surfaces/curves,
+//! never from tessellation (the retired app's polyline-PCA approximation is
+//! the wart this module kills):
 //!
 //! - planar face → plane (origin + OUTWARD unit normal, plane-z convention)
 //! - cylindrical/conical face → axis (origin + direction), radius when the
@@ -94,8 +94,8 @@ pub enum SelectionGeometry {
 }
 
 /// Typed resolution failure. [`Self::status`] maps each variant onto the
-/// constraint status vocabulary so the constraint lifecycle reports it
-/// without string-matching messages.
+/// constraint status vocabulary so the constraint lifecycle
+/// reports it without string-matching messages.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum ResolveError {
     /// No such entity on the solid (or no vertex within snap distance).

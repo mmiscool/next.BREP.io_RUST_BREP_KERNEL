@@ -320,9 +320,140 @@ fn write_analytic_surface(
             )))
         }
         // No SURFACE_OF_REVOLUTION reader exists yet; general revolutions keep
-        // their exact NURBS form.
-        AnalyticSurface::Revolution { .. } => Ok(None),
+        // their exact NURBS form — except a sphere, which a reader knows.
+        AnalyticSurface::Revolution { frame, generatrix, .. } => {
+            let Some((center, radius, reversed)) = polar_meridian_sphere(frame, generatrix) else {
+                return Ok(None);
+            };
+            let placement = write_placement(writer, center, frame.axis, frame.x_axis)?;
+            Ok(Some((
+                writer.add(format!(
+                    "SPHERICAL_SURFACE('',#{placement},{})",
+                    real(radius)?
+                )),
+                reversed,
+                EmittedSurface::Sphere {
+                    frame: EmittedFrame {
+                        origin: center,
+                        x_axis: frame.x_axis,
+                        y_axis: frame.y_axis,
+                        axis: frame.axis,
+                        azimuth_sign: 1.0,
+                    },
+                    radius,
+                },
+            )))
+        }
     }
+}
+
+/// `BREP_STEP_SPHERE_OF_REVOLUTION` (default on, `=0` restores the B-spline):
+/// a revolution whose generatrix is an arc of a circle centred on the axis is
+/// written as a SPHERICAL_SURFACE, whatever its sweep, whichever way the arc
+/// runs and whether or not it reaches a pole.
+fn sphere_of_revolution_on() -> bool {
+    crate::switch!("BREP_STEP_SPHERE_OF_REVOLUTION", true)
+}
+
+/// The centre and radius of the sphere a general revolution lies on when its
+/// generatrix is an arc of a circle centred on the axis, in the meridian
+/// half-plane, and whether the arc runs north to south there, which makes the
+/// stored normal point inward. A part turn of a half circle about its own
+/// chord is such a surface: a lune between the two poles, which a reader can
+/// bound on a sphere but not on a B-spline patch whose two pole sides have no
+/// length.
+///
+/// The arc is read span by span, so a piece split out of a longer circle
+/// (knots and end weights no longer `make_arc`'s) is taken too: each rational
+/// quadratic span is a circular arc about `centre` exactly when its ends are
+/// at the radius, its middle control point is where the end tangents meet,
+/// and its weights satisfy w1² = w0·w2·cos²(half the span's angle).
+fn polar_meridian_sphere(
+    frame: &crate::analytic_surface::RevolutionFrame,
+    generatrix: &NurbsCurve,
+) -> Option<(Vec3, f64, bool)> {
+    if !sphere_of_revolution_on() {
+        return None;
+    }
+    let controls = &generatrix.control_points;
+    let count = controls.len();
+    if generatrix.degree != 2 || count < 3 || count % 2 == 0 || generatrix.knots.len() != count + 3 {
+        return None;
+    }
+    // Bezier spans: every interior knot twice.
+    let knots = &generatrix.knots;
+    let span_knots = (count - 1) / 2;
+    for span in 1..span_knots {
+        if (knots[1 + 2 * span] - knots[2 + 2 * span]).abs() > 1e-12 {
+            return None;
+        }
+    }
+    let scale = curve_scale(generatrix);
+    let tolerance = 1e-9 * scale.max(1.0);
+    let mut points = Vec::with_capacity(count);
+    for control in controls {
+        if control.w <= 0.0 {
+            return None;
+        }
+        let point = control.point().ok()?;
+        // in the meridian half-plane the frame's x axis and its axis span
+        let d = point.sub(frame.origin);
+        if d.dot(frame.y_axis).abs() > tolerance || d.dot(frame.x_axis) < -tolerance {
+            return None;
+        }
+        points.push(point);
+    }
+    // The centre is on the axis at height `t` above the frame's origin; every
+    // span gives linear conditions on it (ends equidistant, end tangents
+    // square to the radii).
+    let (mut num, mut den) = (0.0, 0.0);
+    for span in 0..span_knots {
+        let (p0, p1, p2) = (points[2 * span], points[2 * span + 1], points[2 * span + 2]);
+        for (direction, through) in [
+            (p2.sub(p0), p0.add(p2).scale(0.5)),
+            (p1.sub(p0), p0),
+            (p1.sub(p2), p2),
+        ] {
+            // direction · (through − origin − t·axis) = 0
+            let a = direction.dot(frame.axis);
+            let b = direction.dot(through.sub(frame.origin));
+            num += a * b;
+            den += a * a;
+        }
+    }
+    if den <= tolerance * tolerance {
+        return None;
+    }
+    let center = frame.origin.add(frame.axis.scale(num / den));
+    let radius = points[0].sub(center).length();
+    if radius <= tolerance {
+        return None;
+    }
+    let mut turn = 0.0;
+    for span in 0..span_knots {
+        let (p0, p1, p2) = (points[2 * span], points[2 * span + 1], points[2 * span + 2]);
+        let (r0, r1, r2) = (p0.sub(center), p1.sub(center), p2.sub(center));
+        if (r0.length() - radius).abs() > tolerance
+            || (r2.length() - radius).abs() > tolerance
+            || p1.sub(p0).dot(r0).abs() > tolerance * radius
+            || p1.sub(p2).dot(r2).abs() > tolerance * radius
+        {
+            return None;
+        }
+        // cos(half the span's angle) = radius / |r1|
+        let cos_half = radius / r1.length();
+        let (w0, w1, w2) = (controls[2 * span].w, controls[2 * span + 1].w, controls[2 * span + 2].w);
+        if !(cos_half > 1e-6) || (w1 * w1 / (w0 * w2) - cos_half * cos_half).abs() > 1e-9 {
+            return None;
+        }
+        // which way the span turns in the (x, axis) half-plane
+        let cross = r0.dot(frame.x_axis) * r2.dot(frame.axis) - r0.dot(frame.axis) * r2.dot(frame.x_axis);
+        if cross.abs() <= tolerance * radius || (turn != 0.0 && cross.signum() != turn) {
+            return None;
+        }
+        turn = cross.signum();
+    }
+    Some((center, radius, turn < 0.0))
 }
 
 /// A curve recognized as an exact `make_arc` product: a circular arc of

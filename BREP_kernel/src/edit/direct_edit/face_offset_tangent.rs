@@ -39,13 +39,11 @@ use crate::{KernelRefusal, KernelStage, OrRefuse};
 #[derive(Clone, Debug)]
 pub(super) struct TangentVertex {
     pub(super) vertex: u64,
-    /// The rim arc on floor face `floor_a`, and that floor's other edge here.
+    /// The rim arc on floor face `floor_a`.
     pub(super) rim_a: u64,
     pub(super) floor_a: u64,
-    pub(super) floor_edge_a: u64,
     pub(super) rim_b: u64,
     pub(super) floor_b: u64,
-    pub(super) floor_edge_b: u64,
 }
 
 fn traversal(edge: &EdgeRecord, forward: bool) -> (u64, u64) {
@@ -181,10 +179,8 @@ pub(super) fn tangent_vertices(
                 vertex,
                 rim_a: first.id,
                 floor_a: floor_first,
-                floor_edge_a: edge_first,
                 rim_b: second.id,
                 floor_b: floor_second,
-                floor_edge_b: edge_second,
             });
         }
     }

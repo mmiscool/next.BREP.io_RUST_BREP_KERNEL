@@ -150,7 +150,7 @@ pub struct BrepApp {
     /// highlight. Document data lives in the engine; this holds the widget's
     /// transient state.
     wire_harness: WireHarnessPanel,
-    /// The PMI view tree + annotation forms (the PMI workbench's pane).
+    /// The PMI view tree + annotation forms (the shared PMI pane).
     pmi: crate::panels::pmi::PmiPanel,
     /// The CAM browser tree (the CAM workbench's pane): setups and their
     /// operations, NC programs and the tool library over the document's
@@ -162,9 +162,9 @@ pub struct BrepApp {
     pub(crate) simulation: crate::panels::simulation::SimulationPanel,
     /// The drawing sheets + their forms (the Drawing workbench's pane).
     sheets: crate::panels::sheets::SheetsPanel,
-    /// Update-components checker: compares each parts-library entry's
-    /// `sourceSignature` against the model store's current content. Kept
-    /// current once per frame (cheap generation key: applied run + store
+    /// Update-components checker: compares each parts-library
+    /// entry's `sourceSignature` against the model store's current content.
+    /// Kept current once per frame (cheap generation key: applied run + store
     /// save); the constraints header reads the count + runs the batch refresh,
     /// the structure tree reads per-part badges.
     update_components: UpdateComponents,
@@ -188,11 +188,11 @@ pub struct BrepApp {
     /// and keeps showing that entity regardless of later selection changes. Replaces
     /// the old single Properties window.
     info_windows: InfoWindows,
-    /// Interference results window: opened by the Assembly workbench's `∩`
-    /// toolbar button, which runs the engine's pairwise-intersect check; a
-    /// floating window like the Info windows with a row per interfering pair
-    /// (click = select both components), a green all-clear pass line, and a
-    /// Re-run button.
+    /// Interference results window: opened by the
+    /// Assembly workbench's `∩` toolbar button, which runs the engine's
+    /// pairwise-intersect check; a floating window like the Info windows with a
+    /// row per interfering pair (click = select both components), a green
+    /// all-clear pass line, and a Re-run button.
     interference: crate::panels::interference::InterferenceWindow,
     /// Auto Constraints window (Assembly workbench): opened by the `⚿` toolbar
     /// button, it lists the constraint types the kernel's inference lane can
@@ -276,6 +276,9 @@ pub struct BrepApp {
     /// stays open until the Drawing workbench is LEFT, exactly as PMI's view
     /// deactivates on leaving rather than on every frame outside it.
     sheets_pane_shown: bool,
+    /// Whether an Instructions pane was on screen last frame: the edge on
+    /// which a shown step is put away (see the workbench sync in `ui`).
+    instructions_panes_shown: bool,
 
     /// The DOCUMENT TAB STRIP's per-tab hit-rects from the last dock frame,
     /// published for the headed verifier. The strip is drawn inside the dock's
@@ -571,6 +574,7 @@ impl BrepApp {
     /// open document untitled and clean, the state a fresh start has. A named
     /// document's identity belongs to the store it came from, and a dirty one's
     /// work has nowhere to go in a new store.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn reconnect_blocker(&self) -> Option<String> {
         self.reconnect_blocker_with(crate::document::Document::is_dirty)
     }
@@ -899,6 +903,7 @@ impl BrepApp {
             active_document,
             active_tab: active_document,
             sheets_pane_shown: false,
+            instructions_panes_shown: false,
             document_tab_hits: Vec::new(),
             params_blob: (u64::MAX, usize::MAX, u64::MAX, String::new()),
             state_blob_cache: StateBlobCache::default(),
@@ -1982,7 +1987,7 @@ impl BrepApp {
                 let engine = self.docs.engine_mut();
                 let placed = match engine.sheet_pmi_view_ids().first().cloned() {
                     Some(view) => engine.sheet_place_view(None, &view, None, None).map(|_| ()),
-                    None => Err("capture a PMI view in the PMI workbench first".to_string()),
+                    None => Err("capture a PMI view first (PMI tab, Capture view)".to_string()),
                 };
                 if let Err(error) = placed {
                     engine.push_notice(format!("Place view: {error}"));
@@ -2150,20 +2155,23 @@ impl eframe::App for BrepApp {
                 &crate::workbench::ButtonState::of(engine),
             );
             engine.set_component_ports_visible(show);
-            // The PMI workbench IS the PMI editing mode: a workbench that shows
-            // the PMI panel (PMI, All) enters it — the modeling camera /
-            // visibility / wireframe are remembered — and one that hides it
-            // leaves it, deactivating the view and restoring them.
+            // A workbench that shows the PMI panel (Modeling, Sheet Metal,
+            // Assembly, All) is where PMI is edited: the modeling camera /
+            // visibility / wireframe are remembered there — and again each
+            // time a view is activated from none — and a workbench that hides
+            // the panel leaves it, deactivating the view and restoring them.
+            // Switching between two that show it keeps the active view.
             let pmi_shown = crate::workbench::panel_visible(
                 &engine.settings.workbench,
                 crate::workbench::pmi::PANEL_ID,
                 &crate::workbench::ButtonState::of(engine),
             );
-            // An exploded view is shown from the Assembly workbench's Constraints
-            // pane without entering PMI (a capture still remembers the modeling
-            // state), so that pane counts as an exploded view's home too. With
-            // neither on screen (nor the paper), the view is put away, so no one
-            // models on exploded displays.
+            // An exploded view is shown from the Constraints pane, so that pane
+            // counts as an exploded view's home too (Wire harness shows it
+            // without the PMI panel). With neither on screen (nor the paper),
+            // the view is put away. In the workbenches that host PMI a view
+            // stays active until the user unticks it: the history is editable
+            // on its display, as it always was while a view was active.
             let exploded_shown = crate::workbench::panel_visible(
                 &engine.settings.workbench,
                 crate::workbench::assembly::CONSTRAINTS_PANEL_ID,
@@ -2189,6 +2197,14 @@ impl eframe::App for BrepApp {
             if !pmi_shown && !exploded_shown && !paper_shown && !instructions_shown && engine.pmi_active_view().is_some() {
                 engine.pmi_deactivate_view();
             }
+            // LEAVING the Instructions panes puts a shown step away even for a
+            // workbench that hosts PMI: its ghosts and insertion poses are the
+            // instructions' presentation, not something to model on. An edge,
+            // so a step's view the user ticks in the PMI pane stays.
+            if self.instructions_panes_shown && !instructions_shown && engine.instructions_shown_step().is_some() {
+                engine.pmi_deactivate_view();
+            }
+            self.instructions_panes_shown = instructions_shown;
             // The DRAWING workbench owns the paper: LEAVING it for a workbench
             // that hides the Sheets pane closes an open sheet, so the central
             // tile is not left drawing paper whose tools, pane and way back are
@@ -2588,6 +2604,9 @@ impl eframe::App for BrepApp {
             if let Err(error) = crate::panels::context_bar::add_pmi_from_selection(engine, &type_id) {
                 engine.push_notice(format!("Add annotation: {error}"));
             }
+            // A PMI command brings the shared PMI pane forward, refused or
+            // not: a refusal's remedy (capture or activate a view) is there.
+            self.dock.show_pane(PaneKind::Pmi);
         }
 
         // --- sketch mode has NO strip of its own: its draw tools are workbench
@@ -3253,11 +3272,11 @@ impl eframe::App for BrepApp {
             crate::automation::registry::publish("__brepHit", "history panel widget rects: step:i edit:i del:i box:i add:menu form:* field:* panel:clip", &self.history.hits_json());
             crate::automation::registry::publish("__brepPaletteHit", "add-feature palette widget rects in screen points: input top item:type display display#mode (empty while closed)", &self.history.palette_hits_json());
             crate::automation::registry::publish("__brepExprHit", "expressions panel widget rects", &self.expressions.hits_json());
-            crate::automation::registry::publish("__brepToolbar", "toolbar rects: shared File menu file:* and workbench:item:<id>; Ribbon tabs/overflow ribbon:* and Home creation wbtb:*; command keys undo redo fit projection wireframe show:* help info bug workbench:btn:<id>. Classic wraps its controls; Ribbon compacts Large commands before whole-group overflow. Keys appear when their widgets are rendered; menu entries appear while open", &self.toolbar.hits_json());
+            crate::automation::registry::publish("__brepToolbar", "toolbar rects: shared File menu file:* and workbench:item:<id>; Ribbon tabs/overflow ribbon:* (ribbon:tab:PMI only where PMI is hosted: Modeling, Sheet Metal, Assembly, All) and Home / PMI creation wbtb:*; command keys undo redo fit projection wireframe show:* help info bug workbench:btn:<id>. Classic wraps its controls; Ribbon compacts Large commands before whole-group overflow. Keys appear when their widgets are rendered; menu entries appear while open", &self.toolbar.hits_json());
             // The workbench actions strip's button rects (`wbtb:feature:<type>` /
             // `wbtb:constraint:<type>` / `wbtb:annotation:<type>`); an empty map
             // while the strip is hidden.
-            crate::automation::registry::publish("__brepWorkbenchToolbar", "creation rects: wbtb:* feature:type constraint:type annotation:type, from the Classic workbench strip or Ribbon Home; empty while hidden or another Ribbon tab is selected", &self.workbench_toolbar.hits_json());
+            crate::automation::registry::publish("__brepWorkbenchToolbar", "creation rects: wbtb:* feature:type constraint:type annotation:type, from the Classic workbench strip or the Ribbon tab in front (Home, PMI); empty while hidden or while a tab with no creation command is selected", &self.workbench_toolbar.hits_json());
             // The PLM pane (a PLM session only): its sections' widget rects,
             // `plm/section:<id>` and `plm/<section>:<widget>`, and the active
             // document's access and revision.

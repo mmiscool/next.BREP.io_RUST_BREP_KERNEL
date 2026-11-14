@@ -53,15 +53,8 @@ pub(in crate::step_import) struct BoundedTrim {
     /// How far the file's curve stands off the carrier: the larger of the
     /// fit's station standoff and the standoff read between the stations.
     pub(in crate::step_import) standoff: f64,
-    /// The fit's own two numbers, as reported, for the record.
-    pub(in crate::step_import) fit_residual: f64,
-    pub(in crate::step_import) fit_standoff: f64,
     /// How far the image sits from the stations' FEET, mm.
     pub(in crate::step_import) image_to_foot: f64,
-    /// The same read against the global projector's foot alone, the reading
-    /// before 2026-10-04. The foot `image_to_foot` uses is the one nearer the
-    /// EDGE point, so neither value bounds the other; NaN means unreadable.
-    pub(in crate::step_import) image_to_global_foot: f64,
     pub(in crate::step_import) samples: usize,
     pub(in crate::step_import) exit: String,
     /// The residual exceeds the floor plus the file curve's standoff read

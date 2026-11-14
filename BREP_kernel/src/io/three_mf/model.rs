@@ -3,7 +3,7 @@
 //!
 //! Every element is matched by NAMESPACE and local name, so an extension that
 //! reuses a core name (or a core element written through a prefix) is
-//! classified correctly. Non-core subtrees are skipped whole — see the module
+//! classified correctly. Supported materials are decoded; other extension subtrees are skipped — see the module
 //! doc of [`super`] for what that deliberately discards.
 
 use super::xml::{Event, StartTag, XmlReader};
@@ -14,6 +14,7 @@ use rustc_hash::FxHashMap;
 /// One `<object>`'s `<mesh>`, in the file's own unit.
 pub(super) struct RawMesh {
     pub object_id: u32,
+    pub beam_lattice: Option<super::ThreeMfBeamLattice>,
     pub positions: Vec<f64>,
     pub indices: Vec<u32>,
     /// The object's own `pid`/`pindex`: the property every triangle inherits
@@ -27,13 +28,12 @@ pub(super) struct RawMesh {
 }
 
 /// A property reference as a triangle or object states it: the group id and
-/// the index into that group. Only a group that is a `<basematerials>` can be
-/// resolved to a colour; a reference into an extension's colour group or
-/// texture stays unresolved.
+/// the indices into that group, in triangle corner order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Property {
     pub group: u32,
     pub index: u32,
+    pub corners: [u32; 3],
 }
 
 pub(super) struct Component {
@@ -72,6 +72,10 @@ pub(super) struct ModelDocument {
     /// Every `<basematerials>` group by id: each `<base>`'s `displaycolor` as
     /// 8-bit sRGB, or `None` for one that does not spell `#RRGGBB[AA]`.
     pub materials: FxHashMap<u32, Vec<Option<[u8; 3]>>>,
+    pub composites: FxHashMap<u32, (u32, Vec<u32>, Vec<Vec<f64>>)>,
+    pub colors: FxHashMap<u32, Vec<[u8; 4]>>,
+    pub textures: Vec<super::ThreeMfTexture>,
+    pub texture_groups: FxHashMap<u32, (u32, Vec<[f64; 2]>)>,
 }
 
 impl ModelDocument {
@@ -173,7 +177,7 @@ impl<'a> ModelParser<'a> {
     fn property(&self, tag: &StartTag, index_name: &str) -> Option<Property> {
         let group = tag.attribute("pid")?.trim().parse::<u32>().ok()?;
         let index = tag.attribute(index_name)?.trim().parse::<u32>().ok()?;
-        Some(Property { group, index })
+        Some(Property { group, index, corners: [index, index, index] })
     }
 
     /// The optional 3x4 `transform`, defaulting to the identity.
@@ -238,17 +242,17 @@ pub(super) fn parse_model(part: &str, text: &str) -> Result<ModelDocument, Three
         },
     };
     if let Some(required) = root.attribute("requiredextensions") {
-        let required = required.trim();
-        if !required.is_empty() {
-            return Err(ThreeMfError::Unsupported {
-                part: part.to_owned(),
-                detail: format!(
-                    "the model requires the extension(s) '{required}'; this reader implements \
-                     the core specification only"
-                ),
-            });
+        for prefix in required.split_whitespace() {
+            let namespace = parser.reader.resolve(prefix).unwrap_or_default();
+            if namespace != super::MATERIAL_NAMESPACE && namespace != super::BEAM_NAMESPACE {
+                return Err(ThreeMfError::Unsupported {
+                    part: part.to_owned(),
+                    detail: format!("the model requires the extension '{prefix}' ({namespace}), which is unsupported"),
+                });
+            }
         }
     }
+
     if root.empty {
         return parser.fail("<model> has no <resources> or <build>");
     }
@@ -260,6 +264,10 @@ pub(super) fn parse_model(part: &str, text: &str) -> Result<ModelDocument, Three
         by_id: FxHashMap::default(),
         items: Vec::new(),
         materials: FxHashMap::default(),
+        composites: FxHashMap::default(),
+        colors: FxHashMap::default(),
+        textures: Vec::new(),
+        texture_groups: FxHashMap::default(),
     };
     let mut saw_build = false;
     loop {
@@ -304,6 +312,10 @@ fn parse_resources(
     loop {
         match parser.next()? {
             Event::Start(tag) => {
+                if tag.namespace == super::MATERIAL_NAMESPACE {
+                    parse_material_extension(parser, &tag, document)?;
+                    continue;
+                }
                 if tag.namespace != CORE_NAMESPACE {
                     parser.skip(&tag)?;
                     continue;
@@ -432,6 +444,7 @@ fn parse_mesh(
     model_type: bool,
     object_property: Option<Property>,
 ) -> Result<RawMesh, ThreeMfError> {
+    let mut beam_lattice = None;
     let mut positions = Vec::<f64>::new();
     let mut indices = Vec::<u32>::new();
     let mut properties = Vec::<Option<Property>>::new();
@@ -439,6 +452,14 @@ fn parse_mesh(
         loop {
             match parser.next()? {
                 Event::Start(tag) => {
+                    if tag.namespace == super::BEAM_NAMESPACE && tag.name == "beamlattice" {
+                        if beam_lattice.is_some() { return parser.fail(format!("object {object_id} has duplicate beam lattices")); }
+                        if object_property.is_some() {
+                            return Err(ThreeMfError::Unsupported { part: parser.part.into(), detail: format!("beam lattice in object {object_id}: material properties on beams are unsupported") });
+                        }
+                        beam_lattice = Some(parse_beam_lattice(parser, &tag, object_id)?);
+                        continue;
+                    }
                     if tag.namespace != CORE_NAMESPACE {
                         parser.skip(&tag)?;
                         continue;
@@ -446,7 +467,7 @@ fn parse_mesh(
                     match tag.name.as_str() {
                         "vertices" => parse_vertices(parser, &tag, object_id, &mut positions)?,
                         "triangles" => {
-                            parse_triangles(parser, &tag, object_id, &mut indices, &mut properties)?
+                            parse_triangles(parser, &tag, object_id, object_property, &mut indices, &mut properties)?
                         }
                         // <beamlattice> is an extension; anything else here is
                         // not geometry the core spec defines.
@@ -479,14 +500,28 @@ fn parse_mesh(
     }
     // A model object is printable geometry; the core spec requires a mesh that
     // encloses volume, which an empty one cannot.
-    if model_type && (vertex_count < 3 || indices.is_empty()) {
+    if model_type && beam_lattice.is_none() && (vertex_count < 3 || indices.is_empty()) {
         return parser.fail(format!(
             "object {object_id} is a model object whose mesh has {vertex_count} vertices and {} \
              triangles",
             indices.len() / 3
         ));
     }
-    Ok(RawMesh { object_id, positions, indices, object_property, properties })
+    if let Some(lattice) = &mut beam_lattice {
+        for beam in &lattice.beams {
+            if beam.vertices.iter().any(|v| *v as usize >= vertex_count) {
+                return parser.fail(format!("beam lattice in object {object_id}: vertex index out of range"));
+            }
+        }
+        // The extension requires consumers to ignore beams shorter than minlength.
+        lattice.beams.retain(|beam| {
+            let a = beam.vertices[0] as usize * 3;
+            let b = beam.vertices[1] as usize * 3;
+            (positions[a] - positions[b]).hypot(positions[a+1] - positions[b+1])
+                .hypot(positions[a+2] - positions[b+2]) >= lattice.min_length
+        });
+    }
+    Ok(RawMesh { object_id, beam_lattice, positions, indices, object_property, properties })
 }
 
 fn parse_vertices(
@@ -537,6 +572,7 @@ fn parse_triangles(
     parser: &mut ModelParser<'_>,
     triangles: &StartTag,
     object_id: u32,
+    object_property: Option<Property>,
     indices: &mut Vec<u32>,
     properties: &mut Vec<Option<Property>>,
 ) -> Result<(), ThreeMfError> {
@@ -562,15 +598,27 @@ fn parse_triangles(
                         ),
                     });
                 }
-                // v1/v2/v3 are the geometry. pid/p1 is the triangle's own
-                // property (a base material resolves to a colour; p2/p3 may
-                // only differ for an extension's per-vertex groups, which are
-                // not read); without one the triangle inherits its object's.
+                // Property corners follow the geometric corners; omitted
+                // p2/p3 inherit p1. An omitted pid inherits the object's group.
                 let v1 = parser.index(&tag, "v1")?;
                 let v2 = parser.index(&tag, "v2")?;
                 let v3 = parser.index(&tag, "v3")?;
                 indices.extend([v1, v2, v3]);
-                properties.push(parser.property(&tag, "p1"));
+                let mut property = parser.property(&tag, "p1");
+                if tag.attribute("pid").is_none() && tag.attribute("p1").is_some() {
+                    if let Some(default) = object_property {
+                        let index = parser.index(&tag, "p1")?;
+                        property = Some(Property { group: default.group, index, corners: [index; 3] });
+                    }
+                }
+                if let Some(property) = &mut property {
+                    for (corner, name) in [(1, "p2"), (2, "p3")] {
+                        if tag.attribute(name).is_some() {
+                            property.corners[corner] = parser.index(&tag, name)?;
+                        }
+                    }
+                }
+                properties.push(property);
                 parser.close_leaf(&tag)?;
             }
             Event::End { name } if name == "triangles" => return Ok(()),
@@ -666,4 +714,195 @@ fn parse_build(
             Event::Eof => return parser.fail("the part ends inside <build>"),
         }
     }
+}
+
+fn parse_material_extension(
+    parser: &mut ModelParser<'_>,
+    tag: &StartTag,
+    document: &mut ModelDocument,
+) -> Result<(), ThreeMfError> {
+    let id = parser.identifier(tag, "id")?;
+    if document.colors.contains_key(&id) || document.texture_groups.contains_key(&id)
+        || document.textures.iter().any(|t| t.id == id) || document.composites.contains_key(&id)
+        || document.materials.contains_key(&id) || document.by_id.contains_key(&id) {
+        return parser.fail(format!("duplicate material resource id {id}"));
+    }
+    if tag.name == "texture2d" {
+        let path = parser.required(tag, "path")?.trim_start_matches('/').to_owned();
+        if path.is_empty() || path.split('/').any(|s| s == ".." || s == "." || s.is_empty())
+            || path.contains('\\') || path.contains(':') {
+            return parser.fail(format!("texture2d {id} has an invalid package path"));
+        }
+        let content_type = parser.required(tag, "contenttype")?;
+        if content_type != "image/png" {
+            return Err(ThreeMfError::Unsupported { part: parser.part.into(),
+                detail: format!("texture2d {id}: content type '{content_type}' is unsupported; expected packaged image/png") });
+        }
+        let tile_u = tag.attribute("tilestyleu").unwrap_or("wrap");
+        let tile_v = tag.attribute("tilestylev").unwrap_or("wrap");
+        let filter = tag.attribute("filter").unwrap_or("auto");
+        if !["wrap", "mirror", "clamp", "none"].contains(&tile_u)
+            || !["wrap", "mirror", "clamp", "none"].contains(&tile_v)
+            || !["auto", "linear", "nearest"].contains(&filter) {
+            return parser.fail(format!("texture2d {id} has invalid addressing or filter"));
+        }
+        document.textures.push(super::ThreeMfTexture { id, path, png: Vec::new(),
+            tile_u: tile_u.into(), tile_v: tile_v.into(), filter: filter.into() });
+        return parser.close_leaf(tag);
+    }
+    let mut colors = Vec::new();
+    let mut coords = Vec::new();
+    let mut mixtures = Vec::new();
+    let texid = if tag.name == "texture2dgroup" { parser.identifier(tag, "texid")? } else { 0 };
+    let matid = if tag.name == "compositematerials" { parser.identifier(tag, "matid")? } else { 0 };
+    let constituents = if matid != 0 {
+        parser.required(tag, "matindices")?.split_whitespace().map(|s| s.parse::<u32>())
+            .collect::<Result<Vec<_>, _>>().map_err(|_| ThreeMfError::Model {
+                part: parser.part.into(), detail: format!("compositematerials {id} has invalid matindices") })?
+    } else { Vec::new() };
+    if !["colorgroup", "texture2dgroup", "compositematerials"].contains(&tag.name.as_str()) {
+        return Err(ThreeMfError::Unsupported { part: parser.part.into(),
+            detail: format!("materials extension resource <{}> is unsupported", tag.name) });
+    }
+    if !tag.empty {
+        loop {
+            match parser.next()? {
+                Event::Start(child) => {
+                    if child.namespace != super::MATERIAL_NAMESPACE { parser.skip(&child)?; continue; }
+                    match (tag.name.as_str(), child.name.as_str()) {
+                        ("colorgroup", "color") => {
+                            let value = parser.required(&child, "color")?.trim();
+                            let Some(rgb) = parse_display_color(value) else {
+                                return parser.fail(format!("colorgroup {id} has invalid color '{value}'"));
+                            };
+                            let alpha = if value.len() == 9 { u8::from_str_radix(&value[7..9], 16).ok() } else { Some(255) };
+                            let Some(alpha) = alpha else { return parser.fail("invalid color alpha"); };
+                            colors.push([rgb[0], rgb[1], rgb[2], alpha]);
+                        }
+                        ("texture2dgroup", "tex2coord") => coords.push([parser.coordinate(&child, "u")?, parser.coordinate(&child, "v")?]),
+                        ("compositematerials", "composite") => {
+                            let mut weights = parser.required(&child, "values")?.split_whitespace()
+                                .take(constituents.len()).map(|s| s.parse::<f64>()).collect::<Result<Vec<_>, _>>()
+                                .map_err(|_| ThreeMfError::Model { part: parser.part.into(), detail: "invalid composite values".into() })?;
+                            weights.resize(constituents.len(), 0.0);
+                            if constituents.len() < 2
+                                || weights.iter().any(|v| !v.is_finite() || *v < 0.0 || *v > 1.0) {
+                                return parser.fail(format!("compositematerials {id} has invalid fractions"));
+                            }
+                            mixtures.push(weights);
+                        }
+                        _ => return parser.fail(format!("unexpected <{}> in {}", child.name, tag.name)),
+                    }
+                    if colors.len() + coords.len() + mixtures.len() > MAX_MESH_TRIANGLES {
+                        return Err(ThreeMfError::Bounds { part: parser.part.into(), detail: "too many material properties".into() });
+                    }
+                    parser.close_leaf(&child)?;
+                }
+                Event::End { name } if name == tag.name => break,
+                Event::End { .. } => {},
+                Event::Eof => return parser.fail("part ends inside material resource"),
+            }
+        }
+    }
+    match tag.name.as_str() {
+        "colorgroup" => { document.colors.insert(id, colors); }
+        "texture2dgroup" => { document.texture_groups.insert(id, (texid, coords)); }
+        _ => { document.composites.insert(id, (matid, constituents, mixtures)); }
+    }
+    Ok(())
+}
+
+impl ModelDocument {
+    pub fn appearance(&self, property: Option<Property>, part: &str) -> Result<Option<super::ThreeMfAppearance>, ThreeMfError> {
+        use super::ThreeMfAppearance;
+        let Some(p) = property else { return Ok(None); };
+        let invalid = || ThreeMfError::Model { part: part.into(), detail: format!("invalid property reference in material group {}", p.group) };
+        if let Some(colors) = self.colors.get(&p.group) {
+            let mut out = [[0; 4]; 3];
+            for i in 0..3 { out[i] = *colors.get(p.corners[i] as usize).ok_or_else(invalid)?; }
+            return Ok(Some(ThreeMfAppearance::Colors(out)));
+        }
+        if let Some((texture_id, coords)) = self.texture_groups.get(&p.group) {
+            if !self.textures.iter().any(|t| t.id == *texture_id) { return Err(invalid()); }
+            let mut uv = [[0.0; 2]; 3];
+            for i in 0..3 { uv[i] = *coords.get(p.corners[i] as usize).ok_or_else(invalid)?; }
+            return Ok(Some(ThreeMfAppearance::Texture { texture_id: *texture_id, uv }));
+        }
+        if let Some((matid, indices, mixtures)) = self.composites.get(&p.group) {
+            let base = self.materials.get(matid).ok_or_else(invalid)?;
+            let weights = [
+                mixtures.get(p.corners[0] as usize).ok_or_else(invalid)?.clone(),
+                mixtures.get(p.corners[1] as usize).ok_or_else(invalid)?.clone(),
+                mixtures.get(p.corners[2] as usize).ok_or_else(invalid)?.clone(),
+            ];
+            let colors = indices.iter().map(|i| base.get(*i as usize).copied().flatten().ok_or_else(invalid)).collect::<Result<Vec<_>, _>>()?;
+            return Ok(Some(ThreeMfAppearance::Composite { colors, weights }));
+        }
+        Ok(self.color(property).map(|[r,g,b]| ThreeMfAppearance::Colors([[r,g,b,255]; 3])))
+    }
+}
+
+fn parse_beam_lattice(parser: &mut ModelParser<'_>, tag: &StartTag, object_id: u32) -> Result<super::ThreeMfBeamLattice, ThreeMfError> {
+    let unsupported = |reason: &str| ThreeMfError::Unsupported { part: parser.part.into(),
+        detail: format!("beam lattice in object {object_id}: {reason}") };
+    if tag.attribute("clippingmode").unwrap_or("none") != "none" {
+        return Err(unsupported("clipping is unsupported for non-solid lattice data"));
+    }
+    if tag.attribute("ballmode").unwrap_or("none") != "none" {
+        return Err(unsupported("ball modes are unsupported for non-solid lattice data"));
+    }
+    for attribute in ["representationmesh", "clippingmesh", "pid", "pindex"] {
+        if tag.attribute(attribute).is_some() { return Err(unsupported(&format!("{attribute} is unsupported"))); }
+    }
+    let radius = parser.coordinate(tag, "radius")?;
+    let min_length = parser.coordinate(tag, "minlength")?;
+    let cap = tag.attribute("cap").unwrap_or("sphere");
+    if radius <= 0.0 || min_length <= 0.0 || !["sphere", "hemisphere", "butt"].contains(&cap) {
+        return parser.fail(format!("beam lattice in object {object_id}: invalid radius, minlength or cap"));
+    }
+    let mut beams = Vec::new();
+    if !tag.empty {
+        loop {
+            match parser.next()? {
+                Event::Start(group) => {
+                    if group.namespace != super::BEAM_NAMESPACE || group.name != "beams" {
+                        return Err(ThreeMfError::Unsupported { part: parser.part.into(), detail: format!("beam lattice in object {object_id}: <{}> is unsupported", group.name) });
+                    }
+                    if group.empty { continue; }
+                    loop {
+                        match parser.next()? {
+                            Event::Start(beam) => {
+                                if beam.namespace != super::BEAM_NAMESPACE || beam.name != "beam" {
+                                    return parser.fail(format!("beam lattice in object {object_id}: expected <beam>"));
+                                }
+                                if beam.attribute("p1").is_some() || beam.attribute("p2").is_some() || beam.attribute("pid").is_some() {
+                                    return Err(ThreeMfError::Unsupported { part: parser.part.into(), detail: format!("beam lattice in object {object_id}: beam properties are unsupported") });
+                                }
+                                let r1 = if beam.attribute("r1").is_some() { parser.coordinate(&beam, "r1")? } else { radius };
+                                let r2 = if beam.attribute("r2").is_some() {
+                                    if beam.attribute("r1").is_none() { return parser.fail("beam r2 requires r1"); }
+                                    parser.coordinate(&beam, "r2")?
+                                } else { r1 };
+                                let c1 = beam.attribute("cap1").unwrap_or(cap);
+                                let c2 = beam.attribute("cap2").unwrap_or(cap);
+                                if r1 <= 0.0 || r2 <= 0.0 || !["sphere", "hemisphere", "butt"].contains(&c1) || !["sphere", "hemisphere", "butt"].contains(&c2) {
+                                    return parser.fail(format!("beam lattice in object {object_id}: invalid radius or cap"));
+                                }
+                                if beams.len() >= MAX_MESH_TRIANGLES { return Err(ThreeMfError::Bounds { part: parser.part.into(), detail: "too many beams".into() }); }
+                                beams.push(super::ThreeMfBeam { vertices: [parser.index(&beam, "v1")?, parser.index(&beam, "v2")?], radii: [r1, r2], caps: [c1.into(), c2.into()] });
+                                parser.close_leaf(&beam)?;
+                            }
+                            Event::End { name } if name == "beams" => break,
+                            Event::End { .. } => {},
+                            Event::Eof => return parser.fail("part ends inside beams"),
+                        }
+                    }
+                }
+                Event::End { name } if name == "beamlattice" => break,
+                Event::End { .. } => {},
+                Event::Eof => return parser.fail("part ends inside beam lattice"),
+            }
+        }
+    }
+    Ok(super::ThreeMfBeamLattice { min_length, beams })
 }

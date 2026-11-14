@@ -1,10 +1,10 @@
-//! The shared COMPONENT action set: the ONE list of what can be done to a
-//! component, with each entry's availability and the reason when it is
-//! refused, drawn by every surface a component is acted on from: the
-//! selection context bar, the viewport's right-click menu and the BOM row
-//! menu ([`component_menu`]); and the ONE dispatcher those surfaces call
-//! ([`run_component_actions`]). Actions always route to the owning feature:
-//! one truth, one undo step.
+//! The shared COMPONENT action set: the ONE list
+//! of what can be done to a component, with each entry's availability and the
+//! reason when it is refused, drawn by every surface a component is acted on
+//! from: the selection context bar, the viewport's right-click menu and the
+//! BOM row menu ([`component_menu`]); and the ONE dispatcher those surfaces
+//! call ([`run_component_actions`]). Actions always route to the owning
+//! feature: one truth, one undo step.
 //!
 //! Engine-mutating actions (Move, Unfix and Move, Move Copy, Fix/Unfix, Hide,
 //! Delete) run HERE against [`EngineState`]; the document-level flows (Make

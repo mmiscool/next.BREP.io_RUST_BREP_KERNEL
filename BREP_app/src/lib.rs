@@ -1,5 +1,28 @@
-//! Shared eframe application for native windows and WebAssembly canvases.
-//! [`app::BrepApp`] hosts the renderer and egui in one wgpu frame.
+//! The BREP CAD application: one eframe (egui + wgpu) codebase for native
+//! windows and WebAssembly canvases.
+//!
+//! [`app::BrepApp`] is the `eframe::App`; it hosts the `brep_render` 3D engine
+//! and egui in one wgpu frame, and [`app::BrepApp::new`] builds it from an
+//! `eframe::CreationContext`. The native binary is `brep-app`; the WebAssembly
+//! build exports `start(canvas_id)`, which runs the application on a
+//! `<canvas>` element.
+//!
+//! Main modules:
+//! - [`document`] — the open documents, each with its own engine state;
+//! - [`workbench`] — the workbench definitions, the PMI command set and the
+//!   panels each workbench claims;
+//! - [`panels`], [`form`], [`form_view`] — the panels and the shared schema
+//!   forms;
+//! - [`viewport`] — offscreen 3D rendering composited into egui, with input;
+//! - [`store`], [`recovery`] — native and browser persistence, autosave and
+//!   startup recovery;
+//! - [`automation`] — the command, state and hit-key registries, queue and
+//!   virtual input an automation host drives the application through;
+//! - `mcp` (native) and `webmcp` (browser) — the MCP hosts (feature `mcp`);
+//! - [`plm`] — the client for a `BREP_plm` server;
+//! - [`javascript`] — the in-app JavaScript editor.
+//!
+//! See the README for the command line, feature flags and architecture.
 
 pub mod app;
 pub mod automation;

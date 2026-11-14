@@ -1044,7 +1044,7 @@ impl<'a> Resolver<'a> {
             };
         }
         if let Some(args) = entity.find("LINE") {
-            if switch!("BREP_STEP_LINE_CARRIER", false) {
+            if switch!("BREP_STEP_LINE_CARRIER", true) {
                 if let Some(curve) = self.line_on_written_carrier(args, p_start, p_end)? {
                     return Ok(curve);
                 }
@@ -1233,7 +1233,7 @@ impl<'a> Resolver<'a> {
                 loops: Vec::new(),
                 name: None,
             };
-            if switch!("BREP_STEP_OFFSET_PRECISION", false) {
+            if switch!("BREP_STEP_OFFSET_PRECISION", true) {
                 if let Ok(surface) = crate::offset::offset_surface_for_import(&carrier, -distance) {
                     return Ok(surface);
                 }

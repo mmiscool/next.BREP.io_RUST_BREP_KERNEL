@@ -35,8 +35,16 @@
 //!
 //! # Deferred paths (loud errors, never a silent geometry drop)
 //!
-//! - a `guide` that resolves to no curve, or to a chain of more than one segment
-//!   (the guided loft rides ONE spine curve).
+//! - a `guide` that resolves to no curve, or to ONE chain of curves that meet in
+//!   a corner (the guided loft rides one smooth spine; a chain whose curves meet
+//!   smoothly is joined into it by `loft_profile_brep_guided_chain`).
+//!
+//! `guide` picks that form SEVERAL separate chains are corner guides: one
+//! through each corner of the sections, lofted by
+//! `loft_profile_brep_on_loose_guide_chains`, whose walls follow the guides
+//! exactly and are cut where the guides have corners. A side then has several
+//! faces, `${edgeName}:${guide segment}_LF`, with `${edgeName}_LF` as their
+//! container.
 //!
 //! A resolvable `guide` runs the §5.8 guided loft: `loft_profile_brep_guided`,
 //! or `loft_profile_brep_guided_frame` when `rotateToGuide` is set. Both
@@ -84,7 +92,11 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // emit ONE side face per curve index whatever the station count. So the face
     // order the naming below stamps — `[sides…, START, END]` — is the same
     // guided or not, and nothing downstream changes.
-    let guide = resolve_guide(ctx)?;
+    let (guide, rails) = match resolve_guide(ctx)? {
+        Guide::None => (None, None),
+        Guide::Spine(chain) => (Some(chain), None),
+        Guide::Rails(rails) => (None, Some(rails)),
+    };
     let rotate_to_guide = matches!(ctx.param("rotateToGuide"), Some(Value::Bool(true)));
 
     // Ordered section references (a `multiple` reference_selection). Need >= 2.
@@ -191,6 +203,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
 
     // One lofted solid per REGION (railed across every section), unioned below.
     let mut region_solids = Vec::with_capacity(region_count);
+    let mut wall_containers: Vec<(String, Vec<String>)> = Vec::new();
     for region_index in 0..region_count {
         let first_region = &section_profiles[0].regions[region_index];
         let first_edge_names: Vec<Option<String>> = first_region[0].edge_names.clone();
@@ -200,19 +213,79 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
             .collect();
         let side_count = sections[0].len();
 
-        // Exact kernel loft (unnamed faces), order `[sides…, START, END]`.
-        let mut solid = loft_sections(&sections, guide.as_ref(), rotate_to_guide)?;
-
-        // Author the established name convention onto the emitted faces.
-        let mut face_names: Vec<String> = Vec::with_capacity(side_count + 2);
-        for index in 0..side_count {
-            let edge = first_edge_names
+        let edge = |index: usize| {
+            first_edge_names
                 .get(index)
                 .cloned()
                 .flatten()
-                .unwrap_or_else(|| "EDGE".to_string());
-            face_names.push(format!("{edge}_LF"));
-        }
+                .unwrap_or_else(|| "EDGE".to_string())
+        };
+        let mut face_names: Vec<String> = Vec::with_capacity(side_count + 2);
+        let mut solid = if let Some(rails) = &rails {
+            // CORNER GUIDES: one rail through each corner of the sections. The
+            // kernel matches rails to corners and turns the later sections onto
+            // them, and tells which wall each side face is: a side cut by the
+            // rails' joints or by a middle section is several faces, each named
+            // for the rail segment it runs along, with the un-keyed `{edge}_LF`
+            // as their container (the mitred Path Sweep's convention).
+            if region_count != 1 || first_region.len() != 1 {
+                return Err("loft: corner guides (several separate guide chains) loft sections of ONE \
+                            outline without holes; pick one connected chain to bend a holed or \
+                            multi-region loft along a spine".into());
+            }
+            if rotate_to_guide {
+                return Err("loft: `rotateToGuide` turns the sections along ONE guide (a spine); the \
+                            guide picks form several separate chains, which are corner guides and fix \
+                            the sections where they stand".into());
+            }
+            if rails.len() != side_count {
+                return Err(format!(
+                    "loft: the guide picks form {} separate chains; corner guides need {side_count}, \
+                     one through each corner of the sections (or pick ONE connected chain to bend \
+                     the loft along a spine)",
+                    rails.len()
+                ).into());
+            }
+            let curves: Vec<Vec<NurbsCurve>> = rails
+                .iter()
+                .map(|rail| rail.iter().map(|segment| segment.curve.clone()).collect())
+                .collect();
+            let (solid, walls) = crate::loft_profile_brep_on_loose_guide_chains(&sections, &curves)?;
+            let key = |wall: &crate::GuideLoftWall| (wall.side, rails[wall.guide][wall.piece].name.clone());
+            for wall in &walls {
+                let of_side = walls.iter().filter(|other| other.side == wall.side).count();
+                let of_segment = walls.iter().filter(|other| key(other) == key(wall)).count();
+                let (side, segment) = key(wall);
+                face_names.push(if of_side == 1 {
+                    format!("{}_LF", edge(side))
+                } else if of_segment == 1 {
+                    format!("{}:{segment}_LF", edge(side))
+                } else {
+                    // one rail segment crossed by a middle section: a wall on each side of it
+                    format!("{}:{segment}:{}_LF", edge(side), wall.span)
+                });
+            }
+            for side in 0..side_count {
+                let members: Vec<String> = walls
+                    .iter()
+                    .zip(&face_names)
+                    .filter(|(wall, _)| wall.side == side)
+                    .map(|(_, name)| name.clone())
+                    .collect();
+                if members.len() > 1 {
+                    wall_containers.push((format!("{}_LF", edge(side)), members));
+                }
+            }
+            solid
+        } else {
+            // Exact kernel loft (unnamed faces), order `[sides…, START, END]`.
+            let solid = loft_sections(&sections, guide.as_deref(), rotate_to_guide)?;
+            // Author the established name convention onto the emitted faces.
+            for index in 0..side_count {
+                face_names.push(format!("{}_LF", edge(index)));
+            }
+            solid
+        };
         let (start, end) = &caps.per_loop[region_index];
         face_names.push(start.clone());
         face_names.push(end.clone());
@@ -224,10 +297,10 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
             .faces;
         if faces.len() != face_names.len() {
             return Err(format!(
-                "loft builder produced {} faces, expected {} ({} sides + 2 caps)",
+                "loft builder produced {} faces, expected {} ({} walls + 2 caps)",
                 faces.len(),
                 face_names.len(),
-                side_count
+                face_names.len() - 2
             ).into());
         }
         for (face, name) in faces.iter_mut().zip(&face_names) {
@@ -251,7 +324,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                         .iter()
                         .map(|profile| profile.regions[region_index][loop_index].curves.clone())
                         .collect();
-                    loft_sections(&hole_sections, guide.as_ref(), rotate_to_guide)
+                    loft_sections(&hole_sections, guide.as_deref(), rotate_to_guide)
                 },
             )?;
         }
@@ -264,7 +337,9 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     common::stamp_sweep_roles_multi(&solid, "_LF", &caps.starts(), &caps.ends());
 
     // Optional boolean fold + result.
-    let mut result = common::finalize_solid_grouped(ctx, solid, base, &caps.containers());
+    let mut containers = caps.containers();
+    containers.extend(wall_containers);
+    let mut result = common::finalize_solid_grouped(ctx, solid, base, &containers);
     if result.error.is_some() {
         return Ok(result);
     }
@@ -294,24 +369,42 @@ fn has_guide(ctx: &FeatureContext) -> bool {
     }
 }
 
-/// The `guide` reference resolved to its ONE spine curve, or `None` when no
-/// guide is selected. A named-but-unresolvable guide, or one that resolves to a
-/// multi-segment chain, is a loud error — never a silent un-guided loft.
-fn resolve_guide(ctx: &FeatureContext) -> Result<Option<NurbsCurve>, String> {
+/// What the `guide` picks are.
+enum Guide {
+    None,
+    /// One connected chain: the spine the loft bends along.
+    Spine(Vec<NurbsCurve>),
+    /// Several separate chains: corner guides, one through each corner of the
+    /// sections.
+    Rails(Vec<Vec<common::PathSegment>>),
+}
+
+/// The `guide` reference resolved: nothing, a spine (one curve or one connected
+/// chain of curves) or corner guides (several separate chains). A
+/// named-but-unresolvable guide is a loud error — never a silent un-guided
+/// loft. A spine chain is lofted along where its curves meet smoothly and
+/// refused by the kernel, with the angle, where they meet in a corner
+/// ([`crate::loft_profile_brep_guided_chain`]).
+fn resolve_guide(ctx: &FeatureContext) -> Result<Guide, String> {
     if !has_guide(ctx) {
-        return Ok(None);
+        return Ok(Guide::None);
     }
-    let name = common::first_reference_name(ctx.param("guide"))
+    let names = common::reference_names(ctx.param("guide"));
+    let name = names
+        .first()
         .ok_or("loft: `guide` is set but names nothing selectable")?;
-    let chain = common::resolve_path(ctx, &name).map_err(|error| format!("loft: {error}"))?;
-    match chain.len() {
-        1 => Ok(Some(chain.into_iter().next().expect("one curve"))),
-        0 => Err(format!("loft: guide '{name}' resolved to no curves").into()),
-        other => Err(format!(
-            "loft: guide '{name}' is a {other}-segment chain; the guided loft rides ONE spine \
-             curve — pick a single edge, or a sketch whose open chain is one segment"
-        ).into()),
+    if names.len() == 1 {
+        let chain = common::resolve_path(ctx, name).map_err(|error| format!("loft: {error}"))?;
+        if chain.is_empty() {
+            return Err(format!("loft: guide '{name}' resolved to no curves"));
+        }
+        return Ok(Guide::Spine(chain));
     }
+    let mut chains = common::resolve_path_chains(ctx, &names).map_err(|error| format!("loft: guide: {error}"))?;
+    if chains.len() == 1 {
+        return Ok(Guide::Spine(chains.remove(0).into_iter().map(|segment| segment.curve).collect()));
+    }
+    Ok(Guide::Rails(chains))
 }
 
 /// Loft one stack of sections: straight when there is no guide, along the guide
@@ -319,13 +412,14 @@ fn resolve_guide(ctx: &FeatureContext) -> Result<Option<NurbsCurve>, String> {
 /// Every branch emits the same face order (see the call site).
 fn loft_sections(
     sections: &[Vec<NurbsCurve>],
-    guide: Option<&NurbsCurve>,
+    guide: Option<&[NurbsCurve]>,
     rotate_to_guide: bool,
 ) -> Result<crate::BrepSolid, crate::KernelRefusal> {
     match (guide, rotate_to_guide) {
         (None, _) => loft_profile_brep(sections),
-        (Some(guide), false) => loft_profile_brep_guided(sections, guide, None),
-        (Some(guide), true) => loft_profile_brep_guided_frame(sections, guide, None),
+        (Some([guide]), false) => loft_profile_brep_guided(sections, guide, None),
+        (Some([guide]), true) => loft_profile_brep_guided_frame(sections, guide, None),
+        (Some(chain), rotate) => crate::loft_profile_brep_guided_chain(sections, chain, None, rotate),
     }
 }
 
@@ -370,10 +464,10 @@ pub fn schema() -> serde_json::Value {
             "selectionFilter": [
                 "EDGE"
             ],
-            "multiple": false,
+            "multiple": true,
             "default_value": null,
-            "label": "Guide curve",
-            "hint": "Optional single guide curve (§5.8): the loft's spine follows it, bending the sections along the guide instead of the straight centroid-to-centroid path."
+            "label": "Guide curves",
+            "hint": "Optional guides. Edges that connect into ONE chain are a spine (§5.8): the loft bends along it instead of the straight centroid-to-centroid path; its curves must meet smoothly. Edges that form SEVERAL separate chains are corner guides: one through each corner of the sections, which the walls follow exactly; a corner in a guide becomes an edge of the loft."
         },
         "rotateToGuide": {
             "type": "boolean",

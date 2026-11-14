@@ -555,21 +555,14 @@ pub(super) fn verdict_with_patches(solid: &BrepSolid, options: SelfIntersectionO
 /// One face of the proof: a native carrier, or a patch proved fold-free.
 enum Item<'a> {
     Native(Face<'a>),
-    Patch(&'a FaceRecord, super::blend_patch::Patch),
+    Patch(super::blend_patch::Patch),
 }
 
 impl Item<'_> {
-    fn record(&self) -> &FaceRecord {
-        match self {
-            Item::Native(face) => face.record,
-            Item::Patch(record, _) => record,
-        }
-    }
-
     fn world_box(&self) -> (Vec3, Vec3) {
         match self {
             Item::Native(face) => face.world_box(),
-            Item::Patch(_, patch) => (patch.lo, patch.hi),
+            Item::Patch(patch) => (patch.lo, patch.hi),
         }
     }
 }
@@ -580,7 +573,7 @@ impl Item<'_> {
 fn cells_apart(a: &Item, box_a: (Vec3, Vec3), b: &Item, box_b: (Vec3, Vec3), tau: f64) -> bool {
     match (a, b) {
         (Item::Native(_), Item::Native(_)) => false,
-        (Item::Patch(_, patch), Item::Native(face)) | (Item::Native(face), Item::Patch(_, patch)) => {
+        (Item::Patch(patch), Item::Native(face)) | (Item::Native(face), Item::Patch(patch)) => {
             let face_box = if matches!(a, Item::Native(_)) { box_a } else { box_b };
             patch.nets.iter().all(|net| {
                 let cell = super::blend_curved::net_box(net);
@@ -598,7 +591,7 @@ fn cells_apart(a: &Item, box_a: (Vec3, Vec3), b: &Item, box_b: (Vec3, Vec3), tau
                     }
             })
         }
-        (Item::Patch(_, pa), Item::Patch(_, pb)) => {
+        (Item::Patch(pa), Item::Patch(pb)) => {
             let near_b: Vec<(Vec3, Vec3)> = pb.nets.iter().map(super::blend_curved::net_box).filter(|cell| !separated(*cell, box_a, tau)).collect();
             pa.nets.iter().all(|net| {
                 let cell = super::blend_curved::net_box(net);
@@ -725,7 +718,7 @@ fn verdict_with(solid: &BrepSolid, options: SelfIntersectionOptions, patches: bo
     let mut faces = Vec::with_capacity(records.len());
     for ((record, carrier), patch) in records.iter().zip(carriers).zip(built) {
         match (carrier, patch) {
-            (_, Some(patch)) => faces.push(Item::Patch(record, patch)),
+            (_, Some(patch)) => faces.push(Item::Patch(patch)),
             (Some(carrier), None) => faces.push(Item::Native(Face::new(record, carrier, tau)?)),
             (None, None) => unreachable!("every face without a native carrier was built as a patch"),
         }

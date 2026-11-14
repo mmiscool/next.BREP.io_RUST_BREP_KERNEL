@@ -5,7 +5,7 @@
 //! catalogue entry, and the history stays fully editable as everywhere. What
 //! it adds is the **Sheets** panel — its own, claimed by no other workbench but
 //! All — and the sheet's tools as buttons in the workbench row. The views a
-//! sheet places are captured and annotated in the PMI workbench; this one only
+//! sheet places are captured and annotated from the PMI tab; this one only
 //! reads them.
 //!
 //! Leaving the workbench closes an open sheet (`app.rs` drives that off the

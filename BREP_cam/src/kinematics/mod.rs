@@ -19,7 +19,6 @@
 //! is held at the previous value and tagged `singular`.
 
 use crate::model::{Kinematics, Machine, MachineKind, Point3, RigidTransform, RotaryAxis};
-use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
 pub mod library;

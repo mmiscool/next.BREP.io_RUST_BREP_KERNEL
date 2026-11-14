@@ -157,11 +157,8 @@ fn unplaceable(part: &Part) -> Option<String> {
         .or_else(|| probe.validate().err())
 }
 
-fn offers(reached: Vec<Device>) -> Vec<Offer> {
-    offers_and_refusals(reached).0
-}
 
-/// [`offers`], and a line for each device that could not be offered because its
+/// `offers`, and a line for each device that could not be offered because its
 /// part cannot go on a sheet ([`unplaceable`]).
 fn offers_and_refusals(reached: Vec<Device>) -> (Vec<Offer>, Vec<String>) {
     let mut used = BTreeSet::new();

@@ -191,24 +191,8 @@ struct Arc {
     pieces: Vec<(NurbsCurve, Option<usize>)>,
 }
 
-/// Divide `loops` along the fold locus, keeping every regular piece.
-///
-/// `Ok(None)` when there is nothing to carve: no fold in the region at all, or
-/// a region that folds at every sample — the all-or-nothing lane the callers
-/// already have owns that one, and answering it here would be two mechanisms
-/// for one question.
-pub(crate) fn carve_folded_trim(
-    surface: &NurbsSurface,
-    loops: &[Vec<NurbsCurve>],
-    displacements: &[f64],
-    collapse_factor: f64,
-    budget: ScanBudget,
-) -> Result<Option<CarvedTrim>, KernelRefusal> {
-    carve_folded_trim_scanned(surface, loops, displacements, collapse_factor, budget)
-        .map(|outcome| outcome.carved)
-}
 
-/// [`carve_folded_trim`]'s answer together with the SCAN it was decided on.
+/// `carve_folded_trim`'s answer together with the SCAN it was decided on.
 ///
 /// A caller that gets `None` back still has a decision to make — build the
 /// trim whole, or refuse because the scan could not certify it regular — and

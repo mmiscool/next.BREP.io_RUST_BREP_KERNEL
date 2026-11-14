@@ -573,48 +573,6 @@ pub(crate) fn mixed_convexity_corners(
     found
 }
 
-/// The inside-corner refusal's name: two selected concave edges over an
-/// unselected concave sharp edge.
-pub(crate) const REENTRANT_CONCAVE_WHAT: &str = "reentrant_concave";
-
-/// Whether `refusal` is the inside-corner classification above.
-pub(crate) fn is_reentrant_concave(refusal: &KernelRefusal) -> bool {
-    matches!(&refusal.class, RefusalClass::UnsupportedGeometry { what } if what == REENTRANT_CONCAVE_WHAT)
-}
-
-/// `BREP_BLEND_CONCAVE_MITER`: send an inside corner (two selected concave
-/// edges over a concave sharp edge) down the two-edge miter lane instead of
-/// refusing it by name. `=0`/`off` is the escape hatch. Promoted 2026-10-15
-/// (lane L's census with it on: the 96 cases OK, integration and lib green
-/// but for three refusal pins whose refusal moves one corner further, to the
-/// one-ended concave-third end).
-const CONCAVE_MITER_DEFAULT: bool = true;
-
-pub(crate) fn concave_miter_on() -> bool {
-    switch!(live "BREP_BLEND_CONCAVE_MITER", CONCAVE_MITER_DEFAULT)
-}
-
-
-// BREP named hunk: begin lcount234_creased_seam_join_20261016
-/// `BREP_BLEND_CREASED_SEAM`: close a smooth vertex whose two side faces CREASE
-/// along their seam down the two-edge miter lane, with the seam as its sharp
-/// edge, instead of refusing it as "not a flush join". The two balls then meet
-/// the seam at different points when the seam's faces turn their normals out of
-/// the shared face's normal plane, and the closure is the miter's asymmetric
-/// one (`solve_miter`): the seam leaves the shallower blend through its side
-/// rail at P, and a connector on that blend's side face runs to S on the seam.
-/// `=0`/`off` is the escape hatch. Promoted 2026-10-17 (no case reaches a
-/// creased BUILD yet, lCount_234 reaches the lane at five vertices and is
-/// declined by the corner ball's carrier-extension guard, the same final
-/// refusal either way).
-const CREASED_SEAM_DEFAULT: bool = true;
-
-pub(crate) fn creased_seam_on() -> bool {
-    switch!(live "BREP_BLEND_CREASED_SEAM", CREASED_SEAM_DEFAULT)
-}
-
-// BREP named hunk: end lcount234_creased_seam_join_20261016
-
 /// Whether each selected edge is CONVEX (its ball inside the material), in
 /// selection order; `None` when the selection's mates cannot be read.
 pub(crate) fn selection_convexity(solid: &BrepSolid, edge_ids: &[u64], radius: f64) -> Option<Vec<bool>> {
@@ -890,7 +848,7 @@ fn blend_star_network_building(
         .max(1.0);
     let mut corners: Vec<(u64, Vec<usize>, VertexKind)> = Vec::new();
     // The smooth vertices whose side faces crease along their seam, closed
-    // down the miter lane (`creased_seam_on`).
+    // down the miter lane.
     let mut creased_vertices: Vec<u64> = Vec::new();
     let mut vertex_radii: Vec<(u64, f64)> = Vec::new();
     for (vertex_id, stripe_indices) in &vertex_stripes {
@@ -972,17 +930,11 @@ fn blend_star_network_building(
         let mut ribbon_star = false;
         if unequal.is_some() {
             if is_star {
-                if !super::no_common_ball_star_on() {
-                    return Err(refuse_unequal("an unequal-radius star has no common ball and its N-sided fill is not in this lane"));
-                }
                 if tapered_here {
                     return Err(refuse_unequal("an unequal-radius star at a varying radius is not in this lane"));
                 }
                 ribbon_star = true;
             } else {
-                if !super::unequal_miter_on() {
-                    return Err(refuse_unequal("an unequal-radius corner is not in this lane"));
-                }
                 if tapered_here {
                     return Err(refuse_unequal("an unequal-radius corner at a varying radius is not in this lane"));
                 }
@@ -1058,8 +1010,7 @@ fn blend_star_network_building(
                     // vertex) goes down the miter lane, its seam the sharp
                     // edge.
                     Err(refusal)
-                        if creased_seam_on()
-                            && matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what } if what == "flush_join") =>
+                        if matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what } if what == "flush_join") =>
                     {
                         if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                             eprintln!("creased seam at vertex {vertex_id}: {refusal}; trying the miter lane");
@@ -1159,24 +1110,6 @@ fn blend_star_network_building(
                 ));
                 continue;
             }
-            if !sharp_convex && !concave_miter_on() {
-                // An INSIDE corner: every edge at the vertex is concave and
-                // two are selected.  This is not the horn torus's mirror (the
-                // horn's mirror is two concave stripes over a CONVEX sharp
-                // edge, built above): a ball in the air here is seated by all
-                // three faces at once and cannot wrap the sharp edge without
-                // entering a wall, so the two pads meet in a SEAM from their
-                // floor rails' crossing up to the sharp edge — the mirror of
-                // the convex two-edge miter.  `BREP_BLEND_CONCAVE_MITER=1`
-                // sends it down that miter lane; off, refused by name.
-                return Err(KernelRefusal::unsupported(KernelStage::Classify, REENTRANT_CONCAVE_WHAT, format!(
-                    "blend network: vertex {vertex_id} at ({:.3}, {:.3}, {:.3}) is an inside corner: the selected \
-                     concave edges {} and {} meet the unselected concave edge {}; the ball in the air is seated by \
-                     all three faces and cannot wrap that edge, so the closure is the two pads' seam up to it (the \
-                     mirror of the convex two-edge miter, not of the horn torus), which this lane does not build",
-                    point.x, point.y, point.z, mates[a].0.id, mates[b].0.id, sharp.id
-                )));
-            }
             miter = Some((shared, sharp));
         }
         let face_refs: Vec<&FaceRecord> = faces.iter().map(|(face, _, _)| *face).collect();
@@ -1202,7 +1135,7 @@ fn blend_star_network_building(
         // single inscribed sphere and the notch needs an N-sided fill.
         let bar = 1e-7 * (1.0 + scale);
         if ball.residual > bar && !ribbon_star {
-            if is_star && super::no_common_ball_star_on() && !tapered_here {
+            if is_star && !tapered_here {
                 if !chamfer && super::ridge_star_on() {
                     if let Some([seat_a, seat_b]) = solve_ridge_seats(&faces, &stripe_indices, &mates, corner_radius) {
                         let mut mint = |seat: RidgeSeat| {
@@ -1634,7 +1567,7 @@ fn blend_star_network_building(
         };
         let ladder = concave_corner_ladder(edge, &corners, flush_reach);
         // A rung below the reach the ends ask for (`ladder_reach`) cannot
-        // carry the rows to them: with `short_rungs_deferred_on` the ladder
+        // carry the rows to them: the ladder
         // marches the rungs that can first, and the short ones only when none
         // of those settles (`count.march.short_rungs_deferred` / `_run`).
         let needed_reach = ladder_reach(edge, &corners, flush_reach);
@@ -1656,7 +1589,7 @@ fn blend_star_network_building(
                 && (!wall_check || reading.worst_wall().is_some_and(|wall| wall <= wall_bar))
         };
         let meets_model = |reading: &OpenRungReading| reading.worst_wall().is_some_and(|wall| wall <= model);
-        let mut chosen: Option<(FittedRows, Vec<f64>, StationRefinement, Vec<Station>, [usize; 2], OpenDenseCentres)> = None;
+        let mut chosen: Option<(FittedRows, Vec<f64>, StationRefinement, Vec<Station>, [usize; 2], OpenDenseCentres)>;
         let mut last_error: Option<KernelRefusal> = None;
         let mut station_count = super::stations::STATIONS;
         let mut accepted: Option<StripeRung> = None;
@@ -1670,19 +1603,18 @@ fn blend_star_network_building(
         // directly off the exact rows (`exact_extrusion_wall_readings`). A fit
         // that does not come back exact hands the stripe to the ladder.
         let extrusion = wall_radius.and_then(|_| extrusion_direction(edge, first, second));
-        let mut exact_lane = super::exact_lane_on() && extrusion.is_some();
-        // The exact REVOLUTION lane (`exact_revolution_on`): a circular
-        // edge between a plane and a coaxial revolution carrier is one
-        // section revolved. Decided before any station is solved, for a
-        // stripe whose two ends a corner stops (a free end's crossing lies
-        // in the overshoot, where the carrier's ruled extension and the
-        // circle the rows follow part company); the rows are built by
-        // `exact_revolution_rows`, which declines by name to the ladder
-        // when its witness does not hold.
+        let mut exact_lane = extrusion.is_some();
+        // The exact REVOLUTION lane: a circular edge between a plane and a
+        // coaxial revolution carrier is one section revolved. Decided
+        // before any station is solved, for a stripe whose two ends a
+        // corner stops (a free end's crossing lies in the overshoot, where
+        // the carrier's ruled extension and the circle the rows follow part
+        // company); the rows are built by `exact_revolution_rows`, which
+        // declines by name to the ladder when its witness does not hold.
         let cornered_ends = [edge.start_vertex_id, edge.end_vertex_id]
             .iter()
             .all(|vertex| corners.iter().any(|(id, _, _)| id == vertex));
-        let mut revolution = if exact_lane || wall_radius.is_none() || !cornered_ends || !super::exact_revolution_on() {
+        let mut revolution = if exact_lane || wall_radius.is_none() || !cornered_ends {
             None
         } else {
             revolution_lane_axis(edge, first, second)
@@ -1708,14 +1640,12 @@ fn blend_star_network_building(
         // after the rest. A short rung that runs keeps its precedence: the
         // first rung that fits is the one shipped when none settles, and the
         // last error the one reported when none fits.
-        let order: Vec<(f64, bool)> = if short_rungs_deferred_on() {
+        let order: Vec<(f64, bool)> = {
             let reaching = ladder.iter().filter(|overshoot| **overshoot >= needed_reach).map(|overshoot| (*overshoot, false));
             let short: Vec<(f64, bool)> =
                 ladder.iter().filter(|overshoot| **overshoot < needed_reach).map(|overshoot| (*overshoot, true)).collect();
             super::record_count("count.march.short_rungs_deferred", short.len() as u64);
             reaching.chain(short).collect()
-        } else {
-            ladder.iter().map(|overshoot| (*overshoot, false)).collect()
         };
         let (mut deferred_taken, mut reaching_error) = (false, false);
         for &(overshoot, deferred) in &order {
@@ -2242,7 +2172,7 @@ fn blend_star_network_building(
     // two stops are one point within the band, is not crossed and collapses
     // as before.
     //
-    // On the switch (`crossed_rails_on`) the stripe is CONVERTED
+    // The stripe is CONVERTED
     // (`corner/crossed.rs`): both neighbours end at their rail/rail point
     // `M` on the shared face (the last ball that fits between their side
     // faces), the stripe keeps only its side-face rail, each neighbour gets
@@ -2302,9 +2232,6 @@ fn blend_star_network_building(
             stripes[crossing.index].edge.id, crossing.strip, crossing.shared, crossing.u_start, crossing.u_finish
         ))
     };
-    if let Some(first) = crossed.first().filter(|_| !super::crossed_rails_on()) {
-        return Err(refuse_crossed(first, "converting the stripe into a rib between the merged corners is not built here"));
-    }
     let mut handled_corners: Vec<u64> = Vec::new();
     let mut converted_rows: Vec<(usize, FittedRows)> = Vec::new();
     for crossing in &crossed {
@@ -5882,18 +5809,6 @@ fn ladder_reach(edge: &EdgeRecord, corners: &[(u64, Vec<usize>, VertexKind<'_>)]
         .fold(flush_reach.max(0.0), f64::max)
 }
 
-/// Lane R2 row 6 (2026-10-18): `BREP_BLEND_SHORT_RUNGS=1`/`on` defers the
-/// overshoot rungs below [`ladder_reach`] until the rungs that reach have
-/// failed to settle (the default since its census at 5aadf921e); `=0`/`off`
-/// climbs the ladder in order; `set_short_rungs_deferred_for_test` forces it
-/// on a test's own thread.
-const SHORT_RUNGS_DEFERRED_DEFAULT: bool = true;
-
-pub(in crate::blend) fn short_rungs_deferred_on() -> bool {
-    switch!(live "BREP_BLEND_SHORT_RUNGS", SHORT_RUNGS_DEFERRED_DEFAULT)
-}
-
-
 /// The overshoot ladder for one stripe of the network: [`OVERSHOOTS`], and
 /// past its last rung the rungs a concave corner at either end needs
 /// ([`concave_corner_reach`]) or a flush join's seam-ball stop needs
@@ -6636,12 +6551,11 @@ pub(super) struct CanalPatch {
 
 /// Where the canal's outer sheet crosses the neighbouring stripe's envelope
 /// next to stop `stop` (0: u = 0, 1: u = 1). The crease runs from `k_point`,
-/// the cusp of the envelope on the stop's section arc at row parameter
-/// `v_k`, to the pole (v = 0); `points` and `uv` (the patch parameters of
+/// the cusp of the envelope on the stop's section arc, to the pole
+/// (v = 0); `points` and `uv` (the patch parameters of
 /// each point, from the solve) are listed in that order.
 pub(super) struct CanalCrease {
     pub(super) stop: usize,
-    pub(super) v_k: f64,
     pub(super) points: Vec<Vec3>,
     pub(super) uv: Vec<(f64, f64)>,
 }
@@ -6790,7 +6704,7 @@ fn canal_stop_crease(
             eprintln!("canal crease at stop {stop}: cusp at v = {v_k:.6}, {count} rows, {worst:.3e} off the crease (bar {bar:.3e})");
         }
         if worst <= bar {
-            return Ok(Some(CanalCrease { stop, v_k, points, uv }));
+            return Ok(Some(CanalCrease { stop, points, uv }));
         }
     }
     Err(unsolved("canal_crease_fit"))
@@ -8539,7 +8453,6 @@ fn refine_seam_crossing(
         Ok(seed)
     }
 }
-
 
 
 /// One seat of a ridge star: the ball's centre and its contact with each of the

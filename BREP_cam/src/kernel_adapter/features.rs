@@ -98,7 +98,6 @@ pub fn carrier_of(face: &FaceRecord, t: &RigidTransform, tol: &Tolerance) -> Car
             None => Carrier::Other { label: "Torus".into() },
         },
         Some(AnalyticSurface::Revolution { frame, generatrix, .. }) => revolution_carrier(frame, generatrix, t, tol),
-        Some(other) => Carrier::Other { label: other.kind_label().into() },
         None => Carrier::Other { label: "free-form".into() },
     }
 }

@@ -8,7 +8,7 @@
 //! enumerates constraint kinds: `assembly_constraint_catalogue` hands back the
 //! kernel's own schema catalogue, which is what `assembly_add_constraint`
 //! validates against.
-use crate::automation::command::{app_command, engine_call, parse_args, schema_of, CommandSpec, Ctx, Empty, NoArgs, Outcome};
+use crate::automation::command::{app_command, engine_call, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Outcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -470,21 +470,23 @@ fn assembly_inferable_types(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, S
     })))
 }
 
+/// An inference reply, or the session-pending refusal it carries as a value
+/// (the queue runs a pending command again once the session has landed).
+fn inference_outcome(reply: Value) -> Result<Outcome, String> {
+    if reply["pending"] == true {
+        return Err(reply["error"].as_str().unwrap_or(brep_render::engine_state::ASSEMBLY_SESSION_PENDING).to_string());
+    }
+    Ok(Outcome::Done(reply))
+}
+
 fn assembly_infer_constraints(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: InferConstraintsArgs = parse_args(args)?;
-    Ok(Outcome::Done(
-        ctx.app.docs.engine_mut().assembly_infer_constraints(&a.options()),
-    ))
+    inference_outcome(ctx.app.docs.engine_mut().assembly_infer_constraints(&a.options()))
 }
 
 fn assembly_apply_inferred_constraints(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: InferConstraintsArgs = parse_args(args)?;
-    Ok(Outcome::Done(
-        ctx.app
-            .docs
-            .engine_mut()
-            .assembly_apply_inferred_constraints(&a.options()),
-    ))
+    inference_outcome(ctx.app.docs.engine_mut().assembly_apply_inferred_constraints(&a.options()))
 }
 
 fn component_update(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {

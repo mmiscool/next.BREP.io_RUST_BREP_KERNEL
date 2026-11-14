@@ -115,8 +115,8 @@ impl EngineState {
     }
 
     /// The world bbox CENTER of a component's member solids — the Move gizmo's
-    /// attach point. `None` when the component has no resident members (rolled
-    /// back / failed build).
+    /// attach point. `None` when the component has no resident
+    /// members (rolled back / failed build).
     pub fn component_bbox_center(&self, feature_id: &str) -> Option<[f64; 3]> {
         let mut bbox = crate::camera::Aabb::empty();
         for solid in self.scene.solids() {

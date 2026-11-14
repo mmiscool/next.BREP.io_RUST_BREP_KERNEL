@@ -212,7 +212,9 @@ fn param_schema(name: &str, spec: &Value) -> Option<Value> {
             } else {
                 format!("{description} — {accepts}")
             };
-            if multiple {
+            if multiple && spec.get("allowSingleReference").and_then(Value::as_bool).unwrap_or(false) {
+                json!({ "type": ["array", "string", "null"], "items": { "type": "string" }, "x-selectionFilter": spec.get("selectionFilter").cloned().unwrap_or(json!([])), "description": note })
+            } else if multiple {
                 json!({ "type": "array", "items": { "type": "string" }, "x-selectionFilter": spec.get("selectionFilter").cloned().unwrap_or(json!([])), "description": note })
             } else {
                 json!({ "type": ["string", "null"], "x-selectionFilter": spec.get("selectionFilter").cloned().unwrap_or(json!([])), "description": note })

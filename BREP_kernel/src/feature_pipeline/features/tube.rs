@@ -1,7 +1,7 @@
 //! TU — Tube. A BALL-AND-STICK pipe network: exactly ONE solid segment per input
 //! edge, joined by a SPHERE at every junction (a vertex where ≥2 segments meet).
 //!
-//! # Model (the spec)
+//! # Model
 //!
 //! - Each selected edge → its OWN segment body, following that edge exactly
 //!   (start vertex → end vertex, radius = tube radius): a CYLINDER for a straight
@@ -580,7 +580,7 @@ fn assemble_component_by_joints(
             .collect();
         incident.sort_by_key(|&edge| segments[edge].curve.is_some());
         for edge in incident {
-            let (a, b) = edge_nodes[edge];
+            let (a, _) = edge_nodes[edge];
             let segment = &segments[edge];
             let local = local_index(edge);
             let stub = match split.get(&edge) {
@@ -2286,7 +2286,7 @@ fn build_graph(segments: &[Segment]) -> (Vec<Vec3>, Vec<(usize, usize)>) {
         .max(1.0);
     let tolerance = scale * 1e-6;
     let mut nodes: Vec<Vec3> = Vec::new();
-    let mut node_index = |point: Vec3, nodes: &mut Vec<Vec3>| -> usize {
+    let node_index = |point: Vec3, nodes: &mut Vec<Vec3>| -> usize {
         for (index, &node) in nodes.iter().enumerate() {
             if node.sub(point).length() <= tolerance {
                 return index;

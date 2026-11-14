@@ -293,3 +293,7 @@ fn follow_pattern_seeds(
     }
 }
 
+
+// Welds and their downstream consumers need the final component placements.
+
+pub(crate) use exports::publish_weld_scene;

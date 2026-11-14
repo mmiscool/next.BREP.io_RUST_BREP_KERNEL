@@ -138,7 +138,6 @@ struct Emitter<'a, 'b> {
     /// dropped in silence — an annotation whose geometry moved out from under
     /// it (or was deleted) is a fact the export report has to carry.
     unresolved: std::collections::BTreeSet<String>,
-    null_style: usize,
     curve_style: usize,
 }
 
@@ -819,7 +818,6 @@ pub(crate) fn write_pmi(
         aspects: HashMap::default(),
         datums: HashMap::default(),
         unresolved: std::collections::BTreeSet::new(),
-        null_style,
         curve_style,
     };
     // The shape, mapped into the draughting models with a null style.

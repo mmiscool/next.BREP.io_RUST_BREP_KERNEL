@@ -213,12 +213,54 @@ use assemble::{assemble_fragments_scoped, AssemblyScope};
 #[allow(unused_imports)]
 pub(crate) use assemble::apply_assembly_heal_chain;
 
+
+/// A boolean's operands at the working scale (`brep/rescale.rs`): unless `BREP_WORKING_SCALE=0`, operands whose combined box diagonal
+/// is below 1/16 are scaled up by a power of two, and the result is scaled back.
+struct WorkingScale {
+    factor: f64,
+    solids: Vec<BrepSolid>,
+    options: BooleanOptions,
+}
+
+impl WorkingScale {
+    fn of(operands: &[&BrepSolid], options: &BooleanOptions) -> Result<Option<Self>, KernelRefusal> {
+        let Some(bounds) = crate::rescale::bounds_of(operands.iter().copied()) else {
+            return Ok(None);
+        };
+        let Some(factor) = crate::rescale::guard_factor(bounds) else {
+            return Ok(None);
+        };
+        crate::rescale::profile_fired("boolean", factor, bounds);
+        let solids = operands
+            .iter()
+            .map(|solid| crate::rescale::scale_operand(solid, factor, "boolean"))
+            .collect::<Result<Vec<_>, _>>()?;
+        // The one length the options carry in model units.
+        let mut options = options.clone();
+        options.imprint.maximum_ssi_step = options.imprint.maximum_ssi_step.map(|step| step * factor);
+        Ok(Some(Self { factor, solids, options }))
+    }
+
+    fn back(&self, solid: &BrepSolid) -> Result<BrepSolid, KernelRefusal> {
+        crate::rescale::scale_operand(solid, 1.0 / self.factor, "boolean")
+    }
+
+    fn refusal(&self, error: KernelRefusal) -> KernelRefusal {
+        crate::rescale::name_scale(error, self.factor)
+    }
+}
+
 pub fn boolean_operation(
     first: &BrepSolid,
     second: &BrepSolid,
     operation: BooleanOperation,
     options: &BooleanOptions,
 ) -> Result<BrepSolid, KernelRefusal> {
+    if let Some(scaled) = WorkingScale::of(&[first, second], options)? {
+        return boolean_operation(&scaled.solids[0], &scaled.solids[1], operation, &scaled.options)
+            .map_err(|error| scaled.refusal(error))
+            .and_then(|solid| scaled.back(&solid));
+    }
     match boolean_operation_with_diagnostics(first, second, operation, options) {
         Ok(outcome) => {
             // An empty difference or common part of two solids whose faces only
@@ -228,6 +270,11 @@ pub fn boolean_operation(
                 && !matches!(operation, BooleanOperation::Union)
             {
                 if let Some(refusal) = below_tolerance_refusal(first, second, None) {
+                    return Err(refusal);
+                }
+            }
+            if unresolved_merge_refusal_enabled() && !matches!(operation, BooleanOperation::Subtract) {
+                if let Some(refusal) = unresolved_merge_refusal(first, second) {
                     return Err(refusal);
                 }
             }
@@ -317,6 +364,11 @@ pub fn boolean_operation(
                 && subtract_pinches_at_internal_tangency(first, second, options.tolerance)
                     .unwrap_or(false)
             {
+                // The exact answer exists where the contact only touches: see
+                // `subtract_through_the_common_part`. Not a perturbation.
+                if let Some(solid) = subtract_through_the_common_part(first, second, options) {
+                    return Ok(solid);
+                }
                 return Err(error.with_message(|message| format!(
                     "{message}; internal tangency: the operands touch tangentially with \
                      co-directed normals, so the exact difference pinches to zero thickness \
@@ -344,6 +396,14 @@ pub fn boolean_operation(
             {
                 return Err(error);
             }
+            // The union of two bodies tangent inside one another has an exact
+            // answer the arrangement of the difference reaches: see
+            // `union_through_the_difference`. Not a perturbation.
+            if matches!(operation, BooleanOperation::Union) {
+                if let Some(solid) = union_through_the_difference(first, second, options) {
+                    return Ok(solid);
+                }
+            }
             match perturbation_retry(first, second, operation, options) {
                 Ok(solid) => Ok(solid),
                 Err(refused) if refused.is_empty() => Err(error),
@@ -369,6 +429,78 @@ const PINCH_ANGULAR_TOLERANCE: f64 = 1e-4;
 /// sample to prove the contact is LOWER-DIMENSIONAL — a tangency curve/point
 /// rather than a cosurface patch.
 const PINCH_SEPARATION_STEP: f64 = 1e-2;
+
+/// `first − second` as `first − (first ∩ second)`, on the exact lane only, for a
+/// difference the pinch gate is about to refuse (`BREP_PINCH_COMMON_RETRY`,
+/// default on; `=0` leaves the refusal).
+///
+/// The two are the same set, and the second form is often the arrangement the
+/// exact lane can build where the first is not. A cylinder cut by a smaller one
+/// tangent to it inside along a ruling, the cutter running on past both caps
+/// (a crescent; brep-bench probe 2026-11-12): each cap's section circle is
+/// tangent to the cap's own rim, the cap's loops do not close, and the cut
+/// refused; with the cutter flush with the caps it built, exact. The common part
+/// IS the cutter made flush, it is built without trouble (it has no thin wall),
+/// and cutting it away meets the first operand only in faces they share.
+///
+/// Nothing is nudged, so the pinch gate's reason for refusing a PERTURBED
+/// answer does not apply; what is accepted is an exact-lane body that validates
+/// and whose volume is `V(first) − V(first ∩ second)` to the drift bar. Any
+/// other outcome returns `None` and the gate's refusal stands.
+fn subtract_through_the_common_part(first: &BrepSolid, second: &BrepSolid, options: &BooleanOptions) -> Option<BrepSolid> {
+    // With the tangent imprint switched off the caller has asked for the
+    // recorded-only lane, whose answer to a pinch is its refusal.
+    if !switch!("BREP_PINCH_COMMON_RETRY", true) || !options.imprint.tangent_curve_imprint {
+        return None;
+    }
+    let common = boolean_operation_with_diagnostics(first, second, BooleanOperation::Intersect, options).ok()?.value;
+    if common.shells.iter().all(|shell| shell.faces.is_empty()) {
+        return None;
+    }
+    let cut = boolean_operation_with_diagnostics(first, &common, BooleanOperation::Subtract, options).ok()?.value;
+    if !cut.validate().is_empty() {
+        return None;
+    }
+    let volume = |solid: &BrepSolid| crate::solid_mass_properties(solid).ok().map(|mass| mass.volume);
+    let (whole, taken, left) = (volume(first)?, volume(&common)?, volume(&cut)?);
+    ((left - (whole - taken)).abs() <= 1e-9 * whole.abs().max(1.0)).then_some(cut)
+}
+
+/// `first ∪ second` as `second ∪ (first − second)`, on the exact lane only, for
+/// a union that failed where the operands touch tangentially with co-directed
+/// normals (`BREP_TANGENT_UNION_DIFFERENCE_RETRY`, default on; `=0` leaves the
+/// union to the paths it had).
+///
+/// The two are the same set. A cylinder holding a smaller one tangent to it
+/// inside along a ruling, the smaller running on past a cap: the union's
+/// arrangement leaves the cap's section circle tangent to the cap's own rim and
+/// the shell does not close, while the difference builds (the crescent) and the
+/// smaller body joins it along faces the two share. Accepted only when it
+/// validates and its volume is `V(first − second) + V(second)` to the drift bar;
+/// any other outcome returns `None` and the union goes on as before.
+fn union_through_the_difference(first: &BrepSolid, second: &BrepSolid, options: &BooleanOptions) -> Option<BrepSolid> {
+    if !switch!("BREP_TANGENT_UNION_DIFFERENCE_RETRY", true) || !options.imprint.tangent_curve_imprint {
+        return None;
+    }
+    let pinches = |a: &BrepSolid, b: &BrepSolid| subtract_pinches_at_internal_tangency(a, b, options.tolerance).unwrap_or(false);
+    if !pinches(first, second) && !pinches(second, first) {
+        return None;
+    }
+    let difference = match boolean_operation_with_diagnostics(first, second, BooleanOperation::Subtract, options) {
+        Ok(outcome) => outcome.value,
+        Err(_) => subtract_through_the_common_part(first, second, options)?,
+    };
+    if difference.shells.iter().all(|shell| shell.faces.is_empty()) || !difference.validate().is_empty() {
+        return None;
+    }
+    let union = boolean_operation_with_diagnostics(second, &difference, BooleanOperation::Union, options).ok()?.value;
+    if !union.validate().is_empty() {
+        return None;
+    }
+    let volume = |solid: &BrepSolid| crate::solid_mass_properties(solid).ok().map(|mass| mass.volume);
+    let (left, added, whole) = (volume(&difference)?, volume(second)?, volume(&union)?);
+    ((whole - (left + added)).abs() <= 1e-9 * whole.abs().max(1.0)).then_some(union)
+}
 
 /// Would the exact `first − second` PINCH to zero thickness at a tangential
 /// contact?
@@ -1052,6 +1184,34 @@ pub(crate) fn below_tolerance_refusal_enabled() -> bool {
 /// are read as below the modelling tolerance.
 const BELOW_TOLERANCE_BAND: f64 = 10.0 * crate::tolerance::WELD_FLOOR;
 
+/// UNRESOLVED-MERGE REFUSAL (`BREP_UNRESOLVED_MERGE_REFUSAL`, default off). A
+/// union or common part that SUCCEEDS over two planar faces, one of each
+/// operand, standing farther apart than the coincidence band (1e-6: closer
+/// faces are one surface by the kernel's definition) but no farther than the
+/// weld floor (1e-5) has welded the two faces into one: a unit cube united
+/// with a copy raised 3e-6 came back as the cube, valid, 2e-6 out in volume,
+/// where the difference of the same pair already refuses by this name. The
+/// step between such faces is neither a coincidence nor resolvable, so the
+/// answer is the refusal.
+pub(crate) fn unresolved_merge_refusal_enabled() -> bool {
+    crate::switch!("BREP_UNRESOLVED_MERGE_REFUSAL", false)
+}
+
+fn unresolved_merge_refusal(first: &BrepSolid, second: &BrepSolid) -> Option<KernelRefusal> {
+    let (lower, upper) = (crate::tolerance::COINCIDENCE_DISTANCE_FLOOR, crate::tolerance::WELD_FLOOR);
+    let (face_a, face_b, separation) = planar_faces_apart_within(first, second, lower, upper)?;
+    Some(KernelRefusal::unsupported(
+        KernelStage::Intersect,
+        "below_modelling_tolerance",
+        format!(
+            "boolean: face {face_a} of the first operand and face {face_b} of the second are planes nearly on one \
+             another, {separation:.3e} apart at most over their shared extent: farther than a coincidence \
+             ({lower:.0e}) and closer than the kernel resolves ({upper:.0e}), so the step between them would be \
+             welded away"
+        ),
+    ))
+}
+
 fn below_tolerance_refusal(first: &BrepSolid, second: &BrepSolid, error: Option<&KernelRefusal>) -> Option<KernelRefusal> {
     let (face_a, face_b, separation) = near_coincident_planar_faces(first, second)?;
     let message = format!(
@@ -1067,6 +1227,14 @@ fn below_tolerance_refusal(first: &BrepSolid, second: &BrepSolid, error: Option<
 /// parallel and whose boundaries stand within [`BELOW_TOLERANCE_BAND`] of the
 /// other's plane, with overlapping extents, but which are not one plane.
 fn near_coincident_planar_faces(first: &BrepSolid, second: &BrepSolid) -> Option<(u64, u64, f64)> {
+    let scale = crate::tolerance::solid_scale(first).max(crate::tolerance::solid_scale(second)).max(1.0);
+    planar_faces_apart_within(first, second, 1e-9 * scale, BELOW_TOLERANCE_BAND)
+}
+
+/// The first pair of nearly parallel planar faces (one per operand) with
+/// overlapping extents whose largest separation is above `lower` and at most
+/// `upper`.
+fn planar_faces_apart_within(first: &BrepSolid, second: &BrepSolid, lower: f64, upper: f64) -> Option<(u64, u64, f64)> {
     struct Planar {
         id: u64,
         origin: Vec3,
@@ -1105,14 +1273,12 @@ fn near_coincident_planar_faces(first: &BrepSolid, second: &BrepSolid) -> Option
             .collect()
     };
     let (faces_a, faces_b) = (read(first), read(second));
-    let scale = crate::tolerance::solid_scale(first).max(crate::tolerance::solid_scale(second)).max(1.0);
-    let floor = 1e-9 * scale;
     for a in &faces_a {
         for b in &faces_b {
             if a.normal.cross(b.normal).length() > 1e-3 {
                 continue;
             }
-            if !a.bounds.intersects(b.bounds, BELOW_TOLERANCE_BAND) {
+            if !a.bounds.intersects(b.bounds, upper) {
                 continue;
             }
             let separation = a
@@ -1121,7 +1287,7 @@ fn near_coincident_planar_faces(first: &BrepSolid, second: &BrepSolid) -> Option
                 .map(|corner| corner.sub(b.origin).dot(b.normal).abs())
                 .chain(b.corners.iter().map(|corner| corner.sub(a.origin).dot(a.normal).abs()))
                 .fold(0.0f64, f64::max);
-            if separation > floor && separation <= BELOW_TOLERANCE_BAND {
+            if separation > lower && separation <= upper {
                 return Some((a.id, b.id, separation));
             }
         }
@@ -1514,6 +1680,13 @@ pub fn boolean_operation_nary_with_options(
     operation: BooleanOperation,
     options: &BooleanOptions,
 ) -> Result<BrepSolid, KernelRefusal> {
+    if operands.len() > 1 {
+        if let Some(scaled) = WorkingScale::of(&operands.iter().collect::<Vec<_>>(), options)? {
+            return boolean_operation_nary_with_options(&scaled.solids, operation, &scaled.options)
+                .map_err(|error| scaled.refusal(error))
+                .and_then(|solid| scaled.back(&solid));
+        }
+    }
     if operands.is_empty() {
         return Err(KernelRefusal::input(KernelStage::Collect, "operands", "boolean_operation_nary: no operands provided"));
     }
@@ -1831,6 +2004,14 @@ pub fn boolean_operation_with_diagnostics(
     operation: BooleanOperation,
     options: &BooleanOptions,
 ) -> Result<KernelOutcome<BrepSolid>, KernelRefusal> {
+    if let Some(scaled) = WorkingScale::of(&[first, second], options)? {
+        let mut outcome = boolean_operation_with_diagnostics(&scaled.solids[0], &scaled.solids[1], operation, &scaled.options)
+            .map_err(|error| scaled.refusal(error))?;
+        outcome.value = scaled.back(&outcome.value)?;
+        outcome.diagnostics.count_n("working_scale.fired", 1);
+        outcome.diagnostics.measure_max("working_scale.factor", scaled.factor);
+        return Ok(outcome);
+    }
     let _account = profile::Scope::new("boolean.other");
     let closed_inputs = matches!(std::env::var("BREP_CLOSED_OPERAND_INPUT").as_deref(), Err(_) | Ok("1") | Ok("on"));
     if let (true, Some(later)) = (reseat::seam_reseat_enabled(), &options.seam_reseat_later_references) {
@@ -2130,6 +2311,11 @@ pub fn boolean_split_operands(
     second: &BrepSolid,
     options: &BooleanOptions,
 ) -> Result<(BrepSolid, BrepSolid), KernelRefusal> {
+    if let Some(scaled) = WorkingScale::of(&[first, second], options)? {
+        let (split_first, split_second) = boolean_split_operands(&scaled.solids[0], &scaled.solids[1], &scaled.options)
+            .map_err(|error| scaled.refusal(error))?;
+        return Ok((scaled.back(&split_first)?, scaled.back(&split_second)?));
+    }
     let policy = boolean_policy(first, second, options)?;
     let (first, second) = prepared_operands(first, second, &policy)?;
     let imprint = build_imprints(&first, &second, &boolean_imprint_options(options, policy.model))?;
@@ -2728,6 +2914,7 @@ fn boolean_pipeline(
     profile_stage("assemble_ms", stage_ms);
     diagnostics.measure_max("timing.assemble_ms", stage_ms);
     let stage_started = Instant::now();
+    let declines_before = crate::face_merge::declines_served();
     if std::env::var("BREP_DEBUG_PREMERGE_VALIDATE").is_ok() {
         let issues = solid.validate();
         eprintln!(
@@ -2771,6 +2958,9 @@ fn boolean_pipeline(
     }
     let stage_ms = stage_started.elapsed().as_secs_f64() * 1_000.0;
     profile_stage("face_merge_ms", stage_ms);
+    if crate::profile::profile_enabled() {
+        profile_line!("boolean.merge_declines served={}", crate::face_merge::declines_served() - declines_before);
+    }
     diagnostics.measure_max("timing.face_merge_ms", stage_ms);
     let validation_started = Instant::now();
     let validation = solid.validate_detailed_scoped(&policy, scope.as_ref().map(|scope| &scope.examined));

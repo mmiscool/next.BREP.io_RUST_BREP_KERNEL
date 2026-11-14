@@ -317,6 +317,9 @@ struct FaceRange {
     /// colour (a `color` metadata attribute on the face name); `None` = shade
     /// with the solid's `base_style`.
     style: Option<u32>,
+    /// This face draws see-through (its own or its solid's `transparency`, or
+    /// a motion study's clip): the opaque pass leaves it to the blended one.
+    translucent: bool,
 }
 
 /// The hasher behind the wireframe's per-face edge de-duplication.
@@ -351,9 +354,28 @@ impl std::hash::Hasher for EdgeHasher {
 
 type BuildEdgeHasher = std::hash::BuildHasherDefault<EdgeHasher>;
 
+/// The least opacity a picked or hovered edge is drawn at, however clear its
+/// own `transparency` makes it, so the pick can still be seen.
+const EMPHASIS_EDGE_MIN_OPACITY: f32 = 0.35;
+
 struct EdgeRange {
     first_instance: u32,
     instance_count: u32,
+    /// Index into [`GpuSolid::edge_styles`] when this edge carries its OWN
+    /// colour or opacity (its metadata's); `None` draws it in the theme's.
+    style: Option<u32>,
+}
+
+/// One distinct per-edge look of a solid (a colour and an opacity), in the
+/// four states an edge is drawn in.
+struct EdgeStyle {
+    base: StyleBuf,
+    /// The selection colour at the edge's own opacity (floored, so a clear
+    /// edge can still be seen while it is picked).
+    selected: StyleBuf,
+    hovered: StyleBuf,
+    /// The occluded-pass look: the edge's colour dimmed like any hidden edge.
+    hidden: StyleBuf,
 }
 
 struct GpuSolid {
@@ -371,6 +393,9 @@ struct GpuSolid {
     faces: Vec<FaceRange>,
     edge_buf: Option<wgpu::Buffer>,
     edges: Vec<EdgeRange>,
+    /// The per-edge style palette (empty when no edge has a look of its own,
+    /// which keeps the whole-buffer edge draws).
+    edge_styles: Vec<EdgeStyle>,
     edge_instances: u32,
     /// The instances drawn by the OCCLUDED-edge pass: every edge's up to the
     /// first AUX one. A display-only outline (a board's copper) is not dimmed
@@ -386,6 +411,11 @@ struct GpuSolid {
     /// overwhelmingly common solid whose faces are all one colour, which is what
     /// keeps the whole-mesh fast path in `frame.rs` alive.
     face_styles: Vec<StyleBuf>,
+    /// The solid's own faces draw see-through (triangles no face claims too).
+    base_translucent: bool,
+    /// Some face differs from [`Self::base_translucent`]: an opaque face on a
+    /// see-through solid, or the reverse. Such a solid draws in both passes.
+    mixed_translucency: bool,
     /// Selected/hovered face boundary outline segments (cache keyed by the
     /// emphasis generation).
     boundary: Option<BoundaryBuf>,

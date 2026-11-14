@@ -57,8 +57,9 @@
 //! strip rounded against the kept strip's wall. The junction no longer shrinks
 //! to a point. It splits into TWO vertices on the cap, where each of the kept
 //! strip's straight rims runs into it, joined by the cap's section of the
-//! cylinder: a circular arc when the cap is perpendicular to the axis, which is
-//! the only case read. Every edge arriving at the junction ends on the vertex
+//! cylinder: a circular arc when the cap is perpendicular to the axis, and an
+//! elliptical one (that circle slid along the axis onto the cap) when it is
+//! oblique. Every edge arriving at the junction ends on the vertex
 //! of the kept wall it lies on; the kept strip is trimmed back to the arc and
 //! refit on its own carrier.
 //!
@@ -123,8 +124,7 @@
 //! and the selection goes on to the component split and the one-at-a-time chain
 //! exactly as before. One face is a network only with caps: its own, or caps
 //! standing at its ends. A network that DOES read, but has a curved survivor
-//! beside it that is not a kept strip of that shape (a sphere, a strip whose cap
-//! is oblique to its axis) or that touches it anywhere but a fixed apex, is
+//! beside it that is not a kept strip of that shape (a sphere) or that touches it anywhere but a fixed apex, is
 //! refused by name: one face at a time has no better answer for a network. A
 //! junction holding distinct held and standing apexes, or a kept strip and an
 //! apex, is refused by name. A single corner blend never gets here: the corner
@@ -1260,17 +1260,10 @@ pub(super) fn heal_blend_network(
                 ));
             }
             let cap = &network.planes[&caps[0]];
-            if cap.normal.cross(kept.axis).length() > angular {
-                return Err(KernelRefusal::unsupported(
-                    KernelStage::Classify,
-                    "oblique_cap",
-                    format!(
-                        "{op}: face {} would end kept blend face {kept_id} obliquely to its axis — \
-                     that section is an ellipse, which this lane does not build",
-                        caps[0]
-                    ),
-                ));
-            }
+            // A cap square to the axis cuts the cylinder in a circle; an
+            // oblique one in an ellipse, built below as that circle's arc slid
+            // along the axis onto the cap.
+            let oblique = cap.normal.cross(kept.axis).length() > angular;
             let mut points = [Vec3::default(); 2];
             for side in 0..2 {
                 let rim = &edge_records[&kept.rims[side].0];
@@ -1351,11 +1344,14 @@ pub(super) fn heal_blend_network(
                     format!("{op}: kept blend face {kept_id}'s axis misses its cap"),
                 )
             })?;
-            let x_axis = points[0]
-                .sub(centre_point)
-                .normalized()
-                .or_refuse(KernelStage::Sew, "section_axis")?;
-            let to_second = points[1].sub(centre_point);
+            // Read square to the axis: on an oblique cap the rims' ends stand
+            // at different heights along it.
+            let radial = |point: Vec3| {
+                let delta = point.sub(centre_point);
+                delta.sub(kept.axis.scale(delta.dot(kept.axis)))
+            };
+            let x_axis = radial(points[0]).normalized().or_refuse(KernelStage::Sew, "section_axis")?;
+            let to_second = radial(points[1]);
             let across = to_second.sub(x_axis.scale(to_second.dot(x_axis)));
             if across.length() <= tolerance {
                 return Err(KernelRefusal::unsupported(
@@ -1406,8 +1402,28 @@ pub(super) fn heal_blend_network(
                 ));
             }
             let vertices = [alloc(), alloc()];
-            let curve = crate::make_arc(centre_point, x_axis, y_axis, kept.radius, 0.0, sweep)
+            let circle = crate::make_arc(centre_point, x_axis, y_axis, kept.radius, 0.0, sweep)
                 .or_refuse(KernelStage::Sew, "make_arc")?;
+            let curve = if oblique {
+                // The cylinder's section by the cap: every point of the circle
+                // slid along the axis onto the cap's plane. That slide is an
+                // affine map, so the circle's rational arc under it, pole by
+                // pole with its weights kept, is the ellipse's arc exactly.
+                let slope = cap.normal.dot(kept.axis);
+                let poles = circle
+                    .control_points
+                    .iter()
+                    .map(|pole| {
+                        let weighted = Vec3::new(pole.x, pole.y, pole.z);
+                        let slide = (cap.origin.scale(pole.w).sub(weighted)).dot(cap.normal) / slope;
+                        let moved = weighted.add(kept.axis.scale(slide));
+                        crate::Vec4 { x: moved.x, y: moved.y, z: moved.z, w: pole.w }
+                    })
+                    .collect();
+                crate::NurbsCurve::new(circle.degree, circle.knots.clone(), poles).or_refuse(KernelStage::Sew, "section_ellipse")?
+            } else {
+                circle
+            };
             let [d0, d1] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
             let arc_at = |t: f64| curve.evaluate(t).or_refuse(KernelStage::Sew, "evaluate");
             if arc_at(d0)?.sub(points[0]).length() > plane_tolerance

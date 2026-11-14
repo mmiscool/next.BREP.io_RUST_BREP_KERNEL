@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 #[path = "surface/extension.rs"]
 mod extension;
+#[path = "surface/trim_partials.rs"]
+mod trim_partials;
+pub(crate) use trim_partials::PreparedTrimPartials;
 pub use extension::{
     ExtendRefusal, SurfaceSide, WeightSite, MAXIMUM_FOLD_ANGLE, MAXIMUM_GROWTH_RATIO,
 };
@@ -1103,6 +1106,63 @@ impl NurbsSurface {
         Ok((point, partial_u, partial_v))
     }
 
+    /// The four anchor terms used by a first-order bilinear extension.
+    /// Pure second partials do not feed these terms. Keep the control sums
+    /// and rational recurrence in the generic evaluator's arithmetic order.
+    fn extension_anchor_fixed<const U: usize, const V: usize>(&self, u: f64, v: f64) -> Result<(Vec3, Vec3, Vec3, Vec3), String> {
+        self.ensure_valid()?;
+        let u = knot_clamp(&self.knots_u, U, u);
+        let v = knot_clamp(&self.knots_v, V, v);
+        let span_u = knot_find_span(&self.knots_u, U, u);
+        let span_v = knot_find_span(&self.knots_v, V, v);
+        let mut basis_u = [[0.0; MAX_STACK_ORDER]; 2];
+        let mut basis_v = [[0.0; MAX_STACK_ORDER]; 2];
+        basis_derivatives_into(&self.knots_u, U, span_u, u, 1, &mut basis_u);
+        basis_derivatives_into(&self.knots_v, V, span_v, v, 1, &mut basis_v);
+        let zero = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+        let sum = |k: usize, l: usize| {
+            let mut value = zero;
+            for i in 0..=U {
+                let row = &self.control_points[span_u - U + i];
+                for j in 0..=V {
+                    value = value.add(row[span_v - V + j].scale(basis_u[k][i] * basis_v[l][j]));
+                }
+            }
+            value
+        };
+        let (h00,h01,h10,h11) = (sum(0,0),sum(0,1),sum(1,0),sum(1,1));
+        if h00.w.abs() <= EPS { return Err("NurbsSurface: zero evaluated weight".into()); }
+        let inverse = 1.0 / h00.w;
+        let point = Vec3::new(h00.x,h00.y,h00.z).scale(inverse);
+        let sv = Vec3::new(h01.x,h01.y,h01.z).sub(point.scale(1.0*h01.w)).scale(inverse);
+        let su = Vec3::new(h10.x,h10.y,h10.z).sub(point.scale(1.0*h10.w))
+            .sub(Vec3::default().scale(1.0)).scale(inverse);
+        let mixed = Vec3::default().add(point.scale(1.0*h11.w));
+        let suv = Vec3::new(h11.x,h11.y,h11.z).sub(su.scale(1.0*h01.w))
+            .sub(sv.scale(1.0*h10.w)).sub(mixed.scale(1.0)).scale(inverse);
+        Ok((point,su,sv,suv))
+    }
+
+    fn extension_anchor(&self, u: f64, v: f64) -> Result<(Vec3, Vec3, Vec3, Vec3), String> {
+        match (self.degree_u,self.degree_v) {
+            (1,1) => self.extension_anchor_fixed::<1,1>(u,v),
+            (1,2) => self.extension_anchor_fixed::<1,2>(u,v),
+            (1,3) => self.extension_anchor_fixed::<1,3>(u,v),
+            (2,1) => self.extension_anchor_fixed::<2,1>(u,v),
+            (2,2) => self.extension_anchor_fixed::<2,2>(u,v),
+            (2,3) => self.extension_anchor_fixed::<2,3>(u,v),
+            (3,1) => self.extension_anchor_fixed::<3,1>(u,v),
+            (3,2) => self.extension_anchor_fixed::<3,2>(u,v),
+            (3,3) => self.extension_anchor_fixed::<3,3>(u,v),
+            _ => { let g = self.derivatives_small(u,v,2)?; Ok((g[0][0],g[1][0],g[0][1],g[1][1])) }
+        }
+    }
+
+    /// First-order extension using only the anchor terms that it consumes.
+    pub(crate) fn deriv1_extended_trim(&self, u: f64, v: f64) -> Result<(Vec3, Vec3, Vec3), String> {
+        self.deriv1_extended_impl(u,v,true)
+    }
+
     /// Allocation-free `(S, S_u, S_v)` twin of `derivatives_extended(u, v, 1)`.
     ///
     /// Mirrors the exact C¹ ruled/bilinear extension arithmetic of
@@ -1111,6 +1171,10 @@ impl NurbsSurface {
     /// evaluations allocate nothing. Bit-identical to
     /// `derivatives_extended(u, v, 1)` at `[0][0] / [1][0] / [0][1]`.
     pub(crate) fn deriv1_extended(&self, u: f64, v: f64) -> Result<(Vec3, Vec3, Vec3), String> {
+        self.deriv1_extended_impl(u,v,false)
+    }
+
+    fn deriv1_extended_impl(&self, u: f64, v: f64, reduced_anchor: bool) -> Result<(Vec3, Vec3, Vec3), String> {
         let [u0, u1] = self.domain_u()?;
         let [v0, v1] = self.domain_v()?;
         let (closed_u, closed_v) = self.closed_directions()?;
@@ -1137,6 +1201,16 @@ impl NurbsSurface {
             0.0
         };
         if du_out == 0.0 && dv_out == 0.0 {
+            if reduced_anchor {
+                match (self.degree_u,self.degree_v) {
+                    (3,1) => return self.deriv1_small_fixed::<3,1>(uu,vv),
+                    (1,3) => return self.deriv1_small_fixed::<1,3>(uu,vv),
+                    (3,2) => return self.deriv1_small_fixed::<3,2>(uu,vv),
+                    (2,3) => return self.deriv1_small_fixed::<2,3>(uu,vv),
+                    (3,3) => return self.deriv1_small_fixed::<3,3>(uu,vv),
+                    _ => {}
+                }
+            }
             if analytic_deriv1_on() && matches!((self.degree_u, self.degree_v), (1, 1) | (2, 1) | (1, 2) | (2, 2))
                 && matches!(self.analytic(), Some(crate::AnalyticSurface::Plane { .. }
                     | crate::AnalyticSurface::RuledRevolution { .. } | crate::AnalyticSurface::Sphere { .. }
@@ -1154,16 +1228,18 @@ impl NurbsSurface {
         }
         let anchor_u = uu - du_out;
         let anchor_v = vv - dv_out;
-        let base = self.derivatives_small(anchor_u, anchor_v, 2)?;
+        let (a00,a10,a01,a11) = if reduced_anchor {
+            self.extension_anchor(anchor_u,anchor_v)?
+        } else {
+            let base = self.derivatives_small(anchor_u,anchor_v,2)?;
+            (base[0][0],base[1][0],base[0][1],base[1][1])
+        };
         // Bilinear extension: S = A00 + du·A10 + dv·A01 + du·dv·A11.
         // The mixed anchor derivative has total order two, even when
         // the caller requests only the value or first partials.
-        let s = base[0][0]
-            .add(base[1][0].scale(du_out))
-            .add(base[0][1].scale(dv_out))
-            .add(base[1][1].scale(du_out * dv_out));
-        let su = base[1][0].add(base[1][1].scale(dv_out));
-        let sv = base[0][1].add(base[1][1].scale(du_out));
+        let s = a00.add(a10.scale(du_out)).add(a01.scale(dv_out)).add(a11.scale(du_out * dv_out));
+        let su = a10.add(a11.scale(dv_out));
+        let sv = a01.add(a11.scale(du_out));
         Ok((s, su, sv))
     }
 

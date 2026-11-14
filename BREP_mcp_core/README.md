@@ -21,20 +21,31 @@ which is how a page serves the same tools over WebMCP.
 - `server`, `session`, `tools`, `schema` — the MCP surface: registry-derived
   tools and JSON schemas, sessions, feature validation.
 - `http` — the streamable-HTTP transport; stdio is supported too.
-- `script`, `runner` — JSON automation scripts: steps, waits, assertions and
-  screenshots, run against a session.
+- `script`, `runner` — the JSON step-list script format (tool calls with
+  `expect` assertions and image capture or comparison) and the runner that
+  plays a script against a session and writes per-step artefacts.
+- `program` — JavaScript test programs played through the code runner the
+  way an agent's `run_script` is, with the same per-step artefacts.
+- `script_sdk` — the `brep.<group>.<tool>(args)` functions every host's code
+  runner exposes.
+- `files` — bounded file operations under named roots, shared by MCP, the
+  code runner and the browser store.
+- `launch_state` — the native launch policy for execution journals (instance,
+  state directory or ephemeral).
 - `image` — screenshot processing and comparison.
 - `render_mesh` — a CPU mesh rasteriser and silhouette comparison that need no
   GPU, window or browser; the `render_mesh` example is its command line.
 - `generate` — registry input/output schemas and TypeScript declarations.
 - `cad` — bounded JavaScript/TypeScript workers, semantic CAD operations,
   scoped artifacts, selective function discovery and process-scoped task handles.
-- `prompts` — the same seven workflows via `prompts/list` and `prompts/get`.
+- `prompts` — the same eight workflows via `prompts/list` and `prompts/get`.
   Each takes a required `request` string and optional workflow context listed in
   its descriptor. Retrieval returns user-role messages and performs no CAD work.
   The catalogue is static for the server lifetime; it does not advertise change
   notifications. Unknown names, cursors, arguments and non-string values fail.
-- `skills` — seven embedded workflows exposed through the official Skills
+- `skills` — eight embedded workflows (`inspect-model`,
+  `safe-parametric-edit`, `import-step`, `recover-execution`, `edit-assembly`,
+  `repair-feature`, `export-model`, `design-part`) exposed through the official Skills
   extension and Resources, with SHA-256 file manifests.
 - `skill_distribution` — offline bundle export, explicitly pinned installation,
   verified version selection and rollback for those reviewed Markdown workflows.
@@ -80,8 +91,9 @@ be recovered. Interrupted executions require reconciliation and are never
 replayed automatically. Artifact bytes, app state and the diagnostic event ring
 are not persisted by the execution journal.
 
-It depends on [`BREP_render`](https://crates.io/crates/BREP_render), and on
-`rmcp` and `tokio`.
+It depends on [`BREP_render`](https://crates.io/crates/BREP_render), on
+[`BREP_script_core`](https://crates.io/crates/BREP_script_core) for the code
+runner (with `server`), and on `rmcp` and `tokio`.
 
 ## Native TypeScript toolchain
 
@@ -90,9 +102,9 @@ TypeScript 7.0.2. Set `BREP_NODE` to the Node executable and `BREP_TSC` to the
 TypeScript package's JavaScript `bin/tsc` launcher, or expose `node` and that
 `tsc` on PATH. If an installation exposes a shell shim, point `BREP_TSC`
 directly at the package launcher. Nothing is installed automatically:
-`code::provision_typescript` (the `brep-mcp typescript provision` and
+`cad::code::provision_typescript` (the `brep-mcp typescript provision` and
 `brep-app --provision-typescript` commands) installs the pinned package with
-npm into `code::typescript_prefix`, and `code::typescript_status` is the
+npm into `cad::code::typescript_prefix`, and `cad::code::typescript_status` is the
 discovery-plus-launcher-probe check the server advertises.
 
 Node starts the compiler launcher (which may start its native compiler), with

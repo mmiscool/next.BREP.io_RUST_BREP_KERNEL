@@ -1,5 +1,5 @@
-//! Assembly-constraint VIEWPORT overlays — the CONSTRAINT twin of
-//! [`crate::feature_dimensions`].
+//! Assembly-constraint VIEWPORT overlays — the CONSTRAINT twin
+//! of [`crate::feature_dimensions`].
 //!
 //! Pure builders: the kernel's `assembly_overlay_json` rows (per-constraint world
 //! anchors / directions / status / measured value) + the `assembly_state_json`

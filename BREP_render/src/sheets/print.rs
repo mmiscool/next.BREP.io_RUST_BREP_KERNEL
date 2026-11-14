@@ -14,16 +14,11 @@ use super::frame::FrameDrawing;
 use super::pdf::text_width;
 use super::project::{SheetDrawing, SheetText, ViewDrawing};
 use super::svg::CAP_PER_EM;
-use brep_instructions::layout::{Page, PageKind, Rect, HEADER_MM, MARGIN_MM, PARTS_ROW_MM, TOOLS_ROW_MM};
+use brep_instructions::layout::{self, Page, PageKind, RecordRow, Rect, TextLine, TextMeasure, BODY_MM, HEADER_MM, HEADING_MM, LEADING, MARGIN_MM, PARTS_ROW_MM, TEXT_INSET_MM, TOOLS_ROW_MM};
 use brep_instructions::model::{Instructions, Step};
+use brep_instructions::record::{self, Mark};
 use std::collections::HashMap;
 
-/// Body text's cap height, in millimetres.
-const BODY_MM: f64 = 2.8;
-/// A heading's cap height.
-const HEADING_MM: f64 = 4.2;
-/// Line pitch over cap height.
-const LEADING: f64 = 1.75;
 /// The share of a picture rectangle a fitted view fills.
 const FILL: f64 = 0.9;
 /// The cover's title block above its picture.
@@ -35,6 +30,22 @@ const IMAGE_CAPTION_MM: f64 = 10.0;
 /// A run's width in millimetres at cap height `cap`.
 fn width_mm(text: &str, cap: f64) -> f64 {
     text_width(text) * cap / CAP_PER_EM
+}
+
+/// The pages' own text measure: the font the sheet writers set text in.
+pub struct PageFont;
+
+impl TextMeasure for PageFont {
+    fn width_mm(&self, text: &str, cap: f64) -> f64 {
+        width_mm(text, cap)
+    }
+}
+
+/// The block's printed pages, laid out with the pages' own font metrics:
+/// the layout [`pages`] draws, so a step's Record block (its fields as a
+/// paper form) is paged by the widths it is drawn with.
+pub fn layout(block: &Instructions) -> Result<Vec<Page>, String> {
+    layout::pages_with(block, &PageFont)
 }
 
 /// A run reading left to right whose line box starts at `(x, y)` (top-left).
@@ -55,20 +66,7 @@ fn right(text: impl Into<String>, x: f64, y: f64, cap: f64) -> SheetText {
 /// `text` broken into lines no wider than `width` at cap height `cap`, at
 /// spaces; a word wider than the line stands alone on one.
 pub fn wrap(text: &str, width: f64, cap: f64) -> Vec<String> {
-    let mut lines = Vec::new();
-    for paragraph in text.lines() {
-        let mut line = String::new();
-        for word in paragraph.split_whitespace() {
-            let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-            if !line.is_empty() && width_mm(&candidate, cap) > width {
-                lines.push(std::mem::replace(&mut line, word.to_string()));
-            } else {
-                line = candidate;
-            }
-        }
-        lines.push(line);
-    }
-    lines
+    layout::wrap(text, width, cap, &PageFont)
 }
 
 fn rect_lines(r: Rect) -> Vec<[f64; 2]> {
@@ -119,44 +117,35 @@ impl Column {
 }
 
 /// What a step's text area says: its number and title, the parts it adds,
-/// its tools and torque, its callouts and its notes.
+/// its tools and torque, its callouts and its notes
+/// ([`layout::step_text`], the lines the layout measured).
 fn step_text(step: &Step, number: usize, area: Rect) -> Vec<SheetText> {
     let mut column = Column::new(area);
-    column.line(format!("Step {number}"), HEADING_MM, 0.0);
-    if !step.title.is_empty() {
-        column.wrapped(&step.title, BODY_MM * 1.15, 0.0);
-    }
-    column.gap();
-    if !step.adds.is_empty() {
-        column.line("Parts", BODY_MM, 0.0);
-        for add in &step.adds {
-            let find = if add.find_number.is_empty() { String::new() } else { format!("({}) ", add.find_number) };
-            column.wrapped(&format!("{find}{} \u{d7} {}", add.quantity(), add.display_name()), BODY_MM, 3.0);
+    for line in layout::step_text(step, number, area.w, &PageFont) {
+        match line {
+            TextLine::Text { text, cap, indent } => column.line(text, cap, indent),
+            TextLine::Gap => column.gap(),
         }
-        column.gap();
-    }
-    if !step.tools.is_empty() {
-        column.line("Tools", BODY_MM, 0.0);
-        for tool in &step.tools {
-            let text = if tool.spec.is_empty() { tool.name.clone() } else { format!("{} \u{2014} {}", tool.name, tool.spec) };
-            column.wrapped(&text, BODY_MM, 3.0);
-        }
-        column.gap();
-    }
-    if let Some(torque) = &step.torque {
-        column.wrapped(&format!("Torque: {}", torque.text()), BODY_MM, 0.0);
-        column.gap();
-    }
-    for callout in &step.callouts {
-        column.wrapped(&format!("{}: {}", callout.kind.label().to_uppercase(), callout.text), BODY_MM, 0.0);
-    }
-    if !step.callouts.is_empty() {
-        column.gap();
-    }
-    if !step.notes.is_empty() {
-        column.wrapped(&step.notes, BODY_MM, 0.0);
     }
     column.texts
+}
+
+/// One placed band of a step's Record block as strokes and text: a box to
+/// tick is a square outline and a line to write on a stroke, so the form
+/// prints the same whatever font a viewer substitutes.
+fn record_row(block: &Instructions, row: &RecordRow, lines: &mut Vec<Vec<[f64; 2]>>, texts: &mut Vec<SheetText>) {
+    let Some(step) = block.step(&row.step_id) else { return };
+    let bands = record::bands(step, row.step_number, &row.item, row.rect.w, row.continued, &PageFont);
+    let Some(band) = bands.get(row.band) else { return };
+    let (ox, oy) = (row.rect.x, row.rect.y);
+    for mark in &band.marks {
+        match mark {
+            Mark::Text { text, x, y, cap } => texts.push(left(text.clone(), ox + x, oy + y, *cap)),
+            Mark::Box { x, y, size } => lines.push(rect_lines(Rect { x: ox + x, y: oy + y, w: *size, h: *size })),
+            Mark::Rule { x0, x1, y } => lines.push(vec![[ox + x0, oy + y], [ox + x1, oy + y]]),
+            Mark::Line(points) => lines.push(points.iter().map(|p| [ox + p[0], oy + p[1]]).collect()),
+        }
+    }
 }
 
 /// The document's title as the pages print it.
@@ -228,7 +217,10 @@ pub fn fit(bounds: [f64; 4], rect: Rect) -> ([f64; 2], f64) {
 /// title, and the page number of the count), then its own content — the
 /// cover's title, assembly and picture; a parts or tools list's rows; the
 /// step slots, each framed, its picture in `pictures` and its text beside or
-/// below. A picture missing from `pictures` leaves its place empty.
+/// below, then its Record block (what the person doing the work fills in:
+/// boxes to tick, lines to write on, the Signed and Date lines), which
+/// continues on Record pages where the layout carried it. A picture missing
+/// from `pictures` leaves its place empty.
 pub fn pages(block: &Instructions, layout: &[Page], pictures: &HashMap<PictureAt, ViewDrawing>) -> Vec<SheetDrawing> {
     let title = title(block);
     let count = layout.len();
@@ -249,6 +241,7 @@ pub fn pages(block: &Instructions, layout: &[Page], pictures: &HashMap<PictureAt
                 PageKind::PartsList { .. } => " \u{2014} Parts list".into(),
                 PageKind::ToolsList { .. } => " \u{2014} Tools".into(),
                 PageKind::Steps => String::new(),
+                PageKind::Record => " \u{2014} Record".into(),
             };
             texts.push(left(format!("{title}{section}"), c.x, header_y, BODY_MM * 1.2));
             texts.push(right(format!("Page {} of {count}", page.number), c.x + c.w, header_y, BODY_MM * 1.2));
@@ -327,9 +320,19 @@ pub fn pages(block: &Instructions, layout: &[Page], pictures: &HashMap<PictureAt
                             views.push(view.clone());
                         }
                         if let Some(step) = block.step(&slot.step_id) {
-                            let inset = Rect { x: slot.text.x + 3.0, y: slot.text.y + 3.0, w: slot.text.w - 6.0, h: slot.text.h - 6.0 };
+                            let t = TEXT_INSET_MM;
+                            let inset = Rect { x: slot.text.x + t, y: slot.text.y + t, w: slot.text.w - 2.0 * t, h: slot.text.h - 2.0 * t };
                             texts.extend(step_text(step, slot.step_number, inset));
                         }
+                        // The step's Record block: its fields as a paper form.
+                        for row in &slot.record {
+                            record_row(block, row, &mut lines, &mut texts);
+                        }
+                    }
+                }
+                PageKind::Record => {
+                    for row in &page.records {
+                        record_row(block, row, &mut lines, &mut texts);
                     }
                 }
             }

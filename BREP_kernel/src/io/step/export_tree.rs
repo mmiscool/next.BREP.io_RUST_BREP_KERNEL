@@ -156,6 +156,7 @@ fn place_children(
             parent,
             child,
             placement: *placement,
+            color: None,
         });
     }
     Ok(())

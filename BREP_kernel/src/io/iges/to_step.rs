@@ -17,7 +17,7 @@ use crate::Vec3;
 
 mod face_sets;
 mod splines;
-pub(super) use face_sets::{analyse_face_sets, FaceSets};
+pub(super) use face_sets::{analyse_face_sets, trimmed_surfaces, FaceSets};
 
 const MAX_TRANSFORM_DEPTH: usize = 32;
 /// Relative slack for "this 124 is a rigid motion with one uniform scale".
@@ -548,12 +548,32 @@ impl<'a> Translator<'a> {
         }
         let same_sense = face_agrees == shell_agrees;
         let same_sense = same_sense != surface.reversed;
-        Ok(self.add(format!(
+        let face = self.add(format!(
             "ADVANCED_FACE('',({}),#{},{})",
             bounds.join(","),
             surface.id,
             if same_sense { ".T." } else { ".F." }
-        )))
+        ));
+        // A face's own colour (its directory entry's 314 or colour number)
+        // goes over as the STEP style of that face, so the STEP lane pairs it
+        // with the face it builds, whatever it does to the face on the way.
+        if let Some(color) = super::structure::entity_color(self.file, entity) {
+            self.face_style(face, color);
+        }
+        Ok(face)
+    }
+
+    /// The Part 21 presentation chain that colours one face: what
+    /// `step_import/styles.rs` reads back.
+    fn face_style(&mut self, face: usize, color: crate::ImportedColor) {
+        let rgb = self.add(format!("COLOUR_RGB('',{},{},{})", real(color.r), real(color.g), real(color.b)));
+        let fill_colour = self.add(format!("FILL_AREA_STYLE_COLOUR('',#{rgb})"));
+        let fill = self.add(format!("FILL_AREA_STYLE('',(#{fill_colour}))"));
+        let area = self.add(format!("SURFACE_STYLE_FILL_AREA(#{fill})"));
+        let side = self.add(format!("SURFACE_SIDE_STYLE('',(#{area}))"));
+        let usage = self.add(format!("SURFACE_STYLE_USAGE(.BOTH.,#{side})"));
+        let assignment = self.add(format!("PRESENTATION_STYLE_ASSIGNMENT((#{usage}))"));
+        self.add(format!("STYLED_ITEM('',(#{assignment}),#{face})"));
     }
 
     /// The STEP loops of one 508: usually one, more when it holds a bridge.

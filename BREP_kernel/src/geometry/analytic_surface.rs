@@ -154,7 +154,7 @@ mod canonical;
 pub use intersect::{intersect_analytic_pair, plane_ruled_section_arc};
 pub(crate) use intersect::{intersect_analytic_pair_with, ruled_gate, ruled_gate_census, RuledGate};
 pub use recognition::recognize;
-pub(crate) use canonical::{canonical_carriers_enabled, canonicalise_carriers, CanonicalReport, CanonicalRewrite};
+pub(crate) use canonical::{canonical_carriers_enabled, canonicalise_carriers};
 pub use revolution::{revolution_structure, RevolutionStructure};
 pub use revolution::circumcenter;
 use recognition::generatrix_is_meridional_half_ray;

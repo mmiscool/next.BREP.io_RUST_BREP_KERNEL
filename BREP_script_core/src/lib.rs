@@ -1,14 +1,16 @@
 //! The interpreter core: evaluate one script, call one global function with
 //! one JSON argument, and hand back its JSON result or its refusal.
 //!
-//! This crate depends on Boa and `serde_json` and nothing else — no file system,
-//! no network, no store. That is deliberate: the operator chose Boa so the same
-//! interpreter runs inside the CAD app, including its wasm build
-//! (plm-cad-integration-todo §3 S11). It was the PLM's `scripting::engine` module
-//! and is still reached under that name there. Everything that reaches outside the
-//! interpreter is installed by the caller through [`call`]'s `install` argument:
-//! the server's bindings are in `BREP_plm/src/scripting/host.rs`, the CAD app's in
-//! `BREP_app/src/scripting.rs`.
+//! This crate depends on Boa and `serde_json` and nothing else — no file
+//! system, no network, no store — so the same interpreter runs natively and
+//! in a `wasm32-unknown-unknown` build. Everything that reaches outside the
+//! interpreter is installed by the caller through [`call`]'s `install`
+//! argument; [`boa_engine`] is re-exported so those bindings name the same
+//! engine version.
+//!
+//! Beside [`call`], [`modules::with_module`] evaluates an in-memory graph of
+//! ES modules, and [`worker`] is a restricted execution protocol driven by
+//! host messages ([`worker::Realm`]). See the README for an example.
 //!
 //! # A fresh interpreter per call
 //!
@@ -19,8 +21,8 @@
 //!
 //! # What is bounded, honestly
 //!
-//! Boa's [`RuntimeLimits`](boa_engine::vm::RuntimeLimits) bound three things,
-//! and they are set here:
+//! Boa's [`RuntimeLimits`](boa_engine::vm::RuntimeLimits) bound three things;
+//! the first two are set here and the stack size keeps Boa's default:
 //!
 //! * each CALL FRAME may run at most [`LOOP_ITERATION_LIMIT`] loop iterations
 //!   in total (Boa counts per frame, not per loop) — an infinite `while (true)`

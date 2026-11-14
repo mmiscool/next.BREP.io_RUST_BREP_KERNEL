@@ -1,6 +1,6 @@
 //! A session: one app instance under one host, plus the session directory
-//! (store, shots, exports, log) and the recorder. Where the directory and
-//! the log ARE is the host's platform's business
+//! (store, shots, exports, log) and the recorder. Where the
+//! directory and the log ARE is the host's platform's business
 //! (`crate::host::Platform`): a directory tree natively, a name and a blob
 //! URL in a browser page.
 use crate::host::{HostConfig, HostHandle, HostInfo, KeptShot};

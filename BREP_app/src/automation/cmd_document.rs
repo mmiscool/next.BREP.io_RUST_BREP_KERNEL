@@ -1,6 +1,6 @@
 //! Documents: new / load / save-as-text / import / export / tabs. Files never
 //! cross this boundary — the host reads and writes them and passes content.
-use crate::automation::command::{app_command, parse_args, schema_of, CommandSpec, Ctx, Empty, NoArgs, Outcome};
+use crate::automation::command::{app_command, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Outcome};
 use crate::document::Document;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

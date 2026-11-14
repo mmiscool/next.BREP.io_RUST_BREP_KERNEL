@@ -567,7 +567,11 @@ impl EngineState {
         if !(spread.is_finite() && spread > 0.0) {
             return Err("the spread must be a positive number".into());
         }
-        // Measure the assembly as placed: an active view's poses are put back first.
+        // Measure the assembly as placed: an active view's poses are put back
+        // first. That restores the modeling camera too, so the camera ON
+        // SCREEN is kept for the framing below: the new view looks from where
+        // the user is looking, as a captured view does.
+        let on_screen = self.pmi_active_view.is_some().then(|| self.camera.clone());
         self.pmi_deactivate_view();
         let mut moves: Vec<(String, f64, [f64; 3])> = Vec::new();
         let mut level: Vec<Option<String>> = vec![None];
@@ -610,6 +614,9 @@ impl EngineState {
             exploded.expand(std::array::from_fn(|k| solid.bbox.max[k] + shift[k]));
         }
         let camera = self.camera.clone();
+        if let Some(on_screen) = on_screen {
+            self.camera = on_screen;
+        }
         self.camera.zoom_to_fit(&exploded, 1.15);
         let id = self.pmi_capture_view(Some(&name));
         self.camera = camera;

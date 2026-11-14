@@ -2,13 +2,19 @@
 
 A native/WASM B-rep geometry kernel for building CAD applications, written in
 Rust. Published on crates.io as **`BREP_kernel`** with library name
-`brep_kernel`; this is version **0.18.0**.
+`brep_kernel`; this is version **0.19.0**.
 It is the authoritative geometry engine behind the BREP CAD application
 (`BREP_app` + `BREP_render` in this repository, re-exported as `brep::kernel` by
 the umbrella `BREP` crate), and is usable standalone as a
-library: exact NURBS geometry, manifold B-rep topology, booleans, offsets,
-fillets, sheet metal, tessellation, STEP import/export, and a feature-history
+library: exact NURBS geometry, manifold B-rep topology, booleans, fillets and
+chamfers, sweeps and lofts (including guide curves), offsets and thickening,
+sheet metal, tessellation, STEP and IGES import/export, and a feature-history
 pipeline driven by JSON schemas.
+
+On the public [brep-bench](https://brepbench.org) board (368 modelling cases run
+by an independent harness), version 0.18.0 passed 322 cases with no wrong
+results in its 2026-11-12 run: the most passes, and the only kernel on the board
+with no wrong result. The board is live; read it for current standings.
 
 Current port coverage is intentionally capability-gated:
 
@@ -48,6 +54,13 @@ Current port coverage is intentionally capability-gated:
   shared circle/arc edges, per-face seams, radial end caps, and genus;
 - exact compatible-section lofts using shared averaged chord parameters,
   global B-spline interpolation, shared skin boundaries, and planar caps;
+- guided lofts: sections that follow one smooth spine chain
+  (`loft_profile_brep_guided_chain`), or walls that follow one guide curve per
+  section corner (`loft_profile_brep_on_guides`, `loft_profile_brep_on_guide_chains`);
+- sweeps of a profile along a path or edge chain (`sweep_profile_along_path`,
+  `sweep_profile_along_chain`), with twist and scale (`sweep_profile_twisted*`),
+  along a helix (`sweep_profile_helix`), and solid sweeps of a body along a
+  motion (`sweep_solid*`);
 - exact affine BREP transforms and reflection-aware orientation reversal;
 
 ### Intersection, classification, and arrangement
@@ -122,8 +135,13 @@ APIs always enforce the checks independently of the switch.
 
 ### Interop and infrastructure
 
-- exact AP242 STEP output for rational and non-rational BREP topology;
-- binary STL read/write and OBJ output;
+- STEP import (`import_step`, with colours via `import_step_with_appearance`)
+  and exact AP242 STEP output for rational and non-rational BREP topology,
+  including assemblies (`export_step`, `export_step_assembly`);
+- IGES 5.3 import (solids and trimmed-surface sets, through the STEP builder)
+  and export (`import_iges`, `export_iges`);
+- STL read/write (binary and ASCII), OBJ read/write, and 3MF read/write
+  (`read_3mf`, `write_3mf`);
 - persistent solid handles for validation, transforms, mass properties,
   tessellation, booleans, offset-shell benchmarks, and STEP
   output without repeatedly decoding the input topology;
@@ -149,7 +167,7 @@ is `BREP_kernel`, the Rust library is the idiomatic lowercase `brep_kernel`:
 
 ```toml
 [dependencies]
-brep_kernel = { package = "BREP_kernel", version = "0.18" }
+brep_kernel = { package = "BREP_kernel", version = "0.19" }
 ```
 
 ```rust
@@ -185,12 +203,14 @@ fn main() -> Result<(), String> {
 }
 ```
 
-Boolean operations return `Result<_, KernelRefusal>` with a typed refusal class;
-most other modeling APIs still return `Result<_, String>`. Analytic and fitted
-geometry coexist, so successful construction is not a promise of zero approximation.
-The feature pipeline currently converts boolean refusals to an error string. STEP text goes in and out
-through `import_step(&str) -> Result<Vec<BrepSolid>, String>` and
-`export_step`.
+Booleans, fillets and chamfers, sweeps and lofts return
+`Result<_, KernelRefusal>` with a typed refusal class; many other APIs still
+return `Result<_, String>`. Analytic and fitted geometry coexist, so successful
+construction is not a promise of zero approximation. The feature pipeline
+reports each failing step's message and, where the producer is typed, its
+`KernelRefusal`. STEP text goes in and out through
+`import_step(&str) -> Result<Vec<BrepSolid>, String>` and `export_step`; IGES
+through `import_iges` and `export_iges`.
 
 ## Building
 

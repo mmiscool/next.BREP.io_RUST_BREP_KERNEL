@@ -92,8 +92,8 @@ mod cmd_plm;
 mod cmd_kicad;
 
 /// How a host builds the app. `store: None` = the default store (the user's
-/// own config directory); a host MUST pass an isolated store. `seed: false`
-/// starts on an empty document instead of the seed model.
+/// own config directory); a host MUST pass an isolated store.
+/// `seed: false` starts on an empty document instead of the seed model.
 pub struct AppOptions {
     pub store: Option<Box<dyn crate::store::ModelStore>>,
     pub seed: bool,

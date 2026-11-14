@@ -13,9 +13,6 @@ pub(in crate::boolean) struct ReplacedEdge {
     pub previous: NurbsCurve,
     pub t0: f64,
     pub t1: f64,
-    /// Worst sampled distance to either carrier, before and after.
-    pub residual_before: f64,
-    pub residual_after: f64,
 }
 
 /// Put back every edge in `replaced`.
@@ -574,14 +571,16 @@ pub(in crate::boolean) fn reconstruct_edges_from_carriers_in(
         profile_line!("assemble.reconstruct.work queries={} readings={} projections={}", RESIDUAL_QUERIES.with(|queries| queries.get()) - queries_before, work.0 - work_before.0, work.1 - work_before.1);
     }
     let mut replaced = Vec::new();
-    for (edge_index, curve, residual_before, residual_after) in candidates {
+    for candidate in candidates {
+        let (edge_index, curve, ..) = candidate;
         let edge = &mut solid.edges[edge_index];
         let [t0, t1] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
         let previous = std::mem::replace(&mut edge.curve, curve);
         let (previous_t0, previous_t1) = (edge.t0, edge.t1);
         edge.t0 = t0;
         edge.t1 = t1;
-        replaced.push(ReplacedEdge { edge_id: edge.id, previous, t0: previous_t0, t1: previous_t1, residual_before, residual_after });
+        replaced.push(ReplacedEdge { edge_id: edge.id, previous, t0: previous_t0, t1: previous_t1,
+        });
     }
     if debug {
         eprintln!("edges: {off_edges} edges over the {bar:.1e} bar; {} reconstructed, {} declined", replaced.len(), declined.len());

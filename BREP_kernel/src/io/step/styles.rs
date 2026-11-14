@@ -86,10 +86,11 @@ impl StepColors {
     ///
     /// `prefixes` is the occurrence namespaces a product's geometry is known by
     /// in the document (`""` for the root, `"ACOMP3:"`, `"ACOMP5:ACOMP1:"` …).
-    /// A part placed several times has ONE written geometry, so it can carry
-    /// only one colour per entity: the first prefix in the caller's order wins,
-    /// the same "a shared part resolves to the one face" rule the PMI writer
-    /// documents for annotations.
+    /// A part placed several times has ONE written geometry, so it carries
+    /// one colour of its own per entity: the first prefix in the caller's
+    /// order wins, the same "a shared part resolves to the one face" rule the
+    /// PMI writer documents for annotations. (An instance placed by the root in
+    /// another colour gets it as that occurrence's own, `assembly.rs` step 6b.)
     pub(crate) fn resolve(&self, prefixes: &[String], name: &str) -> Option<[u8; 3]> {
         prefixes.iter().find_map(|prefix| {
             if prefix.is_empty() {
@@ -143,14 +144,25 @@ pub(crate) fn styled_items(
     colors: &StepColors,
     prefixes: &[String],
 ) -> Vec<(usize, [u8; 3])> {
+    styled_items_split(geometry, colors, prefixes, prefixes)
+}
+
+/// [`styled_items`] with the solids resolved through `solid_prefixes` and the
+/// faces through `face_prefixes`.
+pub(crate) fn styled_items_split(
+    geometry: &ProductGeometry,
+    colors: &StepColors,
+    solid_prefixes: &[String],
+    face_prefixes: &[String],
+) -> Vec<(usize, [u8; 3])> {
     let mut items = Vec::new();
     for (name, id) in &geometry.solids {
-        if let Some(rgb) = colors.resolve(prefixes, name) {
+        if let Some(rgb) = colors.resolve(solid_prefixes, name) {
             items.push((*id, rgb));
         }
     }
     for (name, id) in &geometry.faces {
-        if let Some(rgb) = colors.resolve(prefixes, name) {
+        if let Some(rgb) = colors.resolve(face_prefixes, name) {
             items.push((*id, rgb));
         }
     }
@@ -169,14 +181,25 @@ pub(crate) fn write_geometry_styles(
     geometry_context: usize,
     items: &[(usize, [u8; 3])],
 ) -> Result<usize, String> {
+    Ok(write_geometry_styles_keyed(writer, geometry_context, items)?.len())
+}
+
+/// [`write_geometry_styles`], returning each item's `STYLED_ITEM` id (item →
+/// styled item), so an occurrence's override can name the style it overrides.
+pub(crate) fn write_geometry_styles_keyed(
+    writer: &mut StepWriter,
+    geometry_context: usize,
+    items: &[(usize, [u8; 3])],
+) -> Result<BTreeMap<usize, usize>, String> {
     if items.is_empty() {
-        return Ok(0);
+        return Ok(BTreeMap::new());
     }
     // One chain per distinct colour, minted on first use so entity order
     // follows `items` order. Keyed on the 8-bit triple, which IS the colour's
     // persisted identity.
     let mut assignments: BTreeMap<[u8; 3], usize> = BTreeMap::new();
     let mut styled = Vec::with_capacity(items.len());
+    let mut keyed = BTreeMap::new();
     for (item, rgb) in items {
         let assignment = match assignments.get(rgb) {
             Some(id) => *id,
@@ -186,7 +209,60 @@ pub(crate) fn write_geometry_styles(
                 id
             }
         };
-        styled.push(write_styled_item(writer, "color", assignment, *item));
+        let id = write_styled_item(writer, "color", assignment, *item);
+        styled.push(id);
+        keyed.entry(*item).or_insert(id);
+    }
+    writer.add(format!(
+        "MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION('',{},#{geometry_context})",
+        id_list(&styled)
+    ));
+    Ok(keyed)
+}
+
+/// Write each occurrence's own colour: for every `(item, relationship, rgb)`,
+/// a `CONTEXT_DEPENDENT_OVER_RIDING_STYLED_ITEM` on the part's `item` in the
+/// context of the occurrence's `REPRESENTATION_RELATIONSHIP` (the one its
+/// `CONTEXT_DEPENDENT_SHAPE_REPRESENTATION` places the part through), over the
+/// item's own style in `base`. An item with no style of its own gets one that
+/// says so (`NULL_STYLE`), so the override has a style to name and the part's
+/// other instances stay uncoloured. Gathered in a presentation representation
+/// of their own; returns how many styled items were written.
+pub(crate) fn write_occurrence_styles(
+    writer: &mut StepWriter,
+    geometry_context: usize,
+    base: &BTreeMap<usize, usize>,
+    items: &[(usize, usize, [u8; 3])],
+) -> Result<usize, String> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let mut assignments: BTreeMap<[u8; 3], usize> = BTreeMap::new();
+    let mut unstyled: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut null_style = None;
+    let mut styled = Vec::with_capacity(items.len());
+    for (item, relationship, rgb) in items {
+        let over_ridden = match base.get(item).or_else(|| unstyled.get(item)) {
+            Some(id) => *id,
+            None => {
+                let null = *null_style.get_or_insert_with(|| write_style_assignment(writer, "NULL_STYLE(.NULL.)"));
+                let id = write_styled_item(writer, "", null, *item);
+                unstyled.insert(*item, id);
+                styled.push(id);
+                id
+            }
+        };
+        let assignment = match assignments.get(rgb) {
+            Some(id) => *id,
+            None => {
+                let id = write_surface_style(writer, *rgb)?;
+                assignments.insert(*rgb, id);
+                id
+            }
+        };
+        styled.push(writer.add(format!(
+            "CONTEXT_DEPENDENT_OVER_RIDING_STYLED_ITEM('color',(#{assignment}),#{item},#{over_ridden},(#{relationship}))"
+        )));
     }
     writer.add(format!(
         "MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION('',{},#{geometry_context})",

@@ -6,7 +6,12 @@
 //! before it), taken when the job is made; a released document never changes, so
 //! the snapshot is what the floor builds. Each step is signed once, in order,
 //! by an operator (or an author or admin), who records the serial of every
-//! unit the step adds of a part marked `Serial_Tracked`. A serial of a part
+//! unit the step adds of a part marked `Serial_Tracked` and the values of the
+//! step's fields (what its author asked to be recorded there: ticks, choices,
+//! text, measurements, serial numbers), which the server reads against the
+//! field definitions it snapshot with the step: a required field left empty,
+//! a value the field cannot hold, or a measurement outside limits that must
+//! be inside refuses the sign-off, whatever the page checked. A serial of a part
 //! is in at most one job that is not cancelled: `GET /api/serials` answers
 //! which build took it. Only the check-in group reopens a signed step (and every step after
 //! it), and the audit keeps both.
@@ -104,6 +109,44 @@ pub struct JobStep {
     pub note: String,
     #[serde(default)]
     pub serials: Vec<SerialEntry>,
+    /// The step's fields as the instructions define them (a snapshot, like
+    /// the adds): what the sign-off's values are read against. Empty for a
+    /// step without fields and for a job made before fields existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_defs: Vec<brep_instructions::fields::StepField>,
+    /// The values recorded at sign-off, one per field that was filled in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<FieldEntry>,
+}
+
+/// One field's recorded value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldEntry {
+    /// The field's id in the instructions (`MF12`).
+    pub id: String,
+    /// Its label when the step was signed.
+    #[serde(default)]
+    pub label: String,
+    /// `true` for a tick, the option (or an array of them) for a choice,
+    /// text, or a number for a measurement.
+    pub value: Value,
+    /// A measurement's unit.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub unit: String,
+    /// A measurement with limits: whether the value was inside them, as
+    /// the server judged it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_limits: Option<bool>,
+}
+
+/// One field's value as a sign-off sends it. A page may send the label,
+/// unit and its own in-limits reading beside it; the server takes only the
+/// id and the value and works the rest out from the step's definitions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FieldInput {
+    pub id: String,
+    #[serde(default)]
+    pub value: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,15 +199,17 @@ fn group_of(instructions: &brep_instructions::model::Instructions, step_id: &str
 /// The steps a job signs, read with the instructions crate's own model (a
 /// schema-1 document's chapters read as the tree): every step in reading
 /// order (a step's children before it, as the wizard orders them), leaving
-/// out a step that needs no sign-off.
+/// out a step that needs no sign-off and records nothing (a step with fields
+/// is on the checklist: its values are captured with its sign-off).
 pub fn snapshot_steps(state: &State, document: &Value) -> Result<Vec<JobStep>, Error> {
     let block = document.get(brep_instructions::model::BLOCK_KEY).ok_or_else(|| Error::conflict("the document holds no instructions"))?;
     let instructions = brep_instructions::model::Instructions::from_value(block)
         .map_err(|e| Error::conflict(format!("the instructions do not read: {e}")))?;
     let steps: Vec<JobStep> = instructions
         .steps()
-        // A step that needs no sign-off is not on the floor's checklist.
-        .filter(|(_, step)| step.signoff.required)
+        // A step that needs no sign-off and has no field to record is not on
+        // the floor's checklist.
+        .filter(|(_, step)| step.on_checklist())
         .map(|(_, step)| JobStep {
             step: step.id.clone(),
             chapter: group_of(&instructions, &step.id),
@@ -185,6 +230,8 @@ pub fn snapshot_steps(state: &State, document: &Value) -> Result<Vec<JobStep>, E
             signed_at: None,
             note: String::new(),
             serials: Vec::new(),
+            field_defs: step.fields.clone(),
+            fields: Vec::new(),
         })
         .collect();
     if steps.is_empty() {
@@ -237,6 +284,42 @@ pub struct SignOff {
     pub serials: Vec<SerialEntry>,
     #[serde(default)]
     pub note: String,
+    /// The values of the step's fields: `[{id, value}]`.
+    #[serde(default)]
+    pub fields: Vec<FieldInput>,
+}
+
+/// The sign-off's field values read against the step's definitions: one
+/// entry per field that was filled in, in the step's order. Refused: a value
+/// for a field the step does not have, a field given twice, a value its
+/// field cannot hold, a required field left empty, and a measurement outside
+/// limits that must be inside.
+pub fn read_fields(step: &JobStep, given: &[FieldInput]) -> Result<Vec<FieldEntry>, Error> {
+    use brep_instructions::fields::{blocking, evaluate};
+    for (i, input) in given.iter().enumerate() {
+        if !step.field_defs.iter().any(|f| f.id == input.id) {
+            return Err(Error::conflict(format!("step {} has no field '{}'", step.step, input.id)));
+        }
+        if given[..i].iter().any(|earlier| earlier.id == input.id) {
+            return Err(Error::bad_request(format!("field '{}' is given twice", input.id)));
+        }
+    }
+    let mut entries = Vec::new();
+    let mut open = Vec::new();
+    for field in &step.field_defs {
+        let value = given.iter().find(|input| input.id == field.id).map(|input| &input.value);
+        let read = evaluate(field, value).map_err(Error::bad_request)?;
+        if let Some(reason) = blocking(field, &read) {
+            open.push(reason);
+        }
+        if let Some(value) = read.value {
+            entries.push(FieldEntry { id: field.id.clone(), label: field.label.clone(), value, unit: field.unit().to_string(), in_limits: read.in_limits });
+        }
+    }
+    if !open.is_empty() {
+        return Err(Error::conflict(format!("step {} is not complete: {}", step.step, open.join("; "))));
+    }
+    Ok(entries)
 }
 
 impl Db {
@@ -393,6 +476,7 @@ impl Db {
                     }
                 }
             }
+            let fields = read_fields(this, &signoff.fields)?;
             let mut serials = Vec::new();
             for entry in &signoff.serials {
                 let part = add_of(&entry.occurrence).map(|a| a.part.clone()).unwrap_or_default();
@@ -411,6 +495,7 @@ impl Db {
             signed.signed_at = Some(stamp);
             signed.note = signoff.note.trim().to_string();
             signed.serials = serials;
+            signed.fields = fields;
             let signed = signed.clone();
             if job.status == JobStatus::Queued {
                 job.status = JobStatus::InProgress;
@@ -450,6 +535,7 @@ impl Db {
                 later.signed_by = None;
                 later.signed_at = None;
                 later.serials.clear();
+                later.fields.clear();
                 later.note = String::new();
             }
             job.steps[at].note = format!("reopened: {reason}");

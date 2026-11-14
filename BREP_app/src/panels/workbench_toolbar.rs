@@ -58,7 +58,7 @@ impl WorkbenchToolbarPanel {
             return outcome;
         }
         let commands = workbench::offered_home_commands(state);
-        let groups = workbench::command_groups(&commands, "Home");
+        let groups = workbench::creation_groups(&commands);
         if groups.is_empty() {
             return outcome;
         }

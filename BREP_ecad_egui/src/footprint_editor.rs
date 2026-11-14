@@ -1,6 +1,6 @@
 //! Footprint editor: pads, holes, and silkscreen, working like the symbol editor.
 use super::*;
-use crate::editor_core::{EditorCore, WindowEditor, WindowSpec, editor_window};
+use crate::editor_core::EditorCore;
 use crate::actions::{Action, ActionGroup, action, command, key};
 use crate::board_view::{BACKGROUND, SILK, THROUGH_HOLE, WARNING, layer_color};
 use crate::symbol_editor::{InspectorHits, LIST_SHARE, grip_under, key_word, list_height};
@@ -208,13 +208,6 @@ pub struct FootprintEditor {
     items_height: Option<f32>,
     pins_height: Option<f32>,
 }
-impl WindowEditor for FootprintEditor {
-    fn toolbar(&mut self, ui: &mut egui::Ui) { FootprintEditor::toolbar(self, ui); }
-    fn properties(&mut self, ui: &mut egui::Ui) { FootprintEditor::properties(self, ui); }
-    fn canvas(&mut self, ui: &mut egui::Ui, size: Vec2) { FootprintEditor::canvas(self, ui, size); }
-    fn validate(&self) -> Result<(), String> { FootprintEditor::validate(self) }
-    fn error(&mut self) -> &mut String { &mut self.error }
-}
 impl FootprintEditor {
     pub fn new(footprint: Footprint, target: Option<Uuid>, pins: Vec<String>) -> Self {
         Self {
@@ -259,9 +252,6 @@ impl FootprintEditor {
     /// edits there merge whichever field they touched.
     fn record_as(&mut self, before: Footprint, coalesce: Option<&str>) {
         self.core.record(before, &self.footprint, coalesce);
-    }
-    fn note_change(&mut self, coalesce: Option<String>) {
-        self.core.note_change(coalesce);
     }
     /// The edits made since the last call, merged into one. A host that keeps the
     /// footprint in its own file calls this once a frame and stores [`Self::footprint`].
@@ -414,19 +404,13 @@ impl FootprintEditor {
     fn undo(&mut self) {
         self.core.undo(&mut self.footprint);
     }
-    /// Undo or redo for the keyboard or a host, unless a drag is still recording.
-    pub(crate) fn step_history(&mut self, key: HistoryKey) {
-        self.core.step_history(&mut self.footprint, key);
-    }
     pub(crate) fn can_step_history(&self, key: HistoryKey) -> bool {
         self.core.can_step_history(key)
     }
     fn redo(&mut self) {
         self.core.redo(&mut self.footprint);
     }
-    fn validate(&self) -> Result<(), String> {
-        self.footprint.validate()
-    }
+
     /// Whether the symbol's pins are known here at all: a part is open, or the
     /// host has named some. A part whose symbol has NO pins is known and empty,
     /// so a numbered pad on it is honestly reported as being on no pin.
@@ -647,23 +631,7 @@ impl FootprintEditor {
             crate::actions::run_shortcuts(self, &actions, ctx);
         }
     }
-    /// The editor in a window of its own, with Apply and Cancel for the standalone app.
-    /// Returns Some(true) on Apply, Some(false) on Cancel or close.
-    pub(crate) fn window(&mut self, ctx: &egui::Context) -> Option<bool> {
-        // While this window is open the keyboard history is its own.
-        self.run_shortcuts(ctx);
-        let hint = if self.target.is_some() {
-            "Updates this part and the session footprint library."
-        } else {
-            "Adds or updates this footprint in the session library."
-        };
-        editor_window(self, ctx, WindowSpec {
-            title: "Footprint editor", id: "footprint_editor",
-            default_size: Vec2::new(980., 680.), min_size: Vec2::new(660., 460.),
-            inspector_width: 250., apply: "Apply footprint", hint,
-            measure_canvas_after_inspector: false,
-        })
-    }
+
     /// The footprint's name, what its items are on, the symbol's pins, and the
     /// selected item's fields.
     pub fn properties(&mut self, ui: &mut egui::Ui) {

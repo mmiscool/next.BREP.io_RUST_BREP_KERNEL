@@ -333,18 +333,25 @@ impl EngineState {
             .filter(|n| !n.is_empty())
             .map(String::from)
             .unwrap_or_else(|| format!("View {}", state.views.len() + 1));
-        // The capture reads the MODELING state: if another view is active its
-        // applied state is what is on screen, so deactivate first (restores)
-        // — a view captures what the user set up, not another view's snapshot.
-        let was_active = self.pmi_active_view.is_some();
-        if was_active {
+        // The capture reads the MODELING visibility and wireframe: if another
+        // view is active its hides, wireframe and explode poses are what is on
+        // screen, so deactivate first (restores) — a view's baseline is what
+        // the user set up, not another view's display. The CAMERA is the one
+        // on screen all the same: a view stays active while the user goes on
+        // working and orbiting, and Capture means "this camera". It is read
+        // before the restore and given to the new view; the remembered
+        // modeling camera stays the one from before any view was active, as
+        // it does across a switch between views.
+        let live_camera = self.pmi_active_view.is_some().then(|| self.snapshot_camera());
+        if live_camera.is_some() {
             self.pmi_deactivate_view();
         }
         self.pmi_remember_modeling();
+        let camera = live_camera.unwrap_or_else(|| self.snapshot_camera());
         state.views.push(PmiView {
             id: id.clone(),
             name,
-            camera: Some(self.snapshot_camera()),
+            camera: Some(camera),
             display: PmiDisplay::new(12.0, self.settings.wireframe, None),
             annotations: Vec::new(),
         });

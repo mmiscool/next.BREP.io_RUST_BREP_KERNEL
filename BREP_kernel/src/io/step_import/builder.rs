@@ -107,6 +107,7 @@ pub(in crate::step_import) mod planar_split;
 mod rims;
 pub(in crate::step_import) mod loops;
 mod solids;
+pub(in crate::step_import) mod prefit;
 
 pub(super) use solids::*;
-pub(in crate::step_import) use closure::{ClosureNote, SHELL_CLOSURE};
+pub(in crate::step_import) use closure::ClosureNote;

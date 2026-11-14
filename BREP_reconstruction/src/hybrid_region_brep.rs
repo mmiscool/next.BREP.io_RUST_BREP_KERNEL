@@ -2616,7 +2616,7 @@ fn join_cone_pieces(
             let union: BTreeSet<u32> = cones.iter().flat_map(|r| vertices.get(r).into_iter().flatten().copied()).collect();
             let deviation = cones.iter().filter_map(|&r| cone_of(r)).map(|c| c.deviation).fold(0.0, f64::max);
             let bar = accepted_radial_bar(tolerance * 4.0, deviation);
-            let cone = cone_of(top).unwrap();
+            cone_of(top).unwrap();
             // A one-column strip's own carrier can be all but flat (half
             // angle 1.564 on census record
             // occt_countersunk_hole_s1_d0.005_jitter-0.1) and the refit

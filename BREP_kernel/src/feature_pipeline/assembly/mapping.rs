@@ -541,12 +541,12 @@ pub(super) fn facing_field(hint: &str) -> serde_json::Value {
 
 
 
-/// First-solve initialization: when `flag_key` is not yet set in
-/// `persistentData` and the constraint was created WITHOUT `param_key`, the
-/// target ADOPTS the current measurement and both the param and the flag are
-/// queued for commit on solve success. A value given at creation (a script,
-/// the MCP, a dialog) is what was asked for: it drives the parts there, and
-/// only the flag is queued.
+/// First-solve initialization: when `flag_key` is not yet
+/// set in `persistentData` and the constraint was created WITHOUT `param_key`,
+/// the target ADOPTS the current measurement and both the param and the flag
+/// are queued for commit on solve success. A value given at creation (a
+/// script, the MCP, a dialog) is what was asked for: it drives the parts
+/// there, and only the flag is queued.
 #[allow(clippy::type_complexity)]
 pub(super) fn first_solve_target(
     entry: &ConstraintEntry,

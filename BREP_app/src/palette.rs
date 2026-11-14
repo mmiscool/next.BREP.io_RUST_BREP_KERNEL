@@ -170,13 +170,13 @@ fn icon_tile(
         if let Some(icon) = icon {
             egui_extras::install_image_loaders(ui.ctx());
             let side = tile.side;
-            let art_height = side.min((width - 16.0) / icon.artwork_aspect.max(1.0));
+            let art_side = side.min(width - 16.0);
             let rect = egui::Rect::from_center_size(
                 egui::pos2(
                     response.rect.center().x,
                     response.rect.top() + ICON_TOP + side / 2.0,
                 ),
-                egui::vec2(art_height * icon.artwork_aspect, art_height),
+                egui::Vec2::splat(art_side),
             );
             let mut art = egui::Image::new(egui::ImageSource::Bytes {
                 uri: format!("{}-artwork.svg", icon.uri).into(),

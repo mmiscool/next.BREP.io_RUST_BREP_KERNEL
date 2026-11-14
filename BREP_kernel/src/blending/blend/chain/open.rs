@@ -723,8 +723,6 @@ fn open_chain_surgery(
                 name: None,
             });
             pieces.push(RimPiece {
-                face_id: 0,
-                loop_index: 0,
                 window: [a, b],
                 edge_id,
             });

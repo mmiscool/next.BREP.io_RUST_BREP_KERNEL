@@ -1,5 +1,5 @@
-//! The constraint run lifecycle: validate → map → ONE `solve_assembly`
-//! call → status/diagnostics merge → pose write-back.
+//! The constraint run lifecycle: validate → map → ONE
+//! `solve_assembly` call → status/diagnostics merge → pose write-back.
 
 use std::collections::BTreeMap;
 

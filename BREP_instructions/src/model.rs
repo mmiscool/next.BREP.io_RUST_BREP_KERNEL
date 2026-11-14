@@ -213,6 +213,10 @@ pub struct Step {
     pub motion: Option<Value>,
     #[serde(default)]
     pub signoff: Signoff,
+    /// What the person doing the work records at the step, in order: boxes
+    /// to tick, choices, written text, measurements, serial numbers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<crate::fields::StepField>,
     /// The author captured the view's camera from the viewport: it is kept
     /// through every regeneration until Reset view. Otherwise the engine
     /// generates the camera from the step's parts and its parent's direction.
@@ -291,6 +295,13 @@ impl Step {
     /// Whether `step_id` is this step or one of its descendants.
     pub fn contains(&self, step_id: &str) -> bool {
         self.id == step_id || self.steps.iter().any(|s| s.contains(step_id))
+    }
+
+    /// Whether the step is on a build's checklist: it needs a sign-off, or
+    /// it carries fields to record (a field is captured with its step's
+    /// completion, so a step with fields is completed like a signed one).
+    pub fn on_checklist(&self) -> bool {
+        self.signoff.required || !self.fields.is_empty()
     }
 
     /// Whether this step places a sub-assembly at `occurrence`.
@@ -538,7 +549,8 @@ impl Instructions {
     }
 
     /// The structural rules: a known schema, a template the layout can draw,
-    /// unique step ids over the whole tree, and no occurrence added twice.
+    /// unique step and field ids over the whole tree, well-formed fields, and
+    /// no occurrence added twice.
     pub fn validate(&self) -> Result<(), String> {
         if self.schema == 0 || self.schema > SCHEMA {
             return Err(format!("instructions schema {} is not supported (this build reads up to {SCHEMA})", self.schema));
@@ -552,6 +564,12 @@ impl Instructions {
             if !ids.insert(step.id.as_str()) {
                 return Err(format!("duplicate id '{}'", step.id));
             }
+            for field in &step.fields {
+                if field.id.is_empty() || !ids.insert(field.id.as_str()) {
+                    return Err(format!("duplicate id '{}'", field.id));
+                }
+                field.validate()?;
+            }
             for add in &step.adds {
                 for occurrence in &add.occurrences {
                     if !occurrences.insert(occurrence.as_str()) {
@@ -563,7 +581,8 @@ impl Instructions {
         Ok(())
     }
 
-    /// A fresh id with `prefix` (`MS` step, `MK` callout; `MC` was a chapter).
+    /// A fresh id with `prefix` (`MS` step, `MK` callout, `MF` field; `MC` was
+    /// a chapter).
     pub fn next_id(&mut self, prefix: &str) -> String {
         self.id_counter += 1;
         format!("{prefix}{}", self.id_counter)

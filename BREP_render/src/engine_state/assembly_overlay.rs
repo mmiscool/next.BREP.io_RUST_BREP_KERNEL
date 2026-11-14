@@ -519,8 +519,12 @@ impl EngineState {
         };
         // The release commits straight into the live kernel session (no rerun —
         // the movedSolids seam refreshes the scene), so the session has to exist
-        // on THIS thread before the drag starts.
-        self.ensure_assembly_session();
+        // on THIS thread before the drag starts: no grab until its copy has
+        // landed from the runner.
+        if !self.ensure_assembly_session() {
+            self.push_notice(super::ASSEMBLY_SESSION_PENDING.to_string());
+            return false;
+        }
         let Some(overlay) = self.constraint_overlays.iter().find(|o| o.id == id) else {
             return false;
         };

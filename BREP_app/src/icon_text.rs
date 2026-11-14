@@ -289,7 +289,7 @@ impl Opts {
         ui.spacing_mut().item_spacing.x = 0.0;
 
         let mut response: Option<Response> = None;
-        let mut union = |acc: &mut Option<Response>, r: Response| {
+        let union = |acc: &mut Option<Response>, r: Response| {
             *acc = Some(match acc.take() {
                 Some(prev) => prev | r,
                 None => r,

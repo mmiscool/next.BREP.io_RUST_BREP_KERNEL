@@ -652,9 +652,6 @@ pub(super) struct FoldReading {
     /// contact's track — the two readings [`check_wall_fold`] refuses on, as
     /// a number rather than a verdict. One is the fold.
     pub(super) number: f64,
-    /// The ball centre curve's curvature vector here (zero where the probe
-    /// could not read it).
-    pub(super) turn: Vec3,
     /// The sections [`PROBE_FRACTION`] of the span either side: their two
     /// contacts and their ball centre.
     pub(super) sections: [([Vec3; 2], Vec3); 2],
@@ -704,13 +701,7 @@ pub(super) fn fold_number(
             1.0 / turn.length()
         );
     }
-    Some(FoldReading { number: worst, turn, sections: [probed.before, probed.after] })
-}
-
-/// `BREP_BLEND_ROWS_LOOP_CHECK=0` skips [`check_rows_loop`] (a census hatch;
-/// unset or anything else runs it). Read once.
-fn rows_loop_check_enabled() -> bool {
-    switch!("BREP_BLEND_ROWS_LOOP_CHECK", true)
+    Some(FoldReading { number: worst, sections: [probed.before, probed.after] })
 }
 
 /// Sub-steps of each station interval and samples across the section the
@@ -750,7 +741,7 @@ pub(super) fn check_rows_loop(
     faces: Vec<u64>,
     scale: f64,
 ) -> Result<(), KernelRefusal> {
-    if !rows_loop_check_enabled() || rows.exact_extrusion || stations.len() < 2 || parameters.len() != stations.len() {
+    if rows.exact_extrusion || stations.len() < 2 || parameters.len() != stations.len() {
         return Ok(());
     }
     // Only the intervals INSIDE the blend's own span are read, exactly as the

@@ -177,7 +177,6 @@ fn exact_ray_enabled() -> bool {
     switch!("BREP_CLASSIFY_EXACT_RAY", true)
 }
 
-
 /// One ray-face intersection of the ray pass: the exact lane's seeds when it
 /// is on and the face admits them, the sampled search otherwise. Counted on
 /// the profile as `exact_faces` / `fallback_faces` (never timed).

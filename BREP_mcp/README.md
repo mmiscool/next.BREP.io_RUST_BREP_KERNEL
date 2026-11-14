@@ -47,12 +47,19 @@ Without an MCP client:
 ```sh
 brep-mcp shot model.nbrep model.png --view ISO --size 1280x800   # render a document
 brep-mcp schema --all                                           # feature catalogue + script format, as JSON Schema
-brep-mcp test script.json                                       # play automation scripts
+brep-mcp test script.js                                         # play test scripts (.js programs or .json step lists)
 brep-mcp render-mesh mesh.json mesh.png --normalize             # CPU mesh rasteriser, no GPU
 ```
 
 Sessions keep their store, screenshots and logs under the OS temporary
 directory unless `--session-root` or `BREP_MCP_SESSION_ROOT` says otherwise.
+
+`serve` keeps durable execution state under a named profile (`headless` by
+default). `--instance NAME` selects another profile for a second concurrent
+server, `--state-dir DIR` names the journal directory directly, and
+`--ephemeral` keeps execution state in memory for this process only.
+`--event-journal-dir DIR` opts into a private diagnostic metadata archive.
+`brep-mcp --help` and `brep-mcp <command> --help` list every option.
 
 ## Execution and compiler setup
 
@@ -135,7 +142,7 @@ converting coordinates, especially after resizing or changing display scale.
 
 ## Reviewed skills on disk
 
-The seven embedded workflows can also be exported and installed as Markdown.
+The eight embedded workflows can also be exported and installed as Markdown.
 Use a trusted `brep-mcp` binary to export its reviewed bundle and obtain its
 SHA-256, then pass that digest explicitly when installing:
 
@@ -151,7 +158,7 @@ this binary's exact embedded bundle, with the matching supplied digest. A digest
 or publisher label from an untrusted download is not a provenance guarantee.
 
 The destination is a dedicated managed directory whose parent already exists.
-The installer uses an exclusive lock, verifies the seven skill files and selects
+The installer uses an exclusive lock, verifies the eight skill files and selects
 a digest-named version. It rejects modified files, symlinks, unexpected assets
 and executable data files. It never runs skill content or changes agent settings.
 Point your agent's skill loader at the returned `directory` path. After an update
@@ -181,7 +188,7 @@ do is a function a program calls, `await brep.<group>.<tool>(args)`. Those
 functions are generated from the application's own registries, so they are
 exactly what it can do: about 300 tools, typed in the server's
 `brep://cad/sdk.d.ts` resource (`brep-mcp schema --write <dir>` writes the same
-`brep-cad.d.ts`). See `docs/automation/index.md`.
+`brep-cad.d.ts`).
 The `session` group is the server's own (a program runs inside a session).
 File management uses one `files` tool with `op`: `list`, `stat`, `read`,
 `write`, `mkdir`, `copy`, `move`, or `delete`. Scripts use the same operations
@@ -211,8 +218,9 @@ The groups:
   Lifecycle changes are host-controlled and are not callable inside a program.
 - **document** — new, open, save, activate and close documents;
   `document_import` (STEP, IGES, STL, OBJ, 3MF) and `document_export` (native,
-  STEP, STL, OBJ, IGES, glTF, flat-pattern DXF/SVG, drawing SVG/PDF); part
-  attributes, families and templates.
+  STEP, STL, OBJ, IGES, binary glTF, 3MF, flat-pattern DXF/SVG, drawing
+  SVG/PDF and PDF with an embedded 3D model, PCB fabrication files, BOM
+  CSV/JSON); part attributes, families and templates.
 - **features** and **history** — the feature catalogue and schemas,
   `feature_add`, `feature_set_params`, delete, reorder, roll back, undo and
   redo, expressions.
@@ -229,6 +237,15 @@ The groups:
   published state, settings, windows and panes, and frame timing.
 - **capture** — `wait_idle`, `wait_frames`, `wait_state` and `screenshot` (the
   whole window, the viewport, or a region, returned inline and saved as PNG).
+- **cam** — CAM setups, tools, operations, toolpath generation, simulation
+  and post-processing.
+- **instructions** and **simulation** — manufacturing instructions (steps,
+  fields, playback, export) and motion studies (motors, clips, playback,
+  export).
+- **plugins** — the JavaScript editor window, installed plugins, plugin
+  features, panels, annotations and actions.
+- **plm** — PLM follow and bake actions for an app connected to a PLM server.
+- **files** — the `files` operations above, one function per operation.
 
 `brep-mcp schema --write <dir>` writes the full tool and feature reference
 (Markdown and JSON) into a directory.

@@ -285,7 +285,6 @@ struct ChainRestriction {
     mate_face: u64,
     rail_edge: u64,
     rail_parameters: [f64; 2],
-    rail_loop: usize,
     /// The crossing points, matched to `rail_parameters`.
     points: [Vec3; 2],
     /// Links in walk order from `points[0]` to `points[1]`.
@@ -1002,7 +1001,6 @@ fn plan_chain(
         mate_face: mate.id,
         rail_edge: rail.id,
         rail_parameters,
-        rail_loop,
         points,
         links,
         junctions,
@@ -1588,7 +1586,7 @@ fn interpolate_traced(
     obstacle: &FaceRecord,
 ) -> Result<NurbsCurve, KernelRefusal> {
     let free = interpolate_curve(spatial, degree, parameters).or_refuse(KernelStage::Refine, "interpolate_curve")?;
-    if degree < 3 || spatial.len() < 4 || !exact_trace_ends_on() {
+    if degree < 3 || spatial.len() < 4 {
         return Ok(free);
     }
     let mut derivatives = [Vec3::default(); 2];
@@ -1607,11 +1605,6 @@ fn interpolate_traced(
     // An end-derivative solve that fails leaves the free fit, which is what
     // every trace was before and what the fit bands below still measure.
     Ok(crate::interpolate_curve_with_end_tangents(spatial, parameters, derivatives[0], derivatives[1]).unwrap_or(free))
-}
-
-/// `BREP_BLEND_EXACT_TRACE_ENDS=0` replays the free-end trim fit.
-fn exact_trace_ends_on() -> bool {
-    switch!(live "BREP_BLEND_EXACT_TRACE_ENDS", true)
 }
 
 /// The unit tangent of blend ∩ obstacle at `point`, a point on both carriers:
@@ -2906,12 +2899,6 @@ fn unresolved_void(reason: String) -> Result<Option<VoidRestriction>, KernelRefu
 /// The junction index a tagged walk vertex stands for.
 fn marker_index(tagged: u64) -> Option<usize> {
     (tagged > u64::MAX / 2).then(|| (u64::MAX - tagged) as usize)
-}
-
-/// Signed area of a loop's uv polygon (shoelace over the sampled pcurves).
-fn loop_signed_area(face: &FaceRecord, loop_index: usize) -> Result<f64, KernelRefusal> {
-    let polygon = loop_polygon(face, loop_index)?;
-    Ok(0.5 * crate::polygon::twice_signed_area_2d(polygon.len(), |i| polygon[i]))
 }
 
 /// Carry out a void restriction.

@@ -115,7 +115,6 @@ pub(crate) fn taper_runout_on() -> bool {
     switch!(live "BREP_BLEND_TAPER_RUNOUT", TAPER_RUNOUT_DEFAULT)
 }
 
-
 fn debug_on() -> bool {
     debug_flag!(live "BREP_DEBUG_NETWORK")
 }
@@ -504,7 +503,7 @@ pub(in crate::blend) fn taper_stations(
     // The section ball at edge parameter t and its hairline (the distance on
     // A from its contact to B).
     let mut guess = None::<Vec3>;
-    let mut ball_at_t = |t: f64, guess: &mut Option<Vec3>| -> Result<Option<(TaperBall, f64)>, KernelRefusal> {
+    let ball_at_t = |t: f64, guess: &mut Option<Vec3>| -> Result<Option<(TaperBall, f64)>, KernelRefusal> {
         let Some((_, widest)) = width_at(edge, &chain, a, other, t, ceiling)? else {
             return Ok(None);
         };

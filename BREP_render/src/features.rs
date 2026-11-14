@@ -139,6 +139,7 @@ pub fn feature_icon(kind: &str) -> Option<char> {
         "S3D" | "SKETCH3D" | "3D SKETCH" => 0xE0C6,
         "SP" | "SPLINE" => 0xE03A,
         "WP" | "WAYPOINT" => 0xE03B,
+        "WELD" => 0xE0D6,
         "HX" | "HELIX" => 0xE03C,
         "E" | "EXTRUDE" => 0xE03D,
         "B" | "BOOLEAN" => 0xE03E,

@@ -882,6 +882,7 @@ fn merge_curve_continuation_edges_impl(
             (after - before).abs() <= 1e-9f64.max(before.abs() * area_tolerance_ratio)
                 && (before.abs() <= 1e-12 || before.is_sign_positive() == after.is_sign_positive())
         };
+        #[cfg(not(test))]
         let forced = false;
         if forced || !preserves_area(
             before_face,

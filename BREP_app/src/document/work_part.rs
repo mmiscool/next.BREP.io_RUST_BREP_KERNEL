@@ -94,6 +94,10 @@ pub(super) struct WorkPart {
     problems: Vec<(String, String, String, String)>,
     /// How many pushes reached the assembly (automation readback).
     pushes: u64,
+    /// The next push is a step of its own, not a replacement of the last
+    /// coalesced one: that one's capture needed the undone document's session,
+    /// which a background runner had not handed over yet.
+    no_coalesce: bool,
     /// The last push refusal, shown in the bar.
     error: Option<String>,
     /// A PLM part not checked out to this user: the offer to check it out
@@ -348,6 +352,7 @@ impl Documents {
             context_seen: None,
             problems: Vec::new(),
             pushes: 0,
+            no_coalesce: false,
             error: None,
             checkout: CheckoutOffer::default(),
         };
@@ -472,6 +477,7 @@ impl Documents {
         let edited: Value =
             serde_json::from_str(&part.history_request_json()).map_err(|e| e.to_string())?;
         let session = self.work_part.as_mut().unwrap();
+        let previous_seen = session.seen;
         session.seen = Some(key);
         if session.pushed.last().is_some_and(|p| p.signature == signature) {
             return Ok(());
@@ -499,12 +505,27 @@ impl Documents {
         // that assembly step instead of stacking another.
         let replace = pushed_len >= 2
             && undo_top.is_some()
+            && !session.no_coalesce
             && session.pushed.last().is_some_and(|p| p.undo_top == undo_top);
         if !self.open[host].access().is_editable() {
             let session = self.work_part.as_mut().unwrap();
             session.error = Some("the assembly is read-only; part edits are not applied".into());
             return Err("the assembly is read-only".into());
         }
+        // The mates are captured off the host's main-side session. A
+        // background runner hands it over as a copy that lands a frame or so
+        // after it is asked for — never by replaying the whole assembly here —
+        // so until then nothing is pushed and the same state is tried again
+        // next frame (`seen` goes back). The host's library goes in first: an
+        // inline runner may replay, and replays against it.
+        super::install_library_of(&self.open[host]);
+        let ready = self.open[host].engine.assembly_session_ready();
+        self.install_active_library();
+        if !ready {
+            self.work_part.as_mut().unwrap().seen = previous_seen;
+            return if force { Err(brep_render::engine_state::ASSEMBLY_SESSION_PENDING.into()) } else { Ok(()) };
+        }
+        let session = self.work_part.as_mut().unwrap();
         // Replacing a coalesced step: its capture is reused, so the undo
         // runs nothing (the commit's run is the one the assembly needs); the
         // replay a capture would take with that run in flight goes too.
@@ -544,7 +565,6 @@ impl Documents {
                 // document's, so both are put back to the host's first.
                 super::install_library_of(&self.open[host]);
                 let engine = &mut self.open[host].engine;
-                engine.forget_assembly_session();
                 let capture = match reused {
                     Some((reused_parts, capture)) if reused_parts == parts => capture,
                     stale => {
@@ -553,7 +573,7 @@ impl Documents {
                         if stale.is_some() {
                             engine.rebuild_current_history();
                         }
-                        engine.capture_part_edit(&engine.components_of_parts(&parts))
+                        engine.capture_part_edit(&engine.components_of_parts(&parts))?
                     }
                 };
                 let kept = (parts.clone(), capture.clone());
@@ -568,6 +588,7 @@ impl Documents {
                 }
                 session.pushed.push(Pushed { signature, undo_top, capture: Some(capture) });
                 session.redo.clear();
+                session.no_coalesce = false;
                 session.pushes += 1;
                 session.error = None;
                 session.context_seen = None;
@@ -582,6 +603,15 @@ impl Documents {
                     self.install_active_library();
                 }
                 let session = self.work_part.as_mut().unwrap();
+                if error == brep_render::engine_state::ASSEMBLY_SESSION_PENDING {
+                    // Only a coalesced step whose capture had to come from the
+                    // undone document's run gets here (on a background runner
+                    // that run is not in yet): push it as a step of its own
+                    // next frame, captured off the session already here.
+                    session.seen = previous_seen;
+                    session.no_coalesce = true;
+                    return if force { Err(error) } else { Ok(()) };
+                }
                 session.error = Some(error.clone());
                 Err(error)
             }

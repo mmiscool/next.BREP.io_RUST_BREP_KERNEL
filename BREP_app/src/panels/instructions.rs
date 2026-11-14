@@ -1,8 +1,8 @@
 //! The Instructions pane — the Instructions workbench's
 //! ([`crate::workbench::instructions`]) step tree over the
 //! document's `instructions` block, and the selected step's editor: its
-//! title, parts, torque, tools, callouts, insertion arrows, notes and
-//! sign-off — and the print settings the PDF follows (File ▸ Export writes it).
+//! title, parts, torque, tools, callouts, insertion arrows, the fields the
+//! person doing the work records, notes and sign-off — and the print settings the PDF follows (File ▸ Export writes it).
 //! While a re-target waits (a new revision of the assembly came in through
 //! Update components), the pane lists what changed and the steps it touched,
 //! and Approve makes the new revision the target.
@@ -16,6 +16,7 @@
 
 use crate::automation::hit_keys::HitKeyDoc;
 use brep_instructions::edit;
+use brep_instructions::fields::{FieldKind as StepFieldKind, StepField};
 use brep_instructions::model::{Arrow, Callout, CalloutKind, Instructions, Orientation, Step, Style, Torque, TorqueSource, ToolUse};
 use brep_render::engine_state::PublishedMotion;
 use brep_render::engine_state::{EngineState, InstructionsRefField, RefSelectField, RefSelectTarget};
@@ -91,6 +92,10 @@ pub struct InstructionsPanel {
     picking: Option<RefSelectField>,
     /// The occurrence (or solid) a field's line is hovered on this frame.
     hover: Option<String>,
+    /// A step field's number being typed (nominal, min, max), by its hit
+    /// key: the text as typed while the box has focus (`9.` must not snap
+    /// back to `9`), dropped when focus leaves.
+    number_drafts: HashMap<String, String>,
 }
 
 /// What a BOM row, or a part of the "not yet planned" list, carries while
@@ -916,6 +921,8 @@ impl InstructionsPanel {
             }
         });
 
+        self.fields_editor(ui, step, change);
+
         // --- notes and sign-off -----------------------------------------------
         ui.label(egui::RichText::new("Notes").strong());
         let mut notes = step.notes.clone();
@@ -930,6 +937,282 @@ impl InstructionsPanel {
         if check.changed() {
             *change = Some(step_change(&id, "", move |step| step.signoff.required = required));
         }
+    }
+
+    /// The step's fields: what the person doing the work records there. One
+    /// block per field — its label, its kind (a dropdown), whether it is
+    /// required, up / down / remove, a line of help, and the kind's own
+    /// settings (a choice's options as an editable list) — then one button
+    /// per kind to add another. Every edit is one undo step; a typing run in
+    /// one box coalesces.
+    fn fields_editor(&mut self, ui: &mut egui::Ui, step: &Step, change: &mut Option<Change>) {
+        let id = step.id.clone();
+        ui.label(egui::RichText::new("Fields to record").strong()).on_hover_text(
+            "What the person doing the work fills in at this step: the players show them in shop mode, the PDF prints them as a form",
+        );
+        if step.fields.is_empty() {
+            ui.weak("None: add a checkbox, a choice, text, a measurement or a serial number.");
+        }
+        let count = step.fields.len();
+        let mut focused_drafts: Vec<String> = Vec::new();
+        for (index, field) in step.fields.iter().enumerate() {
+            let key = format!("instructions:stepfield:{index}");
+            // One edit of this field, addressed by its id (the index may
+            // have moved by the time the edit is applied).
+            let field_id = field.id.clone();
+            let edit_field = |run: &str, apply: Box<dyn FnOnce(&mut StepField)>| -> Change {
+                let field_id = field_id.clone();
+                step_change(&id, &if run.is_empty() { String::new() } else { format!("stepfield:{field_id}:{run}") }, move |step| {
+                    if let Some(field) = step.fields.iter_mut().find(|f| f.id == field_id) {
+                        apply(field);
+                    }
+                })
+            };
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                let mut label = field.label.clone();
+                let text = ui.add(egui::TextEdit::singleline(&mut label).hint_text("Label").desired_width(150.0));
+                self.hit(format!("{key}:label"), text.rect);
+                if text.changed() {
+                    *change = Some(edit_field("label", Box::new(move |f| f.label = label)));
+                }
+                let kinds: Vec<(&str, &str, &str)> = StepFieldKind::CHOICES.iter().map(|(k, label)| (*k, *k, *label)).collect();
+                let mut kind = field.kind.key();
+                let mut rects = HashMap::new();
+                keep_pair_together(ui, "", 120.0);
+                if crate::form::enum_dropdown(ui, &format!("{key}:kind"), &kinds, &mut kind, Some(120.0), Some(&mut rects)).0 {
+                    if let Some(new) = StepFieldKind::new(kind) {
+                        *change = Some(edit_field("", Box::new(move |f| f.kind = new)));
+                    }
+                }
+                for (k, rect) in rects {
+                    self.hit(k, rect);
+                }
+                let mut required = field.required;
+                let check = ui.checkbox(&mut required, "Required").on_hover_text("The step cannot be signed off or marked done until this is filled in");
+                self.hit(format!("{key}:required"), check.rect);
+                if check.changed() {
+                    *change = Some(edit_field("", Box::new(move |f| f.required = required)));
+                }
+                let up = ui.add_enabled(index > 0, egui::Button::new("▲").small()).on_hover_text("Move this field up");
+                self.hit(format!("{key}:up"), up.rect);
+                let down = ui.add_enabled(index + 1 < count, egui::Button::new("▼").small()).on_hover_text("Move this field down");
+                self.hit(format!("{key}:down"), down.rect);
+                for (button, to) in [(up, index.wrapping_sub(1)), (down, index + 1)] {
+                    if button.clicked() {
+                        let field_id = field.id.clone();
+                        *change = Some(step_change(&id, "", move |step| {
+                            if let Some(at) = step.fields.iter().position(|f| f.id == field_id) {
+                                let moved = step.fields.remove(at);
+                                step.fields.insert(to.min(step.fields.len()), moved);
+                            }
+                        }));
+                    }
+                }
+                let remove = ui.small_button("✕").on_hover_text("Remove this field from the step");
+                self.hit(format!("{key}:remove"), remove.rect);
+                if remove.clicked() {
+                    let field_id = field.id.clone();
+                    *change = Some(step_change(&id, "", move |step| step.fields.retain(|f| f.id != field_id)));
+                }
+            });
+            match &field.kind {
+                StepFieldKind::Check | StepFieldKind::Serial => {}
+                StepFieldKind::Choice { options, multiple, other } => {
+                    for (k, option) in options.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            let mut text = option.clone();
+                            let edit = ui.add(egui::TextEdit::singleline(&mut text).hint_text("Option").desired_width(170.0));
+                            self.hit(format!("{key}:option:{k}"), edit.rect);
+                            if edit.changed() {
+                                *change = Some(edit_field(&format!("option:{k}"), Box::new(move |f| {
+                                    if let StepFieldKind::Choice { options, .. } = &mut f.kind {
+                                        if let Some(option) = options.get_mut(k) {
+                                            *option = text;
+                                        }
+                                    }
+                                })));
+                            }
+                            let remove = ui.add_enabled(options.len() > 1, egui::Button::new("✕").small()).on_hover_text("Remove this option");
+                            self.hit(format!("{key}:option:{k}:remove"), remove.rect);
+                            if remove.clicked() {
+                                *change = Some(edit_field("", Box::new(move |f| {
+                                    if let StepFieldKind::Choice { options, .. } = &mut f.kind {
+                                        if k < options.len() && options.len() > 1 {
+                                            options.remove(k);
+                                        }
+                                    }
+                                })));
+                            }
+                        });
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_space(12.0);
+                        let full = options.len() >= brep_instructions::fields::MAX_OPTIONS;
+                        let add = ui.add_enabled(!full, egui::Button::new("+ Option").small());
+                        self.hit(format!("{key}:option:add"), add.rect);
+                        if add.clicked() {
+                            let name = format!("Option {}", options.len() + 1);
+                            *change = Some(edit_field("", Box::new(move |f| {
+                                if let StepFieldKind::Choice { options, .. } = &mut f.kind {
+                                    options.push(name);
+                                }
+                            })));
+                        }
+                        let mut several = *multiple;
+                        let check = ui.checkbox(&mut several, "Pick several").on_hover_text("Any number of the options may be picked (on paper: mark all that apply)");
+                        self.hit(format!("{key}:multiple"), check.rect);
+                        if check.changed() {
+                            *change = Some(edit_field("", Box::new(move |f| {
+                                if let StepFieldKind::Choice { multiple, .. } = &mut f.kind {
+                                    *multiple = several;
+                                }
+                            })));
+                        }
+                        let mut allow = *other;
+                        let check = ui.checkbox(&mut allow, "Allow Other").on_hover_text("A free-text Other value beside the options");
+                        self.hit(format!("{key}:other"), check.rect);
+                        if check.changed() {
+                            *change = Some(edit_field("", Box::new(move |f| {
+                                if let StepFieldKind::Choice { other, .. } = &mut f.kind {
+                                    *other = allow;
+                                }
+                            })));
+                        }
+                    });
+                }
+                StepFieldKind::Text { lines } => {
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label("Lines");
+                        let mut count = *lines;
+                        let drag = ui
+                            .add(egui::DragValue::new(&mut count).range(1..=brep_instructions::fields::MAX_TEXT_LINES))
+                            .on_hover_text("1 is a single line; more is a box that many lines tall, in the players and on paper");
+                        self.hit(format!("{key}:lines"), drag.rect);
+                        if drag.changed() {
+                            *change = Some(edit_field("lines", Box::new(move |f| {
+                                if let StepFieldKind::Text { lines } = &mut f.kind {
+                                    *lines = count;
+                                }
+                            })));
+                        }
+                    });
+                }
+                StepFieldKind::Number { unit, nominal, min, max, decimals, required_in_limits } => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_space(12.0);
+                        ui.label("Unit");
+                        let mut text = unit.clone();
+                        let edit = ui.add(egui::TextEdit::singleline(&mut text).hint_text("mm").desired_width(48.0));
+                        self.hit(format!("{key}:unit"), edit.rect);
+                        if edit.changed() {
+                            *change = Some(edit_field("unit", Box::new(move |f| {
+                                if let StepFieldKind::Number { unit, .. } = &mut f.kind {
+                                    *unit = text;
+                                }
+                            })));
+                        }
+                        for (what, label, current) in [("nominal", "Nominal", *nominal), ("min", "Min", *min), ("max", "Max", *max)] {
+                            keep_pair_together(ui, label, 64.0);
+                            ui.label(label);
+                            let draft_key = format!("{key}:{what}");
+                            let mut text = self.number_drafts.get(&draft_key).cloned().unwrap_or_else(|| current.map(|v| v.to_string()).unwrap_or_default());
+                            let edit = ui.add(egui::TextEdit::singleline(&mut text).hint_text("none").desired_width(64.0));
+                            self.hit(draft_key.clone(), edit.rect);
+                            if edit.has_focus() || edit.changed() {
+                                focused_drafts.push(draft_key.clone());
+                                self.number_drafts.insert(draft_key.clone(), text.clone());
+                            }
+                            if edit.changed() {
+                                // Blank clears it; text that is not yet a
+                                // number ("-", "1e") waits for the rest.
+                                let parsed = if text.trim().is_empty() { Some(None) } else { text.trim().parse::<f64>().ok().filter(|v| v.is_finite()).map(Some) };
+                                if let Some(value) = parsed {
+                                    *change = Some(edit_field(what, Box::new(move |f| {
+                                        if let StepFieldKind::Number { nominal, min, max, .. } = &mut f.kind {
+                                            match what {
+                                                "nominal" => *nominal = value,
+                                                "min" => *min = value,
+                                                _ => *max = value,
+                                            }
+                                        }
+                                    })));
+                                }
+                            }
+                        }
+                        keep_pair_together(ui, "Decimals", 64.0);
+                        ui.label("Decimals");
+                        const DECIMALS: [(Option<u8>, &str, &str); 8] = [
+                            (None, "auto", "auto"),
+                            (Some(0), "0", "0"),
+                            (Some(1), "1", "1"),
+                            (Some(2), "2", "2"),
+                            (Some(3), "3", "3"),
+                            (Some(4), "4", "4"),
+                            (Some(5), "5", "5"),
+                            (Some(6), "6", "6"),
+                        ];
+                        let mut picked = *decimals;
+                        let mut rects = HashMap::new();
+                        if crate::form::enum_dropdown(ui, &format!("{key}:decimals"), &DECIMALS, &mut picked, Some(64.0), Some(&mut rects)).0 {
+                            *change = Some(edit_field("", Box::new(move |f| {
+                                if let StepFieldKind::Number { decimals, .. } = &mut f.kind {
+                                    *decimals = picked;
+                                }
+                            })));
+                        }
+                        for (k, rect) in rects {
+                            self.hit(k, rect);
+                        }
+                        let mut strict = *required_in_limits;
+                        let check = ui
+                            .checkbox(&mut strict, "Must be in limits")
+                            .on_hover_text("A value outside the limits keeps the step from being completed; off: it is flagged and accepted");
+                        self.hit(format!("{key}:in_limits"), check.rect);
+                        if check.changed() {
+                            *change = Some(edit_field("", Box::new(move |f| {
+                                if let StepFieldKind::Number { required_in_limits, .. } = &mut f.kind {
+                                    *required_in_limits = strict;
+                                }
+                            })));
+                        }
+                    });
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                let mut hint = field.hint.clone();
+                let edit = ui.add(egui::TextEdit::singleline(&mut hint).hint_text("Help shown with the field (optional)").desired_width(f32::INFINITY));
+                self.hit(format!("{key}:hint"), edit.rect);
+                if edit.changed() {
+                    *change = Some(edit_field("hint", Box::new(move |f| f.hint = hint)));
+                }
+            });
+        }
+        self.number_drafts.retain(|k, _| focused_drafts.contains(k));
+        if count > 0 {
+            ui.separator();
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (kind, label) in StepFieldKind::CHOICES {
+                let button = ui.small_button(format!("+ {label}"));
+                self.hit(format!("instructions:stepfield:add:{kind}"), button.rect);
+                if button.clicked() {
+                    let name = match kind {
+                        "check" => "Checked",
+                        "choice" => "Choice",
+                        "text" => "Notes",
+                        "number" => "Measurement",
+                        _ => "Serial number",
+                    };
+                    if let Some(field) = StepField::new(String::new(), kind, name) {
+                        *change = Some(step_change(&id, "", move |step| step.fields.push(field)));
+                    }
+                }
+            }
+        });
     }
 
     fn apply(&mut self, change: Change, engine: &mut EngineState) {
@@ -1009,6 +1292,14 @@ impl InstructionsPanel {
             Change::Step { step, coalesce, apply } => engine.instructions_edit(coalesce.as_deref(), |block| {
                 let target = block.step_mut(&step).ok_or_else(|| format!("no step '{step}'"))?;
                 apply(target);
+                // A field just added takes the next field id.
+                while block.step(&step).is_some_and(|s| s.fields.iter().any(|f| f.id.is_empty())) {
+                    let fresh = block.next_id("MF");
+                    if let Some(field) = block.step_mut(&step).and_then(|s| s.fields.iter_mut().find(|f| f.id.is_empty())) {
+                        field.id = fresh;
+                    }
+                }
+                let target = block.step_mut(&step).ok_or_else(|| format!("no step '{step}'"))?;
                 // A callout just added takes the next callout id.
                 if target.callouts.iter().any(|c| c.id.is_empty()) {
                     let fresh = block.next_id("MK");
@@ -1102,6 +1393,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "instructions", prefix: "instructions:tool:", meaning: "the selected step's tools (remove by index) and the Tool, Spec and Add tool fields", command: Some("instructions_update_step") },
     HitKeyDoc { panel: "instructions", prefix: "instructions:callout:", meaning: "the selected step's callouts (text and remove by index, and the part it points at: `<index>:occurrence` with `#activate` to pick a solid in the viewport, `#line0` the stored part and `#x0` to clear it) and the + Caution, + Note and + Check buttons", command: Some("instructions_update_step") },
     HitKeyDoc { panel: "instructions", prefix: "instructions:arrow:", meaning: "the selected step's insertion arrows (side, distance and remove by index — `<index>:side` is a dropdown whose entries are `<index>:side#<side index>` while open — and the part it moves: `<index>:occurrence` with `#activate` to pick one of the step's own solids in the viewport, `#line0` the part and `#x0` to remove the arrow) and + Arrow", command: Some("instructions_update_step") },
+    HitKeyDoc { panel: "instructions", prefix: "instructions:stepfield:", meaning: "the selected step's fields to record, by index: `<index>:label`, `<index>:kind` (a dropdown: `#check`, `#choice`, `#text`, `#number`, `#serial` while open), `<index>:required`, `<index>:up`, `<index>:down`, `<index>:remove`, `<index>:hint`; a choice's `<index>:option:<n>` (text), `:option:<n>:remove`, `:option:add`, `:multiple`, `:other`; a text's `:lines`; a measurement's `:unit`, `:nominal`, `:min`, `:max`, `:decimals` (a dropdown: `#auto`, `#0` … `#6`), `:in_limits`; and the add buttons `add:check`, `add:choice`, `add:text`, `add:number`, `add:serial`", command: Some("instructions_add_field") },
     HitKeyDoc { panel: "instructions", prefix: "instructions:motion:", meaning: "the selected step's Motion row: the study menu (:study; a published study of the assembly plays in place of the insertion arrows) and remove (:remove)", command: Some("instructions_attach_motion") },
     HitKeyDoc { panel: "instructions", prefix: "instructions:menuitem:motion:", meaning: "the Motion menu's entries, by published study index (a stale one is greyed)", command: Some("instructions_attach_motion") },
 ];

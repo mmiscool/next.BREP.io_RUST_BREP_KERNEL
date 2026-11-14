@@ -1,10 +1,14 @@
 //! brep-docs — the static HTML help-site generator for user-facing documentation
-//! in the repo's `docs/` tree.
+//! in a BREP source tree's `docs/` directory.
 //!
-//! Successor to the retired docs build (`generateLicenses`), with
-//! the deliberate simplification the port was asked for: the output MIRRORS the
-//! docs directory structure (no `__` path flattening), so every relative link
-//! and image reference works as-authored and the only rewrite is `.md` → `.html`.
+//! ```text
+//! brep-docs [SOURCE_TREE]
+//! ```
+//!
+//! With no argument it reads the parent of the directory this crate was
+//! compiled from (the BREP source tree, when run with `cargo run`). The output
+//! MIRRORS the docs directory structure, so every relative link and image
+//! reference works as authored and the only rewrite is `.md` → `.html`.
 //!
 //! What it produces (into `BREP_app/web/help/`, gitignored, wiped each run):
 //!   * one HTML page per user-facing markdown file, with embedded CSS, a sidebar doc tree,
@@ -15,6 +19,9 @@
 //!   * a `licences/` section that no `docs/` file authors: the project licence
 //!     (`LICENSE.md`), the maintained third-party notices, and a crate inventory
 //!     generated from `cargo metadata` — see [`licences`].
+//!
+//! The `developer` section of `docs/` remains source-only and is deliberately
+//! excluded from the generated help site.
 //!
 //! # Icons
 //!

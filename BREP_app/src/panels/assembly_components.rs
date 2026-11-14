@@ -84,15 +84,6 @@ pub(crate) fn is_acomp_segment(segment: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The `collapsed`-set key for a nested component node: its chained path under
-/// the owning component (`ACOMP1:ACOMP5`). Top-level rows key on the bare
-/// `row.id` (never contains `:`); nested nodes append `:label`. The ONE place
-/// this key is formed, so the render path and the collapse-all enumerator
-/// ([`collapsible_keys`]) can never drift.
-fn chain_key(parent_key: &str, label: &str) -> String {
-    format!("{parent_key}:{label}")
-}
-
 /// Parse the read-only child grouping of one component's members: each member
 /// name arrives with the OWNING prefix already stripped; a leading
 /// `ACOMP<digits>:` chain groups into nested nodes, the remainder is a leaf.

@@ -1459,6 +1459,18 @@ pub fn sweep_solid_within(
     motion: &SolidMotion,
     clip: &SweepClip,
 ) -> Result<Vec<BrepSolid>, KernelRefusal> {
+    // A convex polygon's prism carried round a closed planar motion (turns
+    // about axes along its own, ending where it starts: a planet on its
+    // carrier): the plane region its section covers, found exactly and
+    // extruded. It is the whole sweep, so it holds whatever lies in the clip.
+    if let SweptTool::Prism { origin, normal, x_axis, outline, from, to } = tool {
+        if motion.steps.len() >= 2 {
+            let steps: Vec<(Vec3, Vec3, f64, f64)> = motion.steps.iter().map(|step| (step.axis_origin, step.axis_direction, step.turn, step.advance)).collect();
+            if let Some(body) = crate::solid_sweep_caps::closed_planar_prism(*origin, *normal, *x_axis, outline, *from, *to, &steps, motion.from, motion.to)? {
+                return Ok(vec![body]);
+            }
+        }
+    }
     let narrowed: SweepClip;
     // --- Frame and classification.
     let ez = clip

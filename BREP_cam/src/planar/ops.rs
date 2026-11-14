@@ -23,7 +23,7 @@
 //! (area bounds; witness points an offset cannot reach) and report an
 //! [`PlanarError::Inconsistent`] instead of returning a wrong region.
 
-use super::arrange::{arrange, Dsu, Input, Piece};
+use super::arrange::{arrange, Dsu, Input};
 use super::{crossings, dir, Loop, PlanarError, Region, Segment, Vec2};
 use crate::model::Point2;
 use crate::numeric::Tolerance;
@@ -416,24 +416,12 @@ fn strict_tolerance(d: f64) -> f64 {
     1e-9 * d.max(1.0)
 }
 
-fn nearest_on(segments: &[Segment], p: Point2) -> Option<(Point2, f64)> {
-    let mut best: Option<(Point2, f64)> = None;
-    for s in segments {
-        let (q, _) = s.nearest(p);
-        let d = q.distance(p);
-        if best.map_or(true, |(_, bd)| d < bd) {
-            best = Some((q, d));
-        }
-    }
-    best
-}
-
 /// The distance from a point to the nearest of a fixed set of segments,
 /// through a uniform grid of the segments' boxes: cells are visited in
 /// rings around the point's cell until the ring's nearest edge is farther
 /// than the best distance found. The distance is the exact minimum over
 /// the segments (a minimum does not depend on the order it is taken in),
-/// so a grid query equals the linear scan of [`nearest_on`] to the bit.
+/// so a grid query equals a linear nearest-point scan to the bit.
 pub(crate) struct NearestGrid<'a> {
     segments: &'a [Segment],
     lo: Point2,
@@ -558,7 +546,7 @@ fn stitch(pieces: Vec<Kept>, vertices: &[Point2], tol: &Tolerance) -> Result<Vec
             dsu.union(p.v0, p.v1);
         }
     }
-    let mut pieces: Vec<Kept> = pieces
+    let pieces: Vec<Kept> = pieces
         .into_iter()
         .filter(|p| p.seg.length() > stub)
         .map(|mut p| {

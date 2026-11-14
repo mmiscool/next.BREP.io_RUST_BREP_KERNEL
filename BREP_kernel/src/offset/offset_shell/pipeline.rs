@@ -24,10 +24,6 @@ fn one_call_imprint_enabled() -> bool {
 thread_local! {
     static ONE_CALL_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
-/// Shell or offset operations whose imprint the one call produced on this thread since the last call.
-pub(super) fn take_one_call_runs() -> u64 {
-    ONE_CALL_RUNS.with(|count| count.replace(0))
-}
 
 
 fn coheres_face_normals(solid: &mut BrepSolid) -> Result<(), KernelRefusal> {
@@ -168,6 +164,11 @@ pub fn offset_shell(
     opening_face_ids: &[u64],
     distance: f64,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    if let Some(scaled) = crate::rescale::ScaledOffset::of(source, distance, "offset_shell")? {
+        let mut record = offset_shell(&scaled.source, opening_face_ids, scaled.distance).map_err(|error| scaled.refusal(error))?;
+        record.solid = scaled.back(&record.solid, "offset_shell")?;
+        return Ok(record);
+    }
     let direct = match forced_direct_refusal() {
         Some(forced) => Err(forced),
         None => offset_body(source, opening_face_ids, distance, Body::Shell, "offset_shell"),
@@ -507,6 +508,9 @@ fn offset_shell_any_lane(
     // in the meridian half-plane, fold band and all: build it there and revolve
     // it once (`revolved_wedge.rs`). Anything else declines and takes the
     // imprint pipeline, unchanged.
+    if let Some(result) = revolved_wedge::retained_cap_shell(source, opening_face_ids, distance) {
+        return Ok(result);
+    }
     match revolved_wedge::recognize(source, opening_face_ids, distance) {
         Ok(revolved_wedge::Recognition::Wedge(wedge)) => {
             os_debug!("revolved wedge lane: {}", wedge.report());
@@ -3843,6 +3847,14 @@ pub fn offset_shell_with_diagnostics(
     distance: f64,
     tolerances: Option<KernelTolerances>,
 ) -> Result<KernelOutcome<OffsetShellResultRecord>, KernelRefusal> {
+    if let Some(scaled) = crate::rescale::ScaledOffset::of(source, distance, "offset_shell")? {
+        let mut outcome = offset_shell_with_diagnostics(&scaled.source, opening_face_ids, scaled.distance, tolerances)
+            .map_err(|error| scaled.refusal(error))?;
+        outcome.value.solid = scaled.back(&outcome.value.solid, "offset_shell")?;
+        outcome.diagnostics.count_n("working_scale.fired", 1);
+        outcome.diagnostics.measure_max("working_scale.factor", scaled.factor);
+        return Ok(outcome);
+    }
     let policy = tolerances.unwrap_or_else(|| KernelTolerances::for_solid(source, 1e-7));
     policy.check().or_refuse(KernelStage::Sew, "check")?;
     let mut diagnostics = KernelDiagnostics::default();

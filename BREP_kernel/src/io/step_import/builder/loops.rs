@@ -279,7 +279,7 @@ impl<'a> SolidBuilder<'a> {
             let supplied =
                 self.supplied_loop_pcurve(surface, surface_ref, *edge_id, *forward, pcurve_tol)?;
             let edge = self.edge_record(*edge_id).clone();
-            let precision = if supplied.is_none() && switch!("BREP_STEP_MASS_TRIM_TRACKING", false) {
+            let precision = if supplied.is_none() && switch!("BREP_STEP_MASS_TRIM_TRACKING", true) {
                 improved_projected_analytic_trim(surface, &edge, *forward, pcurve_tol)
             } else {
                 None
@@ -302,22 +302,13 @@ impl<'a> SolidBuilder<'a> {
                     // (`abc_00000012` face #299 edge 179, `abc_00000011` #585:
                     // 2.06e-4 at the ask, 0.250 mm at the floor, measured
                     // 2026-09-26).
-                    let mut fit = crate::fit_pcurve_on_surface_range(
-                        surface,
-                        &edge.curve,
-                        edge.t0,
-                        edge.t1,
-                        *forward,
-                        pcurve_tol,
-                    )?;
+                    let mut fit = super::prefit::fit_range(surface, &edge, *forward, pcurve_tol)?;
                     let mut refitted = false;
                     let deviation_trigger = fit.report.residual > trim_detector_bar(&fit.report);
                     if deviation_trigger && pcurve_tol > crate::PCURVE_REFINEMENT_TOLERANCE {
-                        let floor = crate::fit_pcurve_on_surface_range(
+                        let floor = super::prefit::fit_range(
                             surface,
-                            &edge.curve,
-                            edge.t0,
-                            edge.t1,
+                            &edge,
                             *forward,
                             crate::PCURVE_REFINEMENT_TOLERANCE,
                         )?;
@@ -380,10 +371,7 @@ impl<'a> SolidBuilder<'a> {
                                 edge_id: *edge_id,
                                 residual,
                                 standoff,
-                                fit_residual: report.residual,
-                                fit_standoff: report.off_surface,
                                 image_to_foot,
-                                image_to_global_foot,
                                 samples: report.samples,
                                 exit: format!("{:?}", report.exit),
                                 fitter,

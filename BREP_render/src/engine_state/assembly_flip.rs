@@ -40,7 +40,9 @@ impl EngineState {
     /// front: a mechanical mate, or a path/slot measured from the other end).
     /// `Err` names why the constraint has no other solution.
     pub fn assembly_flip_constraint(&mut self, id: &str) -> Result<String, String> {
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return Err(super::ASSEMBLY_SESSION_PENDING.into());
+        }
         let plan: Value = serde_json::from_str(&brep_kernel::assembly_flip_plan_json(id))
             .map_err(|error| format!("flip: {error}"))?;
         if plan["ok"] != true {

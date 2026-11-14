@@ -1210,7 +1210,6 @@ pub(super) fn split(
                             // occt_stepped_shaft_s10_d0.1_jitter-0.3 and the
                             // builder demoted every cylinder/cone edge).
                             crate::AnalyticSurface::Cone(cone) => cone.half_angle >= CONE_STAGE_MIN_HALF_ANGLE_DEG.to_radians() && (!gathered.contains(&region.id) || kinds.len() == 3),
-                            _ => false,
                         })
                         .map(|r| (r.surface, (0..ids.len()).map(|i| holds(&r.surface, ids[i], positions, indices, bar, gathered_gate)).collect()))
                         .collect();
@@ -1387,7 +1386,7 @@ pub(super) fn split(
                         let support = count(held);
                         let own = (0..ids.len()).filter(|&i| held[i] && !taken[i]).count();
                         if debug {
-                            eprintln!("[split] noise-bar carrier holds {support} at {noise_bars} bars, {own} its own ({})", match surface { crate::AnalyticSurface::Cylinder(_) => "cylinder", crate::AnalyticSurface::Cone(_) => "cone", crate::AnalyticSurface::Torus(_) => "torus", crate::AnalyticSurface::Sphere(_) => "sphere", crate::AnalyticSurface::Plane(_) => "plane", _ => "other" });
+                            eprintln!("[split] noise-bar carrier holds {support} at {noise_bars} bars, {own} its own ({})", match surface { crate::AnalyticSurface::Cylinder(_) => "cylinder", crate::AnalyticSurface::Cone(_) => "cone", crate::AnalyticSurface::Torus(_) => "torus", crate::AnalyticSurface::Sphere(_) => "sphere", crate::AnalyticSurface::Plane(_) => "plane" });
                         }
                         // A gathered region's carriers are the small faces
                         // of a small body (caps of 30-60 triangles), under
@@ -3299,7 +3298,6 @@ pub(super) fn split(
                         sense: if outward >= 0.0 { 1 } else { -1 },
                     },
                     crate::AnalyticSurface::Plane(plane) => RegionCarrier::Plane { origin: kv(plane.origin), normal: kv(plane.normal) },
-                    _ => unreachable!("only cylinders, cones, tori, spheres and planes are proposed"),
                 },
                 max_deviation,
                 rms_deviation: (sum_sq / samples.max(1) as f64).sqrt(),

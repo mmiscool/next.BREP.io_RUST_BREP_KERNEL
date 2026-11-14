@@ -475,7 +475,7 @@ pub(super) fn canonicalize_imprint_junctions(
     if std::env::var("BREP_DEBUG_CANONICAL_JUNCTIONS").is_ok() {
         eprintln!("JUNCTION-REFERENCE point={reference:?} vertices={}", result.vertices.len());
     }
-    let mut canonical_vertices = result
+    let canonical_vertices = result
         .vertices
         .iter()
         .filter(|vertex| {

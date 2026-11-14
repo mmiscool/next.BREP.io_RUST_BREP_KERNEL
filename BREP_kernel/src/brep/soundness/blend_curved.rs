@@ -156,8 +156,8 @@ fn revolved_arc_reach(s: &NurbsSurface) -> Option<f64> {
 
 /// A recognised full-turn revolution of one circular arc
 /// ([`revolved_arc_reach`]): its axis, its reach, and the meridian range of
-/// its generatrix's control hull — `ρ ∈ rho`, `z ∈ z` (z along `axis` from
-/// `origin`) — which holds the arc (positive weights), so every point of the
+/// its generatrix's control hull — `ρ ∈ rho` — which holds the arc
+/// (positive weights), so every point of the
 /// carrier and of any trimmed piece of it.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct RevolvedArc {
@@ -165,7 +165,6 @@ pub(super) struct RevolvedArc {
     axis: Vec3,
     reach: f64,
     rho: [f64; 2],
-    z: [f64; 2],
 }
 
 fn revolved_arc(s: &NurbsSurface) -> Option<RevolvedArc> {
@@ -235,10 +234,9 @@ fn revolved_arc(s: &NurbsSurface) -> Option<RevolvedArc> {
     }
     let reach = radius.min(radial(centre).length() - radius);
     // The hull's meridian range: ρ is linear on the half-plane (every point
-    // on the side of `p0`), z along the axis.
+    // on the side of `p0`).
     let x_axis = radial(p0).normalized().ok()?;
     let mut rho = [f64::INFINITY, f64::NEG_INFINITY];
-    let mut z = [f64::INFINITY, f64::NEG_INFINITY];
     for q in [p0, p1, p2] {
         let d = q.sub(origin);
         let x = d.dot(x_axis);
@@ -246,9 +244,8 @@ fn revolved_arc(s: &NurbsSurface) -> Option<RevolvedArc> {
             return None;
         }
         rho = [rho[0].min(x), rho[1].max(x)];
-        z = [z[0].min(d.dot(axis)), z[1].max(d.dot(axis))];
     }
-    (reach.is_finite() && reach > 0.).then_some(RevolvedArc { origin, axis, reach, rho, z })
+    (reach.is_finite() && reach > 0.).then_some(RevolvedArc { origin, axis, reach, rho })
 }
 
 /// Is the face's patch within `tau` on one side of `implicit`? For a face

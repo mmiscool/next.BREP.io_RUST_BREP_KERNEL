@@ -305,6 +305,14 @@ pub fn extrude_profile_brep_draft(
         }
     }
 
+    // --- 5b. The far section must still be the profile's own offset. Past the
+    //     taper that closes a part of the section (a rectangle's short side
+    //     shrunk to nothing, an L's arm pinched shut) the junction stations
+    //     above are still computed, but they describe a loop that has turned
+    //     a segment end over end or crossed itself, and the solid assembled
+    //     from them passes through itself while its incidences stay sound.
+    far_section_survives(&bottom_curves, &top_curves, x_axis, y_axis, tolerance)?;
+
     // --- 6. Assemble the BREP: shared vertices/edges, wall faces with exact
     //     pcurves (plane projection on plane walls, parameter lines for cone
     //     row edges, on-surface fits for cone side edges), and the two planar
@@ -430,7 +438,7 @@ pub fn extrude_profile_brep_draft(
     }
 
     // Caps: planar bbox patches over each section's own footprint.
-    let mut cap = |curves: &[NurbsCurve],
+    let cap = |curves: &[NurbsCurve],
                    edge_base: u64,
                    forward: bool,
                    next_id: &mut u64|
@@ -529,4 +537,68 @@ pub fn extrude_profile_brep_draft(
             format!("Rust draft-extrude builder produced invalid topology: {issues:?}"),
         ))
     }
+}
+
+/// Whether the far section of a drafted extrude is still the profile's offset:
+/// every segment runs the way its source does and has not shrunk to nothing,
+/// and no two segments that are not neighbours cross. Offsets grow linearly
+/// with height, so a section sound at both ends is sound at every height
+/// between. Refuses by name (`draft_section_closes`) otherwise.
+fn far_section_survives(
+    bottom: &[NurbsCurve],
+    top: &[NurbsCurve],
+    x_axis: Vec3,
+    y_axis: Vec3,
+    tolerance: f64,
+) -> Result<(), KernelRefusal> {
+    const STEPS: usize = 16;
+    let closes = |what: String| {
+        KernelRefusal::input(
+            KernelStage::Classify,
+            "draft_section_closes",
+            format!(
+                "draftExtrude: the taper closes the section before the far end ({what}); \
+                 the drafted walls would pass through each other — refusing"
+            ),
+        )
+    };
+    let sampled = |curve: &NurbsCurve| -> Result<Vec<Vec3>, KernelRefusal> {
+        let [start, end] = curve.domain().or_refuse(KernelStage::Classify, "domain")?;
+        (0..=STEPS)
+            .map(|k| curve.evaluate(start + (end - start) * k as f64 / STEPS as f64).or_refuse(KernelStage::Classify, "evaluate"))
+            .collect()
+    };
+    let mut loops: Vec<Vec<[f64; 2]>> = Vec::with_capacity(top.len());
+    for (index, (low, high)) in bottom.iter().zip(top).enumerate() {
+        let (low, high) = (sampled(low)?, sampled(high)?);
+        let (mut along, mut length) = (0.0, 0.0);
+        for k in 0..STEPS {
+            let step = high[k + 1].sub(high[k]);
+            along += step.dot(low[k + 1].sub(low[k]));
+            length += step.length();
+        }
+        if length <= tolerance || along <= 0.0 {
+            return Err(closes(format!("segment {index} of the far section has shrunk to nothing or turned round")));
+        }
+        loops.push(high.iter().map(|q| [q.dot(x_axis), q.dot(y_axis)]).collect());
+    }
+    let side = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    let count = loops.len();
+    for i in 0..count {
+        for j in i + 2..count {
+            if i == 0 && j == count - 1 {
+                continue;
+            }
+            for a in loops[i].windows(2) {
+                for b in loops[j].windows(2) {
+                    let (d1, d2) = (side(b[0], b[1], a[0]), side(b[0], b[1], a[1]));
+                    let (d3, d4) = (side(a[0], a[1], b[0]), side(a[0], a[1], b[1]));
+                    if d1 * d2 < 0.0 && d3 * d4 < 0.0 {
+                        return Err(closes(format!("segments {i} and {j} of the far section cross")));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }

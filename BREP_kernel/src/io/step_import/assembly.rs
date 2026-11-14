@@ -111,6 +111,19 @@ pub struct StepOccurrence {
     /// CARTESIAN_TRANSFORMATION_OPERATOR_3D is the placement that makes this
     /// `false` today (`mapped.rs`).
     pub rigid: bool,
+    /// This instance's own colour, where the file styles the occurrence apart
+    /// from its part (a STEP `CONTEXT_DEPENDENT_OVER_RIDING_STYLED_ITEM` in the
+    /// occurrence's context or a style on its MAPPED_ITEM, an IGES 408's
+    /// colour). It colours every body the instance places, over the part's own
+    /// body colour; `None` leaves the part's colours as they are.
+    #[serde(default)]
+    pub color: Option<crate::ImportedColor>,
+    /// The colour this instance gives each of its child's OWN bodies, parallel
+    /// to that product's `bodies`, where the file styles them in this
+    /// occurrence's context (`None` for a body it leaves as the part has it).
+    /// Empty when it styles none of them.
+    #[serde(default)]
+    pub body_colors: Vec<Option<crate::ImportedColor>>,
 }
 
 /// A STEP file's product structure, with geometry, and without a single
@@ -312,6 +325,10 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     // so a plain assembly pays nothing for it.
     let wants_pmi = super::pmi::file_mentions_pmi(text);
     let mut face_refs: super::assembly_pmi::ProductFaceRefs = Vec::with_capacity(pd_refs.len());
+    // Each product's built bodies as the entities a style can name them by,
+    // parallel to its `bodies`: what an occurrence's own colours are read
+    // against.
+    let mut body_items: Vec<Vec<Vec<usize>>> = Vec::with_capacity(pd_refs.len());
     for (&pd, &scale) in pd_refs.iter().zip(&product_scales) {
         let resolver = Resolver::new(&entities, scale);
         let scale_key = scale.to_bits();
@@ -319,6 +336,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
         let mut appearances = Vec::new();
         let mut product_face_refs = Vec::new();
         let mut failed_bodies = 0usize;
+        let mut items = Vec::new();
         for body in pd_step_bodies(&structure, &resolver, pd) {
             let built = solid_cache
                 .entry((body, scale_key))
@@ -332,6 +350,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
                     }
                     bodies.push(solid.clone());
                     appearances.push(appearance.clone());
+                    items.push(super::bodies::body_style_items(&resolver, body));
                 }
                 // An OPEN SHELL_BASED_SURFACE_MODEL sheet is not a solid body:
                 // skipped, never a failed body, exactly as both other lanes do;
@@ -346,6 +365,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
             }
         }
         face_refs.push(product_face_refs);
+        body_items.push(items);
         products.push(StepProduct {
             pd_ref: pd,
             name: product_name(&resolver, pd),
@@ -395,6 +415,18 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
                 designator: edge_designator(&label_resolver, edge),
                 placement,
                 rigid: transform_is_rigid(&placement),
+                color: {
+                    let leaf = !edges.iter().any(|other| other.parent_pd == edge.child_pd);
+                    let bodies = &body_items[product_index[&edge.child_pd]];
+                    styles.occurrence_color(edge.edge_id, leaf.then_some(bodies.as_slice()))
+                },
+                body_colors: {
+                    let colors: Vec<Option<crate::ImportedColor>> = body_items[product_index[&edge.child_pd]]
+                        .iter()
+                        .map(|items| styles.occurrence_item_color(edge.edge_id, items))
+                        .collect();
+                    if colors.iter().any(Option::is_some) { colors } else { Vec::new() }
+                },
             }
         })
         .collect();

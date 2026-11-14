@@ -1,7 +1,7 @@
-//! Tangent (`TANG`) — a sphere-or-cylinder face against a planar face,
-//! side-preserving: the plane's local normal is flipped when the round side
-//! currently sits on the negative side, so tangency preserves the assembled
-//! side (the signed-distance convention).
+//! Tangent (`TANG`) — a sphere-or-cylinder face against a planar face
+//!, side-preserving: the plane's local normal is flipped when the
+//! round side currently sits on the negative side, so tangency preserves the
+//! assembled side (the signed-distance convention).
 
 use super::super::mapping::{
     mate, require_axis, require_direction, require_plane, ConstraintFailure, MappedConstraint,

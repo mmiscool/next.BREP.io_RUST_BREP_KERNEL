@@ -192,7 +192,9 @@ pub(super) fn instanced_subfigure<'f>(file: &'f IgesFile, instance_pointer: i64)
     }
 }
 
-/// One solid occurrence of the flattened structure: a 186 and where it goes.
+/// One solid occurrence of the flattened structure: a 186 and where it goes,
+/// or (from [`placed_face_sets`]) a 308 whose trimmed surfaces an instance
+/// places.
 pub(super) struct Placed {
     pub solid: i64,
     pub placement: Matrix,
@@ -219,7 +221,38 @@ pub(super) fn placed_solids(file: &IgesFile, scale: f64) -> Result<Vec<Placed>, 
     }
     for (pointer, _) in file.pointers_of_type(408) {
         if !members.contains(&pointer) {
-            expand(file, scale, pointer, &IDENTITY, None, None, 0, &mut placed)?;
+            expand(file, scale, pointer, &IDENTITY, None, None, 0, false, &mut placed)?;
+        }
+    }
+    Ok(placed)
+}
+
+/// Every subfigure instance whose 308 lists trimmed surfaces (144, 143), with
+/// its placement, in file order, nested instances composed: the counterpart
+/// of [`placed_solids`] for a file of surface sets, where `Placed::solid` is
+/// the 308 whose surfaces the instance places. Its name and colour are the
+/// 308's own, else the instance's, as a 186's are.
+pub(super) fn placed_face_sets(file: &IgesFile, scale: f64) -> Result<Vec<Placed>, String> {
+    let members = subfigure_member_set(file)?;
+    let mut placed = Vec::new();
+    for (pointer, _) in file.pointers_of_type(408) {
+        if !members.contains(&pointer) {
+            expand(file, scale, pointer, &IDENTITY, None, None, 0, true, &mut placed)?;
+        }
+    }
+    // Surfaces in a subfigure nothing places (an unused definition, or one
+    // placed only from inside its own cycle) would be left out unseen.
+    let reached: rustc_hash::FxHashSet<i64> = placed.iter().map(|each| each.solid).collect();
+    for (pointer, subfigure) in file.pointers_of_type(308) {
+        if reached.contains(&pointer) {
+            continue;
+        }
+        for member in subfigure_members(subfigure)? {
+            if matches!(file.entity(member)?.de.entity_type, 144 | 143) {
+                return Err(format!(
+                    "iges_import: subfigure DE {pointer} holds trimmed surfaces that no instance (408) of the file places, which this import cannot place; importing without them would leave them out"
+                ));
+            }
         }
     }
     Ok(placed)
@@ -234,6 +267,7 @@ fn expand(
     inherited_name: Option<&str>,
     inherited_color: Option<ImportedColor>,
     depth: usize,
+    face_sets: bool,
     placed: &mut Vec<Placed>,
 ) -> Result<(), String> {
     if depth > MAX_DEPTH {
@@ -244,6 +278,7 @@ fn expand(
     let placement = compose(parent, &instance_matrix(file, instance, scale)?);
     let name = entity_name(file, instance).or_else(|| inherited_name.map(str::to_string));
     let color = entity_color(file, instance).or(inherited_color);
+    let mut sets_placed = false;
     for member in subfigure_members(subfigure)? {
         let entity = file.entity(member)?;
         match entity.de.entity_type {
@@ -254,7 +289,20 @@ fn expand(
                 color: entity_color(file, entity).or(color),
                 level: entity.de.level,
             }),
-            408 => expand(file, scale, member, &placement, name.as_deref(), color, depth + 1, placed)?,
+            408 => expand(file, scale, member, &placement, name.as_deref(), color, depth + 1, face_sets, placed)?,
+            // The 308's surfaces are sewn together, once per instance.
+            144 | 143 if face_sets => {
+                if !sets_placed {
+                    sets_placed = true;
+                    placed.push(Placed {
+                        solid: subfigure_pointer,
+                        placement,
+                        name: entity_name(file, subfigure).or_else(|| name.clone()),
+                        color: entity_color(file, subfigure).or(color),
+                        level: instance.de.level,
+                    });
+                }
+            }
             514 | 144 | 143 | 128 => {
                 return Err(format!(
                     "iges_import: subfigure DE {subfigure_pointer} holds entity {} outside a solid, which this import cannot build yet; importing its solids alone would leave it out",

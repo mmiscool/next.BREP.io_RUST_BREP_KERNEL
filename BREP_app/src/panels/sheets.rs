@@ -952,7 +952,7 @@ fn draw_revision_rows(
     // the date and the ✕ on the first, the description the whole width of the
     // second.
     for (index, row) in rows.iter_mut().enumerate() {
-        let mut edit = |ui: &mut egui::Ui, field: &'static str, value: &mut String, width: f32, hint: &str| {
+        let edit = |ui: &mut egui::Ui, field: &'static str, value: &mut String, width: f32, hint: &str| {
             let response = ui.add(
                 egui::TextEdit::singleline(value)
                     .id(egui::Id::new(("sheet-revision", sheet_id, index, field)))

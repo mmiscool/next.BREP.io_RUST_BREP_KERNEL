@@ -291,7 +291,7 @@ pub fn replace_nested(
             // assembly, in the top occurrence's frame), kept in the marker:
             // the top window chooses and ticks suggestions from it later.
             let namespaced: Vec<String> = refs.iter().map(|r| format!("{prefix}:{r}")).collect();
-            let pre = engine.resolve_refs(&namespaced);
+            let pre = engine.resolve_refs(&namespaced)?;
             constraint["persistentData"][brep_render::engine_state::replace_component::REPLACE_MARKER] = serde_json::json!({
                 "from": old_part,
                 "to": to,
@@ -310,7 +310,7 @@ pub fn replace_nested(
     // ONE document edit through the Work part's refresh (every copy of the
     // sub-assembly definition follows, ancestors rebuild).
     let paths: Vec<String> = targets.iter().map(|id| format!("{prefix}:{id}")).collect();
-    let capture = engine.capture_replace(&paths);
+    let capture = engine.capture_replace(&paths)?;
     let mut assembly: Value = serde_json::from_str(&engine.history_request_json()).map_err(|e| e.to_string())?;
     let mut notes = Vec::new();
     if !crate::document::work_part::refresh_parts(&mut assembly, &names, owner_source.as_deref(), &definition, &mut notes)? {
@@ -392,7 +392,10 @@ pub fn held_mates(engine: &mut EngineState) -> Vec<serde_json::Value> {
                 let owner = format!("{prefix}:{}", local.split(':').next().unwrap_or(local));
                 let pre = &row["pre"];
                 let suggestion = if pre["ok"] == true {
-                    let candidates = engine.occurrence_entities(&owner);
+                    // Read off the main-side session; while its copy is on the
+                    // way this frame offers no suggestion, and the window,
+                    // which lists these every frame, shows it once it lands.
+                    let candidates = engine.occurrence_entities(&owner).unwrap_or_default();
                     match brep_render::engine_state::replace_component::classify_ref(
                         &owner,
                         &reference,

@@ -31,7 +31,7 @@
 
 use crate::feature_pipeline::features::common;
 use crate::feature_pipeline::sheet_metal::evaluate::{FlatPlacement, WedgeStrip};
-use crate::feature_pipeline::sheet_metal::{self, Flat, Hole};
+use crate::feature_pipeline::sheet_metal::{self, Hole};
 use crate::feature_pipeline::{FeatureContext, FeatureResult, ProfileLoop, SketchProfile};
 use crate::{NurbsCurve, Vec3};
 

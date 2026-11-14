@@ -21,7 +21,7 @@ use super::lifecycle::{self, LifecycleOutcome};
 use super::{constraints, mapping, AssemblyState, ConstraintEntry};
 use crate::feature_pipeline::{Env, SceneMap};
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Session {
     state: AssemblyState,
     scene: SceneMap,
@@ -79,6 +79,7 @@ pub fn assembly_session_serial() -> u64 {
 /// and a clone of every solid its scene names, keyed by the handle it had
 /// THERE. It shares nothing with the thread it came from, so that thread may
 /// free or reuse every handle afterwards ([`assembly_session_import`]).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct SessionTransfer {
     session: Session,
     solids: Vec<(u32, crate::BrepSolid)>,
@@ -159,6 +160,22 @@ pub(super) fn install_session(
         fixed_updates: outcome.fixed_updates,
         report: outcome.report,
     }));
+}
+
+/// Publish post-solve weld anchors and notify display consumers of in-place motion.
+pub(crate) fn publish_weld_scene(scene: &SceneMap, moved: &[(String, u32)]) {
+    SESSION.with(|slot| {
+        if let Some(session) = slot.borrow_mut().as_mut() {
+            session.scene = scene.clone();
+            if !moved.is_empty() {
+                let entries = session.report.as_object_mut().expect("assembly report object")
+                    .entry("movedSolids").or_insert_with(|| serde_json::json!([]));
+                if let Some(entries) = entries.as_array_mut() {
+                    entries.extend(moved.iter().map(|(name, handle)| serde_json::json!({"name": name, "handle": handle})));
+                }
+            }
+        }
+    });
 }
 
 fn with_session<T>(f: impl FnOnce(&mut Session) -> Result<T, String>) -> Result<T, String> {

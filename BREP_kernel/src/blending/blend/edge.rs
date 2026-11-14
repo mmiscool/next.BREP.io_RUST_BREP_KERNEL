@@ -29,14 +29,15 @@ pub(crate) use support::{
 };
 pub(super) use support::BLEND_WIDER_THAN_FACE;
 pub(super) use support::check_snap_closure;
-pub(super) use open::{build_open_surgery, build_open_surgery_with_tail, fresh_id_source, prune_orphan_vertices};
+
+pub(super) use open::{build_open_surgery_with_tail, fresh_id_source, prune_orphan_vertices};
 pub(super) use open::{
-    acceptance_deficit, exact_extrusion_wall_readings, junction_stencil, open_wall_readings_why, read_on_stencil, rails_on_shipped_windows, shipped_window, OpenRungReading, OPEN_REQUEST_RUNGS,
+    acceptance_deficit, exact_extrusion_wall_readings, open_wall_readings_why, rails_on_shipped_windows, shipped_window, OpenRungReading, OPEN_REQUEST_RUNGS,
     OPEN_WALL_CENTRES,
 };
 pub(super) use support::{
     extrusion_direction, fit_open_rows, fit_open_rows_breaking_at, fit_rows_breaking, interpolate_piece, march_open_stations,
-    march_open_stations_core, march_open_stations_ending, open_station_parameters, pole_end, rails_off_carriers,
+    march_open_stations_core, open_station_parameters, pole_end, rails_off_carriers,
     vertex_stations, OpenDenseCentres,
 };
 pub(super) use support::{exact_revolution_rows, revolution_lane_axis, ExactRevolution};

@@ -98,6 +98,27 @@ pub struct PlayerData {
     /// Shaded.
     #[serde(default = "Style::saved_before_styles")]
     pub style: Style,
+    /// What an offline page keys a build's record by in the browser's
+    /// storage ([`record_key`]): the instructions' content, so two documents,
+    /// or two revisions of one, never share values. Absent from data made
+    /// before the record was kept, and from a motion study's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub record_key: String,
+}
+
+/// The identity an offline page keeps a build's record under: a digest of
+/// everything the author wrote (the target revision, the steps, their
+/// fields), the same on every machine and in every build. Any edit, and any
+/// new revision of the assembly, is a new key.
+pub fn record_key(block: &Instructions) -> String {
+    // FNV-1a, 64 bit, over the block's JSON in the model's own field order: stable by construction (a
+    // hasher from the standard library may change between releases).
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in serde_json::to_string(block).unwrap_or_default().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// A motion study baked for the player: every frame's poses, in the order
@@ -166,6 +187,9 @@ pub struct PlayerStep {
     #[serde(default)]
     pub callouts: Vec<PlayerCallout>,
     pub signoff: bool,
+    /// What the person doing the work records at the step (shop mode).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<crate::fields::StepField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<Camera>,
     /// Node indices drawn ghosted.
@@ -725,6 +749,7 @@ impl PlayerData {
                     torque: step.torque.as_ref().map(|t| t.text()),
                     callouts: step.callouts.iter().map(|c| PlayerCallout { kind: c.kind, text: c.text.clone() }).collect(),
                     signoff: step.signoff.required,
+                    fields: step.fields.clone(),
                     camera: scene.cameras.get(&step.id).cloned(),
                     placed: index_of(&presentation.placed),
                     adding,
@@ -762,6 +787,7 @@ impl PlayerData {
             assembly,
             motion: None,
             style: block.template.style,
+            record_key: record_key(block),
         })
     }
 
@@ -816,6 +842,7 @@ impl PlayerData {
             assembly: Vec::new(),
             motion: Some(motion),
             style: Style::Shaded,
+            record_key: String::new(),
         })
     }
 

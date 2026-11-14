@@ -468,7 +468,7 @@ pub(super) fn record_push_census(directory: &str, solid: &BrepSolid, face_id: u6
         .collect();
     let detail = serde_json::json!({ "face": face_id, "distance": distance });
     let operation =
-        |body: &BrepSolid| offset_ruled_face(body, face_id, distance).map_err(String::from);
+        |body: &BrepSolid| super::offset_ruled_face_unchecked(body, face_id, distance).map_err(String::from);
     let line = census_line("push", solid, &edges, &vertices, &[], &operation, detail);
     append(directory, &line);
 }

@@ -122,7 +122,8 @@
 //! (`tangent_surround`). On the side that moves in, the plane cuts the fillet in
 //! a new ruling. On the side that moves out, it may miss the fillet altogether,
 //! and the fillet is then filled in, the tilted face meeting the wall beyond it.
-//! `reblend_lost_fillets` rounds that edge again at the fillet's radius.
+//! `reblend_lost_fillets` rounds that edge again at the fillet's radius, or
+//! under its radius law where the radius varies along it.
 //!
 //! Names are RE-STAMPED rather than collected, because the boolean mints its
 //! own faces: a result face whose carrier is an original face's carrier (at its
@@ -681,38 +682,50 @@ pub fn reblend_lost_fillets(original: &BrepSolid, moved: &[u64], mut body: BrepS
             {
                 continue;
             }
-            // Only a constant radius can be rolled again; anything else is
-            // still a fillet this edit filled in, so it is named.
+            // A constant radius is rolled again as it was. Any other band is
+            // read as a rolling-ball fillet under a radius law and re-made
+            // under that law (`blend_rebuild.rs`); one that reads as neither
+            // is still a fillet this edit filled in, so it is named.
             let radius = super::face_move::ruled_revolution_carrier(&band.surface)
                 .filter(|(_, rho0, rho1, _)| (rho0 - rho1).abs() <= tolerance)
                 .map(|(_, rho0, _, _)| rho0);
-            let Some(rho0) = radius else {
-                notes.push(format!(
-                    "transformFace: fillet `{band_name}` was lost: the moved face no longer reaches \
-                     it, so it was filled in, and only a constant-radius fillet can be re-made"
-                ));
-                continue;
+            let (remade, radius_label) = match radius {
+                Some(rho0) => (
+                    across(band)
+                        .into_iter()
+                        .filter(|wall| *wall != id)
+                        .find_map(|wall| {
+                            let wall = faces[&wall];
+                            let wall_plane = plane_of_surface(&wall.surface, tolerance * 10.0, OP).ok()?;
+                            band_is_tangent_along_shared_edges(wall, band, wall_plane.normal).then_some(wall)
+                        })
+                        .ok_or_else(|| "the wall beyond it could not be read".to_string())
+                        .and_then(|wall| sharp_edge_between(&body, face, wall))
+                        .and_then(|edge| {
+                            let rebuilt =
+                                crate::fillet_edge(&body, edge, rho0, Some(&band_name)).map_err(|e| e.to_string())?;
+                            let issues = rebuilt.validate();
+                            if !issues.is_empty() {
+                                return Err(format!("the new fillet is invalid: {issues:?}"));
+                            }
+                            // Checked one by one, so a fillet the acceptance would
+                            // refuse costs that fillet and not the whole edit.
+                            crate::accept_sound(rebuilt, "transformFace").map_err(|e| e.to_string())
+                        }),
+                    format!(" (radius {rho0})"),
+                ),
+                None => (
+                    super::blend_rebuild::read_band_law(original, band_id)
+                        .map_err(|reason| {
+                            format!(
+                                "it is neither a constant-radius fillet nor a rolling-ball fillet under a \
+                                 radius law: {reason}"
+                            )
+                        })
+                        .and_then(|law| super::blend_rebuild::remake_band(&body, &law, false, "transformFace")),
+                    String::new(),
+                ),
             };
-            let remade = across(band)
-                .into_iter()
-                .filter(|wall| *wall != id)
-                .find_map(|wall| {
-                    let wall = faces[&wall];
-                    let wall_plane = plane_of_surface(&wall.surface, tolerance * 10.0, OP).ok()?;
-                    band_is_tangent_along_shared_edges(wall, band, wall_plane.normal).then_some(wall)
-                })
-                .ok_or_else(|| "the wall beyond it could not be read".to_string())
-                .and_then(|wall| sharp_edge_between(&body, face, wall))
-                .and_then(|edge| {
-                    let rebuilt = crate::fillet_edge(&body, edge, rho0, Some(&band_name)).map_err(|e| e.to_string())?;
-                    let issues = rebuilt.validate();
-                    if !issues.is_empty() {
-                        return Err(format!("the new fillet is invalid: {issues:?}"));
-                    }
-                    // Checked one by one, so a fillet the acceptance would
-                    // refuse costs that fillet and not the whole edit.
-                    crate::accept_sound(rebuilt, "transformFace").map_err(|e| e.to_string())
-                });
             match remade {
                 Ok(rebuilt) => {
                     body = rebuilt;
@@ -734,7 +747,7 @@ pub fn reblend_lost_fillets(original: &BrepSolid, moved: &[u64], mut body: BrepS
                     }
                 }
                 Err(reason) => notes.push(format!(
-                    "transformFace: fillet `{band_name}` (radius {rho0}) was lost: the moved face no \
+                    "transformFace: fillet `{band_name}`{radius_label} was lost: the moved face no \
                      longer reaches it, so it was filled in, and it could not be re-made ({reason})"
                 )),
             }

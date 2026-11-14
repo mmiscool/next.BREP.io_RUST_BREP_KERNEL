@@ -363,7 +363,7 @@ pub fn effective_text(stored: &str) -> String {
 pub fn part_fields(config_text: &str, stored: &serde_json::Value) -> Vec<BomColumn> {
     let mut out: Vec<BomColumn> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut push = |out: &mut Vec<BomColumn>, seen: &mut HashSet<String>, column: BomColumn| {
+    let push = |out: &mut Vec<BomColumn>, seen: &mut HashSet<String>, column: BomColumn| {
         if seen.insert(column.field.clone()) {
             out.push(column);
         }

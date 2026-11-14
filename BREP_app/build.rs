@@ -75,14 +75,13 @@ fn main() {
         out.push_str(&format!(
             "    Icon {{ ch: '\\u{{{cp:04X}}}', name: {name:?}, \
              uri: \"bytes://brep-icons/{cp:04X}.svg\", svg: {svg:?}, \
-             aspect: {aspect:?}, mono: {mono}, artwork_svg: {artwork_svg:?}, artwork_aspect: {artwork_aspect:?} }},\n",
+             aspect: {aspect:?}, mono: {mono}, artwork_svg: {artwork_svg:?} }},\n",
             cp = icon.cp,
             name = icon.name,
             svg = icon.svg,
             aspect = icon.aspect,
             mono = icon.mono,
             artwork_svg = icon.artwork_svg,
-            artwork_aspect = icon.artwork_aspect,
         ));
     }
     out.push_str("];\n");
@@ -127,7 +126,6 @@ struct Icon {
     aspect: f32,
     mono: bool,
     artwork_svg: String,
-    artwork_aspect: f32,
 }
 
 /// Read one glyph SVG into a catalog entry, or `None` if it carries no
@@ -164,15 +162,23 @@ fn parse(path: &Path) -> Option<Icon> {
     let tree = usvg::Tree::from_str(&svg, &usvg::Options::default())
         .unwrap_or_else(|e| panic!("{file}: invalid SVG: {e}"));
     let bounds = tree.root().abs_layer_bounding_box();
+    // Every icon's artwork box is SQUARE: the painted bounds, centred in a
+    // square as big as their longer side. A site that draws artwork gives it a
+    // square and can never stretch it, whatever shape the ink is; a wide or a
+    // tall icon simply leaves the rest of its square empty.
+    let side = bounds.width().max(bounds.height());
+    assert!(side > 0.0, "{file}: paints nothing");
+    let (left, top) = (
+        bounds.x() - (side - bounds.width()) / 2.0,
+        bounds.y() - (side - bounds.height()) / 2.0,
+    );
     let serialized = tree.to_string(&usvg::WriteOptions::default());
     let body = &serialized[serialized.find('>').expect("SVG root") + 1..];
     let artwork_svg = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" viewBox=\"{} {} {} {}\" width=\"{}\" height=\"{}\">{}",
-        bounds.x(), bounds.y(), bounds.width(), bounds.height(),
-        bounds.width(), bounds.height(), body,
+        left, top, side, side, side, side, body,
     );
-    Some(Icon { cp, name, svg, aspect: w / h, mono, artwork_svg,
-        artwork_aspect: bounds.width() / bounds.height() })
+    Some(Icon { cp, name, svg, aspect: w / h, mono, artwork_svg })
 }
 
 /// The value of an XML attribute, matched literally as `name="value"`. The

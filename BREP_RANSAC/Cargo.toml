@@ -1,6 +1,6 @@
 [package]
 name = "BREP_RANSAC"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"

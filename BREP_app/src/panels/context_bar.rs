@@ -173,16 +173,11 @@ impl ContextBarPanel {
         let sel = Selection::read(state);
         let comp = component_selection(&sel, state);
         let probe = selection_probe(&sel, &comp, all_on_sheet_metal(&sel, state));
-        // The feature FENCE: a selection made ENTIRELY of component geometry
-        // offers NO modeling-feature creation (the kernel rejects component
-        // references anyway — don't offer dead ends). The constraint offers
-        // are the complement: their predicates REQUIRE an all-component
-        // selection, so the two sets never coexist.
-        let offers = if comp.suppress_features() {
-            Vec::new()
-        } else {
-            feature_offers_scoped(&probe, &sel, &state.settings.workbench, Some(state))
-        };
+        // Welds consume component seams without editing the source part.
+        let mut offers = feature_offers_scoped(&probe, &sel, &state.settings.workbench, Some(state));
+        if comp.suppress_features() {
+            offers.retain(|offer| offer.type_code == "WELD");
+        }
         let constraint_types =
             constraint_offers(&probe, &state.settings.workbench, &crate::workbench::ButtonState::of(state));
         // PMI annotation offers: the third applicability family — each type's
@@ -902,7 +897,7 @@ struct OfferField {
     path: Vec<String>,
     /// That field's `selectionFilter` (which selected kinds map into it).
     filter: Vec<String>,
-    /// Whether the field takes a list (vs a single name).
+    /// Whether automatic prefill writes a list (vs a single name).
     multiple: bool,
 }
 
@@ -1016,13 +1011,19 @@ fn offer_fields(engine: Option<&EngineState>, ty: &str, kinds: &[&str]) -> Vec<O
             let FieldKind::Reference { filter, multiple } = &field.kind else {
                 return None;
             };
+            let mut filter = filter.clone();
+            // Auto-seed a weld's seam as before; a mating face on another part
+            // is not an owner constraint. Optional scopes are added in the form.
+            if ty == "WELD" && field.path == ["seam"] {
+                filter.retain(|kind| matches!(kind.as_str(), "EDGE" | "SKETCH"));
+            }
             filter
                 .iter()
                 .any(|f| kinds.iter().any(|k| *k == f.as_str()))
                 .then(|| OfferField {
                     path: field.path.clone(),
                     filter: filter.clone(),
-                    multiple: *multiple,
+                    multiple: *multiple && ty != "WELD",
                 })
         })
         .collect()
@@ -1042,7 +1043,7 @@ pub(crate) fn prefill_from_selection(state: &EngineState, type_code: &str, param
     }
     let sel = Selection::read(state);
     let kinds = sel.kinds_present();
-    if kinds.is_empty() || component_selection(&sel, state).suppress_features() {
+    if kinds.is_empty() || (type_code != "WELD" && component_selection(&sel, state).suppress_features()) {
         return 0;
     }
     let writes = prefill_references(&offer_fields(Some(state), type_code, &kinds), &sel);
@@ -1128,7 +1129,7 @@ fn component_move_targets(
 
 /// The PMI annotation actions to offer: every type whose `applicable`
 /// predicate ([`brep_kernel::PMI_TYPES`]) accepts the probe — gated on the PMI
-/// panel being available in the active workbench (PMI + All) and on an active
+/// panel being available in the active workbench (Modeling, Sheet Metal, Assembly, All) and on an active
 /// view (no view ⇒ no offers).
 fn pmi_offers(
     probe: &SelectionProbe,

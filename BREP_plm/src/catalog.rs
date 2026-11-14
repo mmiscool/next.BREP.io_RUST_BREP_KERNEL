@@ -4,7 +4,7 @@
 //! Pure functions over the category list, so the store can call them INSIDE
 //! its locked write — the one place a rule cannot be raced past.
 //!
-//! # The rules (round 1 and the catalog slice)
+//! # The rules
 //!
 //! * A category's **effective schema** is its ancestors' attributes, root
 //!   first, then its own.

@@ -1,10 +1,10 @@
 //! The server's host bindings: what a fully trusted script can reach.
 //!
-//! The operator's call (§3.5): scripts are written by administrators and are
-//! trusted with EVERYTHING — the network, the PLM, the server's file system and
-//! child processes. There is no allowlist. These bindings are server-only; the
-//! interpreter core in [`super::engine`] does not depend on them, so the CAD
-//! app can later embed the core with its own host.
+//! The operator's call: scripts are written by
+//! administrators and are trusted with EVERYTHING — the network, the PLM, the
+//! server's file system and child processes. There is no allowlist. These
+//! bindings are server-only; the interpreter core in [`super::engine`] does not
+//! depend on them, so the CAD app can later embed the core with its own host.
 //!
 //! | Global | Function | Returns |
 //! | --- | --- | --- |

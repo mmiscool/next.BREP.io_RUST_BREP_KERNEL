@@ -513,29 +513,6 @@ fn direction_roots(
     Ok(found)
 }
 
-/// The panels of one knot span `[lo, hi]` of `surface`'s `u` (or `v`)
-/// direction, for a cell whose other parameter runs over `cross`. The cached
-/// form ([`SurfaceRules`]) is what the integrators use; this reads the weights
-/// afresh and is the reference the tests drive.
-pub(super) fn surface_panels(
-    surface: &NurbsSurface,
-    in_u: bool,
-    lo: f64,
-    hi: f64,
-    cross: [f64; 2],
-) -> Result<Vec<Panel>, String> {
-    if !rational_rule_on() {
-        return Ok(whole(lo, hi));
-    }
-    let started = super::profile::profile_started();
-    let roots = direction_roots(surface, in_u, [lo, hi], cross)?;
-    let panels = panels_from_roots(&roots, [lo, hi], lo, hi);
-    super::mass_profile(|p| {
-        p.rule_spans += 1;
-        p.rule_ms += super::profile::elapsed_ms(started);
-    });
-    Ok(panels)
-}
 
 /// A patch's weight roots, read ONCE per knot cell and per direction and
 /// reused by every cell that lands in it.

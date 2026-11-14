@@ -1,7 +1,7 @@
 use crate::topology::BrepSolid;
 use crate::{NurbsCurve, NurbsSurface, Vec3, Vec4};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AffineTransform {
     pub elements: [f64; 16],
 }
@@ -159,8 +159,17 @@ pub fn transform_brep(
             }
         }
     }
+    // Where the copy's coordinates are spaced finely, a placement moves the
+    // part faithfully. Farther out, rounding to the coordinates there can
+    // reshape or collapse it while every topological check still passes, so
+    // the move is measured against the part and the copy is validated itself.
+    let precise = arithmetic_spacing(solid, &result, transform) <= PRECISE_SPACING;
+    if !precise {
+        placement_resolves_the_part(solid, &result, transform)?;
+    }
     let mode = carry_verdict_mode();
-    let carried = mode != crate::env_read::Mode::Off
+    let carried = precise
+        && mode != crate::env_read::Mode::Off
         && carries_clean_verdict(solid, transform, reverse_orientation);
     if carried && mode == crate::env_read::Mode::On {
         CARRIED_VERDICTS.with(|count| count.set(count.get() + 1));
@@ -184,6 +193,147 @@ pub fn transform_brep(
     } else {
         Err(format!("transformed BREP is invalid: {issues:?}"))
     }
+}
+
+/// Spacing of the coordinates a placement computes with, below which a moved
+/// copy is faithful to the model tolerance with room to spare (a tenth of
+/// it): within about 4.5e7 of the origin. Such copies keep the fast path
+/// unchanged.
+const PRECISE_SPACING: f64 = 0.1 * crate::tolerance::DEFAULT_MODEL;
+
+/// Every point a solid's geometry is stated by, in a fixed order: its
+/// vertices, then each edge curve's control points, then each face surface's.
+/// A source and its transformed copy list them in parallel. A pole that does
+/// not read as a point comes out non-finite.
+fn stated_points(solid: &BrepSolid) -> impl Iterator<Item = Vec3> + '_ {
+    let cartesian =
+        |point: &Vec4| point.point().unwrap_or(Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY));
+    solid
+        .vertices
+        .iter()
+        .map(|vertex| vertex.point)
+        .chain(solid.edges.iter().flat_map(move |edge| edge.curve.control_points.iter().map(cartesian)))
+        .chain(
+            solid
+                .shells
+                .iter()
+                .flat_map(|shell| &shell.faces)
+                .flat_map(move |face| face.surface.control_points.iter().flatten().map(cartesian)),
+        )
+}
+
+/// The farthest coordinate of `points` from the origin; infinite when one is
+/// not finite.
+fn reach(points: impl Iterator<Item = Vec3>) -> f64 {
+    points
+        .flat_map(|point| [point.x, point.y, point.z])
+        .fold(0.0f64, |reach, value| if value.is_finite() { reach.max(value.abs()) } else { f64::INFINITY })
+}
+
+/// The spacing of representable coordinates at the largest magnitude the
+/// placement computes with: the copy's points, the source's as the linear
+/// part scales them, and the translation. A far part brought back near the
+/// origin loses its precision on the way, so the copy alone cannot tell; a
+/// far pole loses it though every vertex is near.
+fn arithmetic_spacing(source: &BrepSolid, copy: &BrepSolid, transform: AffineTransform) -> f64 {
+    let m = transform.elements;
+    let gain = (0..3).map(|row| m[row * 4].abs() + m[row * 4 + 1].abs() + m[row * 4 + 2].abs()).fold(0.0f64, f64::max);
+    let translation = m[3].abs().max(m[7].abs()).max(m[11].abs());
+    reach(stated_points(copy)).max(gain * reach(stated_points(source))).max(translation) * f64::EPSILON
+}
+
+/// The sum of `terms`, exact until its final rounding: a Shewchuk expansion
+/// keeps every bit any partial sum would lose, however the terms cancel.
+fn exact_sum(terms: impl IntoIterator<Item = f64>) -> f64 {
+    let mut partials: Vec<f64> = Vec::new();
+    for mut term in terms {
+        let mut kept = 0;
+        for index in 0..partials.len() {
+            let mut other = partials[index];
+            if term.abs() < other.abs() {
+                std::mem::swap(&mut term, &mut other);
+            }
+            let high = term + other;
+            let low = other - (high - term);
+            if low != 0.0 {
+                partials[kept] = low;
+                kept += 1;
+            }
+            term = high;
+        }
+        partials.truncate(kept);
+        partials.push(term);
+    }
+    // Smallest first: the large partials do not overlap, so this rounds once
+    // to within an ulp of the result.
+    partials.iter().sum()
+}
+
+/// How far a computed coordinate lies from the exact `A p + t` for one row:
+/// the three products split exactly (fused multiply-add), the translation and
+/// the computed value summed exactly, so the rounding is measured to its own
+/// precision whatever the magnitudes.
+fn coordinate_rounding(row: [f64; 4], point: Vec3, computed: f64) -> f64 {
+    let mut terms = [0.0f64; 8];
+    for (slot, (factor, value)) in [(row[0], point.x), (row[1], point.y), (row[2], point.z)].into_iter().enumerate() {
+        let product = factor * value;
+        terms[2 * slot] = product;
+        terms[2 * slot + 1] = factor.mul_add(value, -product);
+    }
+    terms[6] = row[3];
+    terms[7] = -computed;
+    -exact_sum(terms)
+}
+
+/// Whether a measured rounding is fine enough for roundings to be compared
+/// against the model tolerance: its own ulp must sit well below it. One past
+/// that (tens of kilometres of rounding, from coordinates near 1e23) has lost
+/// the part in any case.
+fn measurable(rounding: f64) -> bool {
+    rounding.is_finite() && rounding.abs() * f64::EPSILON <= 0.01 * crate::tolerance::DEFAULT_MODEL
+}
+
+/// Refuse a copy the placement could not carry at the precision the kernel
+/// models to. Each stated point of the copy is set against its exact image
+/// under the placement: the difference is that coordinate's rounding. Points
+/// rounded alike have only moved together, which changes nothing; the spread
+/// of the roundings across the part is how far it was moved out of shape. A
+/// spread past the model tolerance, the band vertex identity is judged in,
+/// has reshaped the part (a thin side or wall lost, a corner merged, a cavity
+/// shifted into its solid), however small that is next to the part, and
+/// validation cannot see it. No reference point is subtracted, so nothing the
+/// placement rounds away can be rounded away from the measure too.
+fn placement_resolves_the_part(
+    source: &BrepSolid,
+    copy: &BrepSolid,
+    transform: AffineTransform,
+) -> Result<(), String> {
+    let m = transform.elements;
+    let rows = [[m[0], m[1], m[2], m[3]], [m[4], m[5], m[6], m[7]], [m[8], m[9], m[10], m[11]]];
+    let mut low = [f64::INFINITY; 3];
+    let mut high = [f64::NEG_INFINITY; 3];
+    let mut lost = false;
+    for (from, to) in stated_points(source).zip(stated_points(copy)) {
+        for (axis, value) in [to.x, to.y, to.z].into_iter().enumerate() {
+            let rounding = coordinate_rounding(rows[axis], from, value);
+            if !measurable(rounding) {
+                lost = true;
+                continue;
+            }
+            low[axis] = low[axis].min(rounding);
+            high[axis] = high[axis].max(rounding);
+        }
+    }
+    let spread = (0..3).map(|axis| (high[axis] - low[axis]).max(0.0).powi(2)).sum::<f64>().sqrt();
+    let worst = if lost { f64::INFINITY } else { spread };
+    if worst > crate::tolerance::DEFAULT_MODEL {
+        return Err(format!(
+            "transformSolid: the placement computes with coordinates spaced {:.1e}, too coarse to hold the part: it moves its points against one another by up to {worst:.1e}, past the {:.0e} modelling tolerance",
+            arithmetic_spacing(source, copy, transform),
+            crate::tolerance::DEFAULT_MODEL
+        ));
+    }
+    Ok(())
 }
 
 /// Whether a rigid placement may keep its source's clean validation verdict
@@ -215,10 +365,6 @@ thread_local! {
     static CARRIED_VERDICTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many placements on this thread have kept their source's verdict.
-pub(crate) fn carried_verdicts() -> u64 {
-    CARRIED_VERDICTS.with(|count| count.get())
-}
 
 fn carry_verdict_mode() -> crate::env_read::Mode {
     crate::mode_switch!("BREP_TRANSFORM_CARRY_VERDICT", true)

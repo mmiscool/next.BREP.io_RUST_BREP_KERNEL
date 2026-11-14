@@ -168,8 +168,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     // FAST lane, with the SELF-HEAL fallback (dirty entry or unreadable
     // snapshot -> re-execute the embedded document, rewrite the snapshot) and
     // the STALE lane (a snapshot from another kernel build is rebuilt).
-    let stale = !entry.dirty
-        && parts_library::kernel_source_stamp().is_some_and(|stamp| entry.snapshot_producer != stamp);
+    let stale = parts_library::snapshot_is_stale(&entry);
     // A sub-assembly whose constraint rows this session has not seen (a loaded
     // document: the rows are not saved) is rebuilt too, so the parent can say
     // how the sub-assembly's own mates ended — and an old snapshot that baked
@@ -179,6 +178,19 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         || crate::feature_pipeline::extension::document_uses_extensions(&entry.document)
     {
         heal(&part_name, &entry.document)?
+    } else if stale && parts_library::defer_stale() {
+        // The DEFERRED stale lane: shown as stored, rebuilt by a later run
+        // (`HistoryRequest::defer_stale_parts`). The entry keeps its stamp,
+        // so that run still takes the stale lane; a snapshot that no longer
+        // decodes is rebuilt now, as before.
+        match restore_solids_memoized(&part_name, &entry.snapshot) {
+            Ok(snapshot) => {
+                parts_library::note_stale_shown(&part_name);
+                let (rows, poses) = parts_library::stale_saved_rows(&entry);
+                (snapshot, entry.ports.clone(), rows, poses)
+            }
+            Err(_) => rebuild_stale(&part_name, &entry, Rebuild::Stale, &mut note)?,
+        }
     } else if stale {
         rebuild_stale(&part_name, &entry, Rebuild::Stale, &mut note)?
     } else if parts_library::needs_constraint_rows(&entry) {

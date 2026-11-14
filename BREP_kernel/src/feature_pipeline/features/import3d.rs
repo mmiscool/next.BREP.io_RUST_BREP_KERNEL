@@ -388,7 +388,7 @@ fn stamp_imported_names(solids: &mut [BrepSolid], feature_name: &str) -> Vec<Str
 
 /// `importedSolidNames` port: 1 body keeps the feature name; several get a
 /// stable, zero-padded `{feature}_SOLID_0N` suffix.
-pub(crate) fn imported_solid_names(count: usize, feature_name: &str) -> Vec<String> {
+pub fn imported_solid_names(count: usize, feature_name: &str) -> Vec<String> {
     if count == 0 {
         return Vec::new();
     }

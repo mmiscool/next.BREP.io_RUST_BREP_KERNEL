@@ -35,8 +35,7 @@
 //! the ordinary path's text and appends the merged attempt's reason.
 //!
 //! Default ON since the promotion 2026-11-05, (lane F, 2026-10-31, behind a switch
-//! until then): `BREP_SPLIT_RIM_MERGE=0` (or `off`) turns it off, and
-//! `with_split_rim_merge_for_test` forces either on a test's thread.
+//! until then): `BREP_SPLIT_RIM_MERGE=0` (or `off`) turns it off.
 
 use crate::topology::BrepSolid;
 use crate::{KernelRefusal, Vec3};
@@ -46,7 +45,6 @@ use crate::{KernelRefusal, Vec3};
 pub(crate) fn split_rim_merge_on() -> bool {
     switch!("BREP_SPLIT_RIM_MERGE", true)
 }
-
 
 /// The canonicalised body and the selection on it: one point (the first
 /// selected) and its name.

@@ -1,6 +1,5 @@
-//! 3MF (3D Manufacturing Format) import and export — the core specification
-//! only. [`write_3mf`] is the export half, documented in [`write`]; the rest of
-//! this page is the reader.
+//! 3MF (3D Manufacturing Format) import and export. [`write_3mf`] exports
+//! solids; [`write_3mf_meshes`] preserves imported mesh appearance.
 //!
 //! [`read_3mf`] reads a 3MF package (an OPC ZIP container) and returns the
 //! meshes its `<resources>` define plus the flattened list of instances the
@@ -32,25 +31,25 @@
 //! default and a triangle's own `pid`/`p1`. Each triangle of
 //! [`ThreeMfMesh::triangle_colors`] (and of the flattened
 //! [`ThreeMfReadResult::triangle_colors`]) is the colour it resolves to, or
-//! `None` — a triangle with no property, or one naming a group that is not a
-//! base material. The vectors are EMPTY when no triangle resolves, so a plain
-//! package costs nothing. Colour is appearance, never geometry: a malformed or
-//! dangling property reference is `None`, not a refusal. This is what the
+//! `None` — a triangle with no resolvable RGB property. The vectors are empty
+//! when no triangle resolves. Legacy malformed or dangling base-material
+//! references remain `None`; extension references are checked explicitly. This is what the
 //! writer ([`write_3mf`]) emits, so an export re-imports with its colours.
 //!
-//! # What is ignored, by design
+//! # Materials extensions
 //!
-//! Everything outside the core namespace: the materials-and-properties
-//! extension's colour groups, textures and composites, and the slice,
-//! production, beam-lattice and secure-content extensions. Extension elements
-//! are skipped as whole subtrees and prefixed attributes (`p:UUID`) are never
-//! read, so a file that carries them imports as geometry plus whatever core
-//! colours it has, rather than failing. A package that declares such an
-//! extension REQUIRED (`requiredextensions`) is refused instead, because
-//! honouring it is exactly what this reader cannot do. `<metadata>` and
-//! thumbnails carry no geometry and are skipped. An object's `name` is kept on
-//! each [`ThreeMfInstance`] only so a consumer can say WHICH object a refusal
-//! is about.
+//! Colour groups preserve RGBA at each triangle corner. Texture groups retain
+//! per-corner UVs, packaged PNG bytes and sampling settings. Composite materials
+//! retain their constituent display colours and fractions. RGB-only consumers
+//! receive a per-triangle preview; textures have no invented flat colour.
+//! [`write_3mf_meshes`] exports this appearance without solid reconstruction.
+//!
+//! Required extension prefixes are resolved by namespace URI. Unknown required
+//! extensions and unsupported material resources refuse by name. Simple beam
+//! lattices remain named, placed non-solid data alongside their triangle meshes.
+//! Clipping, balls, beam properties and representation meshes refuse precisely;
+//! consumers must not present the triangle soup alone as the complete solid.
+//! Other optional extension subtrees and metadata are skipped.
 //!
 //! Anything the core specification makes required and the file omits — the
 //! start-part relationship, an object id, a triangle's vertex indices, a
@@ -86,6 +85,8 @@
 
 mod inflate;
 mod model;
+mod mesh_write;
+pub use mesh_write::write_3mf_meshes;
 mod write;
 mod xml;
 mod zip;
@@ -96,6 +97,8 @@ pub use write::{write_3mf, ThreeMfSolid, ThreeMfWriteReport};
 use serde::Serialize;
 
 /// The 3MF core-specification namespace this reader accepts elements from.
+pub const MATERIAL_NAMESPACE: &str = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02";
+pub const BEAM_NAMESPACE: &str = "http://schemas.microsoft.com/3dmanufacturing/beamlattice/2017/02";
 pub const CORE_NAMESPACE: &str = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 /// The OPC relationships namespace of `_rels/.rels`.
 const RELATIONSHIP_NAMESPACE: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
@@ -219,6 +222,76 @@ impl ThreeMfUnit {
     }
 }
 
+/// Lossless per-corner appearance, in triangle winding order.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum ThreeMfAppearance {
+    Colors([[u8; 4]; 3]),
+    Texture { texture_id: u32, uv: [[f64; 2]; 3] },
+    Composite { colors: Vec<[u8; 3]>, weights: [Vec<f64>; 3] },
+}
+
+impl ThreeMfAppearance {
+    /// RGB preview for consumers that support only one colour per face.
+    pub fn preview_rgb(&self) -> Option<[u8; 3]> {
+        let mut rgb = [0; 3];
+        match self {
+            Self::Colors(colors) => {
+                // Core 3MF requires a consumer without gradients to use p1.
+                rgb.copy_from_slice(&colors[0][..3]);
+            }
+            Self::Composite { colors, weights } => {
+                let weights = &weights[0];
+                let sum: f64 = weights.iter().take(colors.len()).sum();
+                for i in 0..3 {
+                    let mixed: f64 = colors.iter().enumerate().map(|(j, c)| {
+                        let fraction = if sum > 0.0 { weights.get(j).copied().unwrap_or(0.0) / sum }
+                            else { 1.0 / colors.len() as f64 };
+                        c[i] as f64 * fraction
+                    }).sum();
+                    rgb[i] = mixed.round().clamp(0.0,255.0) as u8;
+                }
+            }
+            Self::Texture { .. } => return None,
+        }
+        Some(rgb)
+    }
+    fn reverse(&mut self) {
+        match self {
+            Self::Colors(c) => c.swap(1, 2),
+            Self::Texture { uv, .. } => uv.swap(1, 2),
+            Self::Composite { weights, .. } => weights.swap(1, 2),
+        }
+    }
+}
+
+/// Beam parameters retained as non-solid data, in object-local millimetres.
+/// Apply the containing instance's full affine transform to the beam surface;
+/// transforming only the endpoints/radii is insufficient for shear or scaling.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ThreeMfBeam {
+    pub vertices: [u32; 2],
+    pub radii: [f64; 2],
+    pub caps: [String; 2],
+}
+
+/// A lattice retained independently of the triangle soup, never claimed as a solid.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ThreeMfBeamLattice {
+    pub min_length: f64,
+    pub beams: Vec<ThreeMfBeam>,
+}
+
+/// A packaged PNG and its sampling settings. Pixels remain encoded.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ThreeMfTexture {
+    pub id: u32,
+    pub path: String,
+    pub png: Vec<u8>,
+    pub tile_u: String,
+    pub tile_v: String,
+    pub filter: String,
+}
+
 /// One `<object>`'s mesh, in millimetres and in the object's own coordinates.
 /// Shared: an object placed three times is ONE entry here and three
 /// [`ThreeMfInstance`]s.
@@ -226,6 +299,8 @@ impl ThreeMfUnit {
 pub struct ThreeMfMesh {
     /// The id of the `<object>` this mesh belongs to.
     pub object_id: u32,
+    /// Non-solid lattice data; named and placed through the mesh instances.
+    pub beam_lattice: Option<ThreeMfBeamLattice>,
     /// Vertex coordinates as xyz triples, millimetres.
     pub positions: Vec<f64>,
     /// Triangle corners, three indices into `positions`/3.
@@ -234,6 +309,8 @@ pub struct ThreeMfMesh {
     /// it, or `None` — when at least one triangle of the mesh resolves to a
     /// colour; EMPTY otherwise. See the module doc's "Colours".
     pub triangle_colors: Vec<Option<[u8; 3]>>,
+    /// Lossless appearance parallel to triangles; empty when absent.
+    pub triangle_appearance: Vec<Option<ThreeMfAppearance>>,
 }
 
 impl ThreeMfMesh {
@@ -286,6 +363,8 @@ pub struct ThreeMfReadResult {
     pub model_part: String,
     /// The unit the file declared, before conversion.
     pub unit: ThreeMfUnit,
+    /// Packaged textures referenced by material resources.
+    pub textures: Vec<ThreeMfTexture>,
     /// One entry per mesh-bearing `<object>` in `<resources>`, in document
     /// order — including any the build never places.
     pub meshes: Vec<ThreeMfMesh>,
@@ -303,6 +382,8 @@ pub struct ThreeMfReadResult {
     /// placement's winding reversal) when any placed triangle resolves to a
     /// colour; EMPTY otherwise.
     pub triangle_colors: Vec<Option<[u8; 3]>>,
+    /// Lossless appearance parallel to triangles; empty when absent.
+    pub triangle_appearance: Vec<Option<ThreeMfAppearance>>,
 }
 
 impl ThreeMfReadResult {
@@ -398,7 +479,18 @@ pub fn read_3mf(bytes: &[u8]) -> Result<ThreeMfReadResult, ThreeMfError> {
         detail: format!("'{RELATIONSHIP_PART}' names it as the 3D model start part"),
     })?;
     let model_text = read_text(&archive, model_entry, &model_part)?;
-    let document = model::parse_model(&model_part, &model_text)?;
+    let mut document = model::parse_model(&model_part, &model_text)?;
+    let mut texture_bytes = 0usize;
+    for texture in &mut document.textures {
+        let entry = archive.find(&texture.path).ok_or_else(|| ThreeMfError::MissingPart {
+            part: texture.path.clone(), detail: format!("texture2d {} references this PNG", texture.id),
+        })?;
+        texture.png = archive.read(entry, MAX_PART_BYTES.saturating_sub(texture_bytes)).map_err(map_zip)?;
+        texture_bytes += texture.png.len();
+        if !texture.png.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Err(ThreeMfError::Model { part: texture.path.clone(), detail: "texture2d is not a PNG".into() });
+        }
+    }
     flatten(model_part, document)
 }
 
@@ -484,26 +576,29 @@ fn flatten(
         .meshes
         .iter()
         .map(|mesh| {
-            let object_color = document.color(mesh.object_property);
-            let mut triangle_colors: Vec<Option<[u8; 3]>> = mesh
-                .properties
-                .iter()
-                .map(|property| match property {
-                    Some(property) => document.color(Some(*property)),
-                    None => object_color,
-                })
-                .collect();
+            let mut triangle_appearance = mesh.properties.iter()
+                .map(|p| document.appearance(p.or(mesh.object_property), &model_part))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut triangle_colors: Vec<_> = triangle_appearance.iter()
+                .map(|a| a.as_ref().and_then(ThreeMfAppearance::preview_rgb)).collect();
+            if triangle_appearance.iter().all(Option::is_none) { triangle_appearance.clear(); }
             if triangle_colors.iter().all(Option::is_none) {
                 triangle_colors.clear();
             }
-            ThreeMfMesh {
+            Ok(ThreeMfMesh {
                 object_id: mesh.object_id,
+                beam_lattice: mesh.beam_lattice.clone().map(|mut lattice| {
+                    lattice.min_length *= scale;
+                    for beam in &mut lattice.beams { for r in &mut beam.radii { *r *= scale; } }
+                    lattice
+                }),
                 positions: mesh.positions.iter().map(|value| value * scale).collect(),
                 indices: mesh.indices.clone(),
                 triangle_colors,
-            }
+                triangle_appearance,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, ThreeMfError>>()?;
     let mut instances = Vec::new();
     for item in &document.items {
         let mut transform = item.transform;
@@ -516,6 +611,8 @@ fn flatten(
     let mut indices = Vec::new();
     let mut triangle_colors: Vec<Option<[u8; 3]>> = Vec::new();
     let colored = instances.iter().any(|instance| !meshes[instance.mesh].triangle_colors.is_empty());
+    let mut triangle_appearance = Vec::new();
+    let has_appearance = instances.iter().any(|i| !meshes[i.mesh].triangle_appearance.is_empty());
     let mut triangles = 0usize;
     for instance in &mut instances {
         let mesh = &meshes[instance.mesh];
@@ -548,6 +645,13 @@ fn flatten(
                 indices.extend([base + triangle[0], base + triangle[1], base + triangle[2]]);
             }
         }
+        if has_appearance {
+            for i in 0..mesh.triangle_count() {
+                let mut appearance = mesh.triangle_appearance.get(i).cloned().flatten();
+                if mirrored { if let Some(a) = &mut appearance { a.reverse(); } }
+                triangle_appearance.push(appearance);
+            }
+        }
         // A colour rides with its triangle whichever way it is wound.
         if colored {
             if mesh.triangle_colors.is_empty() {
@@ -560,11 +664,13 @@ fn flatten(
     Ok(ThreeMfReadResult {
         model_part,
         unit: document.unit,
+        textures: document.textures,
         meshes,
         instances,
         positions,
         indices,
         triangle_colors,
+        triangle_appearance,
     })
 }
 

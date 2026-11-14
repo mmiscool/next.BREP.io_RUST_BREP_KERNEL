@@ -676,7 +676,7 @@ impl EngineState {
                 .ok_or_else(|| format!("replace: '{id}' is not an assembly component"))?;
             from.insert(id.clone(), info.part_name);
         }
-        let capture = self.capture_replace(component_ids);
+        let capture = self.capture_replace(component_ids)?;
 
         // The new part's library entry (added or reused), and lineage.
         let old_library = self.history.parts_library().clone();
@@ -720,15 +720,20 @@ impl EngineState {
     /// ACOMP id, or a NESTED occurrence path (`ACOMP3:ACOMP1`) for a part
     /// inside a sub-assembly (frames are then in the top occurrence's frame,
     /// which the replace does not move).
-    pub fn capture_replace(&mut self, paths: &[String]) -> ReplaceCapture {
+    ///
+    /// `Err` ([`super::ASSEMBLY_SESSION_PENDING`]) while the main-side session
+    /// is still on its way from a background runner: nothing was read.
+    pub fn capture_replace(&mut self, paths: &[String]) -> Result<ReplaceCapture, String> {
         self.capture_replace_listed(paths, &mut EntityListings::default())
     }
 
     /// [`Self::capture_replace`] reading the components' names through
     /// `listings`, which the caller can go on sharing (a part edit's nested
     /// owners sit under these same top components).
-    fn capture_replace_listed(&mut self, paths: &[String], listings: &mut EntityListings) -> ReplaceCapture {
-        self.ensure_assembly_session();
+    fn capture_replace_listed(&mut self, paths: &[String], listings: &mut EntityListings) -> Result<ReplaceCapture, String> {
+        if !self.ensure_assembly_session() {
+            return Err(super::ASSEMBLY_SESSION_PENDING.into());
+        }
         let state = parse(&brep_kernel::assembly_state_json());
         let mut affected = Vec::new();
         for entry in state["constraints"].as_array().into_iter().flatten() {
@@ -768,7 +773,7 @@ impl EngineState {
         for path in paths {
             old_names.insert(path.clone(), listings.names(path));
         }
-        ReplaceCapture { components: paths.to_vec(), affected, old_names }
+        Ok(ReplaceCapture { components: paths.to_vec(), affected, old_names })
     }
 
     /// [`Self::capture_replace`] for a PART EDIT: also the sub-assemblies' OWN
@@ -777,12 +782,12 @@ impl EngineState {
     /// [`Self::commit_part_edit`] classifies them with the rest and writes the
     /// outcome back into that document. (A replace takes the old sub-assembly's
     /// mates away with it, so it captures none.)
-    pub fn capture_part_edit(&mut self, paths: &[String]) -> ReplaceCapture {
+    pub fn capture_part_edit(&mut self, paths: &[String]) -> Result<ReplaceCapture, String> {
         // One listing per top component, shared by the components' own names
         // and every nested owner under them (a listing resolves every name
         // the component has).
         let mut listings = EntityListings::default();
-        let mut capture = self.capture_replace_listed(paths, &mut listings);
+        let mut capture = self.capture_replace_listed(paths, &mut listings)?;
         // One sub-assembly definition placed twice holds one set of mates,
         // and the same definitions below it: its subtree is walked once.
         let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
@@ -850,7 +855,7 @@ impl EngineState {
                 });
             }
         }
-        capture
+        Ok(capture)
     }
 
     /// Write a part edit's outcome for the sub-assemblies' OWN mates into
@@ -1101,6 +1106,11 @@ impl EngineState {
         if self.run_pending() || self.applied_generation < pending.generation {
             return;
         }
+        // The statuses are read off the main-side session: until its copy
+        // lands, the replace stays pending and this runs again next pump.
+        if !self.ensure_assembly_session() {
+            return;
+        }
         let pending = self.replace_pending.take().expect("checked above");
         // The run that landed must be the replace's own document: an undo (or
         // any document change) before it landed means there is nothing of
@@ -1117,7 +1127,6 @@ impl EngineState {
             self.last_replace_report = None;
             return;
         }
-        self.ensure_assembly_session();
         let statuses = parse(&brep_kernel::assembly_statuses_json());
         // A sub-assembly's own mates report on the instance, namespaced.
         let nested = parse(&brep_kernel::assembly_dof_json())["nestedConstraints"].clone();
@@ -1326,19 +1335,27 @@ impl EngineState {
     /// The named faces and edges of an occurrence path (`ACOMP3` or a nested
     /// `ACOMP3:ACOMP1`), each with its frame in the TOP occurrence's local
     /// space: what a held mate's suggestion is chosen from.
-    pub fn occurrence_entities(&mut self, path: &str) -> Vec<Value> {
-        self.ensure_assembly_session();
-        entities_of(path)
+    ///
+    /// `Err` ([`super::ASSEMBLY_SESSION_PENDING`]) while the session is on its way.
+    pub fn occurrence_entities(&mut self, path: &str) -> Result<Vec<Value>, String> {
+        if !self.ensure_assembly_session() {
+            return Err(super::ASSEMBLY_SESSION_PENDING.into());
+        }
+        Ok(entities_of(path))
     }
 
     /// Resolve namespaced refs against the live assembly (frames in the
     /// owning top occurrence's local space; `{ref, ok, geom, point, …}` rows).
-    pub fn resolve_refs(&mut self, refs: &[String]) -> Vec<Value> {
-        self.ensure_assembly_session();
-        parse(&brep_kernel::assembly_resolve_refs_json(&serde_json::to_string(refs).unwrap_or_default()))
+    ///
+    /// `Err` ([`super::ASSEMBLY_SESSION_PENDING`]) while the session is on its way.
+    pub fn resolve_refs(&mut self, refs: &[String]) -> Result<Vec<Value>, String> {
+        if !self.ensure_assembly_session() {
+            return Err(super::ASSEMBLY_SESSION_PENDING.into());
+        }
+        Ok(parse(&brep_kernel::assembly_resolve_refs_json(&serde_json::to_string(refs).unwrap_or_default()))
             .as_array()
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     /// The last replace's report (`null` while its run is in flight or when

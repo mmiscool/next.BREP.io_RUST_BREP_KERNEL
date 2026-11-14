@@ -239,6 +239,17 @@ fn solve_side(
     if guard && uv[0].is_finite() && uv[1].is_finite() && at_pole(surface, uv, reference) {
         return Err(rail_to_pole());
     }
+    // A rail pinned to the chamfer's own line (a distance and an angle) has no
+    // point to converge on where that line never reaches the face: 1 down a
+    // post under a ball of radius 5 at 30° or more passes the ball by. That is
+    // a property of the request, not of the solve, and is named as one.
+    if matches!(pin, Pin::Ray { .. }) {
+        return Err(unsupported(
+            "setback_line_misses_face",
+            "asymmetric chamfer: at this distance and angle the chamfer's line meets no point of the other face that \
+             the section solve can reach from the edge (it did not converge on one) — refusing",
+        ));
+    }
     Err(KernelRefusal::non_convergence(
         KernelStage::Refine,
         "setback_station",

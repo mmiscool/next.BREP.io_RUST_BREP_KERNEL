@@ -240,6 +240,7 @@ pub(crate) fn clear() {
     BOUNDED_TERMS.with(|memo| memo.borrow_mut().clear());
     FOLD_TERMS.with(|memo| { if let Some(memo) = memo.borrow_mut().as_mut() { memo.clear(); } });
     crate::heal::clear_claim_memo();
+    crate::face_merge::clear_decline_memo();
     crate::boolean::clear_candidate_memo();
     crate::imprint::clear_window_memo();
     crate::imprint::clear_touch_memo();

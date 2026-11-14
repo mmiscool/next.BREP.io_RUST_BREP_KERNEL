@@ -36,9 +36,7 @@ impl FitCacheScope {
         Self::open_limit(enabled, switch!("BREP_IMPRINT_PCURVE_CACHE_ROLLOVER", false),
             if crate::pcurve::larger_working_set() { 512 } else { 256 })
     }
-    pub(super) fn open_config(enabled: bool, rollover: bool) -> Self {
-        Self::open_limit(enabled, rollover, 256)
-    }
+
     pub(super) fn open_limit(enabled: bool, rollover: bool, limit: usize) -> Self {
         let depth = CACHES.with(|stack| {
         let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::LOOKUP);

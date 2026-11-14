@@ -59,7 +59,7 @@ pub(super) fn winding_band_integral_with(
 ) -> Result<Option<Vec<f64>>, String> {
     static POLE_GAUGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let pole_gauge = *POLE_GAUGE.get_or_init(|| {
-        std::env::var("BREP_MASS_SPHERE_POLE_GAUGE").as_deref() == Ok("1")
+        std::env::var("BREP_MASS_SPHERE_POLE_GAUGE").as_deref() != Ok("0")
     });
     winding_band_integral_with_pole_gauge(face, kinds, refine, pole_gauge)
 }
@@ -182,7 +182,7 @@ fn winding_loops_integral_oriented(
     let mut rules = rule::SurfaceRules::new(&face.surface)?;
     for loop_record in &face.loops {
         let mut joins = Vec::new();
-        if switch!("BREP_MASS_TRIM_JOINS", false) {
+        if switch!("BREP_MASS_TRIM_JOINS", true) {
             for (index, coedge) in loop_record.coedges.iter().enumerate() {
                 let next = &loop_record.coedges[(index + 1) % loop_record.coedges.len()];
                 let end = coedge.pcurve.evaluate(coedge.pcurve.domain()?[1])?;

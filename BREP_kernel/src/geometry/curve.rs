@@ -1596,14 +1596,6 @@ pub(crate) fn bezier_decompose_raw<T: Copy>(knots: &[f64], points: &[T], degree:
     Some(spans)
 }
 
-/// Homogeneous Bezier spans; callers requiring a particular certificate arithmetic
-/// path may use `bezier_decompose_raw` or retain repeated insertion.
-pub(crate) fn bezier_decompose(curve: &NurbsCurve) -> Option<Vec<Vec<Vec4>>> {
-    bezier_decompose_raw(&curve.knots, &curve.control_points, curve.degree,
-        Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 },
-        |a, b, alpha| a.scale(alpha).add(b.scale(1.0 - alpha)))
-}
-
 /// One raw Boehm insertion. Span selection and the denominator policy belong
 /// to the caller, as does the interpolation expression's operand order.
 pub(crate) fn boehm_insert_raw<T: Copy>(

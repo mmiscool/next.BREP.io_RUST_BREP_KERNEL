@@ -1,6 +1,6 @@
-//! The host protocol. A host owns an app instance and answers commands; the
-//! server talks to it through [`HostHandle`] — a tokio channel in, a oneshot
-//! per reply out — so async tool handlers never block.
+//! The host protocol. A host owns an app instance and answers
+//! commands; the server talks to it through [`HostHandle`] — a tokio channel
+//! in, a oneshot per reply out — so async tool handlers never block.
 //!
 //! Two kinds of host exist, and [`Backend`] is how a server is told which one
 //! it has: a *spawning* backend builds an app per session (BREP_mcp's headless

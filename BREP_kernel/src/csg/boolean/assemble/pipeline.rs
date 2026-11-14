@@ -16,6 +16,11 @@ pub(in crate::boolean) struct AssemblyScope {
     /// whose geometry the acceptance passes read. A face outside this set is
     /// an operand's face carried through unchanged, with every vertex it
     /// stands on shared only with faces carried through the same way.
+    /// Under `touch::changed_ring_on` the ring is narrower: a neighbour
+    /// joins only through a vertex of a touched face where an edge the
+    /// operation made ends. At every other vertex each incident edge is an
+    /// operand's own, bit for bit, so a neighbour standing only on such
+    /// vertices meets the touched face exactly as it did in the operand.
     pub(in crate::boolean) examined: HashSet<u64>,
     /// Result face id → the operand its fragment came from.
     pub(in crate::boolean) operand_of: HashMap<u64, u8>,
@@ -27,6 +32,7 @@ impl AssemblyScope {
         shells: &[ShellRecord],
         edges: &[EdgeRecord],
         aliases: &HashMap<u64, u64>,
+        operand_edges: Option<&HashSet<[u64; 2]>>,
     ) -> Self {
         let canonical = |mut id: u64| {
             while let Some(&next) = aliases.get(&id) {
@@ -64,14 +70,63 @@ impl AssemblyScope {
                 }
             }
         }
+        // The vertices an edge the operation made ends at; None: every vertex.
+        let changed: Option<HashSet<u64>> = operand_edges.map(|held| {
+            edges
+                .iter()
+                .filter(|edge| !held.contains(&crate::boolean::touch::edge_content(edge)))
+                .flat_map(|edge| [canonical(edge.start_vertex_id), canonical(edge.end_vertex_id)])
+                .collect()
+        });
         let mut examined = touched.clone();
         for face_id in &touched {
             for vertex in face_vertices.get(face_id).map(Vec::as_slice).unwrap_or(&[]) {
+                if changed.as_ref().is_some_and(|changed| !changed.contains(vertex)) {
+                    continue;
+                }
                 examined.extend(vertex_faces.get(vertex).into_iter().flatten().copied());
             }
         }
+        if crate::profile::profile_enabled() {
+            profile_line!(
+                "assemble.scope faces={} touched={} examined={} changed_vertices={}",
+                origins.len(),
+                touched.len(),
+                examined.len(),
+                changed.as_ref().map_or(-1, |changed| changed.len() as i64)
+            );
+        }
         Self { touched, examined, operand_of }
     }
+}
+
+/// The faces the edge passes changed: every face using a moved vertex's edge
+/// or a rebuilt edge, and every face holding a replaced trim.
+fn changed_faces(
+    solid: &BrepSolid,
+    settled: &[super::vertices::VertexMove],
+    rebuilt: &[super::edges::ReplacedEdge],
+    trims: &[&[super::joints::ReplacedTrim]],
+) -> HashSet<u64> {
+    let moved: HashSet<u64> = settled.iter().map(|item| item.vertex_id).collect();
+    let mut edges: HashSet<u64> = rebuilt.iter().map(|item| item.edge_id).collect();
+    edges.extend(settled.iter().flat_map(|item| item.edges.iter().map(|edge| edge.0)));
+    edges.extend(
+        solid.edges.iter().filter(|edge| moved.contains(&edge.start_vertex_id) || moved.contains(&edge.end_vertex_id)).map(|edge| edge.id),
+    );
+    let ids: Vec<u64> = solid.shells.iter().flat_map(|shell| &shell.faces).map(|face| face.id).collect();
+    let mut faces = HashSet::default();
+    for item in trims.iter().flat_map(|list| list.iter()) {
+        let (face, edge) = item.changed();
+        faces.extend(ids.get(face).copied());
+        edges.extend(edge);
+    }
+    for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+        if face.loops.iter().flat_map(|loop_record| &loop_record.coedges).any(|coedge| edges.contains(&coedge.edge_id)) {
+            faces.insert(face.id);
+        }
+    }
+    faces
 }
 
 fn assemble_fragments_impl(
@@ -337,8 +392,8 @@ fn assemble_fragments_impl(
             faces,
         })
         .collect::<Vec<_>>();
-    let scope = touch.map(|_| {
-        AssemblyScope::build(&origins, &shells, &assembler.edges, &assembler.vertex_aliases)
+    let mut scope = touch.map(|_| {
+        AssemblyScope::build(&origins, &shells, &assembler.edges, &assembler.vertex_aliases, touch.and_then(|touch| touch.operand_edges.as_ref()))
     });
     // The geometry checks of a scoped validation read the examined faces
     // only; every structural check still reads the whole solid.
@@ -895,7 +950,7 @@ fn assemble_fragments_impl(
         // validator then disagrees with is put back whole.
         let stage_started = Instant::now();
         let mut pass_started = Instant::now();
-        let mut pass_ms = |label: &str, pass_started: &mut Instant| {
+        let pass_ms = |label: &str, pass_started: &mut Instant| {
             if profile {
                 profile_line!("assemble.edges.{label}_ms={:.2}", pass_started.elapsed().as_secs_f64() * 1_000.0);
                 *pass_started = Instant::now();
@@ -914,9 +969,27 @@ fn assemble_fragments_impl(
             std::env::var("BREP_INHERITED_TRIM_REFIT").as_deref() != Ok("0"), examined_faces, Some(&separated))?;
         pass_ms("inherited", &mut pass_started);
         if !rebuilt.is_empty() || !settled.is_empty() || !trims.is_empty() || !inherited.is_empty() {
-            let after = validate_in(&solid);
+            // Under the changed ring the gate also reads every face these
+            // passes changed: they run on the whole solid, so a face outside
+            // the ring can hold a rebuilt edge or a refitted trim. A kept
+            // change makes its faces examined from here on.
+            let widened = match &scope {
+                Some(scope) if crate::boolean::touch::changed_ring_on() => {
+                    let mut faces = scope.examined.clone();
+                    faces.extend(changed_faces(&solid, &settled, &rebuilt, &[&trims, &inherited]));
+                    Some(faces)
+                }
+                _ => None,
+            };
+            let after = match &widened {
+                Some(faces) => solid.validate_scoped(faces),
+                None => validate_in(&solid),
+            };
             let count = rebuilt.len();
             if after.is_empty() {
+                if let (Some(scope), Some(faces)) = (&mut scope, widened) {
+                    scope.examined = faces;
+                }
                 if std::env::var("BREP_DEBUG_BOOL").is_ok() {
                     eprintln!("boolean assembly settled {} vertices and reconstructed {count} edges from their planar trims; {} inherited trims refit", settled.len(), inherited.len());
                 }
@@ -1205,3 +1278,4 @@ fn tangent_material_side(
     let side = outward.cross(travel);
     (side.length() > 1e-9).then(|| side.normalized().ok()).flatten()
 }
+

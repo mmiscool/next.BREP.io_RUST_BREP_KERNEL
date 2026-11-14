@@ -1927,33 +1927,6 @@ fn weld_positions(positions: &[f64], weld: f64) -> Vec<u32> {
     representative
 }
 
-/// Signed distances of a triangle's corners to `surface`, reduced to the
-/// smaller of the two one-sided margins: positive means the corners genuinely
-/// sit on both sides of the carrier by at least that much, zero means they do
-/// not straddle it at all. `None` when a projection or a normal could not be
-/// evaluated — never a verdict.
-///
-/// Three projections, and only for a triangle pair that already survived the
-/// BVH, the welded-vertex skip and the mesh crossing test.
-fn straddle(surface: &NurbsSurface, triangle: &[Vec3; 3], band: f64) -> Option<f64> {
-    let mut above = 0.0f64;
-    let mut below = 0.0f64;
-    for corner in triangle {
-        let projection = project_point_to_surface(surface, *corner).ok()?;
-        if projection.distance <= band {
-            continue;
-        }
-        let normal = surface.normal(projection.u, projection.v).ok()?;
-        let normal = normal.normalized().ok()?;
-        let signed = corner.sub(projection.point).dot(normal);
-        if signed > 0.0 {
-            above = above.max(signed);
-        } else {
-            below = below.max(-signed);
-        }
-    }
-    Some(above.min(below))
-}
 
 /// `BREP_SCAN_NODE_MEMBERSHIP=0` restores the pre-2026-10-03 verdict, where a
 /// tessellation node's side of the other carrier counted whether or not the
@@ -2037,10 +2010,10 @@ fn footprint_material(face: &FaceRecord, point: Vec3) -> Option<bool> {
     }
 }
 
-/// [`straddle`] over the corners `own_face` OWNS: a corner outside its own
+/// `straddle` over the corners `own_face` OWNS: a corner outside its own
 /// trim ([`node_material`] `Some(false)`) contributes no side; a corner whose
 /// membership cannot be evaluated makes the whole reading `None`. With every
-/// corner a member this is exactly [`straddle`].
+/// corner a member this is exactly `straddle`.
 fn straddle_material(
     own_face: &FaceRecord,
     other: &NurbsSurface,
@@ -2110,7 +2083,7 @@ fn signed_distance(surface: &NurbsSurface, point: Vec3) -> Option<f64> {
 /// The SECOND confirmation, and the one a PLANAR face passing through a curved
 /// one needs.
 ///
-/// [`straddle`] reads a triangle's OWN CORNERS, and a planar face is
+/// `straddle` reads a triangle's OWN CORNERS, and a planar face is
 /// tessellated as the two triangles its rectangle needs. When such a face
 /// passes through a cylinder every one of those corners is OUTSIDE the
 /// cylinder, so the corner test reads a one-sided margin of zero and REJECTS a
@@ -2124,7 +2097,7 @@ fn signed_distance(surface: &NurbsSurface, point: Vec3) -> Option<f64> {
 ///    (segment-triangle intersection, with a barycentric margin, so two
 ///    triangles meeting along a shared boundary are never a pierce).
 /// 2. That edge's two ENDPOINTS straddle the pierced face's carrier — the same
-///    signed-distance question [`straddle`] asks of a triangle's corners,
+///    signed-distance question `straddle` asks of a triangle's corners,
 ///    restricted to the two points that bracket the pierce.
 /// 3. Two points ON the pierced triangle, either side of the two triangles'
 ///    crossing line and inside that triangle, straddle the PIERCING face's
@@ -4175,6 +4148,8 @@ pub(crate) fn shell_vector_areas_with_budget(solid: &BrepSolid, span_budget: usi
 /// which budget the reader can raise (the environment's for the public
 /// entry, the caller's for an explicit one).
 fn shell_vector_areas_scan(solid: &BrepSolid, span_budget: usize, advice: &str) -> VectorAreaReport {
+    let extension_partials = crate::switch!("BREP_MASS_EXTENSION_PARTIALS", true);
+    let trim_basis = crate::switch!("BREP_MASS_TRIM_BASIS", true);
     let mut report = VectorAreaReport {
         shells: Vec::new(),
         unreadable: Vec::new(),
@@ -4318,6 +4293,9 @@ fn shell_vector_areas_scan(solid: &BrepSolid, span_budget: usize, advice: &str) 
             let mut face_length = 0.0;
             let mut face_gap = 0.0;
             let mut failed = false;
+            let prepared_trim = if trim_basis {
+                crate::surface::PreparedTrimPartials::new(&face.surface).ok().flatten()
+            } else { None };
             for loop_record in &face.loops {
                 // A loop is walked as a CLOSED curve: each coedge's own
                 // integral, plus the straight chord from where the previous
@@ -4344,7 +4322,13 @@ fn shell_vector_areas_scan(solid: &BrepSolid, span_budget: usize, advice: &str) 
                     // the domain boundary and manufacture a residual.
                     let on_trim = |parameter: f64| -> Result<(Vec3, Vec3), String> {
                         let (uv, duv) = coedge.pcurve.deriv1(parameter)?;
-                        let (point, su, sv) = face.surface.deriv1_extended(uv.x, uv.y)?;
+                        let (point, su, sv) = if let Some(prepared) = &prepared_trim {
+                            prepared.deriv1(uv.x,uv.y)?
+                        } else if extension_partials {
+                            face.surface.deriv1_extended_trim(uv.x,uv.y)?
+                        } else {
+                            face.surface.deriv1_extended(uv.x,uv.y)?
+                        };
                         Ok((point, su.scale(duv.x).add(sv.scale(duv.y))))
                     };
                     let mut note = |message: String| {

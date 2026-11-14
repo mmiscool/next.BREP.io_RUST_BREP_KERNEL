@@ -551,43 +551,6 @@ fn volume_reference_trace(before: &Option<HashMap<u64, ShellTraceRead>>, after: 
     }
 }
 
-/// Run the challenger, reading the `BREP_INHERITED_TRIM_REFIT` hatch.
-pub(in crate::boolean) fn challenge_inherited_trims(
-    solid: &mut BrepSolid,
-    tolerance: f64,
-    boundary: &HashMap<u64, (u8, u64)>,
-    constructed: &HashSet<u64>,
-) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
-    challenge_inherited_trims_in(solid, tolerance, boundary, constructed, None)
-}
-
-/// [`challenge_inherited_trims`] over the edges with a use on a face in
-/// `scope` (`None` reads every edge): a boolean passes the faces it touched
-/// and their neighbours.
-pub(in crate::boolean) fn challenge_inherited_trims_in(
-    solid: &mut BrepSolid,
-    tolerance: f64,
-    boundary: &HashMap<u64, (u8, u64)>,
-    constructed: &HashSet<u64>,
-    scope: Option<&HashSet<u64>>,
-) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
-    let enabled = std::env::var("BREP_INHERITED_TRIM_REFIT").as_deref() != Ok("0");
-    challenge_inherited_trims_with(solid, tolerance, boundary, constructed, enabled, scope)
-}
-
-/// [`challenge_inherited_trims`] with the hatch's value passed in. Returns
-/// every replaced trim, for the stage's restore. Never refuses: every unread
-/// reading declines.
-pub(super) fn challenge_inherited_trims_with(
-    solid: &mut BrepSolid,
-    tolerance: f64,
-    boundary: &HashMap<u64, (u8, u64)>,
-    constructed: &HashSet<u64>,
-    enabled: bool,
-    scope: Option<&HashSet<u64>>,
-) -> Result<Vec<ReplacedTrim>, KernelRefusal> {
-    challenge_inherited_trims_scoped(solid, tolerance, boundary, constructed, enabled, scope, None)
-}
 
 /// Distant edges may reuse a clean content reading, but an unseen or changed
 /// imported trim must still be challenged. Distance alone certifies no repair.

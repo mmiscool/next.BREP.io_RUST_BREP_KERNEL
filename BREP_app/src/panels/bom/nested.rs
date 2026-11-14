@@ -14,7 +14,7 @@
 //!   of them, so the cell is shown read-only with that reason as its tooltip
 //!   (never blank).
 use super::{FLAGS_KEY, ITEM_KEY, QUANTITY_KEY, VISIBLE_KEY};
-use crate::column_tree::{RowAction, RowNode};
+use crate::column_tree::RowNode;
 use crate::panels::assembly_components::{is_acomp_segment, ChainNode};
 use crate::panels::bom_columns::{BomColumn, Scope};
 use brep_render::engine_state::EngineState;
@@ -53,8 +53,6 @@ pub(crate) struct NestedCtx<'a> {
     pub visible_under: &'a HashMap<String, bool>,
     /// The nested lines the user opened (`BomPanel::opened`); the rest draw folded.
     pub opened: &'a HashSet<String>,
-    /// The assembly's own placements' part names (use counts).
-    pub root_parts: &'a [String],
     /// The assembly's parts library.
     pub library: &'a Value,
     pub lines: &'a mut HashMap<String, NestedLine>,

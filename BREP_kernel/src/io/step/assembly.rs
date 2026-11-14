@@ -113,6 +113,12 @@ pub struct StepExportOccurrence {
     /// or scaled instance has no `AXIS2_PLACEMENT_3D` and is rejected rather
     /// than silently written as its rotation part.
     pub placement: Mat4,
+    /// This instance's own colour, over its part's: written as a
+    /// `CONTEXT_DEPENDENT_OVER_RIDING_STYLED_ITEM` on each of the child's own
+    /// solids in this occurrence's context. Only a child that carries solids
+    /// of its own takes one (a sub-assembly instance's colour would need a
+    /// path of occurrences as its context, which is not written).
+    pub color: Option<[u8; 3]>,
 }
 
 /// A document's product structure, ready to write. Exactly one product must be
@@ -400,6 +406,7 @@ pub fn export_step_assembly_report(
     // off (step 7), and the entity a reader tells "this instance" from "this
     // part" by.
     let mut nauo_shapes: Vec<usize> = Vec::with_capacity(assembly.occurrences.len());
+    let mut relationships: Vec<usize> = Vec::with_capacity(assembly.occurrences.len());
     for (slot, occurrence) in assembly.occurrences.iter().enumerate() {
         let parent = definitions[occurrence.parent].definition;
         let child = definitions[occurrence.child].definition;
@@ -424,6 +431,7 @@ pub fn export_step_assembly_report(
              REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#{transformation})\
              SHAPE_REPRESENTATION_RELATIONSHIP())"
         ));
+        relationships.push(relationship);
         writer.add(format!(
             "CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(#{relationship},#{nauo_shape})"
         ));
@@ -442,16 +450,73 @@ pub fn export_step_assembly_report(
     let paths = (pmi.is_some() || colors.is_some())
         .then(|| assembly.occurrence_paths(root))
         .unwrap_or_default();
+    let mut base_styles = std::collections::BTreeMap::new();
+    // The colour each item's own style was written with.
+    let mut base_written: std::collections::BTreeMap<usize, [u8; 3]> = std::collections::BTreeMap::new();
     if let Some(colors) = colors {
         let mut items = Vec::new();
         for (index, geometry) in geometries.iter().enumerate() {
             let mut prefixes: Vec<String> =
                 paths[index].iter().map(|path| path.prefix.clone()).collect();
             prefixes.sort();
-            items.extend(styles::styled_items(geometry, colors, &prefixes));
+            // A part placed only by the root: a solid's own colour is the one
+            // every instance gives it, and none where they differ, since step
+            // 6b writes each instance's own solid colour on its occurrence
+            // wherever it differs from that (so neither an uncoloured instance
+            // takes another's colour, nor a coloured one loses its own).
+            // Faces, which 6b does not write, and a part reached through a
+            // sub-assembly keep the first colour any namespace names.
+            let root_only = !paths[index].is_empty()
+                && paths[index]
+                    .iter()
+                    .all(|path| path.last.is_some_and(|slot| assembly.occurrences[slot].parent == root));
+            if root_only {
+                for (name, solid) in &geometry.solids {
+                    let mut shared = prefixes.iter().map(|prefix| colors.resolve(std::slice::from_ref(prefix), name));
+                    let first = shared.next().flatten();
+                    if let Some(rgb) = first.filter(|rgb| shared.all(|other| other == Some(*rgb))) {
+                        items.push((*solid, rgb));
+                    }
+                }
+                items.extend(styles::styled_items_split(geometry, colors, &[], &prefixes));
+            } else {
+                items.extend(styles::styled_items(geometry, colors, &prefixes));
+            }
         }
-        report.styled_items = styles::write_geometry_styles(&mut writer, geometry_context, &items)?;
+        base_styles = styles::write_geometry_styles_keyed(&mut writer, geometry_context, &items)?;
+        report.styled_items = items.len();
+        for (item, rgb) in &items {
+            base_written.entry(*item).or_insert(*rgb);
+        }
     }
+    // 6b — each occurrence's own colours, on its child's own solids: the one
+    // the caller set, on every solid; or, for an instance placed directly by
+    // the root, each solid's own colour under that instance's namespace where
+    // the part's shared geometry was written with another (or none). Step 6
+    // could give the shared geometry only its first instance's colours.
+    let mut occurrence_items: Vec<(usize, usize, [u8; 3])> = Vec::new();
+    for (slot, occurrence) in assembly.occurrences.iter().enumerate() {
+        let relationship = relationships[slot];
+        let solids = &geometries[occurrence.child].solids;
+        if let Some(rgb) = occurrence.color {
+            occurrence_items.extend(solids.iter().map(|(_, solid)| (*solid, relationship, rgb)));
+            continue;
+        }
+        let Some(colors) = colors else { continue };
+        if occurrence.parent != root {
+            continue;
+        }
+        let own = [format!("{}:", occurrence.designator)];
+        for (name, solid) in solids {
+            if let Some(rgb) = colors.resolve(&own, name) {
+                if base_written.get(solid) != Some(&rgb) {
+                    occurrence_items.push((*solid, relationship, rgb));
+                }
+            }
+        }
+    }
+    report.styled_items +=
+        styles::write_occurrence_styles(&mut writer, geometry_context, &base_styles, &occurrence_items)?;
 
     // 7a — each PART's own PMI, written into that part's product with the
     // part's own names. A part shared by six instances carries its annotations

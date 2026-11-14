@@ -194,8 +194,8 @@ impl State {
 
     /// The part that already carries `number`, compared without regard to
     /// ASCII case. A part number is unique across ALL parts, whatever type
-    /// made it: it is what an ERP, a BOM and a person reading a drawing
-    /// use to mean exactly one part.
+    /// made it: it is what an ERP, a BOM and a person
+    /// reading a drawing use to mean exactly one part.
     pub fn part_with_number(&self, number: &str) -> Option<&Part> {
         let number = number.trim();
         self.parts.iter().find(|p| p.number.eq_ignore_ascii_case(number))
@@ -1219,8 +1219,8 @@ impl Db {
     /// part currently is, never from somebody else's unfinished draft. That
     /// includes an imported part, which is revised rather than forked.
     ///
-    /// `label` is free text; empty takes the suggestion. It must not repeat a
-    /// label the part already has.
+    /// `label` is free text; empty takes the suggestion.
+    /// It must not repeat a label the part already has.
     pub fn create_revision_labelled(
         &self,
         author: &User,

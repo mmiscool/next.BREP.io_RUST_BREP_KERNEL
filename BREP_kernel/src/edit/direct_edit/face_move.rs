@@ -1504,7 +1504,31 @@ pub(super) fn resolve_corner_on_fixed_edge(
 /// its direction (moving a box face onto or past its opposite face) is
 /// refused, as is a group that tears away from its neighbours. The input is
 /// never mutated; the result is returned only when `validate()` is clean.
+///
+/// The re-solve above only ever looks at the faces the selection BORDERS, so a
+/// motion that carries it into a face it does not border — a pocket's floor
+/// through the far side of its block, a bore out through a wall — closes
+/// incidence-clean on a body that passes through itself: `validate()` is an
+/// incidence test, and the measures of such a body are wrong (the block with
+/// its pocket floor 2 past the bottom read 1712 for the through window's 1760).
+/// [`crate::accept_sound`] is that floor, on the way out of this entry: it
+/// splits and trims where the crossing can be proved (a bore carried out of a
+/// wall becomes the notch), and refuses by name where it cannot.
+/// [`move_faces_unchecked`] is the re-solve alone, for a caller that runs its
+/// own acceptance on the result.
 pub fn move_faces(
+    solid: &BrepSolid,
+    face_ids: &[u64],
+    translation: Vec3,
+) -> Result<BrepSolid, KernelRefusal> {
+    crate::accept_sound(move_faces_unchecked(solid, face_ids, translation)?, "moveFaces")
+}
+
+/// [`move_faces`] without its soundness floor: the direct re-solve, returned as
+/// soon as its incidences validate. The result can pass through itself where
+/// the motion met a face the selection does not border; the caller owes it an
+/// acceptance scan ([`crate::accept_sound`]) before it is used as a body.
+pub fn move_faces_unchecked(
     solid: &BrepSolid,
     face_ids: &[u64],
     translation: Vec3,

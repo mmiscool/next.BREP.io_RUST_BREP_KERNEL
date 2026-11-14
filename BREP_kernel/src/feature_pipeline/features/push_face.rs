@@ -48,7 +48,7 @@ use std::collections::HashSet;
 
 use crate::feature_pipeline::features::common;
 use crate::feature_pipeline::{AddedSolid, FeatureContext, FeatureRefusal, FeatureResult};
-use crate::{move_faces, AnalyticSurface, BrepSolid, Vec3};
+use crate::{move_faces_unchecked, AnalyticSurface, BrepSolid, Vec3};
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     match build(ctx) {
@@ -146,10 +146,32 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                 // Positive distance pushes ALONG the outward normal (grow);
                 // negative pushes inward (shrink).
                 let normal = planar_face_normal(&solid, *face_id)?;
-                solid = move_faces(&solid, &[*face_id], normal.scale(distance))?;
+                solid = match move_faces_unchecked(&solid, &[*face_id], normal.scale(distance)) {
+                    Ok(pushed) => pushed,
+                    // A face beside a variable-radius fillet: the push runs on
+                    // the body without the fillet, which is then re-made on the
+                    // edge the push leaves, under its radius law. Only past a
+                    // refusal, and only where such a fillet borders the face.
+                    Err(refusal) => {
+                        let without = crate::rebuild_displaced_blends(&solid, &[*face_id], "pushFace", |sharp| {
+                            let pushed = move_faces_unchecked(sharp, &[*face_id], normal.scale(distance))?;
+                            Ok((crate::accept_sound(pushed, "pushFace")?, Vec::new()))
+                        });
+                        match without {
+                            None => return Err(refusal.into()),
+                            Some(Err(decline)) => {
+                                return Err(crate::with_blend_rebuild_decline(refusal, &decline).into())
+                            }
+                            Some(Ok((pushed, notes))) => {
+                                result.notes.extend(notes);
+                                pushed
+                            }
+                        }
+                    }
+                };
             }
             FaceCarrier::Ruled => {
-                solid = match crate::offset_ruled_face(&solid, *face_id, distance) {
+                solid = match crate::offset_ruled_face_unchecked(&solid, *face_id, distance) {
                     Ok(pushed) => pushed,
                     Err(refusal) => return Err(name_unselected_sibling(&solid, *face_id, refusal).into()),
                 };

@@ -1436,15 +1436,6 @@ impl FootMemo {
         FootMemo { feet: Default::default(), transient: self.transient }
     }
 
-    /// How many feet are stored.
-    pub(in crate::blend) fn stored(&self) -> usize {
-        self.feet.len()
-    }
-
-    /// Forget every foot (the pcurve it was read for is replaced).
-    pub(in crate::blend) fn clear(&mut self) {
-        self.feet.clear();
-    }
 
     /// The foot at `t`, sought once: the rail point first (so a rail that
     /// cannot be evaluated refuses as the rail's, as the unshared reads did),
@@ -1519,30 +1510,8 @@ pub(in crate::blend) fn read_shipped_pcurve_memo(
     Ok((miss, offset, residuals.len(), worst))
 }
 
-/// How much farther the rail stands from its foot under pcurve `candidate`
-/// than under pcurve `reference`, read at the SAME rail parameters: every
-/// knot of either curve in `[d0, d1]`, j/16 of each span between them, and
-/// 513 uniform points. At each parameter the rail point is projected from
-/// each curve's own (u, v) (`foot`), and the largest excess of the
-/// candidate's standoff over the reference's is returned. A candidate on the
-/// reference's branch reads its standoff to rounding; one on another branch
-/// reads the distance between the branches. Two `read_shipped_pcurve` maxima
-/// cannot stand in for this: each samples at its own curve's knots, and
-/// where the rail's standoff peaks sharply they differ by the sampling alone
-/// (6e-7 at a 1.007e-4 peak on the 2026-09-27 offset-shell revolve). An
-/// unreadable or non-finite sample refuses (`track_fit_unreadable`).
-pub(in crate::blend) fn standoff_excess(
-    surface: &NurbsSurface,
-    rail: &dyn Fn(f64) -> Result<Vec3, String>,
-    reference: &crate::NurbsCurve,
-    candidate: &crate::NurbsCurve,
-    d0: f64,
-    d1: f64,
-) -> Result<f64, KernelRefusal> {
-    standoff_excess_memo(surface, rail, reference, candidate, d0, d1, &mut FootMemo::default(), &mut FootMemo::default())
-}
 
-/// [`standoff_excess`] with the reference's and the candidate's feet shared
+/// `standoff_excess` with the reference's and the candidate's feet shared
 /// through their memos (each the memo of that pcurve against `rail`).
 pub(in crate::blend) fn standoff_excess_memo(
     surface: &NurbsSurface,
@@ -1582,28 +1551,8 @@ pub(in crate::blend) fn standoff_excess_memo(
     Ok(excess)
 }
 
-/// How much farther the rail stands from its foot under pcurve `candidate`
-/// than from its NEAREST point on `surface` (the kernel's global nearest-point
-/// projector), read at every knot of `candidate` in `[d0, d1]` and 513
-/// uniform points: the rail's own deviation from its carrier, read
-/// independently of any trim, as the absolute bound a shipped support trim is
-/// held to. A trim on the rail's branch reads its foot at the nearest point
-/// (excess at rounding); a trim on another branch -- even one the march's own
-/// trim shares, which a comparison with that trim cannot see -- reads the
-/// distance between the branches. Where the carrier comes back nearer than
-/// the rail's own branch the excess is real distance too, and refuses. An
-/// unreadable or non-finite sample refuses (`track_fit_unreadable`).
-pub(in crate::blend) fn standoff_over_nearest(
-    surface: &NurbsSurface,
-    rail: &dyn Fn(f64) -> Result<Vec3, String>,
-    candidate: &crate::NurbsCurve,
-    d0: f64,
-    d1: f64,
-) -> Result<f64, KernelRefusal> {
-    standoff_over_nearest_memo(surface, rail, candidate, d0, d1, &mut FootMemo::default())
-}
 
-/// [`standoff_over_nearest`] with the candidate's feet shared through `memo`
+/// `standoff_over_nearest` with the candidate's feet shared through `memo`
 /// (the memo of `candidate` against `rail`); the nearest-point projection is
 /// this read's own.
 pub(in crate::blend) fn standoff_over_nearest_memo(
@@ -1638,24 +1587,8 @@ pub(in crate::blend) fn standoff_over_nearest_memo(
 /// j/16, j = 1..15 — the midpoint `fit_track` checks and the quarters among them.
 const LOCAL_STENCIL: usize = 16;
 
-/// The local-repair verdict on a returned pcurve: the curve's own foot at
-/// every stencil point of every track interval (projected from that interval's
-/// left foot, as `fit_track`'s checks are) against the pcurve pushed through
-/// the surface. Returns the classified miss and the intervals with any point
-/// over `tolerance`, and where the largest reading sits (the fraction of the
-/// stencil point and its interval) -- the STENCIL's own worst, which is what a
-/// caller that reports the stencil miss must name, not a midpoint's.
-fn stencil_verdict(
-    surface: &NurbsSurface,
-    track: &Track,
-    at: &dyn Fn(f64) -> Result<Vec3, String>,
-    curve: &NurbsCurve,
-    tolerance: f64,
-) -> Result<(f64, Vec<usize>, Option<WorstCheck>, Vec<(f64, f64, f64, f64)>), KernelRefusal> {
-    stencil_verdict_cached(surface, track, at, curve, tolerance, None)
-}
 
-/// [`stencil_verdict`] reading its carrier points through `cache`.
+/// `stencil_verdict` reading its carrier points through `cache`.
 fn stencil_verdict_cached(
     surface: &NurbsSurface,
     track: &Track,
@@ -1753,7 +1686,7 @@ fn stencil_verdict_cached(
     Ok((miss, over, worst.map(|(_, at)| at), located))
 }
 
-/// [`fit_track`]; a fit on the floor that ALSO passes [`stencil_verdict`] is
+/// [`fit_track`]; a fit on the floor that ALSO passes `stencil_verdict` is
 /// returned exactly as `fit_track` returned it. A fit on the floor by its
 /// midpoint checks alone is not trusted with that: on the 20-degree crossing's
 /// mirrored single closed exit edge the top rung read 9.898e-8 at its
@@ -1761,7 +1694,7 @@ fn stencil_verdict_cached(
 /// (fraction 0.7189; c1a4e971c + the section-fit fix), and nothing read it
 /// until the shipped curve was. Such a fit, and every fit off the floor, takes
 /// LOCAL REPAIR: every fit this path returns is judged on
-/// [`stencil_verdict`] — the maximum over 15 points of every final interval,
+/// `stencil_verdict` — the maximum over 15 points of every final interval,
 /// not the midpoint alone — and the intervals that verdict finds over
 /// `tolerance` (with those the midpoint checks found) take one sample each
 /// ([`refine_track_intervals`]), for up to `rounds` rounds while the track

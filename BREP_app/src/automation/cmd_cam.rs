@@ -5,7 +5,7 @@
 //! person does. Generation, dialogs and target picking arrive with their rows
 //! (lane C1 rows 3-7); until then `cam_generate` says so rather than
 //! succeeding at nothing.
-use crate::automation::command::{app_command, parse_args, schema_of, CommandSpec, Ctx, Empty, NoArgs, Outcome};
+use crate::automation::command::{app_command, parse_args, schema_of, CommandSpec, Ctx, NoArgs, Outcome};
 use crate::automation::cmd_document::parse;
 use crate::panels::cam;
 use serde::{Deserialize, Serialize};

@@ -250,6 +250,10 @@ pub fn import_step_with_appearance(
 pub struct StepImportReport {
     /// One solid per body that reconstructed, in file order.
     pub solids: Vec<BrepSolid>,
+    /// The file's presentation colours, one per solid in the same order
+    /// (default where the file styles nothing), as
+    /// [`import_step_with_appearance`] returns them.
+    pub appearances: Vec<BodyAppearance>,
     /// Things that did not come in (skipped, not fatal): a body that failed to
     /// reconstruct, an occurrence whose transform failed, or a mapping that was
     /// refused (`mapped::StepMappedItemError`).
@@ -446,6 +450,7 @@ pub fn import_step_report(text: &str) -> Result<StepImportReport, String> {
     diagnostics.count_n(SHEETS_SKIPPED, imported.sheets_skipped as u64);
     Ok(StepImportReport {
         solids: imported.solids,
+        appearances: imported.appearances,
         failed: imported.failed,
         first_error: imported.first_error,
         refused: imported.refused_bodies,

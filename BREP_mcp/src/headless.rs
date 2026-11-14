@@ -286,11 +286,17 @@ pub fn spawn(cfg: impl Into<HeadlessConfig>) -> Result<HostHandle, String> {
             }
         })
         .map_err(|e| format!("spawn host thread: {e}"))?;
-    match ready_rx.recv() {
-        Ok(Ok(info)) => Ok(HostHandle::new(tx, info, join)),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err("the host thread ended before the app was ready".into()),
-    }
+    // A start that failed has no handle to stop it by: its thread is on its
+    // way out, releasing the app and its graphics device, and is joined here
+    // so that it has finished before the caller goes on (and never runs
+    // beside the process's own exit).
+    let failed = match ready_rx.recv() {
+        Ok(Ok(info)) => return Ok(HostHandle::new(tx, info, join)),
+        Ok(Err(e)) => e,
+        Err(_) => "the host thread ended before the app was ready".to_string(),
+    };
+    let _ = join.join();
+    Err(failed)
 }
 
 /// The harness's state is [`Annotated`] — `BrepApp` plus the docs-annotation

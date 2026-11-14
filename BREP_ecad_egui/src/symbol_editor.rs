@@ -1,5 +1,5 @@
 use super::*;
-use crate::editor_core::{EditorCore, WindowEditor, WindowSpec, editor_window};
+use crate::editor_core::EditorCore;
 use crate::actions::{Action, ActionGroup, action, command, key};
 use brep_ecad_core::Pin;
 
@@ -233,13 +233,6 @@ pub struct SymbolEditor {
     /// height it takes from the pane.
     list_height: Option<f32>,
 }
-impl WindowEditor for SymbolEditor {
-    fn toolbar(&mut self, ui: &mut egui::Ui) { SymbolEditor::toolbar(self, ui); }
-    fn properties(&mut self, ui: &mut egui::Ui) { SymbolEditor::properties(self, ui); }
-    fn canvas(&mut self, ui: &mut egui::Ui, size: Vec2) { SymbolEditor::canvas(self, ui, size); }
-    fn validate(&self) -> Result<(), String> { SymbolEditor::validate(self) }
-    fn error(&mut self) -> &mut String { &mut self.error }
-}
 impl SymbolEditor {
     pub fn new(symbol: Symbol, target: Option<Uuid>) -> Self {
         Self {
@@ -470,26 +463,13 @@ impl SymbolEditor {
     fn undo(&mut self) {
         self.core.undo(&mut self.symbol);
     }
-    /// Undo or redo for the keyboard or a host, unless a drag is still recording.
-    pub(crate) fn step_history(&mut self, key: HistoryKey) {
-        self.core.step_history(&mut self.symbol, key);
-    }
     pub(crate) fn can_step_history(&self, key: HistoryKey) -> bool {
         self.core.can_step_history(key)
     }
     fn redo(&mut self) {
         self.core.redo(&mut self.symbol);
     }
-    fn validate(&self) -> Result<(), String> {
-        if self.symbol.library_id.trim().is_empty()
-            || self.symbol.reference_prefix.trim().is_empty()
-        {
-            return Err("Enter a symbol name and reference prefix.".into());
-        }
-        let mut d = Document::default();
-        d.place_unbound(self.symbol.clone(), Point::new(0, 0), 0);
-        d.validate()
-    }
+
     /// The tool buttons, history, and zoom, with a line on the tool in use.
     pub fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
@@ -524,23 +504,7 @@ impl SymbolEditor {
             crate::actions::run_shortcuts(self, &actions, ctx);
         }
     }
-    /// The editor in a window of its own, with Apply and Cancel for the standalone app.
-    /// Returns Some(true) on Apply, Some(false) on Cancel or close.
-    pub(crate) fn window(&mut self, ctx: &egui::Context) -> Option<bool> {
-        // While this window is open the keyboard history is its own.
-        self.run_shortcuts(ctx);
-        let hint = if self.target.is_some() {
-            "Updates this component and the session library."
-        } else {
-            "Adds or updates this symbol in the session library."
-        };
-        editor_window(self, ctx, WindowSpec {
-            title: "Symbol editor", id: "symbol_editor",
-            default_size: Vec2::new(960., 660.), min_size: Vec2::new(640., 450.),
-            inspector_width: 220., apply: "Apply symbol", hint,
-            measure_canvas_after_inspector: true,
-        })
-    }
+
     /// The symbol's name and the selected item's fields: the Inspector. It
     /// scrolls as a whole, so nothing at its foot is lost below a short pane,
     /// and it records where each of its widgets is for [`Self::hits`].

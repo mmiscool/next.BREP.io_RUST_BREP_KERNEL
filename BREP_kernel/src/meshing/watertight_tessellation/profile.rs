@@ -102,7 +102,6 @@ pub(in crate::watertight_tessellation) struct TessProfile {
 /// line's `route=` value; `name` is printed beside it.
 #[derive(Clone, Copy)]
 pub(in crate::watertight_tessellation) enum Route {
-    None = 0,
     SphereAtlas = 1,
     PolePatch = 2,
     RecutWall = 3,
@@ -391,7 +390,6 @@ pub(in crate::watertight_tessellation) enum Stage {
     Host,
     Bridge,
     Cdt,
-    EarClip,
     Certify,
     Simple,
     AngleGate,
@@ -431,7 +429,6 @@ impl Drop for StageTimer {
             Stage::Host => tess_profile(|p| p.host_ms += ms),
             Stage::Bridge => tess_profile(|p| p.bridge_ms += ms),
             Stage::Cdt => tess_profile(|p| p.cdt_ms += ms),
-            Stage::EarClip => tess_profile(|p| p.earclip_ms += ms),
             Stage::Certify => tess_profile(|p| p.certify_ms += ms),
             Stage::Simple => tess_profile(|p| p.simple_ms += ms),
             Stage::AngleGate => tess_profile(|p| p.angle_gate_ms += ms),

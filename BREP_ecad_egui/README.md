@@ -63,13 +63,24 @@ list of parts the host offers to place.
 - `Action`, `ActionGroup`, `actions()` — every command the editor can perform,
   named and grouped, so a host builds its toolbar, menus and automation from
   one list rather than hard-coding button ids.
-- `View`, `BoardTool`, `BoardSelection` — the board editor.
-- `SymbolEditor` and `symbol_actions()` — the symbol editor.
+  `Editor::run_action(id)` runs one by id, as a click on its button does.
+- `View`, `BoardTool`, `BoardSelection` — the board editor (`Editor::set_view`
+  switches between the sheet and the board).
+- `Editor::erc_state` — whether the electrical rule check in the editor's
+  connectivity panel has run, and its findings.
+- `SymbolEditor` and `symbol_actions()` — the symbol editor; `PinPoints`
+  hands it the connection point the host binds to each pin, to show beside it.
 - `FootprintEditor` and `pad_actions()` — the pads (footprint) editor.
+- `power_symbol`, `POWER_NETS`, `is_ground` — the power symbols the Power tool
+  places.
+- `keys_reach_editor` — whether keyboard input should go to an editor this
+  frame (no text field, popup or modal has it).
+- `widgets::enum_dropdown` — the dropdown the editors' panels use for an
+  enumeration, with its hit rectangles keyed for automation.
 
-The editors stroke their own geometry with a small fixed palette, so they take
-the host's theme and stay legible in light and dark without a texture or font
-of their own.
+The sheet, board, symbol and footprint canvases paint their own dark
+background; panels and controls use the host's egui visuals. The editors load
+no texture or font of their own.
 
 `BREP_ecad_core`'s autorouter and design checks are compute-heavy; a host
 building in a debug profile will want:

@@ -23,6 +23,7 @@ pub mod datum;
 pub mod helix;
 pub mod spline;
 pub mod waypoint;
+pub mod weld;
 pub mod face_profile;
 pub mod plane;
 pub mod sketch;

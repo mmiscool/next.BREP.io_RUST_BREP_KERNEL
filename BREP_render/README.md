@@ -23,8 +23,10 @@ From `src/lib.rs`, bottom up:
 - **`runner`** — the submit/poll boundary around that pipeline. `EngineState`
   defaults to the synchronous `InlineRunner`; native hosts can install the
   persistent `ThreadRunner`, and the browser app supplies its worker-backed
-  implementation. The same channel also runs STL/OBJ RANSAC reconstruction
-  through `BREP_reconstruction`.
+  implementation. The same channel also runs STL, OBJ and 3MF mesh
+  reconstruction through `BREP_reconstruction` (`MeshImportFormat`).
+- **`history`** — `History`, the engine-owned editable feature history plus
+  its rollback index.
 - **`engine_state`** — [`EngineState`], the viewer brain every shell wraps:
   scene + camera + arcball controls + render settings, selection and
   hover emphasis with a selection filter, picking, the editable feature
@@ -32,8 +34,10 @@ From `src/lib.rs`, bottom up:
   copy), **sketch mode** (in-viewer 2D sketch editing: input, solving,
   dimensions, inference), widget overlays (transform gizmo, ViewCube, datums,
   feature dimensions via `BREP_gizmos`), expressions, and model I/O. It also owns
-  assembly solving/BOM/interference, PMI views and overlays, wire-harness routing
-  and the spline anchor editor. No GPU,
+  assembly solving/BOM/interference, exploded views, PMI views and overlays,
+  drawing sheets, CAM operations, manufacturing instructions, motion-study
+  playback (`BREP_simulation`), wire-harness routing, the 3D sketch editor
+  (`sketch3d`), plugins, and the spline anchor editor. No GPU,
   no canvas — it is fully unit-testable on native, and everything crosses its
   boundary as plain JSON and scalars.
 - **`render`** — the wgpu core. `RenderCore::render_to_view` draws a scene
@@ -51,6 +55,18 @@ From `src/lib.rs`, bottom up:
   on native and wasm.
 - **`camera` / `controls` / `view`** — pure-math cameras (artifact framing,
   orbit/arcball, ortho/perspective).
+- **`sheets`** — drawing sheets: the document's `sheets` block, projection of
+  placed PMI views onto paper with an analytic hidden-line pass, and SVG and
+  PDF writers (a sheet PDF can embed a U3D 3D model).
+- **`thumbnail`** — part thumbnails from a small CPU rasterizer over the
+  scene's display meshes, so they render without a GPU device.
+- **`widgets`** — the engine-side registry that hosts the `BREP_gizmos`
+  gizmos; `feature_dimensions` and `constraint_overlays` build draggable
+  feature-parameter annotations and assembly-constraint overlays, and
+  `cam_sim` draws the CAM simulation player's overlays.
+- **`features`**, **`metadata`**, **`style`**, **`visibility`** — feature
+  schemas mapped to form fields, the per-entity metadata/measurement store,
+  render settings and emphasis state, and visibility masks.
 
 The crate re-exports its kernel dependency as `brep_render::brep_kernel`,
 so downstream shells can name the run-boundary types (`HistoryRequest`, …)
@@ -78,7 +94,8 @@ The render core never owns a window or canvas; the shells are thin:
 
 The interactive application host is the `BREP_app` crate, which embeds this
 engine in an egui frame; dependency chain: `BREP_app` → `BREP_render` →
-{ `BREP_kernel`, `BREP_gizmos`, `BREP_reconstruction` }.
+{ `BREP_kernel`, `BREP_gizmos`, `BREP_reconstruction`, `BREP_cam`,
+`BREP_instructions`, `BREP_simulation`, `BREP_plugins`, `BREP_ecad_core` }.
 
 ## Build and test
 
@@ -97,4 +114,4 @@ tessellation feature; the wasm build deliberately does not.
 
 - License: the Autodrop3d licence in `LICENSE.md`, shipped in the crate
   (`license-file` in the manifest).
-- Version: 0.17.0.
+- Version: 0.18.0.

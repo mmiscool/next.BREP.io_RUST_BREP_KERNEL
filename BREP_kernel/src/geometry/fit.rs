@@ -1861,37 +1861,8 @@ pub(crate) fn fit_polyline_seeded_with_path(
     full_refit(SeededFallback::RoundsSpent)
 }
 
-/// REFINER-SPECIFIC candidate (2026-10-04, design review of 8f8c17368): the
-/// seeded refit's contract with forced membership replaced by REPRESENTATIVES.
-/// `seeds` (the previous fit's kept stations) that are members of
-/// `station_pool(points, tolerance)` start the set, with both ends; seeds the
-/// pool does not keep, and every refiner insert, are NOT forced as stations.
-/// Instead EVERY point of `points` is a fidelity witness: the candidate is
-/// accepted only when the interpolant's deviation over all of them (the same
-/// `measure_polyline_fit` reading the full refit takes) is within `tolerance`
-/// itself, NOT within max(tolerance, dropped_band). The chord band a
-/// simplified or conditioned pool leaves is a property of the polyline
-/// through the pool, not inherited uncertainty of points that lie on the
-/// carriers; it is reported as `dropped_band` and never used as the bar here.
-/// Growth is the existing rule: per span, the pool member farthest from the
-/// curve, if over `tolerance`, at most 16 per round, 9 rounds, the same
-/// ceiling. The caller enables this only for a run whose every ORIGINAL
-/// point lies on both carriers. Anything that fails (unreadable, ceiling,
-/// rounds, nothing a pool member can add while a witness is still over)
-/// returns the identical `fit_polyline_of_degree(points, tolerance,
-/// full_budget, local_interpolation, degree)`.
-pub(crate) fn fit_polyline_representatives_with_path(
-    points: &[Vec3],
-    seeds: &[usize],
-    tolerance: f64,
-    full_budget: usize,
-    local_interpolation: bool,
-    degree: usize,
-) -> Result<(PolylineFit, SeededPath, RepresentativeCost), String> {
-    fit_polyline_representatives_with_witnesses(points, seeds, &[], tolerance, tolerance, full_budget, local_interpolation, degree)
-}
 
-/// [`fit_polyline_representatives_with_path`] with TIGHT witnesses (root
+/// `fit_polyline_representatives_with_path` with TIGHT witnesses (root
 /// ruling, 2026-10-04): `tight` indices of `points` (the refiner's own
 /// inserted true-carrier points) must lie within `tight_tolerance` of the
 /// curve (the refiner's existing carrier floor), while every other point is

@@ -856,6 +856,25 @@ pub trait HistoryRunner {
     fn session_for_main(&mut self, _generation: u64) -> SessionOnMain {
         SessionOnMain::Unavailable
     }
+    /// Ask, WITHOUT waiting, for a copy of the session the run of `generation`
+    /// left; the answer comes back through [`Self::poll_session`] on a later
+    /// pump. `false`: this runner cannot export one.
+    fn request_session(&mut self, _generation: u64) -> bool {
+        false
+    }
+    /// The next answered [`Self::request_session`]: the generation asked for
+    /// and the copy (`None` when the runner no longer held that run's session).
+    fn poll_session(&mut self) -> Option<(u64, Option<brep_kernel::SessionTransfer>)> {
+        None
+    }
+    /// Whether the main side may REPLAY the history to get a session it cannot
+    /// import. True for a runner that runs on the caller's thread anyway (the
+    /// inline runner, test doubles); a background runner answers false, so a
+    /// missing session is fetched and waited for, never rebuilt on the UI
+    /// thread (a whole assembly, its stale parts included).
+    fn session_replay_on_main(&self) -> bool {
+        true
+    }
     fn submit_plugin_install(&mut self, _request: PluginInstallRequest) -> bool { false }
     fn poll_plugin_install(&mut self) -> Option<PluginInstallReply> { None }
     /// Trusted installed content, separate from saved document dependency pins.
@@ -1364,9 +1383,8 @@ pub enum Command {
     /// One CAM simulation command (never coalesced: every job answers).
     CamSimulate(CamSimJob),
     Reset,
-    /// Copy the assembly session the run of `generation` left here (native
-    /// thread only: the copy holds kernel solids and never crosses a worker).
-    #[serde(skip)]
+    /// Copy the assembly session the run of `generation` left here. A worker
+    /// sends the copy (kernel solids included) back as JSON.
     ExportSession { generation: u64 },
 }
 
@@ -1402,8 +1420,7 @@ pub enum Reply {
     /// [`RunProgress`]). Posted from INSIDE `process_command`, before its
     /// `Reply::Run`; the main side keeps only the latest.
     Progress(RunProgress),
-    /// The answer to `Command::ExportSession` (native thread only).
-    #[serde(skip)]
+    /// The answer to `Command::ExportSession`.
     SessionExport { generation: u64, transfer: Option<brep_kernel::SessionTransfer> },
 }
 
@@ -1519,6 +1536,12 @@ fn reconstruct_mesh_phased(
             MeshImportFormat::ThreeMf => {
                 let model = brep_kernel::read_3mf(&request.bytes)
                     .map_err(|error| format!("3MF import failed: {error}"))?;
+                if let Some(instance) = model.instances.iter().find(|i| model.meshes[i.mesh].beam_lattice.is_some()) {
+                    return Err(format!("3MF beam lattice in object {} ({}): retained as non-solid mesh exchange data; CAD reconstruction cannot build beam caps, junctions or clipping", instance.object_id, instance.name.as_deref().unwrap_or("unnamed")));
+                }
+                if !model.textures.is_empty() {
+                    reader_messages.push("3MF texture images and UV coordinates cannot be displayed on reconstructed CAD faces or retained by CAD scene export.".to_owned());
+                }
                 instances = model.instances;
                 triangle_colors = model.triangle_colors;
                 let vertices = model
@@ -1820,6 +1843,11 @@ pub struct ThreadRunner {
     /// Progress reports of the in-flight run, oldest first (`poll_progress`
     /// keeps the newest).
     progress_buf: std::collections::VecDeque<RunProgress>,
+    /// Answered [`HistoryRunner::request_session`]s awaiting `poll_session`.
+    session_buf: std::collections::VecDeque<(u64, Option<brep_kernel::SessionTransfer>)>,
+    /// Behave as the wasm worker does: no blocking `session_for_main`, and
+    /// every exported session crosses as JSON (see [`ThreadRunner::worker_like`]).
+    worker_like: bool,
     /// The parts-library revision last SENT down the channel (`None` = never,
     /// or the thread dropped it). Lives here rather than on the caller so
     /// "reset forgets the library" is a local property of this object.
@@ -1872,22 +1900,36 @@ impl ThreadRunner {
             plugin_install_buf: std::collections::VecDeque::new(),
             sent_plugin_revision: None,
             progress_buf: std::collections::VecDeque::new(),
+            session_buf: std::collections::VecDeque::new(),
+            worker_like: false,
             sent_library_revision: None,
             library_requested: false,
             stop,
         }
     }
 
+    /// A thread runner that hands the main side its session the way the wasm
+    /// worker must: never by a blocking wait, only by an asked-for copy that
+    /// crosses as JSON. What a native test runs to exercise the worker path.
+    pub fn worker_like() -> Self {
+        let mut runner = Self::new();
+        runner.worker_like = true;
+        runner
+    }
+
     /// Pull every ready reply off the channel and demux it into the run/query
     /// buffers (so a `poll_run` never swallows a query reply and vice versa).
     fn drain(&mut self) {
         while let Ok(reply) = self.rx.try_recv() {
-            self.file(reply);
+            if let Some(answer) = self.file(reply) {
+                self.session_buf.push_back(answer);
+            }
         }
     }
 
-    /// Demux one reply into its buffer. A session export is handed back (only
-    /// [`HistoryRunner::session_for_main`] waits for one; a late one is dropped).
+    /// Demux one reply into its buffer. A session export is handed back to the
+    /// caller: [`HistoryRunner::session_for_main`]'s wait, or `drain`, which
+    /// keeps it for [`HistoryRunner::poll_session`].
     fn file(&mut self, reply: Reply) -> Option<(u64, Option<brep_kernel::SessionTransfer>)> {
         match reply {
             Reply::SessionExport { generation, transfer } => return Some((generation, transfer)),
@@ -2017,6 +2059,9 @@ fn thread_main(
 #[cfg(not(target_arch = "wasm32"))]
 impl HistoryRunner for ThreadRunner {
     fn session_for_main(&mut self, generation: u64) -> SessionOnMain {
+        if self.worker_like {
+            return SessionOnMain::Unavailable;
+        }
         let Some(tx) = &self.tx else { return SessionOnMain::Unavailable };
         if tx.send(Command::ExportSession { generation }).is_err() {
             return SessionOnMain::Unavailable;
@@ -2032,6 +2077,32 @@ impl HistoryRunner for ThreadRunner {
                 return transfer.map_or(SessionOnMain::Unavailable, SessionOnMain::Copied);
             }
         }
+    }
+    fn request_session(&mut self, generation: u64) -> bool {
+        let mut command = Command::ExportSession { generation };
+        if self.worker_like {
+            // The worker's wire: the command crosses as JSON.
+            let json = serde_json::to_string(&command).expect("serialize worker command");
+            command = serde_json::from_str(&json).expect("parse worker command");
+        }
+        self.tx.as_ref().is_some_and(|tx| tx.send(command).is_ok())
+    }
+    fn poll_session(&mut self) -> Option<(u64, Option<brep_kernel::SessionTransfer>)> {
+        self.drain();
+        let (generation, transfer) = self.session_buf.pop_front()?;
+        if !self.worker_like {
+            return Some((generation, transfer));
+        }
+        // The worker's wire: the reply, copy and all, is serialized there and
+        // parsed here.
+        let json = serde_json::to_string(&Reply::SessionExport { generation, transfer }).expect("serialize worker reply");
+        match serde_json::from_str(&json).expect("parse worker reply") {
+            Reply::SessionExport { generation, transfer } => Some((generation, transfer)),
+            _ => unreachable!("a session export parses back as one"),
+        }
+    }
+    fn session_replay_on_main(&self) -> bool {
+        false
     }
     fn submit_plugin_install(&mut self, request: PluginInstallRequest) -> bool {
         self.tx.as_ref().is_some_and(|tx| tx.send(Command::ValidatePlugins(request)).is_ok())
@@ -2274,7 +2345,9 @@ impl HistoryRunner for ThreadRunner {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.tx.take();
         self.handle.take();
+        let worker_like = self.worker_like;
         *self = Self::new();
+        self.worker_like = worker_like;
         true
     }
 
@@ -2296,6 +2369,7 @@ impl HistoryRunner for ThreadRunner {
         self.topology_buf.clear();
         self.sheet_lines_buf.clear();
         self.progress_buf.clear();
+        self.session_buf.clear();
         // `Command::Reset` clears the thread's kernel store, library included,
         // so what we believe it holds is void.
         self.sent_library_revision = None;

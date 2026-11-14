@@ -78,7 +78,7 @@ impl EngineState {
     pub fn begin_instructions_pdf(&mut self) -> Result<InstructionsPdfExport, String> {
         if self.run_pending() { return Err("wait for the model to finish rebuilding before exporting".into()); }
         let block = self.instructions_required()?;
-        let layout = layout::pages(&block)?;
+        let layout = print::layout(&block)?;
         let todo = print::picture_rects(&block, &layout);
         let names: Vec<String> = self.scene.solids().iter().filter(|solid| !solid.is_sketch).map(|solid| solid.name.clone()).collect();
         self.request_exact_solids(names.iter().map(String::as_str));
@@ -277,7 +277,7 @@ impl EngineState {
     pub fn instructions_pdf(&mut self) -> Result<(Vec<u8>, usize), String> {
         let block = self.instructions_required()?;
         self.instructions_topology_ready();
-        let layout = layout::pages(&block)?;
+        let layout = print::layout(&block)?;
         let pmi = self.pmi_state();
         let unposed = self.instructions_export_displays();
         let mut pictures: HashMap<PictureAt, ViewDrawing> = HashMap::new();

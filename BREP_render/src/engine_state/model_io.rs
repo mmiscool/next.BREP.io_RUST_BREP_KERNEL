@@ -318,6 +318,7 @@ impl EngineState {
                     0., 0., 1., 0., //
                     0., 0., 0., 1.,
                 ],
+                color: None,
             });
         }
         for product in &mut assembly.products {
@@ -1233,6 +1234,7 @@ impl EngineState {
             documents,
             mut failed_products,
             baked_below_root,
+            body_names,
         } = plan;
         phase("plan");
 
@@ -1308,6 +1310,19 @@ impl EngineState {
         // exist.
         let mut namespaces: std::collections::HashMap<Vec<usize>, String> =
             std::collections::HashMap::new();
+        // Instances the file colours on their own: each body the component
+        // places takes the colour, as a per-instance override of its part's
+        // (the `color` attribute on `ACOMPn:<body>`, which wins over the
+        // colour the part's snapshot stamps). The outermost coloured
+        // occurrence on the chain wins, as the kernel's flat lane reads it.
+        let mut instance_colors: Vec<(String, String)> = Vec::new();
+        // The chain names occurrences by their entity (`edge_ref`).
+        let occurrences_by_edge: std::collections::HashMap<usize, &brep_kernel::StepOccurrence> = assembly
+            .occurrences
+            .iter()
+            .filter(|occurrence| occurrence.color.is_some() || !occurrence.body_colors.is_empty())
+            .map(|occurrence| (occurrence.edge_ref, occurrence))
+            .collect();
         for (key, pose, chain) in &wanted {
             let Some(part_name) = entry_names.get(key) else {
                 continue; // this product failed to encode; counted above
@@ -1326,6 +1341,33 @@ impl EngineState {
             namespaces
                 .entry(chain.clone())
                 .or_insert_with(|| format!("{id}:"));
+            if !occurrences_by_edge.is_empty() {
+                // Every body the component places: a nested sub-assembly's as
+                // its builder recorded them, a part's own as its `IMPORT3D1`
+                // feature names them. Either list starts with the product's own
+                // bodies, which is what the last occurrence's per-body colours
+                // describe; the outermost coloured occurrence on the chain wins.
+                let names = body_names.get(key).cloned().unwrap_or_else(|| {
+                    let bodies = assembly
+                        .products
+                        .iter()
+                        .find(|product| product.pd_ref == key.0)
+                        .map_or(0, |product| product.bodies.len());
+                    brep_kernel::imported_solid_names(bodies, "IMPORT3D1")
+                });
+                for (index, name) in names.into_iter().enumerate() {
+                    let color = chain.iter().enumerate().find_map(|(depth, edge)| {
+                        let occurrence = occurrences_by_edge.get(edge)?;
+                        let own = (depth + 1 == chain.len())
+                            .then(|| occurrence.body_colors.get(index).copied().flatten())
+                            .flatten();
+                        own.or(occurrence.color)
+                    });
+                    if let Some(color) = color {
+                        instance_colors.push((format!("{id}:{name}"), color.to_hex()));
+                    }
+                }
+            }
             features.push(serde_json::json!({
                 "type": "ACOMP",
                 "inputParams": {
@@ -1362,6 +1404,11 @@ impl EngineState {
         phase(&format!("instance features + parts library ({instances})"));
         self.add_features(&features);
         phase("add_features (rebuild)");
+        // AFTER the features, like the PMI block below and for its reason: the
+        // checkpoint `push_features` took at its start is what undo restores,
+        // so one undo takes the components and their instance colours away
+        // together.
+        self.set_metadata_attributes(brep_kernel::COLOR_METADATA_KEY, &instance_colors);
 
         // The file's ASSEMBLY-level PMI — annotations it pinned to an
         // occurrence, annotations spanning two parts, free notes — merged into
@@ -1495,6 +1542,10 @@ struct Plan {
     /// Non-rigid occurrences baked BELOW the root — nested only, since the flat
     /// lane has no below-the-root and counts its bakes at install time.
     baked_below_root: usize,
+    /// NESTED only: every body a key's document places, named as the scene
+    /// knows it under the component (`IMPORT3D1`, `ACOMP2:IMPORT3D1_SOLID_01`,
+    /// …), so an instance's own colour can reach the bodies of a sub-assembly.
+    body_names: std::collections::HashMap<PartKey, Vec<String>>,
 }
 
 /// **FLAT**: flatten the occurrence tree to its geometry-bearing nodes, each
@@ -1569,6 +1620,7 @@ fn plan_nested(
         failed_products: 0,
         baked_nonrigid: 0,
         first_error: None,
+        body_names: std::collections::HashMap::new(),
     };
     let mut plan = Plan::default();
     for &root in &assembly.roots {
@@ -1602,6 +1654,9 @@ fn plan_nested(
             };
             let part_key = key.part_key(assembly);
             plan.documents.insert(part_key, part);
+            if let Some(names) = build.body_names.get(&key) {
+                plan.body_names.insert(part_key, names.clone());
+            }
             plan.wanted.push((part_key, pose, chain));
         }
     }
@@ -1631,11 +1686,11 @@ const MAX_NESTED_ENTRIES: usize = 10_000;
 /// `partsLibrary` entry it writes at every level.
 ///
 /// This is the guard neither the depth cap nor the entry count provides. A
-/// product reachable at many different depths is stored once PER LEVEL — the
-/// memo builds its document once, but each parent embeds a COPY, so a
-/// diamond-shaped structure well inside the depth cap can still multiply out
-/// geometrically. Charging the embedded bytes is the only place that
-/// multiplication is visible, so it is charged where it happens.
+/// product reachable at many different depths is stored once PER LEVEL
+/// — the memo builds its document once, but each parent
+/// embeds a COPY, so a diamond-shaped structure well inside the depth cap can
+/// still multiply out geometrically. Charging the embedded bytes is the only
+/// place that multiplication is visible, so it is charged where it happens.
 const MAX_NESTED_BYTES: usize = 256 * 1024 * 1024;
 
 /// What a nested part document is memoised under. A product is either a leaf
@@ -1685,6 +1740,8 @@ struct NestedBuild<'a, 'w> {
     failed_products: usize,
     baked_nonrigid: usize,
     first_error: Option<String>,
+    /// Every body each built document places, named under its component.
+    body_names: std::collections::HashMap<DocKey, Vec<String>>,
 }
 
 impl NestedBuild<'_, '_> {
@@ -1710,7 +1767,19 @@ impl NestedBuild<'_, '_> {
             ));
         }
         let built = match key {
-            DocKey::Leaf(part) => self.leaf_document(part),
+            DocKey::Leaf(part) => {
+                let built = self.leaf_document(part);
+                if let Ok(Some(_)) = &built {
+                    let bodies = self
+                        .assembly
+                        .products
+                        .iter()
+                        .find(|product| product.pd_ref == part.0)
+                        .map_or(0, |product| product.bodies.len());
+                    self.body_names.insert(key, brep_kernel::imported_solid_names(bodies, "IMPORT3D1"));
+                }
+                built
+            }
             DocKey::Assembly(product) => {
                 ancestors.push(product);
                 let built = self.assembly_document(product, ancestors);
@@ -1762,6 +1831,7 @@ impl NestedBuild<'_, '_> {
         let node = &self.assembly.products[product];
         let mut library = serde_json::Map::new();
         let mut features: Vec<serde_json::Value> = Vec::new();
+        let mut placed_names = brep_kernel::imported_solid_names(node.bodies.len(), "IMPORT3D1");
 
         // The node's own bodies first, matching the flat lane's "a node before
         // its children" emit order.
@@ -1852,6 +1922,9 @@ impl NestedBuild<'_, '_> {
                 continue;
             };
             components += 1;
+            if let Some(names) = self.body_names.get(&key) {
+                placed_names.extend(names.iter().map(|name| format!("ACOMP{components}:{name}")));
+            }
             features.push(serde_json::json!({
                 "type": "ACOMP",
                 "inputParams": {
@@ -1879,6 +1952,7 @@ impl NestedBuild<'_, '_> {
             return Ok(None);
         }
         self.spend_entry()?;
+        self.body_names.insert(DocKey::Assembly(product), placed_names);
         let mut document =
             serde_json::json!({ "partsLibrary": library, "features": features });
         // A sub-assembly is a part too: its own `PRODUCT.id` is the part number

@@ -934,7 +934,7 @@ pub(super) fn lift_pmi(
     let mut ids: BTreeMap<usize, &Entity> = entities.iter().map(|(id, entity)| (*id, entity)).collect();
     let mut state = PmiState::default();
     let mut semantics: Vec<Semantic> = Vec::new();
-    let mut params = |pairs: Vec<(&str, serde_json::Value)>| -> serde_json::Map<String, serde_json::Value> {
+    let params = |pairs: Vec<(&str, serde_json::Value)>| -> serde_json::Map<String, serde_json::Value> {
         let mut map = serde_json::Map::new();
         for (key, value) in pairs {
             map.insert(key.to_string(), value);

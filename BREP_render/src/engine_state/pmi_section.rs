@@ -57,13 +57,7 @@ fn signed(plane: &Plane, p: [f64; 3]) -> f64 {
     dot(sub(p, plane.0), plane.1)
 }
 
-/// Which [`Side`] `display` is on. A box the plane misses decides it without
-/// touching a triangle: on a large assembly most solids are not cut at all.
-pub(super) fn side_of(display: &SolidDisplay, point: [f64; 3], normal: [f64; 3]) -> Side {
-    side_of_all(display, &[(point, normal)])
-}
-
-/// [`side_of`] for a section of several planes: kept whole when one plane
+/// Classify a display against several planes: kept whole when one plane
 /// keeps the whole box, removed when every plane removes it.
 pub(super) fn side_of_all(display: &SolidDisplay, planes: &[Plane]) -> Side {
     let bbox = &display.bbox;
@@ -139,9 +133,6 @@ fn removed_interval(planes: &[Plane], a: [f64; 3], b: [f64; 3]) -> Option<(f64, 
     Some((lo, hi))
 }
 
-pub(super) fn clip_display(display: &mut SolidDisplay, point: [f64; 3], normal: [f64; 3]) {
-    clip_display_all(display, &[(point, normal)]);
-}
 
 /// Clip `display` to a section of several planes (see the module docs) and
 /// cap each plane where the material behind it is removed.
@@ -292,6 +283,7 @@ pub(super) fn clip_display_all(display: &mut SolidDisplay, planes: &[Plane]) {
             tri_count: cap_count,
             kind: FaceKind::SectionCap,
             color_override: Some(SECTION_CAP_RGB),
+            opacity: None,
         });
     }
     let mut edges = Vec::new();
@@ -339,6 +331,8 @@ pub(super) fn clip_display_all(display: &mut SolidDisplay, planes: &[Plane]) {
         polyline: s.map(|p| p.map(|v| v as f32)).to_vec(),
         aux: true,
         centerline: false,
+        color_override: None,
+        opacity: None,
     }));
     display.edges = edges;
     display.vertices.retain(|v| kept(v.position));

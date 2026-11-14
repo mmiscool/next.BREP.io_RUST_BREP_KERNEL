@@ -399,6 +399,18 @@ struct ToolCurve {
 /// Steps of a grazing curve's exact samples for a lofted wall.
 const LOFT_SAMPLES: usize = 128;
 
+/// How near a lofted wall keeps to its exact grazing loop, as a fraction of
+/// the sweep's size: every exact sample of the loop, in the middle of every
+/// time span, is within this of the wall.
+///
+/// It was 5e-10. A wall that tight is heavy (a quintic's miss falls as the
+/// sixth power of its span, so each tenfold costs half again as many spans
+/// each way), and whoever reads the solid pays for every span. The measures
+/// do not need it: an interpolant's miss changes sign from span to span and
+/// all but cancels in a volume or an area. Over this hundredfold the lofted
+/// cases' volumes and areas moved by 2e-10 or less.
+const LOFT_TARGET: f64 = 5e-8;
+
 /// A face of the tool after the split along K: its exact surface (normal
 /// outward), its side, and its loop (curve, traversed forward?, pcurve in the
 /// direction of traversal).
@@ -431,6 +443,18 @@ enum MeridianChart {
 }
 
 impl Chart {
+    /// Is `x` on the chart's own axis, where its first parameter (the angle
+    /// about the axis) is not defined? A ball's pole.
+    fn at_pole(&self, x: Vec3) -> bool {
+        match *self {
+            Chart::Plane { .. } => false,
+            Chart::Revolution { origin, w, .. } => {
+                let r = x.sub(origin);
+                r.sub(w.scale(r.dot(w))).length() <= 1e-6 * r.length()
+            }
+        }
+    }
+
     fn invert(&self, x: Vec3) -> [f64; 2] {
         match *self {
             Chart::Plane { origin, u, v } => {
@@ -1251,7 +1275,7 @@ fn split_revolved(
                     let (mid_psi, mid_v) = (0.5 * (alpha + beta), 0.5 * (start + end));
                     let mid_normal = w.scale(mid_v.sin()).add(u1.scale(mid_v.cos() * mid_psi.cos())).add(u2.scale(mid_v.cos() * mid_psi.sin()));
                     let front = screw.velocity(tube_point(mid_psi, mid_v)).dot(mid_normal) > 0.0;
-                    let mut pole = |curves: &mut Vec<ToolCurve>| -> usize {
+                    let pole = |curves: &mut Vec<ToolCurve>| -> usize {
                         let p = apex.expect("apex");
                         curves.push(ToolCurve { curve: make_line(points[p], points[p]).expect("point"), start: p, end: p, degenerate: true, samples: None });
                         curves.len() - 1
@@ -1351,7 +1375,7 @@ fn split_revolved(
                     let generatrix = frag(make_line(at(m0[0], m0[1], alpha), at(m1[0], m1[1], alpha)), "generatrix")?;
                     let surface = frag(make_revolution(origin, w, &generatrix, beta - alpha), "patch")?;
                     let front = sign_at(piece, 0.5 * (alpha + beta));
-                    let mut pole = |curves: &mut Vec<ToolCurve>| -> usize {
+                    let pole = |curves: &mut Vec<ToolCurve>| -> usize {
                         let p = apex.expect("apex");
                         curves.push(ToolCurve { curve: make_line(points[p], points[p]).expect("point"), start: p, end: p, degenerate: true, samples: None });
                         curves.len() - 1
@@ -1942,11 +1966,13 @@ struct Shell {
     edges: Vec<EdgeRecord>,
     faces: Vec<FaceRecord>,
     next: u64,
+    /// Loops beyond each face's first (holes).
+    holes: usize,
 }
 
 impl Shell {
     fn new() -> Self {
-        Self { vertices: Vec::new(), edges: Vec::new(), faces: Vec::new(), next: 1 }
+        Self { vertices: Vec::new(), edges: Vec::new(), faces: Vec::new(), next: 1, holes: 0 }
     }
 
     fn id(&mut self) -> u64 {
@@ -1981,13 +2007,32 @@ impl Shell {
         id
     }
 
+    /// A face from its surface and its loops, the outer one first.
+    fn face_loops(&mut self, surface: NurbsSurface, loops: Vec<Vec<(u64, bool, NurbsCurve)>>) -> u64 {
+        let mut records = Vec::with_capacity(loops.len());
+        for coedges in loops {
+            let mut list = Vec::with_capacity(coedges.len());
+            for (edge, forward, pcurve) in coedges {
+                let id = self.id();
+                list.push(CoedgeRecord { id, edge_id: edge, forward, pcurve });
+            }
+            let id = self.id();
+            records.push(LoopRecord { id, coedges: list });
+        }
+        self.holes += records.len().saturating_sub(1);
+        let id = self.id();
+        self.faces.push(FaceRecord { id, surface, same_sense: true, loops: records, name: None });
+        id
+    }
+
     fn solid(mut self) -> BrepSolid {
         let shell = self.id();
         let id = self.id();
         // One shell: V − E + F = 2 − 2g (every face one loop; a pole's
         // degenerate edge is not counted, as the validator counts).
         let edges = self.edges.iter().filter(|e| !e.degenerate).count() as i64;
-        let euler = self.vertices.len() as i64 - edges + self.faces.len() as i64;
+        // A face with holes counts once for each loop beyond its first less.
+        let euler = self.vertices.len() as i64 - edges + self.faces.len() as i64 - self.holes as i64;
         let genus = (2 - euler) / 2;
         BrepSolid {
             mass_properties_cache: Default::default(),
@@ -2134,7 +2179,7 @@ fn sweep_with(screw: &Screw, tool: &SolidTool) -> Result<BrepSolid, KernelRefusa
         };
         let mut coedges = Vec::new();
         let mut corners: Vec<Vec3> = Vec::new();
-        let mut push = |coedges: &mut Vec<(u64, bool, NurbsCurve)>, corners: &mut Vec<Vec3>, edge: u64, forward: bool, curve: &NurbsCurve| -> Result<(), KernelRefusal> {
+        let push = |coedges: &mut Vec<(u64, bool, NurbsCurve)>, corners: &mut Vec<Vec3>, edge: u64, forward: bool, curve: &NurbsCurve| -> Result<(), KernelRefusal> {
             let [d0, d1] = frag(curve.domain(), "domain")?;
             for k in 0..=8 {
                 corners.push(frag(curve.evaluate(d0 + (d1 - d0) * k as f64 / 8.0), "slide")?);
@@ -3235,7 +3280,7 @@ pub struct FrameCurve {
 /// the curve's curvature. It is split at sample times (its structure must not
 /// change), each piece sampled exactly, and the walls lofted through those
 /// samples (quintic both ways; the samples' count doubles until the wall is
-/// within 1e-10 of the exact loop at the times between). Caps are the tool's
+/// within `LOFT_TARGET` of the exact loop at the times between). Caps are the tool's
 /// back at the start and front at the end.
 pub fn sweep_solid_along(tool: &SolidTool, path: &FrameCurve) -> Result<BrepSolid, KernelRefusal> {
     let up = path.up.normalized().map_err(|_| input("up", "the frame's up direction is zero".into()))?;
@@ -3305,6 +3350,41 @@ pub fn sweep_prism_along(outline: &[[f64; 2]], from: f64, to: f64, path: &FrameC
     let e1 = tangent.normalized().map_err(|_| input("tangent", "the curve has no start direction".into()))?;
     let e2 = up.cross(e1);
     let frame = Frame { control: path.control, up, start_tangent: e1 };
+    // The frame in plane coordinates: origin c(s), turned by φ(s).
+    let flat = |p: Vec3| [p.sub(base).dot(e1), p.sub(base).dot(e2)];
+    let pose = |s: f64| (flat(frame.point(s)), frame.angle(s));
+    let rates = |s: f64| {
+        let first = frame.first(s);
+        ([first.dot(e1), first.dot(e2)], frame.angle_rate(s))
+    };
+    prism_region_sweep(outline, from, to, base, e1, e2, up, &pose, &rates, false)
+}
+
+/// The whole sweep of a prism (the convex polygon `outline` in the plane
+/// through `base` spanned by `e1`, `e2`, between `from` and `to` along `up`)
+/// under a planar rigid motion: at s ∈ [0, 1] a point q of the plane (in the
+/// tool's own coordinates) is at origin(s) + R(angle(s)) q, `pose` giving
+/// (origin, angle) and `rates` their derivatives in s. The sweep is the plane
+/// region the moving outline covers, extruded. That region is found exactly:
+/// its boundary lies on the outline's corner paths, the paths of each edge's
+/// grazing point (where the edge's normal is square to the velocity), and,
+/// unless the motion is `closed` (it ends where it starts), the outline's
+/// edges at the two ends; these are split where they meet or cross
+/// themselves, and a piece is kept where one side of it is covered and the
+/// other not. The region may have holes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prism_region_sweep(
+    outline: &[[f64; 2]],
+    from: f64,
+    to: f64,
+    base: Vec3,
+    e1: Vec3,
+    e2: Vec3,
+    up: Vec3,
+    pose: &dyn Fn(f64) -> ([f64; 2], f64),
+    rates: &dyn Fn(f64) -> ([f64; 2], f64),
+    closed: bool,
+) -> Result<BrepSolid, KernelRefusal> {
     if outline.len() < 3 || !(to > from) {
         return Err(input("prism", "a prism needs three corners and a positive height".into()));
     }
@@ -3322,16 +3402,14 @@ pub fn sweep_prism_along(outline: &[[f64; 2]], from: f64, to: f64, path: &FrameC
         }
     }
     let scale = corners.iter().map(|c| c[0].hypot(c[1])).fold(1.0f64, f64::max);
-    // The frame in plane coordinates: origin c(s), turned by φ(s).
-    let flat = |p: Vec3| [p.sub(base).dot(e1), p.sub(base).dot(e2)];
     let place = |s: f64, q: [f64; 2]| -> [f64; 2] {
-        let o = flat(frame.point(s));
-        let (sn, cs) = frame.angle(s).sin_cos();
+        let (o, angle) = pose(s);
+        let (sn, cs) = angle.sin_cos();
         [o[0] + cs * q[0] - sn * q[1], o[1] + sn * q[0] + cs * q[1]]
     };
     let local = |s: f64, p: [f64; 2]| -> [f64; 2] {
-        let o = flat(frame.point(s));
-        let (sn, cs) = frame.angle(s).sin_cos();
+        let (o, angle) = pose(s);
+        let (sn, cs) = angle.sin_cos();
         let d = [p[0] - o[0], p[1] - o[1]];
         [cs * d[0] + sn * d[1], -sn * d[0] + cs * d[1]]
     };
@@ -3382,34 +3460,54 @@ pub fn sweep_prism_along(outline: &[[f64; 2]], from: f64, to: f64, path: &FrameC
         /// Edge k at the start (false) or end (true).
         End(usize, bool),
     }
-    let speed_ratio = |s: f64| frame.angle_rate(s); // κ |c'| / |c'| per unit s, over |c'|
-    let graze_point = |k: usize, s: f64| -> Option<f64> {
-        // Along edge k at u: v·n = |c'| (e1·n + κ (ẑ × x)·n), κ = φ'/|c'|.
+    // Where along edge k's line (0 at its start corner, 1 at its end) the
+    // grazing point is at s, on the edge or beyond it.
+    let graze_at = |k: usize, s: f64| -> Option<f64> {
+        // Along edge k at x (in the tool's coordinates) the velocity's part
+        // along the edge's normal n is w·n + φ' (ẑ × x)·n, w the origin's
+        // velocity read in the tool's frame.
         let (a, b) = (corners[k], corners[(k + 1) % n]);
         let (nn, _) = edges[k];
-        let kappa = speed_ratio(s) / frame.first(s).length();
+        let (velocity, rate) = rates(s);
+        let (sn, cs) = pose(s).1.sin_cos();
+        let w = [cs * velocity[0] + sn * velocity[1], -sn * velocity[0] + cs * velocity[1]];
+        let along = w[0] * nn[0] + w[1] * nn[1];
         let rot = |x: [f64; 2]| -x[1] * nn[0] + x[0] * nn[1]; // (ẑ × x)·n
-        // An edge along the start tangent grazes where (ẑ × x)·n = 0 whatever
-        // the curvature (also where it is zero, at an inflection).
-        let (ga, gb) = if nn[0].abs() < 1e-15 { (rot(a), rot(b)) } else { (nn[0] + kappa * rot(a), nn[0] + kappa * rot(b)) };
+        // An edge the origin moves along grazes where (ẑ × x)·n = 0 whatever
+        // the turning rate (also where it is zero, at an inflection).
+        let (ga, gb) = if along.abs() < 1e-15 * w[0].hypot(w[1]) { (rot(a), rot(b)) } else { (along + rate * rot(a), along + rate * rot(b)) };
         if ga == gb {
             return None;
         }
-        let u = ga / (ga - gb);
-        (u > 0.0 && u < 1.0).then_some(u)
+        Some(ga / (ga - gb))
     };
+    let graze_point = |k: usize, s: f64| -> Option<f64> { graze_at(k, s).filter(|&u| u > 0.0 && u < 1.0) };
     let mut paths: Vec<Path> = (0..n).map(Path::Corner).collect();
+    // Where a grazing point enters or leaves its edge it is at a corner:
+    // (that corner, the time), a place its path is split at.
+    let mut junctions: Vec<(usize, f64)> = Vec::new();
     for k in 0..n {
-        // Where along the motion edge k has a grazing point inside it.
+        // Where along the motion edge k has a grazing point inside it, each
+        // run's ends found where the point passes a corner.
         let steps = 2000;
         let mut run: Option<f64> = None;
+        let mut passes = |inside: f64, outside: f64| -> f64 {
+            let (mut a, mut b) = (inside, outside);
+            for _ in 0..80 {
+                let mid = 0.5 * (a + b);
+                if graze_point(k, mid).is_some() { a = mid } else { b = mid }
+            }
+            let corner = if graze_at(k, a).is_some_and(|u| u < 0.5) { k } else { (k + 1) % n };
+            junctions.push((corner, a));
+            a
+        };
         for j in 0..=steps {
             let s = j as f64 / steps as f64;
             let on = graze_point(k, s).is_some();
             match (on, run) {
-                (true, None) => run = Some(s),
+                (true, None) => run = Some(if j == 0 { s } else { passes(s, s - 1.0 / steps as f64) }),
                 (false, Some(s0)) => {
-                    paths.push(Path::Graze(k, s0, s - 1.0 / steps as f64));
+                    paths.push(Path::Graze(k, s0, passes(s - 1.0 / steps as f64, s)));
                     run = None;
                 }
                 _ => {}
@@ -3418,15 +3516,17 @@ pub fn sweep_prism_along(outline: &[[f64; 2]], from: f64, to: f64, path: &FrameC
         if let Some(s0) = run {
             paths.push(Path::Graze(k, s0, 1.0));
         }
-        paths.push(Path::End(k, false));
-        paths.push(Path::End(k, true));
+        if !closed {
+            paths.push(Path::End(k, false));
+            paths.push(Path::End(k, true));
+        }
     }
     let eval = |path: Path, t: f64| -> [f64; 2] {
         match path {
             Path::Corner(k) => place(t, corners[k]),
             Path::Graze(k, s0, s1) => {
                 let s = s0 + (s1 - s0) * t;
-                let u = graze_point(k, s).unwrap_or(if t < 0.5 { 0.0 } else { 1.0 });
+                let u = graze_at(k, s).map_or(0.5, |u| u.clamp(0.0, 1.0));
                 let (a, b) = (corners[k], corners[(k + 1) % n]);
                 place(s, [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u])
             }
@@ -3443,9 +3543,15 @@ pub fn sweep_prism_along(outline: &[[f64; 2]], from: f64, to: f64, path: &FrameC
     let mut cuts: Vec<Vec<f64>> = vec![vec![0.0, 1.0]; paths.len()];
     let tol = 1e-10 * scale;
     for a in 0..paths.len() {
-        for b in a + 1..paths.len() {
+        for b in a..paths.len() {
             for i in 0..m {
                 for j in 0..m {
+                    // A path against itself: only where it crosses over
+                    // (stretches apart along it; a closed path's ends are
+                    // neighbours too).
+                    if a == b && (j < i + 3 || (closed && i < 3 && j + 3 > m)) {
+                        continue;
+                    }
                     let (p0, p1, q0, q1) = (polylines[a][i], polylines[a][i + 1], polylines[b][j], polylines[b][j + 1]);
                     let d1 = [p1[0] - p0[0], p1[1] - p0[1]];
                     let d2 = [q1[0] - q0[0], q1[1] - q0[1]];
@@ -3479,13 +3585,17 @@ pub fn sweep_prism_along(outline: &[[f64; 2]], from: f64, to: f64, path: &FrameC
                         }
                     }
                     let (pa, pb) = (eval(paths[a], ta), eval(paths[b], tb));
-                    if (pa[0] - pb[0]).hypot(pa[1] - pb[1]) < tol {
+                    if (pa[0] - pb[0]).hypot(pa[1] - pb[1]) < tol && !(a == b && (ta - tb).abs() < 1.0 / m as f64) {
                         cuts[a].push(ta);
                         cuts[b].push(tb);
                     }
                 }
             }
         }
+    }
+    // A corner's path is its own time: split it where a grazing point passes it.
+    for &(corner, s) in &junctions {
+        cuts[corner].push(s);
     }
     for c in &mut cuts {
         c.sort_by(|x, y| x.total_cmp(y));
@@ -3526,111 +3636,225 @@ pub fn sweep_prism_along(outline: &[[f64; 2]], from: f64, to: f64, path: &FrameC
             }
         }
     }
-    // Chain into one loop, the region on its left.
+    // Chain into loops, the region on their left (the outer one runs
+    // counter-clockwise, a hole's clockwise).
     if pieces.is_empty() {
         return Err(refuse("prism_along", "no boundary found".into()));
     }
-    let mut order = vec![0usize];
     let mut used = vec![false; pieces.len()];
-    used[0] = true;
-    loop {
-        let last = &pieces[*order.last().expect("order")];
-        let end = eval(paths[last.path], last.t1);
-        let start = eval(paths[pieces[order[0]].path], pieces[order[0]].t0);
-        if order.len() > 1 && (end[0] - start[0]).hypot(end[1] - start[1]) < 1e-8 * scale {
-            break;
-        }
-        let next = (0..pieces.len()).filter(|&k| !used[k]).min_by(|&x, &y| {
-            let (px, py) = (eval(paths[pieces[x].path], pieces[x].t0), eval(paths[pieces[y].path], pieces[y].t0));
-            (px[0] - end[0]).hypot(px[1] - end[1]).total_cmp(&(py[0] - end[0]).hypot(py[1] - end[1]))
-        });
-        let Some(next) = next else {
-            return Err(refuse("prism_along", "the boundary does not close".into()));
-        };
-        let p = eval(paths[pieces[next].path], pieces[next].t0);
-        if (p[0] - end[0]).hypot(p[1] - end[1]) > 1e-8 * scale {
-            return Err(refuse("prism_along", format!("the boundary does not close (gap {:e})", (p[0] - end[0]).hypot(p[1] - end[1]))));
-        }
-        used[next] = true;
-        order.push(next);
-    }
-    if used.iter().any(|u| !u) {
-        return Err(refuse("prism_along", "the swept region is not one simple loop".into()));
-    }
-    // Plane curves of the loop, then the extrusion.
-    let world = |q: [f64; 2], h: f64| base.add(e1.scale(q[0])).add(e2.scale(q[1])).add(up.scale(h));
-    let mut loop_points: Vec<[f64; 2]> = order.iter().map(|&k| eval(paths[pieces[k].path], pieces[k].t0)).collect();
-    loop_points.push(loop_points[0]);
-    let count = order.len();
-    let mut shell = Shell::new();
-    let (bottom_v, top_v): (Vec<u64>, Vec<u64>) = (0..count).map(|k| (shell.vertex(world(loop_points[k], from)), shell.vertex(world(loop_points[k], to)))).unzip();
-    let mut bottom_e = Vec::with_capacity(count);
-    let mut top_e = Vec::with_capacity(count);
-    let mut curves2d = Vec::with_capacity(count);
-    for (slot, &k) in order.iter().enumerate() {
-        let piece = &pieces[k];
-        let straight = matches!(paths[piece.path], Path::End(..));
-        let next = (slot + 1) % count;
-        let curve_at = |h: f64| -> Result<NurbsCurve, KernelRefusal> {
-            if straight {
-                return frag(make_line(world(loop_points[slot], h), world(loop_points[next], h)), "line");
+    let mut loops: Vec<Vec<usize>> = Vec::new();
+    while let Some(first) = (0..pieces.len()).find(|&k| !used[k]) {
+        let mut order = vec![first];
+        used[first] = true;
+        loop {
+            let last = &pieces[*order.last().expect("order")];
+            let end = eval(paths[last.path], last.t1);
+            let start = eval(paths[pieces[order[0]].path], pieces[order[0]].t0);
+            if (end[0] - start[0]).hypot(end[1] - start[1]) < 1e-8 * scale {
+                break;
             }
-            let samples = 192;
-            let ts: Vec<f64> = (0..=samples).map(|i| i as f64 / samples as f64).collect();
-            let mut points: Vec<Vec3> = ts.iter().map(|&t| world(eval(paths[piece.path], piece.t0 + (piece.t1 - piece.t0) * t), h)).collect();
-            points[0] = world(loop_points[slot], h);
-            points[samples] = world(loop_points[next], h);
-            frag(crate::interpolate_curve(&points, 5, &ts), "plane_path")
-        };
-        let (cb, ct) = (curve_at(from)?, curve_at(to)?);
-        bottom_e.push(shell.edge(cb.clone(), bottom_v[slot], bottom_v[next], false)?);
-        top_e.push(shell.edge(ct.clone(), top_v[slot], top_v[next], false)?);
-        curves2d.push((cb, ct));
+            let next = (0..pieces.len()).filter(|&k| !used[k]).min_by(|&x, &y| {
+                let (px, py) = (eval(paths[pieces[x].path], pieces[x].t0), eval(paths[pieces[y].path], pieces[y].t0));
+                (px[0] - end[0]).hypot(px[1] - end[1]).total_cmp(&(py[0] - end[0]).hypot(py[1] - end[1]))
+            });
+            let Some(next) = next else {
+                return Err(refuse("prism_along", "the boundary does not close".into()));
+            };
+            let p = eval(paths[pieces[next].path], pieces[next].t0);
+            if (p[0] - end[0]).hypot(p[1] - end[1]) > 1e-8 * scale {
+                return Err(refuse("prism_along", format!("the boundary does not close (gap {:e})", (p[0] - end[0]).hypot(p[1] - end[1]))));
+            }
+            used[next] = true;
+            order.push(next);
+        }
+        loops.push(order);
     }
-    let verticals: Vec<u64> = (0..count).map(|k| shell.edge(make_line(world(loop_points[k], from), world(loop_points[k], to)).expect("line"), bottom_v[k], top_v[k], false)).collect::<Result<_, _>>()?;
-    // Top (outward up) and bottom (outward down).
-    let top_points: Vec<Vec3> = loop_points.iter().map(|&q| world(q, to)).collect();
-    let top_surface = plane_patch(world([0.0, 0.0], to), e1, e2, &top_points)?;
-    let mut coedges = Vec::with_capacity(count);
-    for k in 0..count {
-        coedges.push((top_e[k], true, plane_pcurve(world([0.0, 0.0], to), e1, e2, &curves2d[k].1, true)?));
+    // The outer loop first: the one of greatest area.
+    let area_of = |order: &Vec<usize>| -> f64 {
+        let mut points: Vec<[f64; 2]> = Vec::new();
+        for &k in order {
+            let piece = &pieces[k];
+            for i in 0..32 {
+                points.push(eval(paths[piece.path], piece.t0 + (piece.t1 - piece.t0) * i as f64 / 32.0));
+            }
+        }
+        (0..points.len()).map(|i| { let (a, b) = (points[i], points[(i + 1) % points.len()]); a[0] * b[1] - b[0] * a[1] }).sum::<f64>() * 0.5
+    };
+    let areas: Vec<f64> = loops.iter().map(area_of).collect();
+    let outer = (0..loops.len()).max_by(|&x, &y| areas[x].abs().total_cmp(&areas[y].abs())).expect("loops");
+    if areas[outer] <= 0.0 || (0..loops.len()).any(|k| k != outer && areas[k] >= 0.0) {
+        return Err(refuse("prism_along", "the swept region is not one region with holes".into()));
     }
-    shell.face(top_surface, coedges);
-    let bottom_points: Vec<Vec3> = loop_points.iter().map(|&q| world(q, from)).collect();
-    let bottom_surface = plane_patch(world([0.0, 0.0], from), e2, e1, &bottom_points)?;
-    let mut coedges = Vec::with_capacity(count);
-    for k in (0..count).rev() {
-        coedges.push((bottom_e[k], false, plane_pcurve(world([0.0, 0.0], from), e2, e1, &curves2d[k].0, false)?));
+    loops.swap(0, outer);
+    // Plane curves of the loops, then the extrusion.
+    let world = |q: [f64; 2], h: f64| base.add(e1.scale(q[0])).add(e2.scale(q[1])).add(up.scale(h));
+    let mut shell = Shell::new();
+    let mut top_loops = Vec::with_capacity(loops.len());
+    let mut bottom_loops = Vec::with_capacity(loops.len());
+    let mut extent: Vec<[f64; 2]> = Vec::new();
+    for order in &loops {
+        let mut loop_points: Vec<[f64; 2]> = order.iter().map(|&k| eval(paths[pieces[k].path], pieces[k].t0)).collect();
+        loop_points.push(loop_points[0]);
+        let count = order.len();
+        let (bottom_v, top_v): (Vec<u64>, Vec<u64>) = (0..count).map(|k| (shell.vertex(world(loop_points[k], from)), shell.vertex(world(loop_points[k], to)))).unzip();
+        let mut bottom_e = Vec::with_capacity(count);
+        let mut top_e = Vec::with_capacity(count);
+        let mut curves2d = Vec::with_capacity(count);
+        for (slot, &k) in order.iter().enumerate() {
+            let piece = &pieces[k];
+            let straight = matches!(paths[piece.path], Path::End(..));
+            let next = (slot + 1) % count;
+            for i in 0..=16 {
+                extent.push(eval(paths[piece.path], piece.t0 + (piece.t1 - piece.t0) * i as f64 / 16.0));
+            }
+            let curve_at = |h: f64| -> Result<NurbsCurve, KernelRefusal> {
+                if straight {
+                    return frag(make_line(world(loop_points[slot], h), world(loop_points[next], h)), "line");
+                }
+                let samples = 192;
+                let ts: Vec<f64> = (0..=samples).map(|i| i as f64 / samples as f64).collect();
+                let mut points: Vec<Vec3> = ts.iter().map(|&t| world(eval(paths[piece.path], piece.t0 + (piece.t1 - piece.t0) * t), h)).collect();
+                points[0] = world(loop_points[slot], h);
+                points[samples] = world(loop_points[next], h);
+                frag(crate::interpolate_curve(&points, 5, &ts), "plane_path")
+            };
+            let (cb, ct) = (curve_at(from)?, curve_at(to)?);
+            bottom_e.push(shell.edge(cb.clone(), bottom_v[slot], bottom_v[next], false)?);
+            top_e.push(shell.edge(ct.clone(), top_v[slot], top_v[next], false)?);
+            curves2d.push((cb, ct));
+        }
+        let verticals: Vec<u64> = (0..count).map(|k| shell.edge(make_line(world(loop_points[k], from), world(loop_points[k], to)).expect("line"), bottom_v[k], top_v[k], false)).collect::<Result<_, _>>()?;
+        // Top (outward up) and bottom (outward down) loops.
+        let mut coedges = Vec::with_capacity(count);
+        for k in 0..count {
+            coedges.push((top_e[k], true, plane_pcurve(world([0.0, 0.0], to), e1, e2, &curves2d[k].1, true)?));
+        }
+        top_loops.push(coedges);
+        let mut coedges = Vec::with_capacity(count);
+        for k in (0..count).rev() {
+            coedges.push((bottom_e[k], false, plane_pcurve(world([0.0, 0.0], from), e2, e1, &curves2d[k].0, false)?));
+        }
+        bottom_loops.push(coedges);
+        // Sides: the bottom curve extruded (u along it, v up), outward on its right.
+        for k in 0..count {
+            let next = (k + 1) % count;
+            let (cb, _) = &curves2d[k];
+            let rows: Vec<Vec<Vec4>> = cb
+                .control_points
+                .iter()
+                .map(|p| {
+                    let x = p.point().expect("point");
+                    vec![Vec4::from_point(x, p.w), Vec4::from_point(x.add(up.scale(to - from)), p.w)]
+                })
+                .collect();
+            let surface = frag(NurbsSurface::new(cb.degree, 1, cb.knots.clone(), vec![0.0, 0.0, 1.0, 1.0], rows), "side")?;
+            let [u0, u1] = frag(cb.domain(), "domain")?;
+            let coedges = vec![
+                (bottom_e[k], true, uv_line([u0, 0.0], [u1, 0.0])?),
+                (verticals[next], true, uv_line([u1, 0.0], [u1, 1.0])?),
+                (top_e[k], false, uv_line([u1, 1.0], [u0, 1.0])?),
+                (verticals[k], false, uv_line([u0, 1.0], [u0, 0.0])?),
+            ];
+            shell.face(surface, coedges);
+        }
     }
-    shell.face(bottom_surface, coedges);
-    // Sides: the bottom curve extruded (u along it, v up), outward on its right.
-    for k in 0..count {
-        let next = (k + 1) % count;
-        let (cb, _) = &curves2d[k];
-        let rows: Vec<Vec<Vec4>> = cb
-            .control_points
-            .iter()
-            .map(|p| {
-                let x = p.point().expect("point");
-                vec![Vec4::from_point(x, p.w), Vec4::from_point(x.add(up.scale(to - from)), p.w)]
-            })
-            .collect();
-        let surface = frag(NurbsSurface::new(cb.degree, 1, cb.knots.clone(), vec![0.0, 0.0, 1.0, 1.0], rows), "side")?;
-        let [u0, u1] = frag(cb.domain(), "domain")?;
-        let coedges = vec![
-            (bottom_e[k], true, uv_line([u0, 0.0], [u1, 0.0])?),
-            (verticals[next], true, uv_line([u1, 0.0], [u1, 1.0])?),
-            (top_e[k], false, uv_line([u1, 1.0], [u0, 1.0])?),
-            (verticals[k], false, uv_line([u0, 1.0], [u0, 0.0])?),
-        ];
-        shell.face(surface, coedges);
-    }
+    let top_points: Vec<Vec3> = extent.iter().map(|&q| world(q, to)).collect();
+    shell.face_loops(plane_patch(world([0.0, 0.0], to), e1, e2, &top_points)?, top_loops);
+    let bottom_points: Vec<Vec3> = extent.iter().map(|&q| world(q, from)).collect();
+    shell.face_loops(plane_patch(world([0.0, 0.0], from), e2, e1, &bottom_points)?, bottom_loops);
     let body = shell.solid();
     let issues = body.validate();
     if !issues.is_empty() {
         return Err(refuse("assembly", format!("the swept prism is not valid: {:?}", issues.first())));
     }
     Ok(body)
+}
+
+/// A prism whose section is a convex polygon, carried by turns about axes
+/// all along its own (a planar motion: a planet on its carrier) that ends
+/// where it starts: its whole sweep (`prism_region_sweep`), or None when the
+/// tool or motion is not of that kind. `steps`: each turn's axis point,
+/// direction and rate, applied in order at every t ∈ [t0, t1].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn closed_planar_prism(
+    origin: Vec3,
+    normal: Vec3,
+    x_axis: Vec3,
+    outline: &[OutlinePiece],
+    from: f64,
+    to: f64,
+    steps: &[(Vec3, Vec3, f64, f64)],
+    t0: f64,
+    t1: f64,
+) -> Result<Option<BrepSolid>, KernelRefusal> {
+    let Ok(up) = normal.normalized() else { return Ok(None) };
+    let Ok(e1) = x_axis.sub(up.scale(x_axis.dot(up))).normalized() else { return Ok(None) };
+    let e2 = up.cross(e1);
+    // A polygon of straight sides, in order.
+    let mut corners: Vec<[f64; 2]> = Vec::with_capacity(outline.len());
+    for (k, piece) in outline.iter().enumerate() {
+        let OutlinePiece::Line { from: a, to: b } = piece else { return Ok(None) };
+        let OutlinePiece::Line { from: next, .. } = &outline[(k + 1) % outline.len()] else { return Ok(None) };
+        if (b[0] - next[0]).hypot(b[1] - next[1]) > 1e-9 * (1.0 + b[0].hypot(b[1])) {
+            return Ok(None);
+        }
+        corners.push(*a);
+    }
+    if corners.len() < 3 || steps.is_empty() || !(t1 > t0) {
+        return Ok(None);
+    }
+    // Convex (either way round), or it is another engine's.
+    let turn_of = |k: usize| {
+        let (a, b, c) = (corners[k], corners[(k + 1) % corners.len()], corners[(k + 2) % corners.len()]);
+        (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+    };
+    let first_turn = turn_of(0);
+    if first_turn == 0.0 || (1..corners.len()).any(|k| turn_of(k) * first_turn <= 0.0) {
+        return Ok(None);
+    }
+    // Turns only, about axes along the prism's own: (centre in the plane, rate about +up).
+    let mut turns: Vec<([f64; 2], f64)> = Vec::with_capacity(steps.len());
+    for &(point, direction, turn, advance) in steps {
+        let Ok(axis) = direction.normalized() else { return Ok(None) };
+        if advance != 0.0 || axis.cross(up).length() > 1e-12 {
+            return Ok(None);
+        }
+        let r = point.sub(origin);
+        turns.push(([r.dot(e1), r.dot(e2)], turn * axis.dot(up).signum()));
+    }
+    let moved = |t: f64, q: [f64; 2]| -> [f64; 2] {
+        let mut x = q;
+        for &(c, rate) in &turns {
+            let (sn, cs) = (rate * t).sin_cos();
+            let d = [x[0] - c[0], x[1] - c[1]];
+            x = [c[0] + cs * d[0] - sn * d[1], c[1] + sn * d[0] + cs * d[1]];
+        }
+        x
+    };
+    let total: f64 = turns.iter().map(|t| t.1).sum();
+    // The turns compose to one rigid motion of the plane: a point q (where
+    // it stands before any motion) is at moved(t, 0) + R(total t) q.
+    let pose = |s: f64| -> ([f64; 2], f64) {
+        let t = t0 + (t1 - t0) * s;
+        (moved(t, [0.0, 0.0]), total * t)
+    };
+    // The turns are defined at every t, so the origin's velocity is a
+    // centred difference at the motion's ends too.
+    let rates = |s: f64| -> ([f64; 2], f64) {
+        let h = 1e-6;
+        let (pa, pb) = (pose(s - h).0, pose(s + h).0);
+        ([(pb[0] - pa[0]) / (2.0 * h), (pb[1] - pa[1]) / (2.0 * h)], total * (t1 - t0))
+    };
+    // Ends where it starts: the same turn (mod 2π) and place.
+    let scale = corners.iter().map(|c| c[0].hypot(c[1])).fold(1.0f64, f64::max);
+    let closes = corners.iter().all(|&c| {
+        let (a, b) = (moved(t0, c), moved(t1, c));
+        (a[0] - b[0]).hypot(a[1] - b[1]) <= 1e-9 * scale
+    });
+    if !closes {
+        return Ok(None);
+    }
+    prism_region_sweep(&corners, from, to, origin, e1, e2, up, &pose, &rates, true).map(Some)
 }
 
 /// Two turns driven by one parameter t: first by `rates[0]·t` about the
@@ -3733,13 +3957,38 @@ fn charted_pcurve(chart: &Chart, screw: &Screw, t: f64, curve: &NurbsCurve, forw
     let [d0, d1] = frag(curve.domain(), "domain")?;
     let ts: Vec<f64> = (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect();
     let mut uv = Vec::with_capacity(ts.len());
+    let mut poles = Vec::with_capacity(ts.len());
     for &tt in &ts {
         let x = screw.invert(t, frag(curve.evaluate(tt), "point")?);
         let [u, v] = chart.invert(x);
         uv.push(Vec3::new(u, v, 0.0));
+        poles.push(chart.at_pole(x));
     }
+    continue_pole_angles(&mut uv, &ts, &poles)?;
     let fitted = frag(crate::interpolate_curve(&uv, 5, &ts), "charted_pcurve")?;
     if forward { Ok(fitted) } else { frag(fitted.reversed(), "reversed") }
+}
+
+/// An edge through its surface's pole (a ball carried square to its own
+/// axis: every grazing circle runs pole to pole) has no angle there, and the
+/// inverse returns any. Each sample at a pole (`poles`) takes the first
+/// parameter its neighbours run to, continued in a line.
+fn continue_pole_angles(uv: &mut [Vec3], ts: &[f64], poles: &[bool]) -> Result<(), KernelRefusal> {
+    for j in 0..uv.len() {
+        if !poles[j] {
+            continue;
+        }
+        let near = if j + 2 < uv.len() && !poles[j + 1] && !poles[j + 2] {
+            [j + 1, j + 2]
+        } else if j >= 2 && !poles[j - 1] && !poles[j - 2] {
+            [j - 1, j - 2]
+        } else {
+            return Err(refuse("cap_pole", "a lofted edge stays on its cap's pole".into()));
+        };
+        let (a, b) = (uv[near[0]].x, uv[near[1]].x);
+        uv[j].x = a + (a - b) * (ts[j] - ts[near[0]]) / (ts[near[0]] - ts[near[1]]);
+    }
+    Ok(())
 }
 
 /// A cap's pcurve for a lofted edge: its dense image on the cap's surface.
@@ -3747,6 +3996,9 @@ fn projected_pcurve(surface: &NurbsSurface, curve: &NurbsCurve, forward: bool) -
     let [d0, d1] = frag(curve.domain(), "domain")?;
     let ts: Vec<f64> = (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect();
     let mut uv = Vec::with_capacity(ts.len());
+    let mut poles = Vec::with_capacity(ts.len());
+    let [u0, u1] = frag(surface.domain_u(), "domain")?;
+    let step = 1e-3 * (u1 - u0);
     for &t in &ts {
         let x = frag(curve.evaluate(t), "point")?;
         let foot = frag(crate::project_point_to_surface(surface, x), "project")?;
@@ -3754,7 +4006,13 @@ fn projected_pcurve(surface: &NurbsSurface, curve: &NurbsCurve, forward: bool) -
             return Err(refuse("loft_cap", format!("a lofted edge leaves its cap by {} at {x:?}", foot.distance)));
         }
         uv.push(Vec3::new(foot.u, foot.v, 0.0));
+        // A pole of the surface: its points do not move with the first
+        // parameter there.
+        let aside = if foot.u + step <= u1 { foot.u + step } else { foot.u - step };
+        let moved = frag(surface.evaluate(aside, foot.v), "point")?.sub(frag(surface.evaluate(foot.u, foot.v), "point")?).length();
+        poles.push(moved <= 1e-9 * (1.0 + x.length()));
     }
+    continue_pole_angles(&mut uv, &ts, &poles)?;
     let fitted = frag(crate::interpolate_curve(&uv, 5, &ts), "projected_pcurve")?;
     if forward { Ok(fitted) } else { frag(fitted.reversed(), "reversed") }
 }
@@ -3810,7 +4068,7 @@ fn lofted(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[Out
             return Err(refuse("no_grazing", "the tool has no grazing loop under this motion".into()));
         }
         let scale = splits[0].scale + screw.extent;
-        let target = 5e-10 * scale;
+        let target = LOFT_TARGET * scale;
         // Walls: per grazing curve, rows along it at each time, then across time.
         let mut walls = Vec::with_capacity(grazing.len());
         // Every wall's exact samples at every time.
@@ -3952,7 +4210,7 @@ fn lofted(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[Out
                 paths.entry(r).or_insert_with(|| splits.iter().zip(&times).map(|(split, &t)| screw.apply(t, split.points[r])).collect());
             }
         }
-        return assemble_lofted(screw, &splits[0], &splits[count], &walls, &fractions, &paths);
+        return assemble_lofted(screw, &splits[0], &splits[count], &walls, &fractions, &paths, target);
     }
 }
 
@@ -3962,8 +4220,9 @@ fn lofted(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[Out
 /// dense enough to be sure of seeing). Normals are compared between
 /// neighbours on every time row and between rows, outside what the end trims
 /// take away (`removed`, chart rings) and a few columns off its edge (a fold
-/// line meets the end at the cut's own ends).
-fn wall_regular(surface: &NurbsSurface, fractions: &[f64], removed: &[&[[f64; 2]]]) -> Result<(), KernelRefusal> {
+/// line meets the end at the cut's own ends). `fit`: how near the wall keeps
+/// to its exact loop (a length).
+fn wall_regular(surface: &NurbsSurface, fractions: &[f64], removed: &[&[[f64; 2]]], fit: f64) -> Result<(), KernelRefusal> {
     const COLUMNS: usize = 4 * LOFT_SAMPLES;
     let mut rows: Vec<f64> = Vec::with_capacity(2 * fractions.len());
     for j in 0..fractions.len() {
@@ -3977,7 +4236,14 @@ fn wall_regular(surface: &NurbsSurface, fractions: &[f64], removed: &[&[[f64; 2]
         let (ua, ub, va, vb) = ((u - h).max(0.0), (u + h).min(1.0), (v - h).max(0.0), (v + h).min(1.0));
         let du = frag(surface.evaluate(ub, v), "regular")?.sub(frag(surface.evaluate(ua, v), "regular")?).scale(1.0 / (ub - ua));
         let dv = frag(surface.evaluate(u, vb), "regular")?.sub(frag(surface.evaluate(u, va), "regular")?).scale(1.0 / (vb - va));
-        Ok(du.cross(dv).normalized().ok())
+        // Where the wall's two directions all but line up, or it is no
+        // wider than its own fit's ripple (a corner it pinches to), it has
+        // no normal to speak of: the fit's noise would turn it.
+        let cross = du.cross(dv);
+        if cross.length() <= 1e-6 * du.length() * dv.length() || du.length().min(dv.length()) <= 1e3 * fit {
+            return Ok(None);
+        }
+        Ok(cross.normalized().ok())
     };
     let mut previous: Option<Vec<Option<Vec3>>> = None;
     for &v in &rows {
@@ -4102,21 +4368,42 @@ enum TrimPiece {
 /// where f < 0; its boundary is traced as the curve f = 0 from the end and back
 /// to it. It need not be a graph over u: a tongue of it may run on past where
 /// it left the end.
-fn end_trim(screw: &Screw, split: &Split, t: f64, wall: &NurbsSurface, end: usize) -> Result<Option<EndTrim>, KernelRefusal> {
+///
+/// `fit`: how near the wall keeps to the exact loop (a length).
+fn end_trim(screw: &Screw, split: &Split, t: f64, wall: &NurbsSurface, end: usize, fit: f64) -> Result<Option<EndTrim>, KernelRefusal> {
     let v_of = |e: f64| if end == 1 { 1.0 - e } else { e };
     let at = |u: f64, e: f64| -> Result<Vec3, KernelRefusal> { frag(wall.evaluate(u.clamp(0.0, 1.0), v_of(e)), "wall") };
     let f = |u: f64, e: f64| -> Result<f64, KernelRefusal> { Ok(split.distance(screw.invert(t, at(u, e)?)) / (e * e)) };
-    // Below `floor` the walls' fit (5e-10 of the scale) swamps d / ε².
+    // Below `floor` the walls' fit swamps d / ε².
     let floor = 1e-3;
     // How far into the motion (as a fraction of it) a trim may reach (a fold
     // band can run most of a span); past that the end pose meets a distant
     // part of the sweep (`end_trim_deep`).
     let window = 0.6;
-    let noise = 1e-9 * split.scale / (floor * floor);
+    let noise = 2.0 * fit / (floor * floor);
     // Where the wall dips into the pose just off the end.
     let n = 2000;
     let edge: Vec<f64> = (0..=n).map(|i| f(i as f64 / n as f64, floor)).collect::<Result<_, _>>()?;
-    let inside: Vec<bool> = edge.iter().map(|&x| x < -noise).collect();
+    // Inside: the stretches where f is negative, those that dip below the
+    // fit's noise somewhere (a stretch that never does is the fit's own).
+    let mut inside: Vec<bool> = edge.iter().map(|&x| x < 0.0).collect();
+    let mut i = 0;
+    while i <= n {
+        if !inside[i] {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < n && inside[j + 1] {
+            j += 1;
+        }
+        if edge[i..=j].iter().all(|&x| x >= -noise) {
+            for flag in &mut inside[i..=j] {
+                *flag = false;
+            }
+        }
+        i = j + 1;
+    }
     if !inside.iter().any(|&x| x) {
         // Nothing near the end; a pocket deeper in is caught below.
         return pierced(&f, floor, window, noise, &[]);
@@ -4648,6 +4935,7 @@ fn assemble_lofted(
     walls: &[(usize, bool, NurbsSurface, NurbsCurve, NurbsCurve)],
     times: &[f64],
     paths: &HashMap<usize, Vec<Vec3>>,
+    fit: f64,
 ) -> Result<BrepSolid, KernelRefusal> {
     let mut shell = Shell::new();
     let ends = [(first, screw.t0), (last, screw.t1)];
@@ -4659,12 +4947,12 @@ fn assemble_lofted(
     let mut split_walls: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (index, (_, _, surface, _, _)) in walls.iter().enumerate() {
         for end in 0..2 {
-            if let Some(trim) = end_trim(screw, ends[end].0, ends[end].1, surface, end)? {
+            if let Some(trim) = end_trim(screw, ends[end].0, ends[end].1, surface, end, fit)? {
                 trims.insert((index, end), trim);
             }
         }
         let removed: Vec<&[[f64; 2]]> = (0..2).filter_map(|end| trims.get(&(index, end))).flat_map(|trim| trim.spans.iter().map(|span| span.removed.as_slice())).collect();
-        wall_regular(surface, times, &removed)?;
+        wall_regular(surface, times, &removed, fit)?;
         // A trim along a double curve has that curve as one edge on both its
         // sides: on one face its two uses could not be told apart from its
         // 3D curve alone (the wall passes through it twice). The wall is split

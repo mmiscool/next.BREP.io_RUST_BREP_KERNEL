@@ -12,13 +12,14 @@
 //! | `app`     | `app`      | `BREP_app`     |
 //! | `reconstruction` | `reconstruction` | `BREP_reconstruction` |
 //!
-//! `full` turns everything on; `parallel` forwards to the kernel's rayon
-//! tessellation.
+//! `full` is an alias for `app` (which also enables `render` and `gizmos`); it
+//! does not enable `reconstruction` or `parallel`. `parallel` forwards to the
+//! kernel's rayon parallelism (tessellation and STEP import).
 //!
 //! ```toml
-//! BREP = "0.8"                                    # kernel only
-//! BREP = { version = "0.8", features = ["render"] } # + the wgpu render engine
-//! BREP = { version = "0.8", features = ["full"] }   # everything, incl. the eframe app
+//! BREP = "0.21"                                     # kernel only
+//! BREP = { version = "0.21", features = ["render"] } # + the wgpu render engine
+//! BREP = { version = "0.21", features = ["full"] }   # the eframe app, render and gizmos
 //! ```
 //!
 //! ```no_run

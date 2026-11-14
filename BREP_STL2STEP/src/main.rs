@@ -1,4 +1,10 @@
 //! Command-line STL-to-STEP converter with analytic recognition and safe fallback.
+//!
+//! The `stl2step` binary reads an ASCII or binary STL file, converts it with
+//! `brep_reconstruction::stl_conversion::convert_stl_mesh_to_step`, and writes
+//! `INPUT.step` beside the input (plus an optional JSON report with
+//! `--report-json`). Run `stl2step --help` for the options and exit statuses;
+//! see the README for an overview.
 
 use brep_reconstruction::{
     stl::{read_stl_with_options, StlFormat, StlImport, StlReadOptions},
@@ -23,7 +29,7 @@ const EXIT_INPUT: u8 = 3;
 const EXIT_CONVERSION: u8 = 4;
 const EXIT_OUTPUT: u8 = 5;
 
-const HELP: &str = r#"Convert an STL triangle mesh to a validated AP214 STEP solid.
+const HELP: &str = r#"Convert an STL triangle mesh to a validated AP242 STEP solid.
 
 Usage: stl2step [OPTIONS] INPUT.stl
 

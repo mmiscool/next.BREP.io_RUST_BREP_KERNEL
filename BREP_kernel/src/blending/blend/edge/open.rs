@@ -599,19 +599,6 @@ fn interval_at(parameters: &[f64], u: f64) -> Option<(usize, f64)> {
     (to > from).then(|| (interval, ((u - from) / (to - from)).clamp(0.0, 1.0)))
 }
 
-/// Lane R2 row 2a (2026-10-18): `BREP_BLEND_AFFINE_READS=1`/`on` reads the
-/// rails of a straight stripe on a PLANE at their window ends
-/// ([`affine_rail_standoff`], [`exact_planar_trim`]'s read; the default since
-/// its census: 98 + 144 cases identical in every field), `=0`/`off` samples
-/// them as before; `set_affine_reads_for_test` forces it on a test's own
-/// thread.
-const AFFINE_READS_DEFAULT: bool = true;
-
-pub(in crate::blend) fn affine_reads_on() -> bool {
-    switch!(live "BREP_BLEND_AFFINE_READS", AFFINE_READS_DEFAULT)
-}
-
-
 /// A point of `surface` and its unit normal when the surface is AFFINE in
 /// (u, v), its extension included: a plane (`analytic`) of degree 1 × 1 whose
 /// 2 × 2 net is a parallelogram with equal weights, to `1e-12·(1 + scale)`.
@@ -790,7 +777,7 @@ pub(in crate::blend) fn rails_on_shipped_windows(
     windows: [Option<[f64; 2]>; 2],
 ) -> (f64, [usize; 2]) {
     read_rail_windows([&rows.cr, &rows.cs], parameters, stations, carriers, windows,
-        rows.exact_extrusion && affine_reads_on(), certified_rail_bounds(rows, carriers), None)
+        rows.exact_extrusion, certified_rail_bounds(rows, carriers), None)
 }
 
 /// An exact revolution row's rails, bounded in closed form
@@ -909,7 +896,7 @@ impl RailWindowReader {
             rails: [rows.cr.clone(), rows.cs.clone()],
             carriers: [carriers[0].clone(), carriers[1].clone()],
             parameters: parameters.to_vec(), stations: stations.to_vec(),
-            affine: rows.exact_extrusion && affine_reads_on(), certified: certified_rail_bounds(rows, carriers), feet: RailFeet::default(),
+            affine: rows.exact_extrusion, certified: certified_rail_bounds(rows, carriers), feet: RailFeet::default(),
         }
     }
 
@@ -986,7 +973,7 @@ pub(in crate::blend) fn read_on_stencil(point: Vec3, nodes: &[Vec3], abscissae: 
 /// node falls outside 2..=30 -- an end within a node of the interval's own
 /// station, as the original bore's shipped spans were, 1e-16 from their
 /// vertex stations -- has its foot at the interval's end node, where
-/// [`crate::blend::chain::declared_wall_probe`] cannot read (the stencil
+/// `crate::blend::chain::closed::declared_wall_probe` cannot read (the stencil
 /// cannot follow a foot out of its own interval). It is read on a JUNCTION
 /// stencil instead: the neighbouring interval's last half and this one's
 /// first half (or this one's last half and the next one's first), the same
@@ -1279,7 +1266,7 @@ pub(in crate::blend) fn march_trim_stands(read: &Result<(f64, f64, usize, f64), 
     matches!(read, Ok((miss, standoff, _, _)) if *miss + *standoff <= floor)
 }
 
-/// Slice 1b of the surgery lane (`exact_trim_on`): the support trim of a
+/// Slice 1b of the surgery lane: the support trim of a
 /// straight rail on a PLANE, exact. The feet of the rail's two ends on the
 /// plane (the kernel's closed-form projection) joined by a degree-1 pcurve
 /// on the rail's own parameter range, so the surgery reads it at the rail's
@@ -1302,7 +1289,7 @@ fn exact_planar_trim(rail: &NurbsCurve, surface: &NurbsSurface, d0: f64, d1: f64
     let line = NurbsCurve::new(1, vec![d0, d0, d1, d1], control).or_refuse(KernelStage::Refine, "new")?;
     feet_timing.stop();
     let read_timing = crate::blend::BlendTimer::start("timing.surgery.trim.exact.read_ms");
-    let read = match affine_reads_on().then(|| affine_trim_read(rail, surface, &line, d0, d1)).flatten() {
+    let read = match affine_trim_read(rail, surface, &line, d0, d1) {
         Some(read) => {
             crate::blend::record_count("count.read.affine_trims", 1);
             Ok(read)
@@ -1438,7 +1425,6 @@ pub(in crate::blend) fn build_open_surgery_with_tail(
     // identifies (`SewnStripe::identified`) once every stripe is in.  A stripe
     // free at BOTH ends has no corner to collapse onto, so it refuses.
     let band = consumed_band(solid);
-    let exact_trim = crate::blend::exact_trim_on();
     let collapses = |row: &NurbsCurve, a: f64, b: f64| -> Result<bool, KernelRefusal> {
         let from = row.evaluate(a).or_refuse(KernelStage::Refine, "evaluate")?;
         Ok(row.evaluate(b).or_refuse(KernelStage::Refine, "evaluate")?.sub(from).length() <= band
@@ -1500,10 +1486,10 @@ pub(in crate::blend) fn build_open_surgery_with_tail(
             }
         }
         let [d0, d1] = rail.domain().or_refuse(KernelStage::Refine, "domain")?;
-        // Slice 1b (`exact_trim_on`): an exact extrusion row's rail on a
+        // Slice 1b: an exact extrusion row's rail on a
         // plane ships the exact line in uv, read once; the refit road below
         // is for what it declines.
-        if exact_trim && rows.exact_extrusion {
+        if rows.exact_extrusion {
             if let Some(line) = exact_planar_trim(&rail, surface, d0, d1)? {
                 crate::blend::record_count("count.surgery.exact_trim", 1);
                 return Ok(Some((rail, line)));

@@ -155,7 +155,9 @@ impl EngineState {
         if let Some(play) = self.simulation_play.as_mut() {
             play.playing = false;
         }
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return Err(super::ASSEMBLY_SESSION_PENDING.into());
+        }
         let mut guard = 0usize;
         while self.simulation_play.as_ref().is_some_and(|play| play.frames.len() < play.total) {
             guard += 1;
@@ -319,13 +321,15 @@ impl EngineState {
             play.wanted = Some(play.baked_study.frame_at(play.time));
         }
         let start = now_ms();
+        let mut ready = true;
         if self.simulation_play.as_ref().is_some_and(|play| play.frames.len() < play.total) {
             // The frame solve runs against the MAIN-side kernel session, which
             // the history runner's thread owns after a run: bring it over (a
             // no-op once it is current), as a live drag does before its solve.
-            self.ensure_assembly_session();
+            // Until its copy lands, this frame bakes nothing.
+            ready = self.ensure_assembly_session();
         }
-        while self.simulation_play.as_ref().is_some_and(|play| play.frames.len() < play.total) && now_ms() - start < BAKE_BUDGET_MS {
+        while ready && self.simulation_play.as_ref().is_some_and(|play| play.frames.len() < play.total) && now_ms() - start < BAKE_BUDGET_MS {
             self.simulation_bake_next();
         }
         let play = self.simulation_play.as_mut().expect("checked above");
@@ -530,7 +534,7 @@ impl EngineState {
         // Occurrences posed last time and absent from this frame go back.
         let gone: Vec<String> = play.applied.keys().filter(|id| !frame.contains_key(*id)).cloned().collect();
         self.simulation_unsection();
-        let Some(play) = self.simulation_play.as_ref() else { return };
+        let Some(_) = self.simulation_play.as_ref() else { return };
         let mut changed = false;
         for id in gone {
             self.simulation_pose_occurrence(&id, None);

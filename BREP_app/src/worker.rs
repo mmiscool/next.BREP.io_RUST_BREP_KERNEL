@@ -63,6 +63,9 @@ pub struct WorkerRunner {
     /// Progress reports of the in-flight run, oldest first (`poll_progress`
     /// keeps the newest).
     progress_buf: VecDeque<RunProgress>,
+    /// Answered session requests awaiting `poll_session`: the worker's copy of
+    /// its assembly session, parsed from JSON on arrival.
+    session_buf: VecDeque<(u64, Option<brep_render::brep_kernel::SessionTransfer>)>,
     /// MAIN-SIDE run coalescing: a run is on the worker (posted, reply not yet drained).
     in_flight: bool,
     /// The latest run submitted WHILE one was in flight — REPLACES any earlier parked
@@ -140,6 +143,7 @@ impl WorkerRunner {
             cam_sim_buf: VecDeque::new(),
             cam_sim_progress_buf: VecDeque::new(),
             progress_buf: VecDeque::new(),
+            session_buf: VecDeque::new(),
             in_flight: false,
             pending_run: None,
             sent_library_revision: None,
@@ -205,8 +209,7 @@ impl WorkerRunner {
                 Reply::CamSimulate(reply) => self.cam_sim_buf.push_back(reply),
                 Reply::CamSimProgress(progress) => self.cam_sim_progress_buf.push_back(progress),
                 Reply::Progress(progress) => self.progress_buf.push_back(progress),
-                // Never posted by a worker (the copy holds kernel solids).
-                Reply::SessionExport { .. } => {}
+                Reply::SessionExport { generation, transfer } => self.session_buf.push_back((generation, transfer)),
                 Reply::NeedPartsLibrary => {
                     // The worker dropped (or never had) the library this run
                     // needs and did NOT run. Clear the in-flight flag (no run
@@ -257,6 +260,19 @@ impl Drop for WorkerRunner {
 }
 
 impl HistoryRunner for WorkerRunner {
+    /// The worker's session reaches this thread only as an asked-for copy:
+    /// the main thread cannot wait on a worker, and must never replay the
+    /// history in its place (the whole assembly, on the UI thread).
+    fn request_session(&mut self, generation: u64) -> bool {
+        self.post(&Command::ExportSession { generation }).is_ok()
+    }
+    fn poll_session(&mut self) -> Option<(u64, Option<brep_render::brep_kernel::SessionTransfer>)> {
+        self.drain();
+        self.session_buf.pop_front()
+    }
+    fn session_replay_on_main(&self) -> bool {
+        false
+    }
     fn submit_plugin_install(&mut self, request: PluginInstallRequest) -> bool {
         if self.post(&Command::ValidatePlugins(request.clone())).is_err() { return false; }
         self.pending_install = Some(request);
@@ -488,6 +504,7 @@ impl HistoryRunner for WorkerRunner {
         self.topology_buf.clear();
         self.sheet_lines_buf.clear();
         self.progress_buf.clear();
+        self.session_buf.clear();
         self.pending_run = None;
         self.in_flight = false;
         self.sent_library_revision = None;
@@ -519,6 +536,7 @@ impl HistoryRunner for WorkerRunner {
         self.topology_buf.clear();
         self.sheet_lines_buf.clear();
         self.progress_buf.clear();
+        self.session_buf.clear();
         self.pending_run = None;
         self.in_flight = false;
         // `Command::Reset` clears the worker's kernel store, library included.

@@ -43,8 +43,8 @@ pub mod groups {
     /// ([`crate::jobs`]). Nothing else.
     pub const OPERATOR: &str = "operator";
     /// A headless CAD worker: may take bake jobs from the queue and write
-    /// their results (round 8). Nothing else — a worker account cannot
-    /// create parts or release anything.
+    /// their results. Nothing else — a worker
+    /// account cannot create parts or release anything.
     pub const WORKER: &str = "worker";
 }
 
@@ -211,9 +211,9 @@ pub struct PartType {
     pub mode: NumberMode,
 }
 
-/// How a part type's numbers are made. In EVERY mode a number is unique
-/// across all parts, not only within its type — that check lives inside the
-/// store's write, not here.
+/// How a part type's numbers are made. In EVERY mode a
+/// number is unique across all parts, not only within its type — that check
+/// lives inside the store's write, not here.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum NumberMode {
@@ -382,11 +382,11 @@ pub struct Revision {
     pub occurrences: Vec<crate::bom_config::Occurrence>,
     /// The revision label itself; its database key is (part_id, id).
     pub id: String,
-    /// What people call it. FREE TEXT: whoever creates the revision may type it,
-    /// and the store enforces only that it is unique within its part. `A, B, C`
-    /// from [`crate::lifecycle::next_revision_label`] is the suggestion when
-    /// nobody types one. Revisions are ordered by creation — their position in
-    /// [`Part::revisions`] — never by label.
+    /// What people call it. FREE TEXT: whoever creates
+    /// the revision may type it, and the store enforces only that it is unique
+    /// within its part. `A, B, C` from [`crate::lifecycle::next_revision_label`]
+    /// is the suggestion when nobody types one. Revisions are ordered by
+    /// creation — their position in [`Part::revisions`] — never by label.
     pub label: String,
     pub lifecycle: Lifecycle,
     #[serde(default)]
@@ -421,10 +421,10 @@ pub struct Revision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bake: Option<Bake>,
     /// What this revision is built from: the "uses" list the CAD app
-    /// publishes on save and release (round 1). The server never reads
-    /// geometry — this list IS the assembly structure, and the BOM,
-    /// where-used and the release gate are all computed from it. Frozen with
-    /// the document once the revision is released.
+    /// publishes on save and release. The server
+    /// never reads geometry — this list IS the assembly structure, and the
+    /// BOM, where-used and the release gate are all computed from it. Frozen
+    /// with the document once the revision is released.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uses: Vec<Use>,
     /// Every review this revision has been through, oldest first: the last
@@ -1259,9 +1259,9 @@ pub fn default_status_options() -> Vec<StatusOption> {
         .map(|(state, name)| StatusOption { state, name: name.into(), enabled: true }).collect()
 }
 
-/// Policy the administrator decides, not code (round 7). Each defaults
-/// to the PERMISSIVE choice, and a file written before settings existed
-/// loads with those defaults.
+/// Policy the administrator decides, not code. Each
+/// defaults to the PERMISSIVE choice, and a file written before settings
+/// existed loads with those defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -1287,10 +1287,10 @@ pub struct Settings {
     /// is. 30 days by default; 0 means no absolute limit.
     pub session_max_hours: u64,
     /// Let administrators edit and test-run scripts in the browser. On by
-    /// default. Scripts are fully trusted, so an admin login with the
-    /// editor on is a shell on the server; turning it off leaves the
-    /// scripts directory live and editable only on the host. The server's
-    /// `--lock-script-editor` flag forces it off regardless.
+    /// default. Scripts are fully trusted, so an admin
+    /// login with the editor on is a shell on the server; turning it off
+    /// leaves the scripts directory live and editable only on the host. The
+    /// server's `--lock-script-editor` flag forces it off regardless.
     pub script_editor_enabled: bool,
     /// The review rule for a revision whose part no override covers. The
     /// default needs 0 approvals, so a release works as it did before
@@ -1427,10 +1427,10 @@ pub struct FileVersion {
 // ===========================================================================
 
 /// A node of the catalog tree. A part has ONE primary category plus free tags
-/// (round 1). A child category INHERITS every attribute of its ancestors and
-/// may add its own, but may not redefine one — so "Fasteners" can require a
-/// material and "Fasteners/Screws" add a thread without ever disagreeing
-/// about what a material is.
+///. A child category INHERITS every attribute of
+/// its ancestors and may add its own, but may not redefine one — so
+/// "Fasteners" can require a material and "Fasteners/Screws" add a thread
+/// without ever disagreeing about what a material is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Category {
     /// Stable key, stored on parts (`"screws"`). Never changes.

@@ -22,25 +22,6 @@ pub(in crate::step_import) fn prefer_exact_general_ruling(analytic: Option<&crat
     )
 }
 
-pub(in crate::step_import) fn build_solid(resolver: &Resolver, manifold_ref: usize) -> Result<BrepSolid, String> {
-    let debug = std::env::var("BREP_DEBUG_STEP_LOOP").is_ok();
-    let started = debug.then(web_time::Instant::now);
-    if debug {
-        eprintln!("SOLID #{manifold_ref} BEGIN");
-    }
-    let result = build_solid_inner(resolver, manifold_ref, false)
-        .map(|(solid, _, _)| solid)
-        .map_err(|error| error.to_string());
-    if let Some(started) = started {
-        eprintln!(
-            "SOLID #{manifold_ref} END {:?} ok={}",
-            started.elapsed(),
-            result.is_ok()
-        );
-    }
-    result
-}
-
 fn closed_shell_face_refs(resolver: &Resolver, shell_ref: usize) -> Result<Vec<Value>, String> {
     resolver
         .get(shell_ref)?
@@ -409,13 +390,7 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
     Ok(())
 }
 
-pub(in crate::step_import) fn build_brep_with_voids(resolver: &Resolver, body_ref: usize) -> Result<BrepSolid, String> {
-    build_brep_with_voids_captured(resolver, body_ref, false)
-        .map(|(solid, _, _)| solid)
-        .map_err(|error| error.to_string())
-}
-
-/// [`build_brep_with_voids`], optionally carrying the per-edge capture.
+/// Reconstruct the outer shell and voids, optionally carrying the per-edge capture.
 pub(in crate::step_import) fn build_brep_with_voids_captured(
     resolver: &Resolver,
     body_ref: usize,
@@ -622,18 +597,7 @@ pub(in crate::step_import) fn build_solid_inner(
     build_solid_from_shell_captured(resolver, shell_ref, capture)
 }
 
-/// Reconstruct one `BrepSolid` from a single CLOSED_SHELL (or OPEN_SHELL)
-/// reference — the shared core behind MANIFOLD_SOLID_BREP / FACETED_BREP import
-/// and behind each shell of a SHELL_BASED_SURFACE_MODEL. A genuinely open shell
-/// reaches the same validation gate and is rejected there, so this stays safe to
-/// call on any shell reference.
-pub(in crate::step_import) fn build_solid_from_shell(resolver: &Resolver, shell_ref: usize) -> Result<BrepSolid, String> {
-    build_solid_from_shell_captured(resolver, shell_ref, false)
-        .map(|(solid, _, _)| solid)
-        .map_err(|error| error.to_string())
-}
-
-/// [`build_solid_from_shell`], optionally carrying what the importer did to
+/// Reconstruct one shell, optionally carrying what the importer did to
 /// every edge (`capture`), for [`crate::import_step_trim_readings`].
 pub(in crate::step_import) fn build_solid_from_shell_captured(
     resolver: &Resolver,
@@ -677,7 +641,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     let profile = crate::profile::profile_enabled();
     let mut lap_started = web_time::Instant::now();
     let mut laps: Vec<(&str, f64)> = Vec::new();
-    let mut lap = |name: &'static str, started: &mut web_time::Instant, laps: &mut Vec<(&str, f64)>| {
+    let lap = |name: &'static str, started: &mut web_time::Instant, laps: &mut Vec<(&str, f64)>| {
         if profile {
             let now = web_time::Instant::now();
             laps.push((name, (now - *started).as_secs_f64() * 1_000.0));
@@ -704,6 +668,12 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     lap("planar_split", &mut lap_started, &mut laps);
     builder.reconcile_edges_onto_surfaces(&pending)?;
     lap("reconcile", &mut lap_started, &mut laps);
+    // `BREP_STEP_PREFIT`: a large body's projection fits start on idle
+    // threads; the loop below takes the finished ones (`builder/prefit.rs`).
+    let mut prefits = builder.spawn_prefits(&pending)?;
+    if prefits.is_some() {
+        lap("prefit", &mut lap_started, &mut laps);
+    }
     let mut faces = Vec::with_capacity(pending.len());
     // The planar split can have minted more pending faces than STEP faces, so
     // each pending face carries its own source reference.
@@ -714,7 +684,9 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     for (index, pending_face) in pending.into_iter().enumerate() {
         let face_ref = pending_face.face_ref;
         let face_started = profile.then(web_time::Instant::now);
+        let offered = prefits.as_mut().map(|prefits| prefits.claim(index));
         let finished = builder.finish_face(pending_face);
+        drop(offered);
         // Under the profile switch, a face that takes over a second is named
         // with its place in the shell, and so is a face that fails: how much of
         // a refused body's time went before the face that refused it.
@@ -732,6 +704,9 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
         faces.push(finished.map_err(|error| format!("step_import: face #{face_ref}: {error}"))?);
     }
     lap("finish_faces", &mut lap_started, &mut laps);
+    if let Some(prefits) = prefits.take() {
+        prefits.report(shell_ref);
+    }
 
     builder.report_supplied_pcurves();
     let shell_id = builder.fresh();

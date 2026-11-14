@@ -18,6 +18,25 @@ pub(super) struct TouchCensus {
     pub(super) with_pieces: u64,
     pub(super) with_splits: u64,
     pub(super) cosurface: u64,
+    /// Under [`changed_ring_on`]: the content of every edge the operands
+    /// held ([`edge_content`]). A result edge outside this set is one the
+    /// operation made (a section piece, a split piece, a refitted edge).
+    pub(super) operand_edges: Option<HashSet<[u64; 2]>>,
+}
+
+/// Narrow the examined ring to the vertices the operation changed
+/// (`AssemblyScope::build`); `BREP_SCOPE_CHANGED_RING=0` reads the wide ring.
+pub(super) fn changed_ring_on() -> bool {
+    switch!("BREP_SCOPE_CHANGED_RING", true)
+}
+
+/// An edge's geometry, bit for bit: its curve and its range.
+pub(super) fn edge_content(edge: &EdgeRecord) -> [u64; 2] {
+    let mut lane = crate::mass_properties::TwoLane::new();
+    crate::mass_properties::hash_curve(&mut lane, &edge.curve);
+    lane.f64(edge.t0);
+    lane.f64(edge.t1);
+    lane.finish()
 }
 
 impl TouchCensus {
@@ -59,6 +78,8 @@ impl TouchCensus {
             cosurface.insert(*first);
             cosurface.insert(*second);
         }
+        let operand_edges = changed_ring_on()
+            .then(|| solids.iter().flat_map(|solid| &solid.edges).map(edge_content).collect());
         let mut touched = with_pieces.clone();
         touched.extend(with_splits.iter().copied());
         touched.extend(cosurface.iter().copied());
@@ -68,6 +89,7 @@ impl TouchCensus {
             with_pieces: with_pieces.len() as u64,
             with_splits: with_splits.len() as u64,
             cosurface: cosurface.len() as u64,
+            operand_edges,
         }
     }
 

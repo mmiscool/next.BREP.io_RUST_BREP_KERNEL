@@ -35,6 +35,11 @@ pub struct FaceDisplay {
     /// / hover emphasis still wins over it. `None` = inherit the solid.
     #[serde(default)]
     pub color_override: Option<[f32; 3]>,
+    /// Per-FACE opacity (0 clear .. 1 opaque), resolved from this face's
+    /// `transparency` metadata attribute by
+    /// [`RenderScene::apply_metadata_opacity`]. `None` = inherit the solid.
+    #[serde(default)]
+    pub opacity: Option<f32>,
 }
 
 /// One display edge: a world-space polyline plus the kernel edge identity and
@@ -52,6 +57,21 @@ pub struct EdgeDisplay {
     pub aux: bool,
     /// Centerline flag (hole/revolve axis display).
     pub centerline: bool,
+    /// This edge's own colour (linear sRGB), from its `color` metadata
+    /// attribute; `None` draws it in the theme's edge colour.
+    #[serde(default)]
+    pub color_override: Option<[f32; 3]>,
+    /// This edge's own opacity (0 clear .. 1 opaque), from its `transparency`
+    /// metadata attribute; `None` draws it opaque.
+    #[serde(default)]
+    pub opacity: Option<f32>,
+}
+
+impl EdgeDisplay {
+    /// Whether this edge draws in a style of its own rather than the theme's.
+    pub fn is_styled(&self) -> bool {
+        self.color_override.is_some() || self.opacity.is_some_and(|o| o < 1.0)
+    }
 }
 
 /// One display vertex (kernel topology vertex).
@@ -95,6 +115,14 @@ pub struct SolidDisplay {
     /// study's transparency clip. A translucent solid draws after every opaque
     /// one through the blended pass, with its base colour's alpha set to this.
     pub opacity: Option<f32>,
+    /// The solid's own opacity (0 clear .. 1 opaque; `None` = opaque),
+    /// resolved from its `transparency` metadata attribute by
+    /// [`RenderScene::apply_metadata_opacity`]. Kept apart from
+    /// [`Self::opacity`] so a motion study's clip, which writes that field and
+    /// gives it back afterwards, never has to know about it; the clip wins
+    /// while it is set.
+    #[serde(default)]
+    pub model_opacity: Option<f32>,
     /// Monotonic content revision (R10). Every freshly built display gets a
     /// unique value, so the renderer's GPU-buffer cache re-uploads on any
     /// rebuild — correct-by-default (equivalent to teardown-rebuild). The
@@ -199,6 +227,25 @@ pub struct LineArtLook {
     pub placed: std::collections::HashSet<String>,
 }
 
+impl SolidDisplay {
+    /// The opacity the solid's own faces draw at (0 clear .. 1 opaque): a
+    /// motion study's clip while one is set, else the `transparency`
+    /// attribute, else opaque.
+    pub fn base_opacity(&self) -> f32 {
+        self.opacity.or(self.model_opacity).unwrap_or(1.0).clamp(0.0, 1.0)
+    }
+
+    /// The opacity `face` draws at: a clip fades the whole solid, else the
+    /// face's own `transparency` attribute, else the solid's.
+    pub fn face_opacity(&self, face: &FaceDisplay) -> f32 {
+        match self.opacity {
+            Some(clip) => clip,
+            None => face.opacity.or(self.model_opacity).unwrap_or(1.0),
+        }
+        .clamp(0.0, 1.0)
+    }
+}
+
 impl RenderScene {
     pub fn new() -> Self {
         Self::default()
@@ -275,6 +322,85 @@ impl RenderScene {
             solid.pose = None;
         }
         true
+    }
+
+    /// Re-derive every solid's and face's opacity from the name-keyed
+    /// metadata store: the seam through which the durable `transparency`
+    /// attribute reaches the display, as [`Self::apply_metadata_colors`] is
+    /// for `color`.
+    ///
+    /// `lookup` maps an object NAME (a solid's or a face's) to its opacity
+    /// (0 clear .. 1 opaque), `None` for "nothing recorded". A solid that
+    /// resolves fully opaque stores `None`; a face keeps an explicit 1, which
+    /// is how one face of a see-through body is made opaque again. A section
+    /// cap inherits its solid.
+    ///
+    /// A changed solid's `revision` is bumped, and only then: the same no-op
+    /// guarantee the colour pass gives, for the same reason.
+    pub fn apply_metadata_opacity(&mut self, lookup: impl Fn(&str) -> Option<f32>) -> bool {
+        let mut any = false;
+        for solid in &mut self.solids {
+            let mut changed = false;
+            let want = lookup(&solid.name).map(|o| o.clamp(0.0, 1.0)).filter(|o| *o < 1.0);
+            if solid.model_opacity != want {
+                solid.model_opacity = want;
+                changed = true;
+            }
+            for face in &mut solid.faces {
+                let want = if face.name.is_empty() || face.kind == FaceKind::SectionCap {
+                    None
+                } else {
+                    lookup(&face.name).map(|o| o.clamp(0.0, 1.0))
+                };
+                if face.opacity != want {
+                    face.opacity = want;
+                    changed = true;
+                }
+            }
+            if changed {
+                solid.revision = next_revision();
+                solid.shape_revision = 0;
+                solid.pose = None;
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Re-derive every EDGE's own colour and opacity from the metadata store,
+    /// by the edge's own name. Its own lookups, not the solids' and faces':
+    /// an edge never inherits its solid's or its faces' look, and no derived
+    /// default (a board body's colour) may read an edge name as a face's.
+    /// Unnamed and display-only (aux) edges carry none. Returns whether
+    /// anything changed; bumps a changed solid's revision.
+    pub fn apply_metadata_edge_looks(
+        &mut self,
+        color: impl Fn(&str) -> Option<[f32; 3]>,
+        opacity: impl Fn(&str) -> Option<f32>,
+    ) -> bool {
+        let mut any = false;
+        for solid in &mut self.solids {
+            let mut changed = false;
+            for edge in &mut solid.edges {
+                let (want_color, want_opacity) = if edge.name.is_empty() || edge.aux {
+                    (None, None)
+                } else {
+                    (color(&edge.name), opacity(&edge.name).map(|o| o.clamp(0.0, 1.0)).filter(|o| *o < 1.0))
+                };
+                if edge.color_override != want_color || edge.opacity != want_opacity {
+                    edge.color_override = want_color;
+                    edge.opacity = want_opacity;
+                    changed = true;
+                }
+            }
+            if changed {
+                solid.revision = next_revision();
+                solid.shape_revision = 0;
+                solid.pose = None;
+                any = true;
+            }
+        }
+        any
     }
 
     /// Re-derive every solid's and face's base colour from the name-keyed
@@ -770,6 +896,7 @@ pub fn solid_display_from_payload(
             tri_count: 0,
             kind: FaceKind::Unknown,
             color_override: None,
+            opacity: None,
         })
         .collect();
     let mut run_start = 0u32;
@@ -813,6 +940,8 @@ pub fn solid_display_from_payload(
                 .collect(),
             aux: false,
             centerline: false,
+            color_override: None,
+            opacity: None,
         })
         .collect();
 
@@ -831,6 +960,7 @@ pub fn solid_display_from_payload(
         visible: true,
         color_override: None,
         opacity: None,
+        model_opacity: None,
         revision: next_revision(),
         shape_revision: 0,
         pose: None,

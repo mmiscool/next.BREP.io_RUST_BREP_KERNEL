@@ -11,8 +11,8 @@ inside `Runtime::with_provider`. Scopes restore on return and unwinding. Each
 history document selects its own exact pins; component snapshots containing
 plugins conservatively replay instead of trusting cached display geometry.
 
-`Registry` owns serializable immutable feature/action/workbench/panel/annotation descriptors.
-`for_document` selects exact pins and rejects missing/duplicate dependencies.
+`Registry` owns serializable immutable feature/action/workbench/panel/annotation/post
+descriptors. `for_document` selects exact pins and rejects missing/duplicate dependencies.
 `Runtime::from_validated` accepts only metadata produced by a trusted worker;
 it checks package ownership without executing code on the receiving UI thread.
 
@@ -34,20 +34,56 @@ Solids are owned locally until all returned outputs validate; exceptions discard
 the arena without touching upstream solids. Outputs publish as `featureId:key`.
 Opaque handles cannot be saved in persistent state or reused by another call.
 
-Actions receive host input (`params`, `selection`, `document`) and return an
+Actions run through `Runtime::execute_action(pins, id, input)`; they receive
+host input (`params`, `selection`, `document`) and return an
 `ActionPlan`. `ctx.document.addFeature(type,params,persistentData)`,
-`updateFeature(id,params)` and `deleteFeature(id)` only stage commands;
-`ctx.notify(text)` stages notifications. The host must validate the whole plan,
+`updateFeature(id,params)` and `deleteFeature(id)` only stage commands (at most
+256 per call); `ctx.notify(text)` stages notifications, and `console` lines are
+appended to them. The host must validate the whole plan,
 recompute, check document/selection revision, commit pins and commands atomically,
 and create a single undo checkpoint. The runtime does not mutate a document.
 
 V1 schemas support number (finite min/max), string, boolean and
-reference_selection. Unknown parameter keys except reserved string `id` fail.
+reference_selection, each with an optional `default_value`. A feature's or
+annotation's number parameter may also be an expression string, evaluated in the
+document's expression environment. Unknown parameter keys except reserved string
+`id` fail.
 Arbitrary callback predicates, async callbacks and geometry adapters beyond the
 methods above are explicitly unsupported. Module evaluation
 must settle in the job drain; asynchronous host work belongs in host transport.
 
+`execute_script(source, input)` runs a one-off editor script without
+installing or pinning it: `source` is a function body that receives `cad` (the
+action context) and `ui.notify`, and only the resulting `ActionPlan` survives.
+
 The examples below show declarative panels and typed annotations.
+
+## Packages and registrations
+
+A `PackageBundle` is a `PackageManifest` (`id`, `version`, `apiVersion`, `name`,
+`entry`), its ES modules by package-local path, and optional binary assets.
+`PackageBundle::pin` validates it and returns its `PluginPin` (id, version, API version and a
+SHA-256 digest of the bundle). The API version is 1; the id uses ASCII letters,
+digits, `.`, `-` and `_`; a package holds at most 128 modules and 8 MiB of
+modules and assets.
+
+The `app` object passed to `install(app)` offers `registerFeature` (callback
+`execute`), `registerAction` (callback `run`), `registerWorkbench`,
+`registerPanel`, `registerAnnotation` (callback `execute`) and `registerPost`.
+Every registration has an `id` of the form `<package id>/<name>` and a nonempty
+`label`; each kind allows at most 256 registrations, and unknown properties
+reject the package.
+
+- Features and actions take an optional `inputParamsSchema`, `glyph`
+  (default a gear), `ribbonPath` (three `/`-separated segments, tab first; default
+  `Home/Extensions/<label>`; actions may use the `Home`, `View` or `Help` tabs,
+  features only `Home`) and `commandSize` (`Large` or `Compact`; features
+  default to `Large`, actions to `Compact`). Features also take `shortName`.
+- Workbenches list `featureTypes` (the package's features or built-in kernel
+  feature types), `actions` and `panels`, each of which must exist.
+- Posts name a package-local `module`: a CAM post-processor script
+  (`post.define({...})`) for BREP_cam's post runtime. This crate only
+  registers it (`Registry::posts`); the host runs it.
 
 
 ## Declarative panels
@@ -79,7 +115,7 @@ workbench membership explicitly. Aliases use the same registry and lifecycle.
 Panels allow at most 128 controls; tables allow 32 columns, 256 rows, and 4096
 bytes per cell. Text controls allow 16384 bytes. Unknown controls/properties,
 foreign action IDs and unresolved workbench panels reject the whole package.
-Registry deserialization defaults absent panel/annotation lists to empty, so
+Registry deserialization defaults absent panel/annotation/post lists to empty, so
 older validated metadata and existing v1 bundles remain supported.
 
 ## Typed annotations

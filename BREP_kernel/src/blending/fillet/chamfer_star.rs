@@ -24,19 +24,11 @@
 //! edge (a cone sector). On lane L's L prism the result is the closed form 750
 //! + 5d² − (10 − 2d + d√2)·d²/2 − 2·(π/4)·d³/6 to 1e-9.
 //!
-//! Default ON since lane R's promotion (2026-10-29, owner decision: this
-//! corner); `BREP_CHAMFER_MIXED_STAR=0` restores the refusal. A phase that
-//! refuses hands the selection back to the ordinary path unchanged.
+//! Promoted by lane R (2026-10-29, owner decision: this corner). A phase that refuses
+//! hands the selection back to the ordinary path unchanged.
 
 use crate::topology::BrepSolid;
 use crate::{KernelRefusal, Vec3};
-
-/// Whether the two-phase chamfer mixed star runs: ON unless
-/// `BREP_CHAMFER_MIXED_STAR=0` (or `off`), or a test's forced value.
-pub(super) fn chamfer_mixed_star_on() -> bool {
-    switch!("BREP_CHAMFER_MIXED_STAR", true)
-}
-
 
 /// A star found on the selection: the concave edge's index in the selection
 /// and the cap face's id.

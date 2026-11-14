@@ -2304,10 +2304,11 @@ fn reconstruct_impl(
                     &mut face_at_mut(&mut solid.shells, fi).loops[li].coedges[ci].pcurve,
                     c.pcurve,
                 );
-                let previous_edge = if let Some((curve, before, after)) = proposals
+                let previous_edge = if let Some(proposal) = proposals
                     .get(&c.edge_id)
                     .filter(|_| updated.insert(c.edge_id))
                 {
+                    let (curve, ..) = proposal;
                     let edge = &mut solid.edges[edge_indices[&c.edge_id]];
                     let [a, b] = curve.domain().expect("constructed curve domain");
                     let previous = std::mem::replace(&mut edge.curve, curve.clone());
@@ -2319,8 +2320,6 @@ fn reconstruct_impl(
                         previous,
                         t0,
                         t1,
-                        residual_before: *before,
-                        residual_after: *after,
                     })
                 } else {
                     None

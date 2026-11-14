@@ -46,19 +46,6 @@ use super::super::rollover_surgery::split_edge_at_vertices;
 
 const CTX: &str = "round_mixed_concave_open_corner";
 
-/// `BREP_BLEND_OPEN_MIXED_CORNER=1` lets the cutter composition close an open
-/// mixed corner with this closure, `=0` keeps the composition's own body.
-/// Promoted 2026-10-14 (lane L's record: case manifest OK with it on, the
-/// fillet suites green); `=0` is the escape hatch. It also follows the
-/// one-ended runout's switch (`BREP_BLEND_ONE_ENDED_RUNOUT`), whose body it
-/// builds, so that escape hatch keeps meaning "the class as before".
-const OPEN_MIXED_CORNER_DEFAULT: bool = true;
-
-pub(crate) fn open_mixed_corner_on() -> bool {
-    switch!(live "BREP_BLEND_OPEN_MIXED_CORNER", OPEN_MIXED_CORNER_DEFAULT) && crate::blend::runout::one_ended_runout_on()
-}
-
-
 fn unsupported(what: &'static str, message: String) -> KernelRefusal {
     KernelRefusal::unsupported(KernelStage::Classify, what, format!("{CTX}: {message}"))
 }
@@ -176,7 +163,6 @@ fn fresh_pcurve(face: &FaceRecord, curve: &NurbsCurve, uv_ends: Option<(Vec3, Ve
     crate::pcurve::build_pcurve_on_surface_range(&face.surface, curve, t0, t1, true, 1e-9 * (1.0 + radius))
         .or_refuse(KernelStage::Fragment, "build_pcurve")
 }
-
 
 /// The run of `face`'s single loop between the vertices `from` and `to`
 /// whose interior vertices all satisfy `inside`: the coedges before it (from

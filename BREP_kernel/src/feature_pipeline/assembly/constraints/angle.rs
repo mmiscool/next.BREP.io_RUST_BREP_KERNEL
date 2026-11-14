@@ -1,8 +1,8 @@
-//! Angle (`ANGL`) — hold two direction-bearing elements at a target angle.
-//! The stored param is the DISPLAY angle (exterior-remapped when the toggle
-//! is on); a new constraint created without an `angle` adopts the current
-//! orientation on first solve, in that same display convention; one created
-//! with it turns there.
+//! Angle (`ANGL`) — hold two direction-bearing elements at a target angle
+//!. The stored param is the DISPLAY angle (exterior-remapped when the
+//! toggle is on); a new constraint created without an `angle` adopts the
+//! current orientation on first solve, in that same display convention; one
+//! created with it turns there.
 
 use super::super::mapping::{
     first_solve_target, mate, require_direction, ConstraintFailure, MappedConstraint,

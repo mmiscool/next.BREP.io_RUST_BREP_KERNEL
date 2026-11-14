@@ -3,8 +3,6 @@ use super::*;
 
 /// Piece of a support rim assigned to one mate face.
 pub(super) struct RimPiece {
-    pub(super) face_id: u64,
-    pub(super) loop_index: usize,
     /// Global-parameter window of this piece.
     pub(super) window: [f64; 2],
     pub(super) edge_id: u64,
@@ -913,17 +911,17 @@ pub(in crate::blend) fn wall_probe_reading(p: Vec3, nodes: &[Vec3], j: usize, ra
     Some((a.abs().max(b.abs()), (a - b).abs()))
 }
 
-/// The DECLARED wall reading at one probe, the one rule both wall tiers
-/// decide on: `(reading, uncertainty)`, declared = reading + uncertainty.
-/// `fine` are the interval's centres at twice the probe density, `jf` the
-/// probe's (even) node among them; the coarse set is every other node. The
-/// reading is the larger fine two-stencil magnitude; the uncertainty is the
-/// larger of the fine stencils' spread and how far the fine reading moved
-/// from the coarse one — the proxy's error estimated from its own change with
-/// node density, which two stencils agreeing at one density cannot show (two
-/// symmetric stencils that both under-read read a spread of zero). An
-/// ESTIMATE, not a bound: a proxy whose error does not shrink with density
-/// would still hide. `None` when any reading is unreadable.
+// The DECLARED wall reading at one probe, the one rule both wall tiers
+// decide on: `(reading, uncertainty)`, declared = reading + uncertainty.
+// `fine` are the interval's centres at twice the probe density, `jf` the
+// probe's (even) node among them; the coarse set is every other node. The
+// reading is the larger fine two-stencil magnitude; the uncertainty is the
+// larger of the fine stencils' spread and how far the fine reading moved
+// from the coarse one — the proxy's error estimated from its own change with
+// node density, which two stencils agreeing at one density cannot show (two
+// symmetric stencils that both under-read read a spread of zero). An
+// ESTIMATE, not a bound: a proxy whose error does not shrink with density
+// would still hide. `None` when any reading is unreadable.
 
 fn wall_solve_reuse_on() -> bool {
     switch!(live "BREP_WALL_SOLVE_REUSE", true)

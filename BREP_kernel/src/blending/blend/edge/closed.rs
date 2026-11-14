@@ -405,8 +405,7 @@ fn blend_closed_edge_impl(
     crate::blend::stations::CLOSED_MODEL_UNMET.with(|slot| slot.set(None));
     crate::blend::stations::CLOSED_REQUEST_RAILS.with(|slot| slot.set(None));
     prepare_timing.stop();
-    let exact_revolution = crate::blend::exact_rim_lane_on()
-        && crate::blend::stations::closed_revolution_axis(&first_mate, &second_mate).is_some();
+    let exact_revolution = crate::blend::stations::closed_revolution_axis(&first_mate, &second_mate).is_some();
     let depth_budget = if exact_revolution { 0 } else { MAX_REFINEMENT_DEPTH };
     if exact_revolution {
         crate::blend::record_count("count.closed.exact_lane", 1);
@@ -641,17 +640,14 @@ fn blend_closed_edge_impl(
         let scale = crate::blend::stations::march_model_scale(&edge.curve, edge.t0, edge.t1, radius_at(mid_t))?;
         match crate::blend::rollover::plan_closed(solid, edge, &stations, [&first_mate, &second_mate], radius_at, scale) {
             Ok(Some(plan)) => {
-                // The BUILD (behind its switch): every piece marched on its
+                // The BUILD: every piece marched on its
                 // own carriers and fitted, then sewn on the crossing ribs.
-                if crate::blend::rollover_on() {
-                    let pieces = crate::blend::rollover::march_pieces(
-                        solid, edge, &plan, &stations, [&first_mate, &second_mate], radius_at, scale, rail_bar, chamfer, anchor_u,
-                    )?;
-                    let built = crate::blend::rollover::build(solid, edge, [&first_mate, &second_mate], &plan, pieces, anchor_u, name)?;
-                    march_timing.stop();
-                    return Ok(built);
-                }
-                return Err(crate::blend::rollover::refusal(&plan, radius_at(mid_t).abs()));
+                let pieces = crate::blend::rollover::march_pieces(
+                    solid, edge, &plan, &stations, [&first_mate, &second_mate], radius_at, scale, rail_bar, chamfer, anchor_u,
+                )?;
+                let built = crate::blend::rollover::build(solid, edge, [&first_mate, &second_mate], &plan, pieces, anchor_u, name)?;
+                march_timing.stop();
+                return Ok(built);
             }
             Ok(None) => {}
             Err(error) => {
@@ -1608,7 +1604,7 @@ fn refit_closed_support_pcurve_read_with(
             Err(_) => break,
         }
     }
-    let (miss, standoff, samples, _) = read;
+    let (miss, _, samples, _) = read;
     if !(miss <= floor) {
         return Err(KernelRefusal::non_convergence(KernelStage::Refine, CLOSED_SUPPORT_PCURVE_FLOOR_WHAT, format!(
             "{} a blend's support pcurve, as shipped, misses its rail's track by {miss:.3e} at {samples} samples, \

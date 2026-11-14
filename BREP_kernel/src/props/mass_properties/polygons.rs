@@ -101,7 +101,7 @@ impl TrimPolygon {
 
     fn settle_pending(&mut self, next: [f64; 2]) {
         if let Some(end) = self.pending_end.take() {
-            if switch!("BREP_MASS_TRIM_JOINS", false) {
+            if switch!("BREP_MASS_TRIM_JOINS", true) {
                 // The next coedge need not start at this coedge's end.
                 // Keep the complete arc, then a separate straight join;
                 // otherwise the polygon silently replaces its final chord.
@@ -149,7 +149,7 @@ impl TrimPolygon {
                 let point = curve.evaluate(parameter)?;
                 self.push_point([point.x + offset[0], point.y + offset[1]]);
             }
-            if switch!("BREP_MASS_TRIM_JOINS", false) {
+            if switch!("BREP_MASS_TRIM_JOINS", true) {
                 let point = curve.evaluate(end)?;
                 self.pending_end = Some([point.x + offset[0], point.y + offset[1]]);
             }
@@ -181,7 +181,7 @@ impl TrimPolygon {
                 let point = curve.evaluate(parameter)?;
                 self.push_point([point.x + offset[0], point.y + offset[1]]);
             }
-            if !include_end && switch!("BREP_MASS_TRIM_JOINS", false) {
+            if !include_end && switch!("BREP_MASS_TRIM_JOINS", true) {
                 let point = curve.evaluate(end)?;
                 self.pending_end = Some([point.x + offset[0], point.y + offset[1]]);
             }
@@ -285,11 +285,26 @@ pub fn trim_polygons(face: &FaceRecord) -> Result<Vec<Vec<[f64; 2]>>, String> {
 }
 
 pub(super) fn trim_polygons_tagged(face: &FaceRecord) -> Result<Vec<TrimPolygon>, String> {
+    let surface = &face.surface;
+    // This changes only the polygon work count. Every polynomial span keeps
+    // its exact arc correction, including its endpoint and real joins.
+    let span_chords = switch!("BREP_MASS_TRIM_SPAN_CHORDS", true)
+        && switch!("BREP_MASS_EXACT_DOMAIN_COVER", true)
+        && surface.closed_directions()? == (false, false)
+        && surface.degree_u <= 3 && surface.degree_v <= 3
+        && surface.control_points.len() == surface.degree_u + 1
+        && surface.control_points[0].len() == surface.degree_v + 1
+        && surface.control_points.iter().flatten().all(|p| p.w == surface.control_points[0][0].w)
+        && near_rectangle_for_span_chords(face)?;
     let mut polygons = Vec::new();
     for (loop_index, loop_record) in face.loops.iter().enumerate() {
         let mut polygon = TrimPolygon::for_face(face)?;
         for (coedge_index, coedge) in loop_record.coedges.iter().enumerate() {
-            polygon.push_coedge(loop_index, coedge_index, coedge, [0.0, 0.0])?;
+            if span_chords {
+                polygon.push_coedge_spans(loop_index, coedge_index, coedge, [0.0, 0.0], 1, false)?;
+            } else {
+                polygon.push_coedge(loop_index, coedge_index, coedge, [0.0, 0.0])?;
+            }
         }
         polygon.finish();
         polygons.push(polygon);
@@ -693,7 +708,7 @@ pub(super) fn is_untrimmed(face: &FaceRecord) -> Result<bool, String> {
     let [u0, u1] = ku.domain();
     let [v0, v1] = kv.domain();
     let domain_area = (u1 - u0) * (v1 - v0);
-    if switch!("BREP_MASS_EXACT_DOMAIN_COVER", false)
+    if switch!("BREP_MASS_EXACT_DOMAIN_COVER", true)
         && !trim_on_domain_boundary(face, [u0, u1, v0, v1])? {
         return Ok(false);
     }
@@ -733,6 +748,16 @@ pub(super) fn pole_side_clip_on() -> bool {
 }
 
 fn iso_rectangle_trim_impl(face: &FaceRecord) -> Result<Result<[f64; 4], &'static str>, String> {
+    iso_rectangle_trim_impl_with_exact(face, switch!("BREP_MASS_EXACT_DOMAIN_COVER", true), false)
+}
+
+/// A cost classifier only: the caller integrates the actual pcurves, never
+/// the approximate rectangle returned here.
+pub(super) fn near_rectangle_for_span_chords(face: &FaceRecord) -> Result<bool, String> {
+    Ok(iso_rectangle_trim_impl_with_exact(face, false, true)?.is_ok())
+}
+
+fn iso_rectangle_trim_impl_with_exact(face: &FaceRecord, exact: bool, either_orientation: bool) -> Result<Result<[f64; 4], &'static str>, String> {
     if face.loops.len() != 1 {
         return Ok(Err("not one loop"));
     }
@@ -754,7 +779,6 @@ fn iso_rectangle_trim_impl(face: &FaceRecord) -> Result<Result<[f64; 4], &'stati
     // oblique trim by a rectangle. Exact coverage also requires this second
     // shortcut to preserve the boundary; uncertain fits take the trimmed
     // route, including its arc corrections and open-domain extension.
-    let exact = switch!("BREP_MASS_EXACT_DOMAIN_COVER", false);
     let (eps_u, eps_v) = if exact { (0.0, 0.0) } else { (1e-7 * span_u, 1e-7 * span_v) };
     let mut segments: Vec<([f64; 2], [f64; 2])> = Vec::with_capacity(4);
     for coedge in &face.loops[0].coedges {
@@ -840,7 +864,7 @@ fn iso_rectangle_trim_impl(face: &FaceRecord) -> Result<Result<[f64; 4], &'stati
         }
     }
     let corners: Vec<[f64; 2]> = segments.iter().map(|segment| segment.0).collect();
-    if !(polygon_signed_area(&corners) > 0.0) {
+    if !(if either_orientation { polygon_signed_area(&corners).abs() } else { polygon_signed_area(&corners) } > 0.0) {
         return Ok(Err("not wound counter-clockwise"));
     }
     let (mut u_lo, mut u_hi, mut v_lo, mut v_hi) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);

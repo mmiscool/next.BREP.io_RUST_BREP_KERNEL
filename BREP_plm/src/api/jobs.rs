@@ -72,7 +72,8 @@ pub async fn update(State(db): State<Shared>, headers: HeaderMap, Path(id): Path
     Ok(Json(blocking(move || db.update_job(&id, &fields)).await?))
 }
 
-/// `POST /api/jobs/:id/steps/:step/signoff {serials, note?}`.
+/// `POST /api/jobs/:id/steps/:step/signoff {serials, fields?, note?}`:
+/// `fields` is `[{id, value}]`, the values of the step's fields.
 pub async fn sign(State(db): State<Shared>, headers: HeaderMap, Path((id, step)): Path<(String, String)>, Json(signoff): Json<SignOff>) -> Result<Json<JobStep>, Error> {
     let user = require_user(&db, &headers)?;
     Ok(Json(blocking(move || db.sign_step(&user, &id, &step, &signoff)).await?))

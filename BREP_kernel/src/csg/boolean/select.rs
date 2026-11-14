@@ -109,6 +109,9 @@ pub(super) fn classify_fragment_traced(
                 on_normal: None,
             }, "on_to_in"));
         }
+        if debug {
+            eprintln!("frag src_face={} On kept: votes in {in_votes} out {out_votes} on {on_votes}; extras {:?}", fragment.source_face_id, fragment.extra_test_points);
+        }
         return Ok((primary, if fragment.extra_test_points.is_empty() { "primary" } else { "on_kept" }));
     }
     // A stray In/Out on a face that is actually coincident with the other

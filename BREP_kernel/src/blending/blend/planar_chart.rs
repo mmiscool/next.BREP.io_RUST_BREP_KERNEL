@@ -346,15 +346,7 @@ pub(crate) fn fit_planar_charts_to_trims(
 // Every pcurve that followed its edge still does and is left untouched; only
 // the coedges that MISS their edge are rebuilt.  The pass fires only on a
 // measured miss, so a body whose trims all follow their edges is never moved.
-// `BREP_BLEND_RULED_CHART=0`/`off` turns it off.
 // ======================================================================
-
-/// The ruled re-span's switch: on unless `BREP_BLEND_RULED_CHART=0`/`off`.
-/// It also switches `transverse_curve`'s exact ends at EXTEND landings
-/// (`edge/support.rs`), the other half of the same repair.
-pub(in crate::blend) fn ruled_chart_on() -> bool {
-    switch!(live "BREP_BLEND_RULED_CHART", true)
-}
 
 /// Whether the ruled re-span also takes ANALYTIC non-planar carriers (an
 /// exactly ruled cylinder or cone): on unless
@@ -456,9 +448,6 @@ fn pcurve_miss(surface: &crate::NurbsSurface, pcurve: &NurbsCurve, curve: &Nurbs
 /// operation touched (a coedge whose edge is not in `input`).  Returns how
 /// many carriers moved.
 fn fit_ruled_charts_to_trims(input: &BrepSolid, result: &mut BrepSolid) -> Result<usize, KernelRefusal> {
-    if !ruled_chart_on() {
-        return Ok(0);
-    }
     let band = crate::blend::consumed_band(input).min(crate::blend::consumed_band(result));
     // A trim MISSES its edge, and an edge lies ON the extension, by the
     // kernel's own contract for a fitted edge on its face — fitted transverse

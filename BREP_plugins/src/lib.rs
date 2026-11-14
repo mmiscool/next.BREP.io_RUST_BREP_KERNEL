@@ -1,4 +1,16 @@
+//! Pinned JavaScript CAD packages on Boa, backed by exact kernel solids.
+//!
 //! Trusted, explicitly provisioned packages. Saved pins never carry executable code.
+//!
+//! A [`PackageBundle`] is validated and pinned by digest ([`PackageBundle::pin`],
+//! [`PluginPin`]). [`Runtime::new`] installs bundles and builds the [`Registry`] of
+//! feature, action, workbench, panel, annotation and post descriptors;
+//! [`Registry::for_document`] selects a document's exact pins. The runtime is the
+//! kernel's extension provider: [`Runtime::execute_history`] and
+//! [`Runtime::with_provider`] scope it around kernel calls, and
+//! [`Runtime::execute_action`], [`Runtime::execute_annotation`] and
+//! [`execute_script`] run callbacks. See the README for the JavaScript API and its
+//! limits.
 pub use brep_kernel::feature_pipeline::extension::PluginPin;
 use brep_kernel::feature_pipeline::{self as kernel, FeatureContext, FeatureResult};
 use serde::{Deserialize, Serialize};

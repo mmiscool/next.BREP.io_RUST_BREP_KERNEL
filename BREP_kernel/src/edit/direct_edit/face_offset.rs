@@ -177,7 +177,28 @@ fn outward_normal_mid(face: &FaceRecord) -> Result<(Vec3, Vec3), KernelRefusal> 
 /// offset carrier's meridian; each rim edge re-intersects its cap
 /// (`intersect_analytic_pair`, exact circle); the caps re-trim as planar faces.
 /// Ruled/curved neighbours and non-full-revolution ruled faces are deferred.
+///
+/// The offset re-trims the pushed face against the faces it borders only, so a
+/// push that carries it into a face it does not border (two holes widened until
+/// they run into each other) closes incidence-clean on a body that passes
+/// through itself. [`crate::accept_sound`] is the floor on the way out of this
+/// entry, as it is for [`crate::move_faces`]: it repairs where the crossing can
+/// be proved and refuses by name where it cannot. [`offset_ruled_face_unchecked`]
+/// is the offset alone, for a caller that runs its own acceptance on the
+/// result (several pushes in a row, accepted once).
 pub fn offset_ruled_face(
+    solid: &BrepSolid,
+    face_id: u64,
+    distance: f64,
+) -> Result<BrepSolid, KernelRefusal> {
+    crate::accept_sound(offset_ruled_face_unchecked(solid, face_id, distance)?, "offsetRuledFace")
+}
+
+/// [`offset_ruled_face`] without its soundness floor: the offset and re-trim,
+/// returned as soon as its incidences validate. The result can pass through
+/// itself; the caller owes it an acceptance scan ([`crate::accept_sound`])
+/// before it is used as a body.
+pub fn offset_ruled_face_unchecked(
     solid: &BrepSolid,
     face_id: u64,
     distance: f64,

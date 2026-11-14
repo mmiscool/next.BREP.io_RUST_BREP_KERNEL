@@ -1,9 +1,9 @@
 //! Creatable set: the shared building blocks (sketch `S` / datum `D` / plane
 //! `P`) plus the ASSEMBLY COMPONENT (`ACOMP`) — in-context sketches on
-//! component faces are an allowed reference use, so S/D/P stay creatable here.
-//! Everything else (modeling + sheet metal) is filtered out of the creation
-//! UI; the history itself stays fully visible/editable regardless of workbench
-//! (standing rule).
+//! component faces are an allowed reference use, so S/D/P stay
+//! creatable here. Everything else (modeling + sheet metal) is filtered out of
+//! the creation UI; the history itself stays fully visible/editable regardless
+//! of workbench (standing rule).
 //!
 //! Claims the two assembly panels (Assembly Structure tree + Assembly
 //! Constraints), which therefore show ONLY under Assembly (and "All").
@@ -18,7 +18,7 @@ pub const BOM_PANEL_ID: &str = "assemblyBom";
 
 /// Datum / Plane / Sketch / Component (`ACOMP`) / Pattern Component (`APAT`).
 fn includes(feature: &FeatureInfo<'_>) -> bool {
-    matches!(feature.type_code, "S" | "D" | "P" | "ACOMP" | "APAT")
+    matches!(feature.type_code, "S" | "D" | "P" | "ACOMP" | "APAT" | "WELD")
 }
 
 /// Add Component's id — named because the shell arm that answers for it and
@@ -31,13 +31,14 @@ fn needs_component_button(state: &ButtonState<'_>) -> bool {
     !super::includes_feature(&state.engine.settings.workbench, "ACOMP")
 }
 
-/// The assembly toolbar tools. A click surfaces the button id out of the toolbar to the shell:
-/// `"assembly.add_component"` opens the insert-component modal (the same
-/// `FileAction::InsertComponent` flow the ACOMP palette pick routes through),
-/// `"assembly.auto_constrain"` opens the inference window and scans the current placement, and
-/// `"assembly.interference"` runs the engine's pairwise check and opens the results window.
-/// Like every workbench button, "All" carries them automatically via the deduped union. PCB
-/// BORROWS the first of them ([`super::BORROWED`]), which is why this is a named array:
+/// The assembly toolbar tools. A click surfaces the button id out of the
+/// toolbar to the shell: `"assembly.add_component"` opens the insert-component
+/// modal (the same `FileAction::InsertComponent` flow the ACOMP palette pick
+/// routes through), `"assembly.auto_constrain"` opens the inference window and
+/// scans the current placement, and `"assembly.interference"`
+/// runs the engine's pairwise check and opens the results window. Like every workbench button,
+/// "All" carries them automatically via the deduped union. PCB BORROWS the
+/// first of them ([`super::BORROWED`]), which is why this is a named array:
 /// [`ADD_COMPONENT`] points INTO it rather than beside it.
 static BUTTONS: [WorkbenchButton; 4] = [
     WorkbenchButton {
@@ -95,7 +96,7 @@ pub static ADD_COMPONENT: &WorkbenchButton = &BUTTONS[0];
 
 /// The assembly panels this workbench claims (claim-based visibility —
 /// unclaimed panels stay visible everywhere; these show only here + All).
-static PANELS: &[&str] = &[CONSTRAINTS_PANEL_ID, BOM_PANEL_ID];
+static PANELS: &[&str] = &[CONSTRAINTS_PANEL_ID, BOM_PANEL_ID, super::pmi::PANEL_ID];
 
 pub static ASSEMBLY: Workbench = Workbench {
     id: "assembly",

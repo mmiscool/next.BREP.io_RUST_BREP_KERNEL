@@ -1,8 +1,23 @@
-//! UI-independent schematic and board documents, symbol import, and connectivity.
+//! UI-independent schematic, wiring-diagram and board documents, KiCad import,
+//! connectivity, rule checks, autorouting and fabrication output.
+//!
+//! [`Document`] is one sheet (schematic or wiring diagram, [`DocumentKind`]) with
+//! its board; [`Document::netlist`] reads its connectivity and [`History`] keeps
+//! undo/redo snapshots. Coordinates are integer micrometres ([`Point`]), +Y down.
+//!
+//! Modules:
+//! - [`kicad`]: KiCad 9 symbol library and footprint import.
+//! - [`kicad_git`]: shallow clones of KiCad's official libraries (runs `git`).
+//! - [`erc`]: the electrical rule check.
+//! - [`netlist`]: KiCad `.net` netlist export and read-back.
+//! - [`board`]: PCB layout, connectivity and design rules.
+//! - [`autoroute`]: the board autorouter.
+//! - [`fabrication`]: Gerber X2, Excellon drill files, pick-and-place, BOM and a zip bundle.
+//! - [`footprint`]: natural ordering of pad and pin labels.
 //!
 //! Object IDs are random version 4 UUIDs. On `wasm32-unknown-unknown` the randomness
-//! comes from the host: enable the `uuid` crate's `js` feature (as `BREP_app` does) or
-//! configure another `getrandom` backend, or creating an object fails.
+//! comes from the host: enable the `uuid` crate's `js` feature or configure another
+//! `getrandom` backend, or creating an object fails. See the README for an example.
 pub mod autoroute;
 pub mod board;
 pub mod erc;

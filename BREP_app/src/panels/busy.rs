@@ -102,6 +102,14 @@ pub fn engine_activities(engine: &EngineState, document: u64, title: Option<&str
             (None, None) if preview.is_some() => {
                 format!("Previewing {}", preview.as_deref().unwrap_or_default())
             }
+            // The parts a newer kernel shows from older snapshots, rebuilt.
+            (Some(p), None) if !engine.stale_parts_rebuilding().is_empty() => format!(
+                "Refreshing {} made by an earlier kernel — {} ({}/{})",
+                parts_phrase(engine.stale_parts_rebuilding().len()),
+                p.feature_id,
+                p.index + 1,
+                p.total
+            ),
             (Some(p), None) => {
                 format!("Rebuilding model — {} ({}/{})", p.feature_id, p.index + 1, p.total)
             }
@@ -302,3 +310,8 @@ pub static HIT_KEYS: &[crate::automation::hit_keys::HitKeyDoc] = &[
     crate::automation::hit_keys::HitKeyDoc { panel: "status", prefix: "busy:cancel", meaning: "cancel the in-flight history run named by the working indicator", command: None },
 ];
 
+
+/// "1 part" / "3 parts".
+fn parts_phrase(count: usize) -> String {
+    if count == 1 { "1 part".into() } else { format!("{count} parts") }
+}

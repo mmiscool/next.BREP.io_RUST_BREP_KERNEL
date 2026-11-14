@@ -77,6 +77,7 @@ pub static FEATURE_APPLICABILITY: &[(&str, fn(&SelectionProbe) -> bool)] = &[
     ("S3D", super::features::sketch3d::context_applicable),
     ("SP", super::features::spline::context_applicable),
     ("WP", super::features::waypoint::context_applicable),
+    ("WELD", super::features::weld::context_applicable),
     ("HX", super::features::helix::context_applicable),
     ("E", super::features::extrude::context_applicable),
     ("B", super::features::boolean::context_applicable),

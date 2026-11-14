@@ -1,5 +1,5 @@
-//! Parallel (`PARA`) — two direction-bearing elements align, with the
-//! captured facing preference.
+//! Parallel (`PARA`) — two direction-bearing elements align, with
+//! the captured facing preference.
 
 use super::super::mapping::{
     angle_between_deg, effective_align, mate, require_direction, ConstraintFailure,

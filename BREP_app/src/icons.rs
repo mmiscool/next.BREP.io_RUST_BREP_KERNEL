@@ -42,10 +42,10 @@ pub struct Icon {
     pub svg: &'static str,
     /// width / height of the viewBox — the proportion the font draws it at.
     pub aspect: f32,
-    /// SVG cropped to painted bounds, for standalone artwork in icon tiles.
+    /// The artwork alone, for buttons and icon tiles: the painted bounds
+    /// centred in a SQUARE box, with no canvas padding. Always draw it into a
+    /// square; it is 1:1 for every icon, so nothing can stretch it.
     pub artwork_svg: &'static str,
-    /// Aspect ratio of the painted artwork, excluding canvas padding.
-    pub artwork_aspect: f32,
     /// Monochrome artwork that should take the colour of the surrounding text.
     /// `false` means the SVG carries its own colours and must not be tinted.
     pub mono: bool,

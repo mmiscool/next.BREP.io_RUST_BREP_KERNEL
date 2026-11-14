@@ -16,7 +16,6 @@
 //! a rasterised image "would buy nothing" — true in isolation, but it was the
 //! last thing keeping a whole font in the binary, so it went too.
 use eframe::egui;
-use egui::AtomExt as _;
 
 /// The catalogued artwork for a button glyph — what lets a plain
 /// `button`/`button_enabled`/`toggle` call site render its icon with no per-site
@@ -58,12 +57,11 @@ pub(crate) fn glyph_button<'a>(ui: &egui::Ui, glyph: &'a str) -> egui::Button<'a
             // Idempotent, and the only place a toolbar button needs it: a button
             // can be the first thing on screen to draw an SVG.
             egui_extras::install_image_loaders(ui.ctx());
-            let height = GLYPH_SIZE / icon.artwork_aspect.max(1.0);
             let image = egui::Image::new(egui::ImageSource::Bytes {
                 uri: format!("bytes://brep-toolbar/{}.svg", icon.name).into(),
                 bytes: egui::load::Bytes::Static(icon.artwork_svg.as_bytes()),
             })
-            .fit_to_exact_size(egui::vec2(height * icon.artwork_aspect, height));
+            .fit_to_exact_size(egui::Vec2::splat(GLYPH_SIZE));
             egui::Button::new(image)
                 .image_tint_follows_text_color(icon.mono)
                 .min_size(square(ui))
@@ -78,6 +76,9 @@ pub fn button(ui: &mut egui::Ui, glyph: &str, tooltip: &str) -> egui::Response {
     ui.add(button).on_hover_text(tooltip)
 }
 
+/// Side of a Large button's artwork square.
+const LARGE_ART: f32 = 28.0;
+
 /// Ribbon's Large presentation: catalogue artwork above the canonical label.
 pub fn large_button(ui: &mut egui::Ui, glyph: &str, label: &str, selected: bool, toggle: bool, enabled: bool) -> egui::Response {
     let font = egui::TextStyle::Button.resolve(ui.style());
@@ -90,11 +91,12 @@ pub fn large_button(ui: &mut egui::Ui, glyph: &str, label: &str, selected: bool,
         .style()
         .interact_selectable(&response, selected)
         .text_color();
-    let image_rect = egui::Rect::from_center_size(
-        egui::pos2(response.rect.center().x, response.rect.top() + 22.0),
-        egui::vec2(28.0, 28.0),
-    );
+    let image_center = egui::pos2(response.rect.center().x, response.rect.top() + 22.0);
     if let Some(icon) = artwork(glyph) {
+        let image_rect = egui::Rect::from_center_size(
+            image_center,
+            egui::Vec2::splat(LARGE_ART),
+        );
         egui_extras::install_image_loaders(ui.ctx());
         let tint = if icon.mono {
             color
@@ -112,7 +114,7 @@ pub fn large_button(ui: &mut egui::Ui, glyph: &str, label: &str, selected: bool,
         .paint_at(ui, image_rect);
     } else {
         ui.painter().text(
-            image_rect.center(),
+            image_center,
             egui::Align2::CENTER_CENTER,
             glyph,
             font.clone(),
@@ -197,7 +199,8 @@ fn switcher_row(label: &str, glyph: &str, marker_slot: egui::Id) -> egui::Button
         uri: icon.uri.into(),
         bytes: egui::load::Bytes::Static(icon.svg.as_bytes()),
     })
-    .fit_to_exact_size(egui::Vec2::splat(SELECT_ICON));
+    // At the canvas's own proportions, so no workbench icon can be stretched.
+    .fit_to_exact_size(egui::vec2(SELECT_ICON * icon.aspect, SELECT_ICON));
     egui::Button::new((
         image,
         label.to_owned(),
@@ -350,19 +353,14 @@ pub(crate) fn menu_row_button(glyph: &str, label: &str) -> egui::Button<'static>
     // The CROPPED artwork at the strip's own painted size and URI, exactly as
     // [`glyph_button`] draws it — not the switcher's padded `svg`, which paints
     // the same glyph visibly smaller. Menu and toolbar artwork share a size.
-    let height = GLYPH_SIZE / icon.artwork_aspect.max(1.0);
     let image = egui::Image::new(egui::ImageSource::Bytes {
         uri: format!("bytes://brep-toolbar/{}.svg", icon.name).into(),
         bytes: egui::load::Bytes::Static(icon.artwork_svg.as_bytes()),
     })
-    .fit_to_exact_size(egui::vec2(height * icon.artwork_aspect, height));
-    // Every row's icon takes one GLYPH_SIZE-wide slot, so the labels of a menu
-    // start at one x: the artwork is as wide as its aspect makes it (a tall
-    // glyph narrower), which shifted each label by its icon (lane U audit item
-    // 6). The spacer pads the slot; an image atom given the full size would be
-    // stretched to it instead.
-    let pad = (GLYPH_SIZE - height * icon.artwork_aspect).max(0.0);
-    egui::Button::new((image, egui::Atom::default().atom_size(egui::vec2(pad, 0.0)), label.to_owned()))
+    .fit_to_exact_size(egui::Vec2::splat(GLYPH_SIZE));
+    // Every icon's artwork is square, so every row's icon takes the same slot
+    // and the labels of a menu start at one x (lane U audit item 6).
+    egui::Button::new((image, label.to_owned()))
         .image_tint_follows_text_color(icon.mono)
         .wrap_mode(egui::TextWrapMode::Extend)
 }

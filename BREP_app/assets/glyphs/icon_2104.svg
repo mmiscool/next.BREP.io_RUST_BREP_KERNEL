@@ -1,5 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
-     viewBox="-150 0 1550 2384" width="1550" height="2384" brep:glyph-name="icon_2104" brep:unicode="2104">
-  <path d="M1207.0 731.5A760 760 0 1 0 1207.0 1708.5L1092.0 1612.0A610 610 0 1 1 1092.0 828.0Z" fill="#111"/>
-  <path d="M560.0 560.0H690.0V1750.0H1150.0V1880.0H560.0Z" fill="#111"/>
+     viewBox="-150 0 1550 2384" width="1550" height="2384" brep:glyph-name="icon_pmi_center_mark" brep:unicode="2104">
+  <!-- A drafting center mark: a round feature, a small cross at its centre, a
+       gap, then a long dash on each arm running out across the rim. -->
+  <g fill="#111" stroke="#111" stroke-linecap="butt">
+    <circle cx="625" cy="1221" r="500" stroke-width="150" style="fill:none"/>
+    <path d="M455 1221H795M625 1051V1391" stroke-width="100" style="fill:none"/>
+    <path d="M-145 1221H255M995 1221H1395M625 451V851M625 1591V1991" stroke-width="100" style="fill:none"/>
+  </g>
 </svg>

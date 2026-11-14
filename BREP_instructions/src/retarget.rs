@@ -194,7 +194,7 @@ pub fn apply(block: &mut Instructions, new: &Level, diff: &Diff, to: Target) -> 
 pub fn approve(block: &mut Instructions) -> Result<Target, String> {
     let retarget = block.retarget.take().ok_or("no re-target is waiting for approval")?;
     let empty: HashSet<&str> = retarget.empty_steps.iter().map(String::as_str).collect();
-    retain_steps(&mut block.steps, &|s| !(empty.contains(s.id.as_str()) && s.adds.is_empty() && s.steps.is_empty()));
+    retain_steps(&mut block.steps, &|s| !(empty.contains(s.id.as_str()) && s.adds.is_empty() && s.steps.is_empty() && s.fields.is_empty()));
     block.target = retarget.to.clone();
     Ok(retarget.to)
 }

@@ -33,8 +33,8 @@ static BUTTONS: &[WorkbenchButton] = &[WorkbenchButton {
     menu: &[],
 }];
 
-/// No panel claims (v1).
-static PANELS: &[&str] = &[];
+/// The shared PMI panel (Sheet Metal is one of its hosts).
+static PANELS: &[&str] = &[super::pmi::PANEL_ID];
 
 pub static SHEET_METAL: Workbench = Workbench {
     id: "sheetMetal",

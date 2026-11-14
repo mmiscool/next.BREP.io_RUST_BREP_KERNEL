@@ -656,17 +656,17 @@ impl Viewport {
         }
     }
 
-    /// Draw the ASSEMBLY-CONSTRAINT labels over the viewport: for every cached
-    /// constraint overlay the engine reports a world label anchor (leader
-    /// midpoint / arc mid-sweep) plus its status-colored text — we project each
-    /// to screen and draw a small chip. HOVERING a chip highlights the
-    /// constraint's referenced geometry (the engine's element hover — deduped,
-    /// with the one-frame viewport yield flag); CLICKING it expands that
-    /// constraint's row in the Assembly Constraints panel (the kernel `open`
-    /// flag via [`EngineState::constraint_label_clicked`]). The chips are
-    /// hidden whenever the engine's overlay cache is empty (Show Constraint
-    /// Graphics off, sketch mode, no assembly). During a handle drag the chip
-    /// text tracks the live preview value (the cache carries it).
+    /// Draw the ASSEMBLY-CONSTRAINT labels over the viewport:
+    /// for every cached constraint overlay the engine reports a world label
+    /// anchor (leader midpoint / arc mid-sweep) plus its status-colored text —
+    /// we project each to screen and draw a small chip. HOVERING a chip
+    /// highlights the constraint's referenced geometry (the engine's element
+    /// hover — deduped, with the one-frame viewport yield flag); CLICKING it
+    /// expands that constraint's row in the Assembly Constraints panel (the
+    /// kernel `open` flag via [`EngineState::constraint_label_clicked`]). The
+    /// chips are hidden whenever the engine's overlay cache is empty (Show
+    /// Constraint Graphics off, sketch mode, no assembly). During a handle drag
+    /// the chip text tracks the live preview value (the cache carries it).
     pub(super) fn draw_constraint_labels(
         &mut self,
         ctx: &egui::Context,

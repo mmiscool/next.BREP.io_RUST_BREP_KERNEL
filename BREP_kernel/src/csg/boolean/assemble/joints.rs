@@ -354,6 +354,14 @@ pub(in crate::boolean) struct ReplacedTrim {
     previous_edge: Option<super::edges::ReplacedEdge>,
 }
 
+impl ReplacedTrim {
+    /// The face whose trim was replaced (its index over the shells' faces in
+    /// order) and the edge replaced with it, if one was.
+    pub(in crate::boolean) fn changed(&self) -> (usize, Option<u64>) {
+        (self.face, self.previous_edge.as_ref().map(|edge| edge.edge_id))
+    }
+}
+
 /// A trim replacement record for another stage of this transaction (the
 /// inherited-trim challenger), restored by [`restore_trims`].
 pub(super) fn replaced_trim(face: usize, loop_index: usize, coedge: usize, previous: NurbsCurve) -> ReplacedTrim {

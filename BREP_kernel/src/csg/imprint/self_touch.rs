@@ -170,11 +170,37 @@ thread_local! {
     /// imprint (0.77 s of F9 on the sprocket report 1d179b4a).
     static TOUCH_MEMO: std::cell::RefCell<HashMap<[u64; 2], Vec<(usize, f64)>>> = std::cell::RefCell::new(HashMap::default());
     static TOUCH_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// [`closest_approach`]'s reading per edge pair, keyed by the two
+    /// subcurves' content in scan order and the refine gate's bits (all the
+    /// reading depends on). A boolean that adds one hole to a face of many
+    /// holes changes the face's key, so the face is scanned again, yet every
+    /// pair of its old edges reads what it read before.
+    static PAIR_MEMO: std::cell::RefCell<HashMap<[u64; 2], (f64, f64, f64)>> = std::cell::RefCell::new(HashMap::default());
+    static PAIR_READS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// `BREP_SELF_TOUCH_PAIR_MEMO` (default on, `0` off): serve a repeated edge pair's
+/// closest approach from [`PAIR_MEMO`]. Off with the face memo's hatches.
+fn pair_memo_on() -> bool {
+    switch!("BREP_SELF_TOUCH_PAIR_MEMO", true)
+}
+
+/// Pair readings (served, read) since the thread started.
+pub(super) fn pair_reads() -> [usize; 2] {
+    PAIR_READS.with(|reads| reads.get())
+}
+
+/// The content key of one subcurve (see [`PAIR_MEMO`]).
+fn curve_key(curve: &NurbsCurve) -> [u64; 2] {
+    let mut lane = crate::mass_properties::TwoLane::new();
+    crate::mass_properties::hash_curve(&mut lane, curve);
+    lane.finish()
 }
 
 /// Drop every memoised self-touch scan (`reading_memo::clear`).
 pub(crate) fn clear_touch_memo() {
     TOUCH_MEMO.with(|memo| memo.borrow_mut().clear());
+    PAIR_MEMO.with(|memo| memo.borrow_mut().clear());
 }
 
 /// Faces scanned (memo misses and unmemoised scans) since the thread started.
@@ -254,6 +280,8 @@ fn face_self_touches<'a>(
     // at 8.4 ms each, citrus's 178 of 492; none of either within the band).
     let span_cull = switch!(live "BREP_SELF_TOUCH_SPAN_CULL", true);
     let mut spans: Vec<Option<Option<Vec<crate::spatial::Aabb>>>> = vec![None; scans.len()];
+    let pair_memo = memo && pair_memo_on();
+    let mut curve_keys: Vec<Option<[u64; 2]>> = vec![None; scans.len()];
     for (index, first) in scans.iter().enumerate() {
         for (other, second) in scans.iter().enumerate().skip(index + 1) {
             if shares_a_vertex(first.edge, second.edge) || !boxes_overlap(first, second, band) {
@@ -272,7 +300,37 @@ fn face_self_touches<'a>(
                 }
             }
             let refine_gate = (REFINE_GATE * (lengths[index] + lengths[other])).max(band);
-            let (t, u, distance) = closest_approach(&first.curve, &second.curve, refine_gate)?;
+            let pair_key = pair_memo.then(|| {
+                let mut lane = crate::mass_properties::TwoLane::new();
+                for at in [index, other] {
+                    let [a, b] = *curve_keys[at].get_or_insert_with(|| curve_key(&scans[at].curve));
+                    lane.u64(a);
+                    lane.u64(b);
+                }
+                lane.f64(refine_gate);
+                lane.finish()
+            });
+            let served = pair_key.and_then(|key| PAIR_MEMO.with(|memo| memo.borrow().get(&key).copied()));
+            PAIR_READS.with(|reads| {
+                let [hits, misses] = reads.get();
+                reads.set(if served.is_some() { [hits + 1, misses] } else { [hits, misses + 1] });
+            });
+            let (t, u, distance) = match served {
+                Some(reading) => reading,
+                None => {
+                    let reading = closest_approach(&first.curve, &second.curve, refine_gate)?;
+                    if let Some(key) = pair_key {
+                        PAIR_MEMO.with(|memo| {
+                            let mut memo = memo.borrow_mut();
+                            if memo.len() >= crate::reading_memo::capacity() {
+                                memo.clear();
+                            }
+                            memo.insert(key, reading);
+                        });
+                    }
+                    reading
+                }
+            };
             if distance > band {
                 continue;
             }
@@ -395,5 +453,6 @@ impl ImprintBuilder<'_> {
         Ok(())
     }
 }
+
 
 

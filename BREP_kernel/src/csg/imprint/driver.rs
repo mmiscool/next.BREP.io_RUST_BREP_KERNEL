@@ -64,7 +64,7 @@ fn section_refine_gate() -> Option<f64> {
     })
 }
 
-/// Why a section goes to [`refine_section_against_carriers`].
+/// Why a section goes to `refine_section_against_carriers`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum SectionRefineRoute {
     /// `BREP_SECTION_REFINE_GATE`: every section, at the variable's multiple.
@@ -852,23 +852,8 @@ pub(super) struct RefineReceipt {
     pub returned: Option<RefinedFitSource>,
 }
 
-pub(super) fn refine_section_against_carriers(
-    section: &mut Vec<Vec3>,
-    fit: PolylineFit,
-    first: &NurbsSurface,
-    second: &NurbsSurface,
-    fit_tolerance: f64,
-    tolerance: f64,
-    local_fit: bool,
-    gate: f64,
-) -> Result<(PolylineFit, f64, f64, usize, MidspanExit), String> {
-    // `BREP_SECTION_REPRESENTATIVES=0` restores the seeded path everywhere for
-    // an attribution A/B only; read here, once per call, as before.
-    let representatives = std::env::var("BREP_SECTION_REPRESENTATIVES").as_deref() != Ok("0");
-    refine_section_against_carriers_with(section, fit, first, second, fit_tolerance, tolerance, local_fit, gate, representatives, &mut RefineReceipt::default())
-}
 
-/// [`refine_section_against_carriers`] with the representative switch passed
+/// `refine_section_against_carriers` with the representative switch passed
 /// in (the env hatch's value, so a control can take the seeded route without
 /// touching the process environment) and a receipt of the fit returned.
 #[allow(clippy::too_many_arguments)]
@@ -1420,10 +1405,6 @@ thread_local! {
     static PLANE_POINT_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Pairs skipped by [`plane_point_skip_enabled`] on this thread since the last call.
-pub(super) fn take_plane_point_skips() -> u64 {
-    PLANE_POINT_SKIPS.with(|count| count.replace(0))
-}
 
 
 pub(super) fn build_imprints_impl(
@@ -1863,7 +1844,7 @@ fn build_imprints_with_carrier_seeds(
                     && options.tangent_curve_lane
                     && pair_classification.relation == SurfacePairRelation::NearTangent
                 {
-                    if let Some((mut section, run)) = tangent_curve_section(
+                    if let Some((section, run)) = tangent_curve_section(
                         first, second, options, &first_faces, &second_faces, &face_edge_lists, debug_pairs,
                     )? {
                         if options.tangent_curve_imprint && section.planar && run.len() >= 2 {
@@ -1978,7 +1959,7 @@ fn build_imprints_with_carrier_seeds(
                     // generatrix on a carrier no exact lane recognises).
                     // Recognise and record it, typed, rather than lose it.
                     if options.tangent_curve_lane {
-                        if let Some((mut section, run)) = tangent_curve_section(
+                        if let Some((section, run)) = tangent_curve_section(
                             first, second, options, &first_faces, &second_faces, &face_edge_lists, debug_pairs,
                         )? {
                             if options.tangent_curve_imprint && section.planar && run.len() >= 2 {
@@ -3214,7 +3195,7 @@ fn build_imprints_with_carrier_seeds(
     // `PcurveFitScope` per stage, folded into the operation's ledger).
     let mut tail_fits: Option<crate::PcurveFitScope> = None;
     let mut tail_ms = Vec::<(&str, f64, u64)>::new();
-    let mut lap = |name: &'static str,
+    let lap = |name: &'static str,
                    started: &mut Option<Instant>,
                    fits: &mut Option<crate::PcurveFitScope>,
                    tail_ms: &mut Vec<(&str, f64, u64)>| {
@@ -3231,10 +3212,12 @@ fn build_imprints_with_carrier_seeds(
     lap("pairs", &mut tail_lap, &mut tail_fits, &mut tail_ms);
     if std::env::var("BREP_SELF_TOUCH_SPLIT").as_deref() != Ok("0") {
         let scans_before = super::self_touch::touch_scans();
+        let pairs_before = super::self_touch::pair_reads();
         builder.split_self_touching_loops(&first_faces, &face_edge_lists, &cached_subcurve)?;
         builder.split_self_touching_loops(&second_faces, &face_edge_lists, &cached_subcurve)?;
         if profile.enabled {
-            profile_line!("imprint.self_touch faces={} scanned={}", first_faces.len() + second_faces.len(), super::self_touch::touch_scans() - scans_before);
+            let pairs = super::self_touch::pair_reads();
+            profile_line!("imprint.self_touch faces={} scanned={} pairs_served={} pairs_read={}", first_faces.len() + second_faces.len(), super::self_touch::touch_scans() - scans_before, pairs[0] - pairs_before[0], pairs[1] - pairs_before[1]);
         }
     }
     // PIECE-ENDPOINT EXCHANGE post-pass: with every pair's process_curve

@@ -61,6 +61,7 @@ impl EngineState {
                 // boundary the thread/worker receives). The runner re-tessellates
                 // every resident mesh when this differs from its last run's lod.
                 request.display_lod = self.settings.lod_factor;
+                request.defer_stale_parts = std::mem::take(&mut self.defer_stale_next);
                 self.run_generation += 1;
                 // A new run supersedes a cancelled one's notice.
                 self.cancelled_run = None;
@@ -187,6 +188,9 @@ impl EngineState {
                         self.push_notice(
                             "RANSAC reconstruction complete; building imported CAD body",
                         );
+                        for message in output.report.messages.iter().filter(|m| m.starts_with("3MF texture")) {
+                            self.push_notice(message.clone());
+                        }
                         // A body the chain refused is left out of the model;
                         // say so, by name, rather than let it vanish.
                         if let Some(notice) = crate::runner::refused_bodies_notice(&output.report)
@@ -250,6 +254,22 @@ impl EngineState {
                 }
             }
         }
+        // A document's first run showed parts made by another kernel build
+        // from their snapshots: the model is on screen, so frame it now, and
+        // rebuild those parts in a second run (the default rule), whose
+        // progress the busy line names. Submitted in this same pump, so the
+        // document never reads as settled with stale parts in it.
+        if let Some(stale) = self.stale_parts_shown.take() {
+            if self.pending_fit {
+                self.pending_fit = false;
+                self.zoom_to_fit();
+            }
+            self.stale_parts = stale;
+            self.rerun_history();
+        }
+        // A session copy asked for earlier lands here; once the document has
+        // needed its session, the copy of a run that just landed is asked for.
+        self.take_session_copies();
         // The run just applied released sketch links the kernel could not
         // resolve, editing the history after the fact: run it again so the
         // report matches the document. Once, since the second run finds no
@@ -425,6 +445,8 @@ impl EngineState {
         if !self.run_pending() || !self.runner.cancel() {
             return false;
         }
+        // The replaced runner holds no session, and drops any answer pending.
+        self.session_requested = None;
         let stalled_on = self.run_progress.take().map(|progress| progress.feature_id);
         // Past every generation submitted so far: a reply the old runner
         // already posted (sitting in the main event loop on wasm) carries an
@@ -496,6 +518,8 @@ impl EngineState {
         self.runner = runner;
         self.plugin_runner_replaced();
         self.runner.reset();
+        // A reset drops any answer still on its way.
+        self.session_requested = None;
         self.superseded_displays.clear();
         self.pending_mesh_imports.clear();
         self.mesh_preview_results.clear();
@@ -536,7 +560,15 @@ impl EngineState {
             imported_colors,
             consumed,
             assembly,
+            stale_parts,
         } = output;
+        // Parts shown from a stale snapshot: the pump rebuilds them next. A
+        // run that showed none ends any rebuild in progress.
+        if stale_parts.is_empty() {
+            self.stale_parts.clear();
+        } else {
+            self.stale_parts_shown = Some(stale_parts);
+        }
         for (id, data) in &report.plugin_persistent_data {
             self.history.fold_plugin_persistent_data(id, data.clone());
         }
@@ -922,6 +954,8 @@ impl EngineState {
         // Reset the delta runner's baseline in lockstep with the cache clear so the
         // new document is a FULL rebuild (no reuse against the prior model's names).
         self.runner.reset();
+        // A reset drops any answer still on its way.
+        self.session_requested = None;
         self.superseded_displays.clear();
         self.pending_mesh_imports.clear();
         self.mesh_preview_results.clear();
@@ -1008,6 +1042,13 @@ impl EngineState {
         for notice in migration_notices {
             self.push_notice(notice);
         }
+        // The document's first run on a background runner shows each part
+        // another kernel build made from its stored snapshot, at once, and the
+        // pump rebuilds those parts in a second run (an inline runner rebuilds
+        // in this run: it would block the same thread either way).
+        self.defer_stale_next = !self.runner.session_replay_on_main();
+        self.stale_parts.clear();
+        self.stale_parts_shown = None;
         Ok(self.rerun_history())
     }
 
@@ -1027,6 +1068,13 @@ impl EngineState {
     ///   workbench changes this document, so the file panel's dirty flag flips —
     ///   consistent with the `metadata` precedent, and semantically true now
     ///   that the workbench is part of the saved file.
+    /// The parts the last run showed from a snapshot another kernel build
+    /// made, which the run in flight is rebuilding (empty when none): what the
+    /// busy line names while a document's parts are refreshed after an update.
+    pub fn stale_parts_rebuilding(&self) -> &[String] {
+        &self.stale_parts
+    }
+
     pub fn history_request_json(&self) -> String {
         self.history_request_value().to_string()
     }

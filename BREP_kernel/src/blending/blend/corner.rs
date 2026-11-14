@@ -29,10 +29,10 @@ mod crossed;
 pub use convex::round_convex_corner;
 #[allow(unused_imports)] // consumed by the network orchestrator and its cfg(test) siblings
 pub(in crate::blend) use crossed::{hood_rows, march_rib, HoodFrame};
-pub(in crate::blend) use ball::{corner_faces, solve_corner_ball, solve_rail_rail_point, CornerBall, CornerContact, CornerFace, RailRailPoint, RailRailStripe};
+pub(in crate::blend) use ball::{corner_faces, solve_corner_ball, solve_rail_rail_point, RailRailPoint, RailRailStripe};
 pub(super) use keep_open::build_keep_open_surgery;
 pub(crate) use mixed_concave::round_concave_chain_corner;
-pub(crate) use mixed_open::{open_mixed_corner_on, round_mixed_concave_open_corner};
+pub(crate) use mixed_open::round_mixed_concave_open_corner;
 #[allow(unused_imports)] // blend-surface re-export; consumed only by cfg(test) siblings today
 pub(super) use mixed_curved::{detect_mixed_concave_curved_corner, MixedCurvedCorner};
 
@@ -44,7 +44,7 @@ use mixed_support::{
     line_closest_points, locate_mixed_junction_arc, rebuild_mixed_corner_run,
 };
 pub(in crate::blend) use patch::{build_chamfer_corner_facet, build_corner_patch_exact, build_general_corner_patch};
-pub(in crate::blend) use ribbon_star::{build_ribbon_star_patch, RibbonFillReading, RibbonRib};
+pub(in crate::blend) use ribbon_star::{build_ribbon_star_patch, RibbonRib};
 use patch::build_octant_face;
 
 /// Partition a cyclic loop from a retained anchor, preserving traversal order.

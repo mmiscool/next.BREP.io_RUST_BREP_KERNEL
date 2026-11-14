@@ -499,6 +499,12 @@ impl EngineState {
         let Some(members) = self.component_move_members() else {
             return false;
         };
+        // The dry-run solve needs the main-side session (once per applied
+        // run): no grab until its copy has landed from the runner.
+        if self.history_has_assembly() && !self.ensure_assembly_session() {
+            self.push_notice(format!("Move: {}", super::ASSEMBLY_SESSION_PENDING));
+            return false;
+        }
         self.widgets.set_transform_active(handle);
         self.component_move.live_applied.clear();
         self.component_move.drag = Some(ComponentMoveDrag {
@@ -512,10 +518,6 @@ impl EngineState {
         });
         // A drag supersedes the last typed move's status line.
         self.component_move.typed = None;
-        // The dry-run solve needs the main-side session (once per applied run).
-        if self.history_has_assembly() {
-            self.ensure_assembly_session();
-        }
         self.dirty = true;
         true
     }
@@ -564,8 +566,8 @@ impl EngineState {
         } else {
             TransformDelta::Translate([direction[0] * value, direction[1] * value, direction[2] * value])
         };
-        if self.history_has_assembly() {
-            self.ensure_assembly_session();
+        if self.history_has_assembly() && !self.ensure_assembly_session() {
+            return Err(super::ASSEMBLY_SESSION_PENDING.into());
         }
         let (solved, blocking) = match self.component_solve_explained(&members, &delta, None, true) {
             Ok(result) => result,

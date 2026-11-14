@@ -26,7 +26,6 @@ use super::stations::{
 /// The slug of the rollover refusal (`UnsupportedGeometry`).
 pub(crate) const TANGENT_ROLLOVER_WHAT: &str = "tangent_rollover";
 
-
 /// One crossing of a mate's boundary by the march's contact track, onto a
 /// tangent neighbour that carries the ball.
 #[derive(Clone, Debug)]
@@ -79,12 +78,6 @@ pub(super) struct RolloverPlan {
     pub(crate) crossings: Vec<RailCrossing>,
     /// Empty unless every crossing solved.
     pub(crate) pieces: Vec<StripePiece>,
-    /// Per crossing: the first station of the rolled piece, solved on the
-    /// SWAPPED carrier pair (the neighbour in the crossed side's slot, its
-    /// signed radius adjusted to the neighbour's raw normal) one step past
-    /// the crossing and seeded from the crossing station; `None` when the
-    /// crossing did not solve or the station on the neighbour did not.
-    pub(crate) rolled: Vec<Option<(f64, Station)>>,
 }
 
 /// A mate's parameter point brought into its carrier's base period in every
@@ -253,7 +246,7 @@ fn tangent_at(solid: &BrepSolid, face: &FaceRecord, neighbour: &FaceRecord, poin
 /// Every crossing of a mate's boundary by the march's track onto a tangent
 /// neighbour that carries a ball of `radius`, on both sides, in march order.
 /// A crossing onto a SHARP neighbour, onto a tangent one the ball cannot
-/// roll onto (`neighbour_carries_ball`), or one whose boundary edge the
+/// roll onto (`neighbour_carries_ball_sided`), or one whose boundary edge the
 /// chord does not identify, is not reported: those exits keep the lane's
 /// existing route.
 pub(super) fn tangent_crossings(
@@ -391,7 +384,6 @@ pub(crate) struct TailSplice<'a> {
 /// swapped carriers (see [`stopped_end_tail`]).
 pub(crate) struct StoppedEndTail {
     pub(crate) stations: Vec<Station>,
-    pub(crate) ts: Vec<f64>,
     pub(crate) vertex_indices: [usize; 2],
     /// The crossing stations' indices: the rows and pcurves break there.
     pub(crate) breaks: Vec<usize>,
@@ -549,7 +541,7 @@ pub(crate) fn stopped_end_tail(
         .iter()
         .position(|t| (t - t_finish).abs() <= 1e-12 * (1.0 + t_finish.abs()))
         .ok_or_else(|| not_built("the vertex station was not marched on the neighbour".to_string()))?;
-    Ok(StoppedEndTail { stations: out_stations, ts: out_ts, vertex_indices: [vertex_indices[0], finish], breaks, sides })
+    Ok(StoppedEndTail { stations: out_stations, vertex_indices: [vertex_indices[0], finish], breaks, sides })
 }
 
 /// The crossing station by bisection: the march continued on the current
@@ -811,85 +803,6 @@ pub(super) fn solve_crossing(
     Err(KernelRefusal::non_convergence(KernelStage::Refine, "rollover_crossing", "blend rollover: the crossing station did not converge"))
 }
 
-/// The first station of a rolled piece: the tangency system on the SWAPPED
-/// carrier pair — the neighbour in the crossed side's slot — one step past
-/// the crossing station in the direction the track rolls, seeded from the
-/// crossing station (its parameter point on the neighbour is the crossing
-/// point's projection). The neighbour's signed radius is the mate's,
-/// flipped when the neighbour's raw normal opposes the mate's at the
-/// crossing (C1: "ρ sign-adjusted to the neighbour's normal"). This is the
-/// seed the re-march of the piece would continue from.
-pub(super) fn seed_on_neighbour(
-    solid: &BrepSolid,
-    edge: &EdgeRecord,
-    mates: [&BlendMate<'_>; 2],
-    radius_at: &dyn Fn(f64) -> f64,
-    crossing: &RailCrossing,
-    scale: f64,
-) -> Result<(f64, Station), KernelRefusal> {
-    let (t_cross, station) = crossing
-        .solved
-        .as_ref()
-        .ok_or(KernelRefusal::internal(KernelStage::Refine, "rollover_unsolved", "blend rollover: the crossing station did not solve"))?;
-    let side = crossing.side;
-    let other = 1 - side;
-    let neighbour = solid
-        .shells
-        .iter()
-        .flat_map(|shell| &shell.faces)
-        .find(|face| face.id == crossing.neighbour_face_id)
-        .ok_or(KernelRefusal::internal(KernelStage::Refine, "rollover_neighbour", "blend rollover: the neighbour face vanished"))?;
-    let mate = mates[side];
-    let on_mate = track_uv(station, side);
-    let projection = crate::project_point_to_surface(&neighbour.surface, crossing.point)
-        .or_refuse(KernelStage::Refine, "project_point_to_surface")?;
-    let mate_raw = raw_normal(&mate.face.surface, on_mate[0], on_mate[1])?;
-    let neighbour_raw = raw_normal(&neighbour.surface, projection.u, projection.v)?;
-    let flip = if mate_raw.dot(neighbour_raw) < 0.0 { -1.0 } else { 1.0 };
-    let signs = {
-        let mut signs = [mates[0].rho.signum(), mates[1].rho.signum()];
-        signs[side] *= flip;
-        signs
-    };
-    let mut surfaces = [&mates[0].face.surface, &mates[1].face.surface];
-    surfaces[side] = &neighbour.surface;
-    let step = (edge.t1 - edge.t0) / 64.0;
-    let t = if crossing.leaving { t_cross + step } else { t_cross - step };
-    let (section_point, section_tangent) = edge
-        .curve
-        .point_and_unit_tangent_extended(t, edge.t0, edge.t1)
-        .map_err(|error| format!("blend rollover: edge {}: {error}", edge.id))
-        .or_refuse(KernelStage::Refine, "point_and_unit_tangent_extended")?;
-    let radius = radius_at(t);
-    let mut seed = [0.0; 4];
-    seed[2 * side] = projection.u;
-    seed[2 * side + 1] = projection.v;
-    let other_uv = track_uv(station, other);
-    seed[2 * other] = other_uv[0];
-    seed[2 * other + 1] = other_uv[1];
-    let rho = [signs[0] * radius, signs[1] * radius];
-    let uv = solve_station(surfaces[0], surfaces[1], rho, seed, section_point, section_tangent, scale)?;
-    let state = tangency_state(surfaces[0], surfaces[1], rho, uv, section_point, section_tangent)?;
-    let cos_alpha = signs[0] * signs[1] * state.n1.dot(state.n2);
-    let weight = ((1.0 + cos_alpha) * 0.5).max(0.0).sqrt();
-    if weight <= 1e-6 {
-        return Err(KernelRefusal::unsupported(KernelStage::Refine, "tangent_faces", "blend: faces are tangent at a station (α = π)"));
-    }
-    let apex = apex_point(state.p1, state.n1, state.p2, state.n2, state.center)?;
-    Ok((
-        t,
-        Station {
-            uv1: [uv[0], uv[1]],
-            uv2: [uv[2], uv[3]],
-            p1: state.p1,
-            p2: state.p2,
-            center: state.center,
-            weight,
-            apex,
-        },
-    ))
-}
-
 /// The CLOSED march's stations split at its solved crossings, in march
 /// order: a piece runs from one crossing station to the next, the last
 /// wrapping through the seam back to the first. The crossed side's carrier
@@ -966,24 +879,7 @@ pub(super) fn plan_closed(
         }
     }
     let pieces = split_closed_at_crossings(stations, mates, &crossings);
-    let rolled = crossings
-        .iter()
-        .map(|crossing| {
-            if crossing.solved.is_none() {
-                return None;
-            }
-            match seed_on_neighbour(solid, edge, mates, radius_at, crossing, scale) {
-                Ok(seeded) => Some(seeded),
-                Err(error) => {
-                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
-                        eprintln!("closed-rim rollover: the station on the neighbour did not solve: {error}");
-                    }
-                    None
-                }
-            }
-        })
-        .collect();
-    Ok(Some(RolloverPlan { crossings, pieces, rolled }))
+    Ok(Some(RolloverPlan { crossings, pieces }))
 }
 
 /// One piece of the split stripe, marched on ITS carriers and fitted: the
@@ -1282,7 +1178,7 @@ pub(super) fn march_pieces(
                         ));
                     }
                 }
-                // Lane N census row 5 (with `sided_ball_neighbour_on`): a
+                // Lane N census row 5: a
                 // ROLLED piece that wraps past the march's end carries the
                 // anchored seam too — the rim's seam vertex lies on the
                 // rolled stretch (lCount_408: the round on the far side of
@@ -1290,7 +1186,7 @@ pub(super) fn march_pieces(
                 // station is marched AT the seam parameter, between the
                 // uniform ones, and the surgery splits the through rail
                 // there as it does for a piece on the mates.
-                let seam_t = (wraps && anchor_u.is_some() && crate::fillet::sided_ball_neighbour_on()).then_some(edge.t1).filter(|t| *t > t_from && *t < t_to);
+                let seam_t = (wraps && anchor_u.is_some()).then_some(edge.t1).filter(|t| *t > t_from && *t < t_to);
                 // A uniform station within a hair of the seam IS the seam
                 // station: no second one beside it.
                 let hair = 1e-9 * span.abs().max(1.0);
@@ -1334,7 +1230,7 @@ pub(super) fn march_pieces(
             }
             // The rolled wrapping piece's seam station (above): found again
             // by its parameter point below, like every other.
-            Some(_) if wraps && rolled_side.is_some() && crate::fillet::sided_ball_neighbour_on() => Some(0),
+            Some(_) if wraps && rolled_side.is_some() => Some(0),
             _ => None,
         };
         // Refinement: the fitted rails against the carriers between
@@ -1444,30 +1340,5 @@ pub(super) fn build(
 ) -> Result<BrepSolid, KernelRefusal> {
     let built = super::rollover_surgery::rollover_surgery(solid, edge, mates, plan, &pieces, anchor_u, name);
     built
-}
-
-/// The named refusal for a track that rolls over: what crosses what, where,
-/// and that the roll is not built.
-pub(super) fn refusal(plan: &RolloverPlan, radius: f64) -> KernelRefusal {
-    let crossings = &plan.crossings;
-    let first = &crossings[0];
-    let more = match crossings.len() {
-        1 => String::new(),
-        n => format!(" and {} more crossing(s)", n - 1),
-    };
-    let solved = if first.solved.is_some() { "the crossing station solved" } else { "located by the bracket's chord" };
-    let rolled = plan.rolled.iter().filter(|seed| seed.is_some()).count();
-    KernelRefusal::unsupported(
-        KernelStage::Classify,
-        TANGENT_ROLLOVER_WHAT,
-        format!(
-            "blend: the radius {radius} rail on face {} crosses the tangent edge {} onto face {} at \
-             ({:.6}, {:.6}, {:.6}){more} ({solved}; {} piece(s); {rolled} seeded on the neighbour): re-marching the rolled pieces on the \
-             neighbour and sewing them on the shared rib is not built, \
-             so this lane declines",
-            first.mate_face_id, first.edge_id, first.neighbour_face_id, first.point.x, first.point.y, first.point.z,
-            plan.pieces.len()
-        ),
-    )
 }
 

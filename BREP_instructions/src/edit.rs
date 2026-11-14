@@ -5,6 +5,7 @@
 //! under one parent): a group builds one thing. [`nest_step`] moves a step to
 //! another parent, children and all. Each refusal says why.
 
+use crate::fields::StepField;
 use crate::model::{Add, Arrow, Callout, Instructions, Signoff, Step, Torque, ToolUse};
 use crate::wizard::{Component, Level};
 use serde::{Deserialize, Serialize};
@@ -13,8 +14,8 @@ use std::collections::HashSet;
 
 /// Merge `step_ids` (two or more siblings) into the first of them in their
 /// order, which keeps its place: adds, tools, callouts, arrows and child
-/// steps are appended in order, notes joined, and the first torque and view
-/// kept.
+/// steps and fields are appended in order, notes joined, and the first torque
+/// and view kept.
 pub fn merge(block: &mut Instructions, step_ids: &[&str]) -> Result<String, String> {
     if step_ids.len() < 2 {
         return Err("pick two or more steps to merge".into());
@@ -65,6 +66,7 @@ pub fn merge(block: &mut Instructions, step_ids: &[&str]) -> Result<String, Stri
             keeper.motion = step.motion;
         }
         keeper.signoff.required |= step.signoff.required;
+        keeper.fields.extend(step.fields);
         keeper.steps.extend(step.steps);
     }
     keeper.coalesce_adds();
@@ -323,10 +325,11 @@ pub fn unplanned<'a>(block: &Instructions, level: &'a Level) -> Vec<&'a Componen
     out
 }
 
-/// Steps with nothing to add and no steps under them (a group with parts
-/// only in its children is not empty).
+/// Steps with nothing to do: no part to add, no steps under them (a group
+/// with parts only in its children is not empty) and no field to record (an
+/// inspection step adds no part and is still work).
 pub fn empty_steps(block: &Instructions) -> Vec<String> {
-    block.steps().filter(|(_, s)| s.adds.is_empty() && s.steps.is_empty()).map(|(_, s)| s.id.clone()).collect()
+    block.steps().filter(|(_, s)| s.adds.is_empty() && s.steps.is_empty() && s.fields.is_empty()).map(|(_, s)| s.id.clone()).collect()
 }
 
 /// Delete a step. Its parts must have moved elsewhere first, so no part is
@@ -346,7 +349,8 @@ pub fn delete_step(block: &mut Instructions, step_id: &str) -> Result<(), String
 
 /// Update a step's authored fields from a JSON patch. Keys: `title`, `notes`,
 /// `view` (string or null), `tools` (array), `torque` (object or null; a set
-/// torque becomes an override), `callouts`, `arrows`, `signoff`, `motion`.
+/// torque becomes an override), `callouts`, `arrows`, `signoff`, `motion`,
+/// `fields` (the whole list; one without an id takes a fresh one).
 /// Unknown keys are refused. `adds` change only through the edits above.
 pub fn update_step(block: &mut Instructions, step_id: &str, patch: &Value) -> Result<(), String> {
     let object = patch.as_object().ok_or("a step update is a JSON object")?;
@@ -355,6 +359,11 @@ pub fn update_step(block: &mut Instructions, step_id: &str, patch: &Value) -> Re
         ids_needed = callouts.iter().filter(|c| c.get("id").and_then(Value::as_str).is_none_or(str::is_empty)).count();
     }
     let mut fresh: Vec<String> = (0..ids_needed).map(|_| block.next_id("MK")).collect();
+    let fields_needed = match object.get("fields") {
+        Some(Value::Array(fields)) => fields.iter().filter(|f| f.get("id").and_then(Value::as_str).is_none_or(str::is_empty)).count(),
+        _ => 0,
+    };
+    let mut fresh_fields: Vec<String> = (0..fields_needed).map(|_| block.next_id("MF")).collect();
     let step = block.step_mut(step_id).ok_or_else(|| format!("no step '{step_id}'"))?;
     let mut next = step.clone();
     for (key, value) in object {
@@ -387,10 +396,65 @@ pub fn update_step(block: &mut Instructions, step_id: &str, patch: &Value) -> Re
             "arrows" => next.arrows = serde_json::from_value::<Vec<Arrow>>(value.clone()).map_err(|_| parse("arrows list"))?,
             "signoff" => next.signoff = serde_json::from_value::<Signoff>(value.clone()).map_err(|_| parse("signoff"))?,
             "motion" => next.motion = (!value.is_null()).then(|| value.clone()),
+            "fields" => {
+                let mut list = Vec::new();
+                for item in value.as_array().ok_or_else(|| parse("fields list"))? {
+                    let mut field = StepField::from_json(item).map_err(|e| format!("step {key}: {e}"))?;
+                    if field.id.is_empty() {
+                        field.id = fresh_fields.remove(0);
+                    }
+                    list.push(field);
+                }
+                next.fields = list;
+            }
             other => return Err(format!("a step has no field '{other}'")),
         }
     }
     *step = next;
+    Ok(())
+}
+
+/// Add a field to `step_id` at `index` among its fields (the end when
+/// absent or past it). `field` is its JSON (`{label, kind, …}`, see
+/// [`StepField::from_json`]); an id it carries is ignored. Returns the new
+/// field's id.
+pub fn add_field(block: &mut Instructions, step_id: &str, field: &Value, index: Option<usize>) -> Result<String, String> {
+    block.step(step_id).ok_or_else(|| format!("no step '{step_id}'"))?;
+    let mut field = StepField::from_json(field)?;
+    let id = block.next_id("MF");
+    field.id = id.clone();
+    let step = block.step_mut(step_id).expect("checked above");
+    let index = index.unwrap_or(usize::MAX).min(step.fields.len());
+    step.fields.insert(index, field);
+    Ok(id)
+}
+
+fn field_index(step: &Step, field_id: &str) -> Result<usize, String> {
+    step.fields.iter().position(|f| f.id == field_id).ok_or_else(|| format!("step '{}' has no field '{field_id}'", step.id))
+}
+
+/// Set keys of one field from a JSON patch ([`StepField::patched`]).
+pub fn update_field(block: &mut Instructions, step_id: &str, field_id: &str, patch: &Value) -> Result<(), String> {
+    let step = block.step_mut(step_id).ok_or_else(|| format!("no step '{step_id}'"))?;
+    let index = field_index(step, field_id)?;
+    step.fields[index] = step.fields[index].patched(patch)?;
+    Ok(())
+}
+
+/// Take one field off its step. Returns it.
+pub fn remove_field(block: &mut Instructions, step_id: &str, field_id: &str) -> Result<StepField, String> {
+    let step = block.step_mut(step_id).ok_or_else(|| format!("no step '{step_id}'"))?;
+    let index = field_index(step, field_id)?;
+    Ok(step.fields.remove(index))
+}
+
+/// Move one field to `index` among its step's fields (clamped to the end).
+pub fn move_field(block: &mut Instructions, step_id: &str, field_id: &str, index: usize) -> Result<(), String> {
+    let step = block.step_mut(step_id).ok_or_else(|| format!("no step '{step_id}'"))?;
+    let at = field_index(step, field_id)?;
+    let field = step.fields.remove(at);
+    let index = index.min(step.fields.len());
+    step.fields.insert(index, field);
     Ok(())
 }
 

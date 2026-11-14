@@ -314,6 +314,21 @@ fn adaptive_cell_area(
 }
 
 /// One tensor Gauss block: every station of `u_panel × v_panel`, every kind.
+/// The existing tensor rule without area refinement, for an interior cell
+/// of an extended trim. The covering-grid caller already used this rule;
+/// only repeated surface-basis evaluation is removed.
+pub(super) fn integrate_interior_cell_base(
+    face: &FaceRecord, cell: [f64; 4], scale: f64, kinds: &[Integrand],
+    totals: &mut [f64], rules: &mut rule::SurfaceRules,
+) -> Result<Option<usize>, String> {
+    let (us, vs) = rules.panels(&face.surface, cell)?;
+    if us.len() != 1 || vs.len() != 1 || us[0].order != GAUSS_COUNT || vs[0].order != GAUSS_COUNT {
+        return Ok(None);
+    }
+    integrate_block(face, us[0], vs[0], scale, kinds, totals, rules.station_identity)?;
+    Ok(Some(GAUSS_COUNT * GAUSS_COUNT))
+}
+
 fn integrate_block(
     face: &FaceRecord,
     u_panel: rule::Panel,
@@ -727,7 +742,7 @@ pub(super) fn biperiodic_band_integral(
     kinds: &[Integrand],
 ) -> Result<Option<Vec<f64>>, String> {
     let Some(band) = biperiodic_band_range(face)? else {
-        if switch!("BREP_MASS_TORUS_LIFT", false) {
+        if switch!("BREP_MASS_TORUS_LIFT", true) {
             return super::torus::lifted_band_integral(face, kinds);
         }
         return Ok(None);

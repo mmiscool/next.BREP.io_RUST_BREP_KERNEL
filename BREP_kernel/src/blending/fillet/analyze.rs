@@ -898,48 +898,7 @@ fn tangent_neighbours<'a>(solid: &'a BrepSolid, face: &FaceRecord) -> Vec<&'a Fa
     found
 }
 
-
-/// Whether a tangent neighbour can carry a rolling ball of radius `size`
-/// past the join, judged by its curvature along the shared edge.
-///
-/// A ball of radius r cannot follow a surface whose radius of curvature is r
-/// or less: a concave one it does not fit into, and a convex one the ball the
-/// two supports place cuts into rather than rests on.  The blended
-/// through-hole is the convex case exactly: past r = t/2 the second mouth
-/// blend's contact lands on the first blend, a torus of tube radius r, and
-/// the ball the bottom plane and the wall position is 2r − t inside it
-/// (`closed_heal_tests::a_blended_through_hole_never_reaches_the_cap_lane`).
-/// The reported bore mouth is the other side of the line — an r = 0.5 blend
-/// rolling onto an r = 4 corner round — and is what tangent neighbours count
-/// for at all.
-///
-/// Judged by the TIGHTEST principal curvature at three stations on every
-/// shared edge.  That is a bound, and it errs toward refusing: a neighbour
-/// curving tightly only across the ball's path is declined too, and what
-/// stands then is the refusal this check gave before tangent neighbours
-/// counted.  A station that cannot be projected or differentiated declines
-/// the same way.
-pub(crate) fn neighbour_carries_ball(
-    solid: &BrepSolid,
-    face: &FaceRecord,
-    neighbour: &FaceRecord,
-    size: f64,
-) -> bool {
-    neighbour_carries_ball_sided(solid, face, neighbour, size, None)
-}
-
-/// Lane N census row 5 (2026-10-28): `BREP_SIDED_BALL_NEIGHBOUR=1`/`on` reads
-/// the neighbour's curvature on the BALL's side; `=0`/`off` keeps the
-/// unsigned bound. ON by default since lane N's promotion (2026-10-28).
-const SIDED_BALL_NEIGHBOUR_DEFAULT: bool = true;
-
-pub(crate) fn sided_ball_neighbour_on() -> bool {
-    switch!(live "BREP_SIDED_BALL_NEIGHBOUR", SIDED_BALL_NEIGHBOUR_DEFAULT)
-}
-
-
-/// [`neighbour_carries_ball`] told which side of the material the ball is
-/// on: `Some(true)` OUTSIDE (a concave blend's ball, in the air), `Some(false)`
+/// Read whether the neighbour carries a ball on the material side given: `Some(true)` OUTSIDE (a concave blend's ball, in the air), `Some(false)`
 /// INSIDE (a convex blend's). A ball fails to follow a surface only where the
 /// surface curves AROUND it tighter than its radius — the centre of
 /// curvature on the ball's side: a convex neighbour for a ball inside (the
@@ -949,7 +908,7 @@ pub(crate) fn sided_ball_neighbour_on() -> bool {
 /// round (lCount_407/408/409), whose concave base blend rolls onto a convex
 /// r 1 round from above. The curvatures are read against the neighbour's
 /// OUTWARD normal (convex negative, `principal_curvatures`' convention). With
-/// `None`, or the switch off, the unsigned bound as before.
+/// `None`, the unsigned bound as before.
 pub(crate) fn neighbour_carries_ball_sided(
     solid: &BrepSolid,
     face: &FaceRecord,
@@ -957,7 +916,6 @@ pub(crate) fn neighbour_carries_ball_sided(
     size: f64,
     ball_outside: Option<bool>,
 ) -> bool {
-    let ball_outside = ball_outside.filter(|_| sided_ball_neighbour_on());
     let limit = size * (1.0 + 1e-6);
     let mut stations = 0usize;
     for coedge in face.loops.iter().flat_map(|lp| &lp.coedges) {
@@ -1186,9 +1144,6 @@ fn support_extent(
     size: f64,
     entry: &str,
 ) -> Result<SupportExtent, KernelRefusal> {
-    if !sided_ball_neighbour_on() {
-        return support_extent_pass(solid, edge_id, size, entry, false);
-    }
     // The unsigned pass first: what it admits, every lane may build. What
     // only the sided pass admits needs a rollover (lane N census row 5).
     match support_extent_pass(solid, edge_id, size, entry, false) {
@@ -1350,7 +1305,7 @@ fn support_extent_pass(
         // included, because running off one of those is the case this check
         // exists to refuse.  Nor is a tangent neighbour the ball cannot
         // actually roll onto — one curving as tightly as the ball or tighter
-        // (`neighbour_carries_ball`): the far mouth's own round on a blended
+        // (`neighbour_carries_ball_sided`): the far mouth's own round on a blended
         // through-hole is G1 with the wall and still no wall to lie on.
         let mut boundary: Vec<Vec3> = Vec::new();
         let mut boundary_edges = Vec::new();
@@ -1574,14 +1529,6 @@ pub(super) fn concave_clip_outline(
     Some(loops)
 }
 
-/// Lane R1 row 5: the interference check's revolution certificate. On by
-/// default (promoted 2026-10-18 on the 98 + 144 census);
-/// `BREP_INTERFERENCE_REVOLUTION_CERT=0` (or `off`) samples every body.
-pub(crate) fn interference_revolution_cert_on() -> bool {
-    switch!("BREP_INTERFERENCE_REVOLUTION_CERT", true)
-}
-
-
 /// A grown face that is the FULL-TURN revolution of its own u = 0 row about
 /// an axis: `(axis origin, unit axis, [ρmin, ρmax, zmin, zmax], a point of
 /// the box's interior)`, where the box is the meridian (ρ, z) extent of the
@@ -1740,7 +1687,6 @@ fn revolution_interference_certificate(
     };
     fresh_edges.iter().all(|&edge_id| on_band(edge_id)).then_some(true)
 }
-
 
 /// Lane N row 1 (2026-10-28): the interference certificate for bands that are
 /// not full-turn revolutions. `BREP_INTERFERENCE_BAND_CERT=1`/`on` turns it
@@ -2721,7 +2667,7 @@ fn check_blend_interference_uncached(
     // Lane R1 row 5: bands that are full-turn revolutions in a box no face of
     // the original enters are decided by one classification each
     // (`revolution_interference_certificate`); anything else samples.
-    if interference_revolution_cert_on() {
+    {
         let cert_timing = crate::blend::BlendTimer::start("timing.interference.revolution_cert_ms");
         let band = policy.pcurve_consistency.min(policy.intersection_fit) / 10.0;
         let fresh_ids: Vec<u64> = fresh.iter().map(|edge| edge.id).collect();
@@ -3011,6 +2957,22 @@ fn nearest_face_analytic_only() -> bool {
     switch!("BREP_NEAREST_FACE_ANALYTIC_ONLY", false)
 }
 
+/// `curve` cut to `[low, high]`: no cut at an end that is the domain's own
+/// (within the knot identity `split` itself uses), the curve itself when both
+/// are; `None` when a cut fails or the range is not inside the domain.
+pub(crate) fn edge_piece(curve: &NurbsCurve, low: f64, high: f64) -> Option<NurbsCurve> {
+    let [start, end] = curve.domain().ok()?;
+    let slack = 1e-12 * (end - start).abs().max(1.0);
+    if !(low >= start - slack && high <= end + slack && high > low) {
+        return None;
+    }
+    let tail = if low <= start + slack { curve.clone() } else { curve.split(low).ok()?.1 };
+    if high >= end - slack {
+        return Some(tail);
+    }
+    tail.split(high).ok().map(|(piece, _)| piece)
+}
+
 /// The side of a solid's boundary a point is on, read from the point's
 /// NEAREST boundary point instead of a ray: a cheap answer the ray
 /// classifier ([`SolidClassifier::classify`]) would also give, or `None`
@@ -3040,35 +3002,6 @@ fn nearest_face_analytic_only() -> bool {
 /// convexity vote, whose probes sit between the mates of a blend: a wall
 /// sample's nearest boundary point is on a mate, and the ray classifier
 /// spent 18–36 µs per sample confirming it with two agreeing rays.
-/// Lane R1 (2026-10-18, smFilletTest_lCount_235): [`NearestFaceSide`]'s
-/// exterior-face boundary read cuts each edge to its range even where the
-/// range starts or ends at its curve's own domain end (`split` refuses those),
-/// and answers On only from edges so cut — the uncut whole curve, read before
-/// this, passed through a chamfered-away station along the old edge's line and
-/// answered On where the ray reads Out. On by default (promoted 2026-10-19:
-/// 98 + 144 census 0 differ); `BREP_NEAREST_SIDE_EDGE_PIECE=0` (or `off`)
-/// restores the uncut read.
-pub(crate) fn nearest_side_edge_piece_on() -> bool {
-    switch!("BREP_NEAREST_SIDE_EDGE_PIECE", true)
-}
-
-
-/// `curve` cut to `[low, high]`: no cut at an end that is the domain's own
-/// (within the knot identity `split` itself uses), the curve itself when both
-/// are; `None` when a cut fails or the range is not inside the domain.
-pub(crate) fn edge_piece(curve: &NurbsCurve, low: f64, high: f64) -> Option<NurbsCurve> {
-    let [start, end] = curve.domain().ok()?;
-    let slack = 1e-12 * (end - start).abs().max(1.0);
-    if !(low >= start - slack && high <= end + slack && high > low) {
-        return None;
-    }
-    let tail = if low <= start + slack { curve.clone() } else { curve.split(low).ok()?.1 };
-    if high >= end - slack {
-        return Some(tail);
-    }
-    tail.split(high).ok().map(|(piece, _)| piece)
-}
-
 pub(crate) struct NearestFaceSide<'a> {
     solid: &'a BrepSolid,
     faces: Vec<&'a FaceRecord>,
@@ -3187,7 +3120,6 @@ impl<'a> NearestFaceSide<'a> {
             // cut to its range) or only a lower bound from an uncut whole curve:
             // a bound may decline (below), never answer On.
             let mut boundary_exact = true;
-            let piece_fix = nearest_side_edge_piece_on();
             for loop_record in &face.loops {
                 for coedge in &loop_record.coedges {
                     let Some(edge) = self.solid.edges.iter().find(|edge| edge.id == coedge.edge_id) else {
@@ -3197,24 +3129,15 @@ impl<'a> NearestFaceSide<'a> {
                     // (`split` at both ends); the whole curve, a bound no larger
                     // than the edge's, where it cannot.
                     let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
-                    let piece = if piece_fix {
-                        // `split` refuses a parameter at either end of the
-                        // domain: an end the edge shares with its curve needs
-                        // no cut.
-                        match edge_piece(&edge.curve, low, high) {
-                            Some(piece) => piece,
-                            None => {
-                                boundary_exact = false;
-                                edge.curve.clone()
-                            }
+                    // `split` refuses a parameter at either end of the
+                    // domain: an end the edge shares with its curve needs
+                    // no cut.
+                    let piece = match edge_piece(&edge.curve, low, high) {
+                        Some(piece) => piece,
+                        None => {
+                            boundary_exact = false;
+                            edge.curve.clone()
                         }
-                    } else {
-                        edge
-                            .curve
-                            .split(low)
-                            .and_then(|(_, rest)| rest.split(high))
-                            .map(|(piece, _)| piece)
-                            .unwrap_or_else(|_| edge.curve.clone())
                     };
                     let projection = crate::project_point_to_curve(&piece, point).map_err(|_| "a boundary curve projection failed")?;
                     if !projection.distance.is_finite() {

@@ -87,18 +87,18 @@ use crate::panels::bom_columns::{
     VISIBLE_KEY, VOLUME_KEY,
 };
 use crate::store::ModelStore;
-use brep_render::engine_state::{EngineState, WireBomLine, WireLengthState};
+use brep_render::engine_state::{EngineState, WireBomLine};
 use eframe::egui;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 pub(crate) mod nested;
 
 /// The row menu's own entry: roll to the component's feature and open it in
 /// the history tree. Not a [`ComponentAction`] — the shared set is the
-/// COMPONENT vocabulary and the context bar draws a button per member of it,
-/// so a document-navigation entry does not belong in there. The assembly
-/// structure tree keeps this action locally for the same reason.
+/// COMPONENT vocabulary and the context bar draws a button per
+/// member of it, so a document-navigation entry does not belong in there. The
+/// assembly structure tree keeps this action locally for the same reason.
 
 /// What a BOM frame hands back to the shell.
 #[derive(Default)]
@@ -494,7 +494,6 @@ impl BomPanel {
                     solids: &solids,
                     visible_under: &visible_under,
                     opened: &self.opened,
-                    root_parts: &root_parts,
                     library,
                     lines: &mut self.nested,
                     uses: nested::UseCounts::new(&root_parts, library),

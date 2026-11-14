@@ -37,7 +37,7 @@
 use crate::panels::parts_library::{document_signature, refresh_library_entry};
 use crate::store::ModelStore;
 use brep_render::engine_state::{EngineState, NoticeSeverity};
-use crate::store::{ReadNow, Residency};
+use crate::store::ReadNow;
 use eframe::egui;
 use serde_json::Value;
 
@@ -238,6 +238,12 @@ impl UpdateComponents {
         state: &mut EngineState,
         model_store: &dyn ModelStore,
     ) -> Result<usize, String> {
+        // The mates on the updated parts are captured off the main-side
+        // session: until a background runner's copy of it lands, nothing is
+        // touched (the answer to an edited-here question is kept too).
+        if !state.assembly_session_ready() {
+            return Err(brep_render::engine_state::ASSEMBLY_SESSION_PENDING.into());
+        }
         let (mut outdated, missing) = compute(state, model_store, &self.synced, &mut self.verdicts, &mut self.seen_files, &mut self.judged);
         // Edited HERE as well as changed in the file: ask before discarding the
         // edit (default: take the file's version). Edited here = the entry's
@@ -340,15 +346,13 @@ impl UpdateComponents {
             // The mates on the updated parts' occurrences are checked once it
             // lands: a face the update renamed on the same plane is
             // re-attached, anything ambiguous is held for Repair.
-            // Another open document's replay may own the thread's session.
-            state.forget_assembly_session();
             for part_name in &refreshed_names {
                 let entry = crate::document::owned_save::entry_at_chain(&document["partsLibrary"], part_name);
                 if let Some(signature) = entry.and_then(|entry| entry["sourceSignature"].as_str()) {
                     self.taken.insert(part_name.clone(), signature.to_string());
                 }
             }
-            let capture = state.capture_part_edit(&state.components_of_parts(&refreshed_parts));
+            let capture = state.capture_part_edit(&state.components_of_parts(&refreshed_parts))?;
             state
                 .commit_part_edit(capture, document, &refreshed_parts)
                 .map_err(|error| format!("assembly reload failed: {error}"))?;

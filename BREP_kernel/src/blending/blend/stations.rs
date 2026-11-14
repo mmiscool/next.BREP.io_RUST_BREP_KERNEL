@@ -34,12 +34,9 @@ pub(super) const SEED_INTERVALS: usize = 16;
 /// Shared depth budget for sagitta refinement and Newton step-halving retries.
 pub(super) const MAX_REFINEMENT_DEPTH: usize = 4;
 
-/// Maximum adaptive intervals; the station count is one greater. Intervals
-/// reaching this cap retain their best available refinement.
-pub(super) const MAX_STATIONS: usize = SEED_INTERVALS << MAX_REFINEMENT_DEPTH;
 
 /// How an open march's local station refinement ended
-/// ([`crate::blend::edge::march_open_stations_ending`]'s `refine_bar`).
+/// (`crate::blend::edge::support::march_open_stations_ending`'s `refine_bar`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::blend) enum StationRefineExit {
     /// No refinement was asked for.
@@ -2028,7 +2025,7 @@ fn march_stations_impl(
         // (the centre curve's curvature, each mate's normal curvature along
         // the contact track) are read exactly here; the probe runs whenever
         // the reading is not clear by a margin or the mates are not that.
-        if closed_form_fold_on() && revolution_fold_clear(nodes, first, second, radius_at) {
+        if revolution_fold_clear(nodes, first, second, radius_at) {
             crate::blend::record_count("count.closed.march.fold_closed_form", 1);
             return Ok(());
         }
@@ -2186,10 +2183,6 @@ fn march_stations_impl(
                         .zip(&rails)
                         .map(|(&reading, &rail)| stations_for_miss(reading, model).max(stations_for_miss(Some(rail), model)))
                         .collect();
-                    let allocated: usize = counts.iter().sum();
-                    // What is actually inserted: the allocation, or one station
-                    // per short interval when it would pass the ceiling.
-                    let short = if nodes.len() + allocated > station_ceiling { short } else { allocated };
                     let refine_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.refine_ms");
                     let refined = refine_closed_node_counts(&nodes, &counts, station_ceiling, |previous, t| {
                         frame.continue_node(previous.t, previous.uv, previous.station.center, t, None, true)
@@ -2367,15 +2360,6 @@ pub(super) struct FittedRows {
     pub(super) revolution_axis: Option<(Vec3, Vec3)>,
 }
 
-/// Lane R1 row 2 (lane B's B2): the fold of a closed rim between coaxial
-/// revolutions read in closed form. On by default (promoted 2026-10-18 on the
-/// 98 + 144 census); `BREP_CLOSED_FOLD_CLOSED_FORM=0` (or `off`) restores the
-/// probe on every closed-rim march.
-pub(super) fn closed_form_fold_on() -> bool {
-    switch!("BREP_CLOSED_FOLD_CLOSED_FORM", true)
-}
-
-
 /// The fold probe's margin a closed-form reading must clear to stand in for
 /// it: the probe refuses at a factor of exactly 1 (and at a rail where the
 /// ball's radius exceeds the mate's radius of curvature by `1e-11 (1 + ρ)`);
@@ -2520,12 +2504,9 @@ pub(in crate::blend) fn closed_revolution_axis(first: &BlendMate, second: &Blend
             (frame1.origin, axis)
         }
         _ => {
-            // Off the lane a plane has no frame and the pair is not
-            // recognised.
-            let exact_lane = crate::blend::exact_rim_lane_on();
             let is_plane = |surface: &crate::AnalyticSurface| matches!(surface, crate::AnalyticSurface::Plane { .. });
             let carrier = if !matches!(analytic1, crate::AnalyticSurface::Sphere { .. })
-                && !(exact_lane && is_plane(analytic1))
+                && !is_plane(analytic1)
             {
                 analytic1.frame()?
             } else {
@@ -2535,7 +2516,7 @@ pub(in crate::blend) fn closed_revolution_axis(first: &BlendMate, second: &Blend
             let origin = carrier.origin;
             let scale = origin.length().max(1.0);
             let on_same_axis = |surface: &crate::AnalyticSurface| {
-                if let (true, crate::AnalyticSurface::Plane { u_dir, v_dir, .. }) = (exact_lane, surface) {
+                if let crate::AnalyticSurface::Plane { u_dir, v_dir, .. } = surface {
                     return u_dir
                         .cross(*v_dir)
                         .normalized()
@@ -2666,8 +2647,7 @@ pub(super) fn exact_closed_revolution_rows(
         // does not read back takes the refined projector the sphere mate
         // takes.
         let plane_pcurve = |mate: &BlendMate, curve: &NurbsCurve, fallback: NurbsCurve| -> Result<NurbsCurve, KernelRefusal> {
-            if !crate::blend::exact_rim_lane_on()
-                || matches!(mate.face.surface.analytic(), Some(crate::AnalyticSurface::Sphere { .. }))
+            if matches!(mate.face.surface.analytic(), Some(crate::AnalyticSurface::Sphere { .. }))
             {
                 return Ok(fallback);
             }
@@ -2907,25 +2887,6 @@ fn fit_closed_rows_degree(
     })
 }
 
-fn refine_closed_node_intervals(
-    nodes: &[MarchNode],
-    misses: &[f64],
-    bar: f64,
-    solve: impl Fn(&MarchNode, &MarchNode) -> Result<MarchNode, KernelRefusal>,
-) -> Result<Vec<MarchNode>, KernelRefusal> {
-    let count = misses.iter().filter(|&&miss| miss > bar).count();
-    let mut refined = Vec::with_capacity(nodes.len() + count);
-    for (index, &miss) in misses.iter().enumerate() {
-        let left = &nodes[index];
-        let right = &nodes[index + 1];
-        refined.push(left.clone());
-        if miss > bar {
-            refined.push(solve(left, right)?);
-        }
-    }
-    refined.push(nodes.last().expect("closed endpoint").clone());
-    Ok(refined)
-}
 
 /// How many stations a failing interval takes this round, from its MEASURED
 /// miss against the target it must meet: an interpolant's error falls about
@@ -2946,7 +2907,7 @@ fn stations_for_miss(miss: Option<f64>, target: f64) -> usize {
     }
 }
 
-/// [`refine_closed_node_intervals`] with `counts[i]` stations in interval i,
+/// `refine_closed_node_intervals` with `counts[i]` stations in interval i,
 /// at equal fractions of its edge parameter, each continued from the station
 /// before it. An interval taking one station gets exactly the midpoint solve
 /// from its left station that bisection gives. When the counts would pass

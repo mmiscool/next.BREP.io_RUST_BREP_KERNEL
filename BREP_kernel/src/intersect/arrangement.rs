@@ -307,7 +307,6 @@ struct BoundaryBand {
     origin: [f64; 2],
     cell: [f64; 2],
     side: usize,
-    reach: f64,
     starts: Vec<u32>,
     items: Vec<u32>,
     usable: bool,
@@ -323,7 +322,7 @@ impl BoundaryBand {
         let origin = [reject[0] - reach, reject[1] - reach];
         let extent = [(reject[2] + reach) - origin[0], (reject[3] + reach) - origin[1]];
         let cell = [(extent[0] / side.max(1) as f64).max(f64::MIN_POSITIVE), (extent[1] / side.max(1) as f64).max(f64::MIN_POSITIVE)];
-        let mut band = Self { origin, cell, side, reach, starts: Vec::new(), items: Vec::new(), usable };
+        let mut band = Self { origin, cell, side, starts: Vec::new(), items: Vec::new(), usable };
         if !band.usable {
             return band;
         }

@@ -6,7 +6,7 @@
 //! already has: the same call the row ✕ / menu Delete makes, so the same (no)
 //! confirmation and the same single undo step. The modes are exclusive, in the
 //! order a user is inside them: an open sketch owns the key, then a 3D sketch,
-//! an eCAD editor, an open drawing sheet, the PMI workbench; otherwise the 3D
+//! an eCAD editor, an open drawing sheet, a selected PMI annotation; otherwise the 3D
 //! selection is an assembly constraint (label-picked), one component (its
 //! member solids picked in the view or its BOM row), or one feature (its
 //! history-tree row). A sheet or PMI mode with nothing selected deletes
@@ -85,8 +85,14 @@ pub fn target(docs: &Documents) -> Option<DeleteTarget> {
     if engine.sheet_open().is_some() {
         return engine.sheet_selected_object().map(|id| DeleteTarget::SheetObject(id.to_string()));
     }
+    // A selected annotation is what Delete means while the PMI panel is up.
+    // With none selected the key falls through to the model: the panel is
+    // shown beside the history in Modeling, Sheet Metal and Assembly, so it
+    // must not swallow Delete for features, constraints and components.
     if engine.pmi_workbench_entered() {
-        return engine.pmi_selected_annotation().map(|id| DeleteTarget::PmiAnnotation(id.to_string()));
+        if let Some(id) = engine.pmi_selected_annotation() {
+            return Some(DeleteTarget::PmiAnnotation(id.to_string()));
+        }
     }
     model_target(engine)
 }

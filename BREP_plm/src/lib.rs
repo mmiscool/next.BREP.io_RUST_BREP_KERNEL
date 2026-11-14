@@ -11,9 +11,10 @@
 //! The spine, plus the administrator's scripting layer ([`scripting`]): part
 //! types number by counter, free text, pattern or script
 //! ([`model::NumberMode`]); revision labels are free text; every part carries a
-//! fixed [`model::DocumentClass`]; and four hooks — part number, revision
-//! label, before release, after release — let an organization override the
-//! defaults with JavaScript files in a directory it can keep in git.
+//! fixed [`model::DocumentClass`]; and hooks — part number, revision label,
+//! before release, after release, review reviewers and review events — let an
+//! organization override the defaults with JavaScript files in a directory it
+//! can keep in git.
 //!
 //! The catalog ([`catalog`]): a tree of categories, each adding typed
 //! attributes to what it inherits from its parent; every part sits in one
@@ -25,10 +26,14 @@
 //! ([`model::Settings`]) decide whether a part may have several revisions in
 //! work and whether a released part's catalog values lock.
 //!
-//! Families and templates ([`family`], [`seed`]).
+//! Families and templates ([`family`], [`seed`]): the family page, Generate
+//! from the family table's rows — from the CAD app with its documents, or
+//! assembled here and queued for a headless CAD worker's bake ([`bake_worker`])
+//! — CSV import into a family's table, and template spin-out.
 //!
-//! Assembly structure ([`bom`]): each revision's "uses" list — the one the CAD
-//! app will publish on save — and the indented and flat BOM, the diff between
+//! Assembly structure ([`bom`], [`bom_config`]): each revision's "uses" list —
+//! the one the CAD app publishes on save — and the indented and flat BOM, named
+//! BOM column configurations, the diff between
 //! two revisions' lists, where-used, and an administrator's release gate on
 //! unreleased children, all computed from it.
 //!
@@ -43,8 +48,10 @@
 //!
 //! Storage ([`sql`], [`table`]): the metadata in one SQLite file, each change
 //! one transaction with its audit events; a trigram full-text index over what
-//! a person searches a part by; paged part listings; and a one-time import
-//! from the JSON-file store earlier versions wrote.
+//! a person searches a part by; and paged part listings. A data directory's
+//! schema version must match exactly; there is no upgrade path. Attachments
+//! ([`attach`]), per-user workspaces ([`workspace`]) and backups, restore and
+//! export ([`backup`]) sit beside it.
 //!
 //! Review and approval ([`review`]): submitting a revision opens a review
 //! round judged by the settings' rule or the nearest override, reviewers
@@ -52,16 +59,26 @@
 //! waits for the rule, and every revision carries a threaded discussion. One
 //! process holds a data directory at a time ([`dirlock`]).
 //!
-//! Library import is designed but not built — where the design named a field it
-//! will need ([`model::Origin`], `external_ref`), the field is here and inert.
+//! Workflows ([`workflow`]): versioned workflow definitions and durable
+//! executions with forms, reviews and script steps. Jobs ([`jobs`]): shop-floor
+//! builds of released manufacturing instructions, signed off step by step. The
+//! tools library ([`tools`]): the hand tools and fixtures instruction steps
+//! name.
+//!
+//! A part records where it came from ([`model::Origin`]) and an
+//! external reference; the KiCad library setup stamps the parts it imports.
 //!
 //! # The document API
 //!
 //! `/api/store/*` is deliberately shaped to what the CAD app's `StoreBackend`
 //! requires of a remote backend: a metadata-only index (so a client never
 //! hydrates the corpus), a per-key read, a write, a delete, and a monotonic
-//! change sequence with a "what moved" feed. The CAD app is not touched by
-//! this crate; this is the surface it will adopt.
+//! change sequence with a "what moved" feed. The CAD app's PLM client stores
+//! through it.
+//!
+//! [`api::router`] builds the `axum` router over a [`db::Db`] (opened with
+//! [`db::Db::open`]); the `brep-plm` binary serves it. See the README for the
+//! command line and an embedding example.
 
 pub mod api;
 pub mod attach;

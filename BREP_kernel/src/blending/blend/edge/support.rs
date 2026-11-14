@@ -120,13 +120,6 @@ fn predict_station_uv(history: &[(f64, [f64; 4])], t: f64) -> Option<[f64; 4]> {
     uv.iter().all(|value| value.is_finite()).then_some(uv)
 }
 
-/// `BREP_BLEND_DENSE_CHAIN=0` seeds every dense centre from its interval's
-/// start station, as before 2026-10-17; unset or anything else chains them
-/// (see the dense loop). Read once.
-fn dense_chain_enabled() -> bool {
-    switch!("BREP_BLEND_DENSE_CHAIN", true)
-}
-
 /// [`march_open_stations_ending`], also solving each final interval's
 /// [`OpenDenseCentres`] at `dense` subdivisions (0: none) — the exact centres
 /// a wall verdict reads the fitted wall against.
@@ -811,7 +804,7 @@ pub(in crate::blend) fn march_open_stations_core(
             }
             let (a, b) = (station_ts[interval], station_ts[interval + 1]);
             let left = Continued { t: a, uv: solutions[interval], center: final_centers[interval] };
-            // CHAINED SEEDING (`BREP_BLEND_DENSE_CHAIN`, 2026-10-17): each
+            // CHAINED SEEDING (2026-10-17): each
             // centre is continued from the centre before it rather than from
             // the interval's start station, under the same hop guard. The
             // seed is then an interval/32 away instead of up to a whole
@@ -835,7 +828,6 @@ pub(in crate::blend) fn march_open_stations_core(
             // would not. The plain road rebuilt a finite-difference Jacobian
             // at every iteration: five evaluations an iteration, thirty a
             // centre even when seeded from the centre before.
-            let chain = dense_chain_enabled();
             let mut previous = left;
             let mut row = Vec::with_capacity(dense - 1);
             let jacobian = std::cell::RefCell::new(None::<[[f64; 4]; 4]>);
@@ -857,16 +849,11 @@ pub(in crate::blend) fn march_open_stations_core(
                     native: Some([edge.t0, edge.t1]),
                     ..Default::default()
                 };
-                let node = if chain {
-                    crate::blend::stations::with_newton_context(context, || continue_station(&solve_chord, &hop, &previous, t, 0)).ok()
-                } else {
-                    crate::blend::stations::with_newton_context(context, || continue_station(&solve_centered, &hop, &left, t, 0)).ok()
-                };
-                if chain {
-                    if let Some(node) = node {
-                        previous = node;
-                        history.borrow_mut().push((node.t, node.uv));
-                    }
+                let node =
+                    crate::blend::stations::with_newton_context(context, || continue_station(&solve_chord, &hop, &previous, t, 0)).ok();
+                if let Some(node) = node {
+                    previous = node;
+                    history.borrow_mut().push((node.t, node.uv));
                 }
                 row.push(node.and_then(|node| node.center));
             }
@@ -878,7 +865,6 @@ pub(in crate::blend) fn march_open_stations_core(
     }
     let _assemble_timing = crate::blend::BlendTimer::start("timing.march.assemble_ms");
     let mut stations = Vec::with_capacity(station_count + 1);
-    let reuse_normals = assembly_normals_reuse_on();
     for (index, uv) in solutions.iter().enumerate() {
         let t = station_t(index);
         let (section_point, section_tangent) = section_frame(t)?;
@@ -893,13 +879,8 @@ pub(in crate::blend) fn march_open_stations_core(
         let (p1, p2, center) = (state.p1, state.p2, state.center);
         // Raw offset evaluation already used deriv1_extended and
         // raw_unit_normal at these exact arguments. Retain those bits.
-        let (n1, n2) = if reuse_normals {
-            crate::blend::record_count("count.march.assembly_normal_reused", 2);
-            (state.n1, state.n2)
-        } else {
-            crate::blend::record_count("count.march.assembly_normal_reread", 2);
-            (raw_normal(surface1, uv[0], uv[1])?, raw_normal(surface2, uv[2], uv[3])?)
-        };
+        crate::blend::record_count("count.march.assembly_normal_reused", 2);
+        let (n1, n2) = (state.n1, state.n2);
         let cos_alpha = signs[0] * signs[1] * n1.dot(n2);
         let weight = ((1.0 + cos_alpha) * 0.5).max(0.0).sqrt();
         if weight <= 1e-6 {
@@ -928,11 +909,6 @@ pub(in crate::blend) fn march_open_stations_core(
         });
     }
     Ok((stations, vertex_indices, refinement, dense_centres))
-}
-
-
-fn assembly_normals_reuse_on() -> bool {
-    switch!(live "BREP_NETWORK_ASSEMBLY_NORMALS", true)
 }
 
 fn ts_first(ts: &[f64]) -> f64 {
@@ -2303,7 +2279,6 @@ pub(crate) fn end_continuation_on() -> bool {
     switch!(live "BREP_BLEND_END_CONTINUATION", END_CONTINUATION_DEFAULT)
 }
 
-
 /// Resolve one FREE end of a stripe: the §6.9 transverse construction on the
 /// single face across the corner.
 ///
@@ -2585,7 +2560,7 @@ pub(in crate::blend) fn resolve_free_end(
             };
             // Not on a PLANE.
             let planar_end = matches!(end_record.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. }));
-            let exact_ends = if crate::blend::planar_chart::ruled_chart_on() && !planar_end {
+            let exact_ends = if !planar_end {
                 [extends(first_boundary, first_edge_parameter), extends(second_boundary, second_edge_parameter)]
             } else {
                 [false, false]
@@ -2639,7 +2614,7 @@ pub(in crate::blend) fn resolve_free_end(
                 clamp01(cs_parameter),
                 exact_ends,
                 end_points,
-                transverse_ladder_on().then(|| shell_closure_bar(solid, first_face.id)),
+                Some(shell_closure_bar(solid, first_face.id)),
             )?
         }
     };
@@ -4016,7 +3991,7 @@ pub(in crate::blend) fn transverse_curve_with_ends(
     // whose shells were inside their bars (2026-10-18 batch 4).
     const FIRST_SECTIONS: usize = 16;
     const MAX_SECTIONS: usize = 256;
-    let Some(shell_bar) = shell_bar.filter(|_| transverse_ladder_on()) else {
+    let Some(shell_bar) = shell_bar else {
         return transverse_curve_sections(rows, end_face, cr_parameter, cs_parameter, exact_ends, end_points, FIRST_SECTIONS);
     };
     let mut sections = FIRST_SECTIONS;
@@ -4050,18 +4025,6 @@ pub(in crate::blend) fn transverse_curve_with_ends(
     }
     Ok(best.expect("one build at least").0)
 }
-
-/// `BREP_BLEND_TRANSVERSE_LADDER=1`/`on` climbs [`transverse_curve_with_ends`]'s
-/// section ladder at a free end until the section's sliver stands within its
-/// shell's closure bar (the default since its census at 9a785b754); `=0`/`off`
-/// builds 16 sections as before; `set_transverse_ladder_for_test` forces it on
-/// a test's own thread.
-const TRANSVERSE_LADDER_DEFAULT: bool = true;
-
-pub(in crate::blend) fn transverse_ladder_on() -> bool {
-    switch!(live "BREP_BLEND_TRANSVERSE_LADDER", TRANSVERSE_LADDER_DEFAULT)
-}
-
 
 /// How far the transverse section's BLEND pcurve's image stands off its
 /// edge: the worst `|C(z) − S_wall(b(z))|` over `samples` midpoints of
@@ -4925,6 +4888,5 @@ fn extend_edge_on_carriers(
     }
     Ok(())
 }
-
 
 

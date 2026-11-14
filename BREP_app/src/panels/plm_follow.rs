@@ -20,7 +20,6 @@
 //! for what happened before the session looked.
 use crate::plm::client::{Changes, PlmClient, PlmError};
 use crate::plm::PlmFuture;
-use std::future::Future;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 

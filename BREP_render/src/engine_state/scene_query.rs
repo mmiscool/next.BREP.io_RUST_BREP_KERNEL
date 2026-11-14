@@ -129,7 +129,8 @@ impl EngineState {
     }
 
     /// The current per-solid metadata color overrides as JSON —
-    /// `[{"name": "...", "override": "#rrggbb" | null}, …]`. Lets a UI list the
+    /// `[{"name": "...", "override": "#rrggbb" | null, "opacity": 0..1 | null,
+    /// "edges": [{"name", "override", "opacity"}, …]}, …]`. Lets a UI list the
     /// scene's solids with their current override so the picker reflects state.
     pub fn solid_color_overrides_json(&self) -> String {
         let solids: Vec<serde_json::Value> = self
@@ -137,11 +138,22 @@ impl EngineState {
             .solids()
             .iter()
             .map(|solid| {
-                let over = solid.color_override.map(|rgb| {
+                let hex = |rgb: [f32; 3]| {
                     let q = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u32;
                     format!("#{:02x}{:02x}{:02x}", q(rgb[0]), q(rgb[1]), q(rgb[2]))
-                });
-                serde_json::json!({ "name": solid.name, "override": over })
+                };
+                let over = solid.color_override.map(hex);
+                // `opacity`: the solid's own `transparency` attribute as drawn
+                // (1 − transparency); null when the solid is opaque.
+                // `edges`: only the edges drawn in a look of their own (their
+                // `color` / `transparency` attributes), by name.
+                let edges: Vec<serde_json::Value> = solid
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.is_styled())
+                    .map(|edge| serde_json::json!({ "name": edge.name, "override": edge.color_override.map(hex), "opacity": edge.opacity }))
+                    .collect();
+                serde_json::json!({ "name": solid.name, "override": over, "opacity": solid.model_opacity, "edges": edges })
             })
             .collect();
         serde_json::Value::Array(solids).to_string()

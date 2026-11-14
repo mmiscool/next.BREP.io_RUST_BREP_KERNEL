@@ -398,7 +398,7 @@ fn model_xml(objects: &[WeldedObject], palette: &Palette, document_name: &str, f
 /// A minimal STORED ZIP: local headers with their data in order, then the
 /// central directory and the end record. Fixed timestamp (1980-01-01 00:00,
 /// the earliest DOS date), no extra fields, no comments, no data descriptors.
-struct ZipWriter {
+pub(super) struct ZipWriter {
     bytes: Vec<u8>,
     central: Vec<u8>,
     entries: u16,
@@ -408,11 +408,14 @@ struct ZipWriter {
 const DOS_DATE_1980_01_01: u16 = (1 << 5) | 1;
 
 impl ZipWriter {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self { bytes: Vec::new(), central: Vec::new(), entries: 0 }
     }
 
-    fn add(&mut self, name: &str, data: &[u8]) -> Result<(), String> {
+    pub(super) fn add(&mut self, name: &str, data: &[u8]) -> Result<(), String> {
+        if self.entries == u16::MAX || name.len() > u16::MAX as usize {
+            return Err("write_3mf: too many ZIP entries or an overlong part name".into());
+        }
         if data.len() > u32::MAX as usize {
             return Err(format!("write_3mf: part '{name}' is larger than a ZIP entry can hold"));
         }
@@ -459,7 +462,7 @@ impl ZipWriter {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Vec<u8>, String> {
+    pub(super) fn finish(mut self) -> Result<Vec<u8>, String> {
         let directory_offset = self.bytes.len();
         let directory_size = self.central.len();
         if directory_offset + directory_size + 22 > u32::MAX as usize {

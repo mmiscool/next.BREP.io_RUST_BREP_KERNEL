@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="fillet_weld" brep:unicode="E0D6">
+  <path d="M120 120H300V700H880V880H120Z" fill="#7a4d10"/>
+  <path d="M160 160H260V740H840V840H160Z" fill="#f0b840"/>
+  <path d="M300 360L640 700H300Z" fill="#125236"/>
+  <path d="M340 455L545 660H340Z" fill="#a5e8c4"/>
+  <path d="M680 120H730V240H680ZM780 270H900V320H780ZM753 213L838 128L873 163L788 248Z" fill="#d4901f"/>
+</svg>

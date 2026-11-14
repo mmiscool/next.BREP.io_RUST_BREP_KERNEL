@@ -1,5 +1,5 @@
-//! Touch Align (`TALN`) — two like elements touch/align: plane/plane →
-//! coplanar with the captured facing preference, axis/axis → collinear,
+//! Touch Align (`TALN`) — two like elements touch/align: plane/plane
+//! → coplanar with the captured facing preference, axis/axis → collinear,
 //! point/point → coincident.
 
 use super::super::mapping::{

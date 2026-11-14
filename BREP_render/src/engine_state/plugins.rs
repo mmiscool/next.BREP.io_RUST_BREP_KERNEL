@@ -294,6 +294,8 @@ impl EngineState {
     fn plugins_changed(&mut self) {
         self.cancel_plugin_action();
         self.runner.reset();
+        // A reset drops any answer still on its way.
+        self.session_requested = None;
         self.rerun_history();
     }
 
@@ -594,6 +596,8 @@ impl EngineState {
         self.run_generation += 1;
         self.applied_generation = self.run_generation;
         self.runner.reset();
+        // A reset drops any answer still on its way.
+        self.session_requested = None;
         self.rerun_history();
         true
     }
@@ -633,6 +637,8 @@ impl EngineState {
             ));
             if staged {
                 self.runner.reset();
+                // A reset drops any answer still on its way.
+                self.session_requested = None;
                 self.rerun_history();
             }
         }
@@ -722,6 +728,8 @@ impl EngineState {
         self.plugins.status = json!({"state":"pending","id":pending.id});
         // Full delta means discarding an unsuccessful candidate cannot poison the display baseline.
         self.runner.reset();
+        // A reset drops any answer still on its way.
+        self.session_requested = None;
         self.sync_plugin_runner();
         self.runner.sync_parts_library(
             brep_kernel::parts_library_revision(),
@@ -776,6 +784,8 @@ impl EngineState {
         self.plugin_result(result);
         if !accepted {
             self.runner.reset();
+            // A reset drops any answer still on its way.
+            self.session_requested = None;
             self.rerun_history();
         }
         accepted

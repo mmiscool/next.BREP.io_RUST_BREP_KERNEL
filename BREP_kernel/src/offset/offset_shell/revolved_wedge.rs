@@ -610,6 +610,14 @@ pub(super) fn build(
     wedge: &RevolvedWedge,
     source: &BrepSolid,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    build_region(wedge, source, false)
+}
+
+fn build_region(
+    wedge: &RevolvedWedge,
+    source: &BrepSolid,
+    grown_body: bool,
+) -> Result<OffsetShellResultRecord, KernelRefusal> {
     const SKIN: &str = "skin";
     const WALL_LOW: &str = "wall-low";
     const WALL_HIGH: &str = "wall-high";
@@ -622,8 +630,44 @@ pub(super) fn build(
     let mut profile: Vec<NurbsCurve> = Vec::with_capacity(6);
     let mut tags: Vec<&str> = Vec::with_capacity(6);
     // The skin, from the arc's low end to its high end.
-    profile.push(arc(wedge.skin, wedge.low.angle, wedge.high.angle).or_refuse(KernelStage::Refine, "arc")?);
-    tags.push(SKIN);
+    let mut held_tags = Vec::new();
+    let mut held_curves = Vec::new();
+    if grown_body {
+        // Complete the meridian through the source profile, rather than along
+        // the skin: the cap extension contains source material as well.
+        let cap = source.shells.iter().flat_map(|s| &s.faces)
+            .find(|f| f.id == wedge.start_cap).unwrap();
+        let skin = source.shells.iter().flat_map(|s| &s.faces)
+            .find(|f| f.id == wedge.retained).unwrap();
+        let skin_edges: HashSet<_> = skin.loops.iter().flat_map(|l| &l.coedges).map(|c| c.edge_id).collect();
+        let coedges = &cap.loops[0].coedges;
+        let at = coedges.iter().position(|c| skin_edges.contains(&c.edge_id)).unwrap();
+        for step in 1..coedges.len() {
+            let coedge = &coedges[(at + step) % coedges.len()];
+            let edge = source.edges.iter().find(|e| e.id == coedge.edge_id).unwrap();
+            let mut curve = edge.curve.clone();
+            let [lo, hi] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            if edge.t1 < hi { curve = curve.split(edge.t1).or_refuse(KernelStage::Refine, "split")?.0; }
+            if edge.t0 > lo { curve = curve.split(edge.t0).or_refuse(KernelStage::Refine, "split")?.1; }
+            if !coedge.forward { curve = curve.reversed().or_refuse(KernelStage::Refine, "reversed")?; }
+            let side = source.shells.iter().flat_map(|s| &s.faces).find(|f|
+                f.id != wedge.start_cap && f.id != wedge.end_cap &&
+                f.loops.iter().flat_map(|l| &l.coedges).any(|c| c.edge_id == edge.id)).unwrap();
+            held_tags.push(format!("held-{}", side.id));
+            held_curves.push(curve);
+        }
+        let first = held_curves[0].evaluate(held_curves[0].domain().unwrap()[0]).unwrap();
+        if first.sub(wedge.at(wedge.skin, wedge.low.angle)).length() > LINEAR_BAR * crate::solid_scale(source) {
+            held_curves.reverse();
+            held_tags.reverse();
+            for curve in &mut held_curves { *curve = curve.reversed().or_refuse(KernelStage::Refine, "reversed")?; }
+        }
+        profile.extend(held_curves);
+        tags.extend(held_tags.iter().map(String::as_str));
+    } else {
+        profile.push(arc(wedge.skin, wedge.low.angle, wedge.high.angle).or_refuse(KernelStage::Refine, "arc")?);
+        tags.push(SKIN);
+    }
     // Out along the high end's profile edge to the grown circle.
     profile.push(make_line(
         wedge.at(wedge.skin, wedge.high.angle),
@@ -660,6 +704,42 @@ pub(super) fn build(
         wedge.at(wedge.skin, wedge.low.angle),
     ).or_refuse(KernelStage::Refine, "make_line")?);
     tags.push(WALL_LOW);
+
+    if grown_body {
+        // The source arc endpoints are interior stations on the grown walls.
+        // Leaving them as separate revolved faces makes the cap section meet
+        // artificial coplanar junctions. Join only straight continuations of
+        // the same held face, including the cyclic profile's closing pair.
+        let wall_id = |tag: &str| match tag {
+            WALL_LOW => Some(wedge.low.wall),
+            WALL_HIGH => Some(wedge.high.wall),
+            _ => tag.strip_prefix("held-").and_then(|id| id.parse::<u64>().ok()),
+        };
+        loop {
+            let mut joined = false;
+            for i in 0..profile.len() {
+                let j = (i+1)%profile.len();
+                if profile[i].degree != 1 || profile[j].degree != 1
+                    || wall_id(tags[i]).is_none() || wall_id(tags[i]) != wall_id(tags[j]) { continue; }
+                let [a,b] = profile[i].domain().or_refuse(KernelStage::Refine, "domain")?;
+                let [c,d] = profile[j].domain().or_refuse(KernelStage::Refine, "domain")?;
+                let from = profile[i].evaluate(a).or_refuse(KernelStage::Refine, "evaluate")?;
+                let middle = profile[i].evaluate(b).or_refuse(KernelStage::Refine, "evaluate")?;
+                let next = profile[j].evaluate(c).or_refuse(KernelStage::Refine, "evaluate")?;
+                let to = profile[j].evaluate(d).or_refuse(KernelStage::Refine, "evaluate")?;
+                let (first, second) = (middle.sub(from), to.sub(next));
+                let linear = LINEAR_BAR * crate::solid_scale(source);
+                if middle.sub(next).length() > linear || first.dot(second) <= 0.0
+                    || first.cross(second).length() > linear*(first.length()+second.length()) { continue; }
+                profile[i] = make_line(from,to).or_refuse(KernelStage::Refine, "make_line")?;
+                profile.remove(j);
+                tags.remove(j);
+                joined = true;
+                break;
+            }
+            if !joined { break; }
+        }
+    }
 
     let side_names = tags
         .iter()
@@ -698,6 +778,7 @@ pub(super) fn build(
             WALL_HIGH => (OffsetFaceRole::Wall, wedge.high.wall),
             CAP_START => (OffsetFaceRole::Wall, wedge.start_cap),
             CAP_END => (OffsetFaceRole::Wall, wedge.end_cap),
+            other if other.starts_with("held-") => (OffsetFaceRole::Wall, other[5..].parse::<u64>().unwrap()),
             other => {
                 return Err(KernelRefusal::internal(KernelStage::Refine, "offset_shell_wedge_attribution", format!(
                     "offset_shell: the revolved wedge built a face it cannot attribute ({other:?})"
@@ -745,7 +826,7 @@ pub(super) fn build(
         .evaluate(0.5 * (u0 + u1), 0.5 * (v0 + v1)).or_refuse(KernelStage::Refine, "evaluate")?;
     let scale = crate::solid_scale(source);
     let class = classify_point(probe, &solid, LINEAR_BAR * scale * 10.0).or_refuse(KernelStage::Refine, "classify_point")?.class;
-    if class != PointClass::On {
+    if if grown_body { class == PointClass::Out } else { class != PointClass::On } {
         return Err(KernelRefusal::internal(KernelStage::Refine, "offset_shell_wedge_skin", format!(
             "offset_shell: the revolved wedge does not carry its own source skin — the skin's mid \
              sample classifies {class:?} against it ({})",
@@ -754,4 +835,92 @@ pub(super) fn build(
     }
     let solid = crate::accept_sound(solid, "offsetShell")?;
     Ok(OffsetShellResultRecord { solid, face_images })
+}
+
+/// Build the grown meridian first, then intersect its revolution with the cap
+/// half-spaces. Moving a retained cap destroys rotational symmetry; clipping
+/// after revolution preserves its true planar section through the fold.
+/// `BREP_OFFSET_TORUS_RETAINED_CAP` is default on; `=0` restores the refusal. Only convex azimuth wedges
+/// with distinct cap planes are taken; reflex and half-turn sweeps retain the
+/// pipeline's existing behavior.
+pub(super) fn retained_cap_shell(
+    source: &BrepSolid,
+    openings: &[u64],
+    distance: f64,
+) -> Option<OffsetShellResultRecord> {
+    if !switch!("BREP_OFFSET_TORUS_RETAINED_CAP", true) { return None; }
+    match retained_cap_build(source, openings, distance) {
+        Ok(result) => result,
+        Err(error) => { os_debug!("retained torus cap declined: {error}"); None }
+    }
+}
+
+fn retained_cap_build(
+    source: &BrepSolid,
+    openings: &[u64],
+    distance: f64,
+) -> Result<Option<OffsetShellResultRecord>, KernelRefusal> {
+    let faces: Vec<_> = source.shells.iter().flat_map(|s| &s.faces).collect();
+    let retained: Vec<_> = faces.iter().filter(|f| !openings.contains(&f.id)).collect();
+    if retained.len() != 2 { return Ok(None); }
+    let Some(torus) = retained.iter().find(|f| matches!(f.surface.analytic(), Some(crate::AnalyticSurface::Revolution { .. }))) else { return Ok(None) };
+    let all_open: Vec<_> = faces.iter().filter(|f| f.id != torus.id).map(|f| f.id).collect();
+    let Recognition::Wedge(mut wedge) = recognize(source, &all_open, distance)? else { return Ok(None) };
+    if wedge.sweep >= PI - AZIMUTH_BAR || !retained.iter().any(|f| f.id == wedge.start_cap || f.id == wedge.end_cap) {
+        return Ok(None);
+    }
+    if openings.iter().any(|id| !faces.iter().any(|f| f.id == *id)) { return Ok(None); }
+    wedge.sweep = TAU;
+    let mut grown = build_region(&wedge, source, true)?;
+    for cap_id in [wedge.start_cap, wedge.end_cap] {
+        let cap = faces.iter().find(|f| f.id == cap_id).unwrap();
+        let [u0,u1] = cap.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+        let [v0,v1] = cap.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+        let (u,v) = ((u0+u1)*0.5,(v0+v1)*0.5);
+        let normal = cap.surface.normal(u,v).or_refuse(KernelStage::Refine, "normal")?
+            .scale(if cap.same_sense {1.0} else {-1.0});
+        let opened = openings.contains(&cap_id);
+        let foot = cap.surface.evaluate(u,v).or_refuse(KernelStage::Refine, "evaluate")?
+            .add(normal.scale(if opened {0.0} else {-distance}));
+        os_debug!("retained torus cap: clipping face {cap_id}, opened={opened}, normal={normal:?}, foot={foot:?}");
+        let cut = clip_cap(&grown.solid, foot, normal)?;
+        os_debug!("retained torus cap: face {cap_id} section closed");
+        let operands: Vec<_> = grown.solid.shells.iter().flat_map(|s| &s.faces)
+            .zip(grown.face_images.iter().cloned()).collect();
+        let image = OffsetShellFaceImageRecord { role: if opened {OffsetFaceRole::Wall} else {OffsetFaceRole::Offset}, source_face_id: cap_id };
+        let face_images = super::solid::provenance_by_surface(&cut, &operands, Some(&image))?;
+        grown = OffsetShellResultRecord { solid: cut, face_images };
+    }
+    let result = crate::boolean_operation(&grown.solid, source, crate::BooleanOperation::Subtract, &crate::BooleanOptions::default())?;
+    let mut operands: Vec<_> = grown.solid.shells.iter().flat_map(|s| &s.faces)
+        .zip(grown.face_images.iter().cloned()).collect();
+    operands.extend(faces.iter().map(|f| (*f, OffsetShellFaceImageRecord { role: OffsetFaceRole::Source, source_face_id: f.id })));
+    let face_images = super::solid::provenance_by_surface(&result, &operands, None)?;
+    let solid = crate::accept_sound(result, "offsetShell")?;
+    Ok(Some(OffsetShellResultRecord { solid, face_images }))
+}
+
+
+fn clip_cap(solid: &BrepSolid, foot: Vec3, normal: Vec3) -> Result<BrepSolid, KernelRefusal> {
+    let mut bounds = crate::spatial::Aabb::empty();
+    for face in solid.shells.iter().flat_map(|s| &s.faces) {
+        for control in face.surface.control_points.iter().flatten() {
+            bounds.include_point(control.point().or_refuse(KernelStage::Refine, "point")?);
+        }
+    }
+    let side = 3.0*bounds.diagonal();
+    let center = bounds.minimum.add(bounds.maximum).scale(0.5);
+    let center = center.sub(normal.scale(center.sub(foot).dot(normal) + 0.5*side));
+    let u = normal.perpendicular().or_refuse(KernelStage::Refine, "perpendicular")?;
+    let v = normal.cross(u);
+    let transform = crate::AffineTransform::new([
+        u.x,v.x,normal.x,center.x,
+        u.y,v.y,normal.y,center.y,
+        u.z,v.z,normal.z,center.z,
+        0.0,0.0,0.0,1.0,
+    ]).or_refuse(KernelStage::Refine, "transform")?;
+    let cube = crate::make_box_brep(Vec3::new(-side/2.0,-side/2.0,-side/2.0),side,side,side)
+        .or_refuse(KernelStage::Refine, "box")?;
+    let tool = crate::transform_brep(&cube, transform, false).or_refuse(KernelStage::Refine, "transform_brep")?;
+    crate::boolean_operation(solid, &tool, crate::BooleanOperation::Intersect, &crate::BooleanOptions::default())
 }

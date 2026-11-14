@@ -249,8 +249,22 @@ impl RibbonPanel {
     pub fn layout(&self) -> &GroupLayout {
         &self.layout
     }
-    pub fn tabs(&mut self, ui: &mut egui::Ui, hits: &mut HashMap<String, egui::Rect>) {
+    /// Draw the tab strip for this command list. A tab the list has nothing
+    /// for (PMI, outside its host workbenches) is not drawn, and a selection
+    /// left on it — the workbench was switched — returns to Home.
+    pub fn tabs(
+        &mut self,
+        ui: &mut egui::Ui,
+        commands: &[OfferedCommand],
+        hits: &mut HashMap<String, egui::Rect>,
+    ) {
+        if !crate::workbench::ribbon_tab_shown(RIBBON_TABS[self.selected], commands) {
+            self.selected = 0;
+        }
         for (index, tab) in RIBBON_TABS.iter().enumerate() {
+            if !crate::workbench::ribbon_tab_shown(tab, commands) {
+                continue;
+            }
             let response = ui.selectable_label(self.selected == index, *tab);
             hits.insert(format!("ribbon:tab:{tab}"), response.rect);
             if response.clicked() {
@@ -264,6 +278,9 @@ impl RibbonPanel {
         commands: &[OfferedCommand],
         hits: &mut HashMap<String, egui::Rect>,
     ) -> Option<CommandTarget> {
+        if !crate::workbench::ribbon_tab_shown(RIBBON_TABS[self.selected], commands) {
+            self.selected = 0;
+        }
         let groups = command_groups(commands, RIBBON_TABS[self.selected]);
         let measure = |mode: SizeMode| {
             let mut probe = egui::Ui::new(

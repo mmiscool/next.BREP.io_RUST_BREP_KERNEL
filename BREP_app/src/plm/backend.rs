@@ -290,30 +290,6 @@ impl StoreBackend for DocumentsBackend {
         index.ours.get(key).is_some_and(|hash| index.rows.get(key).is_some_and(|row| row.content_hash == *hash))
     }
 
-    /// The change feed moved: re-read exactly the rows it named (a revision's
-    /// lock and lifecycle changes name its keys, server `touch_part`), in
-    /// reads of [`INDEX_ROWS_PER_READ`] keys; the whole index only when the
-    /// feed was `stale`. A row the answer leaves out is a revision gone.
-    fn refresh_plm_index(&self, keys: &[String], stale: bool) {
-        if !stale && keys.is_empty() {
-            return;
-        }
-        let issued = self.index.borrow_mut().issue();
-        let (client, index) = (self.client.clone(), self.index.clone());
-        let keys = keys.to_vec();
-        detach(async move {
-            if stale {
-                if let Ok(fresh) = client.index().await {
-                    index.borrow_mut().reconcile(None, &fresh, issued);
-                }
-                return;
-            }
-            for chunk in keys.chunks(INDEX_ROWS_PER_READ) {
-                let Ok(rows) = client.index_rows(chunk).await else { return };
-                index.borrow_mut().reconcile(Some(chunk), &rows, issued);
-            }
-        });
-    }
 
     /// Every document's bytes. Only a caller that insists on a full hydrate
     /// uses it; the session hydrates through [`Self::load_index`].

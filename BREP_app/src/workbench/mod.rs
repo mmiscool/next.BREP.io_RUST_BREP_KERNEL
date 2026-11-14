@@ -51,6 +51,7 @@ pub mod sketch;
 pub mod sketch3d;
 pub mod symbol;
 pub mod wire_harness;
+pub mod welding;
 
 /// The minimal view of one catalogue entry a workbench predicate consumes: the
 /// feature `type` CODE (e.g. `"E"`, `"S"`, `"SM.F"`), read from the existing
@@ -215,7 +216,7 @@ pub static WORKBENCHES: &[&Workbench] = &[
     // Placeholders — established for the dropdown, fleshed out later.
     &wire_harness::WIRE_HARNESS,
     &assembly::ASSEMBLY,
-    &pmi::PMI,
+    &welding::WELDING,
     &drawing::DRAWING,
     // The eCAD four: their editors are drawn in place of the 3D view.
     &diagram::DIAGRAM,
@@ -258,20 +259,26 @@ pub fn resolve(id: &str) -> &'static Workbench {
 /// is entered from a surface no workbench filters (the sketch tools' own
 /// `editSketch`, on a History panel no workbench claims), so no workbench owns
 /// its tools and every row has to offer them. Declared ONCE — [`sketch::BUTTONS`]
-/// is the only entry today — and conditional on the mode, so out of it the rows
-/// are exactly what each workbench declares.
+/// and conditional on the mode, so out of it the rows are exactly what each
+/// workbench declares.
+///
+/// The PMI command set's buttons ([`pmi::BUTTONS`]) ride the same list: PMI is
+/// no workbench, so no workbench owns Capture view, and it is conditional on
+/// the PMI panel being shown ([`pmi::offered`]) the way a sketch tool is
+/// conditional on its mode.
 ///
 /// This is the ONE reading: [`workbench_buttons`] appends it and
 /// [`button_by_id`] searches it, so the row, `describe_workbenches` and the
 /// `workbench_button` command agree about what exists.
 pub fn shared_buttons() -> &'static [WorkbenchButton] {
-    /// The two shared sets in one slice, built once: the planar sketch's
-    /// tools, then the 3D sketch's. Each set is conditional on its own mode,
-    /// so a row never shows both.
+    /// The shared sets in one slice, built once: the planar sketch's tools,
+    /// the 3D sketch's, then the PMI set's. Each sketch set is conditional on
+    /// its own mode, so a row never shows both.
     static SHARED: std::sync::LazyLock<Vec<WorkbenchButton>> = std::sync::LazyLock::new(|| {
         sketch::BUTTONS
             .iter()
             .chain(sketch3d::BUTTONS.iter())
+            .chain(pmi::BUTTONS.iter())
             .map(|b| WorkbenchButton {
                 id: b.id,
                 glyph: b.glyph,

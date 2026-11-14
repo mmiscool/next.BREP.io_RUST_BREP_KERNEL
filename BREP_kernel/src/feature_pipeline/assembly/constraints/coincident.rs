@@ -1,6 +1,6 @@
-//! Coincident (`COIN`) — two elements touch: two planar faces → coplanar
-//! (owner 2026-11-05: it used to pin their representative points together),
-//! exactly one planar side → point-on-plane, anything else → the
+//! Coincident (`COIN`) — two elements touch: two planar faces →
+//! coplanar (owner 2026-11-05: it used to pin their representative points
+//! together), exactly one planar side → point-on-plane, anything else → the
 //! representative points coincide.
 
 use super::super::mapping::{

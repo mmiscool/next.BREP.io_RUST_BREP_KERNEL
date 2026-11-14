@@ -275,7 +275,7 @@ impl<'a> XmlReader<'a> {
         }
     }
 
-    fn resolve(&self, prefix: &str) -> Result<String, XmlError> {
+    pub(super) fn resolve(&self, prefix: &str) -> Result<String, XmlError> {
         if prefix == "xml" {
             return Ok("http://www.w3.org/XML/1998/namespace".into());
         }

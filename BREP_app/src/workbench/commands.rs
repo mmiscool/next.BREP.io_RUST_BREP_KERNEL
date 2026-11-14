@@ -2,7 +2,24 @@
 use super::{ButtonState, WorkbenchButton};
 use brep_render::engine_state::EngineState;
 
-pub const RIBBON_TABS: [&str; 3] = ["Home", "View", "Help"];
+/// The Ribbon's tabs, in strip order. "PMI" is drawn only where a PMI command
+/// is offered ([`ribbon_tab_shown`]); the others always.
+pub const RIBBON_TABS: [&str; 4] = ["Home", super::pmi::TAB, "View", "Help"];
+
+/// Whether the Ribbon draws `tab` for this command list: the PMI tab exists
+/// only in a workbench that offers PMI commands.
+pub fn ribbon_tab_shown(tab: &str, commands: &[OfferedCommand]) -> bool {
+    tab != super::pmi::TAB || commands.iter().any(|c| c.segments()[0] == tab)
+}
+
+/// The tabs whose creation commands the Classic strip draws, in order: it has
+/// no tab strip, so the PMI tab's groups follow Home's.
+pub const CREATION_TABS: [&str; 2] = ["Home", super::pmi::TAB];
+
+/// [`command_groups`] over every creation tab: what the Classic strip draws.
+pub fn creation_groups(commands: &[OfferedCommand]) -> Vec<(&str, Vec<&OfferedCommand>)> {
+    CREATION_TABS.iter().flat_map(|tab| command_groups(commands, tab)).collect()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandSize {
@@ -311,7 +328,8 @@ pub fn feature_command_label(feature: &serde_json::Value) -> String {
     glyph.map_or_else(|| label.to_owned(), |g| format!("{g} {label}"))
 }
 
-/// The same Home descriptors feed the Classic strip and Ribbon. Order is catalogue order.
+/// The same creation descriptors feed the Classic strip and Ribbon (Home, and
+/// the PMI tab's annotation commands). Order is catalogue order.
 pub fn offered_home_commands(engine: &EngineState) -> Vec<OfferedCommand> {
     if !engine.settings.show_workbench_toolbar || engine.any_sketch_mode() || engine.ref_select_modal()
     {
@@ -394,7 +412,7 @@ fn offered_home_commands_unchecked(engine: &EngineState) -> Vec<OfferedCommand> 
             commands.push(creation(
                 format!("annotation:{}", d.type_id),
                 d.icon,
-                format!("Home/Annotations/{}", d.label),
+                format!("{}/{}/{}", super::pmi::TAB, super::pmi::group_of(d.type_id), d.label),
                 CommandTarget::Annotation(d.type_id.into()),
             ));
         }

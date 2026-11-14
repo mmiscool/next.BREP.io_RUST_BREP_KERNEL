@@ -578,6 +578,11 @@ pub struct RunOutput {
     /// [`AssemblySync`]).
     #[serde(default)]
     pub assembly: Option<AssemblySync>,
+    /// The parts this run showed from a snapshot another kernel build made
+    /// ([`brep_kernel::HistoryRequest::defer_stale_parts`]): a later run
+    /// rebuilds them.
+    #[serde(default)]
+    pub stale_parts: Vec<String>,
 }
 
 impl SceneRunner {
@@ -907,6 +912,7 @@ impl SceneRunner {
             imported_colors,
             consumed,
             assembly,
+            stale_parts: result.stale_parts.clone(),
         }
     }
 

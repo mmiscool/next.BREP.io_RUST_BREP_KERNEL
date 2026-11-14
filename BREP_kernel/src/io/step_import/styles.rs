@@ -35,9 +35,18 @@
 //!   same item.
 //! * Within one rank, the LOWEST entity id wins, so a file that styles one item
 //!   several times (once per representation context) imports the same colour
-//!   every run. Distinguishing those contexts per OCCURRENCE is deferred: this
-//!   importer flattens a product's geometry, so there is no per-instance face to
-//!   hang a second colour on.
+//!   every run.
+//! * An OCCURRENCE's own colour is a
+//!   `CONTEXT_DEPENDENT_OVER_RIDING_STYLED_ITEM(name, styles, item,
+//!   over_ridden_style, style_context)` whose context is that occurrence: the
+//!   `REPRESENTATION_RELATIONSHIP` its `CONTEXT_DEPENDENT_SHAPE_REPRESENTATION`
+//!   places the part through (or, read leniently, the
+//!   `NEXT_ASSEMBLY_USAGE_OCCURRENCE` itself). It colours that item of that
+//!   instance only, never the part, so it is kept apart, keyed by occurrence
+//!   and item ([`StyleTable::occurrence_item_color`]). A
+//!   context naming a path of several occurrences (an instance deep inside a
+//!   sub-assembly) is not read; such styles are counted. A plain style on a
+//!   `MAPPED_ITEM` is likewise the colour of the occurrence that item places.
 //! * `MECHANICAL_DESIGN_GEOMETRIC_PRESENTATION_REPRESENTATION` is the container
 //!   that gathers styled items. It needs no special handling — every styled item
 //!   in the file is scanned directly, which also picks up the styled items of
@@ -58,6 +67,18 @@ use crate::appearance::ImportedColor;
 pub(super) struct StyleTable {
     /// item entity id → its resolved surface colour.
     by_item: HashMap<usize, ImportedColor>,
+    /// (NEXT_ASSEMBLY_USAGE_OCCURRENCE id, styled item id) → the colour that
+    /// item takes in that one occurrence.
+    by_occurrence: HashMap<(usize, usize), ImportedColor>,
+    /// Occurrence styles whose context is a path of several occurrences, which
+    /// this reader does not attach.
+    pub(super) nested_occurrence_styles: usize,
+    /// Occurrence id (a NEXT_ASSEMBLY_USAGE_OCCURRENCE or a MAPPED_ITEM) → the
+    /// representations its placement relates (either side of its relationship,
+    /// which files write both ways round, or a mapped item's mapped
+    /// representation): a style on the placed one in the occurrence's context
+    /// colours the whole instance.
+    placed_representation: HashMap<usize, Vec<usize>>,
 }
 
 impl StyleTable {
@@ -71,7 +92,44 @@ impl StyleTable {
         // (item, colour, over_riding) triples first, so precedence is applied
         // once over a sorted list rather than by fighting HashMap order.
         let mut found: Vec<(usize, usize, ImportedColor, bool)> = Vec::new();
+        let mut occurrences: Vec<(usize, usize, usize, ImportedColor)> = Vec::new();
+        let mut nested_occurrence_styles = 0;
+        let mut placed_through: Option<(HashMap<usize, usize>, HashMap<usize, Vec<usize>>)> = None;
         for (id, entity) in entities.iter() {
+            if let Some(args) = entity.find("CONTEXT_DEPENDENT_OVER_RIDING_STYLED_ITEM") {
+                let Some(color) = args.get(1).and_then(|styles| style_list_color(entities, styles)) else {
+                    continue;
+                };
+                let Some(Ok(item_ref)) = args.get(2).map(Value::as_ref_id) else {
+                    continue;
+                };
+                let Some(context) = args.get(4).and_then(|context| context.as_list().ok()) else {
+                    continue;
+                };
+                if context.len() != 1 {
+                    nested_occurrence_styles += 1;
+                    continue;
+                }
+                let Ok(context_ref) = context[0].as_ref_id() else {
+                    continue;
+                };
+                let (placed_through, _) = placed_through.get_or_insert_with(|| relationship_occurrences(entities));
+                // The occurrence the context names: the NAUO itself, the
+                // MAPPED_ITEM that is the occurrence, or the relationship or
+                // CONTEXT_DEPENDENT_SHAPE_REPRESENTATION that places it.
+                let context = entities.get(&context_ref);
+                let occurrence = if context
+                    .is_some_and(|e| e.has("NEXT_ASSEMBLY_USAGE_OCCURRENCE") || e.has("MAPPED_ITEM"))
+                {
+                    Some(context_ref)
+                } else {
+                    placed_through.get(&context_ref).copied()
+                };
+                if let Some(occurrence) = occurrence {
+                    occurrences.push((occurrence, item_ref, *id, color));
+                }
+                continue;
+            }
             let over_riding = entity.has("OVER_RIDING_STYLED_ITEM");
             let Some(args) = entity
                 .find("OVER_RIDING_STYLED_ITEM")
@@ -100,7 +158,68 @@ impl StyleTable {
         for (item_ref, _, color, _) in found {
             by_item.entry(item_ref).or_insert(color);
         }
-        Self { by_item }
+        // The lowest entity id wins, as for items.
+        occurrences.sort_unstable_by_key(|(occurrence, item, id, _)| (*occurrence, *item, *id));
+        let mut by_occurrence: HashMap<(usize, usize), ImportedColor> = HashMap::default();
+        for (occurrence, item, _, color) in occurrences {
+            by_occurrence.entry((occurrence, item)).or_insert(color);
+        }
+        let placed_representation = if by_occurrence.is_empty() {
+            HashMap::default()
+        } else {
+            placed_through.map(|(_, representations)| representations).unwrap_or_default()
+        };
+        Self { by_item, by_occurrence, nested_occurrence_styles, placed_representation }
+    }
+
+    /// The colour one body takes in one occurrence (a
+    /// NEXT_ASSEMBLY_USAGE_OCCURRENCE, or the MAPPED_ITEM that places a shared
+    /// representation), where the file styles it there on its own: an
+    /// override on any of the body's `items` in that occurrence's context, else
+    /// a style on the mapped item, which colours everything it places.
+    pub(super) fn occurrence_item_color(&self, occurrence_ref: usize, items: &[usize]) -> Option<ImportedColor> {
+        items
+            .iter()
+            .find_map(|item| self.by_occurrence.get(&(occurrence_ref, *item)))
+            .copied()
+            .or_else(|| self.whole_occurrence_color(occurrence_ref))
+    }
+
+    /// A colour the occurrence gives everything it places: a style on its
+    /// MAPPED_ITEM, or an override on the representation it places.
+    fn whole_occurrence_color(&self, occurrence_ref: usize) -> Option<ImportedColor> {
+        self.by_item.get(&occurrence_ref).copied().or_else(|| {
+            let representations = self.placed_representation.get(&occurrence_ref)?;
+            representations
+                .iter()
+                .find_map(|representation| self.by_occurrence.get(&(occurrence_ref, *representation)))
+                .copied()
+        })
+    }
+
+    /// The one colour an occurrence gives everything it places: a style on
+    /// its MAPPED_ITEM, whatever that places; else, for an occurrence of a
+    /// LEAF part (`leaf_bodies`, each body as its styled items), the colour its
+    /// overrides give every one of those bodies alike. `None` when it leaves
+    /// any uncoloured, colours them differently, or places a sub-assembly
+    /// whose own overrides cannot speak for the parts beneath it.
+    pub(super) fn occurrence_color(
+        &self,
+        occurrence_ref: usize,
+        leaf_bodies: Option<&[Vec<usize>]>,
+    ) -> Option<ImportedColor> {
+        if let Some(color) = self.whole_occurrence_color(occurrence_ref) {
+            return Some(color);
+        }
+        let bodies = leaf_bodies?;
+        let mut found: Option<ImportedColor> = None;
+        for items in bodies {
+            let color = self.occurrence_item_color(occurrence_ref, items)?;
+            if *found.get_or_insert(color) != color {
+                return None;
+            }
+        }
+        found
     }
 
     /// The colour assigned to one entity (a face, a shell, or a solid), if any.
@@ -113,6 +232,64 @@ impl StyleTable {
     pub(super) fn is_empty(&self) -> bool {
         self.by_item.is_empty()
     }
+}
+
+/// Each `REPRESENTATION_RELATIONSHIP` a `CONTEXT_DEPENDENT_SHAPE_REPRESENTATION`
+/// places a part through, and the CDSR itself, mapped to the occurrence that
+/// placement is: the NEXT_ASSEMBLY_USAGE_OCCURRENCE its PRODUCT_DEFINITION_SHAPE
+/// defines.
+fn relationship_occurrences(
+    entities: &HashMap<usize, Entity>,
+) -> (HashMap<usize, usize>, HashMap<usize, Vec<usize>>) {
+    let mut map = HashMap::default();
+    let mut representations: HashMap<usize, Vec<usize>> = HashMap::default();
+    for (&id, entity) in entities.iter() {
+        // MAPPED_ITEM(name, mapping_source, mapping_target): the source is a
+        // REPRESENTATION_MAP(mapping_origin, mapped_representation).
+        if let Some(args) = entity.find("MAPPED_ITEM") {
+            if let Some(Ok(mapped)) = args
+                .get(1)
+                .and_then(|source| source.as_ref_id().ok())
+                .and_then(|source| entities.get(&source))
+                .and_then(|source| source.find("REPRESENTATION_MAP"))
+                .and_then(|map| map.get(1))
+                .map(Value::as_ref_id)
+            {
+                representations.entry(id).or_default().push(mapped);
+            }
+            continue;
+        }
+        let Some(args) = entity.find("CONTEXT_DEPENDENT_SHAPE_REPRESENTATION") else {
+            continue;
+        };
+        let (Some(Ok(relationship)), Some(Ok(shape))) =
+            (args.first().map(Value::as_ref_id), args.get(1).map(Value::as_ref_id))
+        else {
+            continue;
+        };
+        let Some(occurrence) = entities
+            .get(&shape)
+            .and_then(|shape| shape.find("PRODUCT_DEFINITION_SHAPE"))
+            .and_then(|args| args.get(2))
+            .and_then(|definition| definition.as_ref_id().ok())
+        else {
+            continue;
+        };
+        if entities.get(&occurrence).is_some_and(|e| e.has("NEXT_ASSEMBLY_USAGE_OCCURRENCE")) {
+            map.insert(relationship, occurrence);
+            // The CONTEXT_DEPENDENT_SHAPE_REPRESENTATION names the same
+            // occurrence.
+            map.insert(id, occurrence);
+            // REPRESENTATION_RELATIONSHIP(name, description, rep_1, rep_2):
+            // the placed (child) representation is usually rep_1, but files
+            // write it both ways round, so both are kept.
+            if let Some(args) = entities.get(&relationship).and_then(|entity| entity.find("REPRESENTATION_RELATIONSHIP")) {
+                let sides = [2, 3].into_iter().filter_map(|index| args.get(index)?.as_ref_id().ok());
+                representations.entry(occurrence).or_default().extend(sides);
+            }
+        }
+    }
+    (map, representations)
 }
 
 /// The first surface colour reachable from a `STYLED_ITEM`'s `styles` list.

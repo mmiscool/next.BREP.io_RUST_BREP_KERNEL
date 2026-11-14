@@ -73,7 +73,7 @@ pub enum PaneKind {
     /// The wire-harness connection list (claimed by the Wire harness
     /// workbench).
     WireHarness,
-    /// The PMI view tree (claimed by the PMI workbench).
+    /// The PMI view tree (claimed by Modeling, Sheet Metal and Assembly).
     Pmi,
     /// The drawing SHEETS the PMI views are placed on (claimed by the PMI
     /// workbench beside the view tree).
@@ -277,6 +277,11 @@ pub struct DialogTargets {
     feature: (Option<String>, u64),
     /// The PMI pane's open annotation or view form, and `pmi_dialog_opens`.
     pmi: (Option<String>, u64),
+    /// Whether that open form is a STEP of the active exploded view (an
+    /// explode or hide row of a view that has explode steps). Such a step has
+    /// two panes that edit it — PMI's tree and the Constraints pane's
+    /// exploded-view section — see [`DockState::surface_opened_dialogs`].
+    pmi_exploded_step: bool,
     /// The Constraints pane's open constraint form, and
     /// `assembly_constraint_opens`.
     constraint: (Option<String>, u64),
@@ -300,6 +305,16 @@ impl DialogTargets {
                     .map(str::to_string),
                 engine.pmi_dialog_opens(),
             ),
+            pmi_exploded_step: engine.pmi_open_annotation().is_some_and(|open| {
+                engine.pmi_active_view().is_some_and(|view| {
+                    engine.is_exploded_view(view)
+                        && engine.pmi_state().find_view(view).is_some_and(|view| {
+                            view.annotations
+                                .iter()
+                                .any(|a| a.id() == open && matches!(a.kind.as_str(), "explode" | "hide"))
+                        })
+                })
+            }),
             constraint: (engine.assembly_open_constraint(), engine.assembly_constraint_opens()),
             sheet: (
                 engine.sheet_open_object().map(str::to_string),
@@ -699,6 +714,7 @@ impl DockState {
     pub(crate) fn mobile_drawer_open(&self) -> bool { self.mobile.active && self.mobile.open }
     pub(crate) fn toggle_mobile_drawer(&mut self) { self.mobile.open = !self.mobile.open; }
 
+    #[cfg(target_arch = "wasm32")]
     pub(crate) fn mobile_state_json(&self) -> String {
         let rects: serde_json::Value = serde_json::from_str(&crate::automation::hit_rects::hits_json(self.mobile.hits.iter())).unwrap_or_default();
         serde_json::json!({"compact": self.mobile.active, "open": self.mobile.open, "pane": self.mobile.pane.map(|pane| pane.title()), "rects": rects}).to_string()
@@ -751,6 +767,11 @@ impl DockState {
             .make_active(|_id, tile| matches!(tile, Tile::Pane(k) if *k == kind));
     }
 
+    /// Whether `kind`'s pane is in the tree and not hidden by the workbench.
+    fn pane_shown(&self, kind: PaneKind) -> bool {
+        self.find_pane(kind).is_some_and(|id| self.tree.tiles.is_visible(id))
+    }
+
     /// **The dialog door's dock half.** Bring the host pane's tab forward for
     /// every dynamically generated dialog that opened since the last call.
     ///
@@ -790,9 +811,23 @@ impl DockState {
         if previous.document != current.document {
             return;
         }
+        // An exploded view's step is edited in the Constraints pane where that
+        // pane is shown (Assembly, Wire harness, All) as well as in PMI's
+        // tree, which Assembly shows too. The step opens where the user is
+        // working: PMI stays in front when it already is, and otherwise the
+        // Constraints pane — the exploded view's home — is the host, so adding
+        // or picking a step there never buries its own section under PMI.
+        let pmi_host = if current.pmi_exploded_step
+            && self.pane_shown(PaneKind::AssemblyConstraints)
+            && !self.find_pane(PaneKind::Pmi).is_some_and(|id| self.tree.tiles.is_visible(id) && self.tab_active(id))
+        {
+            PaneKind::AssemblyConstraints
+        } else {
+            PaneKind::Pmi
+        };
         for (current, previous, host) in [
             (&current.feature, &previous.feature, PaneKind::History),
-            (&current.pmi, &previous.pmi, PaneKind::Pmi),
+            (&current.pmi, &previous.pmi, pmi_host),
             (&current.constraint, &previous.constraint, PaneKind::AssemblyConstraints),
             (&current.sheet, &previous.sheet, PaneKind::Sheets),
         ] {

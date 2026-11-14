@@ -5,9 +5,11 @@ use super::schema_dsl::{closed_object_optional, array, nullable};
 pub(super) fn ecad_action() -> Value {
     closed_object_optional(json!({"id":{"type":"string"},"workbench":{"enum":["diagram","pcb","symbol","pads"]}}), &[])
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn plm_follow_now() -> Value {
     closed_object_optional(json!({"requests":{"type":"integer","minimum":0},"moves":{"type":"integer","minimum":0}}), &[])
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn plm_bake_pass() -> Value {
     let text=json!({"type":"string"});
     let mut variants=Vec::new();
@@ -18,11 +20,13 @@ pub(super) fn plm_bake_pass() -> Value {
     }
     closed_object_optional(json!({"jobs":array(json!({"oneOf":variants})),"ms":{"type":"integer","minimum":0}}), &[])
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn kicad_part_add() -> Value {
     let text=json!({"type":"string"});let maybe=nullable(text.clone());
     closed_object_optional(json!({"id":text,"document":text,"summary":text,"symbol":maybe,"footprint":maybe,
         "pads":{"type":"integer","minimum":0},"model":maybe,"notes":array(text)}), &[])
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub(super) fn kicad_library_search() -> Value {
     let text=json!({"type":"string"});let count=json!({"type":"integer","minimum":0});
     let folder=closed_object_optional(json!({"path":text,"from":text,"exists":{"type":"boolean"}}), &[]);

@@ -306,13 +306,6 @@ impl PartialBand {
         (self.sweep * (self.sector_moment() - far), -self.sweep * far)
     }
 
-    /// The thicken's whole volume, `sweep · ∫∫_S |ρ| dA`.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn volume(&self) -> f64 {
-        let (near, far) = self.volumes();
-        near + far
-    }
-
     /// The axis crossing on the ray at meridian angle `phi`, measured from
     /// the tube centre: `s* = −R / cos φ`.
     fn axis_crossing(&self, phi: f64) -> f64 {

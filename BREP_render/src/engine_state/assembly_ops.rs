@@ -1,6 +1,12 @@
 use super::*;
 use serde_json::Value;
 
+/// What an assembly action answers while the main-side session is still on
+/// its way from the background runner (see `EngineState::ensure_assembly_session`):
+/// nothing was changed, and the same action succeeds once the copy lands, a
+/// frame or so later.
+pub const ASSEMBLY_SESSION_PENDING: &str = "the assembly is still updating; try again in a moment";
+
 // Assembly sessions are thread-local. The runner reads its session at the end of
 // every run and ships it (`pipeline::AssemblySync`); the main thread ADOPTS that
 // — the component projection, the solved constraint state, the statuses, the DOF
@@ -287,58 +293,69 @@ impl EngineState {
     }
 
     /// Make sure a main-side kernel assembly SESSION exists for the last applied
-    /// run — the one thing the runner's reply cannot carry.
+    /// run — the one thing the runner's reply cannot carry. Returns whether it
+    /// does; `false` means "not yet": the copy has been asked for and lands on
+    /// a later pump, and the caller answers [`ASSEMBLY_SESSION_PENDING`] (or
+    /// waits a frame) instead of acting on a session that is not there.
     ///
     /// A constraint mutation auto-solves immediately, against the resident
     /// geometry of whichever thread holds it, and the kernel's registry and
-    /// session are both thread-local; so a mutation needs the history executed
-    /// HERE. That is per USER constraint edit — adding, editing, enabling,
+    /// session are both thread-local; so a mutation needs the session HERE.
+    /// That is per USER constraint edit — adding, editing, enabling,
     /// reordering or removing a mate, inferring constraints, or pressing Solve —
     /// not per run, which is the whole difference from the old `sync_assembly`.
     /// Cheap no-op when the session is already current, and for a componentless
     /// document (nothing to solve).
     ///
-    /// The runner's own session comes first: an owned copy of it
-    /// ([`crate::runner::HistoryRunner::session_for_main`]), imported when it is
-    /// the session of the run applied here, and only while no newer run is in
-    /// flight. Otherwise, and on any refusal, the history is replayed here as
-    /// before.
-    pub(crate) fn ensure_assembly_session(&mut self) {
+    /// The runner's own session comes first: a copy asked for earlier
+    /// ([`crate::runner::HistoryRunner::request_session`]) and answered for the
+    /// run applied here, else the native thread's bounded hand-over
+    /// ([`crate::runner::HistoryRunner::session_for_main`]) while no newer run
+    /// is in flight. Only a runner that runs on this thread anyway (the inline
+    /// runner) may REPLAY the history here instead: a background runner's
+    /// document is never rebuilt on the UI thread — that replay ran the whole
+    /// assembly, every part with a stale snapshot included, and froze the page
+    /// (the wasm worker can never hand its session over synchronously).
+    pub(crate) fn ensure_assembly_session(&mut self) -> bool {
         if self.assembly_session_generation == Some(self.applied_generation)
             && self.assembly_session_serial == brep_kernel::assembly_session_serial()
         {
-            return;
+            return true;
         }
         if !self.history_has_assembly() {
-            return;
+            return true;
         }
-        if self.session_transfer && !self.run_pending() {
-            let mut _trace = crate::run_trace::span("assembly_session_import");
-            match self.runner.session_for_main(self.applied_generation) {
-                crate::runner::SessionOnMain::Resident => {
-                    self.session_imports += 1;
-                    self.mark_session_current();
-                    return;
-                }
-                crate::runner::SessionOnMain::Copied(transfer) => {
-                    let retired = brep_kernel::assembly_session_import(transfer);
-                    // Dropping the replaced copy costs milliseconds: not here.
-                    #[cfg(not(target_arch = "wasm32"))]
-                    std::thread::spawn(move || drop(retired));
-                    #[cfg(target_arch = "wasm32")]
-                    drop(retired);
-                    self.session_imports += 1;
-                    self.mark_session_current();
-                    return;
-                }
-                crate::runner::SessionOnMain::Unavailable => {}
+        self.session_wanted = true;
+        if self.session_transfer {
+            self.take_session_copies();
+            if self.session_current() {
+                return true;
             }
+            if !self.run_pending() {
+                let mut _trace = crate::run_trace::span("assembly_session_import");
+                match self.runner.session_for_main(self.applied_generation) {
+                    crate::runner::SessionOnMain::Resident => {
+                        self.session_imports += 1;
+                        self.mark_session_current();
+                        return true;
+                    }
+                    crate::runner::SessionOnMain::Copied(transfer) => {
+                        self.import_session(transfer);
+                        return true;
+                    }
+                    crate::runner::SessionOnMain::Unavailable => {}
+                }
+            }
+        }
+        if !self.runner.session_replay_on_main() {
+            self.ask_for_session();
+            return false;
         }
         self.session_replays += 1;
         let request: brep_kernel::HistoryRequest =
             match serde_json::from_value(self.run_request_value()) {
                 Ok(request) => request,
-                Err(_) => return, // unparseable mid-edit document — retry next frame
+                Err(_) => return false, // unparseable mid-edit document — retry next frame
             };
         let mut _trace = crate::run_trace::span("assembly_session");
         let result = self.execute_plugin_history(&request);
@@ -346,20 +363,98 @@ impl EngineState {
             trace.result(&result);
         }
         self.mark_session_current();
+        true
+    }
+
+    pub(crate) fn session_current(&self) -> bool {
+        self.assembly_session_generation == Some(self.applied_generation)
+            && self.assembly_session_serial == brep_kernel::assembly_session_serial()
+    }
+
+    /// Install a runner's session copy as this thread's session.
+    fn import_session(&mut self, transfer: brep_kernel::SessionTransfer) {
+        let retired = brep_kernel::assembly_session_import(transfer);
+        // Dropping the replaced copy costs milliseconds: not here.
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(move || drop(retired));
+        #[cfg(target_arch = "wasm32")]
+        drop(retired);
+        self.session_imports += 1;
+        self.mark_session_current();
+    }
+
+    /// Ask the runner for a copy of the applied run's session, once per
+    /// generation, and only while no newer run is in flight (that run replaces
+    /// the session; the pump asks again when it lands).
+    fn ask_for_session(&mut self) {
+        if self.run_pending() || self.session_requested == Some(self.applied_generation) {
+            return;
+        }
+        if self.runner.request_session(self.applied_generation) {
+            self.session_requested = Some(self.applied_generation);
+        }
+    }
+
+    /// Pump side: import an answered copy of the applied run's session, drop
+    /// one of an older run, and — once this document has needed its session —
+    /// ask for the copy of each run that lands, once.
+    pub(crate) fn take_session_copies(&mut self) {
+        while let Some((generation, transfer)) = self.runner.poll_session() {
+            if self.session_requested == Some(generation) {
+                self.session_requested = None;
+            }
+            if generation != self.applied_generation {
+                continue; // an older run's copy: superseded
+            }
+            match transfer {
+                Some(transfer) => {
+                    if !self.session_current() {
+                        self.import_session(transfer);
+                    }
+                    self.session_recoveries = 0;
+                }
+                // The runner no longer holds the applied run's session (a
+                // cancel replaced it, or it ran something since): one rerun
+                // installs a fresh one there — a cache hit — and its copy is
+                // asked for as it lands. A second refusal is left standing:
+                // the actions keep answering pending rather than replay here.
+                None if self.session_recoveries == 0 && !self.run_pending() => {
+                    self.session_recoveries += 1;
+                    self.rerun_history();
+                }
+                None => {}
+            }
+        }
+        if self.session_wanted
+            && self.session_prefetched != Some(self.applied_generation)
+            && !self.run_pending()
+            && !self.session_current()
+            && self.history_has_assembly()
+            && !self.runner.session_replay_on_main()
+        {
+            self.session_prefetched = Some(self.applied_generation);
+            self.ask_for_session();
+        }
+    }
+
+    /// How often this document's session came from a main-side REPLAY of its
+    /// history, and how often from the runner (automation readback; a
+    /// background runner must never replay).
+    pub fn assembly_session_counts(&self) -> (u64, u64) {
+        (self.session_replays, self.session_imports)
+    }
+
+    /// Whether the main-side session is in place for the applied run, asking
+    /// the runner for it when it is not (see `Self::ensure_assembly_session`).
+    /// For a caller outside the engine that must read it on a later frame
+    /// rather than act without it (a Work part push, Update components).
+    pub fn assembly_session_ready(&mut self) -> bool {
+        self.ensure_assembly_session()
     }
 
     fn mark_session_current(&mut self) {
         self.assembly_session_generation = Some(self.applied_generation);
         self.assembly_session_serial = brep_kernel::assembly_session_serial();
-    }
-
-    /// Drop the main-side session's currency stamp, so the next
-    /// `Self::ensure_assembly_session` replays this document. The kernel
-    /// session is one per thread, shared by every open document: a caller that
-    /// may have let another document replay (or changed the kernel's parts
-    /// library) since this one's last replay calls this first.
-    pub fn forget_assembly_session(&mut self) {
-        self.assembly_session_generation = None;
     }
 
     /// Re-read the main-side session into [`Self::assembly_sync`] after a
@@ -447,7 +542,9 @@ impl EngineState {
         if constraint_type == "fixed" {
             return Err(brep_kernel::FIXED_IS_NOT_A_CONSTRAINT.to_string());
         }
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return Err(ASSEMBLY_SESSION_PENDING.into());
+        }
         let reply =
             brep_kernel::assembly_add_constraint_impl(constraint_type, params_json)?;
         self.after_constraint_mutation();
@@ -460,7 +557,9 @@ impl EngineState {
 
     /// Replace a constraint's `inputParams` (the dialog commit).
     pub fn assembly_update_constraint(&mut self, id: &str, params_json: &str) -> Result<(), String> {
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return Err(ASSEMBLY_SESSION_PENDING.into());
+        }
         brep_kernel::assembly_update_constraint_impl(id, params_json)?;
         self.after_constraint_mutation();
         Ok(())
@@ -474,7 +573,9 @@ impl EngineState {
         id: &str,
         params_json: &str,
     ) -> Result<(), String> {
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return Err(ASSEMBLY_SESSION_PENDING.into());
+        }
         brep_kernel::assembly_update_constraint_impl(id, params_json)?;
         self.apply_assembly_fold(true);
         Ok(())
@@ -482,7 +583,9 @@ impl EngineState {
 
     /// Delete a constraint.
     pub fn assembly_remove_constraint(&mut self, id: &str) -> Result<(), String> {
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return Err(ASSEMBLY_SESSION_PENDING.into());
+        }
         brep_kernel::assembly_remove_constraint_impl(id)?;
         self.after_constraint_mutation();
         Ok(())
@@ -490,7 +593,9 @@ impl EngineState {
 
     /// Enable/disable a constraint (the row checkbox).
     pub fn assembly_set_constraint_enabled(&mut self, id: &str, enabled: bool) -> Result<(), String> {
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return Err(ASSEMBLY_SESSION_PENDING.into());
+        }
         brep_kernel::assembly_set_constraint_enabled_impl(id, enabled)?;
         self.after_constraint_mutation();
         Ok(())
@@ -508,7 +613,9 @@ impl EngineState {
     /// tree (`panels::assembly_constraints`), which is why every one of those
     /// surfaces opens the dialog without knowing the panel exists.
     pub fn assembly_set_constraint_open(&mut self, id: &str, open: bool) -> Result<(), String> {
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return Err(ASSEMBLY_SESSION_PENDING.into());
+        }
         if open {
             let others: Vec<String> =
                 serde_json::from_str::<Value>(&brep_kernel::assembly_state_json())
@@ -576,7 +683,9 @@ impl EngineState {
 
     /// Reorder a constraint to `index` (drag-reorder).
     pub fn assembly_move_constraint(&mut self, id: &str, index: usize) -> Result<(), String> {
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return Err(ASSEMBLY_SESSION_PENDING.into());
+        }
         brep_kernel::assembly_move_constraint_impl(id, index)?;
         self.after_constraint_mutation();
         Ok(())
@@ -597,7 +706,9 @@ impl EngineState {
     /// creating nothing. `options` is the kernel's `InferOptions` JSON (`{}` for
     /// the defaults; the dialog sends the ticked `types`).
     pub fn assembly_infer_constraints(&mut self, options: &str) -> Value {
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return serde_json::json!({ "error": ASSEMBLY_SESSION_PENDING, "pending": true });
+        }
         serde_json::from_str(&brep_kernel::assembly_infer_constraints_json(options))
             .unwrap_or(Value::Null)
     }
@@ -607,7 +718,9 @@ impl EngineState {
     /// the result into the document and re-runs the display. A scan that found
     /// nothing skips the tail entirely (no checkpoint, no rerun).
     pub fn assembly_apply_inferred_constraints(&mut self, options: &str) -> Value {
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return serde_json::json!({ "error": ASSEMBLY_SESSION_PENDING, "pending": true });
+        }
         let reply: Value =
             serde_json::from_str(&brep_kernel::assembly_apply_inferred_constraints_json(options))
                 .unwrap_or(Value::Null);
@@ -626,7 +739,9 @@ impl EngineState {
     /// ALWAYS re-run the display (that is the point of pressing Solve — it
     /// works with auto-solve disabled).
     pub fn assembly_run_solve(&mut self) -> Result<(), String> {
-        self.ensure_assembly_session();
+        if !self.ensure_assembly_session() {
+            return Err(ASSEMBLY_SESSION_PENDING.into());
+        }
         // Nothing to solve without components — bail BEFORE the kernel solve:
         // an empty assembly solving to a no-op is the correct result. (This
         // bail was once also the only thing between a missing session and a

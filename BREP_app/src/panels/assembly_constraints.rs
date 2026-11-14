@@ -1,7 +1,7 @@
-//! Assembly Constraints panel — the schema-driven constraint collection widget,
-//! driven EXACTLY like the feature history panel: a TREE of constraints, and
-//! activating one replaces the whole panel with that constraint's dialog, drawn
-//! by the SHARED [`crate::form_view`]. The kernel's
+//! Assembly Constraints panel — the schema-driven constraint collection widget
+//!, driven EXACTLY like the feature history panel: a TREE of
+//! constraints, and activating one replaces the whole panel with that
+//! constraint's dialog, drawn by the SHARED [`crate::form_view`]. The kernel's
 //! `constraint_schema_catalogue` supplies the ten schemas and
 //! [`brep_render::features::form_fields_from_schema`] maps each into the shared
 //! form fields; this panel supplies the engine side and owns nothing about

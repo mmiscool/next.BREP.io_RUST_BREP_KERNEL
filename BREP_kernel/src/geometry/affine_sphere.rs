@@ -236,28 +236,12 @@ fn solve4(mut a: [[f64; 4]; 4], mut b: [f64; 4]) -> Option<[f64; 4]> {
 }
 
 impl AffineSphere {
-    /// `c`.
-    pub(crate) fn center(&self) -> Vec3 {
-        self.center
-    }
 
     /// The semi-axis lengths, descending.
     pub(crate) fn semi_axes(&self) -> [f64; 3] {
         self.semi
     }
 
-    /// The principal axes (unit), in the semi-axes' order.
-    pub(crate) fn axes(&self) -> [Vec3; 3] {
-        self.axes
-    }
-
-    /// `M s + c`.
-    pub(crate) fn image(&self, s: Vec3) -> Vec3 {
-        self.center
-            .add(self.columns[0].scale(s.x))
-            .add(self.columns[1].scale(s.y))
-            .add(self.columns[2].scale(s.z))
-    }
 
     /// `M⁻¹ (p − c)`.
     pub(crate) fn preimage(&self, p: Vec3) -> Vec3 {

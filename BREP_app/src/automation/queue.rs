@@ -229,6 +229,33 @@ pub struct AutomationQueue {
     waker: Mutex<Option<Waker>>,
 }
 
+/// Whether a handler's refusal is [`brep_render::engine_state::ASSEMBLY_SESSION_PENDING`].
+fn session_pending(error: &str) -> bool {
+    error.contains(brep_render::engine_state::ASSEMBLY_SESSION_PENDING)
+}
+
+/// How long an assembly action waits for its session copy before it answers
+/// the refusal after all (a runner that never hands one over).
+const SESSION_PENDING_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// [`Outcome::Poll`] that runs `handler` again each frame while it answers
+/// [`session_pending`], and answers with its first other result. Only for a
+/// command bound to no document context (the active tab): a bound one is
+/// answered with the refusal, since its binding is checked once, at dispatch.
+fn retry_while_session_pending(handler: crate::automation::command::AppHandler, args: serde_json::Value) -> Outcome {
+    let start = std::time::Instant::now();
+    Outcome::Poll(Box::new(move |ctx| {
+        let before = refused_counts(&ctx.app.docs);
+        let result = handler(ctx, args.clone());
+        let result = refused_by_lock(&ctx.app.docs, &before, result);
+        match result {
+            Err(error) if session_pending(&error) && start.elapsed() < SESSION_PENDING_LIMIT => None,
+            Ok(Outcome::Poll(_)) => Some(Err("a retried assembly action started polled work".into())),
+            other => Some(other),
+        }
+    }))
+}
+
 impl AutomationQueue {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -576,10 +603,19 @@ impl AutomationQueue {
         };
         let before = refused_counts(&ctx.app.docs);
         let route = bound.as_ref().and_then(|b| b.route).map(|index| ctx.app.docs.route_begin(index));
+        let retry_args = args.clone();
         let result = f(ctx, args);
         if let Some(visible) = route {
             ctx.app.docs.route_end(visible);
         }
+        // An assembly action that found its main-side session still on the
+        // way from the background runner changed nothing: it is run again on
+        // later frames until the copy has landed, rather than answered with
+        // a refusal a script would have to retry itself.
+        let result = match result {
+            Err(error) if bound.is_none() && session_pending(&error) => Ok(retry_while_session_pending(*f, retry_args)),
+            other => other,
+        };
         let result = refused_by_lock(&ctx.app.docs, &before, result);
         let handle = bound.map(|b| b.handle);
         let result = match &handle {

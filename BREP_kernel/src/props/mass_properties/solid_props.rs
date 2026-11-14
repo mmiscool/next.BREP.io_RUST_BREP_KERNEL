@@ -326,9 +326,13 @@ pub(super) fn sliver_bound_certificate(solid: &BrepSolid, bar: f64) -> Option<f6
         return None;
     }
     let token = super::profile::begin("solid_sign_sliver_bound");
+    // `BREP_SIGN_PREFETCH`: a large solid's face terms start on idle threads;
+    // the loop below takes each finished one in place of computing it.
+    let mut prefetched = SignPrefetch::spawn(solid);
     let outcome = super::trimmed::with_straight_corrections_skipped(|| -> Option<(f64, f64, f64, f64, [usize; 3])> {
         let (mut reading, mut magnitude, mut bound, mut scale) = (0.0, 0.0, 0.0, 0.0);
         let mut counts = [0usize; 3]; // exact terms held, bounded, integrated exactly
+        let mut slot = 0usize;
         for shell in &solid.shells {
             let reference = shell_volume_reference(shell).ok()?;
             let (mut volume, mut compensation) = (0.0f64, 0.0f64);
@@ -336,12 +340,20 @@ pub(super) fn sliver_bound_certificate(solid: &BrepSolid, bar: f64) -> Option<f6
                 let local = face_volume_reference(face).unwrap_or(reference);
                 let identity = super::identity::face_contribution_identity(face, local);
                 let offset = local.sub(reference);
+                let ready = prefetched.as_mut().and_then(|prefetched| prefetched.claim(slot));
+                slot += 1;
+                let (ready_bounded, ready_exact) = match ready {
+                    Some((bounded, exact)) => (Some(bounded), exact),
+                    None => (None, None),
+                };
                 let (terms, face_bound, face_scale) = match crate::reading_memo::peek_sign_terms(identity) {
                     Some(terms) => {
                         counts[0] += 1;
                         (terms?, 0.0, 0.0)
                     }
-                    None => match crate::reading_memo::memoized_bounded_sign_terms(identity, || bounded_face_terms(face, local)) {
+                    None => match crate::reading_memo::memoized_bounded_sign_terms(identity, || {
+                        prefetched_or(ready_bounded, || bounded_face_terms(face, local))
+                    }) {
                         Some((terms, per_offset, fixed, rounding)) => {
                             counts[1] += 1;
                             (terms, fixed + per_offset * offset.length(), rounding)
@@ -349,7 +361,7 @@ pub(super) fn sliver_bound_certificate(solid: &BrepSolid, bar: f64) -> Option<f6
                         None => {
                             counts[2] += 1;
                             let terms = crate::reading_memo::memoized_sign_terms(identity, || {
-                                face_volume_terms_about(face, local).ok()
+                                prefetched_or(ready_exact, || face_volume_terms_about(face, local).ok())
                             })?;
                             (terms, 0.0, 0.0)
                         }
@@ -373,6 +385,9 @@ pub(super) fn sliver_bound_certificate(solid: &BrepSolid, bar: f64) -> Option<f6
         Some((reading, magnitude, bound, scale, counts))
     });
     super::profile::end(token);
+    if let Some(prefetched) = prefetched {
+        prefetched.report();
+    }
     let (reading, magnitude, bound, scale, counts) = outcome?;
     // Rounding: the reading adds each correction station to a running total
     // the cells started, and the certificate does not; a face's stations number
@@ -390,6 +405,129 @@ pub(super) fn sliver_bound_certificate(solid: &BrepSolid, bar: f64) -> Option<f6
         );
     }
     certified.then_some(lower)
+}
+
+/// `BREP_SIGN_PREFETCH` (default off; `1` on, `check` compares): the sliver
+/// certificate's face terms for a solid of [`SIGN_PREFETCH_MIN_FACES`] or more
+/// faces are computed on idle pool threads ahead of its face loop
+/// ([`crate::claim_slots`]). Each helper computes exactly what the loop would
+/// on a memo miss — [`bounded_face_terms`], and [`face_volume_terms_about`]
+/// when that declines — under the same straight-chord flag, on a clone of the
+/// face, about the same local reference. The loop is unchanged: it consults
+/// the memos in the same order, and only where it would have computed a term
+/// does it take the helper's instead (or compute it, when the helper has not
+/// finished; it never waits). `check` computes every term on the loop as before
+/// and compares it with the helper's (`mass.sign_prefetch` under
+/// `BREP_PROFILE`). A helper's face-level profile counters are not added to
+/// the loop's `mass.profile` line.
+const SIGN_PREFETCH_MIN_FACES: usize = 64;
+
+fn sign_prefetch_mode() -> crate::env_read::Mode {
+    #[cfg(not(test))]
+    {
+        crate::mode_switch!("BREP_SIGN_PREFETCH", false)
+    }
+}
+
+
+type BoundedTerms = Option<([f64; 4], f64, f64, f64)>;
+type SignReady = (BoundedTerms, Option<Option<[f64; 4]>>);
+
+struct SignJob {
+    face: FaceRecord,
+    local: Vec3,
+}
+
+fn sign_job(job: SignJob) -> SignReady {
+    super::trimmed::with_straight_corrections_skipped(|| {
+        let bounded = bounded_face_terms(&job.face, job.local);
+        let exact = bounded.is_none().then(|| face_volume_terms_about(&job.face, job.local).ok());
+        (bounded, exact)
+    })
+}
+
+#[derive(Clone, Copy, Default)]
+struct SignPrefetchTally {
+    check: bool,
+    hits: usize,
+    compared: usize,
+    disagree: usize,
+}
+
+thread_local! {
+    /// The tally of the certificate loop running on this thread, if prefetched.
+    static SIGN_PREFETCH_TALLY: std::cell::Cell<Option<SignPrefetchTally>> = const { std::cell::Cell::new(None) };
+}
+
+struct SignPrefetch {
+    slots: crate::claim_slots::ClaimSlots<SignJob, SignReady>,
+    previous: Option<SignPrefetchTally>,
+}
+
+impl SignPrefetch {
+    fn spawn(solid: &BrepSolid) -> Option<Self> {
+        let mode = sign_prefetch_mode();
+        let faces: usize = solid.shells.iter().map(|shell| shell.faces.len()).sum();
+        if mode == crate::env_read::Mode::Off || faces < SIGN_PREFETCH_MIN_FACES {
+            return None;
+        }
+        let mut jobs = Vec::with_capacity(faces);
+        for shell in &solid.shells {
+            let reference = shell_volume_reference(shell).ok()?;
+            for face in &shell.faces {
+                let local = face_volume_reference(face).unwrap_or(reference);
+                jobs.push(SignJob { face: face.clone(), local });
+            }
+        }
+        let slots = crate::claim_slots::ClaimSlots::spawn(jobs, sign_job)?;
+        let tally = SignPrefetchTally { check: mode == crate::env_read::Mode::Check, ..Default::default() };
+        let previous = SIGN_PREFETCH_TALLY.with(|cell| cell.replace(Some(tally)));
+        Some(Self { slots, previous })
+    }
+
+    fn claim(&mut self, index: usize) -> Option<SignReady> {
+        self.slots.claim(index)
+    }
+
+    fn report(self) {
+        let tally = SIGN_PREFETCH_TALLY.with(|cell| cell.replace(self.previous)).unwrap_or_default();
+        if crate::profile::profile_enabled() {
+            profile_line!(
+                "mass.sign_prefetch faces={} check={} taken={} claimed={} hits={} compared={} disagree={}",
+                self.slots.len(),
+                u8::from(tally.check),
+                self.slots.taken,
+                self.slots.claimed,
+                tally.hits,
+                tally.compared,
+                tally.disagree
+            );
+        }
+    }
+}
+
+/// A helper's value when the loop holds one for this face, else `compute`;
+/// in check mode always `compute`, compared with the helper's to the bit
+/// (shortest round-trip rendering of every float).
+fn prefetched_or<T: std::fmt::Debug>(ready: Option<T>, compute: impl FnOnce() -> T) -> T {
+    let Some(value) = ready else {
+        return compute();
+    };
+    let check = SIGN_PREFETCH_TALLY.with(|cell| cell.get()).is_some_and(|tally| tally.check);
+    if !check {
+        SIGN_PREFETCH_TALLY.with(|cell| cell.set(cell.get().map(|mut tally| { tally.hits += 1; tally })));
+        return value;
+    }
+    let fresh = compute();
+    let agrees = format!("{fresh:?}") == format!("{value:?}");
+    SIGN_PREFETCH_TALLY.with(|cell| {
+        cell.set(cell.get().map(|mut tally| {
+            tally.compared += 1;
+            tally.disagree += usize::from(!agrees);
+            tally
+        }))
+    });
+    fresh
 }
 
 /// One face's sign terms with the chord corrections bounded, as

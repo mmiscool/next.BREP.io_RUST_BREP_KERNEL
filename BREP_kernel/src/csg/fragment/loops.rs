@@ -131,6 +131,36 @@ pub(super) fn interior_points(
     interior_points_in_polygons(&outer_polygon, &hole_polygons, area, count)
 }
 
+/// [`interior_points`] kept clear of `strays`: closed there-and-back paths
+/// along section pieces that bound no region. Each is read as one more hole
+/// boundary, so the clearance every candidate is ranked by counts the distance
+/// to it, and a point left within a fiftieth of the region's size of one is
+/// dropped: off a tangent contact the two bodies part only quadratically, so a
+/// point a hair off the piece still reads as lying on the other body.
+pub(super) fn interior_points_clear_of(
+    outer: &[crate::CycleUse],
+    holes: &[Vec<crate::CycleUse>],
+    strays: &[Vec<Vec2>],
+    area: f64,
+    count: usize,
+) -> Vec<Vec2> {
+    let polygon = |cycle: &[crate::CycleUse]| {
+        cycle.iter().map(|usage| if usage.forward { usage.piece.a } else { usage.piece.b }).collect::<Vec<_>>()
+    };
+    let outer_polygon = polygon(outer);
+    let mut hole_polygons = holes.iter().map(|hole| polygon(hole)).collect::<Vec<_>>();
+    hole_polygons.extend(strays.iter().cloned());
+    let band = area.abs().sqrt() * 0.02;
+    let clear = |point: &Vec2| {
+        strays.iter().all(|path| (0..path.len()).all(|i| point_segment_distance(*point, path[i], path[(i + 1) % path.len()]) > band))
+    };
+    let picked = interior_points_in_polygons(&outer_polygon, &hole_polygons, area, count);
+    let kept: Vec<Vec2> = picked.iter().copied().filter(clear).collect();
+    // A region so thin about its piece that no candidate clears the band keeps
+    // the best-clearance point it has.
+    if kept.is_empty() { picked.into_iter().take(1).collect() } else { kept }
+}
+
 /// A conservative nearest-segment index. Each leaf still evaluates the
 /// original point/segment expression; boxes only discard edges that cannot
 /// lower the current distance. Padding encloses roundoff in a+t*(b-a).

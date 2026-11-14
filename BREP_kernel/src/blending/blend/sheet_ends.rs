@@ -24,14 +24,13 @@
 //! the ordinary path's refusal.
 
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord};
-use crate::{KernelRefusal, Vec3};
+use crate::Vec3;
 
 /// Whether a sheet's free ends are closed by temporary faces: ON unless
 /// `BREP_SHEET_FREE_END=0` (or `off`), or a test's forced value.
 pub(crate) fn sheet_free_end_on() -> bool {
     switch!("BREP_SHEET_FREE_END", true)
 }
-
 
 /// The name every temporary end face carries, followed by its index.
 const TEMPORARY_FACE: &str = "__sheet_free_end_";

@@ -51,7 +51,7 @@ use crate::{transform_brep, AffineTransform, BrepSolid};
 /// into `SceneMap::apply`, exactly like profiles/frames — the scene's component
 /// set is rebuilt from feature results every history run (a projected view,
 /// never an owning data structure).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ComponentRecord {
     /// The owning ACOMP feature id — also the namespace prefix segment.
     pub id: String,
@@ -95,7 +95,7 @@ pub struct ComponentRecord {
 
 /// How a pattern instance follows its seed: its pose is `delta · seed pose`
 /// (`T · delta · T⁻¹ · seed pose` with `T` the driver's pose, in HOLES mode).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PatternFollow {
     /// The `APAT` feature that emitted it.
     pub pattern_id: String,
@@ -121,7 +121,7 @@ pub struct PatternFollow {
 /// (`ACOMP1:ACOMP2`). `fixed` is this instance's own Fix/Float of an
 /// occurrence (`inputParams.flexibleFixed`): it wins over the child's
 /// grounding, and a fixed occurrence is a grounded body where it stands.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FlexibleSpec {
     pub constraints: Vec<serde_json::Value>,
     pub grounded: std::collections::BTreeSet<String>,
@@ -437,11 +437,11 @@ pub fn update_component_transform(
     Ok(())
 }
 
-/// The feature fence: fail with a clear message when any of `names` resolves to
-/// component-owned geometry. Modeling features that consume solids/faces/edges
-/// call this over their reference names before operating — cross-part feature
-/// linking is out of scope and must be rejected cleanly, never silently
-/// applied.
+/// The feature fence: fail with a clear message when any of
+/// `names` resolves to component-owned geometry. Modeling features that consume
+/// solids/faces/edges call this over their reference names before operating —
+/// cross-part feature linking is out of scope and must be rejected cleanly,
+/// never silently applied.
 pub fn reject_component_references<'a>(
     scene: &SceneMap,
     names: impl IntoIterator<Item = &'a str>,
@@ -503,6 +503,7 @@ pub fn enforce_reference_fence(
             | "PATTERN COMPONENT"
             | "WP"
             | "WAYPOINT"
+            | "WELD"
             | "SP"
             | "SPLINE"
     ) {

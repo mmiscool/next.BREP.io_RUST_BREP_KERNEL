@@ -829,21 +829,7 @@ struct EndChain {
 //  * at the pad's far rail, rolling on the kept mate EXTENDED into the
 //    floor and trimmed by the floor, when that edge is CONCAVE (not built
 //    in this commit; named).
-//
-// Behind `BREP_BLEND_ONE_ENDED_RUNOUT` until its census.
 // ======================================================================
-
-/// `BREP_BLEND_ONE_ENDED_RUNOUT=1` turns the one-ended runout on, `=0` off;
-/// `set_one_ended_runout_for_test` forces it on a test's own thread.  Off,
-/// the public entry refuses the class exactly as before.
-/// Promoted 2026-10-14: the switch-on census held the
-/// battery, the case manifest and hlr_tests; `=0`/`off` is the escape hatch.
-const ONE_ENDED_RUNOUT_DEFAULT: bool = true;
-
-pub(crate) fn one_ended_runout_on() -> bool {
-    switch!(live "BREP_BLEND_ONE_ENDED_RUNOUT", ONE_ENDED_RUNOUT_DEFAULT)
-}
-
 
 /// The refusal class of a one-ended end whose unselected third edge is
 /// CONCAVE and whose pad overshoots it (lane L, 2026-10-15).
@@ -870,19 +856,7 @@ pub(crate) const ONE_ENDED_CONCAVE_THIRD_WHAT: &str = "one_ended_concave_third";
 //    plane (on the unselected edge), the trim curve runs on the floor from
 //    there to the terminus's pad contact (on the pad's floor rail), and the
 //    pad's end arc and the corner of the kept face it bounded are consumed.
-//
-// `BREP_BLEND_CONCAVE_THIRD_RUNOUT=0`/`off` is the escape hatch; promoted
-// 2026-10-15 (the wedge nine-pick at its quadrature).
 // ======================================================================
-
-const CONCAVE_THIRD_RUNOUT_DEFAULT: bool = true;
-
-/// `BREP_BLEND_CONCAVE_THIRD_RUNOUT=1`/`on` builds the concave-third
-/// one-ended end, `=0`/`off` refuses it by name (`ONE_ENDED_CONCAVE_THIRD_WHAT`).
-pub(crate) fn concave_third_runout_on() -> bool {
-    switch!(live "BREP_BLEND_CONCAVE_THIRD_RUNOUT", CONCAVE_THIRD_RUNOUT_DEFAULT)
-}
-
 
 /// What the ring built at a ONE-ENDED end of a spine: the pad's end arc on
 /// the kept mate continuing the spine, the unselected edge continuing that
@@ -945,18 +919,12 @@ fn one_ended_chain(
                     && tangent_away_from(edge, mid_vertex)
                         .is_ok_and(|leaving| leaving.dot(arriving) >= 1.0 - 1e-6)
             });
-            let point = vertex_point(ring, mid_vertex)?;
-            if reverses && concave_third_runout_on() {
+            // The vertex must exist (the refusal below names a missing one).
+            vertex_point(ring, mid_vertex)?;
+            if reverses {
                 return concave_third_chain(ring, spine, spine_vertex, mates, kept, replaced, pad, e1_id, mid_vertex, arriving);
             }
-            return Err(if reverses {
-                refuse(ONE_ENDED_CONCAVE_THIRD_WHAT, format!(
-                    "at ({:.3}, {:.3}, {:.3}) the spine {} runs out with a CONCAVE unselected third edge: the pad's end arc {e1_id} on the kept face climbs past that edge and the kept face's boundary turns back along it, so the stripe must roll on the kept face EXTENDED and be trimmed by the face across the unselected edge — not built here",
-                    point.x, point.y, point.z, spine.id
-                ))
-            } else {
-                refuse("one_ended_chain", format!("the pad's end arc {e1_id} does not continue smoothly past vertex {mid_vertex}"))
-            });
+            return Err(refuse("one_ended_chain", format!("the pad's end arc {e1_id} does not continue smoothly past vertex {mid_vertex}")));
         }
     };
     let e2_faces = faces_of(ring, e2_id);
@@ -1156,9 +1124,6 @@ fn read_end(
     match end_chain(ring, spine, spine_vertex, mates) {
         Ok((chain, kept, replaced)) => Ok((RingEnd::Chain(chain), kept, replaced)),
         Err(chain_error) => {
-            if !one_ended_runout_on() {
-                return Err(chain_error);
-            }
             match one_ended_chain(ring, spine, spine_vertex, mates, radius) {
                 Ok((chain, kept, replaced)) => Ok((RingEnd::One(chain), kept, replaced)),
                 Err(one_error) => match open_end(ring, spine, spine_vertex, mates) {
@@ -1176,13 +1141,9 @@ fn read_end(
 /// exactly two selected edges meet, one convex and one concave, sharing one
 /// face, the third edge unselected.  Reported as a [`MixedCorner`] with one
 /// concave index, which `mixed_convexity_corners` (two or more concave) never
-/// lists, so the runout composition can count the end.  Empty with the
-/// switch off.
+/// lists, so the runout composition can count the end.
 pub(crate) fn one_ended_runout_corners(solid: &BrepSolid, edge_ids: &[u64], radius: f64) -> Vec<MixedCorner> {
     let mut found = Vec::new();
-    if !one_ended_runout_on() {
-        return found;
-    }
     let Ok(mates) = stripe_mates(solid, edge_ids, radius) else {
         return found;
     };
@@ -1464,10 +1425,6 @@ thread_local! {
     static WALL_REPORTS: std::cell::RefCell<Vec<RunoutWallReport>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The reports of the walls the last [`build_runout_walls`] built.
-pub(crate) fn take_runout_reports() -> Vec<RunoutWallReport> {
-    WALL_REPORTS.with(|reports| std::mem::take(&mut *reports.borrow_mut()))
-}
 
 /// One thing a spine's ridge claims on the ring: an EDGE (its ridge edge
 /// kept∩pad, its pad∩pad seam, or the pad's side rail it trims) or its pole
@@ -1686,10 +1643,9 @@ fn build_runout_wall(
         _ => {
             // Row 2: a concave-third end keeps the mate its pad does NOT
             // replace, which need not be the other end's (the wedge's spine
-            // A keeps the roof at its tip, the side at the wall); with the
-            // switch on, each end keeps its own.
-            let mixed_allowed = concave_third_runout_on()
-                && [&end0_ring, &end1_ring].iter().any(|end| matches!(end, RingEnd::One(chain) if chain.floor_rail.is_some()));
+            // A keeps the roof at its tip, the side at the wall); each end
+            // keeps its own.
+            let mixed_allowed = [&end0_ring, &end1_ring].iter().any(|end| matches!(end, RingEnd::One(chain) if chain.floor_rail.is_some()));
             if kept0 != kept1 && !mixed_allowed {
                 return Err(KernelRefusal::unsupported(KernelStage::Classify, "runout_chain", format!(
                     "blend runout: the two ends of spine {spine_id} keep different mates ({kept0} and {kept1})"
@@ -1756,7 +1712,6 @@ fn build_runout_wall(
     }
     struct EndSolve {
         t_a: f64,
-        pad_s_first: bool,
         /// (kept, pad_s) carriers past A: surfaces by face id, signed radii
         /// and the seed at A.
         middle: (u64, u64, [f64; 2], [f64; 4]),
@@ -1792,7 +1747,6 @@ fn build_runout_wall(
             }
             ends.push(EndSolve {
                 t_a: vertex_t,
-                pad_s_first: !kept_is_first,
                 middle: (first.face.id, second.face.id, rho, ball.uv),
                 terminus: Terminus::Open { station },
             });
@@ -2182,7 +2136,6 @@ fn build_runout_wall(
         };
         ends.push(EndSolve {
             t_a,
-            pad_s_first,
             middle: (middle_ids.0, middle_ids.1, middle_rho, middle_seed),
             terminus,
         });
@@ -2623,7 +2576,7 @@ fn build_runout_wall(
     }
     // The switch vertices: the contact at each interior piece boundary.
     let mut switch_off_rail = Vec::new();
-    let mut commit_pieces = |pieces: &[Piece], side_first: bool, result: &mut BrepSolid, take_id: &mut dyn FnMut() -> u64| -> Result<Vec<(u64, u64, u64, NurbsCurve, u64)>, KernelRefusal> {
+    let commit_pieces = |pieces: &[Piece], side_first: bool, result: &mut BrepSolid, take_id: &mut dyn FnMut() -> u64| -> Result<Vec<(u64, u64, u64, NurbsCurve, u64)>, KernelRefusal> {
         // (edge id, start vertex, end vertex, mate pcurve in station order, carrier)
         let row = if side_first { &rows.cr } else { &rows.cs };
         let side = usize::from(!side_first);

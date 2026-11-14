@@ -18,8 +18,8 @@
 //! The only EXACT repair is to replace the face by faces whose planes DO
 //! contain their boundary: the straight-edged polygon is ear-clipped in the
 //! plane's own frame and every triangle gets a plane through its three
-//! vertices. Original edges keep their 3D lines, so the neighbouring faces
-//! share them unchanged; the diagonals are the same implicit straight edges a
+//! vertices. Boundary lines use those same vertex chords, shared with their
+//! neighbouring faces; the diagonals are the same implicit straight edges a
 //! FACETED_BREP uses (`faceted_edge`); and `finish_face` then derives every
 //! pcurve as the exact projection of a line onto its own plane. Faces whose
 //! boundary already lies within the band, faces with holes, and faces with a
@@ -117,7 +117,9 @@ impl<'a> SolidBuilder<'a> {
             let start = self.vertex_point(from);
             let end = self.vertex_point(to);
             // Only a straight edge keeps a triangle through its ends exactly planar.
-            if !edge_is_straight(edge, start, end, band)? {
+            let written_line = switch!("BREP_STEP_LINE_CARRIER", true)
+                && edge.curve.degree == 1 && edge.curve.control_points.len() == 2;
+            if !written_line && !edge_is_straight(edge, start, end, band)? {
                 return Ok(None);
             }
             vertex_ids.push(from);
@@ -156,6 +158,33 @@ impl<'a> SolidBuilder<'a> {
         plan: &SplitPlan,
     ) -> Result<Vec<PendingFace>, String> {
         let specs = &face.bounds[0].0;
+        if switch!("BREP_STEP_LINE_CARRIER", true) {
+            // This repair is defined by the stored boundary vertices. A
+            // written LINE can be straight yet miss those vertices, so its
+            // straightness alone does not put it on the repaired triangles.
+            // Reconcile the shared boundary to the same vertex chords used
+            // by the triangle planes, only after the split has been admitted.
+            for &(edge_id, _) in specs {
+                let edge = self.edge_record(edge_id);
+                if edge.curve.degree != 1 || edge.curve.control_points.len() != 2 {
+                    continue;
+                }
+                let start = self.vertex_point(edge.start_vertex_id);
+                let end = self.vertex_point(edge.end_vertex_id);
+                if edge.curve.evaluate(edge.t0)?.sub(start).length_squared() == 0.0
+                    && edge.curve.evaluate(edge.t1)?.sub(end).length_squared() == 0.0
+                {
+                    continue;
+                }
+                let curve = make_line(start, end)?;
+                let index = self.edge_index[&edge_id];
+                self.edges[index].curve = curve;
+                self.edges[index].t0 = 0.0;
+                self.edges[index].t1 = 1.0;
+                self.reconciled_edges.insert(edge_id);
+                self.capture_stage(edge_id, || "reconciled to planar-split boundary vertices".into());
+            }
+        }
         let count = plan.vertex_ids.len();
         let outward = {
             let Some(AnalyticSurface::Plane { u_dir, v_dir, .. }) = face.surface.analytic() else {

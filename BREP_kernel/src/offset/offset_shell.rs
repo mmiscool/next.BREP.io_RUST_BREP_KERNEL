@@ -12,7 +12,7 @@ use crate::topology::{
     BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord, VertexRecord,
 };
 use crate::{
-    apply_edge_splits, build_imprints, classify_point, offset_face_carrier, DiagnosticSeverity,
+    apply_edge_splits, build_imprints, classify_point, DiagnosticSeverity,
     KernelDiagnostics, KernelOutcome, KernelStage, KernelTolerances, PointClass, Vec2, Vec3,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -111,6 +111,8 @@ mod torus_body;
 mod bore_dimples;
 #[path = "offset_shell/revolved_parallel.rs"]
 mod revolved_parallel;
+#[path = "offset_shell/rim_witness.rs"]
+mod rim_witness;
 
 use carrier_rebuild::*;
 use carriers::*;

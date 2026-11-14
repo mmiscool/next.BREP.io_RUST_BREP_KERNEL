@@ -151,6 +151,42 @@ pub(super) fn chamfer_cross_section_offsets(
     Ok(vec![line(o, p1)?, line(p1, p2)?, line(p2, o)?])
 }
 
+/// Conic blend cross-section: the corner leg on face 1, the conic (blend wall,
+/// index 1), the face-2 leg back to the corner, as `cross_section_profile`
+/// orders them. The contacts stand `radius / tan(θ/2)` from the corner; the
+/// conic's poles are contact, corner, contact with weights
+/// `1, rho / (1 − rho), 1`.
+pub(super) fn conic_cross_section(
+    cross: &EdgeCross,
+    radius: f64,
+    rho: f64,
+) -> Result<Vec<NurbsCurve>, KernelRefusal> {
+    let corner = cross.start;
+    let theta = cross.into_first.dot(cross.into_second).clamp(-1.0, 1.0).acos();
+    if theta <= 1e-6 || theta >= std::f64::consts::PI - 1e-6 {
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "conic_dihedral_degenerate",
+            "fillet_edge_conic: the faces meet too nearly flat or too nearly folded",
+        ));
+    }
+    let setback = radius / (theta * 0.5).tan();
+    let first = corner.add(cross.into_first.scale(setback));
+    let second = corner.add(cross.into_second.scale(setback));
+    let line = |from: Vec3, to: Vec3| make_line(from, to).or_refuse(KernelStage::Fragment, "conic_profile_line");
+    let conic = NurbsCurve::new(
+        2,
+        vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        vec![
+            crate::Vec4::from_point(first, 1.0),
+            crate::Vec4::from_point(corner, rho / (1.0 - rho)),
+            crate::Vec4::from_point(second, 1.0),
+        ],
+    )
+    .or_refuse(KernelStage::Fragment, "conic_profile_curve")?;
+    Ok(vec![line(corner, first)?, conic, line(second, corner)?])
+}
+
 /// Given setback `d1` on face 1 and the angle α between the chamfer face and
 /// face 1, CONSTRUCT the face-2 setback `d2` in the cross-section plane
 /// (§6.11 distance-angle chamfer).  We do not assume a closed form: an

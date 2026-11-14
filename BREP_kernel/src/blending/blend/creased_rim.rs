@@ -37,25 +37,15 @@
 //! rim on a cylinder keeps its tangent across the seam and is untouched; a
 //! rim between two wall faces is not closed.
 
-//! Default ON since lane R's promotion (2026-10-28); `BREP_CREASED_RIM_SPLIT=0`
-//! (or `off`) restores the unsplit body, and `with_creased_rim_split_for_test`
-//! forces either on a test's thread. Each rim piece carries the OPEN sub-curve
+//! Promoted by lane R (2026-10-28). Each rim piece carries the OPEN sub-curve
 //! over its own range: kept on the closed rim's curve, a piece's extension
-//! wrapped round the crease (closed curves wrap in `derivatives_extended`), the
-//! stripe's overshoot followed the far side of lCount_12's 48° corner and
+//! wrapped round the crease (closed curves wrap in `derivatives_extended`),
+//! the stripe's overshoot followed the far side of lCount_12's 48° corner and
 //! folded back over its own wall, and the crease miter refused at its seam fit
 //! (1.08e-4 against 2e-6).
 
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, VertexRecord};
 use crate::{KernelRefusal, KernelStage, NurbsCurve, NurbsSurface, OrRefuse, Vec3, Vec4};
-
-/// Whether the creased-rim canonicalisation runs: ON unless
-/// `BREP_CREASED_RIM_SPLIT=0` (or `off`), or a test's forced value.  Off, the
-/// creased rim refuses at the anchored seam start as it did before the split.
-pub(crate) fn creased_rim_split_on() -> bool {
-    switch!("BREP_CREASED_RIM_SPLIT", true)
-}
-
 
 /// The canonicalised body and selection, and what it takes to fold the
 /// result back onto the caller's selection.

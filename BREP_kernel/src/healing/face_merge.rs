@@ -2153,11 +2153,9 @@ fn merge_cylinder_full_turn(
     // Each use's stations: axial coordinate and angle at nine samples, plus
     // the station of its start and end in traversal order.
     struct Station {
-        axial: f64,
         angle: Option<f64>,
     }
     let station = |point: Vec3| Station {
-        axial: point.sub(support.origin).dot(support.axis),
         angle: cylinder_angle(support, x_reference, y_reference, point),
     };
     let mut axial_range = [f64::INFINITY, f64::NEG_INFINITY];
@@ -2749,20 +2747,129 @@ fn face_is_pinned(face: &FaceRecord, keep_unmerged: &[String]) -> bool {
     }
 }
 
-/// Pairwise merge driver for one shell.
-///
-/// `try_merge_pair` returns `None` for any two faces that share no
-/// non-degenerate edge, so the only candidates are edge-adjacent pairs; they
-/// are kept in a set ordered by the faces' original positions and evaluated
-/// smallest first. Faces stay in their original slots (a merged face keeps
-/// the lower slot, the absorbed face's slot is emptied), so that order never
-/// shifts. A rejected pair is dropped for good: `try_merge_pair` is a pure
-/// function of the two face records and the constant edge map, and a pair is
-/// re-queued only when one of its faces changes. Hence each accepted merge is
-/// the lexicographically first accepting pair over all faces — the same pair
-/// the former full rescan found — and the result is the same face set, in
-/// the same order, reached without re-examining every pair per merge.
+// Pairwise merge driver for one shell.
+//
+// `try_merge_pair` returns `None` for any two faces that share no
+// non-degenerate edge, so the only candidates are edge-adjacent pairs; they
+// are kept in a set ordered by the faces' original positions and evaluated
+// smallest first. Faces stay in their original slots (a merged face keeps
+// the lower slot, the absorbed face's slot is emptied), so that order never
+// shifts. A rejected pair is dropped for good: `try_merge_pair` is a pure
+// function of the two face records and the constant edge map, and a pair is
+// re-queued only when one of its faces changes. Hence each accepted merge is
+// the lexicographically first accepting pair over all faces — the same pair
+// the former full rescan found — and the result is the same face set, in
+// the same order, reached without re-examining every pair per merge.
+thread_local! {
+    /// Pairs [`try_merge_pair`] declined, by [`pair_identity`]: everything the
+    /// pair test reads. A boolean hands the face merge every edge-adjacent
+    /// pair of its result, and all but the pairs it touched are the pairs the
+    /// boolean before it declined (a bore's two half-turn walls reach the
+    /// full-turn lane and stay apart, each time).
+    static DECLINED_PAIRS: std::cell::RefCell<HashSet<[u64; 2]>> = std::cell::RefCell::new(HashSet::default());
+    static DECLINES_SERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `BREP_MERGE_DECLINE_MEMO` (default on, `0` off): a pair whose content was declined
+/// before is declined unread. Off under the reading memo's hatch
+/// (`BREP_READING_MEMO=0`) and the merge's own trace (`BREP_DEBUG_MERGE`).
+/// The most coedges a pair may hold, both faces together, for the decline
+/// memo to read its identity.
+const DECLINE_MEMO_COEDGES: usize = 32;
+
+fn decline_memo_on() -> bool {
+    switch!("BREP_MERGE_DECLINE_MEMO", true)
+        && crate::reading_memo::memo_on()
+        && std::env::var_os("BREP_DEBUG_MERGE").is_none()
+}
+
+/// Drop every memoised decline (`reading_memo::clear`).
+pub(crate) fn clear_decline_memo() {
+    DECLINED_PAIRS.with(|memo| memo.borrow_mut().clear());
+}
+
+/// Declines served from the memo since the thread started.
+pub(crate) fn declines_served() -> usize {
+    DECLINES_SERVED.with(|served| served.get())
+}
+
+/// One face's content as the pair test reads it, ids apart: the carrier and
+/// sense, and per loop each coedge's sense, pcurve and edge (curve, domain,
+/// degenerate flag) in order.
+fn face_merge_content(face: &FaceRecord, edges: &HashMap<u64, &EdgeRecord>) -> [u64; 2] {
+    let mut lane = crate::mass_properties::TwoLane::new();
+    crate::mass_properties::hash_surface(&mut lane, &face.surface);
+    lane.bool(face.same_sense);
+    lane.usize(face.loops.len());
+    for loop_record in &face.loops {
+        lane.usize(loop_record.coedges.len());
+        for coedge in &loop_record.coedges {
+            let edge = edges[&coedge.edge_id];
+            lane.bool(coedge.forward);
+            crate::mass_properties::hash_curve(&mut lane, &coedge.pcurve);
+            crate::mass_properties::hash_curve(&mut lane, &edge.curve);
+            lane.f64(edge.t0);
+            lane.f64(edge.t1);
+            lane.bool(edge.degenerate);
+        }
+    }
+    lane.finish()
+}
+
+/// The identity of one ordered pair for the pair test: the two contents, the
+/// two tolerances, and every coedge, edge and vertex id of the pair replaced
+/// by its rank among the pair's ids of that kind (which uses share an edge or
+/// a vertex, and every order between ids, without the ids themselves, which
+/// an assembly mints anew).
+fn pair_identity(
+    contents: [[u64; 2]; 2],
+    faces: [&FaceRecord; 2],
+    edges: &HashMap<u64, &EdgeRecord>,
+    tolerance: f64,
+    same_carrier_area_tolerance_ratio: f64,
+) -> [u64; 2] {
+    let uses = || faces.into_iter().flat_map(|face| face.loops.iter().flat_map(|loop_record| &loop_record.coedges));
+    let ranked = |mut ids: Vec<u64>| {
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let coedge_ids = ranked(uses().map(|coedge| coedge.id).collect());
+    let edge_ids = ranked(uses().map(|coedge| coedge.edge_id).collect());
+    let vertex_ids = ranked(
+        uses()
+            .flat_map(|coedge| {
+                let edge = edges[&coedge.edge_id];
+                [edge.start_vertex_id, edge.end_vertex_id]
+            })
+            .collect(),
+    );
+    let rank = |ids: &[u64], id: u64| ids.binary_search(&id).unwrap_or(usize::MAX);
+    let mut lane = crate::mass_properties::TwoLane::new();
+    for content in contents {
+        lane.u64(content[0]);
+        lane.u64(content[1]);
+    }
+    lane.f64(tolerance);
+    lane.f64(same_carrier_area_tolerance_ratio);
+    // The two process switches the pair test reads: a decline stored under
+    // one setting is not the reading under the other.
+    lane.bool(shared_trim_certificate_enabled());
+    lane.bool(std::env::var("BREP_FULL_TURN_MERGE").as_deref() == Ok("0"));
+    for coedge in uses() {
+        let edge = edges[&coedge.edge_id];
+        lane.usize(rank(&coedge_ids, coedge.id));
+        lane.usize(rank(&edge_ids, coedge.edge_id));
+        lane.usize(rank(&vertex_ids, edge.start_vertex_id));
+        lane.usize(rank(&vertex_ids, edge.end_vertex_id));
+    }
+    lane.finish()
+}
+
 struct PairMerger<'a> {
+    /// Each slot's [`face_merge_content`], read on first use and dropped when
+    /// a merge rebuilds the slot.
+    contents: Vec<Option<[u64; 2]>>,
     slots: Vec<Option<FaceRecord>>,
     pinned: Vec<bool>,
     edges: &'a HashMap<u64, &'a EdgeRecord>,
@@ -2785,6 +2892,7 @@ impl<'a> PairMerger<'a> {
             .map(|face| face_is_pinned(face, keep_unmerged))
             .collect::<Vec<_>>();
         let mut merger = Self {
+            contents: vec![None; faces.len()],
             slots: faces.into_iter().map(Some).collect(),
             pinned,
             edges,
@@ -2854,6 +2962,22 @@ impl<'a> PairMerger<'a> {
             let (Some(older), Some(newer)) = (&self.slots[lower], &self.slots[higher]) else {
                 continue;
             };
+            // The identity walks every coedge of both faces, so it is read
+            // only for a small pair: a face with a long boundary (a plate
+            // around many holes) meets each neighbour in a pair the test
+            // declines at once, more cheaply than the identity is hashed.
+            let small = [older, newer].iter().map(|face| face.loops.iter().map(|loop_record| loop_record.coedges.len()).sum::<usize>()).sum::<usize>()
+                <= DECLINE_MEMO_COEDGES;
+            let identity = (small && decline_memo_on()).then(|| {
+                let contents = [(lower, older), (higher, newer)]
+                    .map(|(slot, face)| *self.contents[slot].get_or_insert_with(|| face_merge_content(face, self.edges)));
+                pair_identity(contents, [older, newer], self.edges, tolerance, same_carrier_area_tolerance_ratio)
+            });
+            if identity.is_some_and(|identity| DECLINED_PAIRS.with(|memo| memo.borrow().contains(&identity))) {
+                DECLINES_SERVED.with(|served| served.set(served.get() + 1));
+                crate::reading_memo::note(true);
+                continue;
+            }
             let Some(merged) = try_merge_pair(
                 older,
                 newer,
@@ -2862,8 +2986,20 @@ impl<'a> PairMerger<'a> {
                 same_carrier_area_tolerance_ratio,
             )?
             else {
+                if let Some(identity) = identity {
+                    crate::reading_memo::note(false);
+                    DECLINED_PAIRS.with(|memo| {
+                        let mut memo = memo.borrow_mut();
+                        if memo.len() >= crate::reading_memo::capacity() {
+                            memo.clear();
+                        }
+                        memo.insert(identity);
+                    });
+                }
                 continue;
             };
+            self.contents[lower] = None;
+            self.contents[higher] = None;
             self.unindex_slot(higher);
             self.unindex_slot(lower);
             self.slots[higher] = None;
@@ -3398,4 +3534,5 @@ pub(crate) fn merge_same_surface_faces_open(
 ) -> Result<BrepSolid, KernelRefusal> {
     merge_same_surface_faces_impl(solid, tolerance, false, 5e-3, &[], None)
 }
+
 

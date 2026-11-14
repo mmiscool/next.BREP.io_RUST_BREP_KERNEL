@@ -3,6 +3,14 @@
 //! [`scene`] stores named geometry, [`pipeline`] evaluates feature histories,
 //! and [`render`] draws into a host-provided texture view. Cameras, picking,
 //! sketch state, and display settings are shared across presentation targets.
+//!
+//! [`engine_state::EngineState`] is the viewer state every shell wraps (scene,
+//! camera, selection, picking, the editable feature history, sketch mode and
+//! widget overlays); [`runner`] is the submit/poll boundary that runs histories
+//! and mesh imports; [`pick`] resolves screen points to kernel names. The
+//! kernel crate is re-exported as `brep_render::brep_kernel`. On `wasm32` the
+//! `engine` module provides the wasm-bindgen canvas API. See the README for the
+//! layering and the headless and desktop binaries.
 
 // `RenderSettings::to_json` is one `json!` literal over every setting, and
 // `json_internal!` recurses once per key — the default 128 stops short of the

@@ -16,8 +16,9 @@ cargo install BREP_docs
 brep-docs /path/to/brep-source-tree
 ```
 
-With no argument it reads the source tree the binary was built in, which is
-how the BREP build script runs it (`cargo run --release`).
+With no argument it reads the parent of the directory the crate was compiled
+from, which is the source tree when the BREP build script runs it with
+`cargo run --release`; an installed binary needs the tree as its argument.
 
 It reads, relative to the tree:
 

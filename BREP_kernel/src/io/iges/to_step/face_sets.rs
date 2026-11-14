@@ -90,16 +90,24 @@ impl Welder {
     }
 }
 
-/// Read the file's trimmed surfaces into welded, oriented bodies.
-pub(in super::super) fn analyse_face_sets(file: &IgesFile, scale: f64) -> Result<FaceSets, String> {
+/// Every trimmed surface (144, 143) of the file, in directory order.
+pub(in super::super) fn trimmed_surfaces(file: &IgesFile) -> Vec<i64> {
+    let mut pointers: Vec<i64> = file.pointers_of_type(144).iter().map(|(p, _)| *p).collect();
+    pointers.extend(file.pointers_of_type(143).iter().map(|(p, _)| *p));
+    pointers.sort_unstable();
+    pointers
+}
+
+/// Read the trimmed surfaces at `pointers` (in directory order) into welded,
+/// oriented bodies. Only these surfaces weld to one another: a subfigure's
+/// surfaces are read apart from the file's own and from other subfigures',
+/// which are defined in frames of their own and may overlap them.
+pub(in super::super) fn analyse_face_sets(file: &IgesFile, scale: f64, pointers: &[i64]) -> Result<FaceSets, String> {
     let reader = Translator::new(file, scale, false);
     // Surfaces are translated once here only to learn their charts.
     let mut charts = Translator::new(file, scale, false);
     let mut stated = Vec::new();
-    let mut pointers: Vec<i64> = file.pointers_of_type(144).iter().map(|(p, _)| *p).collect();
-    pointers.extend(file.pointers_of_type(143).iter().map(|(p, _)| *p));
-    pointers.sort_unstable();
-    for pointer in pointers {
+    for &pointer in pointers {
         let entity = file.entity(pointer)?;
         let parent = reader.placed(entity, &Transform::IDENTITY)?;
         let (surface, boundaries) = reader
@@ -109,6 +117,50 @@ pub(in super::super) fn analyse_face_sets(file: &IgesFile, scale: f64) -> Result
     }
     let resolution = reader.resolution;
     let mut welder = Welder { tolerance: resolution, cells: HashMap::default(), points: Vec::new() };
+    // Consecutive curves of one boundary meet: that is what a boundary is.
+    // A writer's two statements of that meeting point can stand further apart
+    // than the resolution it states (a full-turn sphere's seam ending 1.7e-4
+    // from where its rim circle starts, under a stated 7e-5), and welded by
+    // position alone they are two vertices and the loop is open. Such a pair
+    // is one vertex, where it is no further apart than two statements of one
+    // curve may be and joining it folds neither curve onto a point.
+    // `BREP_IGES_LOOP_JOIN` (default on; `=0` restores welding by position alone).
+    let join = crate::switch!("BREP_IGES_LOOP_JOIN", true);
+    let mut same: Vec<usize> = Vec::new();
+    fn root(same: &[usize], mut index: usize) -> usize {
+        while same[index] != index {
+            index = same[index];
+        }
+        index
+    }
+    for (_, _, _, _, boundaries) in &stated {
+        for boundary in boundaries {
+            let ends: Vec<(usize, usize)> = boundary
+                .iter()
+                .map(|(curve, reversed)| {
+                    let (a, b) = (welder.weld(curve.start), welder.weld(curve.end));
+                    if *reversed { (b, a) } else { (a, b) }
+                })
+                .collect();
+            same.extend(same.len()..welder.points.len());
+            for index in 0..ends.len() {
+                let next = (index + 1) % ends.len();
+                let (leaves, enters) = (root(&same, ends[index].1), root(&same, ends[next].0));
+                if leaves == enters {
+                    continue;
+                }
+                let gap = welder.points[leaves].sub(welder.points[enters]).length();
+                let folds = |pair: (usize, usize)| {
+                    let (a, b) = (root(&same, pair.0), root(&same, pair.1));
+                    a != b && [a, b].contains(&leaves) && [a, b].contains(&enters)
+                };
+                if join && gap <= SAME_CURVE_RESOLUTIONS * resolution && !folds(ends[index]) && !folds(ends[next]) {
+                    let (keep, drop) = (leaves.min(enters), leaves.max(enters));
+                    same[drop] = keep;
+                }
+            }
+        }
+    }
     let mut edges: Vec<SoupEdge> = Vec::new();
     let mut by_ends: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
     let mut faces: Vec<SoupFace> = Vec::new();
@@ -171,8 +223,8 @@ pub(in super::super) fn analyse_face_sets(file: &IgesFile, scale: f64) -> Result
         for boundary in boundaries {
             let mut coedges = Vec::with_capacity(boundary.len());
             for (curve, reversed) in boundary {
-                let a = welder.weld(curve.start);
-                let b = welder.weld(curve.end);
+                let a = root(&same, welder.weld(curve.start));
+                let b = root(&same, welder.weld(curve.end));
                 let edge = match_edge(&mut edges, &mut by_ends, curve, a, b, resolution);
                 let along = (a == edges[edge.0].start && b == edges[edge.0].end && edge.1) != reversed;
                 edges[edge.0].uses.push((face_index, along));

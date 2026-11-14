@@ -245,28 +245,8 @@ pub(super) fn tetra_signed_volume(positions: &[f64], indices: &[u32], t: usize) 
         / 6.0
 }
 
-/// Final mesh-level orientation pass: make every 2-manifold shared edge
-/// COHERENT (traversed once in each direction) and wind each connected
-/// component to its source shell's material orientation. This repairs both
-/// within-face incoherence (a folded or
-/// trimmed face whose per-vertex analytic normal flips, so the `same_sense`
-/// emission winds half of it inside-out) and whole faces / shells wound inward.
-///
-/// Positions are never modified — only a triangle's 2nd/3rd index may be swapped
-/// and a stored normal's sign flipped — so the mesh stays watertight. Runs in
-/// O(V + T): hashed welding, a triangle flood-fill over shared edges, then each
-/// component oriented by the sign of its centroid-referenced signed volume
-/// (fold-immune; the stored analytic normals are NOT trusted for orientation
-/// because they are exactly what flips), matched to the source shell sign.
-pub(crate) fn orient_mesh_coherently(
-    mesh: &mut Mesh,
-    chord: f64,
-    face_shell_signs: &[i8],
-) -> Result<(), String> {
-    orient_mesh_coherently_with(mesh, chord, face_shell_signs, None)
-}
 
-/// [`orient_mesh_coherently`], given the faces of a ONE-shell solid. Where
+/// `orient_mesh_coherently`, given the faces of a ONE-shell solid. Where
 /// that shell meshes into more than one closed component, each component's
 /// target sign is read from the B-rep volume of its own faces instead of
 /// being taken as outward: a hollow ball thickened from a whole sphere

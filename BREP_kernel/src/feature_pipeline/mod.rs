@@ -63,7 +63,7 @@ pub mod wire_harness;
 pub mod part_pins;
 pub mod pmi;
 pub mod ports;
-pub(crate) use features::import3d::imported_solid_names;
+pub use features::import3d::imported_solid_names;
 pub use assembly::{AssemblyState, ConstraintEntry};
 mod expression;
 #[path = "features/mod.rs"]
@@ -165,6 +165,14 @@ pub struct HistoryRequest {
     /// consumers follow the usual dirty wavefront. Not part of the saved model.
     #[serde(default, rename = "forceRebuild", skip_serializing_if = "Vec::is_empty")]
     pub force_rebuild: Vec<String>,
+    /// One-shot execution directive: a placed part whose snapshot another
+    /// kernel build made is SHOWN from that snapshot instead of rebuilt, and
+    /// listed in [`HistoryResult::stale_parts`] for a later run without this
+    /// directive to rebuild. What an app opening a document asks for, so the
+    /// model appears at once; the default (`false`) rebuilds as always. Not
+    /// part of the saved model.
+    #[serde(default, rename = "deferStaleParts", skip_serializing_if = "std::ops::Not::not")]
+    pub defer_stale_parts: bool,
     /// Stop AFTER executing the feature with this id (the editor's "stop at the
     /// expanded feature"). The features past the stop stay in the request so the
     /// incremental cache RETAINS their entries — expanding/collapsing a panel
@@ -174,8 +182,8 @@ pub struct HistoryRequest {
     /// Stop BEFORE executing the feature with this id.
     #[serde(default, rename = "stopBeforeId")]
     pub stop_before_id: Option<String>,
-    /// The assembly constraint block: `{ constraints, idCounter }`. Absent on
-    /// every non-assembly document (and omitted on re-serialize, so
+    /// The assembly constraint block: `{ constraints, idCounter }`.
+    /// Absent on every non-assembly document (and omitted on re-serialize, so
     /// componentless files persist byte-identically). Solved at the tail of
     /// every run; see `assembly.rs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -198,11 +206,11 @@ pub struct HistoryRequest {
     /// file / seed request with no `displayLod` tessellates exactly as before.
     #[serde(default = "default_display_lod", rename = "displayLod")]
     pub display_lod: f64,
-    /// The parts library block: unique part payloads the ACOMP instance
-    /// features reference by name. Ingested into the kernel-resident library
-    /// at the start of every run (this is how a LOADED document seeds it);
-    /// SAVE serializes `parts_library_json()` back out — never this loaded
-    /// block (see parts_library.rs).
+    /// The parts library block: unique part
+    /// payloads the ACOMP instance features reference by name. Ingested into
+    /// the kernel-resident library at the start of every run (this is how a
+    /// LOADED document seeds it); SAVE serializes `parts_library_json()` back
+    /// out — never this loaded block (see parts_library.rs).
     #[serde(default, rename = "partsLibrary")]
     pub parts_library: parts_library::PartsLibraryMap,
     /// The declared-ports block: the part's connection points as DATA, a
@@ -412,6 +420,10 @@ pub struct FeatureResult {
     /// that segment, instead of after its position in the chain.
     #[serde(skip)]
     pub path_segment_names: Vec<(String, Vec<Option<String>>)>,
+    /// Resolved source seam for a weld, independent of input selection order.
+    /// Internal placement metadata; never changes published path segment names.
+    #[serde(skip)]
+    pub weld_source_seam: Option<String>,
     /// The SCREW AXIS of each curve in a published path chain, parallel to the
     /// matching [`Self::paths`] entry: `Some` for a curve its builder KNOWS is a
     /// helix about that axis (the HELIX feature), `None` for everything else.
@@ -474,6 +486,7 @@ impl FeatureResult {
             axes: Vec::new(),
             paths: Vec::new(),
             path_segment_names: Vec::new(),
+            weld_source_seam: None,
             path_segment_axes: Vec::new(),
             points: Vec::new(),
             ports: Vec::new(),
@@ -586,6 +599,11 @@ pub struct HistoryResult {
     /// names surface.
     #[serde(skip)]
     pub ports: Option<ports::PortsReport>,
+    /// The parts this run showed from a snapshot of another kernel build
+    /// ([`HistoryRequest::defer_stale_parts`]); empty otherwise. INTERNAL
+    /// side-channel like `timings`.
+    #[serde(skip)]
+    pub stale_parts: Vec<String>,
 }
 
 // ===========================================================================
@@ -595,14 +613,14 @@ pub struct HistoryResult {
 // `handle` + `face_id`/`edge_id` are the contract the caller (and edge-selecting
 // fan-out features) read to resolve a selection to a resident topology entity.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct FaceRef {
     pub handle: u32,
     pub face_id: u64,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct EdgeRef {
     pub handle: u32,
     pub edge_id: u64,
@@ -875,7 +893,7 @@ impl PortRecord {
 }
 
 /// The live scene-map. Exact-match resolution only (contract rule 1).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SceneMap {
     pub solids: HashMap<String, u32>,
     pub faces: HashMap<String, FaceRef>,
@@ -1670,6 +1688,7 @@ pub(crate) fn execute_feature_with_later(
         "S3D" | "SKETCH3D" | "3D SKETCH" => features::sketch3d::execute(&ctx),
         // --- Non-solid construction geometry: editor-drawn pass-throughs ---
         "SP" | "SPLINE" => features::spline::execute(&ctx),
+        "WELD" => features::weld::execute(&ctx),
         "WP" | "WAYPOINT" => features::waypoint::execute(&ctx),
         "HX" | "HELIX" => features::helix::execute(&ctx),
         // --- Scoped extensions cannot replace built-ins. ---
@@ -2123,6 +2142,7 @@ pub fn execute_history_observed(
     observe: &mut dyn FnMut(HistoryProgress<'_>) -> bool,
 ) -> HistoryResult {
     let _plugin_scope = extension::enter(&request.plugins);
+    let deferred = parts_library::DeferStaleScope::enter(request.defer_stale_parts);
     // Part snapshots decoded once per run, however many instances place them.
     let _decodes = features::assembly_component::DecodeMemoScope::open();
     let env = Env::build(&request.expressions, &request.configurator)
@@ -2436,7 +2456,12 @@ pub fn execute_history_observed(
     // scene and install the post-solve session the exported assembly ABI
     // serves. Unconditional, so a document without an `assembly` block
     // resets any stale session.
+    let weld_poses = capture_weld_poses(request, &results, &scene);
     assembly::finish_history_run(request, &mut scene, &env);
+    let moved_welds = pose_weld_outputs(request, &mut results, &mut scene, weld_poses);
+    if results.iter().any(|result| result.feature_type == "WELD") {
+        assembly::publish_weld_scene(&scene, &moved_welds);
+    }
     // Wire-harness tail: route the block's connections over the ports and
     // spline segments the run published, and build the bundle solids. Its
     // solids ride an extra result so the display pipeline shows them through
@@ -2464,7 +2489,98 @@ pub fn execute_history_observed(
         wire_harness: harness.report,
         pmi,
         ports: ports.report,
+        stale_parts: deferred.finish(),
     }
+}
+
+type WeldPoses = Vec<(usize, String, crate::AffineTransform)>;
+
+fn capture_weld_poses(request: &HistoryRequest, results: &[FeatureResult], scene: &SceneMap) -> WeldPoses {
+    let mut poses = Vec::new();
+    // Flexible occurrences are expanded by solver preparation, after capture.
+    // Their snapshot-local solved frames describe the geometry already built.
+    let mut owner_poses: HashMap<String, crate::AffineTransform> = HashMap::new();
+    for (id, record) in scene.components.iter().chain(scene.occurrences.iter()) {
+        owner_poses.insert(id.clone(), record.transform);
+        for (path, local) in &record.nested_poses {
+            if let Ok(pose) = component::compose(&record.transform, local) {
+                owner_poses.insert(format!("{id}:{path}"), pose);
+            }
+        }
+    }
+    let mut inherited: HashMap<String, (String, crate::AffineTransform)> = HashMap::new();
+    for (index, result) in results.iter().enumerate() {
+        if result.feature_type != "WELD" || result.error.is_some() { continue; }
+        let Some(feature) = request.features.get(index) else { continue; };
+        let Some(seam) = result.weld_source_seam.clone()
+            .or_else(|| features::common::first_reference_name(feature.input_params.get("seam"))) else { continue; };
+        let owner = inherited.get(&seam).cloned().or_else(|| {
+            owner_poses.iter().filter(|(id, _)| seam.starts_with(&format!("{id}:")))
+                .max_by_key(|(id, _)| id.len()).map(|(id, pose)| (id.clone(), *pose))
+        });
+        if let Some((owner, pose)) = owner {
+            for (name, _) in &result.paths { inherited.insert(name.clone(), (owner.clone(), pose)); }
+            for added in &result.added {
+                for (_, name) in &added.edge_names { inherited.insert(name.clone(), (owner.clone(), pose)); }
+            }
+            poses.push((index, owner, pose));
+        }
+    }
+    poses
+}
+
+fn pose_weld_outputs(request: &HistoryRequest, results: &mut [FeatureResult], scene: &mut SceneMap, weld_poses: WeldPoses) -> Vec<(String, u32)> {
+    // Pose only weld-owned outputs. Never replay unrelated history or observers.
+    let mut moved_welds = Vec::new();
+    for (index, owner, before) in weld_poses {
+        let after = scene.occurrences.get(&owner).or_else(|| scene.components.get(&owner))
+            .map(|record| record.transform).or_else(|| {
+                let (id, path) = owner.split_once(':')?;
+                let record = scene.components.get(id)?;
+                component::compose(&record.transform, record.nested_poses.get(path)?).ok()
+            });
+        let Some(after) = after else { continue; };
+        if before.elements == after.elements { continue; }
+        let delta = before.rigid_inverse().and_then(|inverse| component::compose(&after, &inverse));
+        let result = &mut results[index];
+        let posed = delta.and_then(|delta| features::weld::pose(result, delta));
+        if let Err(error) = posed {
+            result.error = Some(format!("weld placement: {error}"));
+            for (name, _) in &result.points { scene.points.remove(name); }
+            for (name, _) in &result.paths { scene.paths.remove(name); }
+            for (name, _) in &result.frames { scene.frames.remove(name); }
+            result.frames.clear();
+            result.points.clear();
+            result.paths.clear();
+            // Remove failed geometry from the scene, result and its owning cache.
+            let mut removal = FeatureResult::empty(&result.id, "WELD");
+            removal.removed = result.added.iter()
+                .filter(|added| scene.solids.get(&added.name) == Some(&added.handle))
+                .map(|added| added.name.clone()).collect();
+            scene.apply(&removal);
+            if !parts_library::in_isolated_run() {
+                HISTORY_CACHE.with(|cache| { cache.borrow_mut().remove(&result.id); });
+            }
+            for added in result.added.drain(..) { crate::free_registered_solid(added.handle); }
+            continue;
+        }
+        // A consumed bead stays consumed; its cache-owned handle is still posed.
+        let mut published = result.clone();
+        published.added.retain(|added| scene.solids.get(&added.name) == Some(&added.handle));
+        scene.apply(&published);
+        moved_welds.extend(published.added.iter().map(|added| (added.name.clone(), added.handle)));
+        let cacheable = !parts_library::in_isolated_run() && !result.id.is_empty() && !request.features[..index].iter()
+            .any(|feature| extract_id(&feature.input_params) == result.id);
+        if cacheable {
+            HISTORY_CACHE.with(|cache| {
+                if let Some(entry) = cache.borrow_mut().get_mut(&result.id) {
+                    entry.result = result.clone();
+                    entry.posed_externally = true;
+                }
+            });
+        }
+    }
+    moved_welds
 }
 
 // ===========================================================================

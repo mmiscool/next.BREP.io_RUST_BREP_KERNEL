@@ -104,16 +104,13 @@ impl Ray {
         let dd = d1.dot(r);
         let ee = d2.dot(r);
         let denom = aa * cc - bb * bb;
-        let (mut s, mut t) = if denom.abs() < 1e-9 {
-            (0.0, (ee / cc).clamp(0.0, 1.0))
+        let t = if denom.abs() < 1e-9 {
+            (ee / cc).clamp(0.0, 1.0)
         } else {
-            let s = ((bb * ee - cc * dd) / denom).max(0.0);
-            let t = ((aa * ee - bb * dd) / denom).clamp(0.0, 1.0);
-            (s, t)
+            ((aa * ee - bb * dd) / denom).clamp(0.0, 1.0)
         };
         // one refine of s for the clamped t
-        s = ((d1.dot(a.add(d2.scale(t)).sub(self.origin))) / aa).max(0.0);
-        let _ = &mut t;
+        let s = ((d1.dot(a.add(d2.scale(t)).sub(self.origin))) / aa).max(0.0);
         let pr = self.at(s);
         let ps = a.add(d2.scale(t));
         pr.sub(ps).length()

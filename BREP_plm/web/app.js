@@ -1894,6 +1894,63 @@ async function pollJobs() {
 
 function signedCount(job) { return job.steps.filter((s) => s.signed_at).length; }
 
+// A step's field (what its instructions ask to be recorded) as an input of
+// the sign-off form: a tick, a dropdown (boxes when several may be picked),
+// a line or a box of text, a measurement with its unit and limits, a serial.
+// The server reads the values against the same definitions and refuses what
+// is missing or out of limits.
+function jobFieldLimits(field) {
+  const show = (v) => (field.decimals === undefined || field.decimals === null ? String(v) : Number(v).toFixed(field.decimals));
+  const has = (v) => typeof v === 'number';
+  const unit = (field.unit || '').trim();
+  const range = has(field.min) && has(field.max) ? `${show(field.min)}–${show(field.max)}` : has(field.min) ? `min ${show(field.min)}` : has(field.max) ? `max ${show(field.max)}` : '';
+  const nominal = has(field.nominal) ? `${show(field.nominal)}${unit ? ` ${unit}` : ''}` : '';
+  return nominal && range ? `${nominal}, ${range}` : nominal || (range ? `${range}${unit ? ` ${unit}` : ''}` : '');
+}
+function jobFieldInput(field) {
+  const id = escape(field.id);
+  const name = `${escape(field.label || field.id)}${field.required ? ' *' : ''}`;
+  const options = [...new Set((field.options || []).map((o) => String(o).trim()).filter(Boolean))];
+  const hint = field.hint ? ` <span class="attrs-line">${escape(field.hint)}</span>` : '';
+  if (field.kind === 'check') return `<label><input type="checkbox" data-field="${id}" data-kind="check"> ${name}</label>${hint}`;
+  if (field.kind === 'choice' && field.multiple) {
+    return `<fieldset data-field="${id}" data-kind="multiple"><legend>${name} (mark all that apply)</legend>${options.map((o) => `<label><input type="checkbox" value="${escape(o)}"> ${escape(o)}</label>`).join('')}${field.other ? '<label>Other <input data-other autocomplete="off"></label>' : ''}</fieldset>${hint}`;
+  }
+  if (field.kind === 'choice') {
+    return `<label>${name} <select data-field="${id}" data-kind="choice"><option value="">—</option>${options.map((o) => `<option value="${escape(o)}">${escape(o)}</option>`).join('')}</select></label>${field.other ? `<label>Other <input data-other-of="${id}" autocomplete="off"></label>` : ''}${hint}`;
+  }
+  if (field.kind === 'text' && field.lines > 1) return `<label>${name} <textarea data-field="${id}" data-kind="text" rows="${Math.min(20, field.lines)}"></textarea></label>${hint}`;
+  if (field.kind === 'number') {
+    const limits = jobFieldLimits(field);
+    return `<label>${name} <input data-field="${id}" data-kind="number" inputmode="decimal" autocomplete="off"> ${escape((field.unit || '').trim())}${limits ? ` <span class="attrs-line">(${escape(limits)})</span>` : ''}</label>${hint}`;
+  }
+  return `<label>${name} <input data-field="${id}" data-kind="text" autocomplete="off"></label>${hint}`;
+}
+// The values of a step's field inputs, as the sign-off sends them: only the
+// fields that were filled in.
+function jobFieldValues(li) {
+  const out = [];
+  for (const input of li.querySelectorAll('[data-field]')) {
+    const id = input.dataset.field;
+    let value;
+    if (input.dataset.kind === 'check') value = input.checked || undefined;
+    else if (input.dataset.kind === 'multiple') {
+      const picked = [...input.querySelectorAll('input[type=checkbox]:checked')].map((box) => box.value);
+      const other = input.querySelector('[data-other]')?.value.trim();
+      if (other) picked.push(other);
+      value = picked.length ? picked : undefined;
+    } else if (input.dataset.kind === 'choice') {
+      value = li.querySelector(`[data-other-of="${CSS.escape(id)}"]`)?.value.trim() || input.value || undefined;
+    } else value = input.value.trim() || undefined;
+    if (value !== undefined) out.push({ id, value });
+  }
+  return out;
+}
+function jobFieldText(entry) {
+  const value = entry.value === true ? 'yes' : Array.isArray(entry.value) ? entry.value.join('; ') : String(entry.value);
+  return `${value}${entry.unit ? ` ${entry.unit}` : ''}${entry.in_limits === false ? ' (out of limits)' : ''}`;
+}
+
 function paintJobs() {
   const live = [...jobsView.jobs.values()].filter((j) => j.status === 'queued' || j.status === 'in_progress').sort((a, b) => a.position - b.position || a.id.localeCompare(b.id));
   $('jobs-empty').hidden = live.length > 0;
@@ -1911,19 +1968,35 @@ function paintJobs() {
   $('job-title').textContent = `${job.id}${job.serial ? ` · ${job.serial}` : ''}`;
   $('job-meta').textContent = `${job.instructions.part} rev ${job.instructions.revision} for ${job.assembly.part} rev ${job.assembly.revision} · ${job.status.replace('_', ' ')} · ${signedCount(job)} of ${job.steps.length} steps signed`;
   const next = job.steps.findIndex((s) => !s.signed_at);
+  // The queue's poll repaints this list every time any job moves: what is
+  // typed into the current step's sign-off form (serials, fields, the note)
+  // is carried over the repaint when the same step is still the current one.
+  const typedKey = `${job.id}/${job.steps[next]?.step ?? ''}`;
+  const typed = [...$('job-steps').querySelectorAll('li.current .job-sign input, li.current .job-sign select, li.current .job-sign textarea')].map((input) => ({ value: input.value, checked: input.checked }));
+  const typedFor = $('job-steps').dataset.typedKey;
+  $('job-steps').dataset.typedKey = typedKey;
   $('job-steps').innerHTML = job.steps.map((step, i) => {
     const inputs = i === next && canSign() && job.status !== 'cancelled'
       ? step.adds.filter((a) => a.serial_tracked).flatMap((add) => add.occurrences.map((occurrence) => `<label>Serial of ${escape(add.part)} at ${escape(occurrence)} <input data-serial="${escape(occurrence)}" required autocomplete="off"></label>`)).join('')
+        + (step.field_defs || []).map(jobFieldInput).join('')
         + `<label>Note <input data-note autocomplete="off"></label><button type="button" data-sign>Sign step</button>`
       : '';
-    const signed = step.signed_at ? `<span class="attrs-line">Signed ${new Date(step.signed_at * 1000).toLocaleString()}${step.serials.length ? ` · serials ${step.serials.map((s) => escape(s.serial)).join(', ')}` : ''}${step.note ? ` · ${escape(step.note)}` : ''}</span>${me?.can_checkin ? '<button type="button" class="link" data-reopen>Reopen</button>' : ''}` : (step.note ? `<span class="attrs-line">${escape(step.note)}</span>` : '');
+    const signed = step.signed_at ? `<span class="attrs-line">Signed ${new Date(step.signed_at * 1000).toLocaleString()}${step.serials.length ? ` · serials ${step.serials.map((s) => escape(s.serial)).join(', ')}` : ''}${(step.fields || []).map((f) => ` · ${escape(f.label || f.id)}: ${escape(jobFieldText(f))}`).join('')}${step.note ? ` · ${escape(step.note)}` : ''}</span>${me?.can_checkin ? '<button type="button" class="link" data-reopen>Reopen</button>' : ''}` : (step.note ? `<span class="attrs-line">${escape(step.note)}</span>` : '');
     return `<li data-step="${escape(step.step)}" class="${step.signed_at ? 'signed' : i === next ? 'current' : ''}"><strong>${escape(step.title || step.step)}</strong>${signed}${inputs ? `<div class="job-sign">${inputs}</div>` : ''}</li>`;
   }).join('');
+  const inputsNow = [...$('job-steps').querySelectorAll('li.current .job-sign input, li.current .job-sign select, li.current .job-sign textarea')];
+  if (typedFor === typedKey && inputsNow.length === typed.length) {
+    inputsNow.forEach((input, i) => {
+      if (input.type === 'checkbox') input.checked = typed[i].checked;
+      else input.value = typed[i].value;
+    });
+  }
   for (const li of $('job-steps').querySelectorAll('li')) {
     const step = li.dataset.step;
     li.querySelector('[data-sign]')?.addEventListener('click', () => act(async () => {
       const serials = [...li.querySelectorAll('[data-serial]')].map((input) => ({ occurrence: input.dataset.serial, serial: input.value }));
-      await api('POST', `/api/jobs/${encodeURIComponent(job.id)}/steps/${encodeURIComponent(step)}/signoff`, { serials, note: li.querySelector('[data-note]').value });
+      const fields = jobFieldValues(li);
+      await api('POST', `/api/jobs/${encodeURIComponent(job.id)}/steps/${encodeURIComponent(step)}/signoff`, { serials, fields, note: li.querySelector('[data-note]').value });
       jobsView.jobs.set(job.id, await api('GET', `/api/jobs/${encodeURIComponent(job.id)}`));
       paintJobs();
     }));

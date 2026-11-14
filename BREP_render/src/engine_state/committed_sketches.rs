@@ -128,7 +128,7 @@ impl EngineState {
         // The document's OWN declared connection points: not features, so the
         // ports tail published them under their ADDRESS with the same
         // `{id}:PortLine` / `{id}:Base` names a waypoint uses.
-        let mut declare = |address: String, ids: &mut Vec<(String, String, String, Option<String>)>| {
+        let declare = |address: String, ids: &mut Vec<(String, String, String, Option<String>)>| {
             if ids.iter().any(|(id, _, _, _)| *id == address) {
                 return;
             }

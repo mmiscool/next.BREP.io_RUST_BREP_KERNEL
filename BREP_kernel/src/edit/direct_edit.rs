@@ -140,6 +140,8 @@ mod face_move;
 mod face_move_carrier;
 #[path = "direct_edit/face_move_recut.rs"]
 mod face_move_recut;
+#[path = "direct_edit/blend_rebuild.rs"]
+mod blend_rebuild;
 #[path = "direct_edit/face_rotate.rs"]
 mod face_rotate;
 #[path = "direct_edit/face_draft.rs"]
@@ -177,6 +179,8 @@ mod split_band;
 mod conical_cap;
 #[path = "direct_edit/prism_ring.rs"]
 mod prism_ring;
+#[path = "direct_edit/fill_gap.rs"]
+mod fill_gap;
 #[path = "direct_edit/blend_network_heal.rs"]
 mod blend_network_heal;
 
@@ -269,8 +273,8 @@ pub use delete_faces::delete_faces_and_heal;
 pub use refit_faces::{
     refit_faces_as_one, refit_refusal_phrases, RefitCarrier, RefitReport, RefitSurfaceKind,
 };
-pub use face_move::move_faces;
-pub use face_rotate::rotate_faces;
+pub use face_move::{move_faces, move_faces_unchecked};
+pub use face_rotate::{rotate_faces, rotate_faces_unchecked};
 pub(crate) use face_rotate::rotate_faces_rigid;
 // The ROUTING reading: which faces a moved selection would have to open a new
 // hole in, measured before anything is built. Public so the matrix probe can
@@ -279,7 +283,10 @@ pub use face_move_carrier::{route_reading, RouteReading};
 // The RE-CUT road: the same edit performed from the original body and the
 // motion, for a translation whose answer needs the topology to change.
 pub use face_move_recut::{recut_moved_planes, recut_moved_planes_rigid, reblend_lost_fillets};
-pub use face_offset::offset_ruled_face;
+// A face edit beside a variable-radius fillet: the fillet is set aside, the
+// edit runs on the sharp body, and the fillet is re-made under its radius law.
+pub use blend_rebuild::{rebuild_displaced_blends, with_blend_rebuild_decline};
+pub use face_offset::{offset_ruled_face, offset_ruled_face_unchecked};
 pub use face_offset_sphere::offset_sphere_face;
 pub use face_offset_torus::offset_torus_face;
 pub use face_offset_revolution::offset_revolution_face;

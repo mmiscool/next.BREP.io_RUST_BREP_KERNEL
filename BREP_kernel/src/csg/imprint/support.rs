@@ -1023,7 +1023,7 @@ pub(super) fn tangent_hit_endpoint(
     }
     let (along_low, along_high) = (along_low.min(along_high), along_low.max(along_high));
     let (other_low, other_high) = (other_low.min(other_high), other_low.max(other_high));
-    let hit_point = along.evaluate(hit_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+    along.evaluate(hit_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
     // The endpoint's foot on the partner's LIVE trim, or None.
     let foot = |end_parameter: f64| -> Result<Option<(f64, Vec3)>, KernelRefusal> {
         let end_point = along.evaluate(end_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;

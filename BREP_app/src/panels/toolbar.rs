@@ -108,7 +108,8 @@ impl ToolbarPanel {
                     outcome.plugins |= file.plugins;
                     outcome.javascript |= file.javascript;
                     if style == brep_render::style::ToolbarStyle::Ribbon {
-                        self.ribbon.tabs(ui, &mut self.hits);
+                        let commands = self.commands(state, ecad, *info_open);
+                        self.ribbon.tabs(ui, &commands, &mut self.hits);
                     } else {
                         let commands = self.commands(state, ecad, *info_open);
                         let mut last_group = None;

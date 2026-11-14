@@ -11,7 +11,7 @@
 //! too, by the change that drops its last reference, so an upload and a
 //! delete of the same content can never cross.
 //!
-//! # The rules (attachment defaults)
+//! # The rules
 //!
 //! - A PART attachment follows the part, like sourcing: any author may add or
 //!   remove one at any time, released revisions or not.

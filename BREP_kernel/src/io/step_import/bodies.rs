@@ -172,7 +172,7 @@ pub(super) fn build_step_body_captured(
 ///
 /// **How the per-face pairing is trusted.** Every lane of [`build_step_body`]
 /// builds a shell's faces by `zip`-ing straight down the STEP shell's face-ref
-/// list ([`build_shell_faces_in_namespace`] / [`build_solid_from_shell`]), and
+/// list ([`build_shell_faces_in_namespace`] / [`build_solid_from_shell_captured`]), and
 /// every pass that runs afterwards — the pinched-vertex split, the orientation
 /// flips, and the occurrence lane's `transform_brep` — mutates faces IN PLACE.
 /// So face `i` of built shell `s` IS `#face_refs[s][i]`. This function re-walks
@@ -181,6 +181,19 @@ pub(super) fn build_step_body_captured(
 /// the honest answer is no face colours at all rather than colours on the wrong
 /// faces. A body colour is unaffected by the check — it is keyed on the body's
 /// own entity, not on a position.
+/// The entities a style can name a body by: the solid entity, or (for a
+/// surface model) the model container, then the OUTER shell that stands for
+/// the body. Only the outer shell: a BREP_WITH_VOIDS void shell is a cavity,
+/// not the body, and its style is not the body's.
+pub(super) fn body_style_items(resolver: &Resolver, body: StepBody) -> Vec<usize> {
+    let mut items: Vec<usize> = match body {
+        StepBody::SolidBrep(entity_ref) | StepBody::BrepWithVoids(entity_ref) => vec![entity_ref],
+        StepBody::SurfaceModelShell { model_ref, .. } => vec![model_ref],
+    };
+    items.extend(step_body_claimed_shells(resolver, body).as_ref().and_then(|shells| shells.first()).copied());
+    items
+}
+
 pub(super) fn step_body_appearance(
     resolver: &Resolver,
     styles: &StyleTable,
@@ -192,17 +205,7 @@ pub(super) fn step_body_appearance(
         return appearance;
     }
     let shell_refs = step_body_claimed_shells(resolver, body);
-
-    // The body's own colour: the file may style the solid entity, or (for a
-    // surface model) the model container, or the OUTER shell that stands for the
-    // body. Only the outer shell — a BREP_WITH_VOIDS void shell is a cavity, not
-    // the body, and its style is not the body's.
-    let mut body_items: Vec<usize> = match body {
-        StepBody::SolidBrep(entity_ref) | StepBody::BrepWithVoids(entity_ref) => vec![entity_ref],
-        StepBody::SurfaceModelShell { model_ref, .. } => vec![model_ref],
-    };
-    body_items.extend(shell_refs.as_ref().and_then(|shells| shells.first()).copied());
-    appearance.body = body_items
+    appearance.body = body_style_items(resolver, body)
         .into_iter()
         .find_map(|item_ref| styles.color_for(item_ref));
 
@@ -1207,6 +1210,9 @@ pub(super) struct OccurrenceNode {
     pub(super) name: String,
     /// Every product from the root to this node inclusive: the cycle guard.
     ancestors: Vec<usize>,
+    /// The occurrence edges (NAUO or MAPPED_ITEM ids) from the root to this
+    /// node, outermost first.
+    pub(super) path: Vec<usize>,
 }
 
 /// Depth-first walk of the occurrence tree. THE one implementation of tree
@@ -1234,6 +1240,7 @@ pub(super) fn walk_occurrences(
             world: mat4_identity(),
             name: product_name(resolver, pd),
             ancestors: vec![pd],
+            path: Vec::new(),
         })
         .collect();
 
@@ -1257,11 +1264,14 @@ pub(super) fn walk_occurrences(
             let world = mat4_mul(&node.world, &transform);
             let mut ancestors = node.ancestors.clone();
             ancestors.push(edge.child_pd);
+            let mut path = node.path.clone();
+            path.push(edge.edge_id);
             stack.push(OccurrenceNode {
                 pd: edge.child_pd,
                 world,
                 name: format!("{}/{}", node.name, product_name(resolver, edge.child_pd)),
                 ancestors,
+                path,
             });
         }
     }
@@ -1358,9 +1368,14 @@ pub(super) fn resolve_assembly(
     let mut skipped_sheets: HashSet<StepBody> = HashSet::default();
 
     walk_occurrences(resolver, edges, &transforms, |node| {
+        // An instance styled on its own takes that colour over its part's body
+        // colour; the outermost styled occurrence on the path wins, as an
+        // assembly's choice for a sub-assembly overrides the sub-assembly's.
         // Emit this product's own solids (leaf parts carry geometry; a pure
         // assembly node carries none, so this is a no-op there).
         for body in pd_step_bodies(&structure, resolver, node.pd) {
+            let items = body_style_items(resolver, body);
+            let occurrence_color = node.path.iter().find_map(|&edge| styles.occurrence_item_color(edge, &items));
             let base = solid_cache.entry(body).or_insert_with(|| build_part(body));
             let (base_solid, base_appearance, base_refs) = match base {
                 Ok((solid, appearance, refs)) => (solid.clone(), appearance.clone(), refs.clone()),
@@ -1415,7 +1430,11 @@ pub(super) fn resolve_assembly(
                     // `transform_brep` clones and mutates faces IN PLACE, so the
                     // positioned copy keeps the part's shell/face order and the
                     // part's per-face colour list still pairs index-for-index.
-                    result.appearances.push(base_appearance);
+                    let mut appearance = base_appearance;
+                    if occurrence_color.is_some() {
+                        appearance.body = occurrence_color;
+                    }
+                    result.appearances.push(appearance);
                     result.face_refs.push(base_refs);
                 }
                 Err(error) => {

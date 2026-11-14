@@ -756,9 +756,9 @@ pub trait ModelStore {
 }
 
 /// Construct the platform's one persistent store for application state and models.
-/// A native file store rooted at `dir` — the seam an automation host uses to keep
-/// a session's settings, autosave and recovery blob out of the user's own config
-/// directory.
+/// A native file store rooted at `dir` — the seam an automation host uses to
+/// keep a session's settings, autosave and recovery blob out of the user's
+/// own config directory.
 ///
 /// Laid out the way the SHIPPED app lays out its own config directory: models
 /// in `<dir>/models`, reserved application state beside them in `<dir>`. A
@@ -2567,10 +2567,6 @@ pub(crate) mod mirror_store {
             false
         }
 
-        /// See [`ModelStore::refresh_plm_index`].
-        fn refresh_plm_index(&self, keys: &[String], stale: bool) {
-            let _ = (keys, stale);
-        }
 
         /// The index rows of `keys` (store keys, `part/<p>/rev/<r>`), as the
         /// LAZY entries the mirror reconciles on a feed move: `(mirror key,
@@ -2721,9 +2717,7 @@ pub(crate) mod mirror_store {
             self.documents.plm_written_by_us(key)
         }
 
-        fn refresh_plm_index(&self, keys: &[String], stale: bool) {
-            self.documents.refresh_plm_index(keys, stale)
-        }
+
         fn index_rows(&self, keys: &[String]) -> BackendFuture<Vec<IndexRow>> {
             self.documents.index_rows(keys)
         }
@@ -3527,36 +3521,7 @@ pub(crate) mod mirror_store {
             }
         }
 
-        /// Load every `OnDisk` entry in the background, ONE at a time, so a
-        /// catalog of thousands of parts streams in behind the first frame
-        /// instead of in front of it (or all at once in front of the user's own
-        /// saves). A key a `read` already asked for is not asked twice, and a
-        /// key written meanwhile is skipped.
-        pub(crate) fn prefetch(&self) {
-            let keys: Vec<String> = self
-                .entries
-                .borrow()
-                .iter()
-                .filter(|(_, entry)| matches!(entry, Entry::OnDisk { .. }))
-                .map(|(key, _)| key.clone())
-                .collect();
-            if keys.is_empty() {
-                return;
-            }
-            let store = self.clone();
-            spawn(async move {
-                for key in keys {
-                    let wanted = matches!(store.entries.borrow().get(&key), Some(Entry::OnDisk { .. }));
-                    if !wanted || !store.loading.borrow_mut().insert(key.clone()) {
-                        continue;
-                    }
-                    let issued = store.tick();
-                    let outcome = store.backend.get(&key).await;
-                    store.loading.borrow_mut().remove(&key);
-                    store.resolve(&key, outcome, issued);
-                }
-            });
-        }
+
     }
 
     impl MirrorStore {

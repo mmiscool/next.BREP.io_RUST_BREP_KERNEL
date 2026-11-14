@@ -8,17 +8,20 @@
 //!
 //! * **shop** — touch-first: large buttons, the step's parts as a checklist
 //!   (with a serial field per unit of a serial-tracked part), tools, torque,
-//!   callouts and notes, and a Sign off button on a step that needs it once
-//!   every part is ticked;
+//!   callouts and notes, the fields the author asked to be recorded (a box
+//!   to tick, a choice, text, a measurement judged against its limits, a
+//!   serial number), and a Sign off button on a step that needs it once
+//!   every part is ticked and every required field is in;
 //! * **customer** — pictures first: the step's title, its parts by find
 //!   number and quantity, and its callouts; nothing else.
 //!
-//! The ticks, serials and sign-offs are the pane's, for this session: they
+//! The ticks, serials, field values and sign-offs are the pane's, for this session: they
 //! are a build's record, not the document's, so they never dirty it or
 //! enter its undo. The jobs floor queue keeps the record for a real build.
 
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::panels::instructions::PartsDrag;
+use brep_instructions::fields::{self, FieldKind, StepField};
 use brep_instructions::model::{CalloutKind, Instructions, Step};
 use brep_instructions::player::Mode;
 use brep_render::engine_state::{EngineState, PlayTo};
@@ -41,6 +44,12 @@ pub struct InstructionsPlayerPanel {
     checked: BTreeMap<String, BTreeSet<usize>>,
     /// Captured serials: occurrence path → serial.
     serials: BTreeMap<String, String>,
+    /// Recorded field values: step id → field id → the value, as JSON
+    /// (`brep_instructions::fields`: a tick is `true`, a choice its option
+    /// or an array of them, text and a measurement as typed).
+    values: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    /// Single choices showing their Other box: `(step id, field id)`.
+    other_open: BTreeSet<(String, String)>,
     /// Steps signed off.
     signed: BTreeSet<String>,
     error: Option<String>,
@@ -89,11 +98,47 @@ impl InstructionsPlayerPanel {
             "pending": self.request.is_some(),
             "checked": self.checked,
             "serials": self.serials,
+            "fields": self.values,
+            "missing": self.open_reasons(engine),
             "signed": self.signed,
             "error": self.error,
             "notice": self.notice,
         })
         .to_string()
+    }
+
+    /// What still keeps the shown step from being signed off or marked
+    /// done, as the button's hover says it; empty when nothing does, when no
+    /// step is shown, and for a step that is not on the checklist.
+    fn open_reasons(&self, engine: &EngineState) -> Vec<String> {
+        let Some(id) = engine.instructions_shown_step() else { return Vec::new() };
+        let Ok(Some(block)) = engine.instructions() else { return Vec::new() };
+        match block.step(&id) {
+            Some(step) if step.on_checklist() && !self.signed.contains(&step.id) => self.reasons(step),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Why `step` cannot be completed yet: parts not ticked, serials not
+    /// entered, required fields empty, measurements out of limits.
+    fn reasons(&self, step: &Step) -> Vec<String> {
+        let mut reasons: Vec<String> = Vec::new();
+        let ticked = self.checked.get(&step.id).map_or(0, BTreeSet::len);
+        if ticked != step.adds.len() {
+            reasons.push("tick every part".into());
+        }
+        let serials_in = step
+            .adds
+            .iter()
+            .filter(|add| add.serial_tracked)
+            .flat_map(|add| &add.occurrences)
+            .all(|occurrence| self.serials.get(occurrence).is_some_and(|serial| !serial.trim().is_empty()));
+        if !serials_in {
+            reasons.push("enter every serial".into());
+        }
+        let values = self.values.get(&step.id);
+        reasons.extend(fields::missing(&step.fields, |id| values.and_then(|v| v.get(id))));
+        reasons
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, engine: &mut EngineState, client: Option<&std::rc::Rc<crate::plm::client::PlmClient>>) {
@@ -273,26 +318,191 @@ impl InstructionsPlayerPanel {
             let notes = ui.label(&step.notes);
             self.hits.insert("player:notes".into(), notes.rect);
         }
-        if step.signoff.required {
+        if !step.fields.is_empty() {
             ui.add_space(6.0);
+            ui.label(egui::RichText::new("Record").strong());
+            let locked = self.signed.contains(&step.id);
+            for (index, field) in step.fields.iter().enumerate() {
+                ui.add_enabled_ui(!locked, |ui| self.field(ui, &step.id, index, field));
+            }
+        }
+        if step.on_checklist() {
+            ui.add_space(6.0);
+            let done = if step.signoff.required { "✔ Signed off" } else { "✔ Done" };
             if self.signed.contains(&step.id) {
-                let label = ui.label(egui::RichText::new("✔ Signed off").strong());
+                let label = ui.label(egui::RichText::new(done).strong());
                 self.hits.insert("player:signed".into(), label.rect);
             } else {
-                let ticked = self.checked.get(&step.id).map_or(0, BTreeSet::len);
-                let serials_in = step
-                    .adds
-                    .iter()
-                    .filter(|add| add.serial_tracked)
-                    .flat_map(|add| &add.occurrences)
-                    .all(|occurrence| self.serials.get(occurrence).is_some_and(|serial| !serial.trim().is_empty()));
-                let ready = ticked == step.adds.len() && serials_in;
+                // What still keeps the step open, said on the button's hover.
+                let reasons = self.reasons(step);
+                let label = if step.signoff.required { "Sign off step" } else { "Mark step done" };
                 let sign = ui
-                    .add_enabled(ready, egui::Button::new("Sign off step").min_size(egui::vec2(0.0, TOUCH_HEIGHT)))
-                    .on_disabled_hover_text("Tick every part (and enter its serials) first");
+                    .add_enabled(reasons.is_empty(), egui::Button::new(label).min_size(egui::vec2(0.0, TOUCH_HEIGHT)))
+                    .on_disabled_hover_text(format!("First: {}", reasons.join("; ")));
                 self.hits.insert("player:signoff".into(), sign.rect);
+                if !reasons.is_empty() {
+                    let why = ui.weak(format!("First: {}", reasons.join("; ")));
+                    self.hits.insert("player:signoff:why".into(), why.rect);
+                }
                 if sign.clicked() {
                     self.signed.insert(step.id.clone());
+                }
+            }
+        }
+    }
+
+    /// One field of the shown step, as an input: the value goes to
+    /// `self.values` as the JSON `brep_instructions::fields` reads.
+    fn field(&mut self, ui: &mut egui::Ui, step: &str, index: usize, field: &StepField) {
+        use serde_json::Value;
+        let key = format!("player:field:{index}");
+        let stored = self.values.get(step).and_then(|v| v.get(&field.id)).cloned();
+        let text_of = |v: &Option<Value>| v.as_ref().and_then(Value::as_str).unwrap_or("").to_string();
+        let mut set: Option<Option<Value>> = None;
+        let star = if field.required { " *" } else { "" };
+        let name = format!("{}{star}", if field.label.trim().is_empty() { "Field" } else { field.label.trim() });
+        match &field.kind {
+            FieldKind::Check => {
+                let mut on = stored.as_ref().and_then(Value::as_bool).unwrap_or(false);
+                let tick = ui.checkbox(&mut on, egui::RichText::new(&name).size(16.0));
+                self.hits.insert(key.clone(), tick.rect);
+                if tick.changed() {
+                    set = Some(on.then_some(Value::Bool(true)));
+                }
+            }
+            FieldKind::Choice { multiple: true, other, .. } => {
+                ui.label(format!("{name} (any that apply)"));
+                let options = field.options();
+                let picked: Vec<String> = stored.as_ref().and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
+                let mut next: Vec<String> = Vec::new();
+                let mut changed = false;
+                for (k, option) in options.iter().enumerate() {
+                    let mut on = picked.iter().any(|p| p == option);
+                    let tick = ui.checkbox(&mut on, *option);
+                    self.hits.insert(format!("{key}:option:{k}"), tick.rect);
+                    changed |= tick.changed();
+                    if on {
+                        next.push((*option).to_string());
+                    }
+                }
+                if *other {
+                    let mut text = picked.iter().find(|p| !options.contains(&p.as_str())).cloned().unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.label("Other");
+                        let edit = ui.add(egui::TextEdit::singleline(&mut text).min_size(egui::vec2(160.0, 0.0)));
+                        self.hits.insert(format!("{key}:other"), edit.rect);
+                        changed |= edit.changed();
+                    });
+                    if !text.trim().is_empty() {
+                        next.push(text);
+                    }
+                }
+                if changed {
+                    set = Some((!next.is_empty()).then(|| Value::Array(next.into_iter().map(Value::String).collect())));
+                }
+            }
+            FieldKind::Choice { other, .. } => {
+                let options = field.options();
+                let current = text_of(&stored);
+                let slot = (step.to_string(), field.id.clone());
+                let is_other = *other && (self.other_open.contains(&slot) || (!current.is_empty() && !options.contains(&current.as_str())));
+                // The dropdown's entries: nothing, each option, and Other.
+                const NONE: &str = "\u{0}none";
+                const OTHER: &str = "\u{0}other";
+                let ids: Vec<String> = (0..options.len()).map(|k| k.to_string()).collect();
+                let mut choices: Vec<(String, &str, &str)> = vec![(NONE.to_string(), "none", "—")];
+                choices.extend(options.iter().zip(&ids).map(|(option, id)| ((*option).to_string(), id.as_str(), *option)));
+                if *other {
+                    choices.push((OTHER.to_string(), "other", "Other…"));
+                }
+                let mut picked = if is_other { OTHER.to_string() } else if current.is_empty() { NONE.to_string() } else { current.clone() };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(&name);
+                    let mut rects = HashMap::new();
+                    if crate::form::enum_dropdown(ui, &key, &choices, &mut picked, Some(180.0), Some(&mut rects)).0 {
+                        if picked == OTHER {
+                            self.other_open.insert(slot.clone());
+                            set = Some(None);
+                        } else {
+                            self.other_open.remove(&slot);
+                            set = Some((picked != NONE).then(|| Value::String(picked.clone())));
+                        }
+                    }
+                    self.hits.extend(rects);
+                    if is_other && picked == OTHER {
+                        let mut text = if options.contains(&current.as_str()) { String::new() } else { current.clone() };
+                        let edit = ui.add(egui::TextEdit::singleline(&mut text).hint_text("Other").min_size(egui::vec2(160.0, 0.0)));
+                        self.hits.insert(format!("{key}:other"), edit.rect);
+                        if edit.changed() {
+                            set = Some((!text.trim().is_empty()).then_some(Value::String(text)));
+                        }
+                    }
+                });
+            }
+            FieldKind::Text { lines } => {
+                let mut text = text_of(&stored);
+                ui.label(&name);
+                let edit = if *lines > 1 {
+                    ui.add(egui::TextEdit::multiline(&mut text).desired_rows(*lines as usize).desired_width(f32::INFINITY))
+                } else {
+                    ui.add(egui::TextEdit::singleline(&mut text).desired_width(f32::INFINITY))
+                };
+                self.hits.insert(key.clone(), edit.rect);
+                if edit.changed() {
+                    set = Some((!text.is_empty()).then_some(Value::String(text)));
+                }
+            }
+            FieldKind::Serial => {
+                let mut text = text_of(&stored);
+                ui.horizontal(|ui| {
+                    ui.label(&name);
+                    let edit = ui.add(egui::TextEdit::singleline(&mut text).min_size(egui::vec2(160.0, 0.0)));
+                    self.hits.insert(key.clone(), edit.rect);
+                    if edit.changed() {
+                        set = Some((!text.is_empty()).then_some(Value::String(text)));
+                    }
+                });
+            }
+            FieldKind::Number { .. } => {
+                let mut text = text_of(&stored);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(&name);
+                    let edit = ui.add(egui::TextEdit::singleline(&mut text).desired_width(90.0));
+                    self.hits.insert(key.clone(), edit.rect);
+                    if edit.changed() {
+                        set = Some((!text.is_empty()).then_some(Value::String(text.clone())));
+                    }
+                    if !field.unit().is_empty() {
+                        ui.label(field.unit());
+                    }
+                    let limits = field.limits_text();
+                    if !limits.is_empty() {
+                        ui.weak(format!("({limits})"));
+                    }
+                    // Out of limits, or not a number, is said beside the box.
+                    let flag = match fields::evaluate(field, stored.as_ref()) {
+                        Err(_) => Some("not a number"),
+                        Ok(read) if read.in_limits == Some(false) => Some("out of limits"),
+                        Ok(_) => None,
+                    };
+                    if let Some(flag) = flag {
+                        let label = ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {flag}"));
+                        self.hits.insert(format!("{key}:flag"), label.rect);
+                    }
+                });
+            }
+        }
+        if !field.hint.trim().is_empty() {
+            ui.weak(field.hint.trim());
+        }
+        if let Some(value) = set {
+            let values = self.values.entry(step.to_string()).or_default();
+            match value {
+                Some(value) => {
+                    values.insert(field.id.clone(), value);
+                }
+                None => {
+                    values.remove(&field.id);
                 }
             }
         }
@@ -349,6 +559,8 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "instructionsplayer", prefix: "player:torque", meaning: "the step's torque (shop mode)", command: None },
     HitKeyDoc { panel: "instructionsplayer", prefix: "player:callout:", meaning: "a callout of the step, by index", command: None },
     HitKeyDoc { panel: "instructionsplayer", prefix: "player:notes", meaning: "the step's notes (shop mode)", command: None },
-    HitKeyDoc { panel: "instructionsplayer", prefix: "player:signoff", meaning: "sign the step off, once every part is ticked (shop mode)", command: None },
+    HitKeyDoc { panel: "instructionsplayer", prefix: "player:field:", meaning: "a field the step records, by index (shop mode): a tick, a text, serial or measurement box (`<index>:flag` beside a measurement that is out of limits or not a number), a single choice's dropdown (`<index>#none`, `<index>#<option index>`, `<index>#other` while open, and `<index>:other` its Other box), a multiple choice's boxes `<index>:option:<n>` and `<index>:other`; the values are in the pane state's `fields` (step id → field id → value)", command: None },
+    HitKeyDoc { panel: "instructionsplayer", prefix: "player:signoff", meaning: "sign the step off (Mark step done on a step with fields and no sign-off), once every part is ticked, every serial entered, every required field filled and every measurement that must be is inside its limits (shop mode); the line under it says what is still missing", command: None },
+    HitKeyDoc { panel: "instructionsplayer", prefix: "player:signoff:why", meaning: "what still keeps the shown step from being signed off or marked done (shop mode; drawn only while something does)", command: None },
     HitKeyDoc { panel: "instructionsplayer", prefix: "player:signed", meaning: "the step is signed off (shop mode)", command: None },
 ];

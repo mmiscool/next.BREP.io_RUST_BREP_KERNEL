@@ -501,6 +501,32 @@ pub struct EngineState {
     pub(crate) session_transfer: bool,
     pub(crate) session_imports: u64,
     pub(crate) session_replays: u64,
+    /// This document has needed its main-side session: from then on every
+    /// applied run asks a background runner for a copy of the new session up
+    /// front, so the next mate action finds it in place. Sticky — a document
+    /// only viewed never pays for the copy (the watch's is ~21 MB of JSON).
+    pub(crate) session_wanted: bool,
+    /// The generation a session copy was last asked for (not answered yet).
+    pub(crate) session_requested: Option<u64>,
+    /// The generation the pump last asked for a copy up front: once per run
+    /// that lands, never again for the same one (two open assemblies share
+    /// this thread's one session; re-asking whenever it is not ours would make
+    /// them take it from each other on every pump).
+    pub(crate) session_prefetched: Option<u64>,
+    /// Reruns made because the runner no longer held the applied run's
+    /// session (it answered `None`); reset by an import. One is enough: the
+    /// rerun installs a session there (a cache hit), whose copy is asked for.
+    pub(crate) session_recoveries: u32,
+    /// The next run is a document's first on a background runner: it shows
+    /// parts made by another kernel build from their stored snapshots, and a
+    /// second run rebuilds them (`HistoryRequest::defer_stale_parts`).
+    pub(crate) defer_stale_next: bool,
+    /// The parts the last applied run showed from a stale snapshot, being
+    /// rebuilt by the run in flight (empty when none).
+    pub(crate) stale_parts: Vec<String>,
+    /// Set by the run that just applied when it showed stale parts; the pump
+    /// takes it and submits the run that rebuilds them.
+    pub(crate) stale_parts_shown: Option<Vec<String>>,
     /// A component replace whose run has not landed yet (see
     /// `replace_component`), and the last finished replace's report.
     pub(crate) replace_pending: Option<replace_component::PendingReplace>,
@@ -881,6 +907,13 @@ impl Default for EngineState {
             session_transfer: true,
             session_imports: 0,
             session_replays: 0,
+            session_wanted: false,
+            session_requested: None,
+            session_prefetched: None,
+            session_recoveries: 0,
+            defer_stale_next: false,
+            stale_parts: Vec::new(),
+            stale_parts_shown: None,
             replace_pending: None,
             last_replace_report: None,
             consumed_names: std::collections::HashSet::new(),
@@ -950,9 +983,10 @@ pub(crate) fn overlay_wpp_stale(baked: f64, now: f64) -> bool {
 /// constraint flavor of the reference picker, and `document_signature` — the
 /// ONE parts-library `sourceSignature` hash every writer shares.
 mod assembly_ops;
+pub use assembly_ops::ASSEMBLY_SESSION_PENDING;
 mod context_pick;
-/// Assembly-constraint viewport overlays: overlay refresh from the kernel
-/// session, the grabbable distance/angle handle pick + drag preview +
+/// Assembly-constraint viewport overlays: overlay refresh from
+/// the kernel session, the grabbable distance/angle handle pick + drag preview +
 /// `assembly_update_constraint_json` commit, movedSolids re-tessellation, the
 /// drag-path document fold, label feed + element hover, and tests.
 mod assembly_overlay;
@@ -960,9 +994,9 @@ mod assembly_overlay;
 /// the parts share lineage; mark the rest unresolved) — `replace_components`,
 /// the report, repair, and the Save As lineage stamp.
 pub mod replace_component;
-/// BOM export: the `{partName, sourceKey, quantity}` parts list off the
-/// main-side parts library + live component projection, serialized as CSV /
-/// JSON for the file dialog's Export modal.
+/// BOM export: the `{partName, sourceKey,
+/// quantity}` parts list off the main-side parts library + live component
+/// projection, serialized as CSV / JSON for the file dialog's Export modal.
 mod bom;
 /// Mass properties of a part: computed from its geometry and the density the
 /// PART carries (never per occurrence), and the load-time migration of old
@@ -1004,8 +1038,8 @@ pub use expressions::ExpressionPreview;
 /// toggle): arm state, `__brep`-style annotation JSON, overlay publishing,
 /// drag + set-value writeback, `FEATURE_DIM_OVERLAY`, fd_* math helpers, tests.
 mod feature_dims;
-/// The assembly interference check: the bbox-prefiltered pairwise
-/// non-destructive INTERSECT sweep over component instances
+/// The assembly interference check: the bbox-prefiltered
+/// pairwise non-destructive INTERSECT sweep over component instances
 /// (`interference_check`), its report types, and the pure pair planner.
 mod interference;
 mod batch;

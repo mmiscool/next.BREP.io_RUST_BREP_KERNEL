@@ -797,7 +797,30 @@ fn rotated_rim_section(
 /// corner rides its own generatrix down to the fixed flat. A quadric meeting a
 /// quadric, or a sphere, torus, general revolution or free-form neighbour,
 /// refuses by name.
+///
+/// The re-solve only looks at the faces the selection borders, so a rotation
+/// that carries it into a face it does not border (a bore's wall turned until
+/// a mouth walks off its cap and out through a side) closes incidence-clean on
+/// a body that passes through itself. [`crate::accept_sound`] is the floor on
+/// the way out of this entry, as it is for [`crate::move_faces`]: it repairs
+/// where the crossing can be proved and refuses by name where it cannot.
+/// [`rotate_faces_unchecked`] is the re-solve alone, for a caller that runs
+/// its own acceptance on the result.
 pub fn rotate_faces(
+    solid: &BrepSolid,
+    face_ids: &[u64],
+    axis_point: Vec3,
+    axis_direction: Vec3,
+    angle_radians: f64,
+) -> Result<BrepSolid, KernelRefusal> {
+    crate::accept_sound(rotate_faces_unchecked(solid, face_ids, axis_point, axis_direction, angle_radians)?, "rotateFaces")
+}
+
+/// [`rotate_faces`] without its soundness floor: the direct re-solve, returned
+/// as soon as its incidences validate. The result can pass through itself; the
+/// caller owes it an acceptance scan ([`crate::accept_sound`]) before it is
+/// used as a body.
+pub fn rotate_faces_unchecked(
     solid: &BrepSolid,
     face_ids: &[u64],
     axis_point: Vec3,

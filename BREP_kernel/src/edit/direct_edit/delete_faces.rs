@@ -1808,7 +1808,12 @@ pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<Brep
                     }))
                 }
             },
-            None => return Err(refusal),
+            // Last of all, the gap filled back to its bordering planes
+            // (`fill_gap.rs`): a step, a notch through a side, an open slot.
+            None => match super::fill_gap::heal_by_filling_the_gap(solid, face_ids) {
+                Some(healed) => healed,
+                None => return Err(refusal),
+            },
         },
     };
     crate::accept_sound(healed, "deleteFace")

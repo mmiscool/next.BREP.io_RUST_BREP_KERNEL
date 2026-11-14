@@ -331,7 +331,7 @@ impl Engine {
         let line1_distance = self.find_distance_constraint_on_pair(a, b);
         let line2_distance = self.find_distance_constraint_on_pair(c, d);
 
-        let mut avg_distance = f64::NAN;
+        let avg_distance;
         let mut line1_moving = false;
         let mut line2_moving = false;
         match (line1_distance, line2_distance) {

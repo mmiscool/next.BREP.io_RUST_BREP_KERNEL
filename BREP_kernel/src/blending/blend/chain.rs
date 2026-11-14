@@ -36,9 +36,10 @@ pub(crate) fn smooth_chain_members(solid: &BrepSolid, edge_id: u64) -> Result<(V
 }
 
 
+
 /// The declared wall reading, shared with the closed-edge lane's wall verdict.
 pub(in crate::blend) use closed::{
-    centre_path_node, declared_wall_probe, declared_wall_probe_at_why, declared_wall_probe_located, declared_wall_probe_located_why,
+    declared_wall_probe_at_why, declared_wall_probe_located, declared_wall_probe_located_why,
     declared_wall_probe_why, PreparedWall,
 };
 /// The support-piece pcurve fitter, shared with the closed-edge lane.

@@ -12,6 +12,7 @@ pub mod explode;
 pub mod fcf;
 pub mod hide;
 pub mod hole_callout;
+pub mod weld_callout;
 pub mod leader;
 pub mod linear;
 pub mod note;
@@ -45,7 +46,7 @@ pub struct PmiTypeDef {
 }
 
 /// Panel / `+` dropdown order.
-pub const PMI_TYPES: [PmiTypeDef; 12] = [
+pub const PMI_TYPES: [PmiTypeDef; 13] = [
     linear::DEF,
     radial::DEF,
     angle::DEF,
@@ -53,6 +54,7 @@ pub const PMI_TYPES: [PmiTypeDef; 12] = [
     balloon::DEF,
     note::DEF,
     hole_callout::DEF,
+    weld_callout::DEF,
     centerline::DEF,
     datum::DEF,
     fcf::DEF,

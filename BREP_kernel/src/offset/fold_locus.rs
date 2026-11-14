@@ -91,8 +91,6 @@ const DERIVATIVE_STEP: f64 = 1e-6;
 const CORRECTOR_ITERATIONS: usize = 16;
 const PREDICTOR_HALVINGS: usize = 6;
 const MAX_MARCH_STEPS: usize = 20_000;
-/// Points kept when a marched branch is turned into a pcurve.
-const MAX_PCURVE_POINTS: usize = 128;
 
 /// The offset family's own trace switch, the same `BREP_OS_DEBUG` the scan reads.
 fn debug_enabled() -> bool {
@@ -370,47 +368,7 @@ fn interpolate_stations(stations: &[[f64; 2]], closed: bool) -> Result<NurbsCurv
 }
 
 impl FoldCurve {
-    /// The branch as a parameter-space curve, in the `(u, v, 0)` convention
-    /// every pcurve in the kernel uses, plus the residual the fit reports
-    /// against the locus equation itself.
-    ///
-    /// Thinned to [`MAX_PCURVE_POINTS`] stations before interpolation: the
-    /// march's step is set by the fold's own scale and produces far more points
-    /// than a pcurve needs, and an interpolant through thousands of nearly
-    /// collinear stations is numerically worse, not better.  Whatever the
-    /// thinning costs, [`fit_locus_pcurve`] measures and puts back.
-    pub(crate) fn pcurve(
-        &self,
-        surface: &NurbsSurface,
-        displacements: &[f64],
-        level: f64,
-    ) -> Result<(NurbsCurve, f64), KernelRefusal> {
-        fit_locus_pcurve(
-            surface,
-            displacements,
-            level,
-            &self.thinned(),
-            self.closed,
-        )
-    }
 
-    fn thinned(&self) -> Vec<[f64; 2]> {
-        if self.points.len() <= MAX_PCURVE_POINTS {
-            return self.points.clone();
-        }
-        let step = (self.points.len() - 1) as f64 / (MAX_PCURVE_POINTS - 1) as f64;
-        let mut thinned = (0..MAX_PCURVE_POINTS)
-            .map(|index| self.points[((index as f64) * step).round() as usize])
-            .collect::<Vec<_>>();
-        if self.closed {
-            // The closed interpolant wraps on its own; a duplicated last
-            // station would be a zero-length span.
-            if thinned.len() > 1 && thinned[0] == thinned[thinned.len() - 1] {
-                thinned.pop();
-            }
-        }
-        thinned
-    }
 
     /// Whether any station of this branch lies inside `region` — a branch of
     /// the locus can live entirely in the part of the parameter BOX the trim

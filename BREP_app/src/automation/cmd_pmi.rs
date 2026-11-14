@@ -1,4 +1,4 @@
-//! The PMI workbench: annotation VIEWS and the annotations inside them.
+//! PMI: annotation VIEWS and the annotations inside them.
 //!
 //! A PMI view captures a camera, a visibility set and a display style; every
 //! annotation belongs to one. These commands are the operations

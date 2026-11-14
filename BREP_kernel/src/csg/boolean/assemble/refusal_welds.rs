@@ -510,7 +510,7 @@ pub(super) fn split_pinched_vertices_by_fan(
         parent.insert(end, root);
         root
     }
-    let mut union = |parent: &mut HashMap<End, End>, a: End, b: End| {
+    let union = |parent: &mut HashMap<End, End>, a: End, b: End| {
         let (ra, rb) = (find(parent, a), find(parent, b));
         if ra != rb {
             parent.insert(ra.max(rb), ra.min(rb));

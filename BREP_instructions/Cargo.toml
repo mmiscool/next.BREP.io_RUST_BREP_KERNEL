@@ -1,6 +1,6 @@
 [package]
 name = "BREP_instructions"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"

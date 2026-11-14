@@ -92,7 +92,6 @@ const ARCS: [(usize, usize, usize); 3] = [(2, 0, 1), (0, 1, 2), (1, 2, 0)];
 /// Screen-constant handle sizes in world units at the gizmo origin.
 #[derive(Debug, Clone, Copy)]
 struct Sizes {
-    px: f32,
     axis_len: f32,
     shaft_start: f32,
     head_len: f32,
@@ -185,7 +184,6 @@ impl TransformGizmo {
     fn sizes(&self, camera: &GizmoCamera) -> Sizes {
         let px = camera.world_per_pixel(self.origin).max(1e-6);
         Sizes {
-            px,
             axis_len: PX_AXIS_LEN * px,
             shaft_start: PX_SHAFT_START * px,
             head_len: PX_HEAD_LEN * px,

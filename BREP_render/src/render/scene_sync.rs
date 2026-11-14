@@ -10,8 +10,8 @@ impl RenderCore {
     /// reads it, the opaque pass skips such a solid).
     fn face_base_color(solid: &SolidDisplay, settings: &RenderSettings) -> Rgba {
         let mut color = Self::face_base_color_opaque(solid, settings);
-        if let Some(opacity) = solid.opacity {
-            color[3] = opacity.clamp(0.0, 1.0);
+        if solid.opacity.is_some() || solid.model_opacity.is_some() {
+            color[3] = solid.base_opacity();
         }
         color
     }
@@ -58,44 +58,71 @@ impl RenderCore {
         [if settings.flat_shading { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]
     }
 
-    /// Build this solid's PER-FACE style palette, de-duplicated by colour, and
-    /// the per-face index into it.
+    /// The distinct PER-FACE styles of a solid, as `(colour, opacity)` keys in
+    /// first-use order, and each face's index into them.
     ///
-    /// Faces sharing a colour share one uniform buffer, so an imported body
+    /// A face needs a style of its own when it carries its own colour, or
+    /// draws at an opacity other than its solid's (a `transparency` attribute
+    /// on the face). `None` for the colour means the solid's base colour.
+    /// The palette upload and [`Self::restyle`] both read this, so the two
+    /// cannot disagree about which slot is which.
+    fn face_style_keys(solid: &SolidDisplay) -> (Vec<(Option<[f32; 3]>, f32)>, Vec<Option<u32>>) {
+        let base = solid.base_opacity();
+        let mut keys: Vec<(Option<[f32; 3]>, f32)> = Vec::new();
+        let mut per_face: Vec<Option<u32>> = Vec::with_capacity(solid.faces.len());
+        for face in &solid.faces {
+            let opacity = solid.face_opacity(face);
+            if face.color_override.is_none() && opacity == base {
+                per_face.push(None);
+                continue;
+            }
+            let key = (face.color_override, opacity);
+            let slot = match keys.iter().position(|k| *k == key) {
+                Some(slot) => slot,
+                None => {
+                    keys.push(key);
+                    keys.len() - 1
+                }
+            };
+            per_face.push(Some(slot as u32));
+        }
+        (keys, per_face)
+    }
+
+    /// The LINEAR colour one [`Self::face_style_keys`] entry draws in; its
+    /// alpha is the face's opacity (read by the blended pass only).
+    fn face_style_color(solid: &SolidDisplay, settings: &RenderSettings, key: (Option<[f32; 3]>, f32)) -> Rgba {
+        let mut color = match key.0 {
+            Some(rgb) => Self::opaque_linear(rgb),
+            None => Self::face_base_color_opaque(solid, settings),
+        };
+        color[3] = key.1;
+        color
+    }
+
+    /// Build this solid's PER-FACE style palette, de-duplicated by colour and
+    /// opacity, and the per-face index into it.
+    ///
+    /// Faces sharing a style share one uniform buffer, so an imported body
     /// painted in three colours costs three buffers however many faces it has —
-    /// and the draw loop can still coalesce a contiguous run of same-coloured
-    /// faces into one call. A solid with no per-face colours returns an EMPTY
+    /// and the draw loop can still coalesce a contiguous run of same-styled
+    /// faces into one call. A solid with no per-face styles returns an EMPTY
     /// palette, which is what re-arms the whole-mesh fast path.
     fn face_style_palette(
         &self,
         solid: &SolidDisplay,
         settings: &RenderSettings,
     ) -> (Vec<StyleBuf>, Vec<Option<u32>>) {
-        let mut styles: Vec<StyleBuf> = Vec::new();
-        let mut colors: Vec<[f32; 3]> = Vec::new();
-        let mut per_face: Vec<Option<u32>> = Vec::with_capacity(solid.faces.len());
+        let (keys, per_face) = Self::face_style_keys(solid);
         let params = Self::style_params(settings);
-        for face in &solid.faces {
-            let Some(rgb) = face.color_override else {
-                per_face.push(None);
-                continue;
-            };
-            let slot = match colors.iter().position(|c| *c == rgb) {
-                Some(slot) => slot,
-                None => {
-                    let style = StyleBuf::new(
-                        &self.device,
-                        &self.style_layout,
-                        solid.name.as_str(),
-                    );
-                    style.write(&self.queue, Self::opaque_linear(rgb), params);
-                    styles.push(style);
-                    colors.push(rgb);
-                    colors.len() - 1
-                }
-            };
-            per_face.push(Some(slot as u32));
-        }
+        let styles = keys
+            .into_iter()
+            .map(|key| {
+                let style = StyleBuf::new(&self.device, &self.style_layout, solid.name.as_str());
+                style.write(&self.queue, Self::face_style_color(solid, settings, key), params);
+                style
+            })
+            .collect();
         (styles, per_face)
     }
 
@@ -126,9 +153,75 @@ impl RenderCore {
             edges.push(EdgeRange {
                 first_instance,
                 instance_count: segments.len() as u32 - first_instance,
+                style: None,
             });
         }
         (segments, edges)
+    }
+
+    /// The distinct (colour, opacity) looks among a solid's edges, and each
+    /// edge's index into them (`None`: the theme's edge style).
+    fn edge_style_keys(solid: &SolidDisplay) -> (Vec<(Option<[f32; 3]>, f32)>, Vec<Option<u32>>) {
+        let mut keys: Vec<(Option<[f32; 3]>, f32)> = Vec::new();
+        let mut per_edge: Vec<Option<u32>> = Vec::with_capacity(solid.edges.len());
+        for edge in &solid.edges {
+            if !edge.is_styled() {
+                per_edge.push(None);
+                continue;
+            }
+            let key = (edge.color_override, edge.opacity.unwrap_or(1.0).clamp(0.0, 1.0));
+            let slot = match keys.iter().position(|k| *k == key) {
+                Some(slot) => slot,
+                None => {
+                    keys.push(key);
+                    keys.len() - 1
+                }
+            };
+            per_edge.push(Some(slot as u32));
+        }
+        (keys, per_edge)
+    }
+
+    /// Write one per-edge look's four state buffers for these settings.
+    fn write_edge_style(&self, style: &EdgeStyle, settings: &RenderSettings, key: (Option<[f32; 3]>, f32)) {
+        let q = &self.queue;
+        let params = [settings.edge_width_px, EDGE_NUDGE, 0.0, 0.0];
+        let (color, opacity) = key;
+        // Edge colours are written out as they are (`fs_edge`), so the
+        // metadata's sRGB value is used directly, like the theme's.
+        let mut base = match color {
+            Some([r, g, b]) => [r, g, b, 1.0],
+            None => settings.edge_color,
+        };
+        let mut hidden = base;
+        base[3] *= opacity;
+        hidden[3] = settings.hidden_edge_alpha * opacity;
+        style.base.write(q, base, params);
+        style.hidden.write(q, hidden, params);
+        // Picked or hovered: the emphasis colour, at the edge's own opacity so
+        // a transparency drag shows while the edge is selected, but never so
+        // clear that the pick cannot be seen.
+        let emphasis = |mut rgba: Rgba| {
+            rgba[3] *= opacity.max(EMPHASIS_EDGE_MIN_OPACITY);
+            rgba
+        };
+        style.selected.write(q, emphasis(settings.edge_selected_color), params);
+        style.hovered.write(q, emphasis(settings.hover_color), params);
+    }
+
+    /// Build this solid's per-edge style palette and the per-edge index into it.
+    fn edge_style_palette(&self, solid: &SolidDisplay, settings: &RenderSettings) -> (Vec<EdgeStyle>, Vec<Option<u32>>) {
+        let (keys, per_edge) = Self::edge_style_keys(solid);
+        let styles = keys
+            .into_iter()
+            .map(|key| {
+                let buf = || StyleBuf::new(&self.device, &self.style_layout, solid.name.as_str());
+                let style = EdgeStyle { base: buf(), selected: buf(), hovered: buf(), hidden: buf() };
+                self.write_edge_style(&style, settings, key);
+                style
+            })
+            .collect();
+        (styles, per_edge)
     }
 
     /// The point buffer's contents: one instance per vertex.
@@ -212,7 +305,7 @@ impl RenderCore {
         let mut wire_ranges: Vec<(u32, u32)> = Vec::with_capacity(solid.faces.len());
         let mut covered = vec![false; tri_total];
         let mut seen: HashSet<(u32, u32), BuildEdgeHasher> = HashSet::default();
-        let mut emit_triangle = |wire: &mut Vec<u32>,
+        let emit_triangle = |wire: &mut Vec<u32>,
                                  seen: &mut HashSet<(u32, u32), BuildEdgeHasher>,
                                  tri: usize| {
             let idx = [
@@ -258,7 +351,7 @@ impl RenderCore {
                 usage: wgpu::BufferUsages::INDEX,
             });
         let (face_styles, face_style_index) = self.face_style_palette(solid, settings);
-        let faces = solid
+        let faces: Vec<FaceRange> = solid
             .faces
             .iter()
             .zip(&face_style_index)
@@ -269,10 +362,17 @@ impl RenderCore {
                 wire_first,
                 wire_count,
                 style: *style,
+                translucent: solid.face_opacity(face) < 1.0,
             })
             .collect();
+        let base_translucent = solid.base_opacity() < 1.0;
+        let mixed_translucency = faces.iter().any(|face| face.translucent != base_translucent);
 
-        let (segments, edges) = Self::edge_segments(solid);
+        let (segments, mut edges) = Self::edge_segments(solid);
+        let (edge_styles, edge_style_index) = self.edge_style_palette(solid, settings);
+        for (range, style) in edges.iter_mut().zip(edge_style_index) {
+            range.style = style;
+        }
         let occludable_edge_instances = solid
             .edges
             .iter()
@@ -310,6 +410,8 @@ impl RenderCore {
             shape: Self::shape_of(solid),
             vertex_count: vertices.len() as u32,
             face_styles,
+            base_translucent,
+            mixed_translucency,
             vertex_buf,
             index_buf,
             wire_index_buf,
@@ -317,6 +419,7 @@ impl RenderCore {
             faces,
             edge_buf,
             edges,
+            edge_styles,
             edge_instances: segments.len() as u32,
             occludable_edge_instances,
             point_buf,
@@ -422,16 +525,15 @@ impl RenderCore {
         // The per-face palette carries the same shading params, so it restyles
         // with the base or flat shading would stop applying to individually
         // coloured faces.
-        let mut seen: Vec<[f32; 3]> = Vec::new();
-        for face in &solid.faces {
-            let Some(rgb) = face.color_override else { continue };
-            if seen.contains(&rgb) {
-                continue;
-            }
-            if let Some(style) = existing.face_styles.get(seen.len()) {
-                style.write(&self.queue, Self::opaque_linear(rgb), params);
-            }
-            seen.push(rgb);
+        let (keys, _) = Self::face_style_keys(solid);
+        for (style, key) in existing.face_styles.iter().zip(keys) {
+            style.write(&self.queue, Self::face_style_color(solid, settings, key), params);
+        }
+        // The per-edge palette carries the edge width and the theme's edge
+        // and emphasis colours.
+        let (keys, _) = Self::edge_style_keys(solid);
+        for (style, key) in existing.edge_styles.iter().zip(keys) {
+            self.write_edge_style(style, settings, key);
         }
     }
 

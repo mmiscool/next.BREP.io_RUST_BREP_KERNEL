@@ -244,7 +244,20 @@ impl PinnedInfoWindow {
                             *slot = hex;
                         }
                     }
-                    if let Some(value) = self.values.get_mut(key) {
+                    if key == TRANSPARENCY_KEY {
+                        // `transparency` is a SLIDER, not a text box: the
+                        // same hit key as any other value, so a script finds
+                        // it where it finds the rest.
+                        let shown = self.values.get(key).map(String::as_str).unwrap_or("");
+                        let mut percent = transparency_percent(shown);
+                        let slider = ui.add(transparency_slider(&mut percent));
+                        if slider.changed() {
+                            let text = transparency_text(percent);
+                            state.set_metadata_attribute(name, key, &text);
+                            self.values.insert(key.clone(), text);
+                        }
+                        self.hits.insert(format!("{name}:value:{key}"), slider.rect);
+                    } else if let Some(value) = self.values.get_mut(key) {
                         let edit =
                             ui.add(egui::TextEdit::singleline(value).desired_width(140.0));
                         if edit.changed() {
@@ -289,6 +302,25 @@ impl PinnedInfoWindow {
             });
         }
 
+        // The same for transparency: an object with no `transparency`
+        // attribute yet shows the slider at 0 %, and the first drag writes
+        // the attribute. Once set, the slider in the grid above edits it (and
+        // its × there puts the object back to opaque).
+        if !self.values.contains_key(TRANSPARENCY_KEY) {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Transparency");
+                let mut percent = 0.0;
+                let slider = ui.add(transparency_slider(&mut percent));
+                self.hits.insert(format!("{name}:new-transparency"), slider.rect);
+                if slider.changed() && percent > 0.0 {
+                    let text = transparency_text(percent);
+                    state.set_metadata_attribute(name, TRANSPARENCY_KEY, &text);
+                    self.values.insert(TRANSPARENCY_KEY.to_string(), text);
+                }
+            });
+        }
+
         ui.add_space(6.0);
         ui.separator();
         ui.label("Add attribute:");
@@ -321,7 +353,8 @@ impl PinnedInfoWindow {
         ui.add_space(6.0);
         ui.weak(
             "Hint: `density` (g/cm\u{00b3}) overrides the part's density for this body; \
-             `color` (#RRGGBB) drives how it is shaded.",
+             `color` (#RRGGBB) drives how it is shaded; `transparency` (0 opaque to 1 clear) \
+             how see-through it is.",
         );
     }
 }
@@ -329,6 +362,25 @@ impl PinnedInfoWindow {
 /// The metadata attribute the renderer shades from — the kernel's own key, so
 /// the Info window and a STEP import can never disagree about its spelling.
 const COLOR_KEY: &str = brep_render::brep_kernel::COLOR_METADATA_KEY;
+
+/// The metadata attribute the renderer reads an object's transparency from.
+const TRANSPARENCY_KEY: &str = brep_render::metadata::TRANSPARENCY_METADATA_KEY;
+
+/// A stored `transparency` value as the slider's percentage (0 opaque .. 100
+/// clear); 0 for a value the renderer would not read either.
+fn transparency_percent(value: &str) -> f32 {
+    brep_render::metadata::transparency_opacity(value).map_or(0.0, |opacity| ((1.0 - opacity) * 100.0).round())
+}
+
+/// The value the slider stores: the fraction 0..1 to two places (`0.35`).
+fn transparency_text(percent: f32) -> String {
+    format!("{:.2}", (percent.clamp(0.0, 100.0) / 100.0))
+}
+
+/// The transparency slider: whole percent, 0 (opaque) to 100 (clear).
+fn transparency_slider(percent: &mut f32) -> egui::Slider<'_> {
+    egui::Slider::new(percent, 0.0..=100.0).step_by(1.0).fixed_decimals(0).suffix(" %")
+}
 
 fn hex_color(value: &str) -> Option<egui::Color32> {
     crate::color::parse_hex_color(value.trim())
@@ -603,7 +655,8 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "infowindows", prefix: ":tab:", meaning: "a window's tab ({name}:tab:info for mass properties and topology, {name}:tab:metadata for the key/value editor)", command: None },
     HitKeyDoc { panel: "infowindows", prefix: ":new:", meaning: "add a metadata key/value ({name}:new:key, :new:value, :new:add)", command: Some("metadata_set") },
     HitKeyDoc { panel: "infowindows", prefix: ":new-color:", meaning: "pick or set a colour ({name}:new-color:pick, :set)", command: Some("metadata_set") },
-    HitKeyDoc { panel: "infowindows", prefix: ":value:", meaning: "edit a metadata value ({name}:value:key)", command: Some("metadata_set") },
+    HitKeyDoc { panel: "infowindows", prefix: ":new-transparency", meaning: "the transparency slider of an object with no `transparency` attribute yet ({name}:new-transparency; once set it is {name}:value:transparency)", command: Some("metadata_set") },
+    HitKeyDoc { panel: "infowindows", prefix: ":value:", meaning: "edit a metadata value ({name}:value:key; `transparency` is a slider)", command: Some("metadata_set") },
     HitKeyDoc { panel: "infowindows", prefix: ":remove:", meaning: "remove a metadata key ({name}:remove:key)", command: Some("metadata_remove") },
     HitKeyDoc { panel: "infowindows", prefix: ":swatch:", meaning: "a colour swatch ({name}:swatch:key)", command: None },
 ];

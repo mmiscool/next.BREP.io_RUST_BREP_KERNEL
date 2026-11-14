@@ -53,12 +53,12 @@ scoped by part (for example, `CPART000000001` / `A`). Documents are stored
 under `models/<part-number>/<revision-label>.json`, with unsafe filename
 characters percent-encoded.
 
-This development version requires a fresh data directory when upgrading from
-opaque model IDs. Stop the old server, reset its data directory and CAD caches,
-then start this version with schema 6. Existing model data is not migrated.
-This greenfield schema requires a fresh data directory. Earlier data is not
-imported or upgraded: change orders (no longer a feature; use review rounds or
-workflows), workflow purpose fields and file-store imports are not carried over.
+The database schema is version 6, and a data directory must match it exactly:
+there is no upgrade path. Versions that used opaque model IDs need a fresh data
+directory: stop the old server, reset its data directory and CAD caches, then
+start this version. Earlier data is not imported or upgraded; change orders (no
+longer a feature; use review rounds or workflows), workflow purpose fields and
+file-store imports are not carried over.
 
 ## What it does
 
@@ -83,7 +83,7 @@ workflows), workflow purpose fields and file-store imports are not carried over.
   through **Occurrence fields**. Part values belong to the part revision;
   occurrence values belong to the owning assembly revision and stable CAD
   feature ID. Both the PLM BOM and CAD BOM edit the same stored values.
-- **BOM column configurations.** The separate **BOM columns** page manages
+- **BOM column configurations.** The separate **BOM column configurations** page manages
   named shared and personal configurations, with available and configured
   fields in two lists. Add/remove multiple fields and move selected columns
   up or down while preserving their order. The CAD chooser uses the same
@@ -100,10 +100,18 @@ workflows), workflow purpose fields and file-store imports are not carried over.
 - **Attachments and workspaces.** Files on parts and versioned per-user
   workspaces, with upload limits.
 - **Administrator scripts.** JavaScript hooks (part number, revision label,
-  before and after release, review events) evaluated by
+  before and after release, proposing reviewers, review events) evaluated by
   [`BREP_script_core`](https://crates.io/crates/BREP_script_core), with an
   in-browser editor and a test run. A directory of scripts can live in git.
 - **An audit log** of every committed change, written in the same transaction.
+- **Jobs.** Serialized shop-floor builds of released manufacturing
+  instructions, signed off step by step, with recorded serial numbers and
+  field values.
+- **Tools library.** The hand tools, drivers and fixtures manufacturing
+  instruction steps name, each with a picture and a spec; tools are retired,
+  never deleted.
+- **Native file import.** **Import native files** adopts existing BREP
+  `.nbrep` documents, including assemblies, as numbered parts.
 - **WebMCP.** The page registers its API as tools on the browser's
   [WebMCP](https://webmachinelearning.github.io/webmcp/) surface
   (`document.modelContext`), so an agent built into the browser can search
@@ -180,6 +188,14 @@ async fn main() -> std::io::Result<()> {
 This needs `tokio` (with `macros` and `rt-multi-thread`) and `axum` 0.7 beside
 `BREP_plm` in your own manifest.
 
+## Feature flags
+
+- `native-rusty-alloc` (default) — enables
+  [`BREP_kernel`](https://crates.io/crates/BREP_kernel)'s feature of the same
+  name, which installs the `rusty_alloc` global allocator on native builds.
+  Turn it off (`default-features = false`) when embedding the server in a
+  program that already has a global allocator.
+
 ## Licence
 
 The Autodrop3d licence in `LICENSE.md`, shipped in the crate (`license-file`
@@ -190,9 +206,9 @@ Administrators can use **Administration → Setup wizard** to configure numberin
 catalog taxonomy, accounts and lifecycle labels, with optional KiCad symbols, linked footprints and STEP models in KiCad’s
 library taxonomy, plus mechanical family imports. **Workflows** provides a visual process editor,
 parallel reviews, smart forms with field permissions, JavaScript automation,
-lifecycle steps, an inbox and durable execution history. See the
-[operator guide](GUIDE.md#workflow-processes-and-smart-forms) for configuration
-and integration details.
+lifecycle steps, an inbox and durable execution history. The server's own
+workflow guide (`/workflow-help.html`, linked from the workflow editor and shipped
+as `web/workflow-help.html`) explains steps, paths, form fields and scripts.
 
 Admins can start/stop a server-owned native bake worker from the Bake queue
 when the operator configures `--bake-worker-executable`,

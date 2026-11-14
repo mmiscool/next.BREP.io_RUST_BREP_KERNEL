@@ -1,11 +1,11 @@
 //! Assembly structure: the "uses" lists, and the BOM and where-used views
 //! computed from them.
 //!
-//! The CAD app publishes a revision's uses list on save and release (round
-//! 1); the server never reads geometry. Everything in this file is a pure
-//! function of [`State`]: checking a list before it is stored, walking it
-//! down into a bill of materials, walking it up into a where-used answer,
-//! and naming the children a release gate cares about.
+//! The CAD app publishes a revision's uses list on save and release
+//!; the server never reads geometry. Everything in
+//! this file is a pure function of [`State`]: checking a list before it is
+//! stored, walking it down into a bill of materials, walking it up into a
+//! where-used answer, and naming the children a release gate cares about.
 //!
 //! # What a reference means
 //!
@@ -13,7 +13,7 @@
 //! FLOATING, which reads as the child's current release, else its newest
 //! revision, at the moment the BOM is read. A floating reference stays
 //! floating after its parent releases: the released BOM follows the child's
-//! releases (BOM defaults).
+//! releases.
 //!
 //! # Cycles
 //!

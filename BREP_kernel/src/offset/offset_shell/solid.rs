@@ -47,6 +47,26 @@ pub fn offset_solid(
     distance: f64,
     corners: OffsetCorners,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    if let Some(scaled) = crate::rescale::ScaledOffset::of(source, distance, "offset_solid")? {
+        let mut record = offset_solid(&scaled.source, scaled.distance, corners).map_err(|error| scaled.refusal(error))?;
+        record.solid = scaled.back(&record.solid, "offset_solid")?;
+        return Ok(record);
+    }
+    let built = offset_solid_unread(source, distance, corners)?;
+    if corners == OffsetCorners::Rounded {
+        if let Some(refusal) = super::rim_witness::rim_witness_refusal(source, &built.solid, distance) {
+            return Err(refusal);
+        }
+    }
+    Ok(built)
+}
+
+/// [`offset_solid`] before its result is read back ([`super::rim_witness`]).
+fn offset_solid_unread(
+    source: &BrepSolid,
+    distance: f64,
+    corners: OffsetCorners,
+) -> Result<OffsetShellResultRecord, KernelRefusal> {
     let grown = offset_solid_joined(source, distance, corners)?;
     if corners == OffsetCorners::Rounded && distance > 0.0 {
         if let Some(carved) = super::bore_dimples::carve_bore_dimples(source, &grown.solid, distance) {
@@ -234,7 +254,7 @@ fn round_offset_joins(
 /// order given, so a coincident pair (a held face and the opening it copies)
 /// resolves to whichever is listed first. A face on no operand surface takes
 /// `unmatched`, or refuses by name when there is none.
-fn provenance_by_surface(
+pub(super) fn provenance_by_surface(
     result: &BrepSolid,
     operands: &[(&FaceRecord, OffsetShellFaceImageRecord)],
     unmatched: Option<&OffsetShellFaceImageRecord>,
@@ -361,6 +381,12 @@ pub fn offset_shell_by_boolean(
     opening_face_ids: &[u64],
     distance: f64,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    if let Some(scaled) = crate::rescale::ScaledOffset::of(source, distance, "offset_shell")? {
+        let mut record = offset_shell_by_boolean(&scaled.source, opening_face_ids, scaled.distance)
+            .map_err(|error| scaled.refusal(error))?;
+        record.solid = scaled.back(&record.solid, "offset_shell")?;
+        return Ok(record);
+    }
     if opening_face_ids.is_empty() {
         return Err(KernelRefusal::input(
             KernelStage::Collect,
@@ -421,6 +447,11 @@ pub fn offset_shell_by_boolean(
 /// The construction checks itself: the result is exactly two shells and its
 /// volume is the difference of the operands' volumes.
 pub fn offset_shell_closed(source: &BrepSolid, distance: f64) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    if let Some(scaled) = crate::rescale::ScaledOffset::of(source, distance, "offset_shell_closed")? {
+        let mut record = offset_shell_closed(&scaled.source, scaled.distance).map_err(|error| scaled.refusal(error))?;
+        record.solid = scaled.back(&record.solid, "offset_shell_closed")?;
+        return Ok(record);
+    }
     let body = offset_body(source, &[], distance, Body::Whole, "offset_shell_closed")?;
     let (kept, removed) = if distance > 0.0 { (source, &body.solid) } else { (&body.solid, source) };
     let solid = boolean_operation(kept, removed, BooleanOperation::Subtract, &BooleanOptions::default())

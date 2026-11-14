@@ -164,6 +164,19 @@ impl ToolbarStyle {
     }
 }
 
+/// Workbench ids that no longer exist, each with the id that took its place.
+/// The app's registry owns the live ids; this is only the rename table a
+/// stored value passes through on read.
+pub const RETIRED_WORKBENCHES: &[(&str, &str)] = &[("pmi", "modeling")];
+
+/// `id`, or its successor when it names a retired workbench.
+pub fn successor_workbench(id: &str) -> &str {
+    RETIRED_WORKBENCHES
+        .iter()
+        .find(|(retired, _)| *retired == id)
+        .map_or(id, |(_, successor)| successor)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderSettings {
     /// GUI chrome theme (egui panels/windows/toolbar/text). Defaults to `Auto`,
@@ -316,10 +329,10 @@ pub struct RenderSettings {
     /// update state and the user drives the manual Solve button. Consulted by
     /// the app's constraint-mutation path.
     pub assembly_auto_solve: bool,
-    /// Show Constraint Graphics: the render toggle the viewport overlay lane
-    /// consumes — per-constraint leader/label graphics draw only while this is
-    /// on. Owned here so the panel toggle, persistence, and the overlay
-    /// renderer all read ONE flag.
+    /// Show Constraint Graphics: the render toggle the
+    /// viewport overlay lane consumes — per-constraint leader/label graphics
+    /// draw only while this is on. Owned here so the panel toggle, persistence,
+    /// and the overlay renderer all read ONE flag.
     pub show_constraint_graphics: bool,
     /// The BOM's COLUMN CONFIGURATION — the raw text of the Settings panel's
     /// Assemblies textarea (one `[*]prefix.Field` per line). Stored VERBATIM,
@@ -588,9 +601,11 @@ impl RenderSettings {
             }
         }
         // The active UI workbench id (a plain string; the app validates it against
-        // its registry). Stored verbatim — an unknown id is tolerated here.
+        // its registry). Stored verbatim — an unknown id is tolerated here —
+        // except a RETIRED id, which is rewritten to its successor on read so
+        // a document or settings file saved before the retirement opens there.
         if let Some(v) = value.get("workbench").and_then(|v| v.as_str()) {
-            self.workbench = v.to_string();
+            self.workbench = successor_workbench(v).to_string();
         }
         if let Some(v) = value.get("assemblyAutoSolve").and_then(|v| v.as_bool()) {
             self.assembly_auto_solve = v;

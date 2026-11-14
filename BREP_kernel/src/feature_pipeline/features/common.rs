@@ -1639,6 +1639,70 @@ pub fn resolve_path_chain(
     chain_path_segments(segments)
 }
 
+/// Resolve a `reference_selection` of curves to the SEPARATE chains its picks
+/// form: the picks are gathered as [`resolve_path_chain`] gathers them, grouped
+/// by which ones touch end to end, and each group is ordered head to tail the
+/// same way. The chains come in the order of their first pick. A selection that
+/// forms one chain gives exactly [`resolve_path_chain`]'s result.
+pub fn resolve_path_chains(
+    ctx: &FeatureContext,
+    names: &[String],
+) -> Result<Vec<Vec<PathSegment>>, String> {
+    let mut segments: Vec<PathSegment> = Vec::new();
+    for reference in names {
+        for segment in resolve_path_chain(ctx, std::slice::from_ref(reference))? {
+            if !segments.iter().any(|seen| seen.name == segment.name) {
+                segments.push(segment);
+            }
+        }
+    }
+    let ends: Vec<(Vec3, Vec3)> = segments
+        .iter()
+        .map(|segment| path_endpoints(&segment.curve))
+        .collect::<Result<_, _>>()?;
+    let scale = ends
+        .iter()
+        .flat_map(|(a, b)| [a, b])
+        .map(|point| point.sub(ends[0].0).length())
+        .fold(1.0_f64, f64::max);
+    let tolerance = 1e-5 * scale;
+    let touch = |a: &(Vec3, Vec3), b: &(Vec3, Vec3)| {
+        [a.0, a.1].iter().any(|p| [b.0, b.1].iter().any(|q| p.sub(*q).length() <= tolerance))
+    };
+    // group[i]: the chain segment i belongs to, named by its first segment
+    let mut group: Vec<usize> = (0..segments.len()).collect();
+    loop {
+        let mut changed = false;
+        for i in 0..segments.len() {
+            for j in 0..i {
+                if group[i] != group[j] && touch(&ends[i], &ends[j]) {
+                    let (low, high) = (group[i].min(group[j]), group[i].max(group[j]));
+                    group.iter_mut().filter(|g| **g == high).for_each(|g| *g = low);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut chains = Vec::new();
+    let mut taken: Vec<Option<PathSegment>> = segments.into_iter().map(Some).collect();
+    for first in 0..taken.len() {
+        if group[first] != first {
+            continue;
+        }
+        let members: Vec<PathSegment> = (first..taken.len())
+            .filter(|index| group[*index] == first)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|index| taken[index].take().expect("each segment in one chain"))
+            .collect();
+        chains.push(chain_path_segments(members)?);
+    }
+    Ok(chains)
+}
+
 /// A path curve's world endpoints (`(start, end)` at its domain ends).
 fn path_endpoints(curve: &NurbsCurve) -> Result<(Vec3, Vec3), String> {
     let [t0, t1] = curve.domain()?;

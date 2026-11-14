@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use super::reader::{parse_iges, IgesFile};
 use super::structure::{self, Matrix, Placed};
-use super::to_step::{analyse_face_sets, free_shell_to_step, manifold_solid_to_step, FaceSets};
+use super::to_step::{analyse_face_sets, free_shell_to_step, manifold_solid_to_step, trimmed_surfaces, FaceSets};
 
 /// Parse an IGES document and reconstruct one or more `BrepSolid`s.
 pub fn import_iges(text: &str) -> Result<Vec<BrepSolid>, String> {
@@ -62,7 +62,7 @@ pub fn import_iges_report(text: &str) -> Result<IgesImportReport, String> {
     for body in bodies {
         report.solids.push(body.solid);
         report.names.push(body.name.unwrap_or_default());
-        report.appearances.push(BodyAppearance { body: body.color, faces: Vec::new() });
+        report.appearances.push(BodyAppearance { body: body.color, faces: body.faces });
         report.levels.push(body.level);
     }
     Ok(report)
@@ -73,17 +73,28 @@ struct Body {
     solid: BrepSolid,
     name: Option<String>,
     color: Option<crate::ImportedColor>,
+    /// Each face's own colour in shell/face order, or empty when no face of
+    /// the body has one.
+    faces: FaceColors,
     level: i64,
 }
 
 impl Body {
     fn bare(solid: BrepSolid) -> Self {
-        Self { solid, name: None, color: None, level: 0 }
+        Self { solid, name: None, color: None, faces: Vec::new(), level: 0 }
     }
 }
 
-/// Each 186 built once, through the STEP lane, in its definition frame.
-type SolidCache = HashMap<i64, Vec<BrepSolid>>;
+/// A body's per-face colours, as [`BodyAppearance::faces`] holds them.
+type FaceColors = Vec<Option<crate::ImportedColor>>;
+
+/// Each 186 built once, through the STEP lane, in its definition frame, with
+/// the colours its faces carry.
+type SolidCache = HashMap<i64, Vec<(BrepSolid, FaceColors)>>;
+
+/// Each subfigure's (308) trimmed-surface sets, sewn once in its own frame,
+/// keyed by the 308.
+type SetCache = HashMap<i64, Vec<BrepSolid>>;
 
 fn built_solid<'c>(
     cache: &'c mut SolidCache,
@@ -91,7 +102,7 @@ fn built_solid<'c>(
     pointer: i64,
     scale: f64,
     diagnostics: &mut crate::KernelDiagnostics,
-) -> Result<&'c [BrepSolid], String> {
+) -> Result<&'c [(BrepSolid, FaceColors)], String> {
     if !cache.contains_key(&pointer) {
         let (built, measured) = manifold_solid(file, pointer, scale)?;
         merge_diagnostics(diagnostics, measured);
@@ -102,7 +113,7 @@ fn built_solid<'c>(
 
 /// A built solid moved by a placement; a mirroring placement turns it inside
 /// out unless the orientation is reversed with it.
-fn place(solid: &BrepSolid, placement: &Matrix) -> Result<BrepSolid, String> {
+pub(super) fn place(solid: &BrepSolid, placement: &Matrix) -> Result<BrepSolid, String> {
     if structure::is_identity(placement) {
         return Ok(solid.clone());
     }
@@ -125,8 +136,8 @@ fn solids_with_diagnostics(
         let mut cache = SolidCache::default();
         let mut bodies = Vec::new();
         for Placed { solid, placement, name, color, level } in structure::placed_solids(file, scale)? {
-            for built in built_solid(&mut cache, file, solid, scale, diagnostics)? {
-                bodies.push(Body { solid: place(built, &placement)?, name: name.clone(), color, level });
+            for (built, faces) in built_solid(&mut cache, file, solid, scale, diagnostics)? {
+                bodies.push(Body { solid: place(built, &placement)?, name: name.clone(), color, faces: faces.clone(), level });
             }
         }
         bodies.extend(free_shell_bodies(file, scale, diagnostics)?);
@@ -138,27 +149,113 @@ fn solids_with_diagnostics(
         }
         return Ok(bodies);
     }
+    // A file of trimmed surfaces whose subfigures are placed: the file's own
+    // sets, then each instance's sets where it puts them.
     if file.entities_of_type(408).next().is_some() {
-        return Err(
-            "iges_import: the file places subfigures (408) of trimmed surfaces, which this import cannot build yet"
-                .into(),
-        );
+        let bodies = placed_face_set_bodies(file, scale, diagnostics)?;
+        if bodies.is_empty() {
+            return Err(nothing_to_import(file));
+        }
+        return Ok(bodies);
     }
 
     if file.entities_of_type(144).next().is_none() && file.entities_of_type(143).next().is_none() {
-        if file.entities_of_type(128).next().is_some() {
-            return Err(
-                "iges_import: file has untrimmed B-spline surfaces (entity 128) but no trimmed surfaces (entity 144) to form faces"
-                    .into(),
-            );
-        }
-        return Err("iges_import: the file has no solids (186) or trimmed surfaces (144, 143) to import".into());
+        return Err(nothing_to_import(file));
     }
-    let (solids, measured) = face_set_solids(file, scale)?;
+    let (solids, measured) = face_set_solids(file, scale, &trimmed_surfaces(file))?;
     for each in measured {
         merge_diagnostics(diagnostics, each);
     }
     Ok(solids.into_iter().map(Body::bare).collect())
+}
+
+/// Why a file without solids or sewable surfaces imports nothing.
+fn nothing_to_import(file: &IgesFile) -> String {
+    if file.entities_of_type(144).next().is_none()
+        && file.entities_of_type(143).next().is_none()
+        && file.entities_of_type(128).next().is_some()
+    {
+        return "iges_import: file has untrimmed B-spline surfaces (entity 128) but no trimmed surfaces (entity 144) to form faces"
+            .into();
+    }
+    "iges_import: the file has no solids (186) or trimmed surfaces (144, 143) to import".into()
+}
+
+/// The trimmed surfaces no subfigure (308) lists: the file's own, in
+/// directory order.
+fn loose_surfaces(file: &IgesFile) -> Result<Vec<i64>, String> {
+    let members = structure::subfigure_member_set(file)?;
+    Ok(trimmed_surfaces(file).into_iter().filter(|pointer| !members.contains(pointer)).collect())
+}
+
+/// The file's own surface sets sewn into solids, refused as the flat import
+/// of a file without subfigures refuses them.
+fn loose_set_solids(
+    file: &IgesFile,
+    scale: f64,
+    diagnostics: &mut crate::KernelDiagnostics,
+) -> Result<Vec<BrepSolid>, String> {
+    let loose = loose_surfaces(file)?;
+    if loose.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (solids, measured) = face_set_solids(file, scale, &loose)?;
+    for each in measured {
+        merge_diagnostics(diagnostics, each);
+    }
+    Ok(solids)
+}
+
+/// The solids a subfigure's (308) own trimmed surfaces sew into, in its own
+/// frame, built once however many instances place it. A set that does not
+/// sew refuses the file, naming the subfigure.
+fn subfigure_set_solids<'c>(
+    cache: &'c mut SetCache,
+    file: &IgesFile,
+    pointer: i64,
+    scale: f64,
+    diagnostics: &mut crate::KernelDiagnostics,
+) -> Result<&'c [BrepSolid], String> {
+    if !cache.contains_key(&pointer) {
+        let mut surfaces = Vec::new();
+        for member in structure::subfigure_members(file.entity(pointer)?)? {
+            if matches!(file.entity(member)?.de.entity_type, 144 | 143) {
+                surfaces.push(member);
+            }
+        }
+        surfaces.sort_unstable();
+        surfaces.dedup();
+        let mut solids = Vec::new();
+        if !surfaces.is_empty() {
+            let (built, measured) =
+                face_set_solids(file, scale, &surfaces).map_err(|error| format!("subfigure DE {pointer}: {error}"))?;
+            for each in measured {
+                merge_diagnostics(diagnostics, each);
+            }
+            solids = built;
+        }
+        cache.insert(pointer, solids);
+    }
+    Ok(&cache[&pointer])
+}
+
+/// A file of trimmed surfaces with subfigure instances, flattened: the
+/// file's own sets, then each instance's sets placed, in file order.
+fn placed_face_set_bodies(
+    file: &IgesFile,
+    scale: f64,
+    diagnostics: &mut crate::KernelDiagnostics,
+) -> Result<Vec<Body>, String> {
+    // The structure's refusals come before any sewing.
+    let placed = structure::placed_face_sets(file, scale)?;
+    let mut bodies: Vec<Body> = loose_set_solids(file, scale, diagnostics)?.into_iter().map(Body::bare).collect();
+    let mut cache = SetCache::default();
+    for Placed { solid: definition, placement, name, color, level } in placed {
+        for built in subfigure_set_solids(&mut cache, file, definition, scale, diagnostics)? {
+            bodies.push(Body { solid: place(built, &placement)?, name: name.clone(), color, faces: Vec::new(), level });
+        }
+    }
+    Ok(bodies)
 }
 
 /// The file's subfigure structure, the IGES counterpart of
@@ -167,6 +264,10 @@ fn solids_with_diagnostics(
 /// its own solids in its own frame, and one occurrence per instance (408) with
 /// its placement in millimetres. `Ok(None)` when the file places no
 /// subfigures, so the caller takes the flat import as for STEP.
+///
+/// A file of trimmed surfaces (144, 143) without solids reads the same way:
+/// each instanced subfigure's product holds the solids its own surfaces sew
+/// into, and the root product the file's own sets.
 ///
 /// Every solid is built once, as in the flat import, and a file the flat
 /// import refuses is refused here with the same words: an assembly never
@@ -185,6 +286,9 @@ pub fn read_iges_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     }
     // The flat import's checks and refusals, once, before any structure.
     let scale = file.global.length_scale_mm()?;
+    if file.entities_of_type(186).next().is_none() && file.entities_of_type(514).next().is_none() {
+        return face_set_assembly(&file, scale, top_instances).map(Some);
+    }
     if file.entities_of_type(186).next().is_none() {
         return Err(
             "iges_import: the file places subfigures (408) of trimmed surfaces, which this import cannot build yet"
@@ -195,12 +299,37 @@ pub fn read_iges_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     structure::placed_solids(&file, scale)?;
 
     let mut cache = SolidCache::default();
+    let mut sets = SetCache::default();
     let mut diagnostics = crate::KernelDiagnostics::default();
+    let mut assembly = root_only_assembly(&file);
+    for (pointer, solid) in file.pointers_of_type(186) {
+        if !members.contains(&pointer) {
+            let color = structure::entity_color(&file, solid);
+            for (built, faces) in built_solid(&mut cache, &file, pointer, scale, &mut diagnostics)? {
+                assembly.products[0].bodies.push(built.clone());
+                assembly.products[0].appearances.push(BodyAppearance { body: color, faces: faces.clone() });
+            }
+        }
+    }
+    for body in free_shell_bodies(&file, scale, &mut diagnostics)? {
+        assembly.products[0].bodies.push(body.solid);
+        assembly.products[0].appearances.push(BodyAppearance { body: body.color, faces: body.faces });
+    }
+    assembly.sheets_skipped = diagnostics.counters.get(crate::step_import::SHEETS_SKIPPED).copied().unwrap_or(0) as usize;
+    let mut products: HashMap<i64, usize> = HashMap::default();
+    for pointer in top_instances {
+        add_instance(&file, scale, pointer, 0, &mut assembly, &mut products, (&mut cache, &mut sets), &mut diagnostics, 0)?;
+    }
+    Ok(Some(assembly))
+}
+
+/// The assembly with only its root product, the file itself, and nothing in it.
+fn root_only_assembly(file: &IgesFile) -> StepAssembly {
     let root_name = {
         let product = file.global.product_id.trim();
         if product.is_empty() { "IGES".to_string() } else { product.to_string() }
     };
-    let mut assembly = StepAssembly {
+    StepAssembly {
         products: vec![StepProduct {
             pd_ref: 0,
             name: root_name,
@@ -216,26 +345,42 @@ pub fn read_iges_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
         pmi: None,
         pmi_diagnostics: Vec::new(),
         sheets_skipped: 0,
-    };
-    for (pointer, solid) in file.pointers_of_type(186) {
-        if !members.contains(&pointer) {
-            let color = structure::entity_color(&file, solid);
-            for built in built_solid(&mut cache, &file, pointer, scale, &mut diagnostics)? {
-                assembly.products[0].bodies.push(built.clone());
-                assembly.products[0].appearances.push(BodyAppearance { body: color, faces: Vec::new() });
-            }
+    }
+}
+
+/// [`read_iges_assembly`] for a file of trimmed surfaces: every set the flat
+/// import would sew is sewn first, in the flat import's order, so a file it
+/// refuses is refused here with the same words before any structure.
+fn face_set_assembly(file: &IgesFile, scale: f64, top_instances: Vec<i64>) -> Result<StepAssembly, String> {
+    let mut diagnostics = crate::KernelDiagnostics::default();
+    let placed = structure::placed_face_sets(file, scale)?;
+    let loose = loose_set_solids(file, scale, &mut diagnostics)?;
+    let mut sets = SetCache::default();
+    let mut any = !loose.is_empty();
+    for each in &placed {
+        // Each instance placed as the flat import places it, so a placement it
+        // cannot apply (singular, or one taking the geometry out of range) is
+        // refused here with its words, not carried as an occurrence that
+        // cannot be built.
+        for solid in subfigure_set_solids(&mut sets, file, each.solid, scale, &mut diagnostics)? {
+            place(solid, &each.placement)?;
+            any = true;
         }
     }
-    for body in free_shell_bodies(&file, scale, &mut diagnostics)? {
-        assembly.products[0].bodies.push(body.solid);
-        assembly.products[0].appearances.push(BodyAppearance { body: body.color, faces: Vec::new() });
+    if !any {
+        return Err(nothing_to_import(file));
     }
-    assembly.sheets_skipped = diagnostics.counters.get(crate::step_import::SHEETS_SKIPPED).copied().unwrap_or(0) as usize;
+    let mut assembly = root_only_assembly(file);
+    for solid in loose {
+        assembly.products[0].bodies.push(solid);
+        assembly.products[0].appearances.push(BodyAppearance { body: None, faces: Vec::new() });
+    }
+    let mut cache = SolidCache::default();
     let mut products: HashMap<i64, usize> = HashMap::default();
     for pointer in top_instances {
-        add_instance(&file, scale, pointer, 0, &mut assembly, &mut products, &mut cache, &mut diagnostics, 0)?;
+        add_instance(file, scale, pointer, 0, &mut assembly, &mut products, (&mut cache, &mut sets), &mut diagnostics, 0)?;
     }
-    Ok(Some(assembly))
+    Ok(assembly)
 }
 
 /// One 408 as an occurrence under `parent`, its subfigure as a product (added
@@ -249,7 +394,7 @@ fn add_instance(
     parent: usize,
     assembly: &mut StepAssembly,
     products: &mut HashMap<i64, usize>,
-    cache: &mut SolidCache,
+    (cache, sets): (&mut SolidCache, &mut SetCache),
     diagnostics: &mut crate::KernelDiagnostics,
     depth: usize,
 ) -> Result<(), String> {
@@ -272,6 +417,12 @@ fn add_instance(
                 failed_bodies: 0,
                 pmi: None,
             });
+            // The subfigure's own trimmed surfaces, sewn in its frame.
+            let color = structure::entity_color(file, definition);
+            for solid in subfigure_set_solids(sets, file, definition_pointer, scale, diagnostics)?.to_vec() {
+                assembly.products[index].bodies.push(solid);
+                assembly.products[index].appearances.push(BodyAppearance { body: color, faces: Vec::new() });
+            }
             for member in structure::subfigure_members(definition)? {
                 let entity = file.entity(member)?;
                 match entity.de.entity_type {
@@ -279,12 +430,22 @@ fn add_instance(
                         let color = structure::entity_color(file, entity);
                         let built = built_solid(cache, file, member, scale, diagnostics)?.to_vec();
                         let product = &mut assembly.products[index];
-                        for solid in built {
+                        for (solid, faces) in built {
                             product.bodies.push(solid);
-                            product.appearances.push(BodyAppearance { body: color, faces: Vec::new() });
+                            product.appearances.push(BodyAppearance { body: color, faces });
                         }
                     }
-                    408 => add_instance(file, scale, member, index, assembly, products, cache, diagnostics, depth + 1)?,
+                    408 => add_instance(
+                        file,
+                        scale,
+                        member,
+                        index,
+                        assembly,
+                        products,
+                        (&mut *cache, &mut *sets),
+                        diagnostics,
+                        depth + 1,
+                    )?,
                     _ => {}
                 }
             }
@@ -293,6 +454,24 @@ fn add_instance(
     };
     let placement = structure::instance_matrix(file, instance, scale)?;
     let rigid = crate::AffineTransform::new(placement).is_ok_and(|transform| transform.is_rigid(1e-9));
+    // An instance's colour in IGES is INHERITED: a body's or an inner
+    // instance's own colour wins over it, as the flat import reads it. As a
+    // whole-instance colour (which colours everything the instance places) it
+    // is given only where nothing beneath is coloured on its own; otherwise it
+    // goes to the child's own uncoloured bodies alone.
+    let (color, body_colors) = match structure::entity_color(file, instance) {
+        None => (None, Vec::new()),
+        Some(own) if !coloured_below(file, definition_pointer, 0)? => (Some(own), Vec::new()),
+        Some(own) => {
+            let bodies: Vec<Option<crate::ImportedColor>> = assembly.products[child]
+                .appearances
+                .iter()
+                .map(|appearance| appearance.body.is_none().then_some(own))
+                .collect();
+            let any = bodies.iter().any(Option::is_some);
+            (None, if any { bodies } else { Vec::new() })
+        }
+    };
     assembly.occurrences.push(StepOccurrence {
         edge_ref: pointer as usize,
         parent,
@@ -300,8 +479,40 @@ fn add_instance(
         designator: structure::entity_name(file, instance).unwrap_or_else(|| format!("instance#{pointer}")),
         placement,
         rigid,
+        color,
+        body_colors,
     });
     Ok(())
+}
+
+/// Whether anything a subfigure places carries a colour of its own: the
+/// subfigure itself (its surface sets take it), a member solid, or a member
+/// instance, at any depth.
+fn coloured_below(file: &IgesFile, definition_pointer: i64, depth: usize) -> Result<bool, String> {
+    if depth > 64 {
+        return Err(format!("iges_import: subfigure DE {definition_pointer} nests deeper than 64 levels"));
+    }
+    let definition = file.entity(definition_pointer)?;
+    if structure::entity_color(file, definition).is_some() {
+        return Ok(true);
+    }
+    for member in structure::subfigure_members(definition)? {
+        let entity = file.entity(member)?;
+        match entity.de.entity_type {
+            186 if structure::entity_color(file, entity).is_some() => return Ok(true),
+            408 => {
+                if structure::entity_color(file, entity).is_some() {
+                    return Ok(true);
+                }
+                let (inner, _) = structure::instanced_subfigure(file, member)?;
+                if coloured_below(file, inner, depth + 1)? {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
 }
 
 /// Fold one body's diagnostics into the file's: events and counts add up, and
@@ -319,13 +530,15 @@ fn merge_diagnostics(into: &mut crate::KernelDiagnostics, from: crate::KernelDia
     }
 }
 
-/// Build a file of trimmed surfaces: one solid per connected, closed set of
-/// faces, and a set lying inside another becomes its cavity.
+/// Build trimmed surfaces (`surfaces`, in directory order) into solids: one
+/// solid per connected, closed set of faces, and a set lying inside another
+/// becomes its cavity.
 fn face_set_solids(
     file: &IgesFile,
     scale: f64,
+    surfaces: &[i64],
 ) -> Result<(Vec<BrepSolid>, Vec<crate::KernelDiagnostics>), String> {
-    let sets = analyse_face_sets(file, scale)?;
+    let sets = analyse_face_sets(file, scale, surfaces)?;
     for body in &sets.bodies {
         if let Some(reason) = sets.open_reason(body) {
             return Err(reason);
@@ -393,7 +606,8 @@ fn face_set_body(
             let text = sets.to_step(file, scale, body, voids, flip, split)?;
             match solids_or_refusal(&text) {
                 Ok((mut solids, diagnostics)) if solids.len() == 1 => {
-                    let solid = solids.remove(0);
+                    // A set of trimmed surfaces carries no face colours here.
+                    let (solid, _) = solids.remove(0);
                     let volume = crate::solid_signed_volume(&solid)?;
                     if volume > 0.0 {
                         return Ok(BuiltBody { solid, volume, flip, diagnostics });
@@ -482,12 +696,14 @@ fn free_shell_bodies(
             // geometry without counting it; here it is counted with the sheets.
             diagnostics.count_n(crate::step_import::SHEETS_SKIPPED, 1);
         }
+        let faces = face_colors(&report);
         merge_diagnostics(diagnostics, report.diagnostics);
-        for solid in report.solids {
+        for (solid, faces) in report.solids.into_iter().zip(faces) {
             bodies.push(Body {
                 solid,
                 name: structure::entity_name(file, entity),
                 color: structure::entity_color(file, entity),
+                faces,
                 level: entity.de.level,
             });
         }
@@ -531,8 +747,29 @@ fn manifold_solid(file: &IgesFile, pointer: i64, scale: f64) -> Result<Built, St
 /// Import translated STEP, refusing when the body did not build. The STEP lane
 /// skips a body that fails with text and returns the rest, but a file that
 /// comes in short looks like a complete import.
-/// Solids that built, with the diagnostics the STEP lane measured on them.
-type Built = (Vec<BrepSolid>, crate::KernelDiagnostics);
+/// Solids that built, each with its faces' colours, and the diagnostics the
+/// STEP lane measured on them.
+type Built = (Vec<(BrepSolid, FaceColors)>, crate::KernelDiagnostics);
+
+/// Each built solid's per-face colours as the STEP lane paired them: one list
+/// per solid, as long as its faces where any face has a colour, else empty.
+/// A list of another length is not a pairing and is dropped.
+fn face_colors(report: &crate::StepImportReport) -> Vec<FaceColors> {
+    report
+        .solids
+        .iter()
+        .enumerate()
+        .map(|(index, solid)| {
+            let faces: usize = solid.shells.iter().map(|shell| shell.faces.len()).sum();
+            match report.appearances.get(index) {
+                Some(appearance) if appearance.faces.len() == faces && appearance.faces.iter().any(Option::is_some) => {
+                    appearance.faces.clone()
+                }
+                _ => Vec::new(),
+            }
+        })
+        .collect()
+}
 
 fn solids_or_refusal(step: &str) -> Result<Built, String> {
     let report = crate::import_step_report(step).map_err(|error| format!("iges_import: {error}"))?;
@@ -548,7 +785,8 @@ fn solids_or_refusal(step: &str) -> Result<Built, String> {
     for solid in &report.solids {
         collapsed_face_refusal(solid)?;
     }
-    Ok((report.solids, report.diagnostics))
+    let faces = face_colors(&report);
+    Ok((report.solids.into_iter().zip(faces).collect(), report.diagnostics))
 }
 
 /// Area over boundary length squared below which a face has collapsed. Measured

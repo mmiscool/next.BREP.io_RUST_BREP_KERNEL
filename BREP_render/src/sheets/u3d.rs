@@ -652,22 +652,6 @@ impl Histogram {
         sum
     }
 
-    /// The symbol whose cumulative interval holds `target`.
-    fn symbol_at(&self, target: u32) -> u32 {
-        // The largest prefix whose sum is ≤ target.
-        let mut position = 0usize;
-        let mut remaining = target;
-        let mut step = self.tree.len().next_power_of_two() / 2;
-        while step > 0 {
-            let next = position + step;
-            if next < self.tree.len() && self.tree[next] <= remaining {
-                position = next;
-                remaining -= self.tree[next];
-            }
-            step /= 2;
-        }
-        position as u32
-    }
 
     fn add(&mut self, symbol: u32) {
         if symbol > MAX_SYMBOL_IN_HISTOGRAM {

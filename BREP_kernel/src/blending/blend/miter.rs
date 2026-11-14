@@ -180,36 +180,13 @@ pub(super) fn is_miter_seam_fold(refusal: &KernelRefusal) -> bool {
     matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what } if what == MITER_SEAM_FOLD)
 }
 
-/// `BREP_BLEND_MITER_FOLD=1`/`on` re-marches a folding seam on the other
-/// stripe ([`MITER_SEAM_FOLD`], lane R2 2026-10-18; the default since its
-/// census at 433ed426b), `=0`/`off` keeps the exit the leader found;
-/// `set_miter_fold_for_test` forces it on a test's own thread.
-const MITER_FOLD_DEFAULT: bool = true;
-
-pub(super) fn miter_fold_on() -> bool {
-    switch!(live "BREP_BLEND_MITER_FOLD", MITER_FOLD_DEFAULT)
-}
-
-
-/// Lane R2 row 5a (2026-10-18): `BREP_BLEND_LINE_CANAL=1`/`on` reads a
-/// straight canal's level in closed form ([`canal_distance`]; the default
-/// since its census), `=0`/`off` projects onto the spine as before;
-/// `set_line_canal_for_test` forces it on a test's own thread.
-const LINE_CANAL_DEFAULT: bool = true;
-
-pub(super) fn line_canal_on() -> bool {
-    switch!(live "BREP_BLEND_LINE_CANAL", LINE_CANAL_DEFAULT)
-}
-
-
 /// The distance from `point` to the spine `center`, as
 /// `project_point_to_curve` answers it: the nearest point of the curve over
 /// its domain. A STRAIGHT spine (degree 1, two control points of equal
-/// weight: an exact extrusion's centre line) is a segment, and with
-/// `line_canal_on` its distance is the segment's own closed form; any other
-/// spine, or the switch off, is projected.
+/// weight: an exact extrusion's centre line) is a segment, and its
+/// distance is the segment's own closed form; any other spine is projected.
 pub(super) fn canal_distance(center: &crate::NurbsCurve, point: Vec3) -> Result<f64, KernelRefusal> {
-    if line_canal_on() && center.degree == 1 && center.control_points.len() == 2 {
+    if center.degree == 1 && center.control_points.len() == 2 {
         let [a, b] = [center.control_points[0], center.control_points[1]];
         if a.w > 0.0 && a.w == b.w {
             let (from, to) = (a.point().or_refuse(KernelStage::Refine, "point")?, b.point().or_refuse(KernelStage::Refine, "point")?);
@@ -243,7 +220,6 @@ pub(super) fn canal_distance(center: &crate::NurbsCurve, point: Vec3) -> Result<
 pub(super) fn global_canal_on() -> bool {
     switch!("BREP_MITER_GLOBAL_CANAL", false)
 }
-
 
 
 /// The least distance from `point` to `curve` over every local minimum of its
@@ -747,12 +723,11 @@ fn solve_miter_ordered(
     // seam folded back in the leader's sections at the rail — the leader's
     // section is tangent to it there, so whether a station is found at the
     // exit at all is a rounding decision — and it is marched on the other
-    // stripe (`miter_fold_on`; the caller swaps on `miter_seam_fold`).
+    // stripe (the caller swaps on `miter_seam_fold`).
     // A seam that reaches the leader's far rail at the same station (its far
     // level within the fit bar there: a symmetric chamfer's corner) leaves
     // both stripes at once — the common exit below, not a fold.
-    if miter_fold_on()
-        && leaves_first == 1
+    if leaves_first == 1
         && level(u_exit, 1.0)?.abs() > fit_tolerance
         && matches!(station(u_exit + du / 16.0), Ok(None))
     {

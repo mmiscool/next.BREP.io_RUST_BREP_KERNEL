@@ -1,12 +1,12 @@
 //! Feature-parameter validation against the kernel catalogue, run in the
 //! server before a `feature_add` / `feature_set_params` reaches the engine.
 //!
-//! Rules: an unknown key is an error naming the nearest known key; a value of
-//! the wrong kind is an error; an `options` value outside the list is an
-//! error; a reference name absent from the scene at the feature's history
-//! position is a **warning** (forward references are legal while editing, and
-//! the kernel reports `unresolved` at run time). Engine refusal text is never
-//! rewritten here.
+//! Rules: an unknown key is an error naming the nearest known key;
+//! a value of the wrong kind is an error; an `options` value outside the list
+//! is an error; a reference name absent from the scene at the feature's
+//! history position is a **warning** (forward references are legal while
+//! editing, and the kernel reports `unresolved` at run time). Engine refusal
+//! text is never rewritten here.
 use crate::schema;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -143,9 +143,10 @@ fn check_kind(
         }
         "reference_selection" => {
             let multiple = pspec.get("multiple").and_then(Value::as_bool).unwrap_or(false);
+            let allow_single = pspec.get("allowSingleReference").and_then(Value::as_bool).unwrap_or(false);
             let names: Vec<&str> = match value {
                 Value::Null => vec![],
-                Value::String(s) if !multiple => vec![s.as_str()],
+                Value::String(s) if !multiple || allow_single => vec![s.as_str()],
                 Value::Array(a) if multiple => a.iter().filter_map(Value::as_str).collect(),
                 Value::String(_) => {
                     v.errors.push(format!("`{key}` takes an array of reference names"));

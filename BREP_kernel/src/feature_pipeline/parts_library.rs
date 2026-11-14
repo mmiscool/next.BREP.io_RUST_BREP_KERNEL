@@ -232,6 +232,79 @@ pub fn kernel_source_stamp() -> Option<&'static str> {
     option_env!("BREP_KERNEL_SOURCE_HASH")
 }
 
+/// Whether `entry`'s snapshot was made by another kernel build (and its
+/// document has not changed since: a dirty entry rebuilds for that reason).
+pub(crate) fn snapshot_is_stale(entry: &PartsLibraryEntry) -> bool {
+    !entry.dirty && kernel_source_stamp().is_some_and(|stamp| entry.snapshot_producer != stamp)
+}
+
+thread_local! {
+    /// The run in progress shows a stale part from its stored snapshot
+    /// instead of rebuilding it ([`HistoryRequest::defer_stale_parts`]). Set
+    /// for a whole top-level run, so the isolated part runs inside it (which
+    /// never re-enter `execute_history`) follow the same rule.
+    static DEFER_STALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The parts the run in progress showed from a stale snapshot.
+    static STALE_SHOWN: RefCell<std::collections::BTreeSet<String>> = const { RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// The deferred-stale mode for one top-level run: set on entry, put back on
+/// drop; the parts it showed stale are read by [`Self::finish`].
+pub(crate) struct DeferStaleScope {
+    previous: bool,
+}
+
+impl DeferStaleScope {
+    pub(crate) fn enter(defer: bool) -> Self {
+        STALE_SHOWN.with(|shown| shown.borrow_mut().clear());
+        Self { previous: DEFER_STALE.with(|flag| flag.replace(defer)) }
+    }
+
+    /// The parts this run showed from a snapshot of another kernel build.
+    pub(crate) fn finish(&self) -> Vec<String> {
+        STALE_SHOWN.with(|shown| std::mem::take(&mut *shown.borrow_mut()).into_iter().collect())
+    }
+}
+
+impl Drop for DeferStaleScope {
+    fn drop(&mut self) {
+        DEFER_STALE.with(|flag| flag.set(self.previous));
+    }
+}
+
+/// Whether the run in progress defers stale parts (see [`DeferStaleScope`]).
+pub(crate) fn defer_stale() -> bool {
+    DEFER_STALE.with(std::cell::Cell::get)
+}
+
+/// Record that the run showed `part_name` from a stale snapshot.
+pub(crate) fn note_stale_shown(part_name: &str) {
+    STALE_SHOWN.with(|shown| {
+        shown.borrow_mut().insert(part_name.to_string());
+    });
+}
+
+/// The constraint rows and poses saved with a stale snapshot, taken although
+/// another build made them, when they still describe the entry's document: a
+/// stale part shown as it was stored shows the rows stored with it. Empty
+/// otherwise (the revalidating run solves them).
+pub(crate) fn stale_saved_rows(
+    entry: &PartsLibraryEntry,
+) -> (Vec<NestedConstraint>, BTreeMap<String, crate::AffineTransform>) {
+    let Some(rows) = &entry.nested_rows else { return Default::default() };
+    if rows.document != format!("{:016x}", entry.doc_hash) {
+        return Default::default();
+    }
+    let mut poses = BTreeMap::new();
+    for (path, hex) in &rows.poses {
+        let bits: Option<Vec<f64>> = hex.iter().map(|h| u64::from_str_radix(h, 16).ok().map(f64::from_bits)).collect();
+        let Some(Ok(elements)) = bits.map(|b| <[f64; 16]>::try_from(b)) else { return Default::default() };
+        let Ok(pose) = crate::AffineTransform::new(elements) else { return Default::default() };
+        poses.insert(path.clone(), pose);
+    }
+    (rows.constraints.clone(), poses)
+}
+
 thread_local! {
     /// The open document's library (the ROOT store).
     static ROOT: RefCell<PartsLibraryMap> = RefCell::new(BTreeMap::new());
@@ -619,6 +692,13 @@ pub(crate) fn mix_descriptor_fingerprint(
             entry.source_signature.hash(&mut hasher);
             entry.doc_hash.hash(&mut hasher);
             force_dirty = entry.dirty || super::extension::document_uses_extensions(&entry.document);
+            // A stale part shown from its snapshot is not what a rebuild
+            // makes: the run that revalidates it must not replay this entry.
+            // Mixed only then (an entry with no snapshot is rebuilt in this
+            // very run), so every other fingerprint is unchanged.
+            if defer_stale() && snapshot_is_stale(&entry) && !entry.snapshot.is_empty() {
+                "stale-shown".hash(&mut hasher);
+            }
         }
         None => 0u8.hash(&mut hasher),
     }
@@ -771,8 +851,13 @@ fn run_isolated_features(
     let mut nested_poses = BTreeMap::new();
     if error.is_none() {
         if let Some(state) = request.assembly.as_ref().filter(|state| !state.constraints.is_empty()) {
+            let weld_poses = super::capture_weld_poses(request, &results, &scene);
             let mut state = state.clone();
             crate::feature_pipeline::assembly::lifecycle::run_constraints(&mut state, &mut scene, &env);
+            super::pose_weld_outputs(request, &mut results, &mut scene, weld_poses);
+            if let Some(failed) = results.iter().find(|result| result.error.is_some()) {
+                error = Some(format!("feature '{}': {}", failed.id, failed.error.as_deref().unwrap()));
+            }
             nested_constraints.extend(state.constraints.iter().map(NestedConstraint::from_entry));
         }
         // Every level below arrives on the component records, namespaced by
@@ -1249,9 +1334,9 @@ fn build_identity(document: &serde_json::Value) -> Option<u64> {
     Some(stable_json_hash(&serde_json::to_value(&request).ok()?))
 }
 
-/// The current library in the `partsLibrary` block shape — what SAVE must
-/// serialize into the document (never the loaded block: this copy carries
-/// healed snapshots, refreshes, and GC).
+/// The current library in the `partsLibrary` block shape — what
+/// SAVE must serialize into the document (never the loaded block: this copy
+/// carries healed snapshots, refreshes, and GC).
 #[wasm_bindgen]
 pub fn parts_library_json() -> String {
     ROOT.with(|root| {

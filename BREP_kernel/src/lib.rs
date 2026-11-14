@@ -1,3 +1,57 @@
+//! A native and WebAssembly boundary-representation (B-rep) geometry kernel.
+//!
+//! Published as `BREP_kernel`; the library name is `brep_kernel`. It is the exact
+//! geometry engine of the BREP CAD application and is usable on its own:
+//!
+//! - exact rational NURBS curves and surfaces with recognised analytic carriers;
+//! - manifold B-rep topology with validation ([`BrepSolid`]), and primitives
+//!   ([`make_box_brep`], [`make_cylinder_brep`], [`make_sphere_brep`], ...);
+//! - booleans ([`boolean_operation`]), fillets and chamfers ([`fillet_edges`],
+//!   [`chamfer_edge`]), sweeps ([`sweep_profile_along_path`],
+//!   [`sweep_profile_helix`]), lofts including guide curves ([`loft_profile_brep`],
+//!   [`loft_profile_brep_on_guides`]), offsets ([`offset_shell`]) and thickening;
+//! - mass properties ([`solid_mass_properties`]) and watertight tessellation
+//!   ([`tessellate_brep_watertight`]);
+//! - STEP ([`import_step`], [`export_step`]), IGES ([`import_iges`],
+//!   [`export_iges`]), STL, OBJ and 3MF exchange;
+//! - a JSON feature-history pipeline ([`execute_history_json`]).
+//!
+//! Booleans, blends, sweeps and lofts refuse with a typed [`KernelRefusal`]
+//! rather than returning a wrong body; many other entry points return
+//! `Result<_, String>`.
+//!
+//! ```
+//! use brep_kernel::{
+//!     boolean_operation, make_box_brep, make_cylinder_brep, solid_mass_properties,
+//!     tessellate_brep_watertight, BooleanOperation, BooleanOptions, Vec3,
+//! };
+//!
+//! fn main() -> Result<(), String> {
+//!     // A 40 x 30 x 20 block with a vertical radius-8 hole through it.
+//!     let block = make_box_brep(Vec3::new(0.0, 0.0, 0.0), 40.0, 30.0, 20.0)?;
+//!     let hole = make_cylinder_brep(
+//!         Vec3::new(20.0, 15.0, -1.0), // base point
+//!         Vec3::new(0.0, 0.0, 1.0),    // axis direction
+//!         8.0,                         // radius
+//!         22.0,                        // height (through the block)
+//!     )?;
+//!     let part = boolean_operation(&block, &hole, BooleanOperation::Subtract, &BooleanOptions::default())
+//!         .map_err(|error| error.to_string())?;
+//!
+//!     // Mass properties integrated from the B-rep (no display mesh involved).
+//!     let props = solid_mass_properties(&part)?;
+//!     let expected = 40.0 * 30.0 * 20.0 - std::f64::consts::PI * 8.0 * 8.0 * 20.0;
+//!     assert!((props.volume - expected).abs() < 1e-6 * expected);
+//!
+//!     // Watertight display mesh at a 0.05 chord tolerance.
+//!     let mesh = tessellate_brep_watertight(&part, 0.05)?;
+//!     assert!(!mesh.indices.is_empty());
+//!     Ok(())
+//! }
+//! ```
+//!
+//! The crate README lists the capabilities in detail.
+
 
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -80,6 +134,7 @@ static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 static RUSTY_ALLOC: wall_profile::Allocator<rusty_alloc_api::RustyAlloc> = wall_profile::Allocator(rusty_alloc_api::RustyAlloc);
 
 mod profile;
+mod claim_slots;
 #[cfg(feature = "profile-wall")]
 mod wall_profile;
 #[cfg(not(feature = "profile-wall"))]
@@ -149,7 +204,7 @@ pub use blend::{
 mod fillet;
 pub use fillet::{
     chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,
-    chamfer_edges_asymmetric, fillet_edge, fillet_edges, fillet_edges_reported, fillet_edges_reported_at_offset,
+    chamfer_edges_asymmetric, fillet_edge, fillet_edge_conic, fillet_edges, fillet_edges_conic, fillet_edges_reported, fillet_edges_reported_at_offset,
     fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
     BlendSelection,
 };
@@ -198,7 +253,7 @@ pub use analytic_surface::{
 };
 pub(crate) use analytic_surface::{
     canonical_carriers_enabled, canonicalise_carriers, intersect_analytic_pair_with, ruled_gate,
-    ruled_gate_census, CanonicalReport, CanonicalRewrite, RuledGate,
+    ruled_gate_census, RuledGate,
 };
 #[path = "geometry/sphere_chart.rs"]
 mod sphere_chart;
@@ -246,6 +301,9 @@ pub use solid_sweep::{
 #[path = "construction/solid_sweep_caps.rs"]
 mod solid_sweep_caps;
 pub use solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, sweep_solid_tumbled, FrameCurve, RisingTurn, TwoTurns, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
+#[path = "geometry/curve_chain.rs"]
+mod curve_chain;
+pub use curve_chain::{join_curve_chain, split_surface};
 #[path = "geometry/closed_curves.rs"]
 mod closed_curves;
 pub use closed_curves::{make_ellipse, make_ellipse_arc, make_ellipsoid_brep, make_periodic_bspline};
@@ -255,9 +313,12 @@ pub use surface_faces::{face_from_surface, face_from_surface_trimmed, solid_from
 #[path = "construction/polygon_solids.rs"]
 mod polygon_solids;
 pub use polygon_solids::{make_pyramid_on_polygon, solid_from_polygons};
+#[path = "construction/loft_guide_chain.rs"]
+mod loft_guide_chain;
+pub use loft_guide_chain::loft_profile_brep_guided_chain;
 #[path = "construction/loft_guides.rs"]
 mod loft_guides;
-pub use loft_guides::{loft_profile_brep_on_guides, LOFT_ON_GUIDES_REFUSAL};
+pub use loft_guides::{loft_profile_brep_on_guide_chains, loft_profile_brep_on_guides, loft_profile_brep_on_loose_guide_chains, GuideLoftWall, LOFT_ON_GUIDES_REFUSAL};
 #[path = "construction/extrude_up_to.rs"]
 mod extrude_up_to;
 pub use extrude_up_to::{extrude_profile_up_to_face, solid_pieces, EXTRUDE_UP_TO_REFUSAL};
@@ -308,6 +369,8 @@ pub(crate) use loft_topology::loft_profile_brep_closed_shifted;
 mod transform_topology;
 #[path = "brep/recentre.rs"]
 mod recentre;
+#[path = "brep/rescale.rs"]
+mod rescale;
 pub use transform_topology::{mirror_brep, transform_brep, AffineTransform};
 #[path = "edit/split.rs"]
 mod split;
@@ -345,7 +408,7 @@ pub use watertight_tessellation::{
 #[path = "feature_pipeline/mod.rs"]
 pub mod feature_pipeline;
 pub use feature_pipeline::execute_history_json;
-pub use feature_pipeline::{first_reference_name, reference_names};
+pub use feature_pipeline::{first_reference_name, imported_solid_names, reference_names};
 // Transform Face's default pivot (the selection's boundary centre) over the
 // results of a replayed prefix, so the gizmo and the stored `pivot` agree with
 // the feature by construction.
@@ -777,7 +840,7 @@ pub use mesh_io::{
 #[path = "io/three_mf/mod.rs"]
 mod three_mf;
 pub use three_mf::{
-    read_3mf, write_3mf, ThreeMfError, ThreeMfInstance, ThreeMfMesh, ThreeMfReadResult,
+    read_3mf, write_3mf, write_3mf_meshes, ThreeMfBeam, ThreeMfBeamLattice, ThreeMfAppearance, ThreeMfTexture, ThreeMfError, ThreeMfInstance, ThreeMfMesh, ThreeMfReadResult,
     ThreeMfSolid, ThreeMfUnit, ThreeMfWriteReport,
 };
 // Binary glTF 2.0 of the DISPLAY mesh — tessellated exchange for viewers, with
@@ -831,9 +894,11 @@ pub use assembly_resolve::{
 #[path = "edit/direct_edit.rs"]
 mod direct_edit;
 pub use direct_edit::{
-    delete_face_and_heal, delete_faces_and_heal, draft_faces, draft_faces_parted, move_faces, offset_freeform_face,
-    offset_revolution_face, offset_ruled_face, offset_sphere_face, offset_torus_face,
-    recut_moved_planes, recut_moved_planes_rigid, reblend_lost_fillets, resolve_face_by_point, rotate_faces,
+    delete_face_and_heal, delete_faces_and_heal, draft_faces, draft_faces_parted, move_faces, move_faces_unchecked,
+    offset_freeform_face,
+    offset_revolution_face, offset_ruled_face, offset_ruled_face_unchecked, offset_sphere_face, offset_torus_face,
+    rebuild_displaced_blends, with_blend_rebuild_decline,
+    recut_moved_planes, recut_moved_planes_rigid, reblend_lost_fillets, resolve_face_by_point, rotate_faces, rotate_faces_unchecked,
     route_reading, RouteReading,
 };
 pub use direct_edit::{face_refusal_slugs, face_transform_reason, FaceTransformReason};

@@ -51,10 +51,6 @@ use rustc_hash::FxHashMap as HashMap;
 pub(in crate::boolean) struct VertexMove {
     pub vertex_id: u64,
     pub previous: Vec3,
-    /// The residual the vertex had to its worst carrier before the move.
-    pub residual_before: f64,
-    /// The worst residual to any incident carrier after the move.
-    pub residual_after: f64,
     /// Incident edges as they were: `(edge id, curve, t0, t1)`.
     pub edges: Vec<(u64, crate::NurbsCurve, f64, f64)>,
     /// Constructed-section trims refreshed from their re-snapped edge, as
@@ -875,8 +871,6 @@ pub(in crate::boolean) fn settle_vertices_onto_carriers_in(
         accepted.push(VertexMove {
             vertex_id,
             previous,
-            residual_before,
-            residual_after,
             edges,
             pcurves: Vec::new(),
         });

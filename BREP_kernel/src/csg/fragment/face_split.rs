@@ -2617,6 +2617,33 @@ fn fragment_face_arranged(
             face.same_sense
         );
     }
+    // Section pieces the arrangement bounded no region with: a piece that ends
+    // inside the face (the ruling along which a cylinder merely touches this
+    // wall) splits nothing, and the region's points are found from the region's
+    // boundary alone, so one can land on the piece itself, where the face
+    // touches the other body and reads as lying ON it.
+    let stray_pieces: Vec<Vec<Vec2>> = if stray_piece_clearance_enabled() {
+        let used: HashSet<u64> = regions
+            .iter()
+            .flat_map(|region| region.outer.iter().chain(region.holes.iter().flatten()))
+            .filter_map(|usage| tag_chain(&usage.piece.parent.tag))
+            .collect();
+        chains
+            .iter()
+            .enumerate()
+            .filter(|(index, chain)| matches!(chain.source, ChainSource::Cut { .. }) && !chain.segments.is_empty() && !used.contains(&(*index as u64)))
+            .map(|(_, chain)| {
+                // There and back: a closed path of no area, read as a hole's boundary.
+                let mut path: Vec<Vec2> = chain.segments.iter().map(|segment| segment.0).collect();
+                path.push(chain.segments[chain.segments.len() - 1].1);
+                let back: Vec<Vec2> = path[1..path.len() - 1].iter().rev().copied().collect();
+                path.extend(back);
+                path
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut fragments = Vec::new();
     for mut region in regions {
         super::loops::detach_touched_closed_boundaries(&mut region, &chains, arrangement_tolerance)?;
@@ -2625,7 +2652,11 @@ fn fragment_face_arranged(
             key: super::loops::region_topology_key(&region.outer, &region.holes),
         };
         let mut region_lap = profile.enabled.then(Instant::now);
-        let arranged: Vec<Vec2> = interior_points(&region.outer, &region.holes, region.area, 3);
+        let arranged: Vec<Vec2> = if stray_pieces.is_empty() {
+            interior_points(&region.outer, &region.holes, region.area, 3)
+        } else {
+            super::loops::interior_points_clear_of(&region.outer, &region.holes, &stray_pieces, region.area, 3)
+        };
         let interior_ms = profile.lap(&mut region_lap).as_secs_f64() * 1000.0;
         let candidates: Vec<Vec2> = arranged.iter().copied().map(wrap_back).collect();
         let Some(&test_uv) = candidates.first() else {
@@ -3036,6 +3067,13 @@ fn untouched_fragment(
 
 /// A point of `face`'s material beside its trim, with up to two more as
 /// extra test points, or `None` when no station of the ladder is owned.
+/// Keep a region's test points clear of the section pieces that end inside it
+/// (`BREP_FRAGMENT_STRAY_PIECE_CLEARANCE`, default on; `=0` reads the region's
+/// boundary alone).
+fn stray_piece_clearance_enabled() -> bool {
+    switch!("BREP_FRAGMENT_STRAY_PIECE_CLEARANCE", true)
+}
+
 fn trim_interior_probe(
     face: &FaceRecord,
     u: [f64; 2],

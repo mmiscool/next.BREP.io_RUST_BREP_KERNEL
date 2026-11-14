@@ -29,6 +29,21 @@ use crate::runner::{MeasureKind, MeasureQuery};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// The metadata key a solid's or face's transparency is stored under: a number
+/// from 0 (opaque) to 1 (clear), or the same as a percentage (`35%`).
+pub const TRANSPARENCY_METADATA_KEY: &str = "transparency";
+
+/// A `transparency` attribute's value as the OPACITY the display draws at
+/// (0 clear .. 1 opaque). `None` for anything that is not a number.
+pub fn transparency_opacity(value: &str) -> Option<f32> {
+    let text = value.trim();
+    let fraction = match text.strip_suffix('%') {
+        Some(percent) => percent.trim().parse::<f64>().ok()? / 100.0,
+        None => text.parse::<f64>().ok()?,
+    };
+    fraction.is_finite().then(|| (1.0 - fraction.clamp(0.0, 1.0)) as f32)
+}
+
 /// The default density (mass per unit volume) when an object carries no
 /// `density` metadata: unit density, so `weight == volume`.
 pub const DEFAULT_DENSITY: f64 = 1.0;
@@ -212,7 +227,8 @@ impl EngineState {
 
     /// Set (or overwrite) one metadata attribute of an object by NAME. String
     /// value; the well-known `density` key drives the object's weight and the
-    /// well-known `color` key drives its shaded colour.
+    /// well-known `color` key drives its shaded colour, and the well-known
+    /// `transparency` key (0 opaque .. 1 clear) how see-through it is.
     pub fn set_metadata_attribute(&mut self, name: &str, key: &str, value: &str) {
         self.metadata.set_attribute(name, key, value);
         // A metadata edit (notably `density`) feeds the object-info output but does
@@ -222,7 +238,21 @@ impl EngineState {
         // `color` is the one attribute the VIEWPORT reads, and there is no rerun
         // to carry it through — push it to the display right here so recolouring
         // a body is immediate.
-        if key == COLOR_METADATA_KEY {
+        if key == COLOR_METADATA_KEY || key == TRANSPARENCY_METADATA_KEY {
+            self.sync_colors_from_metadata();
+        }
+    }
+
+    /// [`Self::set_metadata_attribute`] for many `(name, value)` pairs under one
+    /// `key`, re-deriving the display colours once at the end rather than once
+    /// per object (an import colouring many bodies would otherwise walk the
+    /// whole scene for each).
+    pub fn set_metadata_attributes(&mut self, key: &str, pairs: &[(String, String)]) {
+        for (name, value) in pairs {
+            self.metadata.set_attribute(name, key, value);
+            self.info_cache.remove(name.as_str());
+        }
+        if !pairs.is_empty() && (key == COLOR_METADATA_KEY || key == TRANSPARENCY_METADATA_KEY) {
             self.sync_colors_from_metadata();
         }
     }
@@ -232,14 +262,15 @@ impl EngineState {
         let existed = self.metadata.remove_attribute(name, key);
         // Same rerun-less invalidation as `set_metadata_attribute`.
         self.info_cache.remove(name);
-        if existed && key == COLOR_METADATA_KEY {
+        if existed && (key == COLOR_METADATA_KEY || key == TRANSPARENCY_METADATA_KEY) {
             self.sync_colors_from_metadata();
         }
         existed
     }
 
     /// Re-derive the display scene's colours from the metadata store — the ONE
-    /// call that connects the durable `color` attribute to the renderer.
+    /// call that connects the durable `color` attribute to the renderer (and,
+    /// the same way, the `transparency` attribute).
     ///
     /// Every colour the viewport shows comes from here: a STEP import's stamped
     /// body/face colours, a colour typed or picked in the Info window, a colour
@@ -276,6 +307,18 @@ impl EngineState {
                 // wins, so a user may recolour the board like anything else.
                 .or_else(|| crate::engine_state::board_default_color(name))
         });
+        // `transparency` rides the same seam. It is not a colour, so the
+        // "override model colors" setting leaves it alone: a see-through body
+        // stays see-through in whatever colour the display gives it.
+        let changed = self.scene.apply_metadata_opacity(|name| {
+            metadata.attribute(name, TRANSPARENCY_METADATA_KEY).and_then(transparency_opacity)
+        }) || changed;
+        // An edge's own `color` and `transparency`: the stored attributes
+        // only (no board default), the colour hidden by the override.
+        let changed = self.scene.apply_metadata_edge_looks(
+            |name| if ignore { None } else { metadata.attribute(name, COLOR_METADATA_KEY).and_then(crate::style::parse_css_hex) },
+            |name| metadata.attribute(name, TRANSPARENCY_METADATA_KEY).and_then(transparency_opacity),
+        ) || changed;
         if changed {
             self.dirty = true;
         }
