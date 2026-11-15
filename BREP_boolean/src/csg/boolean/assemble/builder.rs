@@ -231,7 +231,7 @@ pub struct WeldCandidates {
 
 impl WeldCandidates {
     pub(super) fn for_assembly() -> Self {
-        Self { vertex_candidates: switch!("BREP_ASSEMBLY_VERTEX_INDEX", false).then(Default::default), ..Self::default() }
+        Self { vertex_candidates: switch!("BREP_ASSEMBLY_VERTEX_INDEX", true).then(Default::default), ..Self::default() }
     }
 
     fn push(&mut self, key: Option<(u8, u64)>) {
@@ -257,18 +257,49 @@ impl WeldCandidates {
     }
 }
 
-/// Broad phase over one coordinate of the append-only vertex records.
+/// Broad phase over the widest coordinate of the append-only vertex records.
+/// Reconsider the axis as the population doubles, rebuilding only when it
+/// changes; this keeps axis-aligned faces from collapsing into one bucket.
 /// Buckets only shortlist candidates; the original distance test and first
 /// insertion order still decide identity. Disabled before conformance can
 /// replace or move the records.
 #[derive(Default)]
 pub(super) struct VertexCandidates {
     indexed: usize,
+    axis: usize,
+    reconsider_at: usize,
     buckets: HashMap<i64, Vec<usize>>,
     unbucketed: Vec<usize>,
 }
 
 impl VertexCandidates {
+    fn coordinate(point: Vec3, axis: usize) -> f64 {
+        [point.x, point.y, point.z][axis]
+    }
+
+    fn reconsider_axis(&mut self, vertices: &[VertexRecord]) {
+        if vertices.len() < self.reconsider_at { return; }
+        let mut low = [f64::INFINITY; 3];
+        let mut high = [f64::NEG_INFINITY; 3];
+        for vertex in vertices {
+            for axis in 0..3 {
+                let value = Self::coordinate(vertex.point, axis);
+                if value.is_finite() { low[axis] = low[axis].min(value); high[axis] = high[axis].max(value); }
+            }
+        }
+        let mut axis = self.axis;
+        for candidate in 0..3 {
+            if high[candidate] - low[candidate] > high[axis] - low[axis] { axis = candidate; }
+        }
+        if axis != self.axis {
+            self.axis = axis;
+            self.indexed = 0;
+            self.buckets.clear();
+            self.unbucketed.clear();
+        }
+        self.reconsider_at = vertices.len().max(8).saturating_mul(2);
+    }
+
     fn key(x: f64, tolerance: f64) -> Option<i64> {
         let cell = 2.0 * tolerance;
         if !(cell.is_finite() && cell > 0.0) { return None; }
@@ -279,14 +310,15 @@ impl VertexCandidates {
     }
 
     fn first(&mut self, vertices: &[VertexRecord], point: Vec3, tolerance: f64) -> Option<u64> {
+        self.reconsider_axis(vertices);
         for (index, vertex) in vertices.iter().enumerate().skip(self.indexed) {
-            match Self::key(vertex.point.x, tolerance) {
+            match Self::key(Self::coordinate(vertex.point, self.axis), tolerance) {
                 Some(key) => self.buckets.entry(key).or_default().push(index),
                 None => self.unbucketed.push(index),
             }
         }
         self.indexed = vertices.len();
-        let Some(key) = Self::key(point.x, tolerance) else {
+        let Some(key) = Self::key(Self::coordinate(point, self.axis), tolerance) else {
             return vertices.iter().find(|v| v.point.sub(point).length() <= tolerance).map(|v| v.id);
         };
         let mut first = None;

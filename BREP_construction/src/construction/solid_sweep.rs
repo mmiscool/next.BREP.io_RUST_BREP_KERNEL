@@ -245,6 +245,20 @@ pub enum SweptTool {
         from: f64,
         to: f64,
     },
+    /// A bar: the region `section` bounds (curves end to end round a closed
+    /// loop, lying in the plane through `origin` square to `normal`), extended
+    /// along `normal` from height `from` to `to`. Its sides lean inward by
+    /// `draft` radians: at height `h` the section is the given one moved
+    /// inward by `h·tan(draft)` (outward where that is negative). Swept by a
+    /// screw about the clip's axis, whichever way the bar points.
+    Bar {
+        origin: Vec3,
+        normal: Vec3,
+        section: Vec<NurbsCurve>,
+        from: f64,
+        to: f64,
+        draft: f64,
+    },
 }
 
 /// One elementary motion, linear in the motion parameter `t`: a turn of
@@ -303,6 +317,23 @@ fn thread_rows_on() -> bool {
 /// sweep whose turns meet at a crest, built as the clip less what stays.
 fn whole_level_on() -> bool {
     crate::switch!("BREP_SWEEP_WHOLE_LEVEL", true)
+}
+
+/// `BREP_SWEEP_SCREW_CARRY` (default off; `=1` on): every screw sweep's walls
+/// are carried along the screw to high order, as a bar's and a crest's already
+/// are, instead of lofted as a cubic through 64 sections a turn (which stands
+/// r·h⁴/384 off the screw: 1e-6 at a groove's floor).
+fn screw_carry_on() -> bool {
+    crate::switch!("BREP_SWEEP_SCREW_CARRY", false)
+}
+
+/// `BREP_SWEEP_APEX_TIP` (default off; `=1` on): a point of a solid of
+/// revolution on its own axis (a cone's apex) is a critical point of the faces
+/// that meet there. It revolves into nothing, so no edge carries it, and a
+/// groove whose tip it cuts was ended where bisection first saw the level's
+/// contour (3.5e-7 short of a cone point's tip) instead of at the point itself.
+fn apex_tip_on() -> bool {
+    crate::switch!("BREP_SWEEP_APEX_TIP", false)
 }
 
 fn refuse(what: &'static str, message: String) -> KernelRefusal {
@@ -376,6 +407,12 @@ enum Source {
     /// high end, parameter s. An end cap itself maps one-to-one into the reduced
     /// plane (polar coordinates at a fixed height), so only its rim can bound.
     ScrewPrismRim { piece: usize, end: bool },
+    /// A bar's side on section curve `piece`, at its own place: (s ∈ [0,1], height).
+    BarSide { piece: usize },
+    /// A bar's upright edge at the start of section curve `piece`, parameter height.
+    BarEdge { piece: usize },
+    /// A bar's section curve `piece` at its low (`end = false`) or high end, parameter s.
+    BarRim { piece: usize, end: bool },
 }
 
 struct Engine<'a> {
@@ -385,6 +422,8 @@ struct Engine<'a> {
     frame: Frame,
     class: Class,
     clip: &'a SweepClip,
+    /// The tool as a bar, where it is swept as one.
+    bar: Option<crate::solid_sweep_bar::Bar>,
     /// The clip was narrowed to a crest level: below it some material is left.
     crest_gap: bool,
     sources: Vec<Source>,
@@ -464,7 +503,11 @@ impl<'a> Engine<'a> {
     }
 
     fn tool_signed_distance(&self, x: Vec3) -> f64 {
+        if let Some(bar) = &self.bar {
+            return bar.signed_distance(x);
+        }
         match self.tool {
+            SweptTool::Bar { .. } => f64::INFINITY,
             SweptTool::Revolved { axis_origin, axis_direction, meridian, .. } => {
                 let axis = axis_direction.normalized_or(*axis_direction);
                 let d = x.sub(*axis_origin);
@@ -487,7 +530,16 @@ impl<'a> Engine<'a> {
     /// The world point of a source at its parameters (at the tool's own place
     /// for revolved tools; carried by the motion for prisms).
     fn source_point(&self, source: Source, u: f64, v: f64) -> Vec3 {
+        if let Some(bar) = &self.bar {
+            match source {
+                Source::BarSide { piece } => return bar.side(piece, u, v),
+                Source::BarEdge { piece } => return bar.joint(piece, u),
+                Source::BarRim { piece, end } => return bar.side(piece, u, if end { bar.to } else { bar.from }),
+                _ => {}
+            }
+        }
         match (self.tool, source) {
+            (SweptTool::Bar { origin, .. }, _) => *origin,
             (SweptTool::Revolved { axis_origin, axis_direction, radial, meridian }, _) => {
                 let axis = axis_direction.normalized_or(*axis_direction);
                 let r0 = radial.sub(axis.scale(radial.dot(axis))).normalized_or(*radial);
@@ -538,7 +590,7 @@ impl<'a> Engine<'a> {
     }
 
     fn is_face(source: Source) -> bool {
-        matches!(source, Source::RevolvedFace { .. } | Source::PrismFace { .. } | Source::ScrewPrismSide { .. })
+        matches!(source, Source::RevolvedFace { .. } | Source::PrismFace { .. } | Source::ScrewPrismSide { .. } | Source::BarSide { .. })
     }
 
     /// Parameter domain of a source: (u range, v range, v periodic).
@@ -553,11 +605,18 @@ impl<'a> Engine<'a> {
             Source::ScrewPrismSide { .. } => ([0.0, 1.0], self.prism_extent(), false),
             Source::ScrewPrismEdge { .. } => (self.prism_extent(), [0.0, 0.0], false),
             Source::ScrewPrismRim { .. } => ([0.0, 1.0], [0.0, 0.0], false),
+            Source::BarSide { .. } => ([0.0, 1.0], self.prism_extent(), false),
+            Source::BarEdge { .. } => (self.prism_extent(), [0.0, 0.0], false),
+            Source::BarRim { .. } => ([0.0, 1.0], [0.0, 0.0], false),
         }
     }
 
     fn prism_extent(&self) -> [f64; 2] {
+        if let Some(bar) = &self.bar {
+            return [bar.from, bar.to];
+        }
         match self.tool {
+            SweptTool::Bar { from, to, .. } => [*from, *to],
             SweptTool::Prism { from, to, .. } => [*from, *to],
             SweptTool::Revolved { .. } => [0.0, 0.0],
         }
@@ -567,6 +626,7 @@ impl<'a> Engine<'a> {
     /// outline, which has no corner to bound it)?
     fn u_periodic(&self, source: Source) -> bool {
         match (self.tool, source) {
+            (_, Source::BarSide { .. }) => self.bar.as_ref().is_some_and(|bar| bar.periodic),
             (SweptTool::Revolved { meridian, .. }, Source::RevolvedFace { piece }) => meridian[piece].is_full_circle(),
             (SweptTool::Prism { outline, .. }, Source::PrismFace { piece } | Source::ScrewPrismSide { piece }) => outline[piece].is_full_circle(),
             _ => false,
@@ -661,6 +721,7 @@ impl<'a> Engine<'a> {
         let (nu, nv) = match source {
             Source::RevolvedFace { .. } => (64, 256),
             Source::ScrewPrismSide { .. } => (64, 64),
+            Source::BarSide { .. } => (128, 64),
             _ => {
                 let turn = self
                     .motion
@@ -805,7 +866,12 @@ impl<'a> Engine<'a> {
             let (range, _, _) = self.domain(source);
             let periodic = matches!(source, Source::RevolvedCorner { .. });
             let n = match source {
-                Source::RevolvedCorner { .. } | Source::PrismEnd { .. } | Source::ScrewPrismEdge { .. } | Source::ScrewPrismRim { .. } => 1024,
+                Source::RevolvedCorner { .. }
+                | Source::PrismEnd { .. }
+                | Source::ScrewPrismEdge { .. }
+                | Source::ScrewPrismRim { .. }
+                | Source::BarEdge { .. }
+                | Source::BarRim { .. } => 1024,
                 _ => self.grids_len_for_time(),
             };
             let _ = periodic;
@@ -1372,17 +1438,19 @@ fn same_or_bounding(engine: &Engine, a: usize, b: usize) -> bool {
     if a == b {
         return true;
     }
-    let pieces = match engine.tool {
-        SweptTool::Revolved { meridian, .. } => meridian.len(),
-        SweptTool::Prism { outline, .. } => outline.len(),
+    let pieces = match (&engine.bar, engine.tool) {
+        (Some(bar), _) => bar.piece_count(),
+        (None, SweptTool::Revolved { meridian, .. }) => meridian.len(),
+        (None, SweptTool::Prism { outline, .. }) => outline.len(),
+        (None, SweptTool::Bar { section, .. }) => section.len(),
     };
     // (piece of the face, piece whose start the edge is)
     let face = |s: Source| match s {
-        Source::RevolvedFace { piece } | Source::PrismFace { piece } | Source::ScrewPrismSide { piece } => Some(piece),
+        Source::RevolvedFace { piece } | Source::PrismFace { piece } | Source::ScrewPrismSide { piece } | Source::BarSide { piece } => Some(piece),
         _ => None,
     };
     let edge = |s: Source| match s {
-        Source::RevolvedCorner { piece } | Source::PrismVertex { piece } | Source::ScrewPrismEdge { piece } => Some(piece),
+        Source::RevolvedCorner { piece } | Source::PrismVertex { piece } | Source::ScrewPrismEdge { piece } | Source::BarEdge { piece } => Some(piece),
         _ => None,
     };
     let (sa, sb) = (engine.sources[a], engine.sources[b]);
@@ -1509,7 +1577,23 @@ pub fn sweep_solid_within(
         let offset = origin.sub(clip.axis_origin);
         parallel && offset.sub(ez.scale(offset.dot(ez))).length() < 1e-9 * (1.0 + clip.radius[1])
     };
+    // One screw about the clip's axis, as its axial advance per radian about +ez.
+    let screw_about_clip = || -> Option<f64> {
+        let step = motion.steps.first()?;
+        (motion.steps.len() == 1 && step.turn != 0.0 && step.advance != 0.0 && on_axis(step.axis_origin, axes[0])).then(|| {
+            let sense = axes[0].dot(ez).signum();
+            (step.advance * sense) / (step.turn * sense)
+        })
+    };
+    let mut bar: Option<crate::solid_sweep_bar::Bar> = None;
     let class = 'class: { match tool {
+        SweptTool::Bar { origin, normal, section, from, to, draft } => {
+            let Some(c) = screw_about_clip() else {
+                return Err(refuse("motion_class", "a bar is swept here only by one screw about the clip's axis".into()));
+            };
+            bar = Some(crate::solid_sweep_bar::Bar::new(*origin, *normal, section, *from, *to, *draft)?);
+            Class::Screw(c)
+        }
         SweptTool::Revolved { meridian, .. } => {
             validate_outline(meridian, "meridian")?;
             if motion.steps.len() != 1 || !on_axis(motion.steps[0].axis_origin, axes[0]) {
@@ -1530,7 +1614,7 @@ pub fn sweep_solid_within(
                 Class::Screw((step.advance * sense) / (step.turn * sense))
             }
         }
-        SweptTool::Prism { normal, outline, from, to, origin, .. } => {
+        SweptTool::Prism { normal, outline, from, to, origin, x_axis } => {
             validate_outline(outline, "prism")?;
             let n = normal.normalized().or_refuse(KernelStage::Collect, "prism_normal")?;
             let screw = motion.steps.len() == 1
@@ -1545,6 +1629,24 @@ pub fn sweep_solid_within(
                 break 'class Class::Screw((step.advance * sense) / (step.turn * sense));
             }
             if n.cross(ez).length() > 1e-12 {
+                // Across the screw's axis the prism is a bar with no draft.
+                if let Some(c) = screw_about_clip() {
+                    let xa = x_axis.sub(n.scale(x_axis.dot(n))).normalized().or_refuse(KernelStage::Collect, "prism_x_axis")?;
+                    let ya = n.cross(xa);
+                    let at = |q: [f64; 2]| origin.add(xa.scale(q[0])).add(ya.scale(q[1]));
+                    let mut section = Vec::with_capacity(outline.len());
+                    for piece in outline {
+                        section.push(match *piece {
+                            OutlinePiece::Line { from, to } => make_line(at(from), at(to)),
+                            // an arc run clockwise is one run the other way about the mirrored axis
+                            OutlinePiece::Arc { centre, radius, start, end } if end >= start => make_arc(at(centre), xa, ya, radius, start, end),
+                            OutlinePiece::Arc { centre, radius, start, end } => make_arc(at(centre), xa, ya.scale(-1.0), radius, -start, -end),
+                        }
+                        .or_refuse(KernelStage::Collect, "prism_outline")?);
+                    }
+                    bar = Some(crate::solid_sweep_bar::Bar::new(*origin, n, &section, *from, *to, 0.0)?);
+                    break 'class Class::Screw(c);
+                }
                 return Err(refuse("motion_class", "a prism is swept here only along its own direction's clip axis".into()));
             }
             for (step, axis) in motion.steps.iter().zip(&axes) {
@@ -1571,6 +1673,15 @@ pub fn sweep_solid_within(
             Class::Planar
         }
     } };
+    // A leaning end face folds into a wall of its own, which is not built.
+    if let (Some(bar), Class::Screw(c)) = (&bar, class) {
+        if bar.end_folds(clip.axis_origin, ez, c, clip.radius) {
+            return Err(refuse(
+                "bar_end_fold",
+                "an end face of the bar leans to the screw's axis and folds inside the clip region, a wall this construction does not build".into(),
+            ));
+        }
+    }
     let prism_height = match tool {
         SweptTool::Prism { from, to, .. } => 0.5 * (from + to),
         _ => 0.0,
@@ -1581,6 +1692,7 @@ pub fn sweep_solid_within(
     // turns 540°, which its half-turn symmetry makes a whole period). The
     // permutation says which piece continues which across the wrap.
     let wrap: Option<Vec<usize>> = match tool {
+        SweptTool::Bar { .. } => None,
         SweptTool::Prism { .. } if matches!(class, Class::Screw(_)) => None,
         SweptTool::Prism { origin, normal, x_axis, outline, .. } => {
             let probe = Engine {
@@ -1590,6 +1702,7 @@ pub fn sweep_solid_within(
                 frame,
                 class,
                 clip,
+                bar: None,
                 crest_gap: false,
                 sources: Vec::new(),
                 grids: Vec::new(),
@@ -1627,6 +1740,18 @@ pub fn sweep_solid_within(
     let periodic_motion = wrap.is_some();
     let mut sources = Vec::new();
     match tool {
+        _ if bar.is_some() => {
+            let bar = bar.as_ref().expect("bar");
+            for piece in 0..bar.piece_count() {
+                sources.push(Source::BarSide { piece });
+                if !bar.periodic {
+                    sources.push(Source::BarEdge { piece });
+                }
+                sources.push(Source::BarRim { piece, end: false });
+                sources.push(Source::BarRim { piece, end: true });
+            }
+        }
+        SweptTool::Bar { .. } => {}
         SweptTool::Revolved { meridian, .. } => {
             // A piece lying on the axis revolves into nothing, and a corner on the
             // axis into a point: neither bounds the tool.
@@ -1672,6 +1797,7 @@ pub fn sweep_solid_within(
         frame,
         class,
         clip,
+        bar,
         crest_gap: false,
         sources,
         grids: Vec::new(),
@@ -1692,6 +1818,23 @@ pub fn sweep_solid_within(
     let critical: Vec<_> = (0..engine.sources.len()).map(|k| engine.source_critical(k)).collect();
     engine.critical_params = critical.iter().map(|c| c.1.clone()).collect();
     engine.critical = critical.into_iter().map(|c| c.0).collect();
+    if let (SweptTool::Revolved { axis_origin, axis_direction, meridian, .. }, true) = (tool, apex_tip_on()) {
+        let axis = axis_direction.normalized_or(*axis_direction);
+        let count = meridian.len();
+        for piece in 0..count {
+            let corner = meridian[piece].point(0.0);
+            if corner[0].abs() > 1e-12 * scale_of(meridian) {
+                continue;
+            }
+            let apex = engine.reduce(engine.frame.local(axis_origin.add(axis.scale(corner[1]))));
+            // the faces on either side of the corner
+            for neighbour in [piece, (piece + count - 1) % count] {
+                if let Some(index) = engine.sources.iter().position(|source| matches!(source, Source::RevolvedFace { piece } if *piece == neighbour)) {
+                    engine.critical[index].push(apex);
+                }
+            }
+        }
+    }
 
     // --- Ends: a screw or turn must not reach the clip at either end.
     if matches!(class, Class::Screw(_) | Class::Turn) {
@@ -2098,7 +2241,9 @@ fn carry_along_screw(body: &mut BrepSolid, engine: &Engine, c: f64, span: f64, s
     for edge in &mut body.edges {
         let (from, to) = (points[&edge.start_vertex_id], points[&edge.end_vertex_id]);
         let rise = to.sub(from).dot(ez);
-        if (rise.abs() - height.abs()).abs() > tolerance {
+        // An edge in a cap rises nothing, a carried one the whole height: told apart
+        // well inside the height itself, however short the clip against its radius.
+        if (rise.abs() - height.abs()).abs() > tolerance.min(0.25 * height.abs()) {
             continue; // lies in a cap
         }
         let domain = edge.curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
@@ -2635,6 +2780,9 @@ fn sample_band(
                 }
             }
         }
+        if std::env::var("BREP_DEBUG_SOLID_SWEEP").is_ok() {
+            eprintln!("  band {a:.9}..{b:.9} n {n} worst {worst:.3e} at {worst_at:?}");
+        }
         if n >= n_cap && worst > 1e-6 * engine.scale {
             return Err(refuse(
                 "fit_tolerance",
@@ -2940,10 +3088,14 @@ fn build_body(engine: &Engine, pieces: &[Piece]) -> Result<BrepSolid, KernelRefu
         Class::Screw(c) => {
             let span = (clip.axial[1] - clip.axial[0]) / c; // radians of screw
             // Over a crest the walls are re-carried below to high order, so 12 a turn is enough.
-            let per_turn = if engine.crest_gap { 12.0 } else { 64.0 };
+            // A bar's walls are carried to high order too: a cubic through 64
+            // sections a turn stands r·h⁴/384 off the screw (1e-6 at a groove's
+            // floor), the quintic through 48 below 1e-9.
+            let carried = engine.crest_gap || engine.bar.is_some() || screw_carry_on();
+            let per_turn = if engine.crest_gap { 12.0 } else if carried { 48.0 } else { 64.0 };
             // Every turn is the screw image of the first: build one and stack
             // copies, so no surface or edge runs the thread's whole length.
-            let rows = if engine.crest_gap && thread_rows_on() { (span.abs() / TAU / TURNS_PER_ROW).round().max(1.0) as usize } else { 1 };
+            let rows = if carried && thread_rows_on() { (span.abs() / TAU / TURNS_PER_ROW).round().max(1.0) as usize } else { 1 };
             let span = span / rows as f64;
             let sections = ((span.abs() / TAU * per_turn).ceil() as usize).max(8) + 1;
             let mut lofted = Vec::with_capacity(sections);
@@ -2957,7 +3109,7 @@ fn build_body(engine: &Engine, pieces: &[Piece]) -> Result<BrepSolid, KernelRefu
                 lofted.push(moved);
             }
             let mut body = loft_profile_brep(&lofted)?;
-            if engine.crest_gap {
+            if carried {
                 carry_along_screw(&mut body, engine, c, span, sections - 1)?;
             }
             if rows > 1 {

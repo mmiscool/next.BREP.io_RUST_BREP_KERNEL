@@ -115,6 +115,10 @@ pub mod revolved_parallel;
 mod rim_witness;
 #[path = "offset_shell/tangent_rim_cuts.rs"]
 mod tangent_rim_cuts;
+#[path = "offset_shell/opening_surface_cut.rs"]
+mod opening_surface_cut;
+#[path = "offset_shell/outward_side_widen.rs"]
+mod outward_side_widen;
 
 pub use carrier_rebuild::*;
 pub use carriers::*;

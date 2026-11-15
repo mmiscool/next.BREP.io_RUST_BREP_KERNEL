@@ -4882,6 +4882,11 @@ impl Editor {
                 let ring: Vec<Pos2> = shape.outline(16).into_iter().map(|p| view.screen(p)).collect();
                 painter.add(egui::Shape::convex_polygon(ring, color, Stroke::NONE));
             }
+            // A trapezoid or custom pad, which may turn inward.
+            Shape::Polygon { .. } => {
+                let ring: Vec<Pos2> = shape.outline(16).into_iter().map(|p| view.screen(p)).collect();
+                paint_filled(painter, &ring, color);
+            }
             Shape::Capsule { a, b, radius } => {
                 let r = view.px(radius).max(0.5);
                 let (a, b) = (view.screen(a), view.screen(b));

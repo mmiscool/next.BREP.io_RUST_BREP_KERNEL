@@ -4,7 +4,7 @@ use crate::editor_core::EditorCore;
 use crate::actions::{Action, ActionGroup, action, command, key};
 use crate::board_view::{BACKGROUND, SILK, THROUGH_HOLE, WARNING, layer_color};
 use crate::symbol_editor::{InspectorHits, LIST_SHARE, grip_under, key_word, list_height};
-use brep_ecad_core::board::{COURTYARD_MARGIN, DesignRules, Footprint, Pad, PadShape, Shape};
+use brep_ecad_core::board::{COURTYARD_MARGIN, DesignRules, Footprint, Pad, PadShape, PasteWindows, Shape};
 use brep_ecad_core::graphic::{GraphicLayer, GraphicShape, LayerGraphic};
 use crate::board_view::graphic_color;
 
@@ -1052,14 +1052,22 @@ impl FootprintEditor {
             self.footprint.graphics.push(graphic);
             return;
         }
-        if let Some((at, size, shape)) = silk_as_pad(&self.footprint.silk[i]) {
+        let as_pad = silk_as_pad(&self.footprint.silk[i]).map(|(at, size, shape)| (at, size, shape, vec![])).or_else(|| {
+            silk_as_custom_pad(&self.footprint.silk[i]).map(|(at, polygon)| {
+                let (lo, hi) = polygon.iter().fold((polygon[0], polygon[0]), |(lo, hi), p| {
+                    (Point::new(lo.x.min(p.x), lo.y.min(p.y)), Point::new(hi.x.max(p.x), hi.y.max(p.y)))
+                });
+                (at, Point::new(hi.x - lo.x, hi.y - lo.y), PadShape::Custom, polygon)
+            })
+        });
+        if let Some((at, size, shape, polygon)) = as_pad {
             let number = self
                 .missing_pins()
                 .first()
                 .map(|pin| (*pin).to_owned())
                 .unwrap_or_else(|| self.next_number());
             let make = ui.button(format!("Make this a pad on pin {number}")).on_hover_text(
-                "Replaces this outline with copper of the same size and place. Offered for a rectangle or a circle, which are the two shapes a pad comes in.",
+                "Replaces this outline with copper of the same size and place: a rectangle or circle pad, or a custom polygon pad for any other closed outline.",
             );
             self.inspector.mark("make_pad", &make);
             if make.clicked() {
@@ -1076,6 +1084,8 @@ impl FootprintEditor {
                     corner_radius: 0,
                     back: false,
                     layers: Default::default(),
+                    trapezoid_delta: Default::default(),
+                    polygon,
                 });
                 return;
             }
@@ -1199,6 +1209,8 @@ impl FootprintEditor {
             (PadShape::RoundRect, "round_rect", shape_name(PadShape::RoundRect)),
             (PadShape::Circle, "circle", shape_name(PadShape::Circle)),
             (PadShape::Oval, "oval", shape_name(PadShape::Oval)),
+            (PadShape::Trapezoid, "trapezoid", shape_name(PadShape::Trapezoid)),
+            (PadShape::Custom, "custom", shape_name(PadShape::Custom)),
         ];
         ui.horizontal(|ui| {
             hits.enum_dropdown(ui, "shape", &choices, &mut pad.shape);
@@ -1216,13 +1228,35 @@ impl FootprintEditor {
             pad.back = false;
         }
         point_fields(ui, hits, "Position", &mut pad.at);
-        ui.label("Size");
-        mm_field(ui, hits, "Width", &mut pad.size.x, 0.01..=100.);
-        mm_field(ui, hits, "Height", &mut pad.size.y, 0.01..=100.);
         if pad.shape != was_shape {
             // A pad made a rounded rectangle starts at a quarter of its short
             // side; one made anything else drops the radius it no longer uses.
             pad.corner_radius = if pad.shape == PadShape::RoundRect { pad.size.x.min(pad.size.y) / 4 } else { 0 };
+            // A trapezoid starts with its bottom a quarter of the width longer
+            // than its top; a custom pad starts as the box the pad filled, its
+            // corners then moved one by one.
+            pad.trapezoid_delta =
+                if pad.shape == PadShape::Trapezoid { Point::new(0, pad.size.x / 4) } else { Point::default() };
+            pad.polygon = if pad.shape == PadShape::Custom {
+                let (x, y) = (pad.size.x / 2, pad.size.y / 2);
+                vec![Point::new(-x, -y), Point::new(x, -y), Point::new(x, y), Point::new(-x, y)]
+            } else {
+                vec![]
+            };
+        }
+        if pad.shape == PadShape::Custom {
+            custom_pad_fields(ui, hits, pad);
+        } else {
+            ui.label("Size");
+            mm_field(ui, hits, "Width", &mut pad.size.x, 0.01..=100.);
+            mm_field(ui, hits, "Height", &mut pad.size.y, 0.01..=100.);
+        }
+        if pad.shape == PadShape::Trapezoid {
+            ui.label("Taper").on_hover_text(
+                "X lengthens the left side and shortens the right by as much; Y lengthens the bottom and shortens the top. Taper one pair of sides only.",
+            );
+            mm_field(ui, hits, "Taper X", &mut pad.trapezoid_delta.x, -100. ..=100.);
+            mm_field(ui, hits, "Taper Y", &mut pad.trapezoid_delta.y, -100. ..=100.);
         }
         if pad.shape == PadShape::RoundRect {
             // Up to half the short side, or the stored radius if a resize left
@@ -1321,15 +1355,47 @@ impl FootprintEditor {
                 } else {
                     layers.paste_margin = None;
                 }
+                let mut windowed = layers.paste_windows.is_some();
+                let check = ui.checkbox(&mut windowed, "Windowpane paste").on_hover_text(
+                    "Split the paste into a grid of smaller windows, as a large thermal pad's is, so the part does not float on one deposit. A window that would leave the pad is not cut.",
+                );
+                hits.mark("paste_windows", &check);
+                if windowed {
+                    let mut windows = layers.paste_windows.unwrap_or(PasteWindows { columns: 2, rows: 2, gap: 200 });
+                    for (key, label, n) in [("paste_columns", "Columns", &mut windows.columns), ("paste_rows", "Rows", &mut windows.rows)] {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            let field = ui.add(egui::DragValue::new(n).range(1..=20));
+                            hits.mark(key, &field);
+                        });
+                    }
+                    mm_field(ui, hits, "Window gap", &mut windows.gap, 0. ..=10.);
+                    layers.paste_windows = Some(windows);
+                } else {
+                    layers.paste_windows = None;
+                }
+            } else {
+                layers.paste_windows = None;
             }
         } else if kind != was_kind {
             layers.no_paste = false;
             layers.paste_margin = None;
+            layers.paste_windows = None;
         }
         let rotate = ui.button("Rotate pad 90°");
         hits.mark("rotate", &rotate);
         if rotate.clicked() {
             pad.size = Point::new(pad.size.y, pad.size.x);
+            // A quarter turn, (x, y) to (-y, x): a trapezoid's taper and a
+            // custom pad's corners turn with it.
+            pad.trapezoid_delta = Point::new(pad.trapezoid_delta.y, -pad.trapezoid_delta.x);
+            for p in &mut pad.polygon {
+                *p = Point::new(-p.y, p.x);
+            }
+            // A windowpane's columns run where its rows did.
+            if let Some(windows) = pad.layers.paste_windows.as_mut() {
+                (windows.columns, windows.rows) = (windows.rows, windows.columns);
+            }
             // A slot turns with its pad.
             if let (Some(width), Some(height)) = (pad.drill, pad.drill_height) {
                 (pad.drill, pad.drill_height) = (Some(height), Some(width));
@@ -1594,6 +1660,19 @@ impl FootprintEditor {
                     painter.add(egui::Shape::closed_line(ring, stroke));
                 }
             }
+            // A trapezoid or custom pad, which may turn inward: filled by ear
+            // clipping, its outline the polygon grown past the edge.
+            Shape::Polygon { .. } => {
+                if let Some(fill) = fill {
+                    let ring: Vec<Pos2> = shape.outline(16).into_iter().map(screen).collect();
+                    crate::board_view::paint_filled(&painter, &ring, fill);
+                }
+                if let Some(stroke) = outline {
+                    let reach = ((grow + stroke.width / 2.) / zoom).round() as i32;
+                    let ring: Vec<Pos2> = shape.grown(reach).outline(16).into_iter().map(screen).collect();
+                    painter.add(egui::Shape::closed_line(ring, stroke));
+                }
+            }
             Shape::Rect { min, max } | Shape::RoundRect { min, max, .. } => {
                 let r = Rect::from_two_pos(screen(min), screen(max));
                 let corner = match shape {
@@ -1639,7 +1718,7 @@ impl FootprintEditor {
                 (Some(_), true) => Some(THROUGH_HOLE),
                 (Some(_), false) => None,
             };
-            paint_shape(shape, fill, None, 0.);
+            paint_shape(shape.clone(), fill, None, 0.);
             if let Some(hole) = pad.local_hole() {
                 let edge = (!pad.plated).then(|| Stroke::new(1., SILK));
                 paint_shape(hole, Some(BACKGROUND), edge, 0.);
@@ -1654,7 +1733,7 @@ impl FootprintEditor {
             // it measures 6.65:1 against the ground, and the selection's outline
             // fills the gap inside it.
             if let Some(colour) = link_ring(self.link(pad)) {
-                paint_shape(shape, None, Some(Stroke::new(RING_WIDTH, colour)), RING_GAP);
+                paint_shape(shape.clone(), None, Some(Stroke::new(RING_WIDTH, colour)), RING_GAP);
             }
             if self.core.selected == Some(Item::Pad(i)) {
                 paint_shape(shape, None, Some(Stroke::new(2., ACCENT)), 0.);
@@ -1814,6 +1893,8 @@ impl FootprintEditor {
                     corner_radius: 0,
                     back: false,
                     layers: Default::default(),
+                    trapezoid_delta: Default::default(),
+                    polygon: vec![],
                 });
             }
             DrawTool::Line | DrawTool::Rectangle | DrawTool::Circle | DrawTool::Arc | DrawTool::Text
@@ -2165,7 +2246,74 @@ fn shape_name(shape: PadShape) -> &'static str {
         PadShape::RoundRect => "Rounded rectangle",
         PadShape::Circle => "Circle",
         PadShape::Oval => "Oval",
+        PadShape::Trapezoid => "Trapezoid",
+        PadShape::Custom => "Custom polygon",
     }
+}
+/// A custom pad's corners, each moved by its two fields, removed while more
+/// than three remain, or added halfway along the edge that follows it, and the
+/// rounding of its outline. The pad's size follows its corners.
+fn custom_pad_fields(ui: &mut egui::Ui, hits: &mut InspectorHits, pad: &mut Pad) {
+    ui.label("Corners").on_hover_text("Relative to the pad's position, which the copper must cover.");
+    let n = pad.polygon.len();
+    let (mut remove, mut add) = (None, None);
+    for k in 0..n {
+        ui.push_id(("corner", k), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(format!("{}", k + 1));
+                let p = &mut pad.polygon[k];
+                for (axis, v) in [("x", &mut p.x), ("y", &mut p.y)] {
+                    let mut mm = f64::from(*v) / 1000.;
+                    let field = ui.add(egui::DragValue::new(&mut mm).speed(0.01).range(-1000. ..=1000.).max_decimals(3).suffix(" mm"));
+                    hits.mark(format!("corner:{}:{axis}", k + 1), &field);
+                    if field.changed() {
+                        *v = (mm * 1000.).round() as i32;
+                    }
+                }
+                let insert = ui.small_button("+").on_hover_text("Add a corner halfway to the next");
+                hits.mark(format!("corner:{}:add", k + 1), &insert);
+                if insert.clicked() {
+                    add = Some(k);
+                }
+                let delete = ui.add_enabled(n > 3, egui::Button::new("−").small()).on_hover_text("Remove this corner");
+                hits.mark(format!("corner:{}:remove", k + 1), &delete);
+                if delete.clicked() {
+                    remove = Some(k);
+                }
+            });
+        });
+    }
+    if let Some(k) = add {
+        let (a, b) = (pad.polygon[k], pad.polygon[(k + 1) % n]);
+        let mid = Point::new(((i64::from(a.x) + i64::from(b.x)) / 2) as i32, ((i64::from(a.y) + i64::from(b.y)) / 2) as i32);
+        pad.polygon.insert(k + 1, mid);
+    } else if let Some(k) = remove {
+        pad.polygon.remove(k);
+    }
+    mm_field(ui, hits, "Rounding", &mut pad.corner_radius, 0. ..=100.);
+    if let Some(problem) = pad.outline_problem() {
+        ui.colored_label(ui.visuals().warn_fg_color, format!("This pad {problem}."));
+    }
+    if let (Some(lo), Some(hi)) = (
+        pad.polygon.iter().copied().reduce(|a, b| Point::new(a.x.min(b.x), a.y.min(b.y))),
+        pad.polygon.iter().copied().reduce(|a, b| Point::new(a.x.max(b.x), a.y.max(b.y))),
+    ) {
+        pad.size = Point::new((hi.x - lo.x).max(1), (hi.y - lo.y).max(1));
+    }
+}
+/// A closed outline that is no rectangle or circle as a custom pad: its
+/// position a point inside it and its corners about that point. `None` for an
+/// open line or one that is not a simple polygon.
+fn silk_as_custom_pad(line: &[Point]) -> Option<(Point, Vec<Point>)> {
+    let (first, last) = (*line.first()?, *line.last()?);
+    if line.len() < 4 || first != last {
+        return None;
+    }
+    let ring = &line[..line.len() - 1];
+    let at = brep_ecad_core::board::polygon_inner_point(ring);
+    let mut pad = Pad::smd("", at, Point::new(1, 1), PadShape::Custom);
+    pad.polygon = ring.iter().map(|p| Point::new(p.x - at.x, p.y - at.y)).collect();
+    pad.outline_problem().is_none().then_some((at, pad.polygon))
 }
 /// The smallest copper gap between two pads the editor passes without a
 /// warning: the board's default clearance, 0.2 mm, which the board's design

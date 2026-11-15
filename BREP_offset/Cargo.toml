@@ -1,6 +1,6 @@
 [package]
 name = "BREP_offset"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "Solid offsets, shells and thickening of the BREP kernel."
@@ -26,12 +26,12 @@ include = [
 name = "brep_offset"
 
 [dependencies]
-BREP_geometry = { version = "0.20.0", path = "../BREP_geometry" }
-BREP_topology = { version = "0.20.0", path = "../BREP_topology" }
-BREP_surface_offset = { version = "0.20.0", path = "../BREP_surface_offset" }
-BREP_boolean = { version = "0.20.0", path = "../BREP_boolean" }
-BREP_construction = { version = "0.20.0", path = "../BREP_construction" }
-BREP_blend = { version = "0.20.0", path = "../BREP_blend" }
+BREP_geometry = { version = "0.21.0", path = "../BREP_geometry" }
+BREP_topology = { version = "0.21.0", path = "../BREP_topology" }
+BREP_surface_offset = { version = "0.21.0", path = "../BREP_surface_offset" }
+BREP_boolean = { version = "0.21.0", path = "../BREP_boolean" }
+BREP_construction = { version = "0.21.0", path = "../BREP_construction" }
+BREP_blend = { version = "0.21.0", path = "../BREP_blend" }
 BREP_RANSAC = { version = "0.2.1", path = "../BREP_RANSAC" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

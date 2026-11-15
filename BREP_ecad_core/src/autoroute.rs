@@ -103,7 +103,7 @@ impl Grid {
 
 /// Whether a disc lies entirely within a shape.
 fn disc_inside(shape: &Shape, at: Point, radius: i32) -> bool {
-    match *shape {
+    match shape.clone() {
         Shape::Rect { min, max } => {
             at.x - radius >= min.x
                 && at.x + radius <= max.x
@@ -126,6 +126,8 @@ fn disc_inside(shape: &Shape, at: Point, radius: i32) -> bool {
             };
             core.distance_to_point(at) + f64::from(radius) <= f64::from(r)
         }
+        // The disc fits where its centre lies at least its radius deep.
+        Shape::Polygon { .. } => shape.depth(at) >= f64::from(radius),
     }
 }
 

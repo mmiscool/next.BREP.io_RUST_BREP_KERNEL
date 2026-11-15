@@ -29,7 +29,15 @@ pub enum PadShape {
     Oval,
     /// A rectangle with rounded corners, of [`Pad::corner_radius`].
     RoundRect,
+    /// A rectangle tapered by [`Pad::trapezoid_delta`] (KiCad's `rect_delta`):
+    /// one pair of opposite sides lengthened and the other shortened.
+    Trapezoid,
+    /// Any simple polygon, [`Pad::polygon`], around the pad's position, its
+    /// outline rounded by [`Pad::corner_radius`].
+    Custom,
 }
+/// The most corners a custom pad's polygon may have.
+pub const MAX_PAD_CORNERS: usize = 1000;
 
 /// What a pad's PRESET (its kind, side and shape) would put on the solder mask and
 /// paste layers, overridden where the user says otherwise. The default is "as the
@@ -54,10 +62,62 @@ pub struct PadLayers {
     /// place of the default 0: the aperture matches the copper.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paste_margin: Option<i32>,
+    /// The paste split into a grid of smaller windows (a windowpane), as a large
+    /// thermal pad's is so the part does not float on one big deposit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paste_windows: Option<PasteWindows>,
 }
 impl PadLayers {
     pub fn is_auto(&self) -> bool {
         *self == Self::default()
+    }
+}
+/// A windowpane paste stencil: the aperture's bounding box cut into `columns`
+/// by `rows` equal windows `gap` apart, each kept only where it lies wholly on
+/// the aperture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PasteWindows {
+    pub columns: u8,
+    pub rows: u8,
+    /// The web of stencil left between windows.
+    pub gap: i32,
+}
+impl PasteWindows {
+    /// Why these windows cannot be cut, if they cannot.
+    pub fn problem(&self) -> Option<&'static str> {
+        if !(1..=20).contains(&self.columns) || !(1..=20).contains(&self.rows) {
+            Some("needs between 1 and 20 paste windows each way")
+        } else if !(0..=10_000).contains(&self.gap) {
+            Some("needs a paste window gap between 0 and 10 mm")
+        } else {
+            None
+        }
+    }
+    /// The windows cut from `aperture`.
+    pub fn cut(&self, aperture: &Shape) -> Vec<Shape> {
+        let (min, max) = aperture.bounds();
+        let (columns, rows) = (i64::from(self.columns.max(1)), i64::from(self.rows.max(1)));
+        let gap = i64::from(self.gap.max(0));
+        let span = |lo: i32, hi: i32, n: i64, k: i64| {
+            let (lo, hi) = (i64::from(lo), i64::from(hi));
+            let cell = (hi - lo - gap * (n - 1)) as f64 / n as f64;
+            let start = lo as f64 + k as f64 * (cell + gap as f64);
+            (start.round() as i32, (start + cell).round() as i32)
+        };
+        let mut out = vec![];
+        for row in 0..rows {
+            let (y0, y1) = span(min.y, max.y, rows, row);
+            for column in 0..columns {
+                let (x0, x1) = span(min.x, max.x, columns, column);
+                if x1 > x0 && y1 > y0 {
+                    let (lo, hi) = (Point::new(x0, y0), Point::new(x1, y1));
+                    if aperture.covers_box(lo, hi) {
+                        out.push(Shape::Rect { min: lo, max: hi });
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -92,12 +152,24 @@ pub struct Pad {
     /// Mask and paste overrides of what the pad's preset generates.
     #[serde(default, skip_serializing_if = "PadLayers::is_auto")]
     pub layers: PadLayers,
+    /// A [`PadShape::Trapezoid`] pad's taper, KiCad's `rect_delta`: `x`
+    /// lengthens the left side and shortens the right by as much, `y`
+    /// lengthens the bottom and shortens the top.
+    #[serde(default, skip_serializing_if = "is_origin")]
+    pub trapezoid_delta: Point,
+    /// A [`PadShape::Custom`] pad's copper: a closed polygon of corners relative
+    /// to [`Pad::at`], which it covers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub polygon: Vec<Point>,
 }
 fn plated_by_default() -> bool {
     true
 }
 fn is_zero(v: &i32) -> bool {
     *v == 0
+}
+fn is_origin(p: &Point) -> bool {
+    *p == Point::default()
 }
 impl Pad {
     /// A pad of the given number, place, size and shape with every other property
@@ -114,20 +186,86 @@ impl Pad {
             corner_radius: 0,
             back: false,
             layers: PadLayers::default(),
+            trapezoid_delta: Point::default(),
+            polygon: vec![],
         }
     }
     /// The corner radius actually drawn: the stored one for a rounded rectangle,
-    /// clamped to half the smaller side, else 0.
+    /// clamped to half the smaller side, a custom pad's rounding, else 0.
     pub fn effective_corner_radius(&self) -> i32 {
-        if self.shape == PadShape::RoundRect {
-            self.corner_radius.clamp(0, self.size.x.min(self.size.y) / 2)
-        } else {
-            0
+        match self.shape {
+            PadShape::RoundRect => self.corner_radius.clamp(0, self.size.x.min(self.size.y) / 2),
+            PadShape::Custom => self.corner_radius.clamp(0, 100_000),
+            _ => 0,
+        }
+    }
+    /// A trapezoid or custom pad's corners in footprint coordinates, else `None`.
+    pub fn corners(&self) -> Option<Vec<Point>> {
+        let at = |x: i64, y: i64| {
+            let c = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            Point::new(c(i64::from(self.at.x) + x), c(i64::from(self.at.y) + y))
+        };
+        match self.shape {
+            PadShape::Trapezoid => {
+                let (hx, hy) = (i64::from(self.size.x) / 2, i64::from(self.size.y) / 2);
+                let (dx, dy) = (i64::from(self.trapezoid_delta.x) / 2, i64::from(self.trapezoid_delta.y) / 2);
+                Some(vec![
+                    at(-hx - dy, hy + dx),
+                    at(hx + dy, hy - dx),
+                    at(hx - dy, -hy + dx),
+                    at(-hx + dy, -hy - dx),
+                ])
+            }
+            PadShape::Custom => Some(self.polygon.iter().map(|p| at(i64::from(p.x), i64::from(p.y))).collect()),
+            _ => None,
         }
     }
     /// The pad's copper in footprint coordinates.
     pub fn local_shape(&self) -> Shape {
-        Shape::rounded_pad(self.at, self.size, self.shape, self.effective_corner_radius())
+        match self.corners() {
+            Some(corners) => Shape::polygon(corners, self.effective_corner_radius()),
+            None => Shape::rounded_pad(self.at, self.size, self.shape, self.effective_corner_radius()),
+        }
+    }
+    /// Why a trapezoid's taper or a custom pad's polygon is not copper, if it is
+    /// not.
+    pub fn outline_problem(&self) -> Option<String> {
+        let far = |v: i32| !(-100_000_000..=100_000_000).contains(&v);
+        match self.shape {
+            PadShape::Trapezoid => {
+                let d = self.trapezoid_delta;
+                if d.x.unsigned_abs() >= self.size.y.unsigned_abs() || d.y.unsigned_abs() >= self.size.x.unsigned_abs() {
+                    return Some("needs a taper shorter than the side it narrows".into());
+                }
+                if d.x != 0 && d.y != 0 {
+                    return Some("tapers one pair of sides only".into());
+                }
+                None
+            }
+            PadShape::Custom => {
+                let n = self.polygon.len();
+                if n < 3 {
+                    return Some("needs at least three corners".into());
+                }
+                if n > MAX_PAD_CORNERS {
+                    return Some(format!("has more than {MAX_PAD_CORNERS} corners"));
+                }
+                if self.polygon.iter().any(|p| far(p.x) || far(p.y)) || far(self.at.x) || far(self.at.y) {
+                    return Some("lies outside the drawing area".into());
+                }
+                if ring_area2(&self.polygon) == 0 {
+                    return Some("encloses no area".into());
+                }
+                if ring_crosses_itself(&self.polygon) {
+                    return Some("crosses itself".into());
+                }
+                if polygon_depth(&self.polygon, Point::default()) + f64::from(self.effective_corner_radius()) < 0. {
+                    return Some("does not cover its own position".into());
+                }
+                None
+            }
+            _ => None,
+        }
     }
     /// Which sides of the FOOTPRINT the pad's copper reaches: (front, back).
     pub fn copper_sides(&self) -> (bool, bool) {
@@ -164,7 +302,7 @@ impl Pad {
     /// out of the copper.
     pub fn annular_ring(&self) -> Option<i32> {
         let drill = self.drill.filter(|_| self.plated)?;
-        if self.drill_height.is_none() {
+        if self.drill_height.is_none() && self.corners().is_none() {
             // A round hole: half the pad's smaller side less the drill's radius,
             // as it has always been measured.
             return Some((self.size.x.min(self.size.y) - drill) / 2);
@@ -172,13 +310,43 @@ impl Pad {
         Some(self.hole_clearance()?.floor() as i32)
     }
     /// How far the hole stays inside the pad's copper at its nearest: the hole is
-    /// a disc swept along a segment and every pad shape is convex, so the depth
-    /// of the copper over the segment is least at one of its ends.
+    /// a disc swept along a segment. The preset shapes are convex, so the depth
+    /// of the copper over the segment is least at one of its ends. A polygon may
+    /// turn inward. A hole within the polygon's own corners, crossing none of its
+    /// edges, has the nearest edge's distance and the rounding as its ring; any
+    /// other (in the rounding, or across a notch) is measured along its length.
     fn hole_clearance(&self) -> Option<f64> {
         let Shape::Capsule { a, b, radius } = self.local_hole()? else {
             return None;
         };
         let copper = self.local_shape();
+        if let Shape::Polygon { points, radius: round } = &copper {
+            let within = polygon_contains(points, a)
+                && polygon_contains(points, b)
+                && ring_edges(points).all(|(p, q)| !segments_intersect(p, q, a, b));
+            if !within {
+                // Through the rounding, or across a notch: the copper's own depth,
+                // sampled along the hole's segment at most a micrometre apart and
+                // taken half a step shallower, as depth changes no faster than
+                // the point moves.
+                let len = f64::from(b.x - a.x).hypot(f64::from(b.y - a.y));
+                let steps = (len.ceil() as usize).clamp(1, 4096);
+                let step = len / steps as f64;
+                let depth = (0..=steps)
+                    .map(|k| {
+                        let t = k as f64 / steps as f64;
+                        let p = Point::new(
+                            (f64::from(a.x) + t * f64::from(b.x - a.x)).round() as i32,
+                            (f64::from(a.y) + t * f64::from(b.y - a.y)).round() as i32,
+                        );
+                        copper.depth(p)
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                return Some(depth - step / 2. - f64::from(radius));
+            }
+            let edges = ring_edges(points).map(|(p, q)| segment_distance(p, q, a, b)).fold(f64::INFINITY, f64::min);
+            return Some(edges + f64::from(*round) - f64::from(radius));
+        }
         Some(copper.depth(a).min(copper.depth(b)) - f64::from(radius))
     }
     /// Why the hole does not fit the pad, if it does not: a drill must be
@@ -194,6 +362,8 @@ impl Pad {
             Some("needs a positive drill")
         } else if self.drill_height.is_some() && self.hole_clearance().is_some_and(|c| c < 0.) {
             Some("has a slot larger than the pad")
+        } else if self.drill_height.is_none() && self.corners().is_some() && self.hole_clearance().is_some_and(|c| c < 0.) {
+            Some("has a drill larger than the pad")
         } else if self.drill_height.is_none() && hole.x > self.size.x.max(self.size.y) {
             Some("has a drill larger than the pad")
         } else {
@@ -274,6 +444,9 @@ impl Footprint {
             if pad.size.x <= 0 || pad.size.y <= 0 {
                 return Err(format!("{name} needs a positive width and height."));
             }
+            if let Some(problem) = pad.outline_problem() {
+                return Err(format!("{name} {problem}."));
+            }
             if let Some(problem) = pad.hole_problem() {
                 return Err(format!("{name} {problem}."));
             }
@@ -283,6 +456,9 @@ impl Footprint {
             let margins = [pad.layers.mask_margin, pad.layers.paste_margin];
             if margins.into_iter().flatten().any(|m| !(-10_000..=10_000).contains(&m)) {
                 return Err(format!("{name} has a mask or paste margin beyond 10 mm."));
+            }
+            if let Some(problem) = pad.layers.paste_windows.and_then(|w| w.problem()) {
+                return Err(format!("{name} {problem}."));
             }
         }
         if self.courtyard_margin.is_some_and(|m| !(0..=100_000).contains(&m)) {
@@ -359,7 +535,10 @@ impl Footprint {
             .pads
             .iter()
             .flat_map(|p| {
-                let (min, max) = Shape::pad(p.at, p.size, PadShape::Rect).bounds();
+                let (min, max) = match p.corners() {
+                    Some(_) => p.local_shape().bounds(),
+                    None => Shape::pad(p.at, p.size, PadShape::Rect).bounds(),
+                };
                 [min, max]
             })
             .collect();
@@ -411,7 +590,35 @@ impl Placement {
         } else {
             pad.size
         };
-        Shape::rounded_pad(self.transform(pad.at), size, pad.shape, pad.effective_corner_radius())
+        match pad.corners() {
+            Some(corners) => Shape::polygon(
+                corners.into_iter().map(|p| self.transform(p)).collect(),
+                pad.effective_corner_radius(),
+            ),
+            None => Shape::rounded_pad(self.transform(pad.at), size, pad.shape, pad.effective_corner_radius()),
+        }
+    }
+    /// A surface-mount pad's paste on the board: its copper grown by its paste
+    /// margin, cut into windows when it has a windowpane. The windows are cut in
+    /// the footprint's own frame, so columns and rows turn with the part.
+    pub fn pad_paste(&self, pad: &Pad) -> Vec<Shape> {
+        let margin = pad.layers.paste_margin.unwrap_or(0);
+        let Some(windows) = pad.layers.paste_windows else {
+            return self.pad_shape(pad).grown_parts(margin);
+        };
+        pad.local_shape()
+            .grown_parts(margin)
+            .iter()
+            .flat_map(|aperture| windows.cut(aperture))
+            .filter_map(|window| {
+                let Shape::Rect { min, max } = window else { return None };
+                let (a, b) = (self.transform(min), self.transform(max));
+                Some(Shape::Rect {
+                    min: Point::new(a.x.min(b.x), a.y.min(b.y)),
+                    max: Point::new(a.x.max(b.x), a.y.max(b.y)),
+                })
+            })
+            .collect()
     }
     /// A drilled pad's hole on the board: a circle, or a slot turned with the part.
     pub fn pad_hole(&self, pad: &Pad) -> Option<Shape> {
@@ -856,7 +1063,7 @@ pub fn rectangle(min: Point, max: Point) -> Vec<Point> {
 }
 
 /// A copper primitive for clearance and connectivity calculations.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Shape {
     Rect {
         min: Point,
@@ -875,8 +1082,51 @@ pub enum Shape {
         max: Point,
         radius: i32,
     },
+    /// A simple polygon swept by a disc of `radius`: a trapezoid or custom
+    /// pad's copper (rounded by its corner radius), and its mask opening grown
+    /// from it. `points` run counter-clockwise in a y-up frame, as
+    /// [`Shape::polygon`] puts them.
+    Polygon {
+        points: Vec<Point>,
+        radius: i32,
+    },
 }
 impl Shape {
+    /// A polygon swept by a disc of `radius`, its corners turned to run
+    /// counter-clockwise in a y-up frame (a positive signed area in board
+    /// coordinates) whichever way they were given, so a mirrored part's pad
+    /// has the same winding as any other.
+    pub fn polygon(mut points: Vec<Point>, radius: i32) -> Self {
+        if ring_area2(&points) < 0 {
+            points.reverse();
+        }
+        Self::Polygon { points, radius: radius.max(0) }
+    }
+    /// A point the shape surely covers, or touches: for a containment test.
+    fn anchor(&self) -> Point {
+        match self {
+            Self::Rect { min, .. } => *min,
+            Self::RoundRect { min, max, radius } => Self::core(*min, *max, *radius).0,
+            Self::Capsule { a, .. } => *a,
+            Self::Polygon { points, .. } => points.first().copied().unwrap_or_default(),
+        }
+    }
+    /// Whether the shape covers the whole box `min..max`.
+    pub fn covers_box(&self, min: Point, max: Point) -> bool {
+        let corners = rectangle(min, max);
+        if !corners.iter().all(|c| self.depth(*c) >= 0.) {
+            return false;
+        }
+        // The preset shapes are convex: covering the corners covers the box. A
+        // polygon may turn inward between them, so none of its outline's edges
+        // may enter the box.
+        let Self::Polygon { .. } = self else {
+            return true;
+        };
+        let ring = self.outline(8);
+        let (lo, hi) = (Point::new(min.x + 1, min.y + 1), Point::new(max.x - 1, max.y - 1));
+        lo.x > hi.x || lo.y > hi.y || ring_edges(&ring).all(|(p, q)| segment_rect_distance(p, q, lo, hi) > 0.)
+    }
     /// A pad's copper, a rounded rectangle taken square-cornered
     /// ([`Shape::rounded_pad`] gives it its corners).
     pub fn pad(center: Point, size: Point, shape: PadShape) -> Self {
@@ -895,7 +1145,9 @@ impl Shape {
                     radius: corner.min(size.x.min(size.y) / 2),
                 }
             }
-            PadShape::Rect | PadShape::RoundRect => {
+            // A trapezoid or custom pad given only its size: its bounding box
+            // ([`Pad::local_shape`] gives it its corners).
+            PadShape::Rect | PadShape::RoundRect | PadShape::Trapezoid | PadShape::Custom => {
                 let min = Point::new(center.x - half.x, center.y - half.y);
                 Self::Rect {
                     min,
@@ -932,7 +1184,18 @@ impl Shape {
     /// solder mask opening or paste aperture. A shrink never inverts the shape.
     pub fn grown(&self, grow: i32) -> Self {
         if grow == 0 {
-            return *self;
+            return self.clone();
+        }
+        if let Self::Polygon { points, radius } = self {
+            let radius = radius + grow;
+            if radius >= 0 {
+                return Self::Polygon { points: points.clone(), radius };
+            }
+            // Shrunk past its rounding: the polygon itself moves in.
+            return match shrink_ring(points, -radius) {
+                Some(points) => Self::Polygon { points, radius: 0 },
+                None => Self::circle(polygon_inner_point(points), 1),
+            };
         }
         match *self {
             Self::Rect { min, max } => {
@@ -950,6 +1213,34 @@ impl Shape {
                 b,
                 radius: (radius + grow).max(1),
             },
+            Self::Polygon { .. } => unreachable!(),
+        }
+    }
+    /// A rounded polygon's outline as exact arcs and the straights between
+    /// them, for a host that draws curves (the STEP export). `None` for any
+    /// other shape, an unrounded polygon (its corners are its outline), or one
+    /// whose rounding fills a notch, where only [`Shape::outline`] is exact.
+    pub fn swept_corners(&self) -> Option<Vec<SweptCorner>> {
+        let Self::Polygon { points, radius } = self else { return None };
+        if *radius == 0 {
+            return None;
+        }
+        let (raw, concave) = swept_outline(points, *radius, 8);
+        if concave && ring_crosses_itself(&raw) {
+            return None;
+        }
+        Some(swept_corners_of(points, *radius))
+    }
+    /// The shape grown by `grow`, as [`Shape::grown`], but a polygon that a
+    /// shrink cuts in two keeps every piece (two lands joined by a thin bridge
+    /// each keep their paste); a shrink that leaves nothing gives none.
+    pub fn grown_parts(&self, grow: i32) -> Vec<Self> {
+        match self {
+            Self::Polygon { points, radius } if radius + grow < 0 => shrink_parts(points, -(radius + grow))
+                .into_iter()
+                .map(|points| Self::Polygon { points, radius: 0 })
+                .collect(),
+            _ => vec![self.grown(grow)],
         }
     }
     /// The rectangle a rounded rectangle's disc sweeps: `min..max` less `radius`.
@@ -973,6 +1264,15 @@ impl Shape {
         };
         let quarter = std::f64::consts::FRAC_PI_2;
         let facets = facets.max(1);
+        if let Self::Polygon { points, radius } = self {
+            if *radius == 0 {
+                return points.clone();
+            }
+            let (out, concave) = swept_outline(points, *radius, facets);
+            // Where the rounding fills a notch, the swept edges of the notch
+            // cross: the loop they make lies inside the copper and is cut out.
+            return if concave { remove_loops(out) } else { out };
+        }
         match *self {
             Self::Rect { min, max } => rectangle(min, max),
             Self::RoundRect { min, max, radius } => {
@@ -1008,15 +1308,24 @@ impl Shape {
                 }
                 out
             }
+            Self::Polygon { .. } => unreachable!(),
         }
     }
     pub fn bounds(&self) -> (Point, Point) {
+        if let Self::Polygon { points, radius } = self {
+            let (min, max) = bounds_of(points).unwrap_or_default();
+            return (
+                Point::new(min.x.saturating_sub(*radius), min.y.saturating_sub(*radius)),
+                Point::new(max.x.saturating_add(*radius), max.y.saturating_add(*radius)),
+            );
+        }
         match *self {
             Self::Rect { min, max } | Self::RoundRect { min, max, .. } => (min, max),
             Self::Capsule { a, b, radius } => (
                 Point::new(a.x.min(b.x) - radius, a.y.min(b.y) - radius),
                 Point::new(a.x.max(b.x) + radius, a.y.max(b.y) + radius),
             ),
+            Self::Polygon { .. } => unreachable!(),
         }
     }
     pub fn center(&self) -> Point {
@@ -1028,6 +1337,9 @@ impl Shape {
     }
     /// Distance from a point to the shape; zero inside.
     pub fn distance_to_point(&self, p: Point) -> f64 {
+        if let Self::Polygon { points, radius } = self {
+            return (-polygon_depth(points, p) - f64::from(*radius)).max(0.);
+        }
         match *self {
             Self::Rect { min, max } => point_rect_distance(p, min, max),
             Self::RoundRect { min, max, radius } => {
@@ -1037,6 +1349,7 @@ impl Shape {
             Self::Capsule { a, b, radius } => {
                 (point_segment_distance(p, a, b) - f64::from(radius)).max(0.)
             }
+            Self::Polygon { .. } => unreachable!(),
         }
     }
     /// How deep `p` lies inside the shape: its distance to the boundary,
@@ -1046,6 +1359,9 @@ impl Shape {
             let d = [p.x - min.x, max.x - p.x, p.y - min.y, max.y - p.y];
             f64::from(d.into_iter().min().unwrap_or(0))
         };
+        if let Self::Polygon { points, radius } = self {
+            return polygon_depth(points, p) + f64::from(*radius);
+        }
         match *self {
             Self::Rect { min, max } => {
                 let inner = inside_box(min, max);
@@ -1057,6 +1373,7 @@ impl Shape {
                 f64::from(radius) + if inner >= 0. { inner } else { -point_rect_distance(p, lo, hi) }
             }
             Self::Capsule { a, b, radius } => f64::from(radius) - point_segment_distance(p, a, b),
+            Self::Polygon { .. } => unreachable!(),
         }
     }
     pub fn contains(&self, p: Point) -> bool {
@@ -1064,6 +1381,23 @@ impl Shape {
     }
     /// Gap between two shapes; zero when they touch or overlap.
     pub fn distance(&self, other: &Self) -> f64 {
+        // A polygon is its edges swept by its disc, unless one shape lies
+        // wholly inside the other.
+        if let Self::Polygon { points, radius } = self {
+            if points.is_empty() {
+                return f64::INFINITY;
+            }
+            if polygon_contains(points, other.anchor()) || other.contains(points[0]) {
+                return 0.;
+            }
+            let edges = ring_edges(points)
+                .map(|(a, b)| Self::Capsule { a, b, radius: 0 }.distance(other))
+                .fold(f64::INFINITY, f64::min);
+            return (edges - f64::from(*radius)).max(0.);
+        }
+        if let Self::Polygon { .. } = other {
+            return other.distance(self);
+        }
         // A rounded rectangle is its core rectangle swept by a disc: measure from
         // the core and take the radius off.
         if let Self::RoundRect { min, max, radius } = *self {
@@ -1073,7 +1407,7 @@ impl Shape {
         if let Self::RoundRect { .. } = *other {
             return other.distance(self);
         }
-        match (*self, *other) {
+        match (self.clone(), other.clone()) {
             (Self::Rect { min: a0, max: a1 }, Self::Rect { min: b0, max: b1 }) => {
                 let dx = (i64::from(a0.x) - i64::from(b1.x))
                     .max(i64::from(b0.x) - i64::from(a1.x))
@@ -1099,7 +1433,9 @@ impl Shape {
                     radius: rb,
                 },
             ) => (segment_distance(a0, a1, b0, b1) - f64::from(ra) - f64::from(rb)).max(0.),
-            (Self::RoundRect { .. }, _) | (_, Self::RoundRect { .. }) => unreachable!(),
+            (Self::RoundRect { .. } | Self::Polygon { .. }, _) | (_, Self::RoundRect { .. } | Self::Polygon { .. }) => {
+                unreachable!()
+            }
         }
     }
 }
@@ -1187,6 +1523,276 @@ pub fn polygon_contains(polygon: &[Point], p: Point) -> bool {
         }
     }
     inside
+}
+/// One corner of a rounded polygon's outline ([`Shape::swept_corners`]): an arc
+/// of the disc about a corner that turns outward, from angle `from` (radians,
+/// board coordinates) through `sweep`, or the point where the two swept edges
+/// of a corner that turns inward meet. Straight edges join consecutive corners.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SweptCorner {
+    Arc { centre: Point, radius: i32, from: f64, sweep: f64 },
+    Meet(f64, f64),
+}
+impl SweptCorner {
+    /// Where the corner's piece of outline starts and ends.
+    pub fn ends(&self) -> ((f64, f64), (f64, f64)) {
+        match *self {
+            Self::Arc { centre, radius, from, sweep } => {
+                let at = |t: f64| (f64::from(centre.x) + f64::from(radius) * t.cos(), f64::from(centre.y) + f64::from(radius) * t.sin());
+                (at(from), at(from + sweep))
+            }
+            Self::Meet(x, y) => ((x, y), (x, y)),
+        }
+    }
+}
+/// A counter-clockwise polygon's corners swept by a disc of `radius`.
+fn swept_corners_of(points: &[Point], radius: i32) -> Vec<SweptCorner> {
+    let n = points.len();
+    let r = f64::from(radius);
+    (0..n)
+        .map(|i| {
+            let (prev, here, next) = (points[(i + n - 1) % n], points[i], points[(i + 1) % n]);
+            let (d0, d1) = (unit(prev, here), unit(here, next));
+            // Outward normal of a counter-clockwise (y-up) edge.
+            let (n0, n1) = ((d0.1, -d0.0), (d1.1, -d1.0));
+            if d0.0 * d1.1 - d0.1 * d1.0 > 1e-12 {
+                let from = n0.1.atan2(n0.0);
+                let mut sweep = n1.1.atan2(n1.0) - from;
+                while sweep <= 0. {
+                    sweep += 2. * std::f64::consts::PI;
+                }
+                SweptCorner::Arc { centre: here, radius, from, sweep }
+            } else {
+                let (mx, my) = miter(n0, n1);
+                SweptCorner::Meet(f64::from(here.x) + mx * r, f64::from(here.y) + my * r)
+            }
+        })
+        .collect()
+}
+/// A rounded polygon's outline before any loop is cut, arcs faceted `facets`
+/// to the quarter turn, and whether the polygon turns inward anywhere.
+fn swept_outline(points: &[Point], radius: i32, facets: usize) -> (Vec<Point>, bool) {
+    let quarter = std::f64::consts::FRAC_PI_2;
+    let mut out = vec![];
+    let round = |(x, y): (f64, f64)| Point::new(x.round() as i32, y.round() as i32);
+    for corner in swept_corners_of(points, radius) {
+        match corner {
+            SweptCorner::Arc { centre, radius, from, sweep } => {
+                let steps = ((sweep / quarter) * facets.max(1) as f64).ceil().max(1.) as usize;
+                for k in 0..=steps {
+                    let t = from + sweep * k as f64 / steps as f64;
+                    out.push(round((
+                        f64::from(centre.x) + f64::from(radius) * t.cos(),
+                        f64::from(centre.y) + f64::from(radius) * t.sin(),
+                    )));
+                }
+            }
+            SweptCorner::Meet(x, y) => out.push(round((x, y))),
+        }
+    }
+    out.dedup();
+    if out.len() > 1 && out.first() == out.last() {
+        out.pop();
+    }
+    let n = points.len();
+    let concave = (0..n).any(|i| cross(points[(i + n - 1) % n], points[i], points[(i + 1) % n]) < 0);
+    (out, concave)
+}
+/// Signed distance from `p` to a closed polygon's boundary: positive inside.
+pub(crate) fn polygon_depth(polygon: &[Point], p: Point) -> f64 {
+    let d = ring_edges(polygon)
+        .map(|(a, b)| point_segment_distance(p, a, b))
+        .fold(f64::INFINITY, f64::min);
+    if polygon_contains(polygon, p) { d } else { -d }
+}
+/// Twice a ring's signed area: positive when it runs counter-clockwise in a
+/// y-up frame.
+fn ring_area2(ring: &[Point]) -> i128 {
+    ring_edges(ring)
+        .map(|(a, b)| i128::from(a.x) * i128::from(b.y) - i128::from(b.x) * i128::from(a.y))
+        .sum()
+}
+/// The unit direction from `a` to `b`, or zero where they coincide.
+fn unit(a: Point, b: Point) -> (f64, f64) {
+    let (dx, dy) = (f64::from(b.x) - f64::from(a.x), f64::from(b.y) - f64::from(a.y));
+    let len = dx.hypot(dy);
+    if len == 0. { (0., 0.) } else { (dx / len, dy / len) }
+}
+/// Where two lines offset one unit along normals `n0` and `n1` meet, from the
+/// corner they share; the normal itself when the lines are parallel.
+fn miter(n0: (f64, f64), n1: (f64, f64)) -> (f64, f64) {
+    let (sx, sy) = (n0.0 + n1.0, n0.1 + n1.1);
+    let dot = 1. + n0.0 * n1.0 + n0.1 * n1.1;
+    if dot < 1e-9 { n1 } else { (sx / dot, sy / dot) }
+}
+/// A counter-clockwise ring moved `by` inward along every edge, each corner
+/// where two moved edges meet. An edge that the move turns round (a short
+/// chamfer, say) is dropped and its neighbours meet instead, and a loop the
+/// move leaves where the ring turns inward is cut out; there the corner stays
+/// sharp, a little more than an exact inset. `None` when nothing is left or the
+/// result would leave the ring's own inset.
+fn shrink_parts(ring: &[Point], by: i32) -> Vec<Vec<Point>> {
+    type Line = ((f64, f64), (f64, f64));
+    let d = f64::from(by);
+    // Where two moved edges meet: the second's start when they are one line.
+    let meet = |((px, py), (ux, uy)): Line, ((qx, qy), (vx, vy)): Line| -> Option<(f64, f64)> {
+        let turn = ux * vy - uy * vx;
+        if turn.abs() < 1e-9 {
+            return (ux * vx + uy * vy > 0.).then_some((qx, qy));
+        }
+        let t = ((qx - px) * vy - (qy - py) * vx) / turn;
+        Some((px + t * ux, py + t * uy))
+    };
+    // Each edge as a line moved inward: a point on it and its direction.
+    let mut lines: Vec<Line> = ring_edges(ring)
+        .filter(|(a, b)| a != b)
+        .map(|(a, b)| {
+            let u = unit(a, b);
+            ((f64::from(a.x) - u.1 * d, f64::from(a.y) + u.0 * d), u)
+        })
+        .collect();
+    for _ in 0..=ring.len() {
+        let n = lines.len();
+        if n < 3 {
+            return vec![];
+        }
+        let Some(corners) = (0..n).map(|i| meet(lines[(i + n - 1) % n], lines[i])).collect::<Option<Vec<(f64, f64)>>>() else {
+            return vec![];
+        };
+        // How far each moved edge still runs along its own direction.
+        let run = |i: usize| {
+            let (s, e) = (corners[i], corners[(i + 1) % n]);
+            (e.0 - s.0) * lines[i].1.0 + (e.1 - s.1) * lines[i].1.1
+        };
+        match (0..n).filter(|&i| run(i) <= 0.5).min_by(|&i, &j| run(i).total_cmp(&run(j))) {
+            Some(worst) => {
+                lines.remove(worst);
+            }
+            None => {
+                let out: Vec<Point> = corners.iter().map(|c| Point::new(c.0.round() as i32, c.1.round() as i32)).collect();
+                let mut parts = vec![];
+                split_loops(out, &mut parts, &mut ring.len().max(8));
+                parts.retain(|part| {
+                    part.iter().all(|p| polygon_depth(ring, *p) >= d - 2.) && !ring_crosses_itself(part)
+                });
+                return parts;
+            }
+        }
+    }
+    vec![]
+}
+/// The largest piece [`shrink_parts`] leaves.
+fn shrink_ring(ring: &[Point], by: i32) -> Option<Vec<Point>> {
+    shrink_parts(ring, by).into_iter().max_by_key(|part| ring_area2(part))
+}
+/// A ring cut at each place it crosses itself into the loops it makes,
+/// keeping each loop that runs counter-clockwise (a reversed loop is where an
+/// inset overran itself and holds nothing); at most `budget` cuts.
+fn split_loops(ring: Vec<Point>, out: &mut Vec<Vec<Point>>, budget: &mut usize) {
+    let n = ring.len();
+    let crossing = (0..n).find_map(|i| {
+        let (a, b) = (ring[i], ring[(i + 1) % n]);
+        (i + 2..n).find_map(|j| {
+            let (c, d) = (ring[j], ring[(j + 1) % n]);
+            ((i, j) != (0, n - 1) && segments_intersect(a, b, c, d)).then_some((i, j))
+        })
+    });
+    match crossing {
+        Some((i, j)) if *budget > 0 && n >= 4 => {
+            *budget -= 1;
+            let x = crossing_point(ring[i], ring[(i + 1) % n], ring[j], ring[(j + 1) % n]);
+            let mut outer: Vec<Point> = ring[..=i].to_vec();
+            outer.push(x);
+            outer.extend_from_slice(&ring[j + 1..]);
+            let mut inner = vec![x];
+            inner.extend_from_slice(&ring[i + 1..=j]);
+            for mut part in [outer, inner] {
+                part.dedup();
+                if part.len() > 1 && part.first() == part.last() {
+                    part.pop();
+                }
+                if part.len() >= 3 {
+                    split_loops(part, out, budget);
+                }
+            }
+        }
+        _ => {
+            if n >= 3 && ring_area2(&ring) > 0 {
+                out.push(ring);
+            }
+        }
+    }
+}
+/// Where segments `a..b` and `c..d`, known to touch, meet.
+fn crossing_point(a: Point, b: Point, c: Point, d: Point) -> Point {
+    let (u, v) = ((f64::from(b.x - a.x), f64::from(b.y - a.y)), (f64::from(d.x - c.x), f64::from(d.y - c.y)));
+    let turn = u.0 * v.1 - u.1 * v.0;
+    if turn.abs() < 1e-9 {
+        return if within_box(a, b, c) { c } else { a };
+    }
+    let t = (f64::from(c.x - a.x) * v.1 - f64::from(c.y - a.y) * v.0) / turn;
+    Point::new((f64::from(a.x) + t * u.0).round() as i32, (f64::from(a.y) + t * u.1).round() as i32)
+}
+/// A ring with the loops it makes where it crosses itself cut out, keeping at
+/// each crossing the side of larger counter-clockwise area: the outline of an
+/// offset whose edges overran one another.
+fn remove_loops(mut ring: Vec<Point>) -> Vec<Point> {
+    'cut: for _ in 0..ring.len() {
+        let n = ring.len();
+        if n < 4 {
+            break;
+        }
+        for i in 0..n {
+            let (a, b) = (ring[i], ring[(i + 1) % n]);
+            for j in i + 2..n {
+                if (i, j) == (0, n - 1) {
+                    continue;
+                }
+                let (c, d) = (ring[j], ring[(j + 1) % n]);
+                if a.x.max(b.x) < c.x.min(d.x)
+                    || c.x.max(d.x) < a.x.min(b.x)
+                    || a.y.max(b.y) < c.y.min(d.y)
+                    || c.y.max(d.y) < a.y.min(b.y)
+                    || !segments_intersect(a, b, c, d)
+                {
+                    continue;
+                }
+                let x = crossing_point(a, b, c, d);
+                let mut outer: Vec<Point> = ring[..=i].to_vec();
+                outer.push(x);
+                outer.extend_from_slice(&ring[j + 1..]);
+                let mut inner = vec![x];
+                inner.extend_from_slice(&ring[i + 1..=j]);
+                outer.dedup();
+                inner.dedup();
+                ring = if ring_area2(&inner) > ring_area2(&outer) { inner } else { outer };
+                continue 'cut;
+            }
+        }
+        break;
+    }
+    ring
+}
+/// A point inside a simple polygon: the middle of its widest span across the
+/// middle of its height.
+pub fn polygon_inner_point(ring: &[Point]) -> Point {
+    let Some((min, max)) = bounds_of(ring) else {
+        return Point::default();
+    };
+    let y = (i64::from(min.y) + i64::from(max.y)) / 2;
+    let mut xs: Vec<f64> = ring_edges(ring)
+        .filter(|(a, b)| (i64::from(a.y) > y) != (i64::from(b.y) > y))
+        .map(|(a, b)| {
+            let t = (y as f64 - f64::from(a.y)) / (f64::from(b.y) - f64::from(a.y));
+            f64::from(a.x) + t * (f64::from(b.x) - f64::from(a.x))
+        })
+        .collect();
+    xs.sort_by(f64::total_cmp);
+    let widest = xs.chunks(2).filter(|c| c.len() == 2).max_by(|a, b| (a[1] - a[0]).total_cmp(&(b[1] - b[0])));
+    match widest {
+        Some(c) => Point::new(((c[0] + c[1]) / 2.).round() as i32, y as i32),
+        None => ring[0],
+    }
 }
 fn bounds_of(points: &[Point]) -> Option<(Point, Point)> {
     let first = *points.first()?;
@@ -2095,6 +2701,8 @@ impl Board {
                 if !valid(pad.at)
                     || !size(pad.size.x)
                     || !size(pad.size.y)
+                    || pad.outline_problem().is_some()
+                    || pad.layers.paste_windows.is_some_and(|w| w.problem().is_some())
                     || pad.hole_problem().is_some()
                     || pad.hole_size().is_some_and(|h| !size(h.x) || !size(h.y))
                     || !(0..=100_000).contains(&pad.corner_radius)

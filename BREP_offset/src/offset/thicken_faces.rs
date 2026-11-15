@@ -20,8 +20,13 @@
 //! or more is the wedge between it and its axis, with the like wedge opposite
 //! for what is left over.
 //!
+//! A whole patch of a ring (an arc turned about an axis: a bend between a
+//! floor and a wall of revolution) thickened toward its tube's centre circle by
+//! the tube's radius or more is likewise the arc's sector turned about that
+//! axis, with the like sector opposite for what is left over.
+//!
 //! Faces that meet smoothly along a crease (a bend and the flat it leaves)
-//! need no fill. Where a crease closes toward the side thickened at a right
+//! need no fill; such a crease may be a closed circle. Where a crease closes toward the side thickened at a right
 //! angle or wider, the slabs end on each other or overlap; tighter than a
 //! right angle their square ends are cut off behind the other face. Fills are built where the crease is a straight line along
 //! which both faces keep their normals; any other open crease is refused by
@@ -81,11 +86,24 @@ struct Side {
     end: Vec3,
     /// The face's normal at the start, the middle and the end.
     normals: [Vec3; 3],
+    /// The way this use runs at its middle (a closed edge has no chord to say).
+    tangent: Vec3,
 }
 
 fn face_normal(face: &FaceRecord, point: Vec3) -> Result<Vec3, KernelRefusal> {
-    let foot = project_point_to_surface(&face.surface, point).or_refuse(KernelStage::Classify, "thickenFaces.project")?;
-    let normal = face.surface.normal(foot.u, foot.v).or_refuse(KernelStage::Classify, "thickenFaces.normal")?;
+    let surface = &face.surface;
+    let foot = project_point_to_surface(surface, point).or_refuse(KernelStage::Classify, "thickenFaces.project")?;
+    let normal = match surface.normal(foot.u, foot.v) {
+        Ok(normal) => normal,
+        // At a pole (a side of the patch collapsed to a point) the surface has no
+        // normal of its own: read it a little way in, where it has one.
+        Err(_) => {
+            let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Classify, "thickenFaces.domain")?;
+            let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Classify, "thickenFaces.domain")?;
+            let inward = |at: f64, low: f64, high: f64| at + (0.5 * (low + high) - at) * 1e-6;
+            surface.normal(inward(foot.u, u0, u1), inward(foot.v, v0, v1)).or_refuse(KernelStage::Classify, "thickenFaces.normal")?
+        }
+    };
     Ok(if face.same_sense { normal } else { normal.scale(-1.0) })
 }
 
@@ -136,7 +154,9 @@ pub fn thicken_sheet_faces(faces: &[BrepSolid], thickness: f64, corners: OffsetC
                 std::mem::swap(&mut start, &mut end);
             }
             let normals = [face_normal(face, start)?, face_normal(face, middle)?, face_normal(face, end)?];
-            sides.push(Side { face: index, start, middle, end, normals });
+            let along = edge.curve.derivatives(0.5 * (edge.t0 + edge.t1), 1).or_refuse(KernelStage::Classify, "thickenFaces.edge")?;
+            let tangent = along.get(1).copied().unwrap_or(end.sub(start)).scale(if coedge.forward { 1.0 } else { -1.0 });
+            sides.push(Side { face: index, start, middle, end, normals, tangent });
         }
     }
 
@@ -145,7 +165,11 @@ pub fn thicken_sheet_faces(faces: &[BrepSolid], thickness: f64, corners: OffsetC
     for (_, face) in &records {
         let loops: Vec<Vec<NurbsCurve>> = face.loops.iter().map(|record| record.coedges.iter().map(|coedge| coedge.pcurve.clone()).collect()).collect();
         let along = if face.same_sense { thickness } else { -thickness };
-        match past_its_axis(face, along, tolerance)? {
+        let wedges = match past_its_axis(face, along, tolerance)? {
+            Some(wedges) => Some(wedges),
+            None => past_its_ring(face, along, tolerance)?,
+        };
+        match wedges {
             Some(wedges) => parts.extend(wedges),
             None => parts.extend(thicken_trimmed_sheet(&face.surface, &loops, along, false)?),
         }
@@ -164,14 +188,17 @@ pub fn thicken_sheet_faces(faces: &[BrepSolid], thickness: f64, corners: OffsetC
             if a.face == b.face || !near(a.middle, b.middle) {
                 continue;
             }
-            if !(near(a.start, b.end) && near(a.end, b.start)) {
-                if near(a.start, b.start) && near(a.end, b.end) {
+            // a closed crease starts where it ends: only the way it runs says how the two uses face
+            let closed = near(a.start, a.end);
+            let opposite = if closed { a.tangent.dot(b.tangent) < 0.0 } else { near(a.start, b.end) && near(a.end, b.start) };
+            if !opposite {
+                if closed || (near(a.start, b.start) && near(a.end, b.end)) {
                     return Err(input("normals", format!("faces {} and {} have their normals on opposite sides of the sheet", a.face, b.face)));
                 }
                 continue;
             }
             let run = a.end.sub(a.start);
-            let tangent = run.normalized().map_err(|_| refuse("crease", "a crease has no length".into()))?;
+            let tangent = if closed { a.tangent } else { run }.normalized().map_err(|_| refuse("crease", "a crease has no length".into()))?;
             // toward face a's inside, across the crease, and how far face b's moved image leans that way
             let inward = a.normals[1].cross(tangent);
             let lean = b.normals[1].scale(sign).dot(inward);
@@ -259,22 +286,11 @@ pub fn thicken_sheet_faces(faces: &[BrepSolid], thickness: f64, corners: OffsetC
 fn past_its_axis(face: &FaceRecord, along: f64, tolerance: f64) -> Result<Option<Vec<BrepSolid>>, KernelRefusal> {
     let surface = &face.surface;
     let stage = KernelStage::Classify;
-    if surface.degree_v != 1 || surface.control_points.first().map(Vec::len) != Some(2) || face.loops.len() != 1 || face.loops[0].coedges.len() != 4 {
+    if surface.degree_v != 1 || surface.control_points.first().map(Vec::len) != Some(2) || !whole_domain(face)? {
         return Ok(None);
     }
     let [u0, u1] = surface.domain_u().or_refuse(stage, "thickenFaces.domain")?;
     let [v0, v1] = surface.domain_v().or_refuse(stage, "thickenFaces.domain")?;
-    // the face is its surface's whole domain when its loop's corners are the domain's
-    let corners = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
-    for coedge in &face.loops[0].coedges {
-        let [t0, t1] = coedge.pcurve.domain().or_refuse(stage, "thickenFaces.pcurve")?;
-        for t in [t0, t1] {
-            let at = coedge.pcurve.evaluate(t).or_refuse(stage, "thickenFaces.pcurve")?;
-            if !corners.iter().any(|corner| (at.x - corner[0]).abs() + (at.y - corner[1]).abs() <= 1e-9 * ((u1 - u0).abs() + (v1 - v0).abs())) {
-                return Ok(None);
-            }
-        }
-    }
     let point = |u: f64, v: f64| surface.evaluate(u, v).or_refuse(stage, "thickenFaces.point");
     let normal = |u: f64, v: f64| surface.normal(u, v).or_refuse(stage, "thickenFaces.normal");
     let slide = point(u0, v1)?.sub(point(u0, v0)?);
@@ -328,6 +344,196 @@ fn past_its_axis(face: &FaceRecord, along: f64, tolerance: f64) -> Result<Option
         wedges.push(wedge(-over / radius)?);
     }
     Ok(Some(wedges))
+}
+
+/// Is the face its surface's whole domain (its one loop's corners the domain's), regular at its corners?
+fn whole_domain(face: &FaceRecord) -> Result<bool, KernelRefusal> {
+    let surface = &face.surface;
+    let stage = KernelStage::Classify;
+    if face.loops.len() != 1 || face.loops[0].coedges.len() != 4 {
+        return Ok(false);
+    }
+    let [u0, u1] = surface.domain_u().or_refuse(stage, "thickenFaces.domain")?;
+    let [v0, v1] = surface.domain_v().or_refuse(stage, "thickenFaces.domain")?;
+    let corners = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
+    let slack = 1e-9 * ((u1 - u0).abs() + (v1 - v0).abs());
+    for coedge in &face.loops[0].coedges {
+        let [t0, t1] = coedge.pcurve.domain().or_refuse(stage, "thickenFaces.pcurve")?;
+        for t in [t0, t1] {
+            let at = coedge.pcurve.evaluate(t).or_refuse(stage, "thickenFaces.pcurve")?;
+            if !corners.iter().any(|corner| (at.x - corner[0]).abs() + (at.y - corner[1]).abs() <= slack) {
+                return Ok(false);
+            }
+        }
+        // and runs along one side of the domain between them, not across the face
+        const SAMPLES: usize = 16;
+        let mut on_side = [true; 4];
+        for index in 1..SAMPLES {
+            let at = coedge.pcurve.evaluate(t0 + (t1 - t0) * index as f64 / SAMPLES as f64).or_refuse(stage, "thickenFaces.pcurve")?;
+            for (side, off) in [(at.x - u0).abs(), (at.x - u1).abs(), (at.y - v0).abs(), (at.y - v1).abs()].into_iter().enumerate() {
+                on_side[side] &= off <= slack;
+            }
+        }
+        if !on_side.iter().any(|on| *on) {
+            return Ok(false);
+        }
+    }
+    // a patch with a pole (a side collapsed to a point, where it has no normal) is no arc slid or turned
+    Ok(corners.iter().all(|corner| surface.normal(corner[0], corner[1]).is_ok()))
+}
+
+/// Places along one parameter of a surface that no span of it can hide
+/// between: twice the degree and one more in every knot span, ends included.
+/// A span is a rational piece of that degree, so the square of a distance
+/// along it, cleared of its weight, is a polynomial of twice the degree: one
+/// that vanishes at these vanishes along the span.
+fn span_places(knots: &[f64], degree: usize, low: f64, high: f64) -> Vec<f64> {
+    let mut breaks = vec![low];
+    breaks.extend(knots.iter().copied().filter(|knot| *knot > low && *knot < high));
+    breaks.push(high);
+    breaks.dedup();
+    let per_span = 2 * degree + 1;
+    let mut places = vec![low];
+    for span in breaks.windows(2) {
+        for index in 1..=per_span {
+            places.push(span[0] + (span[1] - span[0]) * index as f64 / per_span as f64);
+        }
+    }
+    *places.last_mut().expect("places") = high;
+    places
+}
+
+/// A whole patch of a ring (a circular arc along one parameter, turned about
+/// an axis along the other: a quarter of a torus round a cup's floor)
+/// thickened toward its tube's centre circle by the tube's radius or more.
+/// Every point `p + s·n` then runs from the patch to that circle and, past it,
+/// out the other side, each in its own half-plane through the axis. So the
+/// body is the arc's sector (the arc and its centre) turned about the axis
+/// and, opposite it, the like sector of what the thickness has left over the
+/// radius. `None` for any other face, a thickness short of the centre circle,
+/// or a leftover that would reach the axis, which the single-face thicken
+/// takes.
+fn past_its_ring(face: &FaceRecord, along: f64, tolerance: f64) -> Result<Option<Vec<BrepSolid>>, KernelRefusal> {
+    if !whole_domain(face)? {
+        return Ok(None);
+    }
+    for arc_along_u in [false, true] {
+        if let Some(sectors) = ring_sectors(face, along, tolerance, arc_along_u)? {
+            return Ok(Some(sectors));
+        }
+    }
+    Ok(None)
+}
+
+fn ring_sectors(face: &FaceRecord, along: f64, tolerance: f64, arc_along_u: bool) -> Result<Option<Vec<BrepSolid>>, KernelRefusal> {
+    let surface = &face.surface;
+    let stage = KernelStage::Classify;
+    let [u0, u1] = surface.domain_u().or_refuse(stage, "thickenFaces.domain")?;
+    let [v0, v1] = surface.domain_v().or_refuse(stage, "thickenFaces.domain")?;
+    // (a, b): along the arc, round the axis
+    let ([a0, a1], [b0, b1]) = if arc_along_u { ([u0, u1], [v0, v1]) } else { ([v0, v1], [u0, u1]) };
+    let at = |a: f64, b: f64| if arc_along_u { (a, b) } else { (b, a) };
+    let point = |a: f64, b: f64| surface.evaluate(at(a, b).0, at(a, b).1).or_refuse(stage, "thickenFaces.point");
+    let toward = along.signum();
+    let normal = |a: f64, b: f64| surface.normal(at(a, b).0, at(a, b).1).map(|normal| normal.scale(toward)).or_refuse(stage, "thickenFaces.normal");
+    // the centre the normals at the two ends of the first arc pass through
+    let (p0, n0, p1, n1) = (point(a0, b0)?, normal(a0, b0)?, point(a1, b0)?, normal(a1, b0)?);
+    let spread = n0.sub(n1);
+    if spread.length() <= 1e-9 {
+        return Ok(None);
+    }
+    let radius = p1.sub(p0).dot(spread) / spread.dot(spread);
+    if !(radius > 0.0) || along.abs() < radius - tolerance {
+        return Ok(None);
+    }
+    // read in every span of the surface both ways, so nothing between the readings is taken on trust
+    let (arc_places, turn_places) = if arc_along_u {
+        (span_places(&surface.knots_u, surface.degree_u, a0, a1), span_places(&surface.knots_v, surface.degree_v, b0, b1))
+    } else {
+        (span_places(&surface.knots_v, surface.degree_v, a0, a1), span_places(&surface.knots_u, surface.degree_u, b0, b1))
+    };
+    let (arcs, turns) = (arc_places.len() - 1, turn_places.len() - 1);
+    let arc_at = |i: usize| arc_places[i];
+    let turn_at = |j: usize| turn_places[j];
+    // each arc has one centre, the tube's centre line at that turn
+    let mut centres = Vec::with_capacity(turns + 1);
+    for j in 0..=turns {
+        let centre = point(a0, turn_at(j))?.add(normal(a0, turn_at(j))?.scale(radius));
+        for i in 1..=arcs {
+            if point(arc_at(i), turn_at(j))?.add(normal(arc_at(i), turn_at(j))?.scale(radius)).sub(centre).length() > tolerance {
+                return Ok(None);
+            }
+        }
+        centres.push(centre);
+    }
+    // the centres lie on a circle: its axis from three of them
+    let (f0, f1, f2) = (centres[0], centres[turns / 3], centres[2 * turns / 3]);
+    let (e1, e2) = (f1.sub(f0), f2.sub(f0));
+    let across = e1.cross(e2);
+    if across.length() <= 1e-9 * e1.length() * e2.length() || across.length() <= tolerance * tolerance {
+        return Ok(None);
+    }
+    let axis = across.normalized().or_refuse(stage, "thickenFaces.ring_axis")?;
+    // circumcentre of the three
+    let middle = f0.add(
+        e2.scale(e1.dot(e1)).sub(e1.scale(e2.dot(e2))).cross(across).scale(1.0 / (2.0 * across.dot(across))),
+    );
+    let ring = f0.sub(middle).length();
+    let over = along.abs() - radius;
+    if !(ring > over + tolerance) {
+        return Ok(None);
+    }
+    // every arc is the first turned about that axis, by a growing angle
+    let mut angle = 0.0;
+    for j in 1..=turns {
+        let (before, here) = (centres[j - 1].sub(middle), centres[j].sub(middle));
+        if (here.length() - ring).abs() > tolerance || here.dot(axis).abs() > tolerance {
+            return Ok(None);
+        }
+        let step = axis.dot(before.cross(here)).atan2(before.dot(here));
+        if !(step > 0.0) {
+            return Ok(None);
+        }
+        angle += step;
+        for i in 0..=arcs {
+            let first = point(arc_at(i), b0)?.sub(middle);
+            let turned = middle.add(first.rotate_about(axis, angle));
+            if point(arc_at(i), turn_at(j))?.sub(turned).length() > tolerance {
+                return Ok(None);
+            }
+        }
+    }
+    // the first arc lies in a half-plane through the axis, off the axis itself
+    let square = axis.cross(f0.sub(middle));
+    for i in 0..=arcs {
+        let from_axis = point(arc_at(i), b0)?.sub(middle);
+        if from_axis.dot(square).abs() > tolerance * ring.max(1.0) || from_axis.sub(axis.scale(from_axis.dot(axis))).length() <= tolerance {
+            return Ok(None);
+        }
+    }
+    let arc = if arc_along_u { surface.iso_curve_v(b0) } else { surface.iso_curve_u(b0) }.or_refuse(stage, "thickenFaces.arc")?;
+    let turn = angle.min(std::f64::consts::TAU);
+    // the sector on the arc scaled about its centre by `factor`, turned about the axis
+    let sector = |factor: f64| -> Result<BrepSolid, KernelRefusal> {
+        let scaled = |q: Vec3| f0.add(q.sub(f0).scale(factor));
+        let poles = arc
+            .control_points
+            .iter()
+            .map(|pole| crate::Vec4::from_point(scaled(Vec3::new(pole.x / pole.w, pole.y / pole.w, pole.z / pole.w)), pole.w))
+            .collect();
+        let rim = NurbsCurve::new(arc.degree, arc.knots.clone(), poles).or_refuse(stage, "thickenFaces.sector_arc")?;
+        let section = vec![
+            make_line(f0, scaled(p0)).or_refuse(stage, "thickenFaces.sector_side")?,
+            rim,
+            make_line(scaled(p1), f0).or_refuse(stage, "thickenFaces.sector_side")?,
+        ];
+        crate::revolve_profile_brep(&section, middle, axis, turn).or_refuse(KernelStage::Fragment, "thickenFaces.sector")
+    };
+    let mut sectors = vec![sector(1.0)?];
+    if over > tolerance {
+        sectors.push(sector(-over / radius)?);
+    }
+    Ok(Some(sectors))
 }
 
 /// The fill of an open straight crease from `start` along `run`, between the

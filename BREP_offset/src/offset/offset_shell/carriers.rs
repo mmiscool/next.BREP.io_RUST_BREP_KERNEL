@@ -1159,6 +1159,7 @@ fn skin_distance_to_trimmed_face(
             point,
             &mut |edge| edge_is_tangent_to_a_retained_face(face, edge, retained_faces),
             &mut |edge, at| if gauge { neighbour_outward_normal(face, edge, at, retained_faces) } else { Ok(None) },
+            &mut |edge| if miter_curved_neighbour_on() { curved_neighbour_height(face, edge, point, retained_faces) } else { Ok(None) },
         )?
     } else {
         miter_distance_to_trimmed_face(face, edges, point)?
@@ -1417,7 +1418,7 @@ fn miter_distance_with_tangent_edges(
     point: Vec3,
     tangent: &mut dyn FnMut(&EdgeRecord) -> Result<bool, KernelRefusal>,
 ) -> Result<Option<f64>, KernelRefusal> {
-    miter_distance_with_neighbours(face, edges, point, tangent, &mut |_, _| Ok(None))
+    miter_distance_with_neighbours(face, edges, point, tangent, &mut |_, _| Ok(None), &mut |_| Ok(None))
 }
 
 /// `BREP_OFFSET_MITER_NEIGHBOUR_GAUGE` (default on; `=0` restores): past a SHARP edge
@@ -1451,6 +1452,53 @@ pub(super) fn miter_vertex_gauge_on() -> bool {
     switch!("BREP_OFFSET_MITER_VERTEX_GAUGE", true)
 }
 
+/// `BREP_OFFSET_MITER_CURVED_NEIGHBOUR` (default on; `=0` restores): past a
+/// sharp edge whose neighbour is CURVED, the mitered distance to a planar face
+/// reads `max(height, h_S)`, `h_S` the point's signed height over the
+/// neighbour's own surface (at its foot there, along that face's outward
+/// normal), where it read the height over the neighbour's tangent plane at the
+/// edge, or `past` when that plane is square.
+///
+/// Cause: the hemisphere of radius 5 grown by 2 with sharp joins refused
+/// ("non-positive volume"). A point of the grown sphere's skin at (rho 6.72,
+/// z 1.97) lies 2 from the sphere, yet read `max(1.97, 1.72)` = 1.97 from the
+/// base disc: the square box past the rim is the mitre of a PLANAR neighbour,
+/// and the sphere's offset curves inside it. The wall fragment was dropped as
+/// shadowed and the strip under the grown base kept.
+pub(super) fn miter_curved_neighbour_on() -> bool {
+    switch!("BREP_OFFSET_MITER_CURVED_NEIGHBOUR", true)
+}
+
+/// The signed height of `point` over the CURVED retained face other than
+/// `face` that uses `edge` (along its outward normal at the point's foot), or
+/// `None` when that neighbour is planar, there is none, or the height cannot
+/// be read.
+fn curved_neighbour_height(
+    face: &FaceRecord,
+    edge: &EdgeRecord,
+    point: Vec3,
+    retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
+) -> Result<Option<f64>, KernelRefusal> {
+    for (other, _) in retained_faces {
+        if other.id == face.id {
+            continue;
+        }
+        if !other.loops.iter().flat_map(|loop_record| &loop_record.coedges).any(|coedge| coedge.edge_id == edge.id) {
+            continue;
+        }
+        if other.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+            return Ok(None);
+        }
+        // Anything unreadable (a foot on a pole, where the normal is
+        // undefined) keeps the planar reading.
+        let Ok(foot) = crate::project_point_to_surface(&other.surface, point) else { return Ok(None) };
+        let Ok(at) = other.surface.evaluate(foot.u, foot.v) else { return Ok(None) };
+        let Ok(normal) = super::smooth_sync::face_normal(other, foot.u, foot.v) else { return Ok(None) };
+        return Ok(Some(point.sub(at).dot(normal)));
+    }
+    Ok(None)
+}
+
 /// The outward normal, at `at`, of the retained face other than `face` that
 /// uses `edge`, if there is one.
 fn neighbour_outward_normal(
@@ -1482,6 +1530,7 @@ fn miter_distance_with_neighbours(
     point: Vec3,
     tangent: &mut dyn FnMut(&EdgeRecord) -> Result<bool, KernelRefusal>,
     neighbour: &mut dyn FnMut(&EdgeRecord, Vec3) -> Result<Option<(Vec3, bool)>, KernelRefusal>,
+    curved_height: &mut dyn FnMut(&EdgeRecord) -> Result<Option<f64>, KernelRefusal>,
 ) -> Result<Option<f64>, KernelRefusal> {
     if !face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(None);
@@ -1570,10 +1619,19 @@ fn miter_distance_with_neighbours(
                 let projection = crate::project_point_to_curve(&edge.curve, foot).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
                 let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
                 let at = edge.curve.evaluate(projection.u.clamp(low, high)).or_refuse(KernelStage::Refine, "evaluate")?;
-                if let Some((across, _)) = neighbour(edge, at)? {
+                if let Some((across, planar)) = neighbour(edge, at)? {
                     let beyond = foot.sub(at);
                     let square = across.dot(normal).abs() <= 1e-12;
-                    if !square && across.dot(beyond) > 0.0 {
+                    if !planar && across.dot(beyond) > 0.0 {
+                        // A CURVED neighbour (`BREP_OFFSET_MITER_CURVED_NEIGHBOUR`): its offset
+                        // is not its tangent plane's, and the miter is the point's height over
+                        // the neighbour's own surface.
+                        if let Some(over) = curved_height(edge)? {
+                            reading = height.max(over);
+                        } else if !square {
+                            reading = height.max(point.sub(at).dot(across));
+                        }
+                    } else if !square && across.dot(beyond) > 0.0 {
                         reading = height.max(point.sub(at).dot(across));
                     }
                 }

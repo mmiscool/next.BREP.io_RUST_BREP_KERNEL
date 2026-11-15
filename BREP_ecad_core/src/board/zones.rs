@@ -570,10 +570,10 @@ fn fill_zone(board: &Board, conn: &Connectivity, stitch: &Stitching, index: usiz
             if let CopperRef::Pad { placement, pad } = item.owner
                 && board.placements[placement].footprint.pads[pad].drill.is_some()
             {
-                thermal_pads.push((item.owner, item.shape));
+                thermal_pads.push((item.owner, item.shape.clone()));
             }
         } else {
-            obstacles.push(Obstacle::Keep(item.shape, clearance_to(&conn.island_nets[island])));
+            obstacles.push(Obstacle::Keep(item.shape.clone(), clearance_to(&conn.island_nets[island])));
         }
     }
     for earlier in &board.zones[..index] {

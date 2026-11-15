@@ -59,6 +59,8 @@ pub mod solid_sweep;
 pub use solid_sweep::{
     sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
 };
+#[path = "construction/solid_sweep_bar.rs"]
+mod solid_sweep_bar;
 #[path = "construction/solid_sweep_caps.rs"]
 #[doc(hidden)]
 pub mod solid_sweep_caps;

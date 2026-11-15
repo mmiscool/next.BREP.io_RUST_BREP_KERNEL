@@ -122,7 +122,48 @@ fn half_arc(centre: [f64; 2], radius: f64, start: f64, z: f64) -> Result<NurbsCu
 /// four lines, a capsule as two lines and two half-circles, a circle as two
 /// half-circles (the extruder wants at least two curves).
 fn shape_curves(shape: &Shape, z: f64) -> Result<Vec<NurbsCurve>, String> {
-    match *shape {
+    match shape.clone() {
+        // A polygon's corners as straights, its rounding (a custom pad's, or a
+        // mask opening grown from one) faceted on the true outline. Board y
+        // points down, so the outline is walked backwards to turn
+        // counter-clockwise in millimetres.
+        Shape::Polygon { .. } if shape.swept_corners().is_some() => {
+            // Exact: each outward corner's arc and the straights between,
+            // walked backwards (board y points down) to turn counter-clockwise
+            // in millimetres, as the Gerber's stroked region draws it.
+            let corners = shape.swept_corners().unwrap_or_default();
+            let n = corners.len();
+            let mmxy = |(x, y): (f64, f64)| [x / 1000., -y / 1000.];
+            let mut curves = vec![];
+            for i in (0..n).rev() {
+                let (start, _) = corners[i].ends();
+                if let board::SweptCorner::Arc { centre, radius, from, sweep } = corners[i] {
+                    curves.push(make_arc(
+                        point(xy(centre), z),
+                        Vec3::new(1., 0., 0.),
+                        Vec3::new(0., 1., 0.),
+                        mm(radius),
+                        -(from + sweep),
+                        -from,
+                    )?);
+                }
+                let (to, from_pt) = (mmxy(corners[(i + n - 1) % n].ends().1), mmxy(start));
+                if (to[0] - from_pt[0]).hypot(to[1] - from_pt[1]) > 1e-6 {
+                    curves.push(make_line(point(from_pt, z), point(to, z))?);
+                }
+            }
+            Ok(curves)
+        }
+        // A polygon with its corners as its outline, or one whose rounding fills
+        // a notch: the outline, faceted on the true curve.
+        Shape::Polygon { .. } => {
+            let mut ring: Vec<[f64; 2]> = shape.outline(8).into_iter().map(xy).collect();
+            ring.reverse();
+            if ring.len() < 3 {
+                return Err("degenerate polygon".into());
+            }
+            polygon_curves(&ring, z)
+        }
         // Four quarter arcs about the core rectangle's corners, joined by the
         // straights between them (none where the radius takes a whole side).
         Shape::RoundRect { min, max, radius } => {

@@ -339,8 +339,8 @@ fn fan_or_ears(loop_xy: &[[f64; 2]]) -> Vec<[usize; 3]> {
 /// as four corners, a capsule as a stadium closed by two [`ARC_FACETS`] arcs
 /// (a circle when its ends coincide).
 fn shape_loop(shape: &Shape) -> Vec<[f64; 2]> {
-    match *shape {
-        Shape::RoundRect { .. } => {
+    match shape.clone() {
+        Shape::RoundRect { .. } | Shape::Polygon { .. } => {
             // Board y points down, so the outline's turn reverses in millimetres:
             // walk it backwards to stay counter-clockwise.
             let mut out: Vec<[f64; 2]> = shape.outline(ARC_FACETS).into_iter().map(xy).collect();

@@ -399,6 +399,18 @@ fn offset_shell_lanes(
                 Ok(result) => Ok(result),
                 Err(boolean) => {
                     os_debug!("boolean lane refused too ({boolean})");
+                    // An outward wall through a curved opening on a sphere or
+                    // a cylinder: the grown body cut by the opening's own
+                    // surface (`opening_surface_cut`).
+                    if distance < 0.0
+                        && super::opening_surface_cut::answers(&direct)
+                        && super::opening_surface_cut::opening_surface_cut_on()
+                    {
+                        match super::opening_surface_cut::build(source, opening_face_ids, distance) {
+                            Ok(result) => return Ok(result),
+                            Err(cut) => os_debug!("opening-surface cut refused too ({cut})"),
+                        }
+                    }
                     Err(direct)
                 }
             }
@@ -992,7 +1004,17 @@ fn offset_shell_impl(
                 Some(continued) => Some(continued),
                 None => match band_reach_continued_source(source, face, distance, &extension)? {
                     Some(widened) => Some(widened),
-                    None => reflex_side_widened_source(source, face, &source_faces, &opening_set, distance, &extension)?,
+                    None => match reflex_side_widened_source(source, face, &source_faces, &opening_set, distance, &extension)? {
+                        Some(widened) => Some(widened),
+                        None => super::outward_side_widen::outward_sharp_side_widened_source(
+                            source,
+                            face,
+                            &source_faces,
+                            &opening_set,
+                            distance,
+                            &extension,
+                        )?,
+                    },
                 },
             }
         } else {
@@ -1077,6 +1099,23 @@ fn offset_shell_impl(
                         widest + clearance
                     );
                     carrier = rebuilt;
+                } else if super::outward_side_widen::slid_trim_falls_short(
+                    source,
+                    face,
+                    &source_faces,
+                    &carrier,
+                    distance,
+                    narrowest,
+                )? {
+                    // `BREP_OFFSET_OUTWARD_SIDE_WIDEN`: a slid trim short of
+                    // its pad takes the plane's rectangle, and the
+                    // neighbours' offsets cut the skin from it.
+                    os_debug!("carrier for src face {face_id}: slid trim falls short, full rectangle");
+                    carrier = full_rectangle_face(&carrier, &carrier.shells[0].faces[0])?;
+                    // Only the rectangle's own edges: a section along the
+                    // replaced trim's records would be dropped as lying on
+                    // this carrier's boundary.
+                    super::outward_side_widen::keep_used_edges(&mut carrier);
                 }
             }
         }

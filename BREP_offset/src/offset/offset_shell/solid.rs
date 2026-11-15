@@ -99,7 +99,20 @@ fn offset_solid_joined(
             return Ok(grown);
         }
     }
+    let widened_before = super::outward_side_widen::widened_count();
     let sharp = match offset_body(source, &[], -distance, Body::Whole, "offset_solid") {
+        // A rounded growth whose sharp body was assembled only because a
+        // curved face's side was widened (`outward_side_widen`) used to be
+        // refused there and built by the revolved-parallel lane, which is
+        // exact; a solid of revolution keeps that lane, and any other body
+        // (the lane declines it) rounds the sharp body.
+        Ok(_) if corners == OffsetCorners::Rounded
+            && distance > 0.0
+            && super::outward_side_widen::widened_count() != widened_before
+            && super::revolved_parallel::revolved_parallel(source, distance).is_some() =>
+        {
+            return Ok(super::revolved_parallel::revolved_parallel(source, distance).unwrap());
+        }
         Ok(sharp) => sharp,
         Err(error) => {
             if corners == OffsetCorners::Rounded {

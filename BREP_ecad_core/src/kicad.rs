@@ -523,7 +523,9 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
                 let rotation = at.number(3).unwrap_or(0.);
                 let size = item.required("size")?;
                 let (mut w, mut h) = (size.number(1)?, size.number(2)?);
+                let (own_w, own_h) = (w, h);
                 let half_turn = rotation.rem_euclid(180.);
+                let mut boxed = false;
                 if (half_turn - 90.).abs() < 1e-6 {
                     (w, h) = (h, w);
                 } else if half_turn > 1e-6 {
@@ -532,10 +534,7 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
                         rotation.to_radians().sin().abs(),
                     );
                     (w, h) = (w * c + h * s, w * s + h * c);
-                    warnings.push(format!(
-                        "Pad {} rotated {rotation}° is approximated by its bounding box",
-                        item.arg(1)
-                    ));
+                    boxed = true;
                 }
                 // `(drill 1.0)`, or `(drill oval 1.2 0.8)`: a slot's width (x) and
                 // height (y) in the pad's frame. An `(offset …)` child is a list,
@@ -592,7 +591,9 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
                         if corner_radius > 0 { PadShape::RoundRect } else { PadShape::Rect }
                     }
                     "rect" => PadShape::Rect,
-                    "trapezoid" | "chamfered_rect" => {
+                    "trapezoid" => PadShape::Trapezoid,
+                    "custom" => PadShape::Custom,
+                    "chamfered_rect" => {
                         warnings.push(format!(
                             "Pad {} shape {} is approximated by a rectangle",
                             item.arg(1),
@@ -637,6 +638,57 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
                 };
                 layers.mask_margin = margin("solder_mask_margin");
                 layers.paste_margin = margin("solder_paste_margin");
+                // A trapezoid or custom pad is a polygon in the pad's own frame,
+                // turned here by the pad's rotation exactly, whatever it is.
+                let (mut shape, mut trapezoid_delta, mut polygon) = (shape, Point::default(), vec![]);
+                if shape == PadShape::Trapezoid {
+                    let delta = match item.child("rect_delta") {
+                        Some(d) => Point::new(um(d.number(1).unwrap_or(0.)), um(d.number(2).unwrap_or(0.))),
+                        None => Point::default(),
+                    };
+                    let mut pad = Pad::smd("", Point::default(), Point::new(um(own_w), um(own_h)), PadShape::Trapezoid);
+                    pad.trapezoid_delta = delta;
+                    if rotation.rem_euclid(360.).abs() < 1e-6 {
+                        trapezoid_delta = delta;
+                        (w, h) = (own_w, own_h);
+                    } else if let Some(corners) = pad.corners() {
+                        shape = PadShape::Custom;
+                        polygon = corners;
+                    }
+                }
+                if shape == PadShape::Custom && polygon.is_empty() {
+                    match custom_polygon(item, own_w, own_h, &um, &xy) {
+                        Some((points, round)) => {
+                            polygon = points;
+                            corner_radius = round;
+                        }
+                        None => {
+                            warnings.push(format!(
+                                "Pad {} shape custom is approximated by a rectangle",
+                                item.arg(1)
+                            ));
+                            shape = PadShape::Rect;
+                        }
+                    }
+                }
+                if !polygon.is_empty() {
+                    let turn = rotation.to_radians();
+                    let (c, s) = (turn.cos(), turn.sin());
+                    for p in &mut polygon {
+                        let (x, y) = (f64::from(p.x), f64::from(p.y));
+                        // KiCad turns counter-clockwise on a y-down board.
+                        *p = Point::new((x * c + y * s).round() as i32, (-x * s + y * c).round() as i32);
+                    }
+                    let (min, max) = polygon.iter().fold((polygon[0], polygon[0]), |(lo, hi), p| {
+                        (Point::new(lo.x.min(p.x), lo.y.min(p.y)), Point::new(hi.x.max(p.x), hi.y.max(p.y)))
+                    });
+                    (w, h) = (f64::from(max.x - min.x) / 1000., f64::from(max.y - min.y) / 1000.);
+                } else if boxed {
+                    warnings.push(format!(
+                        "Pad {} rotated {rotation}° is approximated by its bounding box",
+                        item.arg(1)
+                    ));
+                }
                 let (dx, dy) = (drill.unwrap_or(0), drill_height.or(drill).unwrap_or(0));
                 pads.push(Pad {
                     number: if kind == "np_thru_hole" {
@@ -653,6 +705,8 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
                     corner_radius,
                     back,
                     layers,
+                    trapezoid_delta,
+                    polygon,
                 });
             }
             "fp_line" if layer.is_some() => {
@@ -934,4 +988,35 @@ fn wildcard_matches(pattern: &[char], subject: &[char]) -> bool {
         }
     }
     pattern[p..].iter().all(|&c| c == '*')
+}
+
+/// A KiCad custom pad's copper as one polygon in the pad's own frame, and its
+/// rounding (half the polygon's pen): only when the pad draws exactly one filled
+/// `gr_poly` that covers its anchor, the union being that polygon then.
+fn custom_polygon(
+    item: &Expr,
+    w: f64,
+    h: f64,
+    um: &dyn Fn(f64) -> i32,
+    xy: &dyn Fn(&Expr) -> Result<Point, String>,
+) -> Option<(Vec<Point>, i32)> {
+    let primitives: Vec<&Expr> = item.child("primitives")?.list().iter().skip(1).collect();
+    let [poly] = primitives.as_slice() else {
+        return None;
+    };
+    if poly.head() != "gr_poly" {
+        return None;
+    }
+    let points = poly.child("pts")?.list().iter().skip(1).map(xy).collect::<Result<Vec<_>, _>>().ok()?;
+    let round = poly.child("width").and_then(|w| w.number(1).ok()).map_or(0, |w| um(w) / 2).max(0);
+    let mut pad = Pad::smd("", Point::default(), Point::new(um(w).max(1), um(h).max(1)), PadShape::Custom);
+    pad.polygon = points.clone();
+    pad.corner_radius = round;
+    if pad.outline_problem().is_some() {
+        return None;
+    }
+    let copper = pad.local_shape();
+    let (hw, hh) = (um(w) / 2, um(h) / 2);
+    let anchor = [Point::new(-hw, -hh), Point::new(hw, -hh), Point::new(hw, hh), Point::new(-hw, hh)];
+    copper.covers_box(anchor[0], anchor[2]).then_some((points, round))
 }

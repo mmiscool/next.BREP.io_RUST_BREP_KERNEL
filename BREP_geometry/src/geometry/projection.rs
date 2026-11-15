@@ -177,13 +177,20 @@ fn projection_memo_enabled() -> bool {
 }
 
 
-type CurveSeeds = std::rc::Rc<Vec<(f64, Vec3)>>;
+// Immutable slices avoid retaining Vec spare capacity: cached sample payload
+// is at most 8 MiB per thread, plus at most 4096 map entries and Rc headers.
+type CurveSeeds = std::rc::Rc<[(f64, Vec3)]>;
 const CURVE_SEED_BUDGET: usize = 262_144;
 thread_local! {
     static CURVE_SEEDS: std::cell::RefCell<(rustc_hash::FxHashMap<[u64; 2], CurveSeeds>, usize)> = Default::default();
 }
 
-/// Discard the bounded per-thread seed geometry at a cold history boundary.
+/// Discard the calling thread's bounded seed geometry at a history boundary.
+/// Other workers retain their own content-keyed entries until local eviction,
+/// an explicit clear on that worker, or thread exit. This is deliberately not
+/// a pool-wide invalidation: curve content fully determines every stored bit.
+/// Each worker retains at most 262,144 samples (8 MiB payload) and 4096 keys;
+/// temporary sampling and an outstanding borrowed snapshot are additional.
 pub fn clear_curve_seed_cache() {
     CURVE_SEEDS.with(|memo| *memo.borrow_mut() = Default::default());
 }
@@ -207,7 +214,7 @@ fn visit_curve_seeds(curve: &NurbsCurve, start: f64, end: f64, mut visit: impl F
 /// Newton iterations and tie breaking. The content key includes every knot
 /// and homogeneous control bit; failed sampling is never retained.
 fn cached_curve_seeds(curve: &NurbsCurve, start: f64, end: f64) -> Result<Option<CurveSeeds>, String> {
-    if !switch!("BREP_CURVE_PROJECTION_SEEDS", false) { return Ok(None); }
+    if !switch!("BREP_CURVE_PROJECTION_SEEDS", true) { return Ok(None); }
     // Avoid allocating a giant one-off vector even when it would not be kept.
     let bound = curve.knots.len().saturating_add(1).saturating_mul(4usize.max(curve.degree + 2).saturating_add(1));
     if bound > CURVE_SEED_BUDGET { return Ok(None); }
@@ -220,7 +227,7 @@ fn cached_curve_seeds(curve: &NurbsCurve, start: f64, end: f64) -> Result<Option
     }
     let mut seeds = Vec::new();
     visit_curve_seeds(curve, start, end, |u, point| seeds.push((u, point)))?;
-    let seeds = std::rc::Rc::new(seeds);
+    let seeds: CurveSeeds = seeds.into();
     CURVE_SEEDS.with(|memo| {
         let mut memo = memo.borrow_mut();
         if memo.0.len() >= PROJECTION_MEMO_ENTRIES || memo.1 + seeds.len() > CURVE_SEED_BUDGET {

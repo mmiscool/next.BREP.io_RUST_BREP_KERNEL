@@ -530,6 +530,24 @@ impl Gerber {
         // point instead of writing a negative aperture.
         let (shape, grow) = (shape.grown(grow), 0);
         match shape {
+            // A polygon is a region; its rounding, the polygon swept by a disc,
+            // is that region with every edge stroked by a round aperture of the
+            // disc, which the film draws exactly.
+            Shape::Polygon { points, radius } => {
+                if let Some(function) = function {
+                    let _ = writeln!(self.body, "%TA.AperFunction,{function}*%");
+                }
+                self.body.push_str("G36*\n");
+                self.stroke(points.iter().chain(points.first()).map(|p| origin.point(*p)));
+                self.body.push_str("G37*\n");
+                if function.is_some() {
+                    self.body.push_str("%TD*%\n");
+                }
+                if radius > 0 {
+                    self.select(Aperture::Circle(2 * radius), function);
+                    self.stroke(points.iter().chain(points.first()).map(|p| origin.point(*p)));
+                }
+            }
             // No standard aperture is a rounded rectangle: drawn as a region of
             // four straights and four EXACT quarter arcs (G02, multi-quadrant
             // G75 is set in the header), so the film carries the copper the
@@ -744,8 +762,9 @@ fn paste(board: &Board, origin: &Origin, top: bool) -> Gerber {
         {
             let (layer, _) = placement.pad_layers(pad, board.layer_count);
             if (top && layer == 0) || (!top && last != 0 && layer == last) {
-                let shape = placement.pad_shape(pad).grown(pad.layers.paste_margin.unwrap_or(0));
-                gerber.shape(origin, shape, 0, None);
+                for shape in placement.pad_paste(pad) {
+                    gerber.shape(origin, shape, 0, None);
+                }
             }
         }
     }

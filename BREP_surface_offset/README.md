@@ -1,7 +1,7 @@
 # BREP_surface_offset
 
 `BREP_surface_offset` holds the surface offsets of the BREP kernel. Its Rust library
-target is `brep_surface_offset`; this is version **0.20.0**.
+target is `brep_surface_offset`; this is version **0.21.0**.
 
 It is one of the implementation crates the kernel is built from. Applications
 should depend on [`BREP_kernel`](https://crates.io/crates/BREP_kernel), which
