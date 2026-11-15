@@ -58,11 +58,15 @@
 //! the part itself, so the rib's far end IS the part's faces, whatever shape they
 //! are. A `depth` in a saved document is ignored.
 //!
-//! # V1 limitation (replicated): OPEN STRAIGHT-POLYLINE profiles only
+//! # Profiles: any OPEN chain the sketcher draws
 //!
-//! Arcs/curves and closed loops are rejected. Here: a
-//! non-degree-1 (arc) profile curve errors clearly; `rib_from_profile` itself
-//! rejects a closed chain, and a collinear chain with no plane to fall back on.
+//! Lines, arcs and splines, tangent or meeting at corners. A Parallel-to-Sketch
+//! rib sweeps the chain itself, so any curve works; a Normal-to-Sketch rib
+//! offsets the chain in its plane (lines and arcs exactly, splines by a fitted
+//! offset), mitring corners as a polyline's are, and refuses a spline bending
+//! tighter than half the thickness (`RIB_OFFSET_CUSP`).
+//! `rib_from_profile` rejects a closed chain, and a collinear chain with no
+//! plane to fall back on.
 //!
 //! # Name fidelity (contract rule 2)
 //!
@@ -131,23 +135,16 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // Normalize a `{sketch}:FACE` display-sheet pick to the sketch profile base.
     let profile_name = common::normalize_profile_alias(
         common::first_reference_name(ctx.param("profile"))
-            .ok_or("rib: select an open sketch chain (polyline) for the profile")?,
+            .ok_or("rib: select an open sketch chain for the profile")?,
     );
     let profile =
         common::resolve_path(ctx, &profile_name).map_err(|error| format!("rib: {error}"))?;
     if profile.is_empty() {
         return Err(format!("rib: profile '{profile_name}' has no curves").into());
     }
-    // V1: OPEN straight-polyline profiles only — reject arcs (degree > 1), matching
-    // the `edgeIsStraight` throw. `rib_from_profile` rejects a CLOSED chain and
-    // a collinear one.
-    if profile.iter().any(|curve| curve.degree != 1) {
-        return Err(
-            "rib: the profile must be a single OPEN polyline chain (arcs and closed loops \
-             are not supported in V1)"
-                .into(),
-        );
-    }
+    // Lines, arcs and splines all go to `rib_from_profile`, which rejects a
+    // CLOSED chain, a collinear one with no plane, and names what it cannot
+    // thicken (a spline bending tighter than half the thickness).
 
     // A non-finite value → 0; `rib_from_profile` enforces > 0.
     let thickness = common::number_or_default(ctx, "thickness", 0.0);
@@ -329,22 +326,35 @@ fn auto_material_side(
 
     let samples = chain_samples(profile)?;
     crate::with_registered_solid_str(target_handle, |solid| {
-        let reach = crate::spatial::Aabb::from_points(
-            solid.vertices.iter().map(|vertex| vertex.point),
-        )
-        .diagonal();
-        if !(reach > 0.0) || !reach.is_finite() {
+        let part = crate::spatial::Aabb::from_points(solid.vertices.iter().map(|vertex| vertex.point))
+            .diagonal();
+        if !(part > 0.0) || !part.is_finite() {
             return Err("rib: the target solid has no extent to aim the rib at".into());
         }
         let classifier = SolidClassifier::new(solid, 1e-6)?;
         let steps = 48;
+        let curved = profile.iter().any(|curve| curve.degree > 1);
+        let bounds = crate::spatial::Aabb::from_points(solid.vertices.iter().map(|vertex| vertex.point));
         let mut best: Option<(usize, f64, Vec3)> = None;
         for signed in [axis, axis.scale(-1.0)] {
             let mut hits = 0usize;
             let mut total = 0.0;
             for sample in &samples {
+                // A polyline marches the part's own diagonal from the sample,
+                // as always. A curve can stand anywhere off the part (a crown
+                // far above it), so its march starts where the ray enters the
+                // part's box and crosses that box in 48 steps: never longer
+                // than the part, never striding over a thin one.
+                let (from, length) = if curved {
+                    match ray_through_box(*sample, signed, &bounds) {
+                        Some((enter, leave)) => (enter, leave - enter),
+                        None => continue,
+                    }
+                } else {
+                    (0.0, part)
+                };
                 for step in 1..=steps {
-                    let distance = reach * step as f64 / steps as f64;
+                    let distance = from + length * step as f64 / steps as f64;
                     let point = sample.add(signed.scale(distance));
                     if classifier.classify(point)?.class == PointClass::In {
                         hits += 1;
@@ -377,6 +387,28 @@ fn auto_material_side(
             ),
         }
     })
+}
+
+/// Where the ray `origin + s·direction` (s ≥ 0) is inside `bounds`: the
+/// parameters it enters and leaves at, or `None` when it misses the box.
+fn ray_through_box(origin: Vec3, direction: Vec3, bounds: &crate::spatial::Aabb) -> Option<(f64, f64)> {
+    let (mut enter, mut leave) = (0.0f64, f64::INFINITY);
+    for (o, d, low, high) in [
+        (origin.x, direction.x, bounds.minimum.x, bounds.maximum.x),
+        (origin.y, direction.y, bounds.minimum.y, bounds.maximum.y),
+        (origin.z, direction.z, bounds.minimum.z, bounds.maximum.z),
+    ] {
+        if d.abs() < 1e-300 {
+            if o < low || o > high {
+                return None;
+            }
+            continue;
+        }
+        let (a, b) = ((low - o) / d, (high - o) / d);
+        enter = enter.max(a.min(b));
+        leave = leave.min(a.max(b));
+    }
+    (enter <= leave).then_some((enter, leave))
 }
 
 /// Points spread along the chain — the probes AUTO marches from.
@@ -414,7 +446,39 @@ fn chain_vertices(profile: &[NurbsCurve]) -> Result<Vec<Vec3>, String> {
 /// publishes one, see [`build`]). Errors on a collinear chain (no unique plane —
 /// the kernel's own `np` derivation errors the same way).
 fn profile_normal(profile: &[NurbsCurve]) -> Result<Vec3, String> {
-    let vertices = chain_vertices(profile)?;
+    // A curved chain bends inside its own segments too: take its plane from
+    // points along it (a single arc edge has a plane; its two ends do not).
+    if profile.iter().any(|curve| curve.degree > 1) {
+        let mut points = Vec::new();
+        for (index, curve) in profile.iter().enumerate() {
+            let [start, end] = curve.domain()?;
+            for k in usize::from(index > 0)..=32 {
+                points.push(curve.evaluate(start + (end - start) * k as f64 / 32.0)?);
+            }
+        }
+        // Signed bends cancel along an S-curve, so the plane is spanned by the
+        // two points farthest apart and the point farthest off their line.
+        let origin = points[0];
+        let far = points
+            .iter()
+            .copied()
+            .max_by(|a, b| a.sub(origin).length().total_cmp(&b.sub(origin).length()))
+            .unwrap_or(origin);
+        let axis = far.sub(origin);
+        let off = points
+            .iter()
+            .copied()
+            .max_by(|a, b| axis.cross(a.sub(origin)).length().total_cmp(&axis.cross(b.sub(origin)).length()))
+            .unwrap_or(origin);
+        return axis.cross(off.sub(origin)).normalized().map_err(|_| {
+            "rib: profile is collinear and publishes no plane of its own; its plane normal cannot \
+             be determined (pick a SKETCH chain instead)"
+                .to_string()
+        });
+    }
+    let vertices = {
+        chain_vertices(profile)?
+    };
     if vertices.len() < 3 {
         return Err(
             "rib: a straight (single-segment) profile from an edge has no plane; pick a SKETCH \
@@ -507,7 +571,7 @@ pub fn schema() -> serde_json::Value {
             ],
             "multiple": true,
             "default_value": [],
-            "hint": "Select an OPEN sketch chain (polyline) to thicken into a rib"
+            "hint": "Select an OPEN sketch chain (lines, arcs, splines) to thicken into a rib"
         },
         "thickness": {
             "type": "number",

@@ -4,7 +4,9 @@ use crate::editor_core::EditorCore;
 use crate::actions::{Action, ActionGroup, action, command, key};
 use crate::board_view::{BACKGROUND, SILK, THROUGH_HOLE, WARNING, layer_color};
 use crate::symbol_editor::{InspectorHits, LIST_SHARE, grip_under, key_word, list_height};
-use brep_ecad_core::board::{COURTYARD_MARGIN, Footprint, Pad, PadShape, Shape};
+use brep_ecad_core::board::{COURTYARD_MARGIN, DesignRules, Footprint, Pad, PadShape, Shape};
+use brep_ecad_core::graphic::{GraphicLayer, GraphicShape, LayerGraphic};
+use crate::board_view::graphic_color;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum DrawTool {
@@ -14,11 +16,16 @@ pub(crate) enum DrawTool {
     Line,
     Rectangle,
     Circle,
+    Arc,
+    Text,
 }
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Item {
     Pad(usize),
     Silk(usize),
+    /// One of the footprint's drawn items on a non-copper layer, by its index
+    /// in `Footprint::graphics`.
+    Graphic(usize),
 }
 #[derive(Clone, Copy, PartialEq)]
 enum PadKind {
@@ -99,6 +106,8 @@ fn link_ring(link: PadLink) -> Option<Color32> {
 enum Mark {
     Ring(Color32),
     Silk,
+    /// A drawn item, in its layer's colour.
+    Drawn(Color32),
 }
 /// A mark as the canvas draws it — its colours, on the canvas's own dark
 /// ground — in a chip before the words about it. The WORDS are drawn in the
@@ -129,6 +138,12 @@ fn swatch(ui: &mut egui::Ui, mark: Option<Mark>) {
             painter.line_segment(
                 [rect.left_center() + Vec2::new(4., 0.), rect.right_center() - Vec2::new(4., 0.)],
                 Stroke::new(1.5, SILK),
+            );
+        }
+        Mark::Drawn(colour) => {
+            painter.line_segment(
+                [rect.left_center() + Vec2::new(4., 0.), rect.right_center() - Vec2::new(4., 0.)],
+                Stroke::new(2., colour),
             );
         }
     }
@@ -180,6 +195,9 @@ pub struct FootprintEditor {
     pin_names: std::collections::BTreeMap<String, String>,
     core: EditorCore<Footprint, Item, (Footprint, Point)>,
     tool: DrawTool,
+    /// The layer and pen the drawing tools draw with; no pen is the layer's own.
+    draw_layer: GraphicLayer,
+    draw_width: Option<i32>,
     start: Option<Point>,
     fit: bool,
     grid: i32,
@@ -217,6 +235,8 @@ impl FootprintEditor {
             pin_names: Default::default(),
             core: EditorCore::new(0.08),
             tool: DrawTool::Select,
+            draw_layer: GraphicLayer::FrontSilk,
+            draw_width: None,
             start: None,
             fit: true,
             grid: 50,
@@ -239,6 +259,8 @@ impl FootprintEditor {
                 pads: vec![],
                 silk: vec![],
                 model: None,
+                courtyard_margin: None,
+                graphics: vec![],
             },
             None,
             vec![],
@@ -268,6 +290,8 @@ impl FootprintEditor {
             DrawTool::Line => "line",
             DrawTool::Rectangle => "rectangle",
             DrawTool::Circle => "circle",
+            DrawTool::Arc => "arc",
+            DrawTool::Text => "text",
         }
     }
     /// Where the canvas is looking: the footprint origin's offset from the canvas centre in
@@ -361,7 +385,41 @@ impl FootprintEditor {
                 .max_by(|a, b| a.0.distance(a.1).total_cmp(&b.0.distance(b.1)))?;
             Some((format!("silk:{i}"), Rect::from_center_size(a.lerp(b, 0.5), Vec2::splat(8.))))
         });
-        pads.chain(silk).chain(self.inspector.shown(self.canvas_pass))
+        // A drawn item the same way, `graphic:<index>`, text by its anchor: on
+        // the middle of its longest segment the canvas answers with THIS item
+        // (a pad or a line over a middle takes the click there), else the
+        // longest.
+        let world = |p: Pos2| {
+            let v = (p - center) / self.core.zoom;
+            Point::new(v.x.round() as i32, v.y.round() as i32)
+        };
+        let graphics = self.footprint.graphics.iter().enumerate().filter_map(|(i, g)| {
+            let at = match &g.shape {
+                // Text by the middle of the box its strokes fill, which is
+                // where it answers a click.
+                GraphicShape::Text { at, .. } => {
+                    let points: Vec<Pos2> = g.strokes(!g.layer.front()).iter().flatten().map(|p| screen(*p)).collect();
+                    if points.is_empty() { screen(*at) } else { Rect::from_points(&points).center() }
+                }
+                _ => {
+                    let mut middles: Vec<(f32, Pos2)> = g
+                        .strokes(!g.layer.front())
+                        .iter()
+                        .flat_map(|line| line.windows(2).map(|s| (screen(s[0]), screen(s[1]))).collect::<Vec<_>>())
+                        .map(|(a, b)| (a.distance(b), a.lerp(b, 0.5)))
+                        .collect();
+                    middles.sort_by(|a, b| b.0.total_cmp(&a.0));
+                    let longest = middles.first()?.1;
+                    middles
+                        .iter()
+                        .map(|m| m.1)
+                        .find(|&m| self.hit(m, screen, world(m)) == Some(Item::Graphic(i)))
+                        .unwrap_or(longest)
+                }
+            };
+            Some((format!("graphic:{i}"), Rect::from_center_size(at, Vec2::splat(8.))))
+        });
+        pads.chain(silk).chain(graphics).chain(self.inspector.shown(self.canvas_pass))
             .chain(self.toolbar_hits.shown(self.canvas_pass)).collect()
     }
     /// The index of the selected silkscreen line, or `None` when the selection
@@ -370,6 +428,14 @@ impl FootprintEditor {
     pub fn selected_silk(&self) -> Option<usize> {
         match self.core.selected {
             Some(Item::Silk(index)) if index < self.footprint.silk.len() => Some(index),
+            _ => None,
+        }
+    }
+    /// The index of the selected drawn item in `Footprint::graphics`, as
+    /// `graphic:<index>` names it, or `None`.
+    pub fn selected_graphic(&self) -> Option<usize> {
+        match self.core.selected {
+            Some(Item::Graphic(index)) if index < self.footprint.graphics.len() => Some(index),
             _ => None,
         }
     }
@@ -461,6 +527,10 @@ impl FootprintEditor {
                 }
             },
             Item::Silk(i) => format!("Silkscreen {} · decoration", i + 1),
+            Item::Graphic(i) => match self.footprint.graphics.get(i) {
+                Some(g) => format!("{} {} · {}", graphic_kind(g), i + 1, g.layer.name()),
+                None => format!("Drawing {}", i + 1),
+            },
         }
     }
     /// Arm a pad tool to place the next pad as pin `number`'s. The other half of
@@ -534,7 +604,13 @@ impl FootprintEditor {
                 if !a.number.is_empty() && a.number == b.number {
                     continue;
                 }
-                let gap = Shape::pad(a.at, a.size, a.shape).distance(&Shape::pad(b.at, b.size, b.shape));
+                // Copper on opposite faces of the board never meets.
+                let (af, ab) = a.copper_sides();
+                let (bf, bb) = b.copper_sides();
+                if !(af && bf) && !(ab && bb) {
+                    continue;
+                }
+                let gap = a.local_shape().distance(&b.local_shape());
                 if gap + 0.5 < minimum {
                     close.push((i, j, gap));
                 }
@@ -656,6 +732,9 @@ impl FootprintEditor {
             crate::count(self.footprint.pads.len(), "pad", "pads"),
             crate::count(self.footprint.silk.len(), "silkscreen line", "silkscreen lines")
         ));
+        if !self.footprint.graphics.is_empty() {
+            ui.small(crate::count(self.footprint.graphics.len(), "drawn item", "drawn items"));
+        }
         // What the pads are ON, at a glance and before anything is selected,
         // because the failure this answers is that a user cannot tell.
         let (on_pins, mechanical, orphans) = self.link_counts();
@@ -681,6 +760,52 @@ impl FootprintEditor {
             ui.label("Snap");
             self.grid_combo(ui, "footprint-grid-inspector");
         });
+        // What the drawing tools draw on, and with what pen.
+        if matches!(
+            self.tool,
+            DrawTool::Line | DrawTool::Rectangle | DrawTool::Circle | DrawTool::Arc | DrawTool::Text
+        ) {
+            let mut layer = self.draw_layer;
+            ui.horizontal(|ui| {
+                self.inspector.enum_dropdown(ui, "draw_layer", &layer_choices(), &mut layer);
+                ui.label("Draw on");
+            });
+            if layer != self.draw_layer {
+                self.draw_layer = layer;
+                self.draw_width = None;
+            }
+            let mut width = self.draw_width.unwrap_or(layer.default_width());
+            mm_field(ui, &mut self.inspector, "Pen width", &mut width, 0.001..=10.);
+            self.draw_width = (width != layer.default_width()).then_some(width);
+        }
+        // The courtyard: the rectangle round the pads and silkscreen grown by
+        // this clearance, which the board's design rule check keeps parts of
+        // one side from overlapping. The default is stored as no value.
+        let mut margin = self.footprint.courtyard_margin.unwrap_or(COURTYARD_MARGIN);
+        mm_field(ui, &mut self.inspector, "Courtyard clearance", &mut margin, 0. ..=100.);
+        self.footprint.courtyard_margin = (margin != COURTYARD_MARGIN).then_some(margin);
+        // Plated holes whose copper ring is narrower than a board allows by
+        // default, named here as the gap warning names close pads.
+        let ring = DesignRules::default().min_annular_ring;
+        let thin: Vec<String> = self
+            .footprint
+            .pads
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.annular_ring().is_some_and(|r| r < ring))
+            .map(|(k, p)| if p.number.is_empty() { format!("mechanical pad {}", k + 1) } else { format!("pad {}", p.number) })
+            .collect();
+        if !thin.is_empty() {
+            let warning = ui.label(
+                egui::RichText::new(format!(
+                    "Copper ring round the hole under {} mm: {}.",
+                    mm_text(ring),
+                    thin.join(", ")
+                ))
+                .color(ui.visuals().warn_fg_color),
+            );
+            self.inspector.mark("ring_warning", &warning);
+        }
         // Pads closer than a board allows are found here, where they are drawn,
         // not on the board after the part is placed and routed.
         let close = self.close_pads();
@@ -726,6 +851,9 @@ impl FootprintEditor {
             .chain((0..self.footprint.silk.len()).map(|i| {
                 (Item::Silk(i), self.item_note(Item::Silk(i)), Some(Mark::Silk))
             }))
+            .chain(self.footprint.graphics.iter().enumerate().map(|(i, g)| {
+                (Item::Graphic(i), self.item_note(Item::Graphic(i)), Some(Mark::Drawn(graphic_color(g.layer))))
+            }))
             .collect();
         // Read again: a pin's row just picked is a selection the Items list
         // has not shown.
@@ -739,6 +867,7 @@ impl FootprintEditor {
             .enumerate()
             .map(|(i, pad)| format!("row:{}", pad_key(i, pad)))
             .chain((0..self.footprint.silk.len()).map(|i| format!("row:silk:{i}")))
+            .chain((0..self.footprint.graphics.len()).map(|i| format!("row:graphic:{i}")))
             .collect();
         let hits = &mut self.inspector;
         let list = egui::ScrollArea::vertical()
@@ -791,6 +920,7 @@ impl FootprintEditor {
         match self.core.selected {
             Some(Item::Pad(i)) if i < self.footprint.pads.len() => self.pad_properties(ui, i),
             Some(Item::Silk(i)) if i < self.footprint.silk.len() => self.silk_properties(ui, i),
+            Some(Item::Graphic(i)) if i < self.footprint.graphics.len() => self.graphic_properties(ui, i),
             _ => {
                 ui.small("Select an item on the canvas or in the list.");
             }
@@ -906,6 +1036,22 @@ impl FootprintEditor {
         ui.small(
             "Decoration: it prints on the silkscreen film. It carries no pin and no net, so there is nothing to link it to.",
         );
+        // Another layer or pen makes it a drawn item, which carries both.
+        let mut layer = GraphicLayer::FrontSilk;
+        ui.horizontal(|ui| {
+            self.inspector.enum_dropdown(ui, "layer", &layer_choices(), &mut layer);
+            ui.label("Layer");
+        });
+        let mut width = brep_ecad_core::fabrication::SILK_WIDTH;
+        mm_field(ui, &mut self.inspector, "Line width", &mut width, 0.001..=10.);
+        if layer != GraphicLayer::FrontSilk || width != brep_ecad_core::fabrication::SILK_WIDTH {
+            let points = self.footprint.silk.remove(i);
+            let mut graphic = LayerGraphic::new(layer, GraphicShape::Polyline { points });
+            graphic.width = (width != layer.default_width()).then_some(width);
+            self.core.selected = Some(Item::Graphic(self.footprint.graphics.len()));
+            self.footprint.graphics.push(graphic);
+            return;
+        }
         if let Some((at, size, shape)) = silk_as_pad(&self.footprint.silk[i]) {
             let number = self
                 .missing_pins()
@@ -925,7 +1071,11 @@ impl FootprintEditor {
                     size,
                     shape,
                     drill: None,
+                    drill_height: None,
                     plated: true,
+                    corner_radius: 0,
+                    back: false,
+                    layers: Default::default(),
                 });
                 return;
             }
@@ -933,6 +1083,10 @@ impl FootprintEditor {
         for (n, p) in self.footprint.silk[i].iter_mut().enumerate() {
             point_fields(ui, &mut self.inspector, &format!("Point {}", n + 1), p);
         }
+    }
+    /// A drawn item: its layer, pen, fill and, for text, its words and height.
+    fn graphic_properties(&mut self, ui: &mut egui::Ui, i: usize) {
+        edit_graphic(ui, &mut self.inspector, &mut self.footprint.graphics[i], &layer_choices());
     }
     fn pad_properties(&mut self, ui: &mut egui::Ui, i: usize) {
         // Read before the pad is held: the pin list, whether it can be judged at
@@ -948,6 +1102,10 @@ impl FootprintEditor {
             (Some(_), true) => PadKind::ThroughHole,
             (Some(_), false) => PadKind::Unplated,
         };
+        // What the pad was before this frame's controls: the layer settings
+        // below are tidied only when the user CHANGES its type, side or shape,
+        // so selecting a pad never edits it.
+        let (was_kind, was_back, was_shape) = (kind, pad.back, pad.shape);
         let choices = [
             (PadKind::SurfaceMount, "surface_mount", kind_name(PadKind::SurfaceMount)),
             (PadKind::ThroughHole, "through_hole", kind_name(PadKind::ThroughHole)),
@@ -961,6 +1119,7 @@ impl FootprintEditor {
         match kind {
             PadKind::SurfaceMount => {
                 pad.drill = None;
+                pad.drill_height = None;
                 pad.plated = true;
             }
             PadKind::ThroughHole => {
@@ -1037,6 +1196,7 @@ impl FootprintEditor {
         ui.separator();
         let choices = [
             (PadShape::Rect, "rect", shape_name(PadShape::Rect)),
+            (PadShape::RoundRect, "round_rect", shape_name(PadShape::RoundRect)),
             (PadShape::Circle, "circle", shape_name(PadShape::Circle)),
             (PadShape::Oval, "oval", shape_name(PadShape::Oval)),
         ];
@@ -1044,17 +1204,136 @@ impl FootprintEditor {
             hits.enum_dropdown(ui, "shape", &choices, &mut pad.shape);
             ui.label("Shape");
         });
+        if kind == PadKind::SurfaceMount {
+            // Which copper of the footprint the pad is on. A part mounted on the
+            // bottom flips the whole footprint, back pads included.
+            let sides = [(false, "front", "Front (F.Cu)"), (true, "back", "Back (B.Cu)")];
+            ui.horizontal(|ui| {
+                hits.enum_dropdown(ui, "side", &sides, &mut pad.back);
+                ui.label("Side");
+            });
+        } else if kind != was_kind {
+            pad.back = false;
+        }
         point_fields(ui, hits, "Position", &mut pad.at);
         ui.label("Size");
         mm_field(ui, hits, "Width", &mut pad.size.x, 0.01..=100.);
         mm_field(ui, hits, "Height", &mut pad.size.y, 0.01..=100.);
-        if let Some(drill) = &mut pad.drill {
+        if pad.shape != was_shape {
+            // A pad made a rounded rectangle starts at a quarter of its short
+            // side; one made anything else drops the radius it no longer uses.
+            pad.corner_radius = if pad.shape == PadShape::RoundRect { pad.size.x.min(pad.size.y) / 4 } else { 0 };
+        }
+        if pad.shape == PadShape::RoundRect {
+            // Up to half the short side, or the stored radius if a resize left
+            // it larger (it draws clamped): the field never clamps a loaded value.
+            let most = (f64::from(pad.size.x.min(pad.size.y)) / 2.).max(f64::from(pad.corner_radius)) / 1000.;
+            mm_field(ui, hits, "Corner radius", &mut pad.corner_radius, 0. ..=most.max(0.001));
+        }
+        if let Some(drill) = pad.drill {
+            // Round, or a SLOT: the hole's width (x) and height (y) apart.
+            let mut slot = pad.drill_height.is_some();
+            let was_slot = slot;
+            let holes = [(false, "round", "Round"), (true, "slot", "Slot (oval)")];
+            ui.horizontal(|ui| {
+                hits.enum_dropdown(ui, "hole", &holes, &mut slot);
+                ui.label("Hole");
+            });
+            if slot != was_slot {
+                if slot {
+                    // Along the pad's long side, keeping the ring the round hole had.
+                    let extra = (pad.size.x - pad.size.y).abs();
+                    let long = if extra > 0 { drill + extra } else { (drill * 3 / 2).min(pad.size.y) };
+                    if pad.size.x > pad.size.y {
+                        (pad.drill, pad.drill_height) = (Some(long), Some(drill));
+                    } else {
+                        pad.drill_height = Some(long);
+                    }
+                } else {
+                    pad.drill = Some(drill.min(pad.drill_height.unwrap_or(drill)));
+                    pad.drill_height = None;
+                }
+            }
+        }
+        if let Some(height) = pad.drill_height.as_mut() {
+            if let Some(drill) = pad.drill.as_mut() {
+                mm_field(ui, hits, "Drill width", drill, 0.05..=100.);
+            }
+            mm_field(ui, hits, "Drill height", height, 0.05..=100.);
+        } else if let Some(drill) = &mut pad.drill {
             mm_field(ui, hits, "Drill", drill, 0.05..=100.);
+        }
+        // What the preset puts on the mask and paste layers, and the overrides.
+        ui.separator();
+        ui.label("Solder mask and paste");
+        let (front_cu, back_cu) = pad.copper_sides();
+        let layers = &mut pad.layers;
+        for (reaches, front, key, label) in [
+            (front_cu, true, "mask_front", "Mask open on front"),
+            (back_cu, false, "mask_back", "Mask open on back"),
+        ] {
+            if reaches {
+                let cover = if front { &mut layers.cover_front } else { &mut layers.cover_back };
+                let mut open = !*cover;
+                let check = ui.checkbox(&mut open, label).on_hover_text(
+                    "Off keeps the solder mask over the pad on this side (tented), e.g. against solder wicking into a via.",
+                );
+                hits.mark(key, &check);
+                *cover = !open;
+            }
+        }
+        let moved = kind != was_kind || pad_back_changed(was_back, front_cu, back_cu);
+        if moved && !front_cu {
+            layers.cover_front = false;
+        }
+        if moved && !back_cu {
+            layers.cover_back = false;
+        }
+        let mut own_mask = layers.mask_margin.is_some();
+        let check = ui.checkbox(&mut own_mask, "Own mask margin").on_hover_text(
+            "Grow this pad's mask opening by its own margin instead of the board's solder mask expansion.",
+        );
+        hits.mark("own_mask_margin", &check);
+        if own_mask {
+            let mut m = layers.mask_margin.unwrap_or(DesignRules::default().mask_expansion);
+            mm_field(ui, hits, "Mask margin", &mut m, -10. ..=10.);
+            layers.mask_margin = Some(m);
+        } else {
+            layers.mask_margin = None;
+        }
+        if kind == PadKind::SurfaceMount {
+            let mut paste = !layers.no_paste;
+            let check = ui.checkbox(&mut paste, "Solder paste").on_hover_text(
+                "Off leaves this pad out of the paste stencil, e.g. a large thermal pad pasted through smaller paste-only pads laid over it.",
+            );
+            hits.mark("paste", &check);
+            layers.no_paste = !paste;
+            if paste {
+                let mut own = layers.paste_margin.is_some();
+                let check = ui.checkbox(&mut own, "Own paste margin").on_hover_text(
+                    "Grow (or, negative, shrink) the paste aperture from the copper outline.",
+                );
+                hits.mark("own_paste_margin", &check);
+                if own {
+                    let mut m = layers.paste_margin.unwrap_or(0);
+                    mm_field(ui, hits, "Paste margin", &mut m, -10. ..=10.);
+                    layers.paste_margin = Some(m);
+                } else {
+                    layers.paste_margin = None;
+                }
+            }
+        } else if kind != was_kind {
+            layers.no_paste = false;
+            layers.paste_margin = None;
         }
         let rotate = ui.button("Rotate pad 90°");
         hits.mark("rotate", &rotate);
         if rotate.clicked() {
             pad.size = Point::new(pad.size.y, pad.size.x);
+            // A slot turns with its pad.
+            if let (Some(width), Some(height)) = (pad.drill, pad.drill_height) {
+                (pad.drill, pad.drill_height) = (Some(height), Some(width));
+            }
         }
         ui.separator();
         ui.label("Repeat pad");
@@ -1113,13 +1392,16 @@ impl FootprintEditor {
             Some(Item::Silk(i)) if i < self.footprint.silk.len() => {
                 self.footprint.silk.remove(i);
             }
+            Some(Item::Graphic(i)) if i < self.footprint.graphics.len() => {
+                self.footprint.graphics.remove(i);
+            }
             _ => {}
         }
     }
     fn hit(&self, p: Pos2, screen: impl Fn(Point) -> Pos2, world: Point) -> Option<Item> {
         let tolerance = f64::from(5. / self.core.zoom);
         for (i, pad) in self.footprint.pads.iter().enumerate().rev() {
-            if Shape::pad(pad.at, pad.size, pad.shape).distance_to_point(world) <= tolerance {
+            if pad.local_shape().distance_to_point(world) <= tolerance {
                 return Some(Item::Pad(i));
             }
         }
@@ -1129,6 +1411,26 @@ impl FootprintEditor {
                 .any(|s| segment_distance(p, screen(s[0]), screen(s[1])) < 8.)
             {
                 return Some(Item::Silk(i));
+            }
+        }
+        for (i, g) in self.footprint.graphics.iter().enumerate().rev() {
+            let strokes = g.strokes(!g.layer.front());
+            let near = strokes.iter().any(|line| {
+                line.len() == 1 && p.distance(screen(line[0])) < 8.
+                    || line.windows(2).any(|s| segment_distance(p, screen(s[0]), screen(s[1])) < 8.)
+            });
+            // Text answers anywhere in the box its strokes fill.
+            let boxed = matches!(g.shape, GraphicShape::Text { .. }) && {
+                let points: Vec<Point> = strokes.iter().flatten().copied().collect();
+                let (lo, hi) = (
+                    points.iter().fold(Point::new(i32::MAX, i32::MAX), |m, p| Point::new(m.x.min(p.x), m.y.min(p.y))),
+                    points.iter().fold(Point::new(i32::MIN, i32::MIN), |m, p| Point::new(m.x.max(p.x), m.y.max(p.y))),
+                );
+                Rect::from_two_pos(screen(lo), screen(hi)).expand(4.).contains(p)
+            };
+            let inside = boxed || g.filled && strokes.first().is_some_and(|line| point_in(world, line));
+            if near || inside {
+                return Some(Item::Graphic(i));
             }
         }
         None
@@ -1193,6 +1495,7 @@ impl FootprintEditor {
                         *p = p.offset(delta);
                     }
                 }
+                Some(Item::Graphic(i)) => move_graphic(&mut self.footprint.graphics[i], delta),
                 None => {}
             }
         }
@@ -1212,6 +1515,10 @@ impl FootprintEditor {
         {
             match self.tool {
                 DrawTool::Pad | DrawTool::ThroughHole => {
+                    let at = self.snap(raw(p));
+                    self.add_item(at, at);
+                }
+                DrawTool::Text => {
                     let at = self.snap(raw(p));
                     self.add_item(at, at);
                 }
@@ -1254,9 +1561,12 @@ impl FootprintEditor {
         ] {
             painter.line_segment([center + a, center + b], Stroke::new(1., Color32::GRAY));
         }
-        if !self.footprint.pads.is_empty() || !self.footprint.silk.is_empty() {
+        if self.footprint.drawn_courtyard(true).is_none()
+            && (!self.footprint.pads.is_empty() || !self.footprint.silk.is_empty())
+        {
             let (min, max) = self.footprint.bounds();
-            let margin = Point::new(COURTYARD_MARGIN, COURTYARD_MARGIN);
+            let margin = self.footprint.courtyard_margin.unwrap_or(COURTYARD_MARGIN);
+            let margin = Point::new(margin, margin);
             let courtyard = Rect::from_two_pos(
                 screen(Point::new(min.x - margin.x, min.y - margin.y)),
                 screen(max.offset(margin)),
@@ -1271,13 +1581,31 @@ impl FootprintEditor {
         // `outline` is drawn outside the shape, `grow` points clear of its edge.
         let paint_shape = |shape: Shape, fill: Option<Color32>, outline: Option<Stroke>, grow: f32| match shape
         {
-            Shape::Rect { min, max } => {
-                let r = Rect::from_two_pos(screen(min), screen(max));
+            // egui keeps a rectangle's corner radius in a byte, so a corner wider
+            // than that on screen is drawn as the pad's own outline instead.
+            Shape::RoundRect { radius, .. } if radius as f32 * zoom > MAX_PAINTED_CORNER => {
                 if let Some(fill) = fill {
-                    painter.rect_filled(r, 0., fill);
+                    let ring: Vec<Pos2> = shape.outline(16).into_iter().map(screen).collect();
+                    painter.add(egui::Shape::convex_polygon(ring, fill, Stroke::NONE));
                 }
                 if let Some(stroke) = outline {
-                    painter.rect_stroke(r.expand(grow), 0., stroke, egui::StrokeKind::Outside);
+                    let reach = ((grow + stroke.width / 2.) / zoom).round() as i32;
+                    let ring: Vec<Pos2> = shape.grown(reach).outline(16).into_iter().map(screen).collect();
+                    painter.add(egui::Shape::closed_line(ring, stroke));
+                }
+            }
+            Shape::Rect { min, max } | Shape::RoundRect { min, max, .. } => {
+                let r = Rect::from_two_pos(screen(min), screen(max));
+                let corner = match shape {
+                    Shape::RoundRect { radius, .. } => radius as f32 * zoom,
+                    _ => 0.,
+                };
+                if let Some(fill) = fill {
+                    painter.rect_filled(r, corner, fill);
+                }
+                if let Some(stroke) = outline {
+                    let corner = if corner > 0. { corner + grow } else { 0. };
+                    painter.rect_stroke(r.expand(grow), corner, stroke, egui::StrokeKind::Outside);
                 }
             }
             Shape::Capsule { a, b, radius } => {
@@ -1305,19 +1633,16 @@ impl FootprintEditor {
             }
         };
         for (i, pad) in self.footprint.pads.iter().enumerate() {
-            let shape = Shape::pad(pad.at, pad.size, pad.shape);
+            let shape = pad.local_shape();
             let fill = match (pad.drill, pad.plated) {
-                (None, _) => Some(layer_color(0, 2)),
+                (None, _) => Some(layer_color(u8::from(pad.back), 2)),
                 (Some(_), true) => Some(THROUGH_HOLE),
                 (Some(_), false) => None,
             };
             paint_shape(shape, fill, None, 0.);
-            if let Some(drill) = pad.drill {
-                let radius = drill as f32 / 2. * zoom;
-                painter.circle_filled(screen(pad.at), radius, BACKGROUND);
-                if !pad.plated {
-                    painter.circle_stroke(screen(pad.at), radius, Stroke::new(1., SILK));
-                }
+            if let Some(hole) = pad.local_hole() {
+                let edge = (!pad.plated).then(|| Stroke::new(1., SILK));
+                paint_shape(hole, Some(BACKGROUND), edge, 0.);
             }
             // What the pad is ON, as a ring: grey for a mechanical pad, the
             // warning colour for a number no pin of the symbol carries. A pad on
@@ -1366,6 +1691,21 @@ impl FootprintEditor {
                 Stroke::new(1.5, color),
             ));
         }
+        // Drawn items with their own pens, the selected one in the accent.
+        for (i, g) in self.footprint.graphics.iter().enumerate() {
+            let color = if self.core.selected == Some(Item::Graphic(i)) { ACCENT } else { graphic_color(g.layer) };
+            let width = (g.width() as f32 * zoom).max(1.);
+            let strokes = g.strokes(!g.layer.front());
+            if g.filled
+                && let Some(line) = strokes.first()
+            {
+                let outline: Vec<Pos2> = line.iter().map(|p| screen(*p)).collect();
+                crate::board_view::paint_filled(&painter, &outline, color.gamma_multiply(0.6));
+            }
+            for line in strokes {
+                painter.add(egui::Shape::line(line.iter().map(|p| screen(*p)).collect(), Stroke::new(width, color)));
+            }
+        }
         // Hovering names the item under the pointer and says what it is on. The
         // canvas is where a user looks first, and a number drawn on a pad does not
         // say whether the symbol has a pin of that number.
@@ -1382,6 +1722,7 @@ impl FootprintEditor {
                     None => self.item_note(item),
                 },
                 Item::Silk(_) => format!("{}\nNo pin and no net: it prints on the silkscreen film.", self.item_note(item)),
+                Item::Graphic(_) => format!("{}\nNo pin and no net: drawing on a non-copper layer.", self.item_note(item)),
             };
             response.clone().on_hover_text_at_pointer(note);
         }
@@ -1416,6 +1757,11 @@ impl FootprintEditor {
                 DrawTool::Line => {
                     painter.line_segment([a, b], stroke);
                 }
+                DrawTool::Arc => {
+                    let end = self.snap(raw(p));
+                    let points = brep_ecad_core::graphic::arc_points(start, arc_through(start, end), end);
+                    painter.add(egui::Shape::line(points.into_iter().map(&screen).collect(), stroke));
+                }
                 _ => {
                     painter.rect_stroke(
                         Rect::from_two_pos(a, b),
@@ -1429,7 +1775,7 @@ impl FootprintEditor {
     }
     fn add_item(&mut self, a: Point, b: Point) {
         let pad_tool = matches!(self.tool, DrawTool::Pad | DrawTool::ThroughHole);
-        if a == b && !pad_tool {
+        if a == b && !pad_tool && self.tool != DrawTool::Text {
             return;
         }
         let before = self.footprint.clone();
@@ -1463,8 +1809,39 @@ impl FootprintEditor {
                         (true, false) => PadShape::Oval,
                     },
                     drill: through.then(|| (size.x.min(size.y) * 6 / 10 / 50 * 50).max(100)),
+                    drill_height: None,
                     plated: true,
+                    corner_radius: 0,
+                    back: false,
+                    layers: Default::default(),
                 });
+            }
+            DrawTool::Line | DrawTool::Rectangle | DrawTool::Circle | DrawTool::Arc | DrawTool::Text
+                if self.draw_layer != GraphicLayer::FrontSilk
+                    || self.draw_width.is_some()
+                    || matches!(self.tool, DrawTool::Arc | DrawTool::Text) =>
+            {
+                // On another layer or pen, or a shape only a drawn item keeps
+                // exactly: a drawn item.
+                let shape = match self.tool {
+                    DrawTool::Line => GraphicShape::Polyline { points: vec![a, b] },
+                    DrawTool::Rectangle => GraphicShape::Polyline {
+                        points: vec![a, Point::new(b.x, a.y), b, Point::new(a.x, b.y), a],
+                    },
+                    DrawTool::Circle => GraphicShape::Circle {
+                        center: a,
+                        radius: f64::from(b.x - a.x).hypot(f64::from(b.y - a.y)).round().min(1e8) as i32,
+                    },
+                    DrawTool::Arc => GraphicShape::Arc { start: a, mid: arc_through(a, b), end: b },
+                    _ => GraphicShape::Text { at: a, text: "TEXT".into(), height: 1000 },
+                };
+                let mut graphic = LayerGraphic::new(self.draw_layer, shape);
+                graphic.width = self.draw_width;
+                if graphic.problem().is_some() {
+                    return;
+                }
+                self.core.selected = Some(Item::Graphic(self.footprint.graphics.len()));
+                self.footprint.graphics.push(graphic);
             }
             DrawTool::Line | DrawTool::Rectangle | DrawTool::Circle => {
                 let line = match self.tool {
@@ -1488,10 +1865,138 @@ impl FootprintEditor {
                 self.core.selected = Some(Item::Silk(self.footprint.silk.len()));
                 self.footprint.silk.push(line);
             }
-            DrawTool::Select => {}
+            DrawTool::Select | DrawTool::Arc | DrawTool::Text => {}
         }
         self.record(before);
     }
+}
+/// A drawn item's Inspector: what it is, its layer (from `layers`), its pen,
+/// its fill when it is closed, and its points or text, edited in place. Shared
+/// by the Pads editor and the board's own drawing.
+pub(crate) fn edit_graphic(
+    ui: &mut egui::Ui,
+    hits: &mut InspectorHits,
+    graphic: &mut LayerGraphic,
+    layers: &[(GraphicLayer, &'static str, &'static str)],
+) {
+    ui.horizontal(|ui| {
+        swatch(ui, Some(Mark::Drawn(graphic_color(graphic.layer))));
+        ui.label(graphic_kind(graphic));
+    });
+    ui.small(match graphic.layer {
+        GraphicLayer::FrontSilk | GraphicLayer::BackSilk => "Prints on the silkscreen film of its side. No pin and no net.",
+        GraphicLayer::FrontFab | GraphicLayer::BackFab => "Fabrication drawing: shown in the editors, never manufactured.",
+        GraphicLayer::FrontCourtyard => "Courtyard: the room the part needs on the side it is mounted on. It replaces the generated rectangle, and the design rule check keeps parts' courtyards apart.",
+        _ => "Back courtyard: room the part needs on the board's other side, which the design rule check keeps apart from the parts mounted there.",
+    });
+    let mut layer = graphic.layer;
+    ui.horizontal(|ui| {
+        hits.enum_dropdown(ui, "layer", layers, &mut layer);
+        ui.label("Layer");
+    });
+    if layer != graphic.layer {
+        // A pen at the old layer's own width takes the new layer's.
+        graphic.layer = layer;
+    }
+    let mut width = graphic.width();
+    mm_field(ui, hits, "Line width", &mut width, 0.001..=10.);
+    graphic.width = (width != layer.default_width()).then_some(width);
+    if graphic.closed() {
+        let fill = ui.checkbox(&mut graphic.filled, "Filled");
+        hits.mark("filled", &fill);
+    }
+    match &mut graphic.shape {
+        GraphicShape::Text { at, text, height } => {
+            ui.label("Text");
+            let field = ui.text_edit_singleline(text);
+            hits.mark("text", &field);
+            mm_field(ui, hits, "Text height", height, 0.1..=100.);
+            point_fields(ui, hits, "Position", at);
+        }
+        GraphicShape::Circle { center, radius } => {
+            point_fields(ui, hits, "Centre", center);
+            mm_field(ui, hits, "Radius", radius, 0.001..=100_000.);
+        }
+        GraphicShape::Arc { start, mid, end } => {
+            point_fields(ui, hits, "Start", start);
+            point_fields(ui, hits, "Through", mid);
+            point_fields(ui, hits, "End", end);
+        }
+        GraphicShape::Polyline { points } => {
+            // A closed shape's last point IS its first: it is offered once, and
+            // the two move together, so an edit never opens the shape.
+            let closed = points.len() > 2 && points.first() == points.last();
+            let shown = if closed { points.len() - 1 } else { points.len() };
+            for (n, p) in points[..shown].iter_mut().enumerate() {
+                point_fields(ui, hits, &format!("Point {}", n + 1), p);
+            }
+            if closed {
+                let first = points[0];
+                *points.last_mut().expect("a closed shape has points") = first;
+            }
+        }
+    }
+}
+/// The layers a drawn item can be on, as the Inspector's dropdowns offer them.
+pub(crate) fn layer_choices() -> Vec<(GraphicLayer, &'static str, &'static str)> {
+    GraphicLayer::ALL
+        .iter()
+        .map(|&layer| {
+            let label = match layer {
+                GraphicLayer::FrontSilk => "Front silkscreen (F.SilkS)",
+                GraphicLayer::BackSilk => "Back silkscreen (B.SilkS)",
+                GraphicLayer::FrontFab => "Front fabrication (F.Fab)",
+                GraphicLayer::BackFab => "Back fabrication (B.Fab)",
+                GraphicLayer::FrontCourtyard => "Front courtyard (F.CrtYd)",
+                GraphicLayer::BackCourtyard => "Back courtyard (B.CrtYd)",
+            };
+            (layer, layer.name(), label)
+        })
+        .collect()
+}
+/// What a drawn item is, in a word.
+pub(crate) fn graphic_kind(graphic: &LayerGraphic) -> &'static str {
+    match &graphic.shape {
+        GraphicShape::Polyline { points } if points.len() == 5 && points.first() == points.last() => "Rectangle",
+        GraphicShape::Polyline { .. } if graphic.closed() => "Polygon",
+        GraphicShape::Polyline { .. } => "Line",
+        GraphicShape::Arc { .. } => "Arc",
+        GraphicShape::Circle { .. } => "Circle",
+        GraphicShape::Text { .. } => "Text",
+    }
+}
+/// The point a half-circle arc from `a` to `b` passes through: the Arc tool's
+/// drag is the chord, and the arc bulges to its left.
+fn arc_through(a: Point, b: Point) -> Point {
+    let (mx, my) = ((i64::from(a.x) + i64::from(b.x)) / 2, (i64::from(a.y) + i64::from(b.y)) / 2);
+    let (dx, dy) = ((i64::from(b.x) - i64::from(a.x)) / 2, (i64::from(b.y) - i64::from(a.y)) / 2);
+    let clamp = |v: i64| v.clamp(-100_000_000, 100_000_000) as i32;
+    Point::new(clamp(mx + dy), clamp(my - dx))
+}
+/// Move a drawn item by `delta`.
+pub(crate) fn move_graphic(graphic: &mut LayerGraphic, delta: Point) {
+    match &mut graphic.shape {
+        GraphicShape::Polyline { points } => points.iter_mut().for_each(|p| *p = p.offset(delta)),
+        GraphicShape::Arc { start, mid, end } => {
+            for p in [start, mid, end] {
+                *p = p.offset(delta);
+            }
+        }
+        GraphicShape::Circle { center, .. } => *center = center.offset(delta),
+        GraphicShape::Text { at, .. } => *at = at.offset(delta),
+    }
+}
+/// Whether `p` is inside the closed polyline `ring` (even-odd).
+pub(crate) fn point_in(p: Point, ring: &[Point]) -> bool {
+    let (x, y) = (f64::from(p.x), f64::from(p.y));
+    let mut inside = false;
+    for s in ring.windows(2) {
+        let (a, b) = ((f64::from(s[0].x), f64::from(s[0].y)), (f64::from(s[1].x), f64::from(s[1].y)));
+        if (a.1 > y) != (b.1 > y) && x < a.0 + (y - a.1) / (b.1 - a.1) * (b.0 - a.0) {
+            inside = !inside;
+        }
+    }
+    inside
 }
 /// [`action`] for the pads editor, so the table's closures need no type.
 const fn pad_action(
@@ -1512,7 +2017,8 @@ macro_rules! grid_action {
 }
 /// The tools that draw SILKSCREEN: decoration, on no pin and no net. The rest of
 /// the Tool group draws copper.
-const SILK_TOOLS: [&str; 3] = ["pads.tool.line", "pads.tool.rectangle", "pads.tool.circle"];
+const SILK_TOOLS: [&str; 5] =
+    ["pads.tool.line", "pads.tool.rectangle", "pads.tool.circle", "pads.tool.arc", "pads.tool.text"];
 /// Every command of the pads editor, in toolbar order.
 pub fn pad_actions() -> &'static [Action<FootprintEditor>] {
     PAD_ACTIONS
@@ -1546,6 +2052,10 @@ static PAD_ACTIONS: &[Action<FootprintEditor>] = &[
         e.set_tool(DrawTool::Circle)
     })
     .pressed_when(|e| e.tool == DrawTool::Circle),
+    pad_action("pads.tool.arc", "Arc", ActionGroup::Tool, |e| e.set_tool(DrawTool::Arc))
+        .pressed_when(|e| e.tool == DrawTool::Arc),
+    pad_action("pads.tool.text", "Text", ActionGroup::Tool, |e| e.set_tool(DrawTool::Text))
+        .pressed_when(|e| e.tool == DrawTool::Text),
     pad_action(
         "pads.undo",
         "Undo",
@@ -1634,6 +2144,14 @@ fn silk_as_pad(line: &[Point]) -> Option<(Point, Point, PadShape)> {
     });
     round.then(|| (at, Point::new(size.x, size.y), PadShape::Circle))
 }
+/// The widest corner radius, in screen points, egui draws on a rectangle: it
+/// stores the radius in a byte.
+pub(crate) const MAX_PAINTED_CORNER: f32 = 250.;
+/// Whether the pad's copper side changed this frame: it was on the back and is
+/// now on the front only, or the other way round.
+fn pad_back_changed(was_back: bool, front_cu: bool, back_cu: bool) -> bool {
+    (front_cu != back_cu) && (back_cu != was_back)
+}
 fn kind_name(kind: PadKind) -> &'static str {
     match kind {
         PadKind::SurfaceMount => "Surface mount",
@@ -1644,6 +2162,7 @@ fn kind_name(kind: PadKind) -> &'static str {
 fn shape_name(shape: PadShape) -> &'static str {
     match shape {
         PadShape::Rect => "Rectangle",
+        PadShape::RoundRect => "Rounded rectangle",
         PadShape::Circle => "Circle",
         PadShape::Oval => "Oval",
     }

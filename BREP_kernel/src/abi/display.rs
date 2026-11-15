@@ -14,38 +14,8 @@ pub struct DisplaySolidPayload {
     /// The chord tolerance actually used.
     pub chord_tolerance: f64,
 }
+use crate::solid_tolerance::display_chord_tolerance;
 
-/// The app's display chord tolerance (`BetterSolid._kernelTessellationOptions`):
-/// vertex |coord| extent — falling back to the control-point hull / sqrt(2) for
-/// vertex-free solids (full spheres/tori) — times 1.5e-3, times the render-LOD
-/// factor (1.0 = the app's "Normal" preset).
-pub fn display_chord_tolerance(solid: &BrepSolid, lod_factor: f64) -> f64 {
-    let mut extent = 0.0f64;
-    for vertex in &solid.vertices {
-        extent = extent
-            .max(vertex.point.x.abs())
-            .max(vertex.point.y.abs())
-            .max(vertex.point.z.abs());
-    }
-    if extent <= 0.0 {
-        let mut control_point_extent = 0.0f64;
-        for shell in &solid.shells {
-            for face in &shell.faces {
-                for row in &face.surface.control_points {
-                    for cp in row {
-                        let w = if cp.w != 0.0 { cp.w } else { 1.0 };
-                        control_point_extent = control_point_extent
-                            .max((cp.x / w).abs())
-                            .max((cp.y / w).abs())
-                            .max((cp.z / w).abs());
-                    }
-                }
-            }
-        }
-        extent = control_point_extent / std::f64::consts::SQRT_2;
-    }
-    extent.max(1e-9) * 1.5e-3 * lod_factor
-}
 
 /// Native display payload for a resident solid: watertight mesh + face list (in
 /// mesh `face_ids` order) + edge polylines + vertices, all in one registry

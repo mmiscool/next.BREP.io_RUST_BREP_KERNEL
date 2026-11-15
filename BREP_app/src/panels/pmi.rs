@@ -2,7 +2,8 @@
 //! widget: one row per PMI view, its annotations as children, and — when an
 //! annotation is open — that annotation's dialog through the SHARED
 //! [`crate::form_view`] (the same function the feature and constraint
-//! dialogs use; the schema comes from the kernel's `pmi_schema_catalogue`).
+//! dialogs use; the schema comes from the kernel's `pmi_schema_catalogue`, with the weld
+//! symbol fields added by `brep_render::pmi_weld_symbol`).
 //!
 //! # Tree mode
 //!
@@ -46,7 +47,7 @@
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::column_tree::{self, CellKind, ColumnLayout, ColumnSpec, ColumnTreeSpec, RowAction, RowNode};
 use crate::form_view::{form_view, FormBanner, FormViewSpec};
-use brep_render::brep_kernel::{pmi_schema_catalogue, pmi_type, PmiReport, PmiState, PmiStatus, PMI_TYPES};
+use brep_render::brep_kernel::{pmi_type, PmiReport, PmiState, PmiStatus, PMI_TYPES};
 use brep_render::engine_state::{pmi_view_params, pmi_view_schema, EngineState, PmiViewPatch, RefSelectField, RefSelectTarget};
 use brep_render::features::form_fields_from_schema;
 use eframe::egui;
@@ -783,7 +784,7 @@ impl PmiPanel {
         close: &mut bool,
         hover: &mut Option<String>,
     ) {
-        let catalogue = pmi_schema_catalogue();
+        let catalogue = brep_render::pmi_weld_symbol::pmi_schema_catalogue();
         let Some(schema) = catalogue
             .as_array()
             .and_then(|entries| entries.iter().find(|entry| entry.get("type").and_then(Value::as_str) == Some(annotation.kind.as_str())))

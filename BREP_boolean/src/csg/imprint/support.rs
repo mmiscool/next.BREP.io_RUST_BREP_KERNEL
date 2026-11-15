@@ -1,0 +1,2278 @@
+pub use super::*;
+use crate::{KernelRefusal, KernelStage, OrRefuse};
+
+/// Split every iso-line of `surface` along one direction and keep the range
+/// [range\[0\], range\[1\]]. Knot insertion is exact, so the result is the same
+/// geometry restricted to the range and its control hull bounds it.
+pub fn restrict_direction(
+    surface: &NurbsSurface,
+    range: [f64; 2],
+    direction_u: bool,
+) -> Result<NurbsSurface, KernelRefusal> {
+    let (knots, degree, domain) = if direction_u {
+        (
+            &surface.knots_u,
+            surface.degree_u,
+            surface
+                .domain_u()
+                .or_refuse(KernelStage::Intersect, "domain_u")?,
+        )
+    } else {
+        (
+            &surface.knots_v,
+            surface.degree_v,
+            surface
+                .domain_v()
+                .or_refuse(KernelStage::Intersect, "domain_v")?,
+        )
+    };
+    // NurbsCurve::split refuses parameters within its absolute knot identity
+    // tolerance of the domain ends (same guard as edge_subcurve). Mirror the
+    // single source (curve.rs KNOT_IDENTITY_TOL) rather than a bare literal.
+    let guard = ((domain[1] - domain[0]) * KNOT_IDENTITY_TOL).max(2e-9);
+    let mut curves: Vec<NurbsCurve> = if direction_u {
+        (0..surface.control_points[0].len())
+            .map(|column| {
+                NurbsCurve::new(
+                    degree,
+                    knots.clone(),
+                    surface
+                        .control_points
+                        .iter()
+                        .map(|row| row[column])
+                        .collect(),
+                )
+            })
+            .collect::<Result<_, _>>()
+            .or_refuse(KernelStage::Intersect, "csg.imprint.support")?
+    } else {
+        surface
+            .control_points
+            .iter()
+            .map(|row| NurbsCurve::new(degree, knots.clone(), row.clone()))
+            .collect::<Result<_, _>>()
+            .or_refuse(KernelStage::Intersect, "csg.imprint.support")?
+    };
+    if range[1] < domain[1] - guard && range[1] > domain[0] + guard {
+        curves = curves
+            .into_iter()
+            .map(|curve| curve.split(range[1]).map(|(left, _)| left))
+            .collect::<Result<_, _>>()
+            .or_refuse(KernelStage::Intersect, "csg.imprint.support")?;
+    }
+    if range[0] > domain[0] + guard && range[0] < domain[1] - guard {
+        curves = curves
+            .into_iter()
+            .map(|curve| curve.split(range[0]).map(|(_, right)| right))
+            .collect::<Result<_, _>>()
+            .or_refuse(KernelStage::Intersect, "csg.imprint.support")?;
+    }
+    let new_knots = curves[0].knots.clone();
+    if direction_u {
+        let rows = curves[0].control_points.len();
+        let control = (0..rows)
+            .map(|row| {
+                curves
+                    .iter()
+                    .map(|curve| curve.control_points[row])
+                    .collect()
+            })
+            .collect();
+        NurbsSurface::new(
+            degree,
+            surface.degree_v,
+            new_knots,
+            surface.knots_v.clone(),
+            control,
+        )
+        .or_refuse(KernelStage::Intersect, "NurbsSurface::new")
+    } else {
+        let control = curves
+            .iter()
+            .map(|curve| curve.control_points.clone())
+            .collect();
+        NurbsSurface::new(
+            surface.degree_u,
+            degree,
+            surface.knots_u.clone(),
+            new_knots,
+            control,
+        )
+        .or_refuse(KernelStage::Intersect, "NurbsSurface::new")
+    }
+}
+
+/// A CLOSED direction's own far span, carried across the seam so a trim drawn
+/// PAST the domain lives in ONE window with the rest of the face's trim.
+///
+/// The strip is the carrier's own control rows with their knots shifted by the
+/// period, so on the lifted surface `S(u) = S(u ± period)` outside the original
+/// domain: the wrap `evaluate_extended` reads, and the convention an importer
+/// drawing a pcurve past the domain used. The original domain's knots and
+/// control net are kept VERBATIM (the [`NurbsSurface::extend_natural`] rule),
+/// so evaluation inside it is bit-identical and every pcurve already on the
+/// face stays valid with no remap.
+///
+/// `None` when the direction is not closed, the strip would reach a whole
+/// period, or the carrier does not close on its own CONTROL rows. The join
+/// keeps one of the two boundary control lines and drops the other, so a
+/// carrier whose lines merely agree geometrically (`closed_directions` reads
+/// 1e-6) would take that disagreement into the strip as geometry that is not
+/// the carrier's. The identity bar is the control net's own: `1e-12` of the
+/// face's 3D extent, the same shape as `align_collapsed_endpoints`' pole band.
+/// The section fit is the backstop — it measures every marched run against the
+/// UNLIFTED carrier, so a strip that is not the carrier reads there.
+pub fn seam_lifted_carrier(
+    surface: &NurbsSurface,
+    direction_u: bool,
+    delta: f64,
+    low_side: bool,
+) -> Option<NurbsSurface> {
+    let [d0, d1] = if direction_u {
+        surface.domain_u().ok()?
+    } else {
+        surface.domain_v().ok()?
+    };
+    let period = d1 - d0;
+    if !(delta > 0.0) || delta >= period || !period.is_finite() {
+        return None;
+    }
+    let degree = if direction_u {
+        surface.degree_u
+    } else {
+        surface.degree_v
+    };
+    let rows = &surface.control_points;
+    let (rows_count, columns_count) = (rows.len(), rows[0].len());
+    // The two boundary control lines the join welds into one.
+    let line_pairs: Vec<(Vec4, Vec4)> = if direction_u {
+        (0..columns_count)
+            .map(|column| (rows[0][column], rows[rows_count - 1][column]))
+            .collect()
+    } else {
+        (0..rows_count)
+            .map(|row| (rows[row][0], rows[row][columns_count - 1]))
+            .collect()
+    };
+    let point_of = |control: Vec4| -> Option<Vec3> { control.point().ok() };
+    let anchor = point_of(rows[0][0])?;
+    let mut extent = 0.0f64;
+    for control in rows.iter().flatten() {
+        extent = extent.max(point_of(*control)?.sub(anchor).length());
+    }
+    let identity = 1e-12 * (1.0 + extent);
+    for (first, last) in &line_pairs {
+        if point_of(*first)?.sub(point_of(*last)?).length() > identity {
+            return None;
+        }
+        let weight_scale = first.w.abs().max(last.w.abs()).max(f64::MIN_POSITIVE);
+        if (first.w - last.w).abs() / weight_scale > 1e-12 {
+            return None;
+        }
+    }
+    let strip_range = if low_side {
+        [d1 - delta, d1]
+    } else {
+        [d0, d0 + delta]
+    };
+    let mut strip = restrict_direction(surface, strip_range, direction_u).ok()?;
+    let shift = if low_side { -period } else { period };
+    if direction_u {
+        for knot in &mut strip.knots_u {
+            *knot += shift;
+        }
+    } else {
+        for knot in &mut strip.knots_v {
+            *knot += shift;
+        }
+    }
+    // Two clamped pieces meeting at one shared control line join exactly by
+    // dropping one copy of the junction knot (multiplicity `degree`, C0) and
+    // one of the two coincident control lines.
+    let join_knots = |low: &[f64], high: &[f64]| -> Vec<f64> {
+        let junction = low[low.len() - 1];
+        let mut knots = low[..low.len() - degree - 1].to_vec();
+        knots.extend(std::iter::repeat_n(junction, degree));
+        knots.extend_from_slice(&high[degree + 1..]);
+        knots
+    };
+    let (low_surface, high_surface) = if low_side {
+        (&strip, surface)
+    } else {
+        (surface, &strip)
+    };
+    let control = if direction_u {
+        let low_rows = &low_surface.control_points;
+        low_rows[..low_rows.len() - 1]
+            .iter()
+            .cloned()
+            .chain(high_surface.control_points.iter().cloned())
+            .collect::<Vec<_>>()
+    } else {
+        low_surface
+            .control_points
+            .iter()
+            .zip(&high_surface.control_points)
+            .map(|(low_row, high_row)| {
+                low_row[..low_row.len() - 1]
+                    .iter()
+                    .copied()
+                    .chain(high_row.iter().copied())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let (knots_u, knots_v) = if direction_u {
+        (
+            join_knots(&low_surface.knots_u, &high_surface.knots_u),
+            surface.knots_v.clone(),
+        )
+    } else {
+        (
+            surface.knots_u.clone(),
+            join_knots(&low_surface.knots_v, &high_surface.knots_v),
+        )
+    };
+    NurbsSurface::new(
+        surface.degree_u,
+        surface.degree_v,
+        knots_u,
+        knots_v,
+        control,
+    )
+    .ok()
+}
+
+/// The carrier restricted (by exact knot-insertion splitting) to the uv
+/// bounding box of the trim pcurves. The pcurve control hulls bound the
+/// loops, the loops bound the trimmed region, and splitting preserves the
+/// global parameterization, so the result is the same surface over a window
+/// that still contains the whole trimmed region — usable interchangeably
+/// with the carrier for bounding, seeding, and marching. Returns None when
+/// the trims span the whole carrier (nothing to gain) or the restriction
+/// fails (callers keep the carrier, which is always conservative).
+///
+/// A trim drawn PAST a closed direction's domain does not fit in one in-domain
+/// interval: it covers the wrapped image of its overhang as well. The window is
+/// then taken on a carrier [lifted](seam_lifted_carrier) across the seam — the
+/// trim's own frame, unwrapped, never clamped — and the window's `lifted` flag
+/// says so, because every uv the imprint reads for that face (the clip's
+/// containment, the section's pcurves) must be read in that frame and not in
+/// the carrier's. Escape hatch `BREP_MARCH_SEAM_LIFT=0` restores the clamp.
+#[derive(Clone)]
+pub struct MarchWindow {
+    pub surface: NurbsSurface,
+    /// The window's frame is the trim's, a period off the carrier's on one
+    /// side of the seam. `false` means the carrier's own parameterization,
+    /// which is what every window before 2026-09-15 was.
+    pub lifted: bool,
+}
+
+/// Every LIFTED face's chart, by key — the imprint's post-passes rebuild
+/// pcurves and must draw them in the frame the mint used. A face absent here
+/// is read on its own carrier, which is every face whose trim sits inside its
+/// domain.
+pub type FaceCharts<'a> = HashMap<FaceKey, &'a NurbsSurface>;
+
+/// The frame a face's uv are read in: its chart where the window was lifted,
+/// its carrier otherwise.
+pub(super) fn chart_of<'a>(
+    charts: &FaceCharts<'a>,
+    key: FaceKey,
+    face: &'a FaceRecord,
+) -> &'a NurbsSurface {
+    charts.get(&key).copied().unwrap_or(&face.surface)
+}
+
+thread_local! {
+    /// [`restricted_carrier`]'s window per face content (`hash_face`: carrier,
+    /// sense, every loop's coedge senses and pcurves) and the two hatches it
+    /// reads. The fillet's cutter composition hands the same body, less a few
+    /// faces, to boolean after boolean: on the sprocket report (1d179b4a) F9's
+    /// 35 imprints rebuilt ~280 unchanged windows each, 1.65 s of its 4.84 s.
+    static WINDOW_MEMO: std::cell::RefCell<HashMap<[u64; 2], Option<MarchWindow>>> = std::cell::RefCell::new(HashMap::default());
+    static WINDOW_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Drop every memoised window (`reading_memo::clear`).
+pub fn clear_window_memo() {
+    WINDOW_MEMO.with(|memo| memo.borrow_mut().clear());
+}
+
+/// Windows built (memo misses and unmemoised reads) since the thread started.
+pub fn window_reads() -> usize {
+    WINDOW_READS.with(|reads| reads.get())
+}
+
+/// [`restricted_carrier`] served from [`WINDOW_MEMO`] when a face of the same
+/// content was windowed before. Off under `BREP_IMPRINT_WINDOW_MEMO=0` or the
+/// reading memo's own hatch (`BREP_READING_MEMO=0`), and while the overhang
+/// census prints (`BREP_DEBUG_OVERHANG`).
+pub fn restricted_carrier_memoized(face: &FaceRecord) -> Option<MarchWindow> {
+    let enabled = crate::reading_memo::memo_on()
+        && std::env::var("BREP_IMPRINT_WINDOW_MEMO").as_deref() != Ok("0")
+        && std::env::var_os("BREP_DEBUG_OVERHANG").is_none();
+    if !enabled {
+        WINDOW_READS.with(|reads| reads.set(reads.get() + 1));
+        return restricted_carrier(face);
+    }
+    let mut lane = crate::mass_properties::TwoLane::new();
+    crate::mass_properties::hash_face(&mut lane, face);
+    lane.bool(std::env::var("BREP_MARCH_SEAM_LIFT").as_deref() != Ok("0"));
+    lane.bool(std::env::var("BREP_RESTRICT_WRAP_GUARD").as_deref() != Ok("0"));
+    let key = lane.finish();
+    if let Some(window) = WINDOW_MEMO.with(|memo| memo.borrow().get(&key).cloned()) {
+        crate::reading_memo::note(true);
+        return window;
+    }
+    crate::reading_memo::note(false);
+    WINDOW_READS.with(|reads| reads.set(reads.get() + 1));
+    let window = restricted_carrier(face);
+    WINDOW_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= 4096 {
+            memo.clear();
+        }
+        memo.insert(key, window.clone());
+    });
+    window
+}
+
+pub fn restricted_carrier(face: &FaceRecord) -> Option<MarchWindow> {
+    let [u0, u1] = face.surface.domain_u().ok()?;
+    let [v0, v1] = face.surface.domain_v().ok()?;
+    let mut u_low = f64::INFINITY;
+    let mut u_high = f64::NEG_INFINITY;
+    let mut v_low = f64::INFINITY;
+    let mut v_high = f64::NEG_INFINITY;
+    let mut found = false;
+    for coedge in face
+        .loops
+        .iter()
+        .flat_map(|loop_record| &loop_record.coedges)
+    {
+        for control in &coedge.pcurve.control_points {
+            let point = control.point().ok()?;
+            u_low = u_low.min(point.x);
+            u_high = u_high.max(point.x);
+            v_low = v_low.min(point.y);
+            v_high = v_high.max(point.y);
+            found = true;
+        }
+    }
+    if !found {
+        return None;
+    }
+    // CENSUS (`BREP_DEBUG_OVERHANG=1`): a trim drawn past a CLOSED direction's
+    // domain covers the wrapped image of its overhang too, and the clamp below
+    // keeps only the in-domain part — so the section's stretch in the overhang
+    // is never marched. One line per face and direction, for the population.
+    if std::env::var_os("BREP_DEBUG_OVERHANG").is_some() {
+        if let Ok((closed_u, closed_v)) = face.surface.closed_directions() {
+            for (axis, closed, domain, low, high) in [
+                (0usize, closed_u, [u0, u1], u_low, u_high),
+                (1, closed_v, [v0, v1], v_low, v_high),
+            ] {
+                let below = (domain[0] - low).max(0.0);
+                let above = (high - domain[1]).max(0.0);
+                if !closed || (below <= 0.0 && above <= 0.0) {
+                    continue;
+                }
+                let period = domain[1] - domain[0];
+                eprintln!(
+                    "overhang: face {} axis {} domain [{:.6},{:.6}] hull [{:.9},{:.9}] below {:.3e} above {:.3e} span/period {:.6} discards {}",
+                    face.id,
+                    if axis == 0 { "u" } else { "v" },
+                    domain[0],
+                    domain[1],
+                    low,
+                    high,
+                    below,
+                    above,
+                    (high - low) / period,
+                    if high - low < period { "YES" } else { "no" }
+                );
+            }
+        }
+    }
+    // Generous margin: the window must strictly contain the trims so that
+    // trim-boundary crossings (which the clip stage locates) stay interior.
+    let u_margin = ((u1 - u0) * 1e-3).max(2e-9);
+    let v_margin = ((v1 - v0) * 1e-3).max(2e-9);
+    // THE OVERHANG: a trim drawn past a CLOSED direction's domain and spanning
+    // less than a period has ONE unwrapped interval and no in-domain one. The
+    // carrier is lifted across the seam by exactly the overhang (plus the same
+    // margin), and the window is then taken on the lifted carrier by the
+    // ordinary restriction below: the trim's own frame, never clamped. A trim
+    // spanning a period or more is the wrap guard's case and keeps the full
+    // period. Escape hatch `BREP_MARCH_SEAM_LIFT=0`.
+    let mut lifted_surface: Option<NurbsSurface> = None;
+    let mut lifted_axis: Option<bool> = None;
+    if std::env::var("BREP_MARCH_SEAM_LIFT").as_deref() != Ok("0") {
+        let (closed_u, closed_v) = face.surface.closed_directions().ok()?;
+        for (direction_u, closed, domain, low, high, margin) in [
+            (true, closed_u, [u0, u1], u_low, u_high, u_margin),
+            (false, closed_v, [v0, v1], v_low, v_high, v_margin),
+        ] {
+            let below = (domain[0] - low).max(0.0);
+            let above = (high - domain[1]).max(0.0);
+            // An overhang the SPLIT could not cut is parametric round-off, not
+            // trim: `restrict_direction`'s own guard, the absolute knot
+            // identity tolerance over the domain. Measured over the boolean
+            // fuzz corpus, the two populations are eight orders apart — a
+            // hull end that overshoots its domain by 1e-16 .. 1.3e-10 (52 of
+            // 57 rows) against the helmet's 1.807e-1 — and lifting the
+            // round-off ones re-marched their sections for nothing: 8 rows of
+            // `21_band_rim_containment` and `27_corner_chord_duplicate_t634`
+            // moved in their last digits with no topology change.
+            let guard = ((domain[1] - domain[0]) * KNOT_IDENTITY_TOL).max(2e-9);
+            if !closed
+                || below.max(above) <= guard
+                || high - low >= domain[1] - domain[0]
+            {
+                continue;
+            }
+            let low_side = below > 0.0;
+            let delta = below.max(above) + margin;
+            if let Some(lift) =
+                seam_lifted_carrier(&face.surface, direction_u, delta, low_side)
+            {
+                lifted_surface = Some(lift);
+                lifted_axis = Some(direction_u);
+                break;
+            }
+        }
+    }
+    let carrier = lifted_surface.as_ref().unwrap_or(&face.surface);
+    let [u0, u1] = carrier.domain_u().ok()?;
+    let [v0, v1] = carrier.domain_v().ok()?;
+    u_low = (u_low - u_margin).max(u0);
+    u_high = (u_high + u_margin).min(u1);
+    v_low = (v_low - v_margin).max(v0);
+    v_high = (v_high + v_margin).min(v1);
+    if u_high <= u_low || v_high <= v_low {
+        return None;
+    }
+    let mut full_u = u_low <= u0 + u_margin && u_high >= u1 - u_margin;
+    let mut full_v = v_low <= v0 + v_margin && v_high >= v1 - v_margin;
+    // WRAPPED-BAND HULL GUARD: on a CLOSED direction the pcurve hull does NOT
+    // necessarily bound the material — a band face whose two rims sit at the
+    // hull edges can have its material in the WRAPPED COMPLEMENT of the hull
+    // window (trial 35's torus face: loops at v=0.25/1.0, material v∈[0,0.25]).
+    // Restricting the march surface to such a hull excludes every interior
+    // material point AND breaks closure, so the SSI trace terminates at the
+    // rim as a false "boundary" and the section over the band is never
+    // marched. The complement strip of the full hull contains no loop curves
+    // at all, so it is uniformly material or uniformly not: ONE sample at its
+    // middle decides exactly. If that sample is Inside, the hull is invalid in
+    // that direction — keep the full period (the unrestricted carrier is
+    // always conservative). Escape hatch: BREP_RESTRICT_WRAP_GUARD=0.
+    // A LIFTED direction is not asked: the lift exists because the trim's own
+    // hull is the material band, drawn unwrapped, so the complement carries no
+    // material by construction — and the sample's parameter would be read in
+    // the carrier's frame while the window is in the trim's.
+    if std::env::var("BREP_RESTRICT_WRAP_GUARD").as_deref() != Ok("0") {
+        let (mut closed_u, mut closed_v) = face.surface.closed_directions().ok()?;
+        match lifted_axis {
+            Some(true) => closed_u = false,
+            Some(false) => closed_v = false,
+            None => {}
+        }
+        let sample_inside = |uv: crate::arrangement::Vec2| -> bool {
+            matches!(
+                parameter_point_in_face(face, uv, 1e-9),
+                Ok(PolygonClass::Inside)
+            )
+        };
+        if closed_u && !full_u {
+            let period = u1 - u0;
+            let gap = period - (u_high - u_low);
+            let mut mid = u_high + gap / 2.0;
+            if mid > u1 {
+                mid -= period;
+            }
+            if sample_inside(crate::arrangement::Vec2 {
+                x: mid,
+                y: (v_low + v_high) / 2.0,
+            }) {
+                full_u = true;
+            }
+        }
+        if closed_v && !full_v {
+            let period = v1 - v0;
+            let gap = period - (v_high - v_low);
+            let mut mid = v_high + gap / 2.0;
+            if mid > v1 {
+                mid -= period;
+            }
+            if sample_inside(crate::arrangement::Vec2 {
+                x: (u_low + u_high) / 2.0,
+                y: mid,
+            }) {
+                full_v = true;
+            }
+        }
+    }
+    let lifted = lifted_axis.is_some();
+    if full_u && full_v {
+        // A lifted carrier is itself the window — the strip past the seam is
+        // the whole point, even where the hull narrows nothing further.
+        return lifted_surface.map(|surface| MarchWindow { surface, lifted });
+    }
+    let restricted_u = if full_u {
+        None
+    } else {
+        Some(restrict_direction(carrier, [u_low, u_high], true).ok()?)
+    };
+    let surface = if full_v {
+        restricted_u?
+    } else {
+        let base = restricted_u.as_ref().unwrap_or(carrier);
+        restrict_direction(base, [v_low, v_high], false).ok()?
+    };
+    Some(MarchWindow { surface, lifted })
+}
+
+pub(super) fn face_bounds(
+    face: &FaceRecord,
+    restricted: Option<&NurbsSurface>,
+    edges: &HashMap<(u8, u64), &EdgeRecord>,
+    operand: u8,
+    tolerance: f64,
+) -> Result<Aabb, KernelRefusal> {
+    let [u0, u1] = face
+        .surface
+        .domain_u()
+        .or_refuse(KernelStage::Intersect, "domain_u")?;
+    let [v0, v1] = face
+        .surface
+        .domain_v()
+        .or_refuse(KernelStage::Intersect, "domain_v")?;
+    let origin = face
+        .surface
+        .evaluate((u0 + u1) / 2.0, (v0 + v1) / 2.0)
+        .or_refuse(KernelStage::Intersect, "csg.imprint.support")?;
+    let normal = face
+        .surface
+        .normal((u0 + u1) / 2.0, (v0 + v1) / 2.0)
+        .or_refuse(KernelStage::Intersect, "csg.imprint.support")?;
+    let surface_controls = face
+        .surface
+        .control_points
+        .iter()
+        .flatten()
+        .map(|control| control.point())
+        .collect::<Result<Vec<_>, _>>()
+        .or_refuse(KernelStage::Intersect, "csg.imprint.support")?;
+    let scale = surface_controls
+        .iter()
+        .map(|point| point.sub(origin).length())
+        .fold(1.0f64, f64::max);
+    let plane_tolerance = (tolerance * 100.0).max(1e-7) * scale;
+    if surface_controls
+        .iter()
+        .any(|point| point.sub(origin).dot(normal).abs() > plane_tolerance)
+    {
+        // Curved carrier: bound the trimmed uv sub-patch when the trims
+        // cover only part of it (a revolve wall's full carrier box spans
+        // the whole ring and pairs with everything).
+        if let Some(restricted) = restricted {
+            return Ok(Aabb::from_surface_controls(restricted)
+                .or_refuse(KernelStage::Intersect, "from_surface_controls")?
+                .expanded(plane_tolerance));
+        }
+        return Aabb::from_surface_controls(&face.surface)
+            .or_refuse(KernelStage::Intersect, "from_surface_controls");
+    }
+
+    // A planar trimmed region lies inside the convex hull of its boundary.
+    // Bounding its exact trimmed edge curves is therefore conservative and
+    // substantially tighter than the often much larger carrier patch.
+    let mut bounds = Aabb::empty();
+    let mut found = false;
+    for coedge in face
+        .loops
+        .iter()
+        .flat_map(|loop_record| &loop_record.coedges)
+    {
+        let edge = edges.get(&(operand, coedge.edge_id)).ok_or_else(|| {
+            KernelRefusal::internal(
+                KernelStage::Intersect,
+                "imprint.support",
+                format!("missing edge {} on operand {operand}", coedge.edge_id),
+            )
+        })?;
+        let curve = edge_subcurve(edge)?;
+        for control in &curve.control_points {
+            bounds.include_point(control.point().or_refuse(KernelStage::Intersect, "point")?);
+            found = true;
+        }
+    }
+    if !found {
+        return Aabb::from_surface_controls(&face.surface)
+            .or_refuse(KernelStage::Intersect, "from_surface_controls");
+    }
+    Ok(bounds.expanded(plane_tolerance))
+}
+
+/// The parameter seam of a closed revolution carrier, as the plane it lies in
+/// and the half of that plane it occupies: the u = 0 meridian is the half-plane
+/// through the axis on `frame.x_axis`'s side, and a torus's v = 0 circle is the
+/// outer half of its equatorial plane. An analytic carrier keeps every pcurve
+/// on its own period (`build_interpolant` clamps it there), so a trim cannot
+/// run across one of these; a section that crosses one inside a face needs a
+/// vertex on it, whether or not the face's own seam EDGE sits there.
+pub(super) struct CarrierSeam {
+    origin: Vec3,
+    normal: Vec3,
+    half: SeamHalf,
+}
+
+enum SeamHalf {
+    Toward(Vec3),
+    Beyond { axis: Vec3, radius: f64 },
+}
+
+impl CarrierSeam {
+    pub(super) fn of(surface: &NurbsSurface) -> Result<Vec<CarrierSeam>, KernelRefusal> {
+        let Some(analytic) = surface.analytic() else {
+            return Ok(Vec::new());
+        };
+        let Some(frame) = analytic.frame() else {
+            return Ok(Vec::new());
+        };
+        let (closed_u, closed_v) = surface
+            .closed_directions()
+            .or_refuse(KernelStage::Intersect, "closed_directions")?;
+        let mut seams = Vec::new();
+        if closed_u {
+            seams.push(CarrierSeam {
+                origin: frame.origin,
+                normal: frame.y_axis,
+                half: SeamHalf::Toward(frame.x_axis),
+            });
+        }
+        if let (true, crate::AnalyticSurface::Torus { major_radius, .. }) = (closed_v, &analytic) {
+            seams.push(CarrierSeam {
+                origin: frame.origin,
+                normal: frame.axis,
+                half: SeamHalf::Beyond {
+                    axis: frame.axis,
+                    radius: *major_radius,
+                },
+            });
+        }
+        Ok(seams)
+    }
+
+    /// Signed distance from the seam's plane.
+    pub(super) fn offset(&self, point: Vec3) -> f64 {
+        point.sub(self.origin).dot(self.normal)
+    }
+
+    /// Whether `point`'s foot on the seam's plane lies on the seam's half of it.
+    pub(super) fn on_seam_half(&self, point: Vec3) -> bool {
+        let relative = point.sub(self.origin);
+        match self.half {
+            SeamHalf::Toward(direction) => relative.dot(direction) > 0.0,
+            SeamHalf::Beyond { axis, radius } => {
+                relative.sub(axis.scale(relative.dot(axis))).length() > radius
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct TaggedFace<'a> {
+    pub(super) operand: u8,
+    pub face: &'a FaceRecord,
+    /// The face's [lifted](seam_lifted_carrier) carrier, where its trim is
+    /// drawn past a closed direction's domain. Set by the driver from the
+    /// face's own march window; `None` on every face whose trim sits inside
+    /// its domain, which is all but the overhanging ones.
+    pub(super) lifted: Option<&'a NurbsSurface>,
+}
+
+impl<'a> TaggedFace<'a> {
+    pub fn key(self) -> FaceKey {
+        FaceKey {
+            operand: self.operand,
+            face_id: self.face.id,
+        }
+    }
+
+    /// THE FRAME EVERY uv OF THIS FACE IS READ IN. For a face whose trim sits
+    /// inside its domain this is the carrier itself, so every reading is what
+    /// it was before the lift existed, to the bit. For a face whose trim is
+    /// drawn past a closed direction's domain it is the lifted carrier, whose
+    /// parameters are the trim's own: a section marched in the overhang then
+    /// carries the parameters the face's loops are drawn in, and the
+    /// containment tests and pcurve builds that read them need no period image.
+    pub(super) fn chart(self) -> &'a NurbsSurface {
+        self.lifted.unwrap_or(&self.face.surface)
+    }
+}
+
+pub fn faces(solid: &BrepSolid, operand: u8) -> Vec<TaggedFace<'_>> {
+    solid
+        .shells
+        .iter()
+        .flat_map(|shell| shell.faces.iter())
+        .map(|face| TaggedFace { operand, face, lifted: None })
+        .collect()
+}
+
+pub(super) fn edge_map<'a>(
+    solid_a: &'a BrepSolid,
+    solid_b: &'a BrepSolid,
+) -> HashMap<(u8, u64), &'a EdgeRecord> {
+    solid_a
+        .edges
+        .iter()
+        .map(|edge| ((0, edge.id), edge))
+        .chain(solid_b.edges.iter().map(|edge| ((1, edge.id), edge)))
+        .collect()
+}
+
+pub(super) fn face_edges<'a>(
+    face: TaggedFace<'_>,
+    edges: &HashMap<(u8, u64), &'a EdgeRecord>,
+) -> Result<Vec<&'a EdgeRecord>, KernelRefusal> {
+    let mut seen = HashSet::default();
+    let mut result = Vec::new();
+    for coedge in face
+        .face
+        .loops
+        .iter()
+        .flat_map(|loop_record| &loop_record.coedges)
+    {
+        if seen.insert(coedge.edge_id) {
+            result.push(*edges.get(&(face.operand, coedge.edge_id)).ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Intersect,
+                    "imprint.support",
+                    format!("face {} references missing edge", face.face.id),
+                )
+            })?);
+        }
+    }
+    Ok(result)
+}
+
+pub fn edge_subcurve(edge: &EdgeRecord) -> Result<NurbsCurve, KernelRefusal> {
+    let mut curve = edge.curve.clone();
+    let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    // NurbsCurve::split refuses parameters within its ABSOLUTE knot identity
+    // tolerance (curve.rs KNOT_IDENTITY_TOL) of the domain ends; the skip
+    // epsilon must cover that or a near-edge trim parameter slips past the
+    // guard and errors.
+    let epsilon = (KNOT_IDENTITY_TOL * (end - start)).max(2e-9);
+    if edge.t0 > start + epsilon && edge.t0 < end - epsilon {
+        curve = curve
+            .split(edge.t0)
+            .or_refuse(KernelStage::Intersect, "split")?
+            .1;
+    }
+    let domain = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    if edge.t1 < domain[1] - epsilon && edge.t1 > domain[0] + epsilon {
+        curve = curve
+            .split(edge.t1)
+            .or_refuse(KernelStage::Intersect, "split")?
+            .0;
+    } else if env_read!("BREP_DEBUG_SUBRANGE").is_some() && edge.t1 < domain[1] - epsilon {
+        eprintln!("abnormal subrange skip in imprint edge_subcurve");
+    }
+    Ok(curve)
+}
+
+pub(super) fn curve_length_rough(curve: &NurbsCurve) -> Result<f64, KernelRefusal> {
+    let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let mut previous = curve
+        .evaluate(start)
+        .or_refuse(KernelStage::Intersect, "evaluate")?;
+    let mut length = 0.0;
+    for index in 1..=8 {
+        let point = curve
+            .evaluate(start + (end - start) * index as f64 / 8.0)
+            .or_refuse(KernelStage::Intersect, "evaluate")?;
+        length += point.sub(previous).length();
+        previous = point;
+    }
+    Ok(length)
+}
+
+pub(super) fn parameter_tolerance(
+    curve: &NurbsCurve,
+    parameter: f64,
+    tolerance: f64,
+) -> Result<f64, KernelRefusal> {
+    let tangent = if crate::curve::small_curve_derivatives_enabled() {
+        curve.derivatives_small(parameter, 1).or_refuse(KernelStage::Intersect, "derivatives")?[1].length()
+    } else {
+        curve
+            .derivatives(parameter, 1)
+            .or_refuse(KernelStage::Intersect, "derivatives")?[1]
+            .length()
+    };
+    Ok(tolerance / tangent.max(1e-12))
+}
+
+pub(super) fn snap_curve_ends(
+    curve: &NurbsCurve,
+    start: Vec3,
+    end: Vec3,
+) -> Result<NurbsCurve, KernelRefusal> {
+    let [t0, t1] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let p0 = curve
+        .evaluate(t0)
+        .or_refuse(KernelStage::Intersect, "evaluate")?;
+    let p1 = curve
+        .evaluate(t1)
+        .or_refuse(KernelStage::Intersect, "evaluate")?;
+    let cap = 5e-3 * (1.0 + p0.length());
+    let d0 = p0.sub(start).length();
+    let d1 = p1.sub(end).length();
+    if (d0 <= 1e-12 && d1 <= 1e-12) || d0 > cap || d1 > cap {
+        return Ok(curve.clone());
+    }
+    let mut controls = curve.control_points.clone();
+    if d0 > 1e-12 {
+        controls[0] = Vec4::from_point(start, controls[0].w);
+    }
+    let last = controls.len() - 1;
+    if d1 > 1e-12 {
+        controls[last] = Vec4::from_point(end, controls[last].w);
+    }
+    NurbsCurve::new(curve.degree, curve.knots.clone(), controls)
+        .or_refuse(KernelStage::Intersect, "NurbsCurve::new")
+}
+
+pub fn curve_lies_on_surface(
+    curve: &NurbsCurve,
+    surface: &NurbsSurface,
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    // This curve is being offered as lying on another carrier. A short
+    // grazing contact is not a shared section, and translating the operands
+    // must not enlarge that geometric allowance.
+    let carrier_tolerance = tolerance.max(1e-7);
+    // The quarter samples first, then — only for a curve every one of them
+    // admitted — the odd eighths. The quarters alone are exactly where a
+    // four-quadrant NURBS circle has its knots, so a circle that merely
+    // TOUCHES a surface at its four quadrant points read as lying on it:
+    // the 2026-11-01 report's cylinder rim, tangent to a NURBS Solid box
+    // cage at the four side midpoints and 0.89 off it at the corners, was
+    // exchanged whole onto the cage face and cut it into four false regions.
+    for fraction in [0.0, 0.25, 0.5, 0.75, 1.0, 0.125, 0.375, 0.625, 0.875] {
+        let point = curve
+            .evaluate(start + (end - start) * fraction)
+            .or_refuse(KernelStage::Intersect, "evaluate")?;
+        if project_point_to_surface(surface, point)
+            .or_refuse(KernelStage::Intersect, "project_point_to_surface")?
+            .distance
+            > carrier_tolerance
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Most pieces the hug certificate ([`tangent_hit_endpoint`]) may bisect the
+/// window into before it gives up. A window the certificate cannot close in
+/// this many pieces is not the sub-weld tangency band the snap exists for; the
+/// helper then answers `None`, which is the pre-snap behaviour.
+const HUG_PIECE_CAP: usize = 64;
+
+/// Whether every control point of `curve` is finite with a finite, positive
+/// weight: the premise of the convex-hull certificate and of every evaluation
+/// the snap relies on. `NurbsCurve::new` enforces this at construction, but the
+/// field is public, so the certificate re-reads it rather than assume it.
+fn controls_are_finite(curve: &NurbsCurve) -> bool {
+    curve.control_points.iter().all(|control| {
+        control.w.is_finite()
+            && control.w > 0.0
+            && control.x.is_finite()
+            && control.y.is_finite()
+            && control.z.is_finite()
+    })
+}
+
+/// Whether every point of `along` over `[lo, hi]` lies within `limit` of the
+/// live trim of `other` (`[other_low, other_high]`), certified over the WHOLE
+/// window, not at stations. Each piece is compared with one point of the
+/// trim, the foot of the piece's midpoint: a NURBS with positive weights lies
+/// in the convex hull of its control points and `x ↦ |x − foot|` is convex,
+/// so the farthest point of the piece from that foot is a control point, and
+/// a piece whose control points all sit within `limit` of the foot lies within
+/// `limit` of the trim everywhere. A piece too long or too far for that bound
+/// is bisected and each half certified on its own, up to `budget` pieces in
+/// all; a window `split` cannot cut (within the knot identity band of an end)
+/// fails closed. The foot is clamped into the live interval so the certificate
+/// speaks for the trim, never for an unused stretch of the carrier.
+#[allow(clippy::too_many_arguments)]
+fn span_hull_within(
+    along: &NurbsCurve,
+    lo: f64,
+    hi: f64,
+    other: &NurbsCurve,
+    other_low: f64,
+    other_high: f64,
+    limit: f64,
+    budget: &mut usize,
+) -> Result<bool, KernelRefusal> {
+    if *budget == 0 || !(lo < hi) || !lo.is_finite() || !hi.is_finite() {
+        return Ok(false);
+    }
+    *budget -= 1;
+    let [d0, d1] = along.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let mut piece = along.clone();
+    if lo > d0 {
+        piece = match piece.split(lo) {
+            Ok((_, right)) => right,
+            Err(_) => return Ok(false),
+        };
+    }
+    if hi < d1 {
+        piece = match piece.split(hi) {
+            Ok((left, _)) => left,
+            Err(_) => return Ok(false),
+        };
+    }
+    let mid = 0.5 * (lo + hi);
+    let midpoint = along.evaluate(mid).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let projection = project_point_to_curve(other, midpoint).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+    if !projection.u.is_finite() {
+        return Ok(false);
+    }
+    let foot = other
+        .evaluate(projection.u.clamp(other_low, other_high))
+        .or_refuse(KernelStage::Intersect, "evaluate")?;
+    if !controls_are_finite(&piece) {
+        return Ok(false);
+    }
+    let mut worst = 0.0f64;
+    for control in &piece.control_points {
+        let point = control.point().or_refuse(KernelStage::Intersect, "control point")?;
+        let distance = point.sub(foot).length();
+        if !distance.is_finite() {
+            return Ok(false);
+        }
+        worst = worst.max(distance);
+    }
+    if worst <= limit {
+        return Ok(true);
+    }
+    if !(lo < mid && mid < hi) {
+        return Ok(false);
+    }
+    Ok(span_hull_within(along, lo, mid, other, other_low, other_high, limit, budget)?
+        && span_hull_within(along, mid, hi, other, other_low, other_high, limit, budget)?)
+}
+
+/// The endpoint of `along` (live over `[along_low, along_high]`) that a
+/// TANGENTIAL hit at `hit_parameter` against `other` (live over `[other_low,
+/// other_high]`) stands for, if any, as `(along parameter, other parameter)`.
+///
+/// A tangential hit is placed only to the tangency's flat band, so when the
+/// contact the finder was reaching for is an endpoint of `along` that itself
+/// lies on `other`, the endpoint is the junction. The answer is one of:
+///
+/// * **Identity.** The hit's parameter IS an endpoint's parameter: that
+///   endpoint, and only that endpoint, with a zero-length window and nothing
+///   to certify. On a closed ring or a retraced curve both endpoints share a
+///   point, and the exact parameter names this traversal's visit of it, so
+///   the far end's visit is never chosen. Physical nearness alone is not an
+///   identity: a hit that returns to an endpoint's point after an excursion
+///   has a window with the excursion in it, and goes through the certificate.
+/// * **Reach.** Otherwise an endpoint whose span back to the hit lies within
+///   `limit` of `other`'s live trim over the WHOLE window
+///   ([`span_hull_within`]), so no distinct topology can fit between hit and
+///   vertex. A curve that leaves `other` and returns, however briefly, between
+///   stations is refused by the hull bound, and so is a window the bound
+///   cannot close within [`HUG_PIECE_CAP`] pieces (a window many hundreds of
+///   floors long is never the tangency band). A hit that could reach BOTH
+///   endpoints is a coincident overlap, the overlap branch's territory: `None`.
+///
+/// In every case the endpoint must project onto `other` within `limit` AND at
+/// a parameter inside `other`'s live interval (widened only by that point's
+/// own parameter band), and the certificate's feet are taken on that
+/// interval. Every comparison fails closed on a non-finite value, and both
+/// curves must carry finite controls with finite positive weights
+/// ([`controls_are_finite`]) before anything is accepted.
+#[allow(clippy::too_many_arguments)]
+pub fn tangent_hit_endpoint(
+    along: &NurbsCurve,
+    along_low: f64,
+    along_high: f64,
+    hit_parameter: f64,
+    other: &NurbsCurve,
+    other_low: f64,
+    other_high: f64,
+    limit: f64,
+) -> Result<Option<(f64, f64)>, KernelRefusal> {
+    if ![along_low, along_high, hit_parameter, other_low, other_high, limit]
+        .iter()
+        .all(|value| value.is_finite())
+        || !(limit > 0.0)
+        || !controls_are_finite(along)
+        || !controls_are_finite(other)
+    {
+        return Ok(None);
+    }
+    let (along_low, along_high) = (along_low.min(along_high), along_low.max(along_high));
+    let (other_low, other_high) = (other_low.min(other_high), other_low.max(other_high));
+    along.evaluate(hit_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+    // The endpoint's foot on the partner's LIVE trim, or None.
+    let foot = |end_parameter: f64| -> Result<Option<(f64, Vec3)>, KernelRefusal> {
+        let end_point = along.evaluate(end_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let projection = project_point_to_curve(other, end_point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+        if !(projection.distance <= limit) || !projection.u.is_finite() {
+            return Ok(None);
+        }
+        let band = parameter_tolerance(other, projection.u, limit)?;
+        if !(projection.u >= other_low - band && projection.u <= other_high + band) {
+            return Ok(None);
+        }
+        let u = projection.u.clamp(other_low, other_high);
+        let reference = other.evaluate(u).or_refuse(KernelStage::Intersect, "evaluate")?;
+        if !(reference.sub(end_point).length() <= limit) {
+            return Ok(None);
+        }
+        Ok(Some((u, reference)))
+    };
+    // Identity: the hit IS an endpoint, by parameter. Only an exact endpoint
+    // parameter has a zero-length window and may bypass the certificate; a
+    // hit merely NEAR an endpoint's point, or returning to it after an
+    // excursion, is a candidate like any other and must certify its window
+    // and be the unique reachable end.
+    if hit_parameter == along_low || hit_parameter == along_high {
+        return Ok(foot(hit_parameter)?.map(|(u, _)| (hit_parameter, u)));
+    }
+    // Reach: the window from the hit to the endpoint hugs the partner's trim.
+    let mut reached: Vec<(f64, f64)> = Vec::new();
+    for end_parameter in [along_low, along_high] {
+        if !(hit_parameter > along_low && hit_parameter < along_high) {
+            break;
+        }
+        let Some((u, _)) = foot(end_parameter)? else {
+            continue;
+        };
+        let (lo, hi) = if end_parameter < hit_parameter {
+            (end_parameter, hit_parameter)
+        } else {
+            (hit_parameter, end_parameter)
+        };
+        let mut budget = HUG_PIECE_CAP;
+        if span_hull_within(along, lo, hi, other, other_low, other_high, limit, &mut budget)? {
+            reached.push((end_parameter, u));
+        }
+    }
+    Ok(match reached.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    })
+}
+
+/// The spans of an operand edge's `curve` that lie on the other operand's
+/// `face`, for the boundary-curve exchange: the whole curve when it lies on
+/// the face's surface ([`curve_lies_on_surface`]), and otherwise each span
+/// between the curve's crossings with the face's boundary edges that does.
+///
+/// The surface is a bounded patch, so a curve on its carrier that runs past
+/// the patch does not lie on it, and the whole-curve test refused the part
+/// that did. That part is a section: the flush partial torus's equator circles
+/// lie in the box's top plane for 281 degrees and over the top face for the
+/// last 11, and the march of that plane against the torus skips the same
+/// section because it rides the torus's own edge. With neither lane minting
+/// it, the union's shell stood open on five edges. Given the edges already
+/// split where the imprint's sections meet them, the whole-curve test passed
+/// on the sub-edge and the union built, so the answer depended on what the
+/// input happened to have split.
+///
+/// A span that leaves the face crosses the face's boundary there, so the
+/// crossings are the only span ends a curve can have short of its own ends,
+/// and each span is held to the whole-curve test with its bar. The crossings
+/// are `process_curve`'s own search, with its split guard and its overlap
+/// skip, so the call that exchanges a span finds the crossing again at the
+/// span's end; a tangential hit within its own precision of the curve's end is
+/// that end. A boundary edge whose control hull stands farther than that
+/// search's reach from the curve's is not searched. A curve that meets the
+/// surface only where it lifts off inside the face has no crossing there and
+/// is not exchanged, as before. `whole_only` is used for seam edges when an
+/// exact lane already retains the section. Ordinary boundary sections are
+/// discarded by that lane, so their partial spans must still be exchanged.
+/// Escape hatch for tamper-verification:
+/// `BREP_LIES_ON_SPANS=0` exchanges whole curves only.
+pub fn curve_spans_on_face(
+    curve: NurbsCurve,
+    face: &FaceRecord,
+    face_edges: &[&EdgeRecord],
+    tolerance: f64,
+    whole_only: bool,
+) -> Result<Vec<NurbsCurve>, KernelRefusal> {
+    let split_clock = profile_enabled().then(Instant::now);
+    let whole = curve_lies_on_surface(&curve, &face.surface, tolerance)?;
+    if let Some(started) = split_clock {
+        let elapsed = started.elapsed();
+        imprint_split_add(|split| { split.lies_whole += elapsed; split.lies_whole_calls += 1; split.lies_whole_hits += whole as u64; });
+    }
+    if whole {
+        return Ok(vec![curve]);
+    }
+    if whole_only {
+        return Ok(Vec::new());
+    }
+    curve_spans_after_whole_miss(curve, face, face_edges, tolerance)
+}
+
+/// Continue the partial-span search after the caller proved this exact curve
+/// does not lie wholly on this face, with the same tolerance and no mutation.
+pub fn curve_spans_after_whole_miss(
+    curve: NurbsCurve, face: &FaceRecord, face_edges: &[&EdgeRecord], tolerance: f64,
+) -> Result<Vec<NurbsCurve>, KernelRefusal> {
+    if env_read!("BREP_LIES_ON_SPANS").as_deref() == Some("0") {
+        return Ok(Vec::new());
+    }
+    let split_clock = profile_enabled().then(Instant::now);
+    let spans = curve_spans_after_whole_miss_impl(curve, face, face_edges, tolerance);
+    if let Some(started) = split_clock {
+        let elapsed = started.elapsed();
+        imprint_split_add(|split| { split.lies_span += elapsed; split.lies_span_calls += 1; });
+    }
+    spans
+}
+
+/// The boundary edges' control hulls the span search reads, memoised for one
+/// imprint (2026-11-03). The search rebuilt every boundary
+/// edge's hull on every call (cookie-cutter: 465k rebuilds over 62k calls, 55
+/// of its 89 ms). Every caller passes edges borrowed from the imprint's two
+/// operand solids, which no stage mutates while the scope is open, so an
+/// edge's address names it; the entry also keeps the curve's control count and
+/// the bits of its first and last control point, and a mismatch recomputes. A
+/// hull is a pure function of the control points, so the served hull is the
+/// computed one; a hull that errors is never stored.
+pub struct EdgeHullScope {
+    previous: Option<rustc_hash::FxHashMap<usize, ([u64; 9], Aabb)>>,
+}
+thread_local! {
+    static EDGE_HULLS: std::cell::RefCell<Option<rustc_hash::FxHashMap<usize, ([u64; 9], Aabb)>>> = const { std::cell::RefCell::new(None) };
+}
+impl EdgeHullScope {
+    pub fn open(enabled: bool) -> Self {
+        let previous = EDGE_HULLS.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), enabled.then(rustc_hash::FxHashMap::default)));
+        Self { previous }
+    }
+}
+impl Drop for EdgeHullScope {
+    fn drop(&mut self) {
+        EDGE_HULLS.with(|cell| *cell.borrow_mut() = self.previous.take());
+    }
+}
+pub(super) fn edge_hull_memo_enabled() -> bool {
+    switch!("BREP_IMPRINT_EDGE_HULL_MEMO", true)
+}
+fn control_hull(curve: &NurbsCurve) -> Result<Aabb, KernelRefusal> {
+    let points = curve
+        .control_points
+        .iter()
+        .map(|point| point.point())
+        .collect::<Result<Vec<_>, _>>()
+        .or_refuse(KernelStage::Intersect, "control point")?;
+    Ok(Aabb::from_points(points))
+}
+fn edge_control_hull(edge: &EdgeRecord) -> Result<Aabb, KernelRefusal> {
+    let controls = &edge.curve.control_points;
+    let guard = |controls: &[crate::Vec4]| -> [u64; 9] {
+        match (controls.first(), controls.last()) {
+            (Some(first), Some(last)) => [controls.len() as u64, first.x.to_bits(), first.y.to_bits(), first.z.to_bits(), first.w.to_bits(), last.x.to_bits(), last.y.to_bits(), last.z.to_bits(), last.w.to_bits()],
+            _ => [0; 9],
+        }
+    };
+    let key = edge as *const EdgeRecord as usize;
+    let stored = EDGE_HULLS.with(|cell| cell.borrow().as_ref().map(|memo| memo.get(&key).copied()));
+    let Some(stored) = stored else { return control_hull(&edge.curve) };
+    let mark = guard(controls);
+    if let Some((stored_mark, hull)) = stored {
+        if stored_mark == mark {
+            return Ok(hull);
+        }
+    }
+    let hull = control_hull(&edge.curve)?;
+    EDGE_HULLS.with(|cell| {
+        if let Some(memo) = cell.borrow_mut().as_mut() {
+            memo.insert(key, (mark, hull));
+        }
+    });
+    Ok(hull)
+}
+
+fn curve_spans_after_whole_miss_impl(
+    curve: NurbsCurve, face: &FaceRecord, face_edges: &[&EdgeRecord], tolerance: f64,
+) -> Result<Vec<NurbsCurve>, KernelRefusal> {
+    let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let split_tolerance = 2e-9f64.max((end - start) * KNOT_IDENTITY_TOL);
+    let overlap_limit = tolerance.max(1e-5);
+    const CROSSING_TOLERANCE: f64 = 1e-5;
+    let start_point = curve.evaluate(start).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let end_point = curve.evaluate(end).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let curve_hull = control_hull(&curve)?;
+    let mut crossings = Vec::new();
+    for edge in face_edges {
+        if edge.degenerate
+            || !curve_hull.intersects(edge_control_hull(edge)?, CROSSING_TOLERANCE)
+            || curve_overlaps_edge(&curve, edge, overlap_limit)?
+        {
+            continue;
+        }
+        let hits = intersect_curves(&curve, &edge.curve, CROSSING_TOLERANCE)
+            .map_err(|error| format!("imprint span crossing on edge {}: {error}", edge.id))
+            .or_refuse(KernelStage::Intersect, "csg.imprint.support")?;
+        for hit in hits {
+            if hit.t < edge.t0 - 1e-9
+                || hit.t > edge.t1 + 1e-9
+                || hit.s <= start + split_tolerance
+                || hit.s >= end - split_tolerance
+            {
+                continue;
+            }
+            // A tangential hit is only placed to `intersect_curves`' spatial
+            // precision for one, √tolerance · (1 + |p|). Within that of the
+            // curve's own end it is that end's junction: where a curve leaves a
+            // corner tangent to one of the corner's edges (a flange's window
+            // edge along a bend's inner arc) the hit lands 1.4e-6 off the corner,
+            // and a span cut there started off it. A transversal hit is placed
+            // to the search's tolerance and stays a crossing.
+            let mut crossing = hit.s;
+            if hit.tangential {
+                let point = curve.evaluate(hit.s).or_refuse(KernelStage::Intersect, "evaluate")?;
+                let precision = CROSSING_TOLERANCE.sqrt() * (1.0 + point.length());
+                if point.sub(start_point).length() <= precision || point.sub(end_point).length() <= precision {
+                    continue;
+                }
+                // Likewise a tangential hit reaching for the EDGE's own vertex
+                // — the cap circle touching the slab's height edge at the
+                // corner the circle passes through — is that vertex's crossing
+                // (`tangent_hit_endpoint`): the finder placed it 1.26e-5 along
+                // the edge from the corner, past the dedup band of the exact
+                // crossing the corner's other edge gives, and the 1.26e-5 arc
+                // between them "lay on" the side plane and was exchanged as a
+                // span, planting a sliver split on the height edge.
+                if let Some((_, snapped)) = tangent_hit_endpoint(&edge.curve, edge.t0, edge.t1, hit.t, &curve, start, end, overlap_limit)? {
+                    crossing = snapped;
+                    if crossing <= start + split_tolerance || crossing >= end - split_tolerance {
+                        continue;
+                    }
+                }
+            }
+            crossings.push(crossing);
+        }
+    }
+    if crossings.is_empty() {
+        return Ok(Vec::new());
+    }
+    crossings.sort_by(f64::total_cmp);
+    crossings.dedup_by(|a, b| (*a - *b).abs() <= split_tolerance);
+    let crossing_count = crossings.len();
+    let mut spans = Vec::new();
+    let mut rest = curve;
+    for parameter in crossings {
+        let (left, right) = rest.split(parameter).or_refuse(KernelStage::Intersect, "split")?;
+        if curve_lies_on_surface(&left, &face.surface, tolerance)? {
+            spans.push(left);
+        }
+        rest = right;
+    }
+    if curve_lies_on_surface(&rest, &face.surface, tolerance)? {
+        spans.push(rest);
+    }
+    if std::env::var("BREP_DEBUG_PAIRS").is_ok() {
+        eprintln!("lies-on spans: face {} {crossing_count} crossing(s), {} span(s) on it", face.id, spans.len());
+    }
+    Ok(spans)
+}
+
+/// Which predicate admits a direction of a carrier into the exact lane of
+/// [`planar_iso_section`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsoGate {
+    /// The count proxy: degree 1 with exactly two control rows across the
+    /// direction. One knot insertion sends the same surface to the marcher.
+    Count,
+    /// What the lane consumes: every ruling across the direction is a straight
+    /// segment traced at constant speed ([`rulings_are_straight_and_affine`]).
+    Geometry,
+}
+
+/// The gate the boolean runs: the geometry the lane consumes. The count proxy
+/// sent a knot-refined or degree-elevated net of the same carrier to the
+/// marcher, and admitted a two-row rational net whose weights differ along its
+/// rulings — a curve off the plane that nothing downstream catches. Escape
+/// hatch for measurement: `BREP_ISO_GATE_GEOMETRY=0` runs the count gate, and
+/// with `BREP_FIT_CENSUS=1` compares every pair that then marches against the
+/// exact curve.
+pub(super) fn iso_gate() -> IsoGate {
+    if env_read!("BREP_ISO_GATE_GEOMETRY").as_deref() == Some("0") {
+        IsoGate::Count
+    } else {
+        IsoGate::Geometry
+    }
+}
+
+/// How far one direction of a net is from the rulings the iso lane assumes.
+#[derive(Clone, Copy, Debug)]
+pub struct RulingMeasure {
+    /// Every line of control points across the direction passes
+    /// [`NurbsCurve::straight_segment`] at the lane's tolerance.
+    pub straight: bool,
+    /// Largest distance of a control point from where a constant-speed
+    /// parameterization puts it: `P_0 + (ξ_k − ξ_0)·(P_n − P_0)/(ξ_n − ξ_0)`
+    /// at its Greville abscissa `ξ_k`.
+    pub affine_gap: f64,
+    /// Largest `|w_k / w_0 − 1|·|P_n − P_0|` along a line: the displacement a
+    /// weight spread can put on the ruling's parameterization.
+    pub weight_gap: f64,
+}
+
+impl RulingMeasure {
+    pub(super) fn admits(&self, tolerance: f64) -> bool {
+        self.straight && self.affine_gap <= tolerance && self.weight_gap <= tolerance
+    }
+}
+
+/// Measure whether every ruling of `ruled` across one direction is a straight
+/// segment traced at constant speed — the property the iso lane's root
+/// computation consumes.
+///
+/// The lane finds where a ruling crosses the plane from the plane distances
+/// of the ruling's two ENDS, as the linear fraction `d₀/(d₀ − d₁)` of the
+/// parameter domain, and then takes the iso-curve at that parameter. That is
+/// exact when the ruling is straight (so one crossing, located by its ends)
+/// AND its parameterization is affine (so the crossing's parameter is that
+/// fraction). Straightness alone is the image; the fraction also reads the
+/// parameter.
+///
+/// Both are decided on the net, at any degree and any row count. Weights are
+/// strictly positive, so every point of a line is a convex combination of its
+/// control points: collinear control points make it straight
+/// ([`NurbsCurve::straight_segment`]). B-splines reproduce linear functions
+/// from their Greville abscissae (`Σ N_k(t)·ξ_k = t`), so control points at
+/// `A + B·ξ_k` with equal weights make it `A + B·t` exactly — and because a
+/// row's weights are shared across the whole row, every ruling blended
+/// between rows inherits it, within the same distance. A two-row degree-1
+/// polynomial net passes both by construction; a knot insertion, a degree
+/// elevation or a rejoin at the right parameter keeps passing; a rejoin
+/// whose interior pole is not at its knot's fraction, or a rational line
+/// whose weights differ along it, does not, whatever it counts.
+pub fn rulings_are_straight_and_affine(
+    ruled: &NurbsSurface,
+    linear_v: bool,
+    tolerance: f64,
+) -> RulingMeasure {
+    let declined = RulingMeasure {
+        straight: false,
+        affine_gap: f64::INFINITY,
+        weight_gap: f64::INFINITY,
+    };
+    let rows = &ruled.control_points;
+    let (degree, knots, lines): (usize, &Vec<f64>, Vec<Vec<Vec4>>) = if linear_v {
+        (ruled.degree_v, &ruled.knots_v, rows.clone())
+    } else {
+        (
+            ruled.degree_u,
+            &ruled.knots_u,
+            (0..rows.first().map(|row| row.len()).unwrap_or(0))
+                .map(|column| rows.iter().map(|row| row[column]).collect())
+                .collect(),
+        )
+    };
+    if degree == 0 || lines.is_empty() {
+        return declined;
+    }
+    let mut measure = RulingMeasure {
+        straight: true,
+        affine_gap: 0.0,
+        weight_gap: 0.0,
+    };
+    for line in lines {
+        let count = line.len();
+        if count < 2 || knots.len() != count + degree + 1 {
+            return declined;
+        }
+        let greville = (0..count)
+            .map(|index| knots[index + 1..=index + degree].iter().sum::<f64>() / degree as f64)
+            .collect::<Vec<_>>();
+        let span = greville[count - 1] - greville[0];
+        let Ok(points) = line
+            .iter()
+            .map(|control| control.point())
+            .collect::<Result<Vec<Vec3>, _>>()
+        else {
+            return declined;
+        };
+        if span <= 0.0 || line[0].w <= 0.0 {
+            return declined;
+        }
+        let chord = points[count - 1].sub(points[0]);
+        for index in 0..count {
+            let expected = points[0].add(chord.scale((greville[index] - greville[0]) / span));
+            measure.affine_gap = measure.affine_gap.max(points[index].sub(expected).length());
+            measure.weight_gap = measure
+                .weight_gap
+                .max((line[index].w / line[0].w - 1.0).abs() * chord.length());
+        }
+        match NurbsCurve::new(degree, knots.clone(), line) {
+            Ok(curve) => measure.straight &= curve.straight_segment(tolerance).is_some(),
+            Err(_) => return declined,
+        }
+    }
+    measure
+}
+
+/// How [`planar_iso_section`] answered one direction.
+#[derive(Clone, Debug)]
+pub enum IsoOutcome {
+    /// The gate declined the direction.
+    Gate,
+    /// A ruling runs parallel to the plane, or crosses it outside its domain.
+    Root,
+    /// The rulings cross at different parameters: not an iso-curve.
+    RootAgreement,
+    /// The iso-curve failed `curve_lies_on_surface` against the plane.
+    OffPlane,
+    /// The iso-curve collapses to a point: every ruling meets the plane at a
+    /// shared pole (a cone whose apex lies in the plane). That point is not
+    /// the section — a plane through a cone's apex cuts it along rulings —
+    /// so the lane declines and the analytic/marched lanes answer.
+    Pole,
+    Curve(NurbsCurve),
+}
+
+impl IsoOutcome {
+    pub fn label(&self) -> &'static str {
+        match self {
+            IsoOutcome::Gate => "gate",
+            IsoOutcome::Root => "root",
+            IsoOutcome::RootAgreement => "root_agreement",
+            IsoOutcome::OffPlane => "off_plane",
+            IsoOutcome::Pole => "pole",
+            IsoOutcome::Curve(_) => "curve",
+        }
+    }
+}
+
+/// [`planar_iso_section`] recovers an exact isoparametric intersection when an affine plane slices
+/// a surface that is linear across one parameter direction. General SSI can
+/// miss this case when the other direction is a high-degree rational curve:
+/// all seeds lie on two distant trim boundaries even though the intersection
+/// itself is a simple interior iso-curve.
+///
+/// "Linear across one direction" is decided by [`iso_gate`] — by default on the
+/// net's geometry ([`rulings_are_straight_and_affine`]), at any degree and any
+/// row count — and the root, root-agreement and `curve_lies_on_surface` checks
+/// below stand behind it unchanged.
+///
+/// One direction of [`planar_iso_section`] under a named gate.
+pub fn planar_linear_iso_direction(
+    plane: &NurbsSurface,
+    ruled: &NurbsSurface,
+    tolerance: f64,
+    linear_v: bool,
+    gate: IsoGate,
+) -> Result<IsoOutcome, KernelRefusal> {
+    Ok(match planar_linear_iso_direction_section(plane, ruled, tolerance, linear_v, gate)? {
+        IsoAnswer::Declined(outcome) => outcome,
+        IsoAnswer::Curve { curve, .. } => IsoOutcome::Curve(curve),
+    })
+}
+
+/// [`planar_linear_iso_direction`]'s answer with the pcurves of an accepted
+/// curve ([`planar_iso_section`]).
+enum IsoAnswer {
+    Declined(IsoOutcome),
+    Curve {
+        curve: NurbsCurve,
+        on_plane: Option<NurbsCurve>,
+        on_ruled: Option<NurbsCurve>,
+    },
+}
+
+/// A complete control-net proof that distance to the plane is affine in
+/// one parameter and independent of the other. The spatial ruling may curve:
+/// only its normal component matters. Constant positive weights along that
+/// parameter let the rational basis reproduce its Greville abscissae. Every
+/// row must reproduce the SAME affine function, so five agreeing samples
+/// cannot hide an extra section between them. Off by default in the caller.
+pub fn plane_distance_is_affine(
+    plane: &NurbsSurface, surface: &NurbsSurface, along_v: bool, tolerance: f64,
+) -> bool {
+    let proof = || -> Option<()> {
+        if !tolerance.is_finite() || tolerance <= 0. || !plane.is_affine().ok()? {
+            return None;
+        }
+        let d = plane.derivatives(plane.domain_u().ok()?[0], plane.domain_v().ok()?[0], 1).ok()?;
+        let origin = d[0][0];
+        let normal = d[1][0].cross(d[0][1]).normalized().ok()?;
+        let (degree, knots) = if along_v { (surface.degree_v, &surface.knots_v) }
+            else { (surface.degree_u, &surface.knots_u) };
+        let rows = &surface.control_points;
+        let columns = rows.first()?.len();
+        if rows.iter().any(|row| row.len() != columns) || degree == 0 { return None; }
+        let count = if along_v { columns } else { rows.len() };
+        if count < 2 || knots.len() != count + degree + 1 || knots.windows(2).any(|k| k[1] < k[0]) { return None; }
+        let greville: Vec<_> = (0..count).map(|i| knots[i+1..=i+degree].iter().sum::<f64>() / degree as f64).collect();
+        if greville.iter().any(|t| !t.is_finite()) || greville[count-1] <= greville[0] { return None; }
+        let control = |line: usize, index: usize| if along_v { rows[line][index] } else { rows[index][line] };
+        let first = control(0,0).point().ok()?.sub(origin).dot(normal);
+        let last = control(0,count-1).point().ok()?.sub(origin).dot(normal);
+        let slope = (last-first)/(greville[count-1]-greville[0]);
+        if !slope.is_finite() || (last-first).abs() <= tolerance * 100. { return None; }
+        for line in 0..if along_v { rows.len() } else { columns } {
+            let weight = control(line,0).w;
+            if !weight.is_finite() || weight <= 0. { return None; }
+            for (i, t) in greville.iter().enumerate() {
+                let h = control(line,i);
+                if h.w.to_bits() != weight.to_bits() { return None; }
+                let point = h.point().ok()?;
+                let expected = first + slope * (t-greville[0]);
+                let residual = (point.sub(origin).dot(normal)-expected).abs();
+                let round = 128. * f64::EPSILON * (1. + point.length() + origin.length() + expected.abs());
+                if !residual.is_finite() || residual + round > tolerance * 0.01 { return None; }
+            }
+        }
+        Some(())
+    };
+    proof().is_some()
+}
+
+fn planar_linear_iso_direction_section(
+    plane: &NurbsSurface,
+    ruled: &NurbsSurface,
+    tolerance: f64,
+    linear_v: bool,
+    gate: IsoGate,
+) -> Result<IsoAnswer, KernelRefusal> {
+    // Named Count/Geometry answers are reference readings for the gate
+    // census. Only production dispatch opts into the additional proof.
+    planar_linear_iso_direction_section_with(plane, ruled, tolerance, linear_v, gate, false)
+}
+
+/// `BREP_FEATURE_SCALE_PLANAR_ISO` (default on, `=0` off): see UNBOUNDED PLANE in
+/// [`planar_linear_iso_direction_section_with`].
+fn feature_scale_planar_iso_enabled() -> bool {
+    crate::switch!("BREP_FEATURE_SCALE_PLANAR_ISO", true)
+}
+
+/// Whether `curve` meets the BOUNDED patch of `plane` over a span: at least
+/// two of 33 even samples lie within the band of it. A curve that only
+/// touches the patch at a point (a corner, an edge it crosses) has at most
+/// one such sample at this spacing, unless the touch is a 32nd of its length.
+fn runs_through_patch(curve: &NurbsCurve, plane: &NurbsSurface, tolerance: f64) -> Result<bool, KernelRefusal> {
+    const SAMPLES: usize = 32;
+    let band = tolerance.max(1e-7);
+    let [a, b] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let mut inside = 0usize;
+    for i in 0..=SAMPLES {
+        let point = curve.evaluate(a + (b - a) * i as f64 / SAMPLES as f64).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let projection = project_point_to_surface(plane, point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
+        if projection.distance <= band {
+            inside += 1;
+            if inside >= 2 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn planar_linear_iso_direction_section_with(
+    plane: &NurbsSurface, ruled: &NurbsSurface, tolerance: f64,
+    linear_v: bool, gate: IsoGate, projected: bool,
+) -> Result<IsoAnswer, KernelRefusal> {
+    if !plane
+        .is_affine()
+        .or_refuse(KernelStage::Intersect, "is_affine")?
+    {
+        return Ok(IsoAnswer::Declined(IsoOutcome::Gate));
+    }
+    let admitted = match gate {
+        IsoGate::Count => {
+            if linear_v {
+                ruled.degree_v == 1 && ruled.control_points.iter().all(|row| row.len() == 2)
+            } else {
+                ruled.degree_u == 1 && ruled.control_points.len() == 2
+            }
+        }
+        IsoGate::Geometry => rulings_are_straight_and_affine(ruled, linear_v, tolerance).admits(tolerance),
+    };
+    let projected_iso = !admitted && projected
+        && plane_distance_is_affine(plane, ruled, linear_v, tolerance);
+    if !admitted && !projected_iso {
+        return Ok(IsoAnswer::Declined(IsoOutcome::Gate));
+    }
+    let plane_u = KnotVector::new(plane.knots_u.clone(), plane.degree_u)
+        .or_refuse(KernelStage::Intersect, "new")?
+        .domain()[0];
+    let plane_v = KnotVector::new(plane.knots_v.clone(), plane.degree_v)
+        .or_refuse(KernelStage::Intersect, "new")?
+        .domain()[0];
+    let derivatives = plane
+        .derivatives(plane_u, plane_v, 1)
+        .or_refuse(KernelStage::Intersect, "derivatives")?;
+    let origin = derivatives[0][0];
+    let normal = derivatives[1][0]
+        .cross(derivatives[0][1])
+        .normalized()
+        .or_refuse(KernelStage::Intersect, "normalized")?;
+    let signed_distance = |point: Vec3| point.sub(origin).dot(normal);
+    let root_tolerance = (tolerance * 100.0).max(1e-7);
+
+    let u_domain = KnotVector::new(ruled.knots_u.clone(), ruled.degree_u)
+        .or_refuse(KernelStage::Intersect, "new")?
+        .domain();
+    let v_domain = KnotVector::new(ruled.knots_v.clone(), ruled.degree_v)
+        .or_refuse(KernelStage::Intersect, "new")?
+        .domain();
+    let mut roots = Vec::new();
+    for fraction in [0.0, 0.2, 0.5, 0.8, 1.0] {
+        let (first, second) = if linear_v {
+            let u = u_domain[0] + (u_domain[1] - u_domain[0]) * fraction;
+            (
+                ruled
+                    .evaluate(u, v_domain[0])
+                    .or_refuse(KernelStage::Intersect, "evaluate")?,
+                ruled
+                    .evaluate(u, v_domain[1])
+                    .or_refuse(KernelStage::Intersect, "evaluate")?,
+            )
+        } else {
+            let v = v_domain[0] + (v_domain[1] - v_domain[0]) * fraction;
+            (
+                ruled
+                    .evaluate(u_domain[0], v)
+                    .or_refuse(KernelStage::Intersect, "evaluate")?,
+                ruled
+                    .evaluate(u_domain[1], v)
+                    .or_refuse(KernelStage::Intersect, "evaluate")?,
+            )
+        };
+        let first_distance = signed_distance(first);
+        let second_distance = signed_distance(second);
+        let denominator = first_distance - second_distance;
+        if denominator.abs() <= root_tolerance {
+            return Ok(IsoAnswer::Declined(IsoOutcome::Root));
+        }
+        let root = first_distance / denominator;
+        if root < -root_tolerance || root > 1.0 + root_tolerance {
+            return Ok(IsoAnswer::Declined(IsoOutcome::Root));
+        }
+        roots.push(root.clamp(0.0, 1.0));
+    }
+    let root = roots.iter().sum::<f64>() / roots.len() as f64;
+    if roots
+        .iter()
+        .any(|candidate| (candidate - root).abs() > root_tolerance * 10.0)
+    {
+        return Ok(IsoAnswer::Declined(IsoOutcome::RootAgreement));
+    }
+    // The iso parameter, computed once and shared by the curve and its
+    // pcurve on the ruled carrier (`iso_curve_*` clamps it to the domain the
+    // same way `knot_clamp` does; the root is already within it).
+    let fixed = if linear_v {
+        v_domain[0] + (v_domain[1] - v_domain[0]) * root
+    } else {
+        u_domain[0] + (u_domain[1] - u_domain[0]) * root
+    };
+    let curve = if linear_v {
+        ruled
+            .iso_curve_v(fixed)
+            .or_refuse(KernelStage::Intersect, "iso_curve_v")?
+    } else {
+        ruled
+            .iso_curve_u(fixed)
+            .or_refuse(KernelStage::Intersect, "iso_curve_u")?
+    };
+    let anchor = curve
+        .control_points
+        .first()
+        .and_then(|control| control.point().ok());
+    if let Some(anchor) = anchor {
+        let collapsed = curve.control_points.iter().all(|control| {
+            control
+                .point()
+                .map(|point| point.sub(anchor).length() <= tolerance)
+                .unwrap_or(false)
+        });
+        if collapsed {
+            return Ok(IsoAnswer::Declined(IsoOutcome::Pole));
+        }
+    }
+    // UNBOUNDED PLANE (`BREP_FEATURE_SCALE_PLANAR_ISO`, default on, `=0` off): the
+    // patch reading projects onto the plane's BOUNDED carrier, so an iso line
+    // longer than that patch reads off it at its ends however exactly it lies
+    // in the plane (brep-bench tangent/wedge-a-millionth-steep: the half-space
+    // block's 40-wide face crosses the cube's 10-wide top along the x axis at
+    // a slope of 1e-6; the reverse order's ±5e-6 lean is inside the root band,
+    // and the march's seeds on the top's edges graze, so the pair had no
+    // section). The plane is affine, so its unbounded plane is exact, and a
+    // curve whose whole control hull lies within the band of it lies on it.
+    // The bounded reading also kept out a line that only touches the patch:
+    // two boxes meeting along an edge cross one's bottom with the other's
+    // side along a line that meets that side at its corner alone, which is a
+    // point contact, not a section. So the unbounded reading also asks the
+    // line to run through the bounded patch over a span (see
+    // `runs_through_patch`).
+    let on_plane = curve_lies_on_surface(&curve, plane, tolerance)?
+        || (feature_scale_planar_iso_enabled()
+            && curve.control_points.iter().all(|control| {
+                control.point().is_ok_and(|point| signed_distance(point).abs() <= tolerance.max(1e-7))
+            })
+            && runs_through_patch(&curve, plane, tolerance)?);
+    if !on_plane {
+        return Ok(IsoAnswer::Declined(IsoOutcome::OffPlane));
+    }
+    // An iso-curve in `u` (`iso_curve_v`, `v` fixed) runs along the ruled
+    // carrier's `u`; one in `v` runs along its `v`.
+    let on_ruled = iso_line_pcurve(&curve, fixed, linear_v).ok();
+    let on_plane = crate::fit_pcurve_on_surface(plane, &curve).ok().map(|fit| fit.curve);
+    Ok(IsoAnswer::Curve { curve, on_plane, on_ruled })
+}
+
+/// [`planar_iso_intersection`] under a named gate — what the census asks of
+/// the gate the boolean does NOT run.
+pub(super) fn planar_iso_intersection_with(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+    gate: IsoGate,
+) -> Result<Option<NurbsCurve>, KernelRefusal> {
+    for (plane, ruled) in [(first, second), (second, first)] {
+        for linear_v in [true, false] {
+            if let IsoOutcome::Curve(curve) =
+                planar_linear_iso_direction(plane, ruled, tolerance, linear_v, gate)?
+            {
+                return Ok(Some(curve));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// CENSUS ONLY (`BREP_FIT_CENSUS=1`, observation, no behaviour change): one
+/// line per direction on which the two iso gates answer differently, with the
+/// geometry each was shown and the check that declined each.
+pub(super) fn report_iso_gate_census(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+) -> Result<(), KernelRefusal> {
+    for (plane, ruled) in [(first, second), (second, first)] {
+        if !plane
+            .is_affine()
+            .or_refuse(KernelStage::Intersect, "is_affine")?
+        {
+            continue;
+        }
+        for linear_v in [true, false] {
+            let count = planar_linear_iso_direction(plane, ruled, tolerance, linear_v, IsoGate::Count)?;
+            let geometry =
+                planar_linear_iso_direction(plane, ruled, tolerance, linear_v, IsoGate::Geometry)?;
+            if matches!((&count, &geometry), (IsoOutcome::Gate, IsoOutcome::Gate)) {
+                continue;
+            }
+            let same = match (&count, &geometry) {
+                (IsoOutcome::Curve(a), IsoOutcome::Curve(b)) => curves_bitwise_equal(a, b),
+                (a, b) => a.label() == b.label(),
+            };
+            if same {
+                continue;
+            }
+            let measure = rulings_are_straight_and_affine(ruled, linear_v, tolerance);
+            let (rows, columns) = (
+                ruled.control_points.len(),
+                ruled.control_points.first().map(|row| row.len()).unwrap_or(0),
+            );
+            eprintln!(
+                "FITCENSUS iso_gate linear_v={linear_v} degree={} net={rows}x{columns} count={} \
+                 collinearity={:.3e} straight={} affine_gap={:.3e} weight_gap={:.3e} \
+                 count_gate={} geometry_gate={} thread={}",
+                if linear_v { ruled.degree_v } else { ruled.degree_u },
+                if linear_v { columns } else { rows },
+                control_collinearity(ruled, linear_v),
+                measure.straight,
+                measure.affine_gap,
+                measure.weight_gap,
+                count.label(),
+                geometry.label(),
+                std::thread::current().name().unwrap_or("unnamed").replace(' ', "_"),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The same curve to the bit: degree, knots and every homogeneous coordinate.
+pub fn curves_bitwise_equal(a: &NurbsCurve, b: &NurbsCurve) -> bool {
+    a.degree == b.degree
+        && a.knots.len() == b.knots.len()
+        && a.knots.iter().zip(&b.knots).all(|(x, y)| x.to_bits() == y.to_bits())
+        && a.control_points.len() == b.control_points.len()
+        && a.control_points.iter().zip(&b.control_points).all(|(p, q)| {
+            [p.x, p.y, p.z, p.w]
+                .iter()
+                .zip([q.x, q.y, q.z, q.w])
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+        })
+}
+
+/// Largest distance of an interior control point from the straight line through
+/// its row's (or column's) ends — how far a direction is from straight, read
+/// off the control points alone. Census helper; see
+/// [`report_iso_gate_census`].
+fn control_collinearity(ruled: &NurbsSurface, linear_v: bool) -> f64 {
+    let rows = &ruled.control_points;
+    let mut worst = 0.0_f64;
+    let lines: Vec<Vec<Vec3>> = if linear_v {
+        rows.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|point| point.point().unwrap_or_default())
+                    .collect()
+            })
+            .collect()
+    } else {
+        (0..rows.first().map(|row| row.len()).unwrap_or(0))
+            .map(|column| {
+                rows.iter()
+                    .map(|row| row[column].point().unwrap_or_default())
+                    .collect()
+            })
+            .collect()
+    };
+    for line in lines {
+        if line.len() < 3 {
+            continue;
+        }
+        let (first, last) = (line[0], line[line.len() - 1]);
+        let direction = last.sub(first);
+        let length_squared = direction.length_squared();
+        for point in &line[1..line.len() - 1] {
+            let distance = if length_squared <= 0.0 {
+                point.sub(first).length()
+            } else {
+                let fraction =
+                    (point.sub(first).dot(direction) / length_squared).clamp(0.0, 1.0);
+                point.sub(first.add(direction.scale(fraction))).length()
+            };
+            worst = worst.max(distance);
+        }
+    }
+    worst
+}
+
+pub(super) fn planar_iso_intersection(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+) -> Result<Option<NurbsCurve>, KernelRefusal> {
+    Ok(planar_iso_section(first, second, tolerance)?.map(|section| section.curve))
+}
+
+/// A planar-iso section with its two EXACT pcurves (2026-10-11, the
+/// catalogue's P3 for the exact lanes). The curve is the one
+/// [`planar_iso_intersection`] returns, to the bit: the same gate, root,
+/// agreement and on-plane checks decide it, the pcurves are read off the
+/// construction afterwards.
+///
+/// On the ruled carrier the section IS an iso-curve, so its pcurve is the
+/// straight line at the iso parameter traced at unit speed in the curve's own
+/// parameter: control points at the Greville abscissae of the curve's knots
+/// with unit weights, which a B-spline reproduces exactly (`Σ N_k(t)·ξ_k = t`).
+/// On the plane the pcurve is the affine inverse image of the curve's control
+/// net (`fit_pcurve_on_surface`'s affine arm, which maps the net and keeps the
+/// weights; no fit is recorded). Both share the curve's degree and knots, so
+/// the builder splits them with the curve and the junction pass moves their
+/// ends instead of re-marching them, as it does for a Hermite-emitted pcurve.
+pub(super) struct IsoSection {
+    pub(super) curve: NurbsCurve,
+    /// The pcurves on `first` and on `second`, in that order; `None` when
+    /// either could not be built (an affine plane whose inverse is not
+    /// determined), which leaves the fit lane to say so as it always has.
+    pub(super) pcurves: Option<[NurbsCurve; 2]>,
+}
+
+/// `BREP_IMPRINT_PLANE_POINT_SKIP` (lane X row 5): two exact parallelogram
+/// carriers on clearly non-parallel planes whose contact is ONE point. Each
+/// parallelogram is cut by the other's plane (a corner within `band` of that
+/// plane counts as on it, so a near-touching edge is contact, never a miss);
+/// both cuts lie on the planes' common line, and when both are non-empty and
+/// overlap there in no more than rounding (1e-12 of the extent) the faces,
+/// which lie inside their carriers, meet at most at that point: no section
+/// curve exists for the march to find. `None` when either carrier is not an
+/// exact parallelogram or the planes are near parallel.
+pub fn planar_point_contact(first: &NurbsSurface, second: &NurbsSurface, band: f64) -> Option<bool> {
+    let corners = |surface: &NurbsSurface| -> Option<[Vec3; 4]> {
+        if surface.degree_u != 1 || surface.degree_v != 1 || surface.control_points.len() != 2
+            || surface.control_points.iter().any(|row| row.len() != 2)
+        {
+            return None;
+        }
+        let w = surface.control_points[0][0].w;
+        if surface.control_points.iter().flatten().any(|control| control.w != w) {
+            return None;
+        }
+        let p00 = surface.control_points[0][0].point().ok()?;
+        let p01 = surface.control_points[0][1].point().ok()?;
+        let p10 = surface.control_points[1][0].point().ok()?;
+        let p11 = surface.control_points[1][1].point().ok()?;
+        let defect = p11.sub(p10).sub(p01.sub(p00));
+        if defect.x != 0.0 || defect.y != 0.0 || defect.z != 0.0 {
+            return None;
+        }
+        Some([p00, p10, p11, p01])
+    };
+    let a = corners(first)?;
+    let b = corners(second)?;
+    let normal = |c: &[Vec3; 4]| c[1].sub(c[0]).cross(c[3].sub(c[0]));
+    let (na, nb) = (normal(&a), normal(&b));
+    let (la, lb) = (na.length(), nb.length());
+    if la == 0.0 || lb == 0.0 {
+        return None;
+    }
+    let line = na.cross(nb);
+    if line.length() <= 1e-6 * la * lb {
+        return None;
+    }
+    let line = line.scale(1.0 / line.length());
+    let extent = a.iter().chain(b.iter()).map(|p| p.sub(a[0]).length()).fold(0.0, f64::max).max(1.0);
+    // The interval along `line` where polygon `c` meets the plane through
+    // `origin` with unit normal `n`.
+    let cut = |c: &[Vec3; 4], origin: Vec3, n: Vec3| -> Option<[f64; 2]> {
+        let d: Vec<f64> = c.iter().map(|p| n.dot(p.sub(origin))).collect();
+        let mut low = f64::INFINITY;
+        let mut high = f64::NEG_INFINITY;
+        let mut take = |p: Vec3| {
+            let t = line.dot(p);
+            low = low.min(t);
+            high = high.max(t);
+        };
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            if d[i].abs() <= band {
+                take(c[i]);
+            }
+            if (d[i] > band && d[j] < -band) || (d[i] < -band && d[j] > band) {
+                take(c[i].add(c[j].sub(c[i]).scale(d[i] / (d[i] - d[j]))));
+            }
+        }
+        (low <= high).then_some([low, high])
+    };
+    let on_b = cut(&a, b[0], nb.scale(1.0 / lb))?;
+    let on_a = cut(&b, a[0], na.scale(1.0 / la))?;
+    let overlap = on_b[1].min(on_a[1]) - on_b[0].max(on_a[0]);
+    Some(overlap.abs() <= 1e-12 * extent)
+}
+
+pub(super) fn planar_iso_section(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+) -> Result<Option<IsoSection>, KernelRefusal> {
+    // Promoted after the whole ON kernel/manifest/HLR and body-byte census.
+    // Explicit 0/off retains the pre-promotion production dispatch.
+    let projected = match std::env::var("BREP_NURBS_PLANE_ISO") {
+        Ok(value) => value == "1" || value == "on",
+        Err(std::env::VarError::NotPresent) => true,
+        Err(_) => false,
+    };
+    for (plane, ruled, plane_first) in [(first, second, true), (second, first, false)] {
+        for linear_v in [true, false] {
+            if let IsoAnswer::Curve { curve, on_plane, on_ruled } =
+                planar_linear_iso_direction_section_with(plane, ruled, tolerance, linear_v, iso_gate(), projected)?
+            {
+                let pcurves = match (on_plane, on_ruled) {
+                    (Some(on_plane), Some(on_ruled)) if plane_first => Some([on_plane, on_ruled]),
+                    (Some(on_plane), Some(on_ruled)) => Some([on_ruled, on_plane]),
+                    _ => None,
+                };
+                return Ok(Some(IsoSection { curve, pcurves }));
+            }
+        }
+    }
+    if plane_pair_section_enabled() {
+        return plane_pair_section(first, second, tolerance);
+    }
+    Ok(None)
+}
+
+/// PLANE PAIR SECTION (`BREP_PLANE_PAIR_SECTION`, default on, `=0` off). Two affine
+/// planar patches that cross meet in a straight line. The iso readings above
+/// take that line only where it is an iso-line of one patch (an axis-aligned
+/// box against another); any other crossing went to the marcher, which for two
+/// planes a small angle apart traces a curve that stays within the band of
+/// both planes but wanders along them: a cube against a copy turned 0.1 deg
+/// about a skew axis gave a cubic section whose middle stood 0.62 off the
+/// chord of its ends, 1.2e-3 off its own face, and a solid whose measure was
+/// 2.3e-5 out though its vertices were exact.
+///
+/// The line is computed from the first patch's origin, `p = o1 + c (d x n1) /
+/// |d|^2` with `d = n1 x n2` and `c` the second plane's offset from `o1`, so
+/// no term cancels as the planes approach parallel; it is clipped to both
+/// patches' parameter squares, and its pcurves are the straight images of the
+/// segment in each patch's own parameters, on the curve's parameter. A pair
+/// crossing at under 1e-5 rad, a segment that does not run through the
+/// interior of both patches, or one no longer than the tolerance, is left to
+/// the paths below.
+pub fn plane_pair_section_enabled() -> bool {
+    crate::switch!("BREP_PLANE_PAIR_SECTION", true)
+}
+
+/// An affine patch `S(u, v) = o + a (u - u0) / (u1 - u0) + b (v - v0) / (v1 - v0)`.
+struct AffinePatch {
+    origin: Vec3,
+    a: Vec3,
+    b: Vec3,
+    normal: Vec3,
+    u: [f64; 2],
+    v: [f64; 2],
+}
+
+impl AffinePatch {
+    fn read(surface: &NurbsSurface) -> Option<Self> {
+        if !surface.is_affine().ok()? {
+            return None;
+        }
+        let u = surface.domain_u().ok()?;
+        let v = surface.domain_v().ok()?;
+        let origin = surface.control_points[0][0].point().ok()?;
+        let a = surface.control_points[1][0].point().ok()?.sub(origin);
+        let b = surface.control_points[0][1].point().ok()?.sub(origin);
+        let normal = a.cross(b).normalized().ok()?;
+        Some(Self { origin, a, b, normal, u, v })
+    }
+
+    /// The unit-square coordinates `(s, t)` of a point in the patch's plane.
+    fn square(&self, point: Vec3) -> (f64, f64) {
+        let r = point.sub(self.origin);
+        let (aa, ab, bb) = (self.a.dot(self.a), self.a.dot(self.b), self.b.dot(self.b));
+        let (ra, rb) = (r.dot(self.a), r.dot(self.b));
+        let det = aa * bb - ab * ab;
+        ((ra * bb - rb * ab) / det, (rb * aa - ra * ab) / det)
+    }
+
+    /// The interval of `p0 + x d` (x in the line's own parameter) inside the
+    /// patch's square, or `None` when the line misses it.
+    fn clip(&self, p0: Vec3, d: Vec3, interval: [f64; 2]) -> Option<[f64; 2]> {
+        let (s0, t0) = self.square(p0);
+        let (s1, t1) = self.square(p0.add(d));
+        let (ds, dt) = (s1 - s0, t1 - t0);
+        let mut range = interval;
+        for (start, rate) in [(s0, ds), (t0, dt)] {
+            if rate.abs() <= 1e-300 {
+                if !(0.0..=1.0).contains(&start) {
+                    return None;
+                }
+                continue;
+            }
+            let (x0, x1) = ((0.0 - start) / rate, (1.0 - start) / rate);
+            range[0] = range[0].max(x0.min(x1));
+            range[1] = range[1].min(x0.max(x1));
+        }
+        (range[0] < range[1]).then_some(range)
+    }
+
+    /// The straight pcurve in this patch's parameters of the segment from
+    /// `start` to `end`, on the parameter `[0, 1]`.
+    fn pcurve(&self, start: Vec3, end: Vec3) -> Option<NurbsCurve> {
+        let uv = |point: Vec3| {
+            let (s, t) = self.square(point);
+            Vec4 { x: self.u[0] + s * (self.u[1] - self.u[0]), y: self.v[0] + t * (self.v[1] - self.v[0]), z: 0.0, w: 1.0 }
+        };
+        NurbsCurve::new(1, vec![0.0, 0.0, 1.0, 1.0], vec![uv(start), uv(end)]).ok()
+    }
+}
+
+fn plane_pair_section(first: &NurbsSurface, second: &NurbsSurface, tolerance: f64) -> Result<Option<IsoSection>, KernelRefusal> {
+    let (Some(one), Some(two)) = (AffinePatch::read(first), AffinePatch::read(second)) else {
+        return Ok(None);
+    };
+    let d = one.normal.cross(two.normal);
+    let sine = d.length();
+    // Planes crossing at under 1e-5 rad stay with the feature-scale planar
+    // iso and grazing-crossing lanes, which own that regime (brep-bench
+    // tangent/wedge-a-millionth-steep crosses at 1e-6) and the parallel band.
+    if sine <= 1e-5 {
+        return Ok(None);
+    }
+    let offset = two.origin.sub(one.origin).dot(two.normal);
+    let p0 = one.origin.add(d.cross(one.normal).scale(offset / (sine * sine)));
+    let direction = d.scale(1.0 / sine);
+    let reach = one.a.length() + one.b.length() + two.a.length() + two.b.length() + p0.sub(one.origin).length() + p0.sub(two.origin).length();
+    let Some(range) = one.clip(p0, direction, [-reach, reach]).and_then(|range| two.clip(p0, direction, range)) else {
+        return Ok(None);
+    };
+    if range[1] - range[0] <= tolerance.max(1e-12) {
+        return Ok(None);
+    }
+    let start = p0.add(direction.scale(range[0]));
+    let end = p0.add(direction.scale(range[1]));
+    // A line that runs along a patch's boundary (two boxes meeting along an
+    // edge) or only touches a patch at a corner is a contact the iso readings
+    // and the boundary exchange already decline or own: the section must run
+    // through the interior of both patches.
+    let middle = start.add(end).scale(0.5);
+    let inside = |patch: &AffinePatch| {
+        let (s, t) = patch.square(middle);
+        let margin = 1e-9;
+        s > margin && s < 1.0 - margin && t > margin && t < 1.0 - margin
+    };
+    if !inside(&one) || !inside(&two) {
+        return Ok(None);
+    }
+    let curve = NurbsCurve::new(1, vec![0.0, 0.0, 1.0, 1.0], vec![
+        Vec4 { x: start.x, y: start.y, z: start.z, w: 1.0 },
+        Vec4 { x: end.x, y: end.y, z: end.z, w: 1.0 },
+    ])
+    .or_refuse(KernelStage::Intersect, "plane pair line")?;
+    let pcurves = match (one.pcurve(start, end), two.pcurve(start, end)) {
+        (Some(on_first), Some(on_second)) => Some([on_first, on_second]),
+        _ => None,
+    };
+    Ok(Some(IsoSection { curve, pcurves }))
+}
+
+/// The straight pcurve of an iso-curve on its own carrier, on the curve's
+/// knots: `(ξ_k, fixed)` for an iso-curve in `u` at `v = fixed`, `(fixed, ξ_k)`
+/// for one in `v` at `u = fixed`.
+fn iso_line_pcurve(curve: &NurbsCurve, fixed: f64, along_u: bool) -> Result<NurbsCurve, String> {
+    let degree = curve.degree;
+    let count = curve.control_points.len();
+    if degree == 0 || curve.knots.len() != count + degree + 1 {
+        return Err("iso_line_pcurve: the curve's knots do not match its net".into());
+    }
+    let controls = (0..count)
+        .map(|index| {
+            let greville = curve.knots[index + 1..=index + degree].iter().sum::<f64>() / degree as f64;
+            let (x, y) = if along_u { (greville, fixed) } else { (fixed, greville) };
+            Vec4 { x, y, z: 0.0, w: 1.0 }
+        })
+        .collect();
+    NurbsCurve::new(degree, curve.knots.clone(), controls)
+}
+
+fn coplanar_pair(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    if first.degree_u != 1 || first.degree_v != 1 || second.degree_u != 1 || second.degree_v != 1 {
+        return Ok(false);
+    }
+    let first_u = KnotVector::new(first.knots_u.clone(), first.degree_u)
+        .or_refuse(KernelStage::Intersect, "new")?
+        .domain()[0];
+    let first_v = KnotVector::new(first.knots_v.clone(), first.degree_v)
+        .or_refuse(KernelStage::Intersect, "new")?
+        .domain()[0];
+    let second_u = KnotVector::new(second.knots_u.clone(), second.degree_u)
+        .or_refuse(KernelStage::Intersect, "new")?
+        .domain()[0];
+    let second_v = KnotVector::new(second.knots_v.clone(), second.degree_v)
+        .or_refuse(KernelStage::Intersect, "new")?
+        .domain()[0];
+    let a = first
+        .derivatives(first_u, first_v, 1)
+        .or_refuse(KernelStage::Intersect, "derivatives")?;
+    let b = second
+        .derivatives(second_u, second_v, 1)
+        .or_refuse(KernelStage::Intersect, "derivatives")?;
+    let normal_a = a[1][0]
+        .cross(a[0][1])
+        .normalized()
+        .or_refuse(KernelStage::Intersect, "normalized")?;
+    let normal_b = b[1][0]
+        .cross(b[0][1])
+        .normalized()
+        .or_refuse(KernelStage::Intersect, "normalized")?;
+    let band = (tolerance * 10.0).max(COINCIDENCE_DISTANCE_FLOOR);
+    // Planes 4.5e-5 rad apart pass the angular gate; a pair that crosses
+    // inside the patches is two planes however near the origins stand
+    // (`crate::pair_classification::planar_patches_straddle`).
+    if normal_a.dot(normal_b).abs() >= 1.0 - 1e-9
+        && crate::pair_classification::plane_pair_straddle_enabled()
+        && crate::pair_classification::planar_patches_straddle(
+            first, a[0][0], normal_a, second, b[0][0], normal_b, band,
+        )
+    {
+        return Ok(false);
+    }
+    Ok(normal_a.dot(normal_b).abs() >= 1.0 - 1e-9
+        && b[0][0].sub(a[0][0]).dot(normal_a).abs() <= band)
+}
+
+pub(super) fn cosurface_pair(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    let first_planar = first.degree_u == 1 && first.degree_v == 1;
+    let second_planar = second.degree_u == 1 && second.degree_v == 1;
+    if first_planar && second_planar {
+        return coplanar_pair(first, second, tolerance);
+    }
+    if first_planar != second_planar {
+        return Ok(false);
+    }
+    let bounds_a = Aabb::from_surface_controls(first)
+        .or_refuse(KernelStage::Intersect, "from_surface_controls")?;
+    let bounds_b = Aabb::from_surface_controls(second)
+        .or_refuse(KernelStage::Intersect, "from_surface_controls")?;
+    if !bounds_a.intersects(bounds_b, tolerance * 10.0) {
+        return Ok(false);
+    }
+    let scale = bounds_a.diagonal().max(bounds_b.diagonal());
+    let probe = bounds_b.expanded(scale * 0.01);
+    let u_domain = KnotVector::new(first.knots_u.clone(), first.degree_u)
+        .or_refuse(KernelStage::Intersect, "new")?
+        .domain();
+    let v_domain = KnotVector::new(first.knots_v.clone(), first.degree_v)
+        .or_refuse(KernelStage::Intersect, "new")?
+        .domain();
+    let mut samples = Vec::new();
+    for fu in [0.13, 0.37, 0.61, 0.89] {
+        for fv in [0.17, 0.43, 0.71, 0.93] {
+            let u = u_domain[0] + (u_domain[1] - u_domain[0]) * fu;
+            let v = v_domain[0] + (v_domain[1] - v_domain[0]) * fv;
+            let point = first
+                .evaluate(u, v)
+                .or_refuse(KernelStage::Intersect, "evaluate")?;
+            if probe.contains(point) {
+                samples.push((point, u, v));
+            }
+        }
+    }
+    if samples.len() < 3 {
+        return Ok(false);
+    }
+    for (point, u, v) in samples {
+        let projection = project_point_to_surface(second, point)
+            .or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
+        if projection.distance > (tolerance * 100.0).max(COINCIDENCE_DISTANCE_FLOOR) {
+            return Ok(false);
+        }
+        if let (Ok(normal_a), Ok(normal_b)) = (
+            first.normal(u, v),
+            second.normal(projection.u, projection.v),
+        ) {
+            if normal_a.dot(normal_b).abs() < 1.0 - 1e-6 {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+
+
+

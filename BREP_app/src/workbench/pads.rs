@@ -43,6 +43,8 @@ static BUTTONS: &[WorkbenchButton] = &[
     ecad_button!("pads.tool.line", "\u{E06E}", "Line", "Home/Pads/Line", toggle),
     ecad_button!("pads.tool.rectangle", "\u{2610}", "Rectangle", "Home/Pads/Rectangle", toggle),
     ecad_button!("pads.tool.circle", "\u{25EF}", "Circle", "Home/Pads/Circle", toggle),
+    ecad_button!("pads.tool.arc", "\u{25E0}", "Arc", "Home/Pads/Arc", toggle),
+    ecad_button!("pads.tool.text", "\u{E089}", "Text", "Home/Pads/Text", toggle),
     WorkbenchButton {
         id: GRID_MENU_ID,
         glyph: "\u{E08D}",

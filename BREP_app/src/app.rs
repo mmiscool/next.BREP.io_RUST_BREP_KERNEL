@@ -537,7 +537,7 @@ impl BrepApp {
                 Err(e) => self.refuse_command_line_path(format!("import failed: cannot read {name}: {e}")),
             },
             CommandLineLane::Refuse => self.refuse_command_line_path(format!(
-                "cannot open {name}: not a BREP document (.nbrep, .fbrep, .tbrep) or a file BREP imports (STEP, IGES, STL, 3MF, OBJ, KiCad)"
+                "cannot open {name}: not a BREP document (.nbrep, .fbrep, .tbrep) or a file BREP imports (STEP, IGES, Parasolid, STL, 3MF, OBJ, KiCad)"
             )),
         }
     }
@@ -1562,6 +1562,7 @@ impl BrepApp {
             "__brepBusy" => self.busy.state_json(),
             "__brepExpr" => serde_json::json!({
                 "expressions": engine.expressions_json(),
+                "editor": self.expressions.editor_text(),
                 "variables": serde_json::from_str::<serde_json::Value>(&engine.expression_variables_json())
                     .unwrap_or(serde_json::Value::Null),
                 "configurator": serde_json::from_str::<serde_json::Value>(&engine.configurator_json())

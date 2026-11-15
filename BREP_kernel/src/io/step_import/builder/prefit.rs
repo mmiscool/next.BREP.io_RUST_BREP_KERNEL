@@ -1,4 +1,4 @@
-//! `BREP_STEP_PREFIT` (default off; `1` on, `check` compares): the projection
+//! `BREP_STEP_PREFIT` (default on; `0` off, `check` compares): the projection
 //! fits of a large body's coedges, run on idle threads ahead of the face loop.
 //!
 //! A body's faces are finished one after another on the thread that builds the
@@ -33,7 +33,7 @@ const MIN_FACES: usize = 64;
 fn prefit_mode() -> crate::env_read::Mode {
     #[cfg(not(test))]
     {
-        crate::mode_switch!("BREP_STEP_PREFIT", false)
+        crate::mode_switch!("BREP_STEP_PREFIT", true)
     }
 }
 
@@ -98,7 +98,10 @@ impl<'a> SolidBuilder<'a> {
     /// the `parallel` feature).
     pub(super) fn spawn_prefits(&self, pending: &[PendingFace]) -> Result<Option<Prefits>, String> {
         let mode = prefit_mode();
-        if mode == crate::env_read::Mode::Off || pending.len() < MIN_FACES {
+        if mode == crate::env_read::Mode::Off
+            || pending.len() < MIN_FACES
+            || !crate::claim_slots::helpers_available()
+        {
             return Ok(None);
         }
         // A memo already open on this thread could answer the loop's fits

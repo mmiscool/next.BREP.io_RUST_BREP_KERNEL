@@ -53,291 +53,112 @@
 //! The crate README lists the capabilities in detail.
 
 
-use serde::{Deserialize, Serialize};
-use wasm_bindgen::prelude::*;
+#[macro_use]
+extern crate brep_solvers;
+#[allow(unused_imports)]
+use brep_solvers::*;
 
-/// One environment variable read through its call site's once-cell
-/// ([`env_read::read`], lane O row 19): `std::env::var(name).ok()` as an
-/// `Option<Cow<str>>`, kept for the process when `BREP_ENV_READ_ONCE` is on.
-/// Only for variables nothing sets at run time.
-macro_rules! env_read {
-    ($name:literal) => {{
-        static CELL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-        $crate::env_read::read($name, &CELL)
-    }};
-}
-/// One on/off switch (consolidation S1): `switch!("BREP_X", default)` reads
-/// `BREP_X` through its call site's once-cell ([`env_read::switch`], kept for
-/// the process while `BREP_ENV_READ_ONCE` is on); `switch!(live "BREP_X",
-/// default)` reads it on every call, for a variable a probe sets at run time.
-/// One grammar (owner decision 2026-11-01): `0|off|false` off, `1|on|true`
-/// on, unset or anything else the default. In the kernel's tests one keyed
-/// override (`env_read::with_switch_for_test`) forces either form.
-#[macro_export]
-macro_rules! switch {
-    (live $name:expr, $default:expr) => {
-        $crate::env_read::switch_live($name, $default, $crate::env_read::Grammar::Switch)
-    };
-    ($name:expr, $default:expr) => {{
-        static CELL: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-        $crate::env_read::switch($name, &CELL, $default, $crate::env_read::Grammar::Switch)
-    }};
-}
-
-/// One debug, trace or `BREP_NO_*` flag (consolidation S1): on when its
-/// variable is set to anything but `0`, `off` or `false`.
-/// `debug_flag!(live "BREP_X")` reads it on every call.
-#[macro_export]
-macro_rules! debug_flag {
-    (live $name:expr) => {
-        $crate::env_read::switch_live($name, false, $crate::env_read::Grammar::Flag)
-    };
-    ($name:expr) => {{
-        static CELL: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-        $crate::env_read::switch($name, &CELL, false, $crate::env_read::Grammar::Flag)
-    }};
-}
-
-/// One `0|off / check / on` mode (consolidation X1): an
-/// [`env_read::Mode`]; unset, `On` when `default_on` and `Off` otherwise.
-/// `mode_switch!(live "BREP_X", default_on)` reads it on every call.
-#[macro_export]
-macro_rules! mode_switch {
-    (live $name:expr, $default_on:expr) => {
-        $crate::env_read::mode_live($name, $default_on)
-    };
-    ($name:expr, $default_on:expr) => {{
-        static CELL: std::sync::OnceLock<Option<$crate::env_read::Mode>> = std::sync::OnceLock::new();
-        $crate::env_read::mode($name, &CELL, $default_on)
-    }};
-}
-
-/// `eprintln!` for a `BREP_PROFILE` line: buffered while a
-/// [`profile::ProfileSink`] is open (consolidation I8).
-macro_rules! profile_line {
-    ($($arg:tt)*) => { $crate::profile::profile_emit(format_args!($($arg)*)) };
-}
-
-// The wasm global allocator, when the `wasm-talc` feature asks for it.
-#[cfg(all(feature = "wasm-talc", target_family = "wasm", not(target_feature = "atomics")))]
-#[global_allocator]
-static TALC: talc::wasm::WasmDynamicTalc = talc::wasm::new_wasm_dynamic_allocator();
-
-// The native global allocator, when the `native-rusty-alloc` feature asks for it.
-#[cfg(all(feature = "native-rusty-alloc", not(target_family = "wasm")))]
-#[cfg(not(feature = "profile-wall"))]
-#[global_allocator]
-static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
-
-#[cfg(all(feature = "native-rusty-alloc", not(target_family = "wasm"), feature = "profile-wall"))]
-#[global_allocator]
-static RUSTY_ALLOC: wall_profile::Allocator<rusty_alloc_api::RustyAlloc> = wall_profile::Allocator(rusty_alloc_api::RustyAlloc);
-
-mod profile;
-mod claim_slots;
-#[cfg(feature = "profile-wall")]
-mod wall_profile;
-#[cfg(not(feature = "profile-wall"))]
-#[path = "wall_profile_off.rs"]
-mod wall_profile;
-#[cfg(feature = "profile-wall")]
-mod reader_profile;
-#[cfg(not(feature = "profile-wall"))]
-#[path = "reader_profile_off.rs"]
-mod reader_profile;
+// The public root API of the kernel, from the crates below.
+pub use brep_solvers::sketch_solver::{
+    is_sketch_origin_point_id, sketch_id_key, mint_sketch_id, solve_sketch, solve_sketch_from_json,
+    SketchSolverSettings, SolveSketchRequest, SKETCH_ORIGIN_POINT_ID,
+};
+pub use brep_solvers::assembly_solver::{
+    solve_assembly, AssemblyBody, AssemblyMate, AssemblySolution, AssemblySolveOptions, BodyFreedom, BodyPose,
+    LinearAlgebra, MateAlign, MateAxis, MateCurve, MateKind, MatePlane, MateResidualReport,
+    SolveStrategy, SymmetricElement,
+};
+pub use brep_solvers::sketch3d_solver::{
+    sketch3d_constraint_type, solve_sketch3d, solve_sketch3d_doc, solve_sketch3d_from_json,
+    Sketch3dConstraint, Sketch3dConstraintType, Sketch3dDiagnostics, Sketch3dDoc,
+    Sketch3dGeometry, Sketch3dPoint, Sketch3dSolveOptions, SolveSketch3dRequest,
+    SKETCH3D_CONSTRAINT_TYPES,
+};
+pub use brep_solvers::assembly_resolve::{
+    is_component_reference, resolve_component_point, resolve_edge_selection,
+    resolve_face_selection, resolve_named_selection, resolve_vertex_selection,
+    split_component_namespace, ResolveError, SelectionGeometry,
+};
 
 
-/// Switch reading for the kernel's dependants ([`switch!`],
-/// [`debug_flag!`], [`mode_switch!`]); not a stable interface.
-#[doc(hidden)]
-pub mod env_read;
+#[macro_use]
+extern crate brep_surface_offset;
+#[allow(unused_imports)]
+use brep_surface_offset::*;
+#[macro_use]
+extern crate brep_boolean;
+#[allow(unused_imports)]
+use brep_boolean::*;
+#[macro_use]
+extern crate brep_construction;
+#[allow(unused_imports)]
+use brep_construction::*;
+#[macro_use]
+extern crate brep_blend;
+#[allow(unused_imports)]
+use brep_blend::*;
+#[macro_use]
+extern crate brep_offset;
+#[allow(unused_imports)]
+use brep_offset::*;
+#[macro_use]
+extern crate brep_direct_edit;
+#[allow(unused_imports)]
+use brep_direct_edit::*;
 
-/// The wasm panic hook every `#[wasm_bindgen]` entry point installs. Replaces
-/// the `console_error_panic_hook` crate for the whole BREP family — reached as
-/// `brep_kernel::panic_hook` and, through the render engine's re-export, as
-/// `brep_render::brep_kernel::panic_hook`.
-pub mod panic_hook;
-
-/// Plain-text formats shared by the CAD app and the PLM server
-/// (`text::delimited`: CSV and tab-separated text).
-pub mod text;
-
-#[path = "geometry/tolerance.rs"]
-mod tolerance;
-pub use tolerance::{
-    curve_model_scale, model_scale, report_scale_migration, solid_model_scale, solid_scale,
-    offset_construction_band, vertex_tolerance_from_edges, KernelTolerances,
-    MeasuredTolerance, OFFSET_CONSTRUCTION_FLOOR, OFFSET_CONSTRUCTION_REL,
-    VERTEX_MATCH_FLOOR, VOLUME_DRIFT_ABS, VOLUME_DRIFT_REL,
+// The public root API of the kernel, from the crates below.
+pub use brep_surface_offset::offset::{
+    offset_face_carrier, offset_face_carrier_measured, offset_face_carrier_sided, offset_surface,
+    offset_surface_measured, offset_surface_measured_sided, CarrierDeviation, CarrierExtension,
+    MeasuredOffsetSurface, OffsetFaceCarrier, OffsetSurfaceLane,
 };
-// Per-entity measured tolerances: the lazy, capped band an individual edge or
-// vertex earns from its own redundant representations, on top of the global
-// policy above. Measurement only — no record field, no serialization; see the
-// module doc for invariants I1/I2.
-#[path = "geometry/entity_tolerance.rs"]
-mod entity_tolerance;
-pub use entity_tolerance::{EntityTolerances, EDGE_CAP_FRACTION, VERTEX_CAP_FRACTION};
-#[path = "props/diagnostics.rs"]
-mod diagnostics;
-pub use diagnostics::{
-    Approximation, ApproximationBudget, Backing, BudgetMechanism, BudgetReason, MeasuredComponent, DiagnosticEvent, DiagnosticSeverity, EdgeOrigin, KernelDiagnostics,
-    KernelOutcome, KernelRefusal, OffCarrierEdge,
-    KernelStage, OrRefuse, RefusalClass, SoundnessDefect, UndecidedCause,
+pub use brep_boolean::split::{
+    split_solid_by_face_surface, split_solid_by_plane, split_solid_by_surface, SplitSurface,
 };
-#[path = "geometry/polygon.rs"]
-pub mod polygon;
-#[path = "geometry/curve.rs"]
-mod curve;
-pub use curve::{
-    make_arc, make_circle, make_hyperbola, make_line, make_parabola, uniform_clamped_knots,
-    KnotVector, NurbsCurve, Vec4, KNOT_DEDUP_EPS, KNOT_IDENTITY_TOL,
+pub use brep_boolean::imprint::{
+    build_imprints, EdgeSplitRecord, FaceImprints, FaceKey, FacePcurve, ImprintOptions,
+    ImprintPieceRecord, ImprintResultRecord, ImprintVertex, TangentSectionRecord,
 };
-#[path = "blending/blend/mod.rs"]
-mod blend;
-pub use blend::{
-    take_blend_approximations, take_blend_notes,
-    blend_timing_capture, take_blend_timings, BlendTiming,
-    blend_closed_edge, blend_edge_variable, blend_open_edge, blend_smooth_chain,
-    round_convex_corner,
+pub use brep_boolean::edge_split::{apply_edge_splits, apply_edge_splits_with_map};
+pub use brep_boolean::fragment::{
+    fragment_face, fragment_solid, FaceFragmentRecord, FragmentCoedge, FragmentEdgeSource,
+    FragmentLoop, FragmentOrder,
 };
-#[path = "blending/fillet.rs"]
-mod fillet;
-pub use fillet::{
-    chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,
-    chamfer_edges_asymmetric, fillet_edge, fillet_edge_conic, fillet_edges, fillet_edges_conic, fillet_edges_reported, fillet_edges_reported_at_offset,
-    fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
-    BlendSelection,
+pub use brep_boolean::boolean::{
+    boolean_operation, boolean_operation_nary, boolean_operation_nary_with_options, boolean_operation_with_diagnostics, boolean_operation_with_diagnostics_at_offset, boolean_split_operands,
+    BooleanOperation, BooleanOptions,
 };
-#[path = "blending/law.rs"]
-mod law;
-pub use law::{LawSegment, RadiusLaw};
-#[path = "geometry/fit.rs"]
-mod fit;
-pub use fit::{
-    fit_polyline, fit_polyline_at, fit_polyline_of_degree, interpolate_curve, interpolate_curve_closed,
-    interpolate_curve_local, interpolate_curve_thinned, interpolate_curve_with_end_tangents,
-    simplify_polyline, simplify_polyline_indices, solve_banded, solve_dense, PolylineFit,
-    PolylineFitExit, PolylineFitLedger, PolylineFitReport, PolylineFitScope, MAX_FIT_STATIONS,
+pub use brep_boolean::oracle::{
+    boolean_residual_fusables, boolean_semantic_disagreement, boolean_semantic_disagreement_nary,
+    OracleReport, ResidualFusable, ResidualKind, SemanticDisagreement, DISAGREEMENT_THRESHOLD,
 };
-#[path = "geometry/image_curve.rs"]
-mod image_curve;
-pub use image_curve::{affine_image_curve, image_curve, image_curve_pair, ImageCurve, ImageCurveTier};
-#[path = "geometry/surface.rs"]
-mod surface;
-pub use surface::{
-    carrier_preview_patch, make_cone_surface, make_cylinder_surface, make_extrusion, make_plane,
-    make_revolution, make_sphere_surface, make_sphere_surface_framed, make_torus_surface,
-    ExtendRefusal, NurbsSurface, SurfaceSide, WeightSite, MAXIMUM_FOLD_ANGLE,
-    MAXIMUM_GROWTH_RATIO,
+pub use brep_boolean::accept::{
+    accept_sound, accept_sound_against, accept_sound_against_scoped, resolve_face_crossing, resolve_face_crossing_between,
+    take_crossing_repairs,
+    CrossingRepairRecord,
 };
-#[path = "geometry/control_cage.rs"]
-mod control_cage;
-pub use control_cage::{
-    CagePoint, CagePrimitive, ControlCage, CAGE_DEGREE, MAX_RINGS, MAX_SEGMENTS, MIN_RINGS,
-    MIN_SEGMENTS,
+pub use brep_boolean::coalesce::{concatenate_exact_curve_pieces, merge_curve_continuation_edges};
+pub use brep_boolean::face_merge::{merge_faces_within, merge_same_surface_faces, merge_same_surface_faces_excluding, merge_same_surface_faces_scoped};
+pub use brep_boolean::faceted_repair::{mesh_to_faceted_brep, repair_triangle_soup, MeshRepairReport};
+pub use brep_boolean::sew::{sew_solid, split_pinched_vertices, SewReport};
+pub use brep_boolean::mesh_segment::{
+    mesh_regions_to_brep, segment_mesh_faces, MeshRegion, MeshSegmentation, RegionCarrier,
+    SegmentOptions, UNASSIGNED_REGION,
 };
-#[path = "geometry/coons.rs"]
-mod coons;
-pub use coons::{
-    coons_bilinear, coons_bilinear_reported, coons_with_ribbons, CompatWork, CoonsRefusal,
-    CoonsReport, RibbonReport,
-};
-#[path = "geometry/gordon.rs"]
-mod gordon;
-pub use gordon::{gordon_surface, gordon_surface_reported, GordonRefusal, GordonReport};
-#[path = "geometry/analytic_surface.rs"]
-mod analytic_surface;
-pub use analytic_surface::{
-    circle_angle_to_parameter, intersect_analytic_pair, plane_ruled_section_arc,
-    revolution_structure, AnalyticSurface, RevolutionFrame, RevolutionStructure,
-};
-pub(crate) use analytic_surface::{
-    canonical_carriers_enabled, canonicalise_carriers, intersect_analytic_pair_with, ruled_gate,
-    ruled_gate_census, RuledGate,
-};
-#[path = "geometry/sphere_chart.rs"]
-mod sphere_chart;
-pub use sphere_chart::{
-    canonicalize_points, chart_grid_divisions, chart_grid_parameters, corner_index,
-    cube_edge_corner, cube_edge_divisions, cube_edge_index, cube_edge_parameters,
-    cube_edge_parts, Chart, ChartSegment, ChartSide, SphereAtlas,
-    SphericalRegion, CHART_COUNT, CUBE_CORNER_COUNT, CUBE_EDGE_COUNT,
-};
-#[path = "brep/solid_codec.rs"]
-mod solid_codec;
-pub use solid_codec::{decode_solid, encode_solid, SolidNames, SOLID_CODEC_VERSION, SOLID_CODEC_VERSION_KIND};
-#[path = "brep/topology.rs"]
-mod topology;
-pub use topology::{
-    make_box_brep, make_cylinder_brep, make_pyramid_brep, topology_kind, BodyKind, BrepSolid, CellRecord, CoedgeRecord,
-    FaceRecord, IssueKind, KindReport, LoopRecord, TopologyKind, ValidationReport,
-};
-#[path = "brep/soundness.rs"]
-mod soundness;
-pub use soundness::{
-    face_self_intersections, loop_self_crossings, shell_vector_areas, solid_connectivity,
-    solid_euler, solid_self_intersections, ConnectivityReport, CrossingConfirmation, EulerReport,
-    CertificateScope, CertifiedFacePair, FaceCrossing, FaceFold, FaceVectorArea,
-    LoopCrossing, LoopCrossingReport, SelfIntersectionOptions, SelfIntersectionReport,
-    ClosureReading, ShellConnectivity, ShellVectorArea, VectorAreaReport, CrossingUndecidedCause, UndecidedCrossing,
-    MAX_LISTED_UNDECIDED,
-};
-#[path = "brep/topology_arena.rs"]
-mod topology_arena;
-pub use topology_arena::{
-    ArenaCoedge, ArenaEdge, ArenaFace, ArenaLoop, ArenaShell, ArenaVertex, CoedgeId, EdgeId,
-    FaceId, LoopId, ShellId, TopologyArena, VertexId,
-};
-#[path = "brep/analytic_topology.rs"]
-mod analytic_topology;
-pub use analytic_topology::{
-    make_cone_brep, make_sphere_brep, make_sphere_brep_framed, make_torus_brep,
-};
-#[path = "construction/solid_sweep.rs"]
-mod solid_sweep;
-pub use solid_sweep::{
+pub use brep_boolean::spherical_union::reconstruct_spherical_mesh_union;
+pub use brep_construction::solid_sweep::{
     sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
 };
-#[path = "construction/solid_sweep_caps.rs"]
-mod solid_sweep_caps;
-pub use solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, sweep_solid_tumbled, FrameCurve, RisingTurn, TwoTurns, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
-#[path = "geometry/curve_chain.rs"]
-mod curve_chain;
-pub use curve_chain::{join_curve_chain, split_surface};
-#[path = "geometry/closed_curves.rs"]
-mod closed_curves;
-pub use closed_curves::{make_ellipse, make_ellipse_arc, make_ellipsoid_brep, make_periodic_bspline};
-#[path = "construction/surface_faces.rs"]
-mod surface_faces;
-pub use surface_faces::{face_from_surface, face_from_surface_trimmed, solid_from_sheets, SURFACE_FACE_REFUSAL};
-#[path = "construction/polygon_solids.rs"]
-mod polygon_solids;
-pub use polygon_solids::{make_pyramid_on_polygon, solid_from_polygons};
-#[path = "construction/loft_guide_chain.rs"]
-mod loft_guide_chain;
-pub use loft_guide_chain::loft_profile_brep_guided_chain;
-#[path = "construction/loft_guides.rs"]
-mod loft_guides;
-pub use loft_guides::{loft_profile_brep_on_guide_chains, loft_profile_brep_on_guides, loft_profile_brep_on_loose_guide_chains, GuideLoftWall, LOFT_ON_GUIDES_REFUSAL};
-#[path = "construction/extrude_up_to.rs"]
-mod extrude_up_to;
-pub use extrude_up_to::{extrude_profile_up_to_face, solid_pieces, EXTRUDE_UP_TO_REFUSAL};
-#[path = "offset/thicken_faces.rs"]
-mod thicken_faces;
-pub use thicken_faces::{extrude_curves_to_sheet, thicken_sheet_faces, THICKEN_FACES_REFUSAL};
-#[path = "offset/shell_rounded.rs"]
-mod shell_rounded;
-pub use shell_rounded::{offset_shell_rounded, SHELL_ROUNDED_REFUSAL};
-#[path = "construction/sweep_round_corners.rs"]
-mod sweep_round_corners;
-pub use sweep_round_corners::{sweep_profile_round_corners, SWEEP_ROUND_CORNERS_REFUSAL};
-#[path = "construction/sweep_ellipsoid.rs"]
-mod sweep_ellipsoid;
-pub use sweep_ellipsoid::sweep_ellipsoid_along_line;
-#[path = "construction/sweep_topology.rs"]
-mod sweep_topology;
-pub(crate) use sweep_topology::is_sweep_tight_bend;
-pub use sweep_topology::{
+pub use brep_construction::solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, sweep_solid_tumbled, FrameCurve, RisingTurn, TwoTurns, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
+pub use brep_construction::closed_curves::{make_ellipse, make_ellipse_arc, make_ellipsoid_brep, make_periodic_bspline};
+pub use brep_construction::surface_faces::{face_from_surface, face_from_surface_trimmed, solid_from_sheets, SURFACE_FACE_REFUSAL};
+pub use brep_construction::polygon_solids::{make_pyramid_on_polygon, solid_from_polygons};
+pub use brep_construction::loft_guide_chain::loft_profile_brep_guided_chain;
+pub use brep_construction::loft_guides::{loft_profile_brep_on_guide_chains, loft_profile_brep_on_guides, loft_profile_brep_on_loose_guide_chains, GuideLoftWall, LOFT_ON_GUIDES_REFUSAL};
+pub use brep_construction::extrude_up_to::{extrude_profile_up_to_face, solid_pieces, EXTRUDE_UP_TO_REFUSAL};
+pub use brep_construction::sweep_round_corners::{sweep_profile_round_corners, SWEEP_ROUND_CORNERS_REFUSAL};
+pub use brep_construction::sweep_ellipsoid::sweep_ellipsoid_along_line;
+pub use brep_construction::sweep_topology::{
     extrude_profile_brep, extrude_profile_brep_draft, fit_helix_curve, helix_sample_points,
     profile_anchor, rib_from_profile, sweep_bend_profile, sweep_closure, BendStation,
     JointContinuity, PathJoint, SweepClosure,
@@ -355,31 +176,180 @@ pub use sweep_topology::{
     StationBudget, SweepStationReport, SweptChain, SWEEP_DEFAULT_TOLERANCE, SWEEP_MAX_STATIONS,
     SWEEP_REFINEMENT_ROUNDS,
 };
-#[path = "construction/revolve_topology.rs"]
-mod revolve_topology;
-pub use revolve_topology::{revolve_profile_brep, revolve_profile_brep_named};
-#[path = "construction/loft_topology.rs"]
-mod loft_topology;
-pub use loft_topology::{
+pub use brep_construction::revolve_topology::{revolve_profile_brep, revolve_profile_brep_named};
+pub use brep_construction::loft_topology::{
     loft_profile_brep, loft_profile_brep_closed, loft_profile_brep_guided,
     loft_profile_brep_guided_frame, loft_profile_brep_tangent,
 };
-pub(crate) use loft_topology::loft_profile_brep_closed_shifted;
-#[path = "brep/transform_topology.rs"]
-mod transform_topology;
-#[path = "brep/recentre.rs"]
-mod recentre;
-#[path = "brep/rescale.rs"]
-mod rescale;
-pub use transform_topology::{mirror_brep, transform_brep, AffineTransform};
-#[path = "edit/split.rs"]
-mod split;
-pub use split::{
-    split_solid_by_face_surface, split_solid_by_plane, split_solid_by_surface, SplitSurface,
+pub use brep_blend::blend::{
+    take_blend_approximations, take_blend_notes,
+    blend_timing_capture, take_blend_timings, BlendTiming,
+    blend_closed_edge, blend_edge_variable, blend_open_edge, blend_smooth_chain,
+    round_convex_corner,
 };
-#[path = "props/mass_properties.rs"]
-mod mass_properties;
-pub use mass_properties::{
+pub use brep_blend::fillet::{
+    chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,
+    chamfer_edges_asymmetric, fillet_edge, fillet_edge_conic, fillet_edges, fillet_edges_conic, fillet_edges_reported, fillet_edges_reported_at_offset,
+    fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
+    BlendSelection,
+};
+pub use brep_blend::law::{LawSegment, RadiusLaw};
+pub use brep_offset::thicken_faces::{extrude_curves_to_sheet, thicken_sheet_faces, THICKEN_FACES_REFUSAL};
+pub use brep_offset::shell_rounded::{offset_shell_rounded, SHELL_ROUNDED_REFUSAL};
+pub use brep_offset::thicken::{thicken_face_sheet, thicken_trimmed_sheet};
+pub use brep_offset::offset_shell::{
+    offset_shell, offset_shell_by_boolean, offset_shell_closed, offset_shell_with_diagnostics, offset_solid, OffsetCorners,
+    OffsetFaceRole, OffsetShellFaceImageRecord, OffsetShellResultRecord,
+};
+pub use brep_direct_edit::direct_edit::{
+    delete_face_and_heal, delete_faces_and_heal, draft_faces, draft_faces_parted, draft_faces_unchecked, move_faces, move_faces_unchecked,
+    offset_freeform_face, offset_freeform_face_unchecked,
+    offset_revolution_face, offset_revolution_face_unchecked, offset_ruled_face, offset_ruled_face_unchecked, offset_sphere_face,
+    offset_sphere_face_unchecked, offset_torus_face, offset_torus_face_unchecked,
+    rebuild_displaced_blends, with_blend_rebuild_decline,
+    recut_moved_planes, recut_moved_planes_rigid, recut_moved_planes_unchecked, reblend_lost_fillets, resolve_face_by_point, rotate_faces, rotate_faces_unchecked,
+    route_reading, RouteReading,
+};
+pub use brep_direct_edit::direct_edit::{face_refusal_slugs, face_transform_reason, FaceTransformReason};
+pub use brep_direct_edit::direct_edit::{
+    refit_faces_as_one, refit_refusal_phrases, RefitCarrier, RefitReport, RefitSurfaceKind,
+};
+
+
+#[macro_use]
+extern crate brep_geometry;
+#[allow(unused_imports)]
+use brep_geometry::*;
+#[macro_use]
+extern crate brep_topology;
+#[allow(unused_imports)]
+use brep_topology::*;
+
+// The public root API of the kernel, from the crates below.
+pub use brep_topology::{display_chord_tolerance, solid_model_scale, solid_scale};
+pub use brep_geometry::switch;
+pub use brep_geometry::debug_flag;
+pub use brep_geometry::mode_switch;
+pub use brep_geometry::env_read;
+pub use brep_geometry::panic_hook;
+pub use brep_geometry::text;
+pub use brep_geometry::tolerance::{
+    curve_model_scale, model_scale, report_scale_migration, SolidScale,
+    offset_construction_band, vertex_tolerance_from_edges, KernelTolerances,
+    MeasuredTolerance, OFFSET_CONSTRUCTION_FLOOR, OFFSET_CONSTRUCTION_REL,
+    VERTEX_MATCH_FLOOR, VOLUME_DRIFT_ABS, VOLUME_DRIFT_REL,
+};
+pub use brep_geometry::diagnostics::{
+    Approximation, ApproximationBudget, Backing, BudgetMechanism, BudgetReason, MeasuredComponent, DiagnosticEvent, DiagnosticSeverity, EdgeOrigin, KernelDiagnostics,
+    KernelOutcome, KernelRefusal, OffCarrierEdge,
+    KernelStage, OrRefuse, RefusalClass, SoundnessDefect, UndecidedCause,
+};
+pub use brep_geometry::polygon;
+pub use brep_geometry::curve::{
+    make_arc, make_circle, make_hyperbola, make_line, make_parabola, uniform_clamped_knots,
+    KnotVector, NurbsCurve, Vec4, KNOT_DEDUP_EPS, KNOT_IDENTITY_TOL,
+};
+pub use brep_geometry::fit::{
+    fit_polyline, fit_polyline_at, fit_polyline_of_degree, interpolate_curve, interpolate_curve_closed,
+    interpolate_curve_local, interpolate_curve_thinned, interpolate_curve_with_end_tangents,
+    simplify_polyline, simplify_polyline_indices, solve_banded, solve_dense, PolylineFit,
+    PolylineFitExit, PolylineFitLedger, PolylineFitReport, PolylineFitScope, MAX_FIT_STATIONS,
+};
+pub use brep_geometry::image_curve::{affine_image_curve, image_curve, image_curve_pair, ImageCurve, ImageCurveTier};
+pub use brep_geometry::surface::{
+    carrier_preview_patch, make_cone_surface, make_cylinder_surface, make_extrusion, make_plane,
+    make_revolution, make_sphere_surface, make_sphere_surface_framed, make_torus_surface,
+    ExtendRefusal, NurbsSurface, SurfaceSide, WeightSite, MAXIMUM_FOLD_ANGLE,
+    MAXIMUM_GROWTH_RATIO,
+};
+pub use brep_geometry::coons::{
+    coons_bilinear, coons_bilinear_reported, coons_with_ribbons, CompatWork, CoonsRefusal,
+    CoonsReport, RibbonReport,
+};
+pub use brep_geometry::gordon::{gordon_surface, gordon_surface_reported, GordonRefusal, GordonReport};
+pub use brep_geometry::analytic_surface::{
+    circle_angle_to_parameter, intersect_analytic_pair, plane_ruled_section_arc,
+    revolution_structure, AnalyticSurface, RevolutionFrame, RevolutionStructure,
+};
+pub use brep_geometry::sphere_chart::{
+    canonicalize_points, chart_grid_divisions, chart_grid_parameters, corner_index,
+    cube_edge_corner, cube_edge_divisions, cube_edge_index, cube_edge_parameters,
+    cube_edge_parts, Chart, ChartSegment, ChartSide, SphereAtlas,
+    SphericalRegion, CHART_COUNT, CUBE_CORNER_COUNT, CUBE_EDGE_COUNT,
+};
+#[doc(hidden)]
+pub use brep_geometry::projection_profile::report as projection_profile_report;
+pub use brep_geometry::projection::{
+    project_point_to_curve, project_point_to_surface, project_point_to_surface_seeded,
+    CurveProjection, SurfaceProjection,
+};
+#[doc(hidden)]
+pub use brep_geometry::projection::{
+    project_point_to_surface_basin_census, project_point_to_surface_general_lanes, BasinCensus,
+    GlobalStats,
+};
+pub use brep_geometry::curve_surface_intersection::{intersect_curve_surface, CurveSurfaceIntersection};
+pub use brep_geometry::curve_curve_intersection::{intersect_curves, CurveCurveIntersection};
+pub use brep_geometry::surface_surface_intersection::{
+    intersect_surfaces, intersect_surfaces_supplemental, SurfaceIntersectionCurve,
+    SurfaceIntersectionOptions,
+};
+pub use brep_geometry::crossing_node::{crossing_node_split_enabled, split_at_crossing_nodes};
+pub use brep_geometry::tangent_curve::{
+    classify_tangent_contact_at, find_tangent_contact, trace_tangent_curve, TangentContact,
+    EXTENDED_RANK_FLOOR,
+};
+pub use brep_geometry::spatial::{Aabb, Bvh};
+pub use brep_geometry::arrangement::{
+    arrange_segments, point_in_polygon, segment_intersection, ArrangementPiece, ArrangementRegion,
+    CycleUse, Segment2, Vec2,
+};
+pub use brep_geometry::pcurve::{
+    build_pcurve_on_surface, build_pcurve_on_surface_marched, build_pcurve_on_surface_range,
+    build_pcurve_on_surface_range_dense, build_pcurve_on_surface_stations, fit_pcurve_on_surface,
+    fit_pcurve_on_surface_marched, fit_pcurve_on_surface_range, fit_pcurve_on_surface_range_dense,
+    fit_pcurve_on_surface_stations, PcurveFit, PcurveFitExit, PcurveFitLedger, PcurveFitReport,
+    PcurveFitScope, PCURVE_OFF_BAR, PCURVE_REFINEMENT_TOLERANCE,
+};
+pub use brep_geometry::offset_point::{OffsetEvaluator, OffsetNormal, OffsetSample};
+pub use brep_geometry::Vec3;
+pub use brep_geometry::Mesh;
+pub use brep_geometry::make_box;
+pub use brep_geometry::make_cylinder;
+pub use brep_geometry::union_find;
+pub use brep_geometry::union_find::UnionFind;
+pub use brep_geometry::poly;
+pub use brep_geometry::analytic_surface::{circumcenter, circumcenter_2d, recognize_circle, RecognizedCircle};
+pub use brep_geometry::triangle::closest_point_on_triangle;
+pub use brep_geometry::tolerance::RIGID_TOL;
+pub use brep_topology::entity_tolerance::{EntityTolerances, EDGE_CAP_FRACTION, VERTEX_CAP_FRACTION};
+pub use brep_topology::control_cage::{
+    CagePoint, CagePrimitive, ControlCage, CAGE_DEGREE, MAX_RINGS, MAX_SEGMENTS, MIN_RINGS,
+    MIN_SEGMENTS,
+};
+pub use brep_topology::solid_codec::{decode_solid, encode_solid, SolidNames, SOLID_CODEC_VERSION, SOLID_CODEC_VERSION_KIND};
+pub use brep_topology::topology::{
+    make_box_brep, make_cylinder_brep, make_pyramid_brep, topology_kind, BodyKind, BrepSolid, CellRecord, CoedgeRecord,
+    FaceRecord, IssueKind, KindReport, LoopRecord, TopologyKind, ValidationReport,
+};
+pub use brep_topology::soundness::{
+    face_self_intersections, loop_self_crossings, shell_vector_areas, solid_connectivity,
+    solid_euler, solid_self_intersections, ConnectivityReport, CrossingConfirmation, EulerReport,
+    CertificateScope, CertifiedFacePair, FaceCrossing, FaceFold, FaceVectorArea,
+    LoopCrossing, LoopCrossingReport, SelfIntersectionOptions, SelfIntersectionReport,
+    ClosureReading, ShellConnectivity, ShellVectorArea, VectorAreaReport, CrossingUndecidedCause, UndecidedCrossing,
+    MAX_LISTED_UNDECIDED,
+};
+pub use brep_topology::topology_arena::{
+    ArenaCoedge, ArenaEdge, ArenaFace, ArenaLoop, ArenaShell, ArenaVertex, CoedgeId, EdgeId,
+    FaceId, LoopId, ShellId, TopologyArena, VertexId,
+};
+pub use brep_topology::analytic_topology::{
+    make_cone_brep, make_sphere_brep, make_sphere_brep_framed, make_torus_brep,
+};
+pub use brep_topology::curve_chain::{join_curve_chain, split_surface};
+pub use brep_topology::transform_topology::{mirror_brep, transform_brep, AffineTransform};
+pub use brep_topology::mass_properties::{
     curve_arc_length, edge_arc_length, face_area, face_boundary_length, face_volume_contribution,
     face_set_identity, mass_caller, parameter_space_area, solid_edge_length_total,
     solid_mass_properties,
@@ -387,20 +357,54 @@ pub use mass_properties::{
     DensityMassProperties,
     FaceSetIdentity, FullMassProperties, MassCaller, MassProperties, MassPropertiesCache,
 };
-#[path = "props/carrier_dimensions.rs"]
-mod carrier_dimensions;
-pub use carrier_dimensions::{curve_carrier_dimensions, surface_carrier_dimensions, CarrierDimensions};
-#[path = "meshing/tessellation.rs"]
-mod tessellation;
-pub use tessellation::{tessellate_brep, tessellate_face, TessellationOptions};
-#[path = "meshing/watertight_tessellation/mod.rs"]
-mod watertight_tessellation;
-pub use watertight_tessellation::{
+pub use brep_topology::carrier_dimensions::{curve_carrier_dimensions, surface_carrier_dimensions, CarrierDimensions};
+pub use brep_topology::tessellation::{tessellate_brep, tessellate_face, TessellationOptions};
+pub use brep_topology::watertight_tessellation::{
     sample_edge_polyline_checked, EdgeChordError, EdgeChordFailure, TessellationError,
     tessellate_brep_watertight_checked,
     sample_edge_polylines, sample_edges_encoded, tessellate_brep_watertight,
     tessellate_brep_watertight_face_stride, tessellate_brep_watertight_face_stride_with_samples,
 };
+pub use brep_topology::classification::{
+    classify_point, containment_lane, horizon_cross_frame, parameter_point_in_face,
+    trim_sample_count, trim_station, ContainmentLane, PointClass, PointClassification,
+    PolygonClass, SolidClassifier, COVERING_RIM_STRIP_SWITCH, HORIZON_CONTAINMENT_SWITCH,
+    HORIZON_CROSS_FRAME_SWITCH, HORIZON_SINGLE_LOOP_SWITCH, NO_SPHERE_CHART_TRIM_SWITCH,
+    SEAM_BAND_MERGED_SWITCH,
+};
+#[doc(hidden)]
+pub use brep_topology::classification::parameter_point_in_face_scan;
+pub use brep_topology::pair_classification::{
+    classify_surface_pair, classify_surface_pair_cached, SurfaceClassifyData,
+    SurfacePairClassification, SurfacePairRelation,
+};
+pub use brep_topology::offset_measure::{
+    measure_edge_against_pcurve_image, measure_surface_fit_against_pointwise_offset,
+    span_midpoint_error, vertex_endpoint_gap,
+};
+pub use brep_topology::mesh_weld::{canonical_bits, VertexWeld};
+
+
+use serde::{Deserialize, Serialize};
+use wasm_bindgen::prelude::*;
+
+// The wasm global allocator, when the `wasm-talc` feature asks for it.
+#[cfg(all(feature = "wasm-talc", target_family = "wasm", not(target_feature = "atomics")))]
+#[global_allocator]
+static TALC: talc::wasm::WasmDynamicTalc = talc::wasm::new_wasm_dynamic_allocator();
+
+// The native global allocator, when the `native-rusty-alloc` feature asks for it.
+#[cfg(all(feature = "native-rusty-alloc", not(target_family = "wasm")))]
+#[cfg(not(feature = "profile-wall"))]
+#[global_allocator]
+static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
+
+#[cfg(all(feature = "native-rusty-alloc", not(target_family = "wasm"), feature = "profile-wall"))]
+#[global_allocator]
+static RUSTY_ALLOC: wall_profile::Allocator<rusty_alloc_api::RustyAlloc> = wall_profile::Allocator(rusty_alloc_api::RustyAlloc);
+#[path = "construction/draft_roof.rs"]
+mod draft_roof;
+pub use draft_roof::{extrude_profile_brep_draft_roof, DRAFT_ROOF_REFUSAL};
 // The Rust feature-history execution engine (migration-plan Stage 4/5 foundation).
 // Deserializes the serialized `{ type, inputParams, ... }` descriptor shape, runs
 // each feature against a live scene-map of resident handles, and returns per-feature
@@ -494,7 +498,7 @@ pub use feature_pipeline::{native_import_payload, native_import_payload_with_app
 pub use feature_pipeline::IsolatedSceneMetadata;
 // The imported-colour read of the name-keyed scene-metadata store. Thread-local
 // like the rest of it, so an off-thread runner reads it and ships the result.
-pub use feature_pipeline::scene_metadata_colors_json;
+pub use feature_pipeline::{scene_metadata_colors_json, scene_metadata_weld_colors_json};
 // Family tables (rows, the expression rewrite, the persisted fingerprints): one
 // copy for the CAD app and the PLM server.
 pub use feature_pipeline::family;
@@ -545,6 +549,9 @@ pub use feature_pipeline::{feature_context_applicable, SelectionProbe};
 // solve would (`features/sketch.rs` `pre_evaluate_expressions`). `Env::build`/
 // `eval` are pure arithmetic (no `std::time`), so this stays wasm-clean.
 pub use feature_pipeline::Env;
+// Expressions sources are kept one statement per line: the editor, the open
+// path and the automation setter normalise through this.
+pub use feature_pipeline::format_expressions;
 
 /// One-shot: build an [`Env`] from a history's `expressions` source + its
 /// `configurator` JSON, then evaluate `source` to a scalar. The small surface the
@@ -566,226 +573,6 @@ pub fn eval_expression(
 // (see `tessellate_faces_stride` under the `parallel` feature).
 #[cfg(feature = "wasm-threads")]
 pub use wasm_bindgen_rayon::init_thread_pool;
-#[path = "geometry/projection.rs"]
-mod projection;
-#[path = "geometry/projection_profile.rs"]
-mod projection_profile;
-#[doc(hidden)]
-pub use projection_profile::report as projection_profile_report;
-#[path = "geometry/affine_sphere.rs"]
-mod affine_sphere;
-pub use projection::{
-    project_point_to_curve, project_point_to_surface, project_point_to_surface_seeded,
-    CurveProjection, SurfaceProjection,
-};
-#[doc(hidden)]
-pub use projection::{
-    project_point_to_surface_basin_census, project_point_to_surface_general_lanes, BasinCensus,
-    GlobalStats,
-};
-#[path = "intersect/curve_surface_intersection.rs"]
-mod curve_surface_intersection;
-pub use curve_surface_intersection::{intersect_curve_surface, CurveSurfaceIntersection};
-#[path = "intersect/exact_line_surface.rs"]
-mod exact_line_surface;
-#[path = "intersect/curve_curve_intersection.rs"]
-mod curve_curve_intersection;
-pub use curve_curve_intersection::{intersect_curves, CurveCurveIntersection};
-#[path = "intersect/surface_surface_intersection.rs"]
-mod surface_surface_intersection;
-pub use surface_surface_intersection::{
-    intersect_surfaces, intersect_surfaces_supplemental, SurfaceIntersectionCurve,
-    SurfaceIntersectionOptions,
-};
-pub(crate) use surface_surface_intersection::TRANSVERSE_SEED_CROSS;
-#[path = "intersect/tangent_curve.rs"]
-mod tangent_curve;
-#[path = "intersect/crossing_node.rs"]
-mod crossing_node;
-pub use crossing_node::{crossing_node_split_enabled, split_at_crossing_nodes};
-pub use tangent_curve::{
-    classify_tangent_contact_at, find_tangent_contact, trace_tangent_curve, TangentContact,
-    EXTENDED_RANK_FLOOR,
-};
-#[path = "brep/classification.rs"]
-mod classification;
-pub use classification::{
-    classify_point, containment_lane, horizon_cross_frame, parameter_point_in_face,
-    trim_sample_count, trim_station, ContainmentLane, PointClass, PointClassification,
-    PolygonClass, SolidClassifier, COVERING_RIM_STRIP_SWITCH, HORIZON_CONTAINMENT_SWITCH,
-    HORIZON_CROSS_FRAME_SWITCH, HORIZON_SINGLE_LOOP_SWITCH, NO_SPHERE_CHART_TRIM_SWITCH,
-    SEAM_BAND_MERGED_SWITCH,
-};
-#[doc(hidden)]
-pub use classification::parameter_point_in_face_scan;
-#[path = "geometry/spatial.rs"]
-mod spatial;
-pub use spatial::{Aabb, Bvh};
-#[path = "brep/pair_classification.rs"]
-mod pair_classification;
-pub use pair_classification::{
-    classify_surface_pair, classify_surface_pair_cached, SurfaceClassifyData,
-    SurfacePairClassification, SurfacePairRelation,
-};
-#[path = "intersect/arrangement.rs"]
-mod arrangement;
-pub use arrangement::{
-    arrange_segments, point_in_polygon, segment_intersection, ArrangementPiece, ArrangementRegion,
-    CycleUse, Segment2, Vec2,
-};
-#[path = "geometry/pcurve.rs"]
-mod pcurve;
-pub use pcurve::{
-    build_pcurve_on_surface, build_pcurve_on_surface_marched, build_pcurve_on_surface_range,
-    build_pcurve_on_surface_range_dense, build_pcurve_on_surface_stations, fit_pcurve_on_surface,
-    fit_pcurve_on_surface_marched, fit_pcurve_on_surface_range, fit_pcurve_on_surface_range_dense,
-    fit_pcurve_on_surface_stations, PcurveFit, PcurveFitExit, PcurveFitLedger, PcurveFitReport,
-    PcurveFitScope, PCURVE_OFF_BAR, PCURVE_REFINEMENT_TOLERANCE,
-};
-#[path = "csg/imprint.rs"]
-mod imprint;
-pub use imprint::{
-    build_imprints, EdgeSplitRecord, FaceImprints, FaceKey, FacePcurve, ImprintOptions,
-    ImprintPieceRecord, ImprintResultRecord, ImprintVertex, TangentSectionRecord,
-};
-#[path = "csg/feature_scale.rs"]
-mod feature_scale;
-#[path = "csg/edge_split.rs"]
-mod edge_split;
-pub use edge_split::{apply_edge_splits, apply_edge_splits_with_map};
-#[path = "csg/fragment.rs"]
-mod fragment;
-pub use fragment::{
-    fragment_face, fragment_solid, FaceFragmentRecord, FragmentCoedge, FragmentEdgeSource,
-    FragmentLoop, FragmentOrder,
-};
-#[path = "csg/boolean/mod.rs"]
-mod boolean;
-pub use boolean::{
-    boolean_operation, boolean_operation_nary, boolean_operation_nary_with_options, boolean_operation_with_diagnostics, boolean_operation_with_diagnostics_at_offset, boolean_split_operands,
-    BooleanOperation, BooleanOptions,
-};
-#[path = "csg/oracle.rs"]
-mod oracle;
-pub use oracle::{
-    boolean_residual_fusables, boolean_semantic_disagreement, boolean_semantic_disagreement_nary,
-    OracleReport, ResidualFusable, ResidualKind, SemanticDisagreement, DISAGREEMENT_THRESHOLD,
-};
-#[path = "healing/heal.rs"]
-mod heal;
-// The content-keyed memo of the per-coedge readings the heal pre-pass and
-// the assembly's inherited-trim challenger take on every boolean.
-#[path = "healing/reading_memo.rs"]
-mod reading_memo;
-// The soundness ACCEPTANCE: the one place a construction lane asks "is this
-// result sound enough to return", repairs it where it can and refuses it by
-// name where it cannot. Declared beside the heal pre-pass it is the mirror of
-// — that one removes noise from an operand before the work, this one refuses a
-// wrong answer after it.
-#[path = "healing/accept.rs"]
-mod accept;
-pub use accept::{
-    accept_sound, accept_sound_against, accept_sound_against_scoped, resolve_face_crossing, resolve_face_crossing_between,
-    take_crossing_repairs,
-    CrossingRepairRecord,
-};
-// The pointwise offset evaluator — ONE definition of "the offset of a surface
-// at a parameter", shared by `offset_surface`'s Greville sampling, the blend
-// march's tangency residual, and the push-face offset residual gates. Declared
-// before `offset` because that module is its first consumer.
-#[path = "offset/point.rs"]
-mod offset_point;
-pub use offset_point::{OffsetEvaluator, OffsetNormal, OffsetSample};
-// The LOCUS-level offset seam — ONE definition of "intersect two offset
-// analytic carriers in closed form", shared by the blend's corner closures.
-// The pointwise evaluator above answers "where is the offset at this (u, v)";
-// this answers "where do two offsets MEET", which is what the corner solves
-// need and what no pointwise evaluator can produce (audit §9.4, §11).
-// Crate-internal: no consumer outside the kernel names these.
-#[path = "offset/analytic_pair.rs"]
-mod offset_analytic_pair;
-// The shared re-trim helpers — ONE definition of "rebuild a face's carrier and
-// pcurves around a boundary that has already moved", shared by push-face,
-// face-move and the direct-edit heals. This is the RE-INTERSECTION sense of
-// trimming; offset-shell's parametric-image trimming is a different operation
-// and deliberately not here (see the module doc). Crate-internal: no consumer
-// outside the kernel names these.
-#[path = "offset/retrim.rs"]
-mod offset_retrim;
-// The RE-INTERSECTION seam — ONE definition of "intersect two carriers to
-// remake a trim boundary", with the exact analytic lane first and the general
-// marched lane behind it. `offset_retrim` above re-trims a face around a
-// boundary that has ALREADY moved; this is the step that moves it, and it is
-// what makes a neighbour re-intersection surface-type-blind the way
-// offset-shell's imprint driver already is. Crate-internal: no consumer outside
-// the kernel names these.
-#[path = "offset/reintersect.rs"]
-mod offset_reintersect;
-// The MEASURED half of the tolerance model: the deviation actually observed
-// between an offset construction and the geometry it was built to reproduce.
-// Everything in `geometry/tolerance.rs` above `MeasuredTolerance` DERIVES a
-// band from a size before the geometry exists; this measures what the
-// construction then did, and compares it against that band. The comparison is
-// not itself a gate: the deviation rides the transient construction result
-// (`OffsetFaceCarrier::deviation`, `#[serde(skip)]`) and refusing on an
-// exceedance is the caller's call, not this module's. Declared before `offset`
-// because that module is its first consumer.
-#[path = "offset/measure.rs"]
-mod offset_measure;
-pub use offset_measure::{
-    measure_edge_against_pcurve_image, measure_surface_fit_against_pointwise_offset,
-    span_midpoint_error, vertex_endpoint_gap,
-};
-#[path = "offset/offset.rs"]
-mod offset;
-pub use offset::{
-    offset_face_carrier, offset_face_carrier_measured, offset_face_carrier_sided, offset_surface,
-    offset_surface_measured, offset_surface_measured_sided, CarrierDeviation, CarrierExtension,
-    MeasuredOffsetSurface, OffsetFaceCarrier, OffsetSurfaceLane,
-};
-// Region-scoped offset REGULARITY — ONE definition of "does the equidistant
-// surface fold over THIS trimmed region", shared by the sheet thickener's gate
-// and offset-shell's carrier-collapse lane. Both used to sweep a fixed grid
-// over the whole surface DOMAIN, which answers about the carrier instead of the
-// face. Crate-internal: no consumer outside the kernel names these.
-#[path = "offset/regularity.rs"]
-mod offset_regularity;
-// The fold LOCUS — the curve `1 − d·k = 0` itself, marched out of the brackets
-// the regularity scan above already finds on its own grid. `regularity` answers
-// "does this region fold"; this answers "WHERE does it stop folding", which is
-// the boundary a partially-folded trim has to be split along. Crate-internal:
-// no consumer outside the kernel names these.
-#[path = "offset/fold_locus.rs"]
-mod offset_fold_locus;
-// The CARVE — split a trim along the fold locus, keep the regular side, hand
-// back the folded one. The two modules above decide THAT a region folds and
-// WHERE it stops; this is what both are for, and it is shared by the sheet
-// thickener and offset shell for the same reason the scan is. Crate-internal:
-// no consumer outside the kernel names these.
-#[path = "offset/carve.rs"]
-mod offset_carve;
-#[path = "offset/thicken.rs"]
-mod thicken;
-pub use thicken::{thicken_face_sheet, thicken_trimmed_sheet};
-#[path = "healing/coalesce.rs"]
-mod coalesce;
-pub use coalesce::{concatenate_exact_curve_pieces, merge_curve_continuation_edges};
-#[path = "healing/face_merge.rs"]
-mod face_merge;
-// Retained for potential mesh-import repair; no exact operation may fall
-// back to it (offset shell must produce real surfaces or fail loudly).
-#[allow(dead_code)]
-#[path = "healing/faceted_repair.rs"]
-mod faceted_repair;
-pub use face_merge::{merge_faces_within, merge_same_surface_faces, merge_same_surface_faces_excluding, merge_same_surface_faces_scoped};
-pub use faceted_repair::{mesh_to_faceted_brep, repair_triangle_soup, MeshRepairReport};
-#[path = "offset/offset_shell.rs"]
-mod offset_shell;
-pub use offset_shell::{
-    offset_shell, offset_shell_by_boolean, offset_shell_closed, offset_shell_with_diagnostics, offset_solid, OffsetCorners,
-    OffsetFaceRole, OffsetShellFaceImageRecord, OffsetShellResultRecord,
-};
-pub(crate) use offset_shell::{is_offset_shell_no_retained_face, is_offset_shell_open_curved_rim};
 #[path = "io/step_matrix.rs"]
 mod step_matrix;
 #[path = "io/step.rs"]
@@ -826,6 +613,8 @@ pub use iges::{
     export_iges, export_iges_assembly, export_iges_bodies, import_iges, import_iges_report,
     read_iges_assembly, IgesBody, IgesImportReport,
 };
+#[path = "io/parasolid/mod.rs"]
+pub mod parasolid;
 #[path = "io/mesh_io.rs"]
 mod mesh_io;
 pub use mesh_io::{
@@ -858,335 +647,38 @@ pub use snapshot::{
     restore_solids, snapshot_resident_solids, snapshot_solids, RestoredSnapshot, RestoredSolid,
     SNAPSHOT_FORMAT_VERSION,
 };
-#[path = "solvers/linear_algebra.rs"]
-mod solver_linear_algebra;
-#[path = "solvers/sketch_solver.rs"]
-mod sketch_solver;
-pub use sketch_solver::{
-    is_sketch_origin_point_id, sketch_id_key, mint_sketch_id, solve_sketch, solve_sketch_from_json,
-    SketchSolverSettings, SolveSketchRequest, SKETCH_ORIGIN_POINT_ID,
-};
-#[path = "solvers/assembly_solver.rs"]
-mod assembly_solver;
-pub use assembly_solver::{
-    solve_assembly, AssemblyBody, AssemblyMate, AssemblySolution, AssemblySolveOptions, BodyFreedom, BodyPose,
-    LinearAlgebra, MateAlign, MateAxis, MateCurve, MateKind, MatePlane, MateResidualReport,
-    SolveStrategy, SymmetricElement,
-};
-// Assembly selection resolution: a namespaced selection ref resolved to an
-// analytic frame (plane/axis/sphere/circle/line/point) read from the exact
-// BREP, feeding `MateKind` inputs in component-local coordinates.
-#[path = "solvers/sketch3d_solver.rs"]
-mod sketch3d_solver;
-pub use sketch3d_solver::{
-    sketch3d_constraint_type, solve_sketch3d, solve_sketch3d_doc, solve_sketch3d_from_json,
-    Sketch3dConstraint, Sketch3dConstraintType, Sketch3dDiagnostics, Sketch3dDoc,
-    Sketch3dGeometry, Sketch3dPoint, Sketch3dSolveOptions, SolveSketch3dRequest,
-    SKETCH3D_CONSTRAINT_TYPES,
-};
-#[path = "solvers/assembly_resolve.rs"]
-mod assembly_resolve;
-pub use assembly_resolve::{
-    is_component_reference, resolve_component_point, resolve_edge_selection,
-    resolve_face_selection, resolve_named_selection, resolve_vertex_selection,
-    split_component_namespace, ResolveError, SelectionGeometry,
-};
-#[path = "edit/direct_edit.rs"]
-mod direct_edit;
-pub use direct_edit::{
-    delete_face_and_heal, delete_faces_and_heal, draft_faces, draft_faces_parted, move_faces, move_faces_unchecked,
-    offset_freeform_face,
-    offset_revolution_face, offset_ruled_face, offset_ruled_face_unchecked, offset_sphere_face, offset_torus_face,
-    rebuild_displaced_blends, with_blend_rebuild_decline,
-    recut_moved_planes, recut_moved_planes_rigid, reblend_lost_fillets, resolve_face_by_point, rotate_faces, rotate_faces_unchecked,
-    route_reading, RouteReading,
-};
-pub use direct_edit::{face_refusal_slugs, face_transform_reason, FaceTransformReason};
-pub use direct_edit::{
-    refit_faces_as_one, refit_refusal_phrases, RefitCarrier, RefitReport, RefitSurfaceKind,
-};
-#[path = "healing/sew.rs"]
-mod sew;
-pub use sew::{sew_solid, split_pinched_vertices, SewReport};
-#[path = "meshing/mesh_weld.rs"]
-mod mesh_weld;
-pub use mesh_weld::{canonical_bits, VertexWeld};
-#[path = "meshing/mesh_segment.rs"]
-mod mesh_segment;
-pub use mesh_segment::{
-    mesh_regions_to_brep, segment_mesh_faces, MeshRegion, MeshSegmentation, RegionCarrier,
-    SegmentOptions, UNASSIGNED_REGION,
-};
-
-#[path = "meshing/spherical_union.rs"]
-mod spherical_union;
-pub use spherical_union::reconstruct_spherical_mesh_union;
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-pub struct Vec3 {
-    pub x: f64,
-    pub y: f64,
-    pub z: f64,
-}
-
-impl Vec3 {
-    pub const ZERO: Self = Self { x: 0.0, y: 0.0, z: 0.0 };
-    pub const X: Self = Self { x: 1.0, y: 0.0, z: 0.0 };
-    pub const Y: Self = Self { x: 0.0, y: 1.0, z: 0.0 };
-    pub const Z: Self = Self { x: 0.0, y: 0.0, z: 1.0 };
-
-    /// Normalize using the standard vector guard, or return the caller's fallback.
-    pub fn normalized_or(self, fallback: Self) -> Self {
-        self.normalized().unwrap_or(fallback)
-    }
-
-    /// Rodrigues rotation about a unit axis through the origin.
-    #[inline]
-    pub fn rotate_about(self, axis: Self, angle: f64) -> Self {
-        let (sin, cos) = angle.sin_cos();
-        self.scale(cos)
-            .add(axis.cross(self).scale(sin))
-            .add(axis.scale(axis.dot(self) * (1.0 - cos)))
-    }
-
-    /// Distance to a segment. `guard` is the caller's squared-length threshold.
-    #[inline]
-    pub fn distance_to_segment(self, start: Self, end: Self, guard: f64) -> f64 {
-        let segment = end.sub(start);
-        let length_squared = segment.dot(segment);
-        if length_squared <= guard {
-            return self.sub(start).length();
-        }
-        let parameter = (self.sub(start).dot(segment) / length_squared).clamp(0.0, 1.0);
-        self.sub(start.add(segment.scale(parameter))).length()
-    }
-
-    /// Squared distance, retaining the seed sweep's projection on zero-length segments.
-    #[inline]
-    pub fn distance_to_segment_squared(self, start: Self, end: Self) -> f64 {
-        let segment = end.sub(start);
-        let length_squared = segment.dot(segment);
-        let parameter = if length_squared > 0.0 {
-            (self.sub(start).dot(segment) / length_squared).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let residual = self.sub(start.add(segment.scale(parameter)));
-        residual.dot(residual)
-    }
-
-    pub fn new(x: f64, y: f64, z: f64) -> Self {
-        Self { x, y, z }
-    }
-    pub fn sub(self, rhs: Self) -> Self {
-        Self::new(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
-    }
-    pub fn add(self, rhs: Self) -> Self {
-        Self::new(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
-    }
-    pub fn scale(self, factor: f64) -> Self {
-        Self::new(self.x * factor, self.y * factor, self.z * factor)
-    }
-    pub fn cross(self, rhs: Self) -> Self {
-        Self::new(
-            self.y * rhs.z - self.z * rhs.y,
-            self.z * rhs.x - self.x * rhs.z,
-            self.x * rhs.y - self.y * rhs.x,
-        )
-    }
-    pub fn dot(self, rhs: Self) -> f64 {
-        self.x * rhs.x + self.y * rhs.y + self.z * rhs.z
-    }
-    pub fn length(self) -> f64 {
-        self.dot(self).sqrt()
-    }
-    pub fn length_squared(self) -> f64 {
-        self.dot(self)
-    }
-    pub fn normalized(self) -> Result<Self, String> {
-        let length = self.length();
-        if length <= 1e-12 {
-            return Err("Vec3.normalized: zero-length vector".into());
-        }
-        Ok(self.scale(1.0 / length))
-    }
-    pub fn perpendicular(self) -> Result<Self, String> {
-        let x = self.x.abs();
-        let y = self.y.abs();
-        let z = self.z.abs();
-        let axis = if x <= y && x <= z {
-            Self::new(1.0, 0.0, 0.0)
-        } else if y <= z {
-            Self::new(0.0, 1.0, 0.0)
-        } else {
-            Self::new(0.0, 0.0, 1.0)
-        };
-        self.cross(axis).normalized()
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct Mesh {
-    pub positions: Vec<f64>,
-    pub normals: Vec<f64>,
-    pub indices: Vec<u32>,
-    pub face_ids: Vec<u32>,
-}
-
-impl Mesh {
-    fn push_vertex(&mut self, point: Vec3, normal: Vec3) -> u32 {
-        self.positions.extend([point.x, point.y, point.z]);
-        self.normals.extend([normal.x, normal.y, normal.z]);
-        (self.positions.len() / 3 - 1) as u32
-    }
-
-    fn quad(&mut self, points: [Vec3; 4], normal: Vec3, face_id: u32) {
-        let base = self.push_vertex(points[0], normal);
-        for point in points.iter().skip(1) {
-            self.push_vertex(*point, normal);
-        }
-        self.indices
-            .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
-        self.face_ids.extend([face_id, face_id]);
-    }
-
-    pub fn signed_volume(&self) -> f64 {
-        self.indices
-            .chunks_exact(3)
-            .map(|tri| {
-                let point = |index: u32| {
-                    let i = index as usize * 3;
-                    Vec3::new(
-                        self.positions[i],
-                        self.positions[i + 1],
-                        self.positions[i + 2],
-                    )
-                };
-                point(tri[0]).dot(point(tri[1]).cross(point(tri[2]))) / 6.0
-            })
-            .sum()
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        if self.positions.len() % 3 != 0 || self.normals.len() != self.positions.len() {
-            return Err("invalid vertex or normal buffer".into());
-        }
-        self.validate_geometry()
-    }
-
-    /// Geometry-only validation for consumers that use positions + indices but
-    /// NOT normals (e.g. `signed_volume`, whose tetrahedron sum never reads a
-    /// normal). Mesh-only solids such as sheet-metal bodies supply metrics
-    /// meshes with an empty normal buffer, which is legitimate for volume.
-    pub fn validate_geometry(&self) -> Result<(), String> {
-        if self.positions.len() % 3 != 0 {
-            return Err("invalid vertex buffer".into());
-        }
-        if self.indices.len() % 3 != 0 {
-            return Err("index buffer is not triangular".into());
-        }
-        let count = self.positions.len() / 3;
-        if self.indices.iter().any(|index| *index as usize >= count) {
-            return Err("index outside vertex buffer".into());
-        }
-        if !self.positions.iter().all(|value| value.is_finite()) {
-            return Err("non-finite vertex".into());
-        }
-        Ok(())
-    }
-}
-
-pub fn make_box(size_x: f64, size_y: f64, size_z: f64) -> Mesh {
-    let x = size_x.abs();
-    let y = size_y.abs();
-    let z = size_z.abs();
-    let p = [
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(x, 0.0, 0.0),
-        Vec3::new(x, y, 0.0),
-        Vec3::new(0.0, y, 0.0),
-        Vec3::new(0.0, 0.0, z),
-        Vec3::new(x, 0.0, z),
-        Vec3::new(x, y, z),
-        Vec3::new(0.0, y, z),
-    ];
-    let mut mesh = Mesh::default();
-    mesh.quad([p[0], p[3], p[2], p[1]], Vec3::new(0.0, 0.0, -1.0), 0);
-    mesh.quad([p[4], p[5], p[6], p[7]], Vec3::new(0.0, 0.0, 1.0), 1);
-    mesh.quad([p[0], p[1], p[5], p[4]], Vec3::new(0.0, -1.0, 0.0), 2);
-    mesh.quad([p[3], p[7], p[6], p[2]], Vec3::new(0.0, 1.0, 0.0), 3);
-    mesh.quad([p[0], p[4], p[7], p[3]], Vec3::new(-1.0, 0.0, 0.0), 4);
-    mesh.quad([p[1], p[2], p[6], p[5]], Vec3::new(1.0, 0.0, 0.0), 5);
-    mesh
-}
-
-pub fn make_cylinder(radius: f64, height: f64, segments: usize) -> Mesh {
-    let radius = radius.abs();
-    let height = height.abs();
-    let segments = segments.max(3);
-    let mut mesh = Mesh::default();
-    for i in 0..segments {
-        let a = std::f64::consts::TAU * i as f64 / segments as f64;
-        let b = std::f64::consts::TAU * (i + 1) as f64 / segments as f64;
-        let (sa, ca) = a.sin_cos();
-        let (sb, cb) = b.sin_cos();
-        let pa = Vec3::new(radius * ca, 0.0, -radius * sa);
-        let pb = Vec3::new(radius * cb, 0.0, -radius * sb);
-        let ta = Vec3::new(pa.x, height, pa.z);
-        let tb = Vec3::new(pb.x, height, pb.z);
-        mesh.quad(
-            [pa, pb, tb, ta],
-            Vec3::new((ca + cb) * 0.5, 0.0, -(sa + sb) * 0.5),
-            0,
-        );
-        let bottom = mesh.push_vertex(Vec3::default(), Vec3::new(0.0, -1.0, 0.0));
-        let bi = mesh.push_vertex(pb, Vec3::new(0.0, -1.0, 0.0));
-        let bj = mesh.push_vertex(pa, Vec3::new(0.0, -1.0, 0.0));
-        mesh.indices.extend([bottom, bi, bj]);
-        mesh.face_ids.push(1);
-        let top = mesh.push_vertex(Vec3::new(0.0, height, 0.0), Vec3::new(0.0, 1.0, 0.0));
-        let ti = mesh.push_vertex(ta, Vec3::new(0.0, 1.0, 0.0));
-        let tj = mesh.push_vertex(tb, Vec3::new(0.0, 1.0, 0.0));
-        mesh.indices.extend([top, ti, tj]);
-        mesh.face_ids.push(2);
-    }
-    mesh
-}
 
 
 mod abi;
 pub use abi::*;
 
 
-#[path = "healing/curve_helpers.rs"]
-mod curve_helpers;
+/// The source hashes of the kernel's crates (each crate's `build.rs`); together they are the stamp the
+/// parts library compares snapshots against, so a change in any kernel crate invalidates them.
+pub(crate) static KERNEL_SOURCE_HASHES: &[Option<&str>] = &[option_env!("BREP_KERNEL_SOURCE_HASH"), brep_geometry::SOURCE_HASH, brep_topology::SOURCE_HASH, brep_surface_offset::SOURCE_HASH, brep_boolean::SOURCE_HASH, brep_construction::SOURCE_HASH, brep_blend::SOURCE_HASH, brep_offset::SOURCE_HASH, brep_direct_edit::SOURCE_HASH, brep_solvers::SOURCE_HASH];
 
-#[path = "geometry/eigen2.rs"]
-mod eigen2;
-
-#[path = "geometry/union_find.rs"]
-pub mod union_find;
-pub use union_find::UnionFind;
-
-#[path = "geometry/poly.rs"]
-pub mod poly;
-
-pub use analytic_surface::{circumcenter, circumcenter_2d, recognize_circle, RecognizedCircle};
-
-#[path = "geometry/triangle.rs"]
-mod triangle;
-pub use triangle::closest_point_on_triangle;
-
-pub use tolerance::RIGID_TOL;
-
-impl std::ops::Index<usize> for Vec3 {
-    type Output = f64;
-    fn index(&self, index: usize) -> &Self::Output {
-        match index { 0 => &self.x, 1 => &self.y, 2 => &self.z, _ => panic!("Vec3 index out of bounds: {index}") }
+/// One stamp over the crates' hashes; `None` when any crate could not compute its own.
+pub(crate) fn combined_source_stamp(parts: &[Option<&str>]) -> Option<String> {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for byte in part.as_ref()?.bytes().chain([0]) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     }
+    Some(format!("{hash:016x}"))
 }
-impl std::ops::IndexMut<usize> for Vec3 {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        match index { 0 => &mut self.x, 1 => &mut self.y, 2 => &mut self.z, _ => panic!("Vec3 index out of bounds: {index}") }
-    }
+
+/// Drop every reading memo (the history cache's clear, a document switch): the
+/// topology memos and the boolean, heal and face-merge memos keyed on them.
+pub(crate) fn clear_reading_memos() {
+    brep_geometry::projection::clear_curve_seed_cache();
+    crate::reading_memo::clear();
+    crate::heal::clear_claim_memo();
+    crate::face_merge::clear_decline_memo();
+    crate::boolean::clear_candidate_memo();
+    crate::imprint::clear_window_memo();
+    crate::imprint::clear_touch_memo();
 }
+
+

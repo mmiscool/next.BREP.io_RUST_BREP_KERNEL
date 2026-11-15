@@ -158,7 +158,17 @@ impl EngineState {
                 }
                 continue;
             }
-            let drawn = pmi_present(&geometry, label, &row.text, &row_style);
+            // A weld callout in symbol style is drawn as its weld symbol from the
+            // kernel leader's seam point and the label (the elbow).
+            let drawn = match self.weld_symbol_layout(row, &geometry, label) {
+                Some((symbol, anchor, elbow, frame)) => {
+                    let mut drawn = crate::pmi_weld_symbol::present(&symbol, anchor, elbow, &frame);
+                    let strokes: Vec<Vec<[f64; 3]>> = drawn.texts.iter().flat_map(|run| run.strokes()).collect();
+                    drawn.polylines.extend(strokes);
+                    drawn
+                }
+                None => pmi_present(&geometry, label, &row.text, &row_style),
+            };
             if let brep_kernel::PmiGeometry::CenterMark { marks, .. } = &geometry {
                 // Each mark is drawn as six polylines, its two short cross
                 // arms first.
@@ -315,6 +325,65 @@ impl EngineState {
     /// annotations: `[{id, type, icon, text, status, message, color:[r,g,b],
     /// world:[x,y,z], enabled, open, selected, textSizePt}]`. Empty without an
     /// active view. The automation registry's copy of [`Self::pmi_labels`].
+    /// The weld symbol a `weldCallout` row asks for: `None` for another type,
+    /// the text-leader style or a weld feature not in the history; `Err` when
+    /// one of its numbers does not evaluate (the row then shows the error).
+    pub(crate) fn weld_symbol_result(&self, row: &brep_kernel::PmiAnnotationReport) -> Option<Result<crate::pmi_weld_symbol::WeldSymbol, String>> {
+        if row.kind != crate::pmi_weld_symbol::WELD_CALLOUT {
+            return None;
+        }
+        let state = self.pmi_state_shared();
+        let (_, annotation) = state.find_annotation(&row.id)?;
+        let weld_id = annotation.params.get("weld")?.as_str()?.trim().to_string();
+        let mut index = 0;
+        let weld = loop {
+            let id = self.feature_id_at(index)?;
+            if id == weld_id && self.feature_type_at(index).as_deref() == Some("WELD") {
+                break serde_json::from_str::<serde_json::Value>(&self.feature_params_json(index)).ok()?;
+            }
+            index += 1;
+        };
+        let env = brep_kernel::Env::build(&self.history.expressions(), &self.history.configurator()).ok();
+        let evaluate = |source: &str| env.as_ref().and_then(|env| env.eval(source).ok());
+        crate::pmi_weld_symbol::WeldSymbol::from_params(&annotation.params, &weld, &evaluate).transpose()
+    }
+
+    /// The weld symbol a row draws, when it draws one.
+    pub(crate) fn weld_symbol(&self, row: &brep_kernel::PmiAnnotationReport) -> Option<crate::pmi_weld_symbol::WeldSymbol> {
+        self.weld_symbol_result(row).and_then(Result::ok)
+    }
+
+    /// Everything a weld symbol row is drawn from: the symbol, the seam point
+    /// (the kernel leader's target), the elbow (the dragged label, else a
+    /// screen-space default beside the seam) and the view frame.
+    pub(crate) fn weld_symbol_layout(
+        &self,
+        row: &brep_kernel::PmiAnnotationReport,
+        geometry: &brep_kernel::PmiGeometry,
+        label: [f64; 3],
+    ) -> Option<(crate::pmi_weld_symbol::WeldSymbol, [f64; 3], [f64; 3], crate::pmi_weld_symbol::Frame)> {
+        let brep_kernel::PmiGeometry::Leader { targets, .. } = geometry else { return None };
+        let anchor = *targets.first()?;
+        let symbol = self.weld_symbol(row)?;
+        let active = self.pmi_active_view.as_deref()?;
+        let state = self.pmi_state_shared();
+        let text_size = state.find_view(active).map(|view| view.display.text_size_pt).unwrap_or(12.0);
+        let wpp = self.camera.world_per_pixel();
+        let (_, up, forward) = self.camera.basis();
+        let (height, arrow) = (TEXT_PX_AT_12PT * wpp * (text_size / 12.0), ARROW_PX * wpp);
+        // A picked annotation plane holds the symbol, as it holds every planar PMI row.
+        let frame = match row.plane {
+            Some(plane) => crate::pmi_weld_symbol::Frame::from_plane(plane.normal, plane.x_axis, height, arrow),
+            None => crate::pmi_weld_symbol::Frame::from_view(forward, up, height, arrow),
+        };
+        let dragged = state.find_annotation(&row.id).is_some_and(|(_, annotation)| annotation.label_world.is_some());
+        let elbow = if dragged { label } else { crate::pmi_weld_symbol::default_elbow(anchor, &frame) };
+        // In a picked annotation plane the elbow (and so the whole symbol) lies
+        // in the plane, as the kernel projects a dragged label.
+        let elbow = row.plane.map_or(elbow, |plane| plane.project(elbow));
+        Some((symbol, anchor, elbow, frame))
+    }
+
     pub fn pmi_labels_json(&self) -> String {
         serde_json::to_string(&self.pmi_labels()).unwrap_or_else(|_| "[]".into())
     }
@@ -363,6 +432,10 @@ impl EngineState {
                 // nobody sees.
                 let (status, message) = if row.status == PmiStatus::Ok && self.balloon_target_hidden_live(row) {
                     (PmiStatus::Error, LIVE_HIDDEN_MESSAGE.to_string())
+                } else if let (PmiStatus::Ok, Some(Err(error))) = (row.status, self.weld_symbol_result(row)) {
+                    // A weld symbol number that does not evaluate: the row shows
+                    // its text leader and this error, never a silently empty field.
+                    (PmiStatus::Error, error)
                 } else {
                     (row.status, row.message.clone())
                 };
@@ -376,6 +449,10 @@ impl EngineState {
                 let icon = pmi_type(&row.kind).map(|def| def.icon).unwrap_or("");
                 let text = if status == PmiStatus::Error || row.text.is_empty() {
                     format!("{} {}", icon, row.id)
+                } else if self.weld_symbol(row).is_some() {
+                    // The symbol carries the weld's texts; its chip is just the
+                    // handle (the type icon), so it does not cover the symbol.
+                    icon.to_string()
                 } else {
                     row.text.clone()
                 };
@@ -387,7 +464,10 @@ impl EngineState {
                     status: match status { PmiStatus::Ok => "ok", PmiStatus::Error => "error" },
                     message,
                     color,
-                    world: playback.as_ref().map_or(row.label_world, |poses| poses.shown(row, row.label_world)),
+                    world: match self.weld_symbol_layout(row, &row.geometry, row.label_world) {
+                        Some((_, _, elbow, _)) => elbow,
+                        None => playback.as_ref().map_or(row.label_world, |poses| poses.shown(row, row.label_world)),
+                    },
                     enabled: row.enabled,
                     open: self.pmi_open_annotation.as_deref() == Some(row.id.as_str()),
                     selected: self.pmi_selected_annotation.as_deref() == Some(row.id.as_str()),

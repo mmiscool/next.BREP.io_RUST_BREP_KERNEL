@@ -6,6 +6,7 @@
 //! requires; bottom-side footprints are already mirrored by their placement.
 use crate::csv_field;
 use crate::board::{Board, Placement, Shape};
+use crate::graphic::GraphicLayer;
 use crate::{Document, Point};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -43,6 +44,22 @@ impl Document {
     /// Gerber and drill files for the board. `name` prefixes every file name.
     pub fn fabrication(&self, name: &str) -> Result<Fabrication, String> {
         self.validate()?;
+        // A one-layer board has no bottom copper to put a back-side pad on, and
+        // drawing it on the top would make a board that is not the design. The
+        // design rule check names it; the export refuses it. (Storing the
+        // document does not: a refusal there would block every other edit.)
+        if self.board.layer_count == 1 {
+            if let Some(p) = self.board.placements.iter().find(|p| p.has_back_copper_pad()) {
+                let reference = self
+                    .components
+                    .iter()
+                    .find(|c| c.id == p.component)
+                    .map_or("A part", |c| c.reference.as_str());
+                return Err(format!(
+                    "{reference} has pads on the back copper, which a one-layer board does not have: add a second copper layer or move those pads to the front."
+                ));
+            }
+        }
         // The zones are refilled on a copy first: what is sent to be made is the
         // fill the copper as it stands asks for, never a stale one the user forgot
         // to refill.
@@ -122,13 +139,24 @@ impl Document {
         }
         let mut profile = Gerber::default();
         profile.select(Aperture::Circle(OUTLINE_WIDTH), Some("Profile"));
-        let mut outline: Vec<Point> = board.outline.clone();
-        outline.push(board.outline[0]);
-        profile.stroke(outline.iter().map(|p| origin.point(*p)));
+        // The outline, then each cutout, each its own closed loop of the profile.
+        for ring in std::iter::once(&board.outline).chain(board.cutouts.iter().map(|c| &c.points)) {
+            profile.stroke(ring.iter().chain(&ring[..1]).map(|p| origin.point(*p)));
+        }
         add("Edge_Cuts.gm1", profile.finish("Profile,NP", "Positive"));
 
-        let (plated, unplated) = drills(board, &origin);
+        let (plated, unplated, spans) = drills(board, &origin);
         let layers = board.layer_count;
+        // Blind and buried vias, one drill file per layer pair, numbered from 1
+        // at the top as Gerber X2 numbers copper.
+        for ((from, to), holes) in &spans {
+            let kind = if *from == 0 || *to + 1 == layers { "Blind" } else { "Buried" };
+            let (a, b) = (from + 1, to + 1);
+            add(
+                &format!("{kind}_{a}_{b}.drl"),
+                excellon(holes, &format!("Plated,{a},{b},{kind}"), &format!("Plated,{kind}")),
+            );
+        }
         add(
             "PTH.drl",
             excellon(&plated, &format!("Plated,1,{layers},PTH"), "Plated,PTH"),
@@ -401,6 +429,12 @@ fn readme(document: &Document, files: &[FabricationFile], warnings: &[String]) -
             "B_Silkscreen" => "Gerber X2, bottom silkscreen (legend)".into(),
             "Edge_Cuts" => "Gerber X2, board outline (profile)".into(),
             "PTH" => "Excellon, plated holes (vias and component holes)".into(),
+            span if span.starts_with("Blind_") || span.starts_with("Buried_") => {
+                let mut parts = span.split('_');
+                let kind = parts.next().unwrap_or("").to_lowercase();
+                let (a, b) = (parts.next().unwrap_or("?"), parts.next().unwrap_or("?"));
+                format!("Excellon, {kind} vias drilled between copper layers {a} and {b}")
+            }
             "NPTH" => "Excellon, non-plated holes".into(),
             "pos" => "pick and place (centroid), JLCPCB CPL columns".into(),
             "bom" => "bill of materials, JLCPCB BOM columns, grouped by value and footprint".into(),
@@ -492,7 +526,44 @@ impl Gerber {
     }
     /// Draw a copper-style shape grown by `grow` on every side.
     fn shape(&mut self, origin: &Origin, shape: Shape, grow: i32, function: Option<&'static str>) {
+        // Grown first, so a negative margin shrinks the shape to at least a
+        // point instead of writing a negative aperture.
+        let (shape, grow) = (shape.grown(grow), 0);
         match shape {
+            // No standard aperture is a rounded rectangle: drawn as a region of
+            // four straights and four EXACT quarter arcs (G02, multi-quadrant
+            // G75 is set in the header), so the film carries the copper the
+            // clearance and connectivity checks measured, not a facetted inside.
+            Shape::RoundRect { min, max, radius } => {
+                if let Some(function) = function {
+                    let _ = writeln!(self.body, "%TA.AperFunction,{function}*%");
+                }
+                let (lo, hi) = (
+                    Point::new(min.x + radius, min.y + radius),
+                    Point::new(max.x - radius, max.y - radius),
+                );
+                // Board y points down, so this walk (down the right side, then
+                // left along the bottom) is clockwise on the film.
+                let walk = [
+                    (Point::new(max.x, hi.y), Point::new(hi.x, max.y), hi),
+                    (Point::new(lo.x, max.y), Point::new(min.x, hi.y), Point::new(lo.x, hi.y)),
+                    (Point::new(min.x, lo.y), Point::new(lo.x, min.y), lo),
+                    (Point::new(hi.x, min.y), Point::new(max.x, lo.y), Point::new(hi.x, lo.y)),
+                ];
+                let (x, y) = origin.point(Point::new(max.x, lo.y));
+                let _ = writeln!(self.body, "G36*\nX{x}Y{y}D02*");
+                for (line_end, arc_end, centre) in walk {
+                    let (x, y) = origin.point(line_end);
+                    let _ = writeln!(self.body, "X{x}Y{y}D01*");
+                    let (cx, cy) = origin.point(centre);
+                    let (ex, ey) = origin.point(arc_end);
+                    let _ = writeln!(self.body, "G02*\nX{ex}Y{ey}I{}J{}D01*\nG01*", cx - x, cy - y);
+                }
+                self.body.push_str("G37*\n");
+                if function.is_some() {
+                    self.body.push_str("%TD*%\n");
+                }
+            }
             Shape::Rect { min, max } => {
                 self.select(
                     Aperture::Rect(max.x - min.x + 2 * grow, max.y - min.y + 2 * grow),
@@ -556,8 +627,8 @@ fn millimetres(um: impl Into<i64>) -> String {
 /// A drilled pad with copper around the hole, or a plated one of any size.
 fn pad_has_copper(placement: &Placement, index: usize) -> bool {
     let pad = &placement.footprint.pads[index];
-    match pad.drill {
-        Some(drill) if !pad.plated => pad.size.x.min(pad.size.y) > drill,
+    match pad.hole_size() {
+        Some(hole) if !pad.plated => pad.size.x > hole.x && pad.size.y > hole.y,
         _ => true,
     }
 }
@@ -599,7 +670,11 @@ fn copper(board: &Board, origin: &Origin, layer: u8) -> Gerber {
         gerber.select(Aperture::Circle(track.width), Some("Conductor"));
         gerber.stroke(track.points.iter().map(|p| origin.point(*p)));
     }
-    for via in &board.vias {
+    // A via's pad is on every layer it joins, and only those.
+    for via in board.vias.iter().filter(|v| {
+        let (from, to) = v.layers(board.layer_count);
+        (from..=to).contains(&layer)
+    }) {
         gerber.shape(
             origin,
             Shape::circle(via.at, via.diameter / 2),
@@ -610,19 +685,30 @@ fn copper(board: &Board, origin: &Origin, layer: u8) -> Gerber {
     gerber
 }
 
-/// Openings over pads on one side. Vias stay covered (tented).
+/// Openings over pads on one side: every pad whose copper reaches that side,
+/// unless the pad is set to stay covered there, grown by the pad's own mask
+/// margin or else the board's. Vias stay covered (tented) unless the board's
+/// rules say otherwise, when each via's ring opens on both sides.
 fn mask(board: &Board, origin: &Origin, top: bool) -> Gerber {
-    let side = if top { 0 } else { board.layer_count - 1 };
     let mut gerber = Gerber::default();
+    if !board.rules.tent_vias {
+        // Only on a side the via reaches: a blind via opens on its outer side,
+        // a buried one on neither.
+        let last = board.layer_count - 1;
+        for via in board.vias.iter().filter(|v| {
+            let (from, to) = v.layers(board.layer_count);
+            if top { from == 0 } else { to == last }
+        }) {
+            gerber.shape(origin, Shape::circle(via.at, via.diameter / 2), board.rules.mask_expansion, None);
+        }
+    }
     for placement in &board.placements {
         for pad in &placement.footprint.pads {
-            let (from, to) = placement.pad_layers(pad, board.layer_count);
-            let reaches = (from..=to).contains(&side) && (top || side != 0);
-            if reaches || (!top && pad.drill.is_some()) {
+            if pad_mask_open(board, placement, pad, top) {
                 gerber.shape(
                     origin,
                     placement.pad_shape(pad),
-                    board.rules.mask_expansion,
+                    pad.layers.mask_margin.unwrap_or(board.rules.mask_expansion),
                     None,
                 );
             }
@@ -631,7 +717,21 @@ fn mask(board: &Board, origin: &Origin, top: bool) -> Gerber {
     gerber
 }
 
-/// Stencil apertures for surface-mount pads on one side.
+/// Whether `pad` of `placement` gets a solder mask opening on the board's top
+/// (`top`) or bottom: its copper faces that side and it is not covered there.
+pub fn pad_mask_open(board: &Board, placement: &Placement, pad: &crate::board::Pad, top: bool) -> bool {
+    let side = if top { 0 } else { board.layer_count - 1 };
+    let (from, to) = placement.pad_layers(pad, board.layer_count);
+    // A one-layer board's bottom is layer 0 too: only a drilled pad reaches it.
+    let reaches = ((from..=to).contains(&side) && (top || side != 0)) || (!top && pad.drill.is_some());
+    reaches && !covered(pad, placement.front_faces(top))
+}
+fn covered(pad: &crate::board::Pad, front: bool) -> bool {
+    if front { pad.layers.cover_front } else { pad.layers.cover_back }
+}
+
+/// Stencil apertures for surface-mount pads on one side, grown by each pad's
+/// paste margin (0 unless set; negative shrinks the aperture).
 fn paste(board: &Board, origin: &Origin, top: bool) -> Gerber {
     let last = board.layer_count - 1;
     let mut gerber = Gerber::default();
@@ -640,11 +740,12 @@ fn paste(board: &Board, origin: &Origin, top: bool) -> Gerber {
             .footprint
             .pads
             .iter()
-            .filter(|p| p.drill.is_none())
+            .filter(|p| p.drill.is_none() && !p.layers.no_paste)
         {
             let (layer, _) = placement.pad_layers(pad, board.layer_count);
             if (top && layer == 0) || (!top && last != 0 && layer == last) {
-                gerber.shape(origin, placement.pad_shape(pad), 0, None);
+                let shape = placement.pad_shape(pad).grown(pad.layers.paste_margin.unwrap_or(0));
+                gerber.shape(origin, shape, 0, None);
             }
         }
     }
@@ -659,10 +760,19 @@ fn legend(
     unsupported: &mut BTreeSet<char>,
 ) -> Gerber {
     let mut gerber = Gerber::default();
-    for placement in document.board.placements.iter().filter(|p| p.bottom != top) {
-        for line in &placement.footprint.silk {
-            gerber.select(Aperture::Circle(SILK_WIDTH), None);
-            gerber.stroke(line.iter().map(|p| origin.point(placement.transform(*p))));
+    let layer = if top { GraphicLayer::FrontSilk } else { GraphicLayer::BackSilk };
+    // What is drawn on the board itself, then each part's own.
+    for (width, filled, strokes) in document.board.drawing_on(layer) {
+        ink(&mut gerber, origin, width, filled, &strokes);
+    }
+    for placement in &document.board.placements {
+        // Every drawn item on this side's silkscreen, the part's own `silk`
+        // lines among them: a filled shape is a region, outlined by its pen.
+        for (width, filled, strokes) in placement.drawing_on(layer) {
+            ink(&mut gerber, origin, width, filled, &strokes);
+        }
+        if placement.bottom == top {
+            continue;
         }
         let Some(component) = document
             .components
@@ -676,7 +786,7 @@ fn legend(
             ((i64::from(min.x) + i64::from(max.x)) / 2) as i32,
             min.y - SILK_WIDTH,
         );
-        for stroke in text_strokes(&component.reference, anchor, !top, unsupported) {
+        for stroke in crate::font::text_strokes(&component.reference, anchor, TEXT_HEIGHT, !top, unsupported) {
             gerber.select(Aperture::Circle(SILK_WIDTH), None);
             gerber.stroke(stroke.iter().map(|p| origin.point(*p)));
         }
@@ -684,94 +794,20 @@ fn legend(
     gerber
 }
 
-/// Stroke-font glyphs on a 4 × 6 cell, Y up. Each glyph is polylines separated by
-/// `;`, each polyline a list of `x,y` pairs.
-fn glyph(c: char) -> Option<&'static str> {
-    Some(match c {
-        '0' => "1,0 0,1 0,5 1,6 3,6 4,5 4,1 3,0 1,0;1,1 3,5",
-        '1' => "1,5 2,6 2,0;1,0 3,0",
-        '2' => "0,5 1,6 3,6 4,5 4,4 0,0 4,0",
-        '3' => "0,5 1,6 3,6 4,5 4,4 3,3 4,2 4,1 3,0 1,0 0,1;1,3 3,3",
-        '4' => "3,0 3,6 0,2 4,2",
-        '5' => "4,6 0,6 0,3 3,3 4,2 4,1 3,0 0,0",
-        '6' => "4,5 3,6 1,6 0,5 0,1 1,0 3,0 4,1 4,2 3,3 0,3",
-        '7' => "0,6 4,6 1,0",
-        '8' => "1,3 0,4 0,5 1,6 3,6 4,5 4,4 3,3 1,3 0,2 0,1 1,0 3,0 4,1 4,2 3,3",
-        '9' => "0,1 1,0 3,0 4,1 4,5 3,6 1,6 0,5 0,4 1,3 4,3",
-        'A' => "0,0 0,4 2,6 4,4 4,0;0,3 4,3",
-        'B' => "0,3 3,3 4,4 4,5 3,6 0,6 0,0 3,0 4,1 4,2 3,3",
-        'C' => "4,5 3,6 1,6 0,5 0,1 1,0 3,0 4,1",
-        'D' => "0,0 0,6 2,6 4,4 4,2 2,0 0,0",
-        'E' => "4,6 0,6 0,0 4,0;0,3 3,3",
-        'F' => "4,6 0,6 0,0;0,3 3,3",
-        'G' => "4,5 3,6 1,6 0,5 0,1 1,0 3,0 4,1 4,3 2,3",
-        'H' => "0,0 0,6;4,0 4,6;0,3 4,3",
-        'I' => "1,6 3,6;2,6 2,0;1,0 3,0",
-        'J' => "4,6 4,1 3,0 1,0 0,1",
-        'K' => "0,0 0,6;4,6 0,2;1,3 4,0",
-        'L' => "0,6 0,0 4,0",
-        'M' => "0,0 0,6 2,3 4,6 4,0",
-        'N' => "0,0 0,6 4,0 4,6",
-        'O' => "1,0 0,1 0,5 1,6 3,6 4,5 4,1 3,0 1,0",
-        'P' => "0,0 0,6 3,6 4,5 4,4 3,3 0,3",
-        'Q' => "1,0 0,1 0,5 1,6 3,6 4,5 4,1 3,0 1,0;2,2 4,0",
-        'R' => "0,0 0,6 3,6 4,5 4,4 3,3 0,3;2,3 4,0",
-        'S' => "4,5 3,6 1,6 0,5 0,4 1,3 3,3 4,2 4,1 3,0 1,0 0,1",
-        'T' => "0,6 4,6;2,6 2,0",
-        'U' => "0,6 0,1 1,0 3,0 4,1 4,6",
-        'V' => "0,6 2,0 4,6",
-        'W' => "0,6 1,0 2,3 3,0 4,6",
-        'X' => "0,0 4,6;0,6 4,0",
-        'Y' => "0,6 2,3 4,6;2,3 2,0",
-        'Z' => "0,6 4,6 0,0 4,0",
-        '-' => "1,3 3,3",
-        '_' => "0,0 4,0",
-        '+' => "1,3 3,3;2,2 2,4",
-        '.' => "2,0 2,0",
-        '/' => "0,0 4,6",
-        '?' => "0,5 1,6 3,6 4,5 4,4 2,3 2,2;2,0 2,0",
-        _ => return None,
-    })
-}
-
-/// Polylines in board coordinates for `text` centred on `anchor`, with its
-/// baseline there. Bottom-side text is mirrored so it reads from below.
-fn text_strokes(
-    text: &str,
-    anchor: Point,
-    mirrored: bool,
-    unsupported: &mut BTreeSet<char>,
-) -> Vec<Vec<Point>> {
-    let unit = TEXT_HEIGHT / 6;
-    let count = text.chars().count() as i32;
-    let width = (count * 5 - 1).max(0) * unit;
-    let mut strokes = vec![];
-    for (i, c) in text.chars().enumerate() {
-        let c = c.to_ascii_uppercase();
-        if c == ' ' {
-            continue;
+/// One drawn item's centre lines on a legend film: a filled shape is a region
+/// (with no pen, the region alone), outlined by its pen.
+fn ink(gerber: &mut Gerber, origin: &Origin, width: i32, filled: bool, strokes: &[Vec<Point>]) {
+    for line in strokes {
+        gerber.select(Aperture::Circle(width.max(1)), None);
+        if filled && line.len() >= 4 {
+            gerber.body.push_str("G36*\n");
+            gerber.stroke(line.iter().map(|p| origin.point(*p)));
+            gerber.body.push_str("G37*\n");
         }
-        let shape = glyph(c).unwrap_or_else(|| {
-            unsupported.insert(c);
-            glyph('?').unwrap_or_default()
-        });
-        let left = i as i32 * 5;
-        for polyline in shape.split(';') {
-            strokes.push(
-                polyline
-                    .split(' ')
-                    .filter_map(|pair| {
-                        let (x, y) = pair.split_once(',')?;
-                        let (x, y) = (x.parse::<i32>().ok()?, y.parse::<i32>().ok()?);
-                        let offset = (left + x) * unit - width / 2;
-                        let offset = if mirrored { -offset } else { offset };
-                        Some(Point::new(anchor.x + offset, anchor.y - y * unit))
-                    })
-                    .collect(),
-            );
+        if width > 0 {
+            gerber.stroke(line.iter().map(|p| origin.point(*p)));
         }
     }
-    strokes
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -780,32 +816,41 @@ enum Hole {
     Component,
 }
 /// Drill hits grouped by (diameter, kind), in output coordinates.
-type Drills = BTreeMap<(i32, Hole), Vec<(i64, i64)>>;
+/// Holes by (tool diameter, kind): each a hit, or a slot routed from its first
+/// point to its second (equal for a round hole).
+type Drills = BTreeMap<(i32, Hole), Vec<((i64, i64), (i64, i64))>>;
 
-fn drills(board: &Board, origin: &Origin) -> (Drills, Drills) {
+/// Plated through holes, unplated holes, and the blind and buried vias by
+/// their (top, bottom) copper layers.
+fn drills(board: &Board, origin: &Origin) -> (Drills, Drills, BTreeMap<(u8, u8), Drills>) {
     let (mut plated, mut unplated) = (Drills::new(), Drills::new());
+    let mut spans: BTreeMap<(u8, u8), Drills> = BTreeMap::new();
     for via in &board.vias {
-        plated
-            .entry((via.drill, Hole::Via))
-            .or_default()
-            .push(origin.point(via.at));
+        let at = origin.point(via.at);
+        let target = match via.kind(board.layer_count) {
+            crate::board::ViaKind::Through => &mut plated,
+            _ => spans.entry(via.layers(board.layer_count)).or_default(),
+        };
+        target.entry((via.drill, Hole::Via)).or_default().push((at, at));
     }
     for placement in &board.placements {
         for pad in &placement.footprint.pads {
-            if let Some(drill) = pad.drill {
-                let target = if pad.plated {
-                    &mut plated
-                } else {
-                    &mut unplated
-                };
+            // A round hole is a capsule with its two centres together; a slot's
+            // tool is its width, routed between the two.
+            if let (Some(Shape::Capsule { a, b, radius }), Some(hole)) = (placement.pad_hole(pad), pad.hole_size()) {
+                let target = if pad.plated { &mut plated } else { &mut unplated };
+                // A round hole's tool is its drill, as always; a slot's is the width
+                // of the capsule every other check measures, so the drill file, the
+                // STEP and the ring agree to the micrometre.
+                let tool = if a == b { hole.x.min(hole.y) } else { 2 * radius };
                 target
-                    .entry((drill, Hole::Component))
+                    .entry((tool, Hole::Component))
                     .or_default()
-                    .push(origin.point(placement.transform(pad.at)));
+                    .push((origin.point(a), origin.point(b)));
             }
         }
     }
-    (plated, unplated)
+    (plated, unplated, spans)
 }
 
 /// Excellon drill file in the XNC subset, with decimal millimetre coordinates.
@@ -832,14 +877,17 @@ fn excellon(holes: &Drills, file_function: &str, plating: &str) -> String {
     out.push_str("%\nG05\n");
     for (tool, hits) in holes.values().enumerate() {
         let _ = writeln!(out, "T{}", tool + 1);
-        for (x, y) in hits {
-            // Output coordinates are nanometres; drill files use micrometre precision.
-            let _ = writeln!(
-                out,
-                "X{}Y{}",
-                millimetres(x.div_euclid(1000)),
-                millimetres(y.div_euclid(1000))
-            );
+        // Output coordinates are nanometres; drill files use micrometre precision.
+        let at = |(x, y): (i64, i64)| {
+            format!("X{}Y{}", millimetres(x.div_euclid(1000)), millimetres(y.div_euclid(1000)))
+        };
+        for (a, b) in hits {
+            if a == b {
+                let _ = writeln!(out, "{}", at(*a));
+            } else {
+                // A slot: the tool routed from one end centre to the other.
+                let _ = writeln!(out, "{}G85{}", at(*a), at(*b));
+            }
         }
     }
     out.push_str("M30\n");

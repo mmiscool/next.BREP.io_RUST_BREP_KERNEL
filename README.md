@@ -5,9 +5,13 @@ Release snapshots are maintained here, and public issues and pull requests are
 welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow.
 
 Start with [BREP](BREP/README.md), the umbrella crate, or use
-[BREP_kernel](BREP_kernel/README.md) directly. The workspace also includes surface
-recognition, reconstruction, rendering, CAD application, electronics, automation,
-PLM and documentation crates. Each crate has its own README.
+[BREP_kernel](BREP_kernel/README.md) directly. The kernel is built from nine
+implementation crates (`BREP_geometry`, `BREP_topology`, `BREP_surface_offset`,
+`BREP_boolean`, `BREP_solvers`, `BREP_construction`, `BREP_blend`, `BREP_offset`
+and `BREP_direct_edit`), released with it at one version. The workspace also
+includes surface recognition, reconstruction, rendering, CAD application,
+electronics, automation, PLM and documentation crates. Each crate has its own
+README.
 
 ```sh
 cargo check --workspace

@@ -136,6 +136,185 @@ impl Env {
     }
 }
 
+/// Put every statement of an expressions source on its own line, in order.
+///
+/// The only edit is a line break after a statement-ending `;` that has more
+/// code after it on the same line: the spaces and tabs after the `;` become a
+/// line break plus that line's own indentation. Nothing else moves. A `;`
+/// followed (on its line) only by a `//` comment keeps it, so a trailing
+/// comment stays with its statement; blank lines, multi-line statements and
+/// comment lines are untouched, and the line-break style (`\n` or `\r\n`)
+/// follows the source's.
+///
+/// Conservative by construction:
+/// * source that does not tokenize, or whose statements are not
+///   `IDENT '=' <well-formed expr> (';' | end)`, is returned exactly as given
+///   (no evaluation: an unknown name or a missing configurator field is not a
+///   syntax error, and still formats);
+/// * the result is returned only when its token stream equals the source's,
+///   so it evaluates to exactly the same variables and values;
+/// * it is idempotent: formatted text has no `;` with code after it on its
+///   line, so formatting it again changes nothing.
+pub fn format_expressions(source: &str) -> String {
+    let Ok(before) = tokenize(source) else {
+        return source.to_string();
+    };
+    if !statements_well_formed(&before) {
+        return source.to_string();
+    }
+    let bytes = source.as_bytes();
+    let newline = if source.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut out = String::with_capacity(source.len() + 16);
+    let mut copied = 0;
+    let mut line_start = 0;
+    // The indentation of the line the current statement starts on (a statement
+    // wrapped over lines keeps its first line's indent for the ones split
+    // after it); `None` until the statement's first code character is seen.
+    let mut indent: Option<(usize, usize)> = None;
+    let mut statement_started = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                line_start = i + 1;
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b';' => {
+                let mut next = i + 1;
+                while next < bytes.len() && (bytes[next] == b' ' || bytes[next] == b'\t') {
+                    next += 1;
+                }
+                let rest_of_line_empty = next == bytes.len()
+                    || bytes[next] == b'\n'
+                    || bytes[next] == b'\r'
+                    || (bytes[next] == b'/' && bytes.get(next + 1) == Some(&b'/'));
+                if rest_of_line_empty {
+                    statement_started = false;
+                } else {
+                    let (start, end) = indent.unwrap_or((line_start, line_start));
+                    out.push_str(&source[copied..=i]);
+                    out.push_str(newline);
+                    out.push_str(&source[start..end]);
+                    copied = next;
+                    // The next statement starts on the line just made, with
+                    // the same indent.
+                    statement_started = true;
+                }
+                i = next;
+            }
+            b' ' | b'\t' | b'\r' => i += 1,
+            _ => {
+                if !statement_started {
+                    let end = source[line_start..]
+                        .find(|c: char| c != ' ' && c != '\t')
+                        .map_or(source.len(), |offset| line_start + offset);
+                    indent = Some((line_start, end));
+                    statement_started = true;
+                }
+                i += 1;
+            }
+        }
+    }
+    if copied == 0 {
+        return source.to_string();
+    }
+    out.push_str(&source[copied..]);
+    match tokenize(&out) {
+        Ok(after) if after == before => out,
+        _ => source.to_string(),
+    }
+}
+
+/// Whether a token stream is a sequence of `IDENT '=' expr` statements, each
+/// ended by `;` (the last may end at the end of the source) — the shape
+/// [`Env::build`] accepts, checked without evaluating anything.
+fn statements_well_formed(tokens: &[Token]) -> bool {
+    let mut pos = 0;
+    while tokens.get(pos).is_some_and(|token| *token != Token::Eof) {
+        if !matches!(tokens.get(pos), Some(Token::Ident(_))) || tokens.get(pos + 1) != Some(&Token::Assign) {
+            return false;
+        }
+        pos += 2;
+        if !expr_well_formed(tokens, &mut pos, 0) {
+            return false;
+        }
+        match tokens.get(pos) {
+            Some(Token::Semi) => pos += 1,
+            Some(Token::Eof) | None => {}
+            Some(_) => return false,
+        }
+    }
+    true
+}
+
+/// Nesting deeper than this (parentheses or call arguments) is not
+/// formatted: the check recurses once per level and must not exhaust the
+/// stack on hostile input.
+const MAX_FORMAT_DEPTH: usize = 128;
+
+/// `expr` of the module grammar, syntax only; advances `pos` past it.
+fn expr_well_formed(tokens: &[Token], pos: &mut usize, depth: usize) -> bool {
+    if depth > MAX_FORMAT_DEPTH {
+        return false;
+    }
+    loop {
+        // unary := ('-' | '+')* primary
+        while matches!(tokens.get(*pos), Some(Token::Minus | Token::Plus)) {
+            *pos += 1;
+        }
+        match tokens.get(*pos) {
+            Some(Token::Number(_)) => *pos += 1,
+            Some(Token::LParen) => {
+                *pos += 1;
+                if !expr_well_formed(tokens, pos, depth + 1) || tokens.get(*pos) != Some(&Token::RParen) {
+                    return false;
+                }
+                *pos += 1;
+            }
+            Some(Token::Ident(_)) => {
+                *pos += 1;
+                while tokens.get(*pos) == Some(&Token::Dot) {
+                    if !matches!(tokens.get(*pos + 1), Some(Token::Ident(_))) {
+                        return false;
+                    }
+                    *pos += 2;
+                }
+                if tokens.get(*pos) == Some(&Token::LParen) {
+                    *pos += 1;
+                    if tokens.get(*pos) == Some(&Token::RParen) {
+                        *pos += 1;
+                    } else {
+                        loop {
+                            if !expr_well_formed(tokens, pos, depth + 1) {
+                                return false;
+                            }
+                            match tokens.get(*pos) {
+                                Some(Token::Comma) => *pos += 1,
+                                Some(Token::RParen) => {
+                                    *pos += 1;
+                                    break;
+                                }
+                                _ => return false,
+                            }
+                        }
+                    }
+                }
+            }
+            _ => return false,
+        }
+        // A binary operator continues the expression with another operand.
+        match tokens.get(*pos) {
+            Some(Token::Plus | Token::Minus | Token::Star | Token::Slash | Token::Percent) => *pos += 1,
+            _ => return true,
+        }
+    }
+}
+
 /// Extract the flat `field -> f64` values map from a configurator JSON value,
 /// preferring a `.values` sub-object (the normalized configurator state shape).
 /// Non-numeric fields are dropped (an expression referencing one errors clearly

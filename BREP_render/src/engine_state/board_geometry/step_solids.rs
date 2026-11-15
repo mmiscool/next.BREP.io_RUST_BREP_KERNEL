@@ -10,7 +10,8 @@
 //!
 //!   * `PCB_Board` — the outline swept through `SUBSTRATE_THICKNESS`, DRILLED:
 //!     every via and every through-hole pad is a cylindrical hole through it,
-//!     which the display substrate is not;
+//!     which the display substrate is not; and with the board's cutouts milled
+//!     through it, as the display substrate also has them;
 //!   * `PCB_<layer>/<net>#<n>` — one thin solid per copper primitive (track
 //!     segment, pad, via ring) on each layer, `COPPER_THICKNESS` thick, with
 //!     true circular arcs for round track ends and pads, and a drilled pad or
@@ -46,7 +47,7 @@
 //! fail the whole export: a board with one odd pad still exports its board,
 //! and the export posts a notice naming what is missing.
 
-use super::{copper_and_nets, mm, oriented_outline, xy, BOARD_SOLID_PREFIX, SUBSTRATE_SOLID, VIAS_SOLID};
+use super::{copper_and_nets, cutout_rings, mm, oriented_outline, xy, BOARD_SOLID_PREFIX, SUBSTRATE_SOLID, VIAS_SOLID};
 use brep_ecad_core::board::{self, Board, CopperRef, Shape};
 use brep_ecad_core::Netlist;
 use brep_kernel::{
@@ -74,11 +75,24 @@ pub(crate) struct BoardStepSolids {
     pub notices: Vec<String>,
 }
 
-/// One drilled hole: centre (mm, +Y up) and diameter (mm).
+/// One drilled hole: centre (mm, +Y up) and diameter (mm). A SLOT is the
+/// diameter swept from `at` to `to`; a round hole has `to == at`.
 #[derive(Clone, Copy)]
 struct Hole {
     at: [f64; 2],
+    to: [f64; 2],
     diameter: f64,
+    /// How deep a BLIND hole goes, as the z range it opens (mm); `None` for a
+    /// hole through the whole board.
+    depth: Option<(f64, f64)>,
+}
+impl Hole {
+    fn round(at: [f64; 2], diameter: f64) -> Self {
+        Self { at, to: at, diameter, depth: None }
+    }
+    fn is_round(&self) -> bool {
+        (self.to[0] - self.at[0]).hypot(self.to[1] - self.at[1]) <= 1e-9
+    }
 }
 
 fn point(p: [f64; 2], z: f64) -> Vec3 {
@@ -109,6 +123,37 @@ fn half_arc(centre: [f64; 2], radius: f64, start: f64, z: f64) -> Result<NurbsCu
 /// half-circles (the extruder wants at least two curves).
 fn shape_curves(shape: &Shape, z: f64) -> Result<Vec<NurbsCurve>, String> {
     match *shape {
+        // Four quarter arcs about the core rectangle's corners, joined by the
+        // straights between them (none where the radius takes a whole side).
+        Shape::RoundRect { min, max, radius } => {
+            let r = mm(radius);
+            let (a, b) = (xy(min), xy(max));
+            let (x0, x1) = (a[0].min(b[0]) + r, a[0].max(b[0]) - r);
+            let (y0, y1) = (a[1].min(b[1]) + r, a[1].max(b[1]) - r);
+            if r <= 1e-6 || x1 < x0 - 1e-9 || y1 < y0 - 1e-9 {
+                return Err("degenerate rounded rectangle".into());
+            }
+            let half = std::f64::consts::FRAC_PI_2;
+            let at = |c: [f64; 2], t: f64| [c[0] + r * t.cos(), c[1] + r * t.sin()];
+            let mut curves = vec![];
+            for (k, c) in [[x1, y0], [x1, y1], [x0, y1], [x0, y0]].into_iter().enumerate() {
+                let start = half * (k as f64 - 1.);
+                curves.push(make_arc(
+                    point(c, z),
+                    Vec3::new(1., 0., 0.),
+                    Vec3::new(0., 1., 0.),
+                    r,
+                    start,
+                    start + half,
+                )?);
+                let next = [[x1, y1], [x0, y1], [x0, y0], [x1, y0]][k];
+                let (from, to) = (at(c, start + half), at(next, start + half));
+                if (from[0] - to[0]).hypot(from[1] - to[1]) > 1e-6 {
+                    curves.push(make_line(point(from, z), point(to, z))?);
+                }
+            }
+            Ok(curves)
+        }
         Shape::Rect { min, max } => {
             let (a, b) = (xy(min), xy(max));
             let (x0, x1) = (a[0].min(b[0]), a[0].max(b[0]));
@@ -174,7 +219,7 @@ fn ring(centre: [f64; 2], r_in: f64, r_out: f64, lo: f64, hi: f64) -> Result<Bre
 fn drilled(shape: &Shape, hole: Hole, lo: f64, hi: f64) -> Result<BrepSolid, String> {
     if let Shape::Capsule { a, b, radius } = *shape {
         let centred = (xy(a)[0] - hole.at[0]).hypot(xy(a)[1] - hole.at[1]) <= 1e-6;
-        if a == b && centred {
+        if a == b && centred && hole.is_round() {
             return ring(hole.at, hole.diameter / 2., mm(radius), lo, hi);
         }
     }
@@ -186,6 +231,28 @@ fn drilled(shape: &Shape, hole: Hole, lo: f64, hi: f64) -> Result<BrepSolid, Str
 /// with, clear of both faces so no cap is coplanar with the body's.
 fn cutter(hole: &Hole, lo: f64, hi: f64) -> Result<BrepSolid, String> {
     let margin = 1.0;
+    // A blind hole: from past the outer face it opens on down (or up) to the
+    // plane of the inner layer it stops at.
+    let (lo, hi, margin_lo, margin_hi) = match hole.depth {
+        Some((d_lo, d_hi)) => (d_lo.max(lo), d_hi.min(hi), if d_lo <= lo { margin } else { 0. }, if d_hi >= hi { margin } else { 0. }),
+        None => (lo, hi, margin, margin),
+    };
+    if hole.depth.is_some() {
+        return make_cylinder_brep(
+            point(hole.at, lo - margin_lo),
+            Vec3::new(0., 0., 1.),
+            hole.diameter / 2.,
+            hi - lo + margin_lo + margin_hi,
+        );
+    }
+    if !hole.is_round() {
+        // A slot: its stadium, exact arcs and straights, swept through.
+        let (z0, z1) = (lo - margin, hi + margin);
+        let um = |v: f64| (v * 1000.).round() as i32;
+        let end = |p: [f64; 2]| brep_ecad_core::Point::new(um(p[0]), -um(p[1]));
+        let slot = Shape::Capsule { a: end(hole.at), b: end(hole.to), radius: um(hole.diameter / 2.) };
+        return prism(&shape_curves(&slot, z0)?, z0, z1);
+    }
     make_cylinder_brep(
         point(hole.at, lo - margin),
         Vec3::new(0., 0., 1.),
@@ -217,6 +284,35 @@ fn drill(body: BrepSolid, holes: &[Hole], lo: f64, hi: f64) -> Result<BrepSolid,
     for hole in holes {
         body = boolean_operation(&body, &cutter(hole, lo, hi)?, BooleanOperation::Subtract, &options)
             .map_err(|refusal| format!("hole at ({:.3}, {:.3}): {refusal}", hole.at[0], hole.at[1]))?;
+    }
+    Ok(body)
+}
+
+/// Mill the board's cutouts out of the substrate `body`: each cutout's polygon
+/// swept clear of both faces, all in one n-ary subtract, one at a time if the
+/// kernel refuses the set (as [`drill`] does).
+fn cut_out(body: BrepSolid, board: &Board, lo: f64, hi: f64) -> Result<BrepSolid, String> {
+    if board.cutouts.is_empty() {
+        return Ok(body);
+    }
+    let (z0, z1) = (lo - 1., hi + 1.);
+    let cutters = cutout_rings(board)
+        .into_iter()
+        .map(|mut ring| {
+            // Wound counter-clockwise, as the outline is swept.
+            ring.reverse();
+            prism(&polygon_curves(&ring, z0)?, z0, z1)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let operands: Vec<BrepSolid> = std::iter::once(body.clone()).chain(cutters.iter().cloned()).collect();
+    if let Ok(cut) = brep_kernel::boolean_operation_nary(&operands, BooleanOperation::Subtract) {
+        return Ok(cut);
+    }
+    let options = BooleanOptions::default();
+    let mut body = body;
+    for (k, cutter) in cutters.iter().enumerate() {
+        body = boolean_operation(&body, cutter, BooleanOperation::Subtract, &options)
+            .map_err(|refusal| format!("cutout {}: {refusal}", k + 1))?;
     }
     Ok(body)
 }
@@ -264,30 +360,47 @@ fn fill_solid(piece: &board::FillPiece, lo: f64, hi: f64) -> Result<BrepSolid, S
 /// The drill a copper primitive surrounds: a via's, or a drilled pad's.
 fn item_hole(board: &Board, owner: &CopperRef) -> Option<Hole> {
     match *owner {
-        CopperRef::Via(index) => board.vias.get(index).map(|via| Hole {
-            at: xy(via.at),
-            diameter: mm(via.drill),
-        }),
+        CopperRef::Via(index) => board.vias.get(index).map(|via| Hole::round(xy(via.at), mm(via.drill))),
         CopperRef::Pad { placement, pad } => {
             let placement = board.placements.get(placement)?;
             let pad = placement.footprint.pads.get(pad)?;
-            pad.drill.map(|drill| Hole {
-                at: xy(placement.transform(pad.at)),
-                diameter: mm(drill),
-            })
+            let hole = pad.hole_size()?;
+            match placement.pad_hole(pad)? {
+                // The slot the drill file routes: the capsule's own width.
+                Shape::Capsule { a, b, radius } if a != b => Some(Hole { at: xy(a), to: xy(b), diameter: mm(2 * radius), depth: None }),
+                _ => Some(Hole::round(xy(placement.transform(pad.at)), mm(hole.x.min(hole.y)))),
+            }
         }
         CopperRef::Track { .. } => None,
     }
 }
 
-/// Every hole through the board: each via's drill and each drilled pad's.
+/// Every hole in the board: each through via's drill and each drilled pad's,
+/// right through, and each BLIND via's from the outer face it opens on to the
+/// plane of its inner layer. A BURIED via's hole opens on neither face: it would
+/// be a closed cavity inside the substrate, which is not cut, and its barrel
+/// stands in solid substrate as every barrel does in the display.
 fn board_holes(board: &Board) -> Vec<Hole> {
-    let vias = (0..board.vias.len()).map(CopperRef::Via);
+    let count = board.layer_count;
+    let blind: Vec<Hole> = board
+        .vias
+        .iter()
+        .filter(|via| via.kind(count) == board::ViaKind::Blind)
+        .map(|via| {
+            let (from, to) = via.layers(count);
+            let depth = (mm(board::layer_z(to, count)), mm(board::layer_z(from, count)));
+            Hole { depth: Some(depth), ..Hole::round(xy(via.at), mm(via.drill)) }
+        })
+        .collect();
+    let vias = (0..board.vias.len())
+        .filter(|&v| board.vias[v].kind(count) == board::ViaKind::Through)
+        .map(CopperRef::Via);
     let pads = board.placements.iter().enumerate().flat_map(|(placement, p)| {
         (0..p.footprint.pads.len()).map(move |pad| CopperRef::Pad { placement, pad })
     });
     vias.chain(pads)
         .filter_map(|owner| item_hole(board, &owner))
+        .chain(blind)
         .filter(|hole| hole.diameter > 1e-6)
         .collect()
 }
@@ -327,7 +440,8 @@ pub(crate) fn board_step_solids(board: &Board, netlist: Option<&Netlist>) -> Opt
     // The substrate.
     let substrate = polygon_curves(&outline, board_lo)
         .and_then(|curves| prism(&curves, board_lo, board_hi))
-        .and_then(|body| drill(body, &holes, board_lo, board_hi));
+        .and_then(|body| drill(body, &holes, board_lo, board_hi))
+        .and_then(|body| cut_out(body, board, board_lo, board_hi));
     match substrate {
         Ok(body) => {
             out.bodies.push((SUBSTRATE_SOLID.to_string(), body));
@@ -381,7 +495,12 @@ pub(crate) fn board_step_solids(board: &Board, netlist: Option<&Netlist>) -> Opt
         let name = format!("{VIAS_SOLID}#{}", index + 1);
         let inner = mm(via.drill) / 2.;
         let outer = inner + mm(board::COPPER_THICKNESS);
-        let barrel = ring(xy(via.at), inner, outer, board_lo, board_hi);
+        let (from, to) = via.layers(board.layer_count);
+        let (lo, hi) = (
+            mm(board::layer_z(to, board.layer_count)),
+            mm(board::layer_z(from, board.layer_count)),
+        );
+        let barrel = ring(xy(via.at), inner, outer, lo, hi);
         match barrel {
             Ok(body) => {
                 out.colors.push((name.clone(), COPPER_RGB));

@@ -1,5 +1,6 @@
 //! KiCad 6+ symbol and footprint importers with inherited and multi-unit device support.
-use crate::board::{Footprint, Model, Pad, PadShape};
+use crate::board::{Footprint, Model, Pad, PadLayers, PadShape};
+use crate::graphic::{GraphicLayer, GraphicShape, LayerGraphic, arc_points};
 use crate::{Graphic, Pin, Point, Symbol};
 use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug)]
@@ -439,41 +440,11 @@ fn hidden(item: &Expr) -> Option<bool> {
         _ => None,
     })
 }
-fn arc_points(a: Point, m: Point, b: Point) -> Vec<Point> {
-    let (ax, ay, mx, my, bx, by) = (
-        a.x as f64, a.y as f64, m.x as f64, m.y as f64, b.x as f64, b.y as f64,
-    );
-    let d = 2. * (ax * (my - by) + mx * (by - ay) + bx * (ay - my));
-    if d.abs() < 0.01 {
-        return vec![a, m, b];
-    }
-    let (aa, mm, bb) = (ax * ax + ay * ay, mx * mx + my * my, bx * bx + by * by);
-    let cx = (aa * (my - by) + mm * (by - ay) + bb * (ay - my)) / d;
-    let cy = (aa * (bx - mx) + mm * (ax - bx) + bb * (mx - ax)) / d;
-    let start = (ay - cy).atan2(ax - cx);
-    let mid = (my - cy).atan2(mx - cx);
-    let end = (by - cy).atan2(bx - cx);
-    let tau = std::f64::consts::TAU;
-    let ccw = (end - start).rem_euclid(tau);
-    let sweep = if (mid - start).rem_euclid(tau) <= ccw {
-        ccw
-    } else {
-        ccw - tau
-    };
-    let r = ((ax - cx).powi(2) + (ay - cy).powi(2)).sqrt();
-    (0..=32)
-        .map(|i| {
-            let t = start + sweep * i as f64 / 32.;
-            Point::new(
-                (cx + r * t.cos()).round() as i32,
-                (cy + r * t.sin()).round() as i32,
-            )
-        })
-        .collect()
-}
 
-/// Import a KiCad 6+ `.kicad_mod` footprint. Silkscreen (or, without it, fabrication)
-/// outlines are kept. Pads rotated by other than a multiple of 90° are approximated by
+/// Import a KiCad 6+ `.kicad_mod` footprint. Lines, rectangles, polygons, circles,
+/// arcs and user text on F/B.SilkS, F/B.Fab and F/B.CrtYd are kept on their layers
+/// with their widths; without front silkscreen, the front fabrication outlines become
+/// the silkscreen, as they always have. Pads rotated by other than a multiple of 90° are approximated by
 /// their bounding box and reported in the warnings.
 pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> {
     let root = parse(text)?;
@@ -520,12 +491,30 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
         }
         _ => None,
     };
-    let (mut silk, mut fab) = (vec![], vec![]);
+    let mut drawn: Vec<LayerGraphic> = vec![];
     for item in root.list().iter().skip(2) {
-        let outline = match item.child("layer").map_or("", |l| l.arg(1)) {
-            "F.SilkS" | "F.Silkscreen" => Some(&mut silk),
-            "F.Fab" => Some(&mut fab),
-            _ => None,
+        let layer = GraphicLayer::from_name(item.child("layer").map_or("", |l| l.arg(1)));
+        // The pen: `(stroke (width w))` since KiCad 7, `(width w)` before.
+        let width = item
+            .child("stroke")
+            .and_then(|s| s.child("width"))
+            .or_else(|| item.child("width"))
+            .and_then(|w| w.number(1).ok())
+            .filter(|w| *w >= 0.)
+            .map(um);
+        let filled = item.child("fill").is_some_and(|f| matches!(f.arg(1), "solid" | "yes"));
+        // `pen` is a pen the item names other than its stroke (a text's font
+        // thickness).
+        let mut draw = |shape: GraphicShape, closed: bool, pen: Option<i32>| {
+            if let Some(layer) = layer {
+                let mut graphic = LayerGraphic::new(layer, shape);
+                graphic.filled = filled && closed;
+                // No pen is the layer's own, except on a filled shape, which
+                // KiCad draws without an outline.
+                let width = pen.or(width).filter(|w| *w > 0 || graphic.filled);
+                graphic.width = width.filter(|w| *w != layer.default_width());
+                drawn.push(graphic);
+            }
         };
         match item.head() {
             "pad" => {
@@ -548,23 +537,69 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
                         item.arg(1)
                     ));
                 }
-                let drill = item.child("drill").and_then(|d| {
-                    d.list()
-                        .iter()
-                        .skip(1)
-                        .find_map(|e| e.atom().parse::<f64>().ok())
-                });
-                let drill = match kind {
-                    "thru_hole" | "np_thru_hole" => Some(um(drill
-                        .filter(|d| *d > 0.)
-                        .ok_or("Through-hole pad without a drill")?)),
-                    "smd" | "connect" => None,
+                // `(drill 1.0)`, or `(drill oval 1.2 0.8)`: a slot's width (x) and
+                // height (y) in the pad's frame. An `(offset …)` child is a list,
+                // so it is never read as a number.
+                let (drill, oval) = match item.child("drill") {
+                    Some(d) => {
+                        let numbers: Vec<f64> =
+                            d.list().iter().skip(1).filter_map(|e| e.atom().parse::<f64>().ok()).collect();
+                        let oval = d.list().iter().any(|e| e.atom() == "oval");
+                        (numbers.first().copied(), if oval { numbers.get(1).copied() } else { None })
+                    }
+                    None => (None, None),
+                };
+                let (drill, mut drill_height) = match kind {
+                    "thru_hole" | "np_thru_hole" => (
+                        Some(um(drill
+                            .filter(|d| *d > 0.)
+                            .ok_or("Through-hole pad without a drill")?)),
+                        oval.filter(|h| *h > 0.).map(um),
+                    ),
+                    "smd" | "connect" => (None, None),
                     other => return Err(format!("Unsupported pad type {other}")),
                 };
+                let mut drill = drill;
+                if let (Some(width), Some(height)) = (drill, drill_height) {
+                    if (half_turn - 90.).abs() < 1e-6 {
+                        (drill, drill_height) = (Some(height), Some(width));
+                    } else if half_turn > 1e-6 {
+                        // A slot at an angle is not a shape here: drilled round at
+                        // its width, which never cuts copper the slot would not.
+                        warnings.push(format!(
+                            "Pad {} slot rotated {rotation}° is drilled round at its width",
+                            item.arg(1)
+                        ));
+                        (drill, drill_height) = (Some(width.min(height)), None);
+                    }
+                    if drill_height == drill {
+                        drill_height = None;
+                    }
+                }
+                let mut corner_radius = 0;
                 let shape = match item.arg(3) {
                     "circle" => PadShape::Circle,
                     "oval" => PadShape::Oval,
-                    "rect" | "roundrect" | "trapezoid" | "chamfered_rect" => PadShape::Rect,
+                    // KiCad gives the corner as a ratio of the smaller side, 0.25
+                    // when the file leaves it out.
+                    "roundrect" => {
+                        let ratio = item
+                            .child("roundrect_rratio")
+                            .and_then(|r| r.number(1).ok())
+                            .unwrap_or(0.25)
+                            .clamp(0., 0.5);
+                        corner_radius = um(ratio * w.min(h));
+                        if corner_radius > 0 { PadShape::RoundRect } else { PadShape::Rect }
+                    }
+                    "rect" => PadShape::Rect,
+                    "trapezoid" | "chamfered_rect" => {
+                        warnings.push(format!(
+                            "Pad {} shape {} is approximated by a rectangle",
+                            item.arg(1),
+                            item.arg(3)
+                        ));
+                        PadShape::Rect
+                    }
                     other => {
                         warnings.push(format!(
                             "Pad {} shape {other} is approximated by a rectangle",
@@ -573,19 +608,36 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
                         PadShape::Rect
                     }
                 };
-                if drill.is_none()
-                    && item.child("layers").is_some_and(|l| {
-                        let layers: Vec<&str> = l.list().iter().skip(1).map(Expr::atom).collect();
-                        layers.contains(&"B.Cu")
-                            && !layers.iter().any(|l| *l == "F.Cu" || *l == "*.Cu")
-                    })
-                {
-                    warnings.push(format!(
-                        "Bottom-side pad {} is placed on the footprint side",
-                        item.arg(1)
-                    ));
+                // The layers the pad names: its copper side, and whether the
+                // mask is open and paste applied on each side. With no list the
+                // pad keeps every default.
+                let named: Option<Vec<&str>> = item
+                    .child("layers")
+                    .map(|l| l.list().iter().skip(1).map(Expr::atom).collect());
+                let has = |layers: &[&str], name: &str| {
+                    let kind = &name[1..];
+                    layers
+                        .iter()
+                        .any(|l| *l == name || *l == format!("*{kind}") || *l == format!("F&B{kind}"))
+                };
+                let back = drill.is_none()
+                    && named.as_ref().is_some_and(|l| has(l, "B.Cu") && !has(l, "F.Cu"));
+                let mut layers = PadLayers::default();
+                if let Some(named) = &named {
+                    let (front_cu, back_cu) = if drill.is_some() { (true, true) } else { (!back, back) };
+                    layers.cover_front = front_cu && !has(named, "F.Mask");
+                    layers.cover_back = back_cu && !has(named, "B.Mask");
+                    layers.no_paste = drill.is_none() && !has(named, if back { "B.Paste" } else { "F.Paste" });
                 }
-                let d = drill.unwrap_or(0);
+                let margin = |key: &str| {
+                    item.child(key)
+                        .and_then(|m| m.number(1).ok())
+                        .filter(|m| *m != 0.)
+                        .map(um)
+                };
+                layers.mask_margin = margin("solder_mask_margin");
+                layers.paste_margin = margin("solder_paste_margin");
+                let (dx, dy) = (drill.unwrap_or(0), drill_height.or(drill).unwrap_or(0));
                 pads.push(Pad {
                     number: if kind == "np_thru_hole" {
                         String::new()
@@ -593,81 +645,122 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
                         item.arg(1).into()
                     },
                     at: xy(at)?,
-                    size: Point::new(um(w).max(d).max(1), um(h).max(d).max(1)),
+                    size: Point::new(um(w).max(dx).max(1), um(h).max(dy).max(1)),
                     shape,
                     drill,
+                    drill_height,
                     plated: kind != "np_thru_hole",
+                    corner_radius,
+                    back,
+                    layers,
                 });
             }
-            "fp_line" => {
-                if let Some(o) = outline {
-                    o.push(vec![
-                        xy(item.required("start")?)?,
-                        xy(item.required("end")?)?,
-                    ]);
+            "fp_line" if layer.is_some() => {
+                let points = vec![xy(item.required("start")?)?, xy(item.required("end")?)?];
+                draw(GraphicShape::Polyline { points }, false, None);
+            }
+            "fp_rect" if layer.is_some() => {
+                let (a, b) = (xy(item.required("start")?)?, xy(item.required("end")?)?);
+                let points = vec![a, Point::new(b.x, a.y), b, Point::new(a.x, b.y), a];
+                draw(GraphicShape::Polyline { points }, true, None);
+            }
+            "fp_poly" if layer.is_some() => {
+                let mut points = item
+                    .required("pts")?
+                    .list()
+                    .iter()
+                    .skip(1)
+                    .map(xy)
+                    .collect::<Result<Vec<_>, _>>()?;
+                if let Some(&first) = points.first() {
+                    points.push(first);
+                }
+                if points.len() >= 2 {
+                    let closed = points.len() >= 4;
+                    draw(GraphicShape::Polyline { points }, closed, None);
                 }
             }
-            "fp_rect" => {
-                if let Some(o) = outline {
-                    let (a, b) = (xy(item.required("start")?)?, xy(item.required("end")?)?);
-                    o.push(vec![a, Point::new(b.x, a.y), b, Point::new(a.x, b.y), a]);
+            "fp_circle" if layer.is_some() => {
+                let center = xy(item.required("center")?)?;
+                let e = xy(item.required("end")?)?;
+                let radius = f64::from(e.x - center.x).hypot(f64::from(e.y - center.y)).round() as i32;
+                if radius > 0 {
+                    draw(GraphicShape::Circle { center, radius }, true, None);
                 }
             }
-            "fp_poly" => {
-                if let Some(o) = outline {
-                    let mut points = item
-                        .required("pts")?
-                        .list()
-                        .iter()
-                        .skip(1)
-                        .map(xy)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if let Some(&first) = points.first() {
-                        points.push(first);
+            "fp_arc" if layer.is_some() => {
+                if let Some(mid) = item.child("mid") {
+                    let (start, mid, end) =
+                        (xy(item.required("start")?)?, xy(mid)?, xy(item.required("end")?)?);
+                    draw(GraphicShape::Arc { start, mid, end }, false, None);
+                } else {
+                    warnings.push("Legacy arc without a midpoint skipped".into());
+                }
+            }
+            // Text the footprint itself carries; the reference and value are the
+            // placed part's, which the board writes.
+            // Hidden text (`hide`, `(hide yes)`, or hidden in its effects) is
+            // not drawn by KiCad, so it is not drawn here.
+            "fp_text"
+                if layer.is_some()
+                    && item.arg(1) == "user"
+                    && !hidden(item).unwrap_or(false)
+                    && !item.child("effects").and_then(hidden).unwrap_or(false) =>
+            {
+                let text = item.arg(2).trim().to_owned();
+                let at = item.required("at")?;
+                let height = item
+                    .child("effects")
+                    .and_then(|e| e.child("font"))
+                    .and_then(|f| f.child("size"))
+                    .and_then(|s| s.number(1).ok())
+                    .map_or(1000, um);
+                // `${REFERENCE}` and the like stand for the placed part's fields.
+                if !text.is_empty() && !text.contains("${") {
+                    if at.number(3).unwrap_or(0.) != 0. {
+                        warnings.push(format!("Text \"{text}\" is imported unrotated"));
                     }
-                    o.push(points);
-                }
-            }
-            "fp_circle" => {
-                if let Some(o) = outline {
-                    let c = xy(item.required("center")?)?;
-                    let e = xy(item.required("end")?)?;
-                    let r = f64::from(e.x - c.x).hypot(f64::from(e.y - c.y));
-                    o.push(
-                        (0..=32)
-                            .map(|i| {
-                                let t = std::f64::consts::TAU * f64::from(i) / 32.;
-                                Point::new(
-                                    c.x + (r * t.cos()).round() as i32,
-                                    c.y + (r * t.sin()).round() as i32,
-                                )
-                            })
-                            .collect(),
-                    );
-                }
-            }
-            "fp_arc" => {
-                if let Some(o) = outline {
-                    if let Some(mid) = item.child("mid") {
-                        o.push(arc_points(
-                            xy(item.required("start")?)?,
-                            xy(mid)?,
-                            xy(item.required("end")?)?,
-                        ));
-                    } else {
-                        warnings.push("Legacy arc without a midpoint skipped".into());
-                    }
+                    let at = xy(at)?;
+                    // The stroke font's pen is the font's thickness.
+                    let thickness = item
+                        .child("effects")
+                        .and_then(|e| e.child("font"))
+                        .and_then(|f| f.child("thickness"))
+                        .and_then(|t| t.number(1).ok())
+                        .filter(|t| *t > 0.)
+                        .map(um);
+                    draw(GraphicShape::Text { at, text, height: height.clamp(100, 100_000) }, false, thickness);
                 }
             }
             _ => {}
         }
     }
+    // A footprint with no front silkscreen has always shown its front
+    // fabrication drawing as its silkscreen.
+    let mut silk = vec![];
+    if !drawn.iter().any(|g| g.layer == GraphicLayer::FrontSilk) {
+        drawn.retain(|g| {
+            if g.layer != GraphicLayer::FrontFab || matches!(g.shape, GraphicShape::Text { .. }) {
+                return true;
+            }
+            silk.extend(g.strokes(false));
+            false
+        });
+    }
+    // Anything the board could not store is left out, with a word.
+    let before = drawn.len();
+    drawn.retain(|g| g.problem().is_none());
+    if drawn.len() < before {
+        warnings.push(format!("{} drawn items could not be imported", before - drawn.len()));
+    }
     Ok((
         Footprint {
             name,
             pads,
-            silk: if silk.is_empty() { fab } else { silk },
+            silk,
             model,
+            courtyard_margin: None,
+            graphics: drawn,
         },
         warnings,
     ))

@@ -20,7 +20,7 @@ pub const STATE_BLOBS: &[(&str, &str)] = &[
     ("__brepReport", "last run report {featureErrors, featureNotes, featureFulfilment, featureRefusals (only when a feature failed with a typed refusal), featureApproximations (only when a successful feature carries a measured approximation: feature id → [{code, body, measured, bar, volume_bound, edges, message, summary}]), featureAutoTargets (only when a feature's boolean named no target and used the part's only solid: feature id → solid name), unresolved, displayErrors, featureTimings, featureOutputs}"),
     ("__brepRun", "in-flight run {pending, progress:{generation,index,total,featureId,featureType}|null, cancelled}"),
     ("__brepBusy", "the status bar's working indicator {shown, activities:[{kind, label, document, cancellable, elapsed}]} — everything in flight, most important first; shown once work has lasted 0.2 s"),
-    ("__brepExpr", "expressions script, its variables and the configurator"),
+    ("__brepExpr", "expressions script (as stored, one statement per line), the Expressions editor's text (`editor`: the stored script while not being edited; null while the pane is not drawn), its variables and the configurator"),
     ("__brepPlmDoc", "the active document on the PLM: {access:{editable, reason}, plmDocument, revision:{id,label,lifecycle,lockedBy,lockedByMe}, busy, message, offered:[verb key], files:{staged:{name,mediaType,kind,size,target}, revision:[name], part:[name], problem, notice, status, busy}}; null with no PLM session"),
     ("__brepNotices", "queued toast texts"),
     ("__brepToasts", "toast cards {cards: [{text, severity (error|warning|info), count, shown, superseded}], shown, folded}"),

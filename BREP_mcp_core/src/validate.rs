@@ -122,6 +122,12 @@ fn check_kind(
                 v.errors.push(format!("`{key}` must be a string"));
             }
         }
+        "color" => {
+            let hex = value.as_str().is_some_and(|s| s.len() == 7 && s.starts_with('#') && s[1..].bytes().all(|b| b.is_ascii_hexdigit()));
+            if !hex {
+                v.errors.push(format!("`{key}` must be a colour `#rrggbb`"));
+            }
+        }
         "boolean" => {
             if !value.is_boolean() {
                 v.errors.push(format!("`{key}` must be a boolean"));
@@ -143,10 +149,9 @@ fn check_kind(
         }
         "reference_selection" => {
             let multiple = pspec.get("multiple").and_then(Value::as_bool).unwrap_or(false);
-            let allow_single = pspec.get("allowSingleReference").and_then(Value::as_bool).unwrap_or(false);
             let names: Vec<&str> = match value {
                 Value::Null => vec![],
-                Value::String(s) if !multiple || allow_single => vec![s.as_str()],
+                Value::String(s) if !multiple => vec![s.as_str()],
                 Value::Array(a) if multiple => a.iter().filter_map(Value::as_str).collect(),
                 Value::String(_) => {
                     v.errors.push(format!("`{key}` takes an array of reference names"));

@@ -1003,6 +1003,7 @@ impl EngineState {
                     }
                 }
             }
+            crate::pmi_weld_symbol::seed_defaults(type_id, object);
             object.insert("id".into(), serde_json::Value::String(id.clone()));
             if type_id == "datum" {
                 let letter = object.get("letter").and_then(serde_json::Value::as_str).unwrap_or("").trim().to_string();

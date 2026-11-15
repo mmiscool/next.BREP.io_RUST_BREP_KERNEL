@@ -229,7 +229,8 @@ pub type PartsLibraryMap = BTreeMap<String, PartsLibraryEntry>;
 /// not compute it, which disables stale-snapshot invalidation rather than
 /// making every snapshot look stale on every run.
 pub fn kernel_source_stamp() -> Option<&'static str> {
-    option_env!("BREP_KERNEL_SOURCE_HASH")
+    static STAMP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    STAMP.get_or_init(|| crate::combined_source_stamp(crate::KERNEL_SOURCE_HASHES)).as_deref()
 }
 
 /// Whether `entry`'s snapshot was made by another kernel build (and its
@@ -854,7 +855,17 @@ fn run_isolated_features(
             let weld_poses = super::capture_weld_poses(request, &results, &scene);
             let mut state = state.clone();
             crate::feature_pipeline::assembly::lifecycle::run_constraints(&mut state, &mut scene, &env);
-            super::pose_weld_outputs(request, &mut results, &mut scene, weld_poses);
+            // A weld rebuilt after the solve frees its old bead and owns a new
+            // one: the free loop below must follow the swap.
+            let weld_handles = |results: &[super::FeatureResult]| -> Vec<u32> {
+                results.iter().filter(|result| result.feature_type == "WELD")
+                    .flat_map(|result| result.added.iter().map(|added| added.handle)).collect()
+            };
+            let before = weld_handles(&results);
+            super::pose_weld_outputs(request, &env, &mut results, &mut scene, weld_poses);
+            let after = weld_handles(&results);
+            all_handles.retain(|handle| !before.contains(handle) || after.contains(handle));
+            all_handles.extend(after.iter().filter(|handle| !before.contains(handle)));
             if let Some(failed) = results.iter().find(|result| result.error.is_some()) {
                 error = Some(format!("feature '{}': {}", failed.id, failed.error.as_deref().unwrap()));
             }

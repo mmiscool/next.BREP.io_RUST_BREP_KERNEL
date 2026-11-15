@@ -98,7 +98,7 @@ pub(crate) mod scene_metadata;
 pub use scene_metadata::IsolatedSceneMetadata;
 // The colour-only read of the name-keyed store: THREAD-LOCAL, so a caller whose
 // history runs off-thread must read it runner-side (`io/appearance.rs`).
-pub use scene_metadata::scene_metadata_colors_json;
+pub use scene_metadata::{scene_metadata_colors_json, scene_metadata_weld_colors_json};
 mod schema;
 // The kernel-owned feature-schema catalogue, reachable by NATIVE Rust consumers
 // (the engine-native egui UI in brep-app, via a brep-render re-export) — the same
@@ -116,7 +116,7 @@ mod sheet_metal;
 // Keyed by resident handle so `SheetTree` stays private to the pipeline.
 pub use sheet_metal::{flat_pattern_dxf, flat_pattern_svg, is_sheet_metal_handle};
 
-pub use expression::Env;
+pub use expression::{format_expressions, Env};
 // The sketch loop-id write-back (the editor calls it on commit) — the
 // persistence half of the per-loop face-naming scheme. See
 // `features/sketch/loop_ids.rs`.
@@ -424,6 +424,10 @@ pub struct FeatureResult {
     /// Internal placement metadata; never changes published path segment names.
     #[serde(skip)]
     pub weld_source_seam: Option<String>,
+    /// The solids whose faces a fitted weld bead was fitted to. Internal: the
+    /// post-solve pass rebuilds the weld when they no longer move together.
+    #[serde(skip)]
+    pub weld_joint_solids: Vec<String>,
     /// The SCREW AXIS of each curve in a published path chain, parallel to the
     /// matching [`Self::paths`] entry: `Some` for a curve its builder KNOWS is a
     /// helix about that axis (the HELIX feature), `None` for everything else.
@@ -487,6 +491,7 @@ impl FeatureResult {
             paths: Vec::new(),
             path_segment_names: Vec::new(),
             weld_source_seam: None,
+            weld_joint_solids: Vec::new(),
             path_segment_axes: Vec::new(),
             points: Vec::new(),
             ports: Vec::new(),
@@ -1518,6 +1523,10 @@ pub enum RejectedKind {
     /// The feature was given nothing to act on (an Offset Shell with no
     /// opening face and no solid): it did nothing, and says so.
     NothingSelected,
+    /// The reference resolved but the feature could not build the geometry
+    /// asked for on it (a weld bead on a seam the bead builder cannot follow):
+    /// the rest of the feature stands, and it says what is missing.
+    NotBuilt,
 }
 
 /// What a feature's `build` hands back when it refuses. A feature that drives
@@ -1800,7 +1809,7 @@ pub fn clear_history_cache() {
     // Memoized part rebuilds (the self-heal / insert lane).
     parts_library::clear_rebuilt_memo();
     // The per-coedge reading memo the boolean's operand preparation keeps.
-    crate::reading_memo::clear();
+    crate::clear_reading_memos();
     crate::mass_properties::clear_cell_memo();
     // The per-face mesh fragments the soundness scan and the display share.
     crate::watertight_tessellation::clear_face_memo();
@@ -2238,6 +2247,11 @@ pub fn execute_history_observed(
         if features::common::wants_implicit_target(&descriptor.feature_type, &descriptor.input_params) {
             consumed.extend(features::common::implicit_target_candidates(&scene));
         }
+        // A fitted weld reads the faces that meet along its seam, which its
+        // descriptor never names: it re-runs when any resident body changes.
+        if features::weld::fits_joint_faces(descriptor) {
+            consumed.extend(scene.solids.keys().cloned());
+        }
         let reseat_references = if matches!(descriptor.feature_type.as_str(), "B" | "BOOLEAN") {
             seam_reseat_references(&consumed, &scene, &input_texts[index + 1..], persistent_after[index + 1])
         } else {
@@ -2458,7 +2472,7 @@ pub fn execute_history_observed(
     // resets any stale session.
     let weld_poses = capture_weld_poses(request, &results, &scene);
     assembly::finish_history_run(request, &mut scene, &env);
-    let moved_welds = pose_weld_outputs(request, &mut results, &mut scene, weld_poses);
+    let moved_welds = pose_weld_outputs(request, &env, &mut results, &mut scene, weld_poses);
     if results.iter().any(|result| result.feature_type == "WELD") {
         assembly::publish_weld_scene(&scene, &moved_welds);
     }
@@ -2493,7 +2507,11 @@ pub fn execute_history_observed(
     }
 }
 
-type WeldPoses = Vec<(usize, String, crate::AffineTransform)>;
+/// Per weld: its result index, the seam owner and its pre-solve pose (when the
+/// seam belongs to a placed component), and, for each body a fitted bead was
+/// fitted to, its owner and pre-solve pose (`None` for a body no component
+/// owns, which the solve never moves).
+type WeldPoses = Vec<(usize, Option<(String, crate::AffineTransform)>, Vec<Option<(String, crate::AffineTransform)>>)>;
 
 fn capture_weld_poses(request: &HistoryRequest, results: &[FeatureResult], scene: &SceneMap) -> WeldPoses {
     let mut poses = Vec::new();
@@ -2518,28 +2536,143 @@ fn capture_weld_poses(request: &HistoryRequest, results: &[FeatureResult], scene
             owner_poses.iter().filter(|(id, _)| seam.starts_with(&format!("{id}:")))
                 .max_by_key(|(id, _)| id.len()).map(|(id, pose)| (id.clone(), *pose))
         });
-        if let Some((owner, pose)) = owner {
-            for (name, _) in &result.paths { inherited.insert(name.clone(), (owner.clone(), pose)); }
+        let mut joints: Vec<_> = result.weld_joint_solids.iter().map(|solid| {
+            owner_poses.iter().filter(|(id, _)| solid.starts_with(&format!("{id}:")))
+                .max_by_key(|(id, _)| id.len()).map(|(id, pose)| (id.clone(), *pose))
+        }).collect();
+        // A fitted bead must also stay clear of every other body: any owner the
+        // solve moves re-checks it. (A weld that found no corner is posed
+        // rigidly; it fits on the next run, from the poses the solve writes back.)
+        if !joints.is_empty() {
+            let mut others: Vec<_> = owner_poses.iter().map(|(id, pose)| Some((id.clone(), *pose))).collect();
+            others.sort_by(|a, b| a.as_ref().map(|(id, _)| id).cmp(&b.as_ref().map(|(id, _)| id)));
+            joints.extend(others);
+        }
+        if let Some((owner, pose)) = &owner {
+            for (name, _) in &result.paths { inherited.insert(name.clone(), (owner.clone(), *pose)); }
             for added in &result.added {
-                for (_, name) in &added.edge_names { inherited.insert(name.clone(), (owner.clone(), pose)); }
+                for (_, name) in &added.edge_names { inherited.insert(name.clone(), (owner.clone(), *pose)); }
             }
-            poses.push((index, owner, pose));
+        }
+        if owner.is_some() || !joints.is_empty() {
+            poses.push((index, owner, joints));
         }
     }
     poses
 }
 
-fn pose_weld_outputs(request: &HistoryRequest, results: &mut [FeatureResult], scene: &mut SceneMap, weld_poses: WeldPoses) -> Vec<(String, u32)> {
+fn solved_owner_pose(scene: &SceneMap, owner: &str) -> Option<crate::AffineTransform> {
+    scene.occurrences.get(owner).or_else(|| scene.components.get(owner))
+        .map(|record| record.transform).or_else(|| {
+            let (id, path) = owner.split_once(':')?;
+            let record = scene.components.get(id)?;
+            component::compose(&record.transform, record.nested_poses.get(path)?).ok()
+        })
+}
+
+/// The rigid motion the solve gave an owner (identity for a body no
+/// component owns, which the solve never moves).
+fn owner_delta(scene: &SceneMap, owner: Option<&(String, crate::AffineTransform)>) -> Option<crate::AffineTransform> {
+    match owner {
+        None => crate::AffineTransform::new(IDENTITY_POSE).ok(),
+        Some((owner, before)) => {
+            let after = solved_owner_pose(scene, owner)?;
+            before.rigid_inverse().and_then(|inverse| component::compose(&after, &inverse)).ok()
+        }
+    }
+}
+
+const IDENTITY_POSE: [f64; 16] = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
+
+fn same_motion(a: &crate::AffineTransform, b: &crate::AffineTransform) -> bool {
+    a.elements.iter().zip(b.elements.iter()).all(|(x, y)| (x - y).abs() <= 1e-9 * (1.0 + x.abs().max(y.abs())))
+}
+
+/// Rebuild a fitted weld against the solved scene: its joint faces moved apart,
+/// so a rigid pose of the old bead would no longer sit in the corner. The old
+/// outputs leave the scene and the cache; the rebuilt result is not cached, so
+/// the next run builds it again from the authored poses and solves.
+fn withdraw_weld(results: &mut [FeatureResult], scene: &mut SceneMap, index: usize) {
+    let result = &mut results[index];
+    for (name, _) in &result.points { scene.points.remove(name); }
+    for (name, _) in &result.paths { scene.paths.remove(name); }
+    for (name, _) in &result.frames { scene.frames.remove(name); }
+    let mut removal = FeatureResult::empty(&result.id, "WELD");
+    removal.removed = result.added.iter().map(|added| added.name.clone()).collect();
+    scene.apply(&removal);
+    // The cache entry stays and keeps owning the weld: it no longer holds the
+    // freed bead, takes the rebuilt one in `rebuild_weld`, and never replays.
+    if !parts_library::in_isolated_run() {
+        HISTORY_CACHE.with(|cache| {
+            if let Some(entry) = cache.borrow_mut().get_mut(&result.id) {
+                entry.result.added.clear();
+                entry.posed_externally = true;
+            }
+        });
+    }
+    for added in result.added.drain(..) { crate::free_registered_solid(added.handle); }
+}
+
+fn rebuild_weld(request: &HistoryRequest, env: &Env, results: &mut [FeatureResult], scene: &mut SceneMap, index: usize) -> Vec<(String, u32)> {
+    let result = &mut results[index];
+    let mut fresh = execute_feature(&request.features[index], env, scene);
+    if let Some(error) = &fresh.error {
+        fresh.error = Some(format!("weld placement after the assembly solve: {error}"));
+        for added in fresh.added.drain(..) { crate::free_registered_solid(added.handle); }
+    }
+    scene.apply(&fresh);
+    // The weld's cache entry owns the rebuilt bead, so the next invalidation
+    // or `clear_history_cache` frees it. A weld with no entry (duplicate id,
+    // isolated run) is owned as the walk owns it.
+    if !parts_library::in_isolated_run() {
+        HISTORY_CACHE.with(|cache| {
+            if let Some(entry) = cache.borrow_mut().get_mut(&fresh.id) {
+                entry.result = fresh.clone();
+                entry.posed_externally = true;
+            }
+        });
+    }
+    let moved = fresh.added.iter().map(|added| (added.name.clone(), added.handle)).collect();
+    *result = fresh;
+    moved
+}
+
+fn pose_weld_outputs(request: &HistoryRequest, env: &Env, results: &mut [FeatureResult], scene: &mut SceneMap, weld_poses: WeldPoses) -> Vec<(String, u32)> {
     // Pose only weld-owned outputs. Never replay unrelated history or observers.
     let mut moved_welds = Vec::new();
-    for (index, owner, before) in weld_poses {
-        let after = scene.occurrences.get(&owner).or_else(|| scene.components.get(&owner))
-            .map(|record| record.transform).or_else(|| {
-                let (id, path) = owner.split_once(':')?;
-                let record = scene.components.get(id)?;
-                component::compose(&record.transform, record.nested_poses.get(path)?).ok()
-            });
-        let Some(after) = after else { continue; };
+    // A fitted weld whose seam or joint bodies a later feature consumed cannot
+    // be rebuilt against the final scene: it keeps the rigid pose. Decided
+    // before any weld is withdrawn, so a chained seam still reads as resident.
+    let rebuildable: Vec<bool> = weld_poses.iter().map(|(index, _, _)| {
+        let result = &results[*index];
+        let seam = result.weld_source_seam.as_deref()
+            .is_some_and(|seam| scene.resolve_edge(seam).is_some() || scene.resolve_path(seam).is_some());
+        seam && result.weld_joint_solids.iter().all(|solid| scene.solids.contains_key(solid))
+    }).collect();
+    // Rebuilds run after every other weld is posed and every rebuilt weld is
+    // withdrawn, so a rebuilt bead is checked against the solved scene only.
+    let mut rebuilds = Vec::new();
+    for ((index, owner, joints), rebuildable) in weld_poses.into_iter().zip(rebuildable) {
+        let seam_delta = owner_delta(scene, owner.as_ref());
+        // A fitted weld (its entry lists every owner) is rebuilt and re-checked
+        // when the solve moved anything at all: its corner, an obstacle or the
+        // bead itself.
+        let identity = crate::AffineTransform::new(IDENTITY_POSE).ok();
+        let moved = |delta: Option<crate::AffineTransform>| match (delta, &identity) {
+            (Some(delta), Some(identity)) => !same_motion(&delta, identity),
+            _ => false,
+        };
+        let apart = !joints.is_empty()
+            && (moved(seam_delta) || joints.iter().any(|joint| moved(owner_delta(scene, joint.as_ref()))));
+        // A consumed bead stays consumed: only a resident bead is rebuilt.
+        let resident = results[index].added.iter().all(|added| scene.solids.get(&added.name) == Some(&added.handle));
+        if apart && resident && rebuildable {
+            withdraw_weld(results, scene, index);
+            rebuilds.push(index);
+            continue;
+        }
+        let Some((owner, before)) = owner else { continue; };
+        let Some(after) = solved_owner_pose(scene, &owner) else { continue; };
         if before.elements == after.elements { continue; }
         let delta = before.rigid_inverse().and_then(|inverse| component::compose(&after, &inverse));
         let result = &mut results[index];
@@ -2579,6 +2712,9 @@ fn pose_weld_outputs(request: &HistoryRequest, results: &mut [FeatureResult], sc
                 }
             });
         }
+    }
+    for index in rebuilds {
+        moved_welds.extend(rebuild_weld(request, env, results, scene, index));
     }
     moved_welds
 }

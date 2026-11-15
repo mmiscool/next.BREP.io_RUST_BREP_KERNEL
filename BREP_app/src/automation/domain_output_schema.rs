@@ -73,7 +73,11 @@ pub(super) fn ecad_state() -> Value {
     let count=json!({"type":"integer","minimum":0});let integer=json!({"type":"integer"});
     let maybe=nullable(text.clone());let strings=array(text.clone());
     let point=json!({"type":"array","items":integer,"minItems":2,"maxItems":2});
-    let pad=closed_object_optional(json!({"number":text,"at":point}),&[]);
+    let pad=closed_object_optional(json!({"number":text,"at":point,"shape":{"enum":["Rect","Circle","Oval","RoundRect"]},"cornerRadius":count,
+        "side":{"enum":["front","back","both"]},"maskOpen":{"type":"array","items":boolean,"minItems":2,"maxItems":2},"paste":boolean,
+        "hole":nullable(point.clone())}),
+        // The Pads workbench reports a pad's layers and hole; the board's pads (shared shape) name only number and place.
+        &["shape","cornerRadius","side","maskOpen","paste","hole"]);
     let common=json!({"target":text,"inStep":boolean,"revision":count,
         "pan":{"type":"array","items":number,"minItems":2,"maxItems":2},"zoom":number,
         "unreadable":maybe,"offender":maybe,"repair":maybe,"tool":text,
@@ -85,8 +89,13 @@ pub(super) fn ecad_state() -> Value {
     symbol["pins"]=array(closed_object_optional(json!({"number":text,"name":text,"at":point,"end":point,"unit":count,"gate":count}),&[]));
     let mut pads=common.clone();pads["target"]=json!({"const":"pads"});pads["pads"]=array(pad.clone());
     pads["pinsWithoutPads"]=strings.clone();pads["silk"]=array(array(point.clone()));
+    let graphic=closed_object_optional(json!({"layer":{"enum":["F.SilkS","B.SilkS","F.Fab","B.Fab","F.CrtYd","B.CrtYd"]},
+        "kind":{"enum":["polyline","arc","circle","text"]},"width":count,"filled":boolean,"points":array(point.clone()),
+        "radius":count,"text":text,"height":count}),&["radius","text","height"]);
+    pads["graphics"]=array(graphic.clone());
     pads["selection"]=nullable(json!({"oneOf":[
-        closed_object_optional(json!({"kind":{"const":"pad"},"number":text}),&[]),closed_object_optional(json!({"kind":{"const":"silk"},"index":count}),&[])]}));
+        closed_object_optional(json!({"kind":{"const":"pad"},"number":text}),&[]),closed_object_optional(json!({"kind":{"const":"silk"},"index":count}),&[]),
+        closed_object_optional(json!({"kind":{"const":"graphic"},"index":count}),&[])]}));
     let mut sheet=common;sheet["target"]=json!({"enum":["diagram","pcb"]});
     for key in ["view","kind","labelText","powerNetText","stockPartNumber"] { sheet[key]=text.clone(); }
     sheet["selection"]=nullable(json!({"oneOf":[
@@ -107,7 +116,7 @@ pub(super) fn ecad_state() -> Value {
             "spokes":nullable(array(closed_object_optional(json!({"pad":text,"spokes":count}),&[])))}),&[])),"zonesStale":boolean,
         "netClasses":array(closed_object_optional(json!({"name":text,"clearance":integer,"trackWidth":integer,"viaDiameter":integer,"viaDrill":integer,"patterns":strings,"nets":strings}),&[])),
         "netClassOf":dictionary,"netClassAssigned":dictionary,"netClassNet":maybe,
-        "findings":nullable(array(closed_object_optional(json!({"kind":text,"message":text}),&[]))),"selectedZone":nullable(count.clone()),
+        "findings":nullable(array(closed_object_optional(json!({"kind":text,"message":text}),&[]))),"selectedZone":nullable(count.clone()),"drawings":array(graphic),"selectedDrawing":nullable(count.clone()),"cutouts":array(array(point.clone())),"selectedCutout":nullable(count.clone()),
         "selectedPad":nullable(closed_object_optional(json!({"reference":maybe,"number":text}),&[])),
         "selectedSilk":nullable(closed_object_optional(json!({"reference":maybe,"index":count}),&[])),"message":text}),&[]);
     json!({"type":"object","oneOf":[closed_object_optional(json!({"target":{"type":"null"}}),&[]),closed_object_optional(symbol,&[]),closed_object_optional(pads,&[]),closed_object_optional(sheet,&[])]})

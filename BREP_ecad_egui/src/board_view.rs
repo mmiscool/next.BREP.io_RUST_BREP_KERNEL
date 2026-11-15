@@ -4,9 +4,12 @@ use crate::actions::{Action, ActionGroup, key, sheet_action};
 use brep_ecad_core::autoroute::RouteJob;
 use brep_ecad_core::board::{
     Airwire, Board, BoardSync, ClassReason, Connectivity, CopperRef, DEFAULT_CLASS, DesignRules, NetClass, Pad, Placement, Shape, Track,
-    Via, ViaPolicy, Violation, ViolationKind, Zone, layer_name, needs_footprint, rectangle,
+    Via, ViaKind, ViaPolicy, Violation, ViolationKind, Zone, layer_name, needs_footprint, rectangle,
 };
 use brep_ecad_core::board::zones::{self, ZoneReport};
+use brep_ecad_core::board::{BoardCutout, BoardGraphic, MAX_CUTOUTS};
+use brep_ecad_core::graphic::{GraphicLayer, GraphicShape, LayerGraphic};
+use crate::footprint_editor::{edit_graphic, graphic_kind, layer_choices, move_graphic, point_in};
 use crate::symbol_editor::{InspectorHits, key_word};
 use brep_ecad_core::footprint;
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,7 +24,99 @@ const EDGE: Color32 = Color32::from_rgb(222, 196, 76);
 pub(crate) const THROUGH_HOLE: Color32 = Color32::from_rgb(201, 162, 72);
 const VIA: Color32 = Color32::from_rgb(178, 184, 192);
 pub(crate) const SILK: Color32 = Color32::from_rgb(222, 226, 232);
+/// Paint the inside of a closed outline (its last point repeating its first),
+/// concave or not: ear-clipped into triangles, as a fan when the clipping finds
+/// no ear (a self-crossing outline).
+pub(crate) fn paint_filled(painter: &egui::Painter, outline: &[Pos2], color: Color32) {
+    let mut ring: Vec<Pos2> = outline.to_vec();
+    if ring.len() > 1 && ring.first() == ring.last() {
+        ring.pop();
+    }
+    if ring.len() < 3 {
+        return;
+    }
+    let area: f32 = (0..ring.len())
+        .map(|i| {
+            let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
+            a.x * b.y - b.x * a.y
+        })
+        .sum();
+    let cross = |a: Pos2, b: Pos2, c: Pos2| (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    let sign = if area >= 0. { 1. } else { -1. };
+    let mut left: Vec<usize> = (0..ring.len()).collect();
+    let mut triangles: Vec<[usize; 3]> = vec![];
+    let mut guard = ring.len() * ring.len();
+    while left.len() > 3 && guard > 0 {
+        guard -= 1;
+        let n = left.len();
+        let ear = (0..n).find(|&i| {
+            let (a, b, c) = (left[(i + n - 1) % n], left[i], left[(i + 1) % n]);
+            sign * cross(ring[a], ring[b], ring[c]) > 0.
+                && !left.iter().any(|&k| {
+                    k != a && k != b && k != c && {
+                        let p = ring[k];
+                        let (d1, d2, d3) = (cross(ring[a], ring[b], p), cross(ring[b], ring[c], p), cross(ring[c], ring[a], p));
+                        sign * d1 >= 0. && sign * d2 >= 0. && sign * d3 >= 0.
+                    }
+                })
+        });
+        let Some(i) = ear else { break };
+        triangles.push([left[(i + n - 1) % n], left[i], left[(i + 1) % n]]);
+        left.remove(i);
+    }
+    if left.len() == 3 {
+        triangles.push([left[0], left[1], left[2]]);
+    } else {
+        // No ear: fan what is left from its first corner.
+        triangles.extend((1..left.len().saturating_sub(1)).map(|i| [left[0], left[i], left[i + 1]]));
+    }
+    let mut mesh = egui::epaint::Mesh::default();
+    for p in &ring {
+        mesh.colored_vertex(*p, color);
+    }
+    for [a, b, c] in triangles {
+        mesh.add_triangle(a as u32, b as u32, c as u32);
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+/// The colour a drawn item is painted in, by the board (or footprint) layer
+/// it is on: the silkscreen's, the fabrication drawing's and the courtyard's.
+pub(crate) fn graphic_color(layer: brep_ecad_core::graphic::GraphicLayer) -> Color32 {
+    use brep_ecad_core::graphic::GraphicLayer as L;
+    match layer {
+        L::FrontSilk => SILK.gamma_multiply(0.7),
+        L::BackSilk => Color32::from_rgb(142, 154, 186).gamma_multiply(0.7),
+        L::FrontFab | L::BackFab => Color32::from_rgb(176, 168, 120),
+        L::FrontCourtyard | L::BackCourtyard => Color32::from_rgb(200, 110, 200),
+    }
+}
 pub(crate) const WARNING: Color32 = Color32::from_rgb(238, 120, 96);
+/// The layers the board's own drawing can be on: a courtyard is a part's.
+fn board_layers() -> Vec<(GraphicLayer, &'static str, &'static str)> {
+    layer_choices().into_iter().filter(|c| !c.0.is_courtyard()).collect()
+}
+/// Whether board point `q` catches the board drawing `g`: within `tolerance`
+/// of one of its lines (grown by half its pen), or inside it when filled.
+fn board_drawing_hit(g: &BoardGraphic, q: Point, tolerance: f64) -> bool {
+    let strokes = g.graphic.strokes(!g.graphic.layer.front());
+    let reach = tolerance + f64::from(g.graphic.width()) / 2.;
+    // Text is caught anywhere in the box round its letters, as the Pads editor
+    // catches it: the inside of an "O" is still the text.
+    if matches!(g.graphic.shape, GraphicShape::Text { .. }) {
+        let all: Vec<Point> = strokes.iter().flatten().copied().collect();
+        let (Some(x0), Some(x1)) = (all.iter().map(|p| p.x).min(), all.iter().map(|p| p.x).max()) else {
+            return false;
+        };
+        let (y0, y1) = (all.iter().map(|p| p.y).min().unwrap_or(0), all.iter().map(|p| p.y).max().unwrap_or(0));
+        let (qx, qy) = (f64::from(q.x), f64::from(q.y));
+        return qx >= f64::from(x0) - reach && qx <= f64::from(x1) + reach && qy >= f64::from(y0) - reach && qy <= f64::from(y1) + reach;
+    }
+    strokes
+        .iter()
+        .flat_map(|line| line.windows(2))
+        .any(|s| Shape::segment(s[0], s[1], 0).distance_to_point(q) <= reach)
+        || (g.graphic.filled && strokes.first().is_some_and(|ring| point_in(q, ring)))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum View {
@@ -36,6 +131,13 @@ pub enum BoardTool {
     Route,
     /// Draw a copper zone's outline, corner by corner.
     Zone,
+    /// Draw a line or a closed shape on a silkscreen or fabrication layer of
+    /// the board itself, corner by corner.
+    Draw,
+    /// Put text on a silkscreen or fabrication layer of the board itself.
+    Text,
+    /// Draw a cutout, a hole milled through the board, corner by corner.
+    Cutout,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BoardSelection {
@@ -56,6 +158,10 @@ pub enum BoardSelection {
     Silk(Uuid, usize),
     Track(Uuid),
     Via(Uuid),
+    /// An item drawn on the board itself ([`Board::graphics`]), owned by no part.
+    Drawing(Uuid),
+    /// A cutout milled through the board ([`Board::cutouts`]), by its id.
+    Cutout(Uuid),
     /// A copper zone, by its id.
     Zone(Uuid),
 }
@@ -82,6 +188,12 @@ fn drafting(e: &Editor) -> bool {
 }
 fn zone_tool(e: &Editor) -> bool {
     board(e) && e.board_view.tool == BoardTool::Zone
+}
+fn draw_tool(e: &Editor) -> bool {
+    board(e) && e.board_view.tool == BoardTool::Draw
+}
+fn cutout_tool(e: &Editor) -> bool {
+    board(e) && e.board_view.tool == BoardTool::Cutout
 }
 /// Choosing copper layer `layer` (from 0) on a board with at least `layer + 1` layers.
 const fn layer_action(
@@ -119,6 +231,21 @@ pub(crate) static BOARD_ACTIONS: &[Action<Editor>] = &[
     })
     .offered_when(board)
     .pressed_when(|e| e.board_view.tool == BoardTool::Zone),
+    sheet_action("board.tool.draw", "Draw line", ActionGroup::Tool, |e| {
+        e.set_board_tool(BoardTool::Draw)
+    })
+    .offered_when(board)
+    .pressed_when(|e| e.board_view.tool == BoardTool::Draw),
+    sheet_action("board.tool.text", "Place text", ActionGroup::Tool, |e| {
+        e.set_board_tool(BoardTool::Text)
+    })
+    .offered_when(board)
+    .pressed_when(|e| e.board_view.tool == BoardTool::Text),
+    sheet_action("board.tool.cutout", "Draw cutout", ActionGroup::Tool, |e| {
+        e.set_board_tool(BoardTool::Cutout)
+    })
+    .offered_when(board)
+    .pressed_when(|e| e.board_view.tool == BoardTool::Cutout),
     layer_action("board.layer.1", "Copper layer 1", |e| e.choose_layer(0))
         .offered_when(|e| offers_layer(e, 0))
         .pressed_when(|e| on_layer(e, 0))
@@ -193,6 +320,24 @@ pub(crate) static BOARD_ACTIONS: &[Action<Editor>] = &[
     .keys(&[key(Key::Enter)])
     .offered_when(zone_tool)
     .enabled_when(|e| e.board_view.zone_draft.len() >= 3),
+    sheet_action(
+        "board.draw.finish",
+        "Finish line",
+        ActionGroup::Context,
+        Editor::finish_drawing,
+    )
+    .keys(&[key(Key::Enter)])
+    .offered_when(draw_tool)
+    .enabled_when(|e| e.board_view.drawing_draft.len() >= 2),
+    sheet_action(
+        "board.cutout.finish",
+        "Close cutout",
+        ActionGroup::Context,
+        Editor::finish_cutout,
+    )
+    .keys(&[key(Key::Enter)])
+    .offered_when(cutout_tool)
+    .enabled_when(|e| e.board_view.cutout_draft.len() >= 3),
     sheet_action("board.zones.fill", "Fill zones", ActionGroup::Context, |e| {
         e.fill_zones()
     })
@@ -316,6 +461,8 @@ enum Subject {
     Via(Uuid),
     Track(Uuid, Grip),
     Zone(Uuid, ZoneGrip),
+    Drawing(Uuid),
+    Cutout(Uuid),
 }
 
 /// What a press on a zone takes hold of: one corner, the middle of one edge (a
@@ -368,6 +515,7 @@ fn dragged_outline(outline: &[Point], grip: ZoneGrip, delta: Point) -> Vec<Point
 /// to say whether the fill on show is still the one the copper asks for.
 fn fill_inputs_match(a: &Board, b: &Board) -> bool {
     a.outline == b.outline
+        && a.cutouts == b.cutouts
         && a.layer_count == b.layer_count
         && a.placements == b.placements
         && a.tracks == b.tracks
@@ -443,7 +591,8 @@ fn zone_words(zone: &Zone, report: &ZoneReport, layer_count: u8, pads: &dyn Fn(C
 #[derive(Clone, Copy, PartialEq)]
 enum Anchor {
     Pad { layers: (u8, u8), width: i32 },
-    Via,
+    /// A via, and the copper layers it joins.
+    Via { layers: (u8, u8) },
     Track { layer: u8, width: i32 },
 }
 
@@ -496,6 +645,14 @@ pub(crate) struct BoardView {
     canvas_pass: u64,
     /// The corners of a zone being drawn with the Zone tool.
     zone_draft: Vec<Point>,
+    /// The corners of a line being drawn with the Draw tool.
+    drawing_draft: Vec<Point>,
+    /// The corners of the cutout being drawn with the Cutout tool.
+    cutout_draft: Vec<Point>,
+    /// The layer the Draw and Text tools draw on, and their pen (`None`: the
+    /// layer's standard one).
+    pub(crate) draw_layer: GraphicLayer,
+    pub(crate) draw_width: Option<i32>,
     /// The net a zone drawn next pours: chosen in the Inspector, GND until then.
     pub(crate) zone_net: String,
     /// What each zone's last fill in this session did, by zone.
@@ -543,6 +700,10 @@ impl Default for BoardView {
             menu: vec![],
             canvas_pass: 0,
             zone_draft: vec![],
+            drawing_draft: vec![],
+            cutout_draft: vec![],
+            draw_layer: GraphicLayer::FrontSilk,
+            draw_width: None,
             zone_net: String::new(),
             zone_reports: BTreeMap::new(),
             filled_from: None,
@@ -635,6 +796,7 @@ fn violation_kind(kind: ViolationKind) -> &'static str {
         ViolationKind::BoardEdge => "Edge",
         ViolationKind::MissingPad => "Pad",
         ViolationKind::Courtyard => "Courtyard",
+        ViolationKind::AnnularRing => "Ring",
         ViolationKind::Stitching => "Stitching",
         ViolationKind::Unrouted => "Unrouted",
     }
@@ -740,16 +902,18 @@ pub(crate) fn layer_color(layer: u8, count: u8) -> Color32 {
 /// a run the user never touched; that crossing shows up as an airwire and, if it is a
 /// different net, as a clearance finding.
 fn move_via(board: &mut Board, id: Uuid, delta: Point) {
-    let Some(land) = board
+    let count = board.layer_count;
+    let Some((land, (from, to))) = board
         .vias
         .iter()
         .find(|v| v.id == id)
-        .map(|v| Shape::circle(v.at, v.diameter / 2))
+        .map(|v| (Shape::circle(v.at, v.diameter / 2), v.layers(count)))
     else {
         return;
     };
     for track in &mut board.tracks {
-        if track.points.is_empty() {
+        // Only a track on a layer the via joins rests on it.
+        if track.points.is_empty() || !(from..=to).contains(&track.layer) {
             continue;
         }
         let last = track.points.len() - 1;
@@ -775,14 +939,19 @@ fn rests_on(copper: &Shape, end: Point, width: i32) -> bool {
 }
 
 /// Whether the end of `track` at `end` is HELD: it rests on a pad on the track's
-/// layer, on a via, or on another track of the same layer. A held end is where the
-/// run is connected to something, and no track gesture moves it.
+/// layer, on a via that reaches the track's layer, or on another track of the same
+/// layer. A held end is where the run is connected to something, and no track
+/// gesture moves it.
 fn held(board: &Board, track: &Track, end: Point) -> bool {
     let count = board.layer_count;
     let width = track.width;
     board
         .vias
         .iter()
+        .filter(|v| {
+            let (from, to) = v.layers(count);
+            (from..=to).contains(&track.layer)
+        })
         .any(|v| rests_on(&Shape::circle(v.at, v.diameter / 2), end, width))
         || board.placements.iter().any(|p| {
             p.footprint.pads.iter().any(|pad| {
@@ -1339,6 +1508,13 @@ impl Editor {
         if self.board_view.tool != tool {
             self.board_view.draft = None;
             self.board_view.zone_draft.clear();
+            self.board_view.drawing_draft.clear();
+            self.board_view.cutout_draft.clear();
+            // The drawing tools start from nothing selected, so the Inspector
+            // shows the layer and pen they draw with.
+            if matches!(tool, BoardTool::Draw | BoardTool::Text) {
+                self.board_view.selected = None;
+            }
         }
         self.board_view.tool = tool;
         if tool == BoardTool::Route && self.board_view.draft.is_none() {
@@ -1358,7 +1534,7 @@ impl Editor {
                 .vias
                 .iter()
                 .find(|v| v.id == id)
-                .map(|v| (v.at, Anchor::Via)),
+                .map(|v| (v.at, Anchor::Via { layers: v.layers(self.document.board.layer_count) })),
             _ => None,
         };
         if let Some((at, anchor)) = start {
@@ -1425,6 +1601,8 @@ impl Editor {
         view.placing = None;
         view.draft = None;
         view.zone_draft.clear();
+        view.drawing_draft.clear();
+        view.cutout_draft.clear();
         view.rules = None;
         view.outline = None;
         view.violations = None;
@@ -1454,16 +1632,28 @@ impl Editor {
             .get(index)?;
         Some((self.reference_of(component), pad))
     }
-    /// One silkscreen line of a placed part, in BOARD coordinates, with the
-    /// part's reference: [`Self::pad_at`]'s twin, and for the same reason — a
-    /// line index left behind by a refreshed footprint answers `None`.
+    /// One drawn item of a placed part — a silkscreen line, then its graphics,
+    /// in [`brep_ecad_core::board::Footprint::drawing`]'s order — in BOARD
+    /// coordinates, its strokes joined, with the part's reference:
+    /// [`Self::pad_at`]'s twin, and for the same reason — an index left behind
+    /// by a refreshed footprint answers `None`.
     fn silk_at(&self, component: Uuid, index: usize) -> Option<(&str, Vec<Point>)> {
         let placement = self.document.board.placement(component)?;
-        let line = placement.footprint.silk.get(index)?;
+        let drawn = placement.footprint.drawing().nth(index)?;
         Some((
             self.reference_of(component),
-            line.iter().map(|p| placement.transform(*p)).collect(),
+            drawn.strokes.iter().flatten().map(|p| placement.transform(*p)).collect(),
         ))
+    }
+    /// What a part's drawn item `index` is called: "silkscreen line 2" for one
+    /// of its silkscreen lines, "B.Fab drawing 3" for one of its graphics.
+    fn drawing_name(&self, component: Uuid, index: usize) -> String {
+        let placement = self.document.board.placement(component);
+        let silk = placement.map_or(0, |p| p.footprint.silk.len());
+        match placement.and_then(|p| p.footprint.drawing().nth(index)) {
+            Some(d) if index >= silk => format!("{} drawing {index}", d.layer.name()),
+            _ => format!("silkscreen line {index}"),
+        }
     }
     /// The net the schematic puts on each of one component's pins, by pin
     /// number — the join eCAD makes everywhere: a pad matches the pin of the
@@ -1504,6 +1694,135 @@ impl Editor {
         match self.board_view.selected {
             Some(BoardSelection::Silk(id, index)) => Some((id, index)),
             _ => None,
+        }
+    }
+    /// The selected board drawing's index in [`Board::graphics`], or `None`
+    /// when the selection is not one.
+    pub fn selected_board_drawing(&self) -> Option<usize> {
+        match self.board_view.selected {
+            Some(BoardSelection::Drawing(id)) => self.document.board.graphics.iter().position(|g| g.id == id),
+            _ => None,
+        }
+    }
+    /// Put `graphic` on the board as one undo step and select it, unless the
+    /// board would refuse it.
+    fn add_drawing(&mut self, mut graphic: LayerGraphic) {
+        graphic.width = self.board_view.draw_width;
+        if let Some(problem) = graphic.problem() {
+            self.board_view.message = format!("That {} {problem}.", graphic_kind(&graphic).to_lowercase());
+            return;
+        }
+        let item = BoardGraphic::new(graphic);
+        let id = item.id;
+        self.transaction(|d| d.board.graphics.push(item));
+        self.board_view.selected = Some(BoardSelection::Drawing(id));
+    }
+    /// End the line being drawn with the Draw tool: open, or closed when its last
+    /// corner is its first.
+    fn finish_drawing(&mut self) {
+        let points = std::mem::take(&mut self.board_view.drawing_draft);
+        if points.len() < 2 {
+            return;
+        }
+        let layer = self.board_view.draw_layer;
+        self.add_drawing(LayerGraphic::new(layer, GraphicShape::Polyline { points }));
+    }
+    /// A Draw-tool click: a corner at the grid point under the pointer, or, on
+    /// the first corner with two already down, the shape closed and finished.
+    fn drawing_click(&mut self, p: Pos2) {
+        let q = snap(self.board_view.world(p), PLACE_GRID);
+        // A new line's first corner lets go of the last thing drawn, so the
+        // Inspector shows the layer and pen this one is drawn with.
+        if self.board_view.drawing_draft.is_empty() {
+            self.board_view.selected = None;
+        }
+        let draft = &self.board_view.drawing_draft;
+        if draft.len() >= 3 && self.board_view.screen(draft[0]).distance(p) <= 8. {
+            let first = draft[0];
+            self.board_view.drawing_draft.push(first);
+            self.finish_drawing();
+            return;
+        }
+        if draft.last() != Some(&q) {
+            self.board_view.drawing_draft.push(q);
+        }
+    }
+    /// A Text-tool click: "TEXT", 1.5 mm tall, centred on the grid point under
+    /// the pointer, selected so its words can be typed in the Inspector.
+    fn text_click(&mut self, p: Pos2) {
+        let at = snap(self.board_view.world(p), PLACE_GRID);
+        let layer = self.board_view.draw_layer;
+        self.add_drawing(LayerGraphic::new(layer, GraphicShape::Text { at, text: "TEXT".into(), height: 1500 }));
+    }
+    /// What a board drawing is called where the board names it: "silkscreen
+    /// text 2" (its place among the board's drawn items).
+    fn board_drawing_name(&self, id: Uuid) -> String {
+        let board = &self.document.board;
+        let Some(n) = board.graphics.iter().position(|g| g.id == id) else {
+            return "drawing".into();
+        };
+        let g = &board.graphics[n].graphic;
+        format!("{} {} {}", g.layer.name(), graphic_kind(g).to_lowercase(), n + 1)
+    }
+    /// The selected cutout's index in [`Board::cutouts`], or `None` when the
+    /// selection is not one.
+    pub fn selected_board_cutout(&self) -> Option<usize> {
+        match self.board_view.selected {
+            Some(BoardSelection::Cutout(id)) => self.document.board.cutouts.iter().position(|c| c.id == id),
+            _ => None,
+        }
+    }
+    /// Close the cutout being drawn, as one undo step that refills the zones
+    /// round it, and select it; unless the board would refuse it, which is said.
+    fn finish_cutout(&mut self) {
+        let corners = std::mem::take(&mut self.board_view.cutout_draft);
+        if corners.len() < 3 {
+            return;
+        }
+        if self.document.board.cutouts.len() >= MAX_CUTOUTS {
+            self.board_view.message = format!("A board holds at most {MAX_CUTOUTS} cutouts.");
+            return;
+        }
+        if let Some(problem) = self.document.board.cutout_problem(&corners, None) {
+            self.board_view.message = format!("That cutout {problem}.");
+            return;
+        }
+        let cutout = BoardCutout::new(corners);
+        let id = cutout.id;
+        let refill = !self.document.board.zones.is_empty();
+        self.transaction(|d| {
+            d.board.cutouts.push(cutout);
+            if refill {
+                d.fill_zones();
+            }
+        });
+        if refill {
+            self.note_filled();
+        }
+        self.board_view.tool = BoardTool::Select;
+        self.board_view.selected = Some(BoardSelection::Cutout(id));
+    }
+    /// A Cutout-tool click: a corner at the grid point under the pointer, or, on
+    /// the first corner with three already down, the cutout closed.
+    fn cutout_click(&mut self, p: Pos2) {
+        let q = snap(self.board_view.world(p), PLACE_GRID);
+        if self.board_view.cutout_draft.is_empty() {
+            self.board_view.selected = None;
+        }
+        let draft = &self.board_view.cutout_draft;
+        if draft.len() >= 3 && self.board_view.screen(draft[0]).distance(p) <= 8. {
+            self.finish_cutout();
+            return;
+        }
+        if draft.last() != Some(&q) {
+            self.board_view.cutout_draft.push(q);
+        }
+    }
+    /// What a cutout is called where the board names it: "cutout 2".
+    fn board_cutout_name(&self, id: Uuid) -> String {
+        match self.document.board.cutouts.iter().position(|c| c.id == id) {
+            Some(n) => format!("cutout {}", n + 1),
+            None => "cutout".into(),
         }
     }
     /// The selected zone's index on the board, or `None` when the selection is not a zone.
@@ -1600,6 +1919,23 @@ impl Editor {
                 self.transaction(|d| d.delete_component(id));
                 self.board_view.selected = None;
             }
+            Some(BoardSelection::Drawing(id)) => {
+                self.transaction(|d| d.board.graphics.retain(|g| g.id != id));
+                self.board_view.selected = None;
+            }
+            Some(BoardSelection::Cutout(id)) => {
+                let refill = !self.document.board.zones.is_empty();
+                self.transaction(|d| {
+                    d.board.cutouts.retain(|c| c.id != id);
+                    if refill {
+                        d.fill_zones();
+                    }
+                });
+                if refill {
+                    self.note_filled();
+                }
+                self.board_view.selected = None;
+            }
             // A pad is a copy of its part's footprint, refreshed from the part:
             // deleting it here would come back at the next refresh, and deleting
             // the whole part is not what a click on one pad asked for.
@@ -1612,10 +1948,11 @@ impl Editor {
                 );
             }
             // The same for a silkscreen line, for the same reason.
-            Some(BoardSelection::Silk(id, _)) => {
+            Some(BoardSelection::Silk(id, index)) => {
                 let reference = self.reference_of(id).to_owned();
+                let name = self.drawing_name(id, index);
                 self.board_view.message = format!(
-                    "That silkscreen line belongs to {reference}'s footprint. Edit it on the part, in the Pads workbench; Delete here removes a track, a via or a whole part."
+                    "That {name} belongs to {reference}'s footprint. Edit it on the part, in the Pads workbench; Delete here removes a track, a via or a whole part."
                 );
             }
             None => {}
@@ -1880,6 +2217,15 @@ impl Editor {
                 BoardTool::Zone => {
                     ui.label("Click the zone's corners; click the first again, double-click or press Enter to close it. It pours the net chosen in the Inspector.");
                 }
+                BoardTool::Draw => {
+                    ui.label("Click the line's corners on the layer chosen in the Inspector; double-click or press Enter to end it, or click the first corner to close it.");
+                }
+                BoardTool::Text => {
+                    ui.label("Click where the text goes, on the layer chosen in the Inspector; then type its words there.");
+                }
+                BoardTool::Cutout => {
+                    ui.label("Click the cutout's corners inside the board outline; click the first again, double-click or press Enter to close it. It is milled through the board.");
+                }
             }
             self.action_buttons(ui, ActionGroup::Context);
         });
@@ -2061,8 +2407,14 @@ impl Editor {
                 }
             }
             Some(BoardSelection::Via(id)) => {
-                if let Some(v) = self.document.board.vias.iter().find(|v| v.id == id) {
-                    ui.label(egui::RichText::new("Via").color(accent(ui)));
+                let count = self.document.board.layer_count;
+                if let Some(v) = self.document.board.vias.iter().find(|v| v.id == id).cloned() {
+                    let kind = match v.kind(count) {
+                        ViaKind::Through => "Through via",
+                        ViaKind::Blind => "Blind via",
+                        ViaKind::Buried => "Buried via",
+                    };
+                    ui.label(egui::RichText::new(kind).color(accent(ui)));
                     ui.small(format!(
                         "{:.2} mm pad · {:.2} mm drill at {:.2}, {:.2} mm",
                         mm(v.diameter),
@@ -2070,6 +2422,33 @@ impl Editor {
                         mm(v.at.x),
                         mm(v.at.y)
                     ));
+                    // The layers it joins: every layer for a through via; a blind
+                    // via reaches one outer layer, a buried one neither. Offered
+                    // only where there is an inner layer to stop at.
+                    if count > 2 {
+                        let (mut from, mut to) = v.layers(count);
+                        let ids: Vec<_> = (0..count).map(|l| l.to_string()).collect();
+                        let labels: Vec<_> = (0..count).map(|l| layer_name(l, count)).collect();
+                        let choices = |range: std::ops::Range<u8>| -> Vec<(u8, &str, &str)> {
+                            range.map(|l| (l, ids[l as usize].as_str(), labels[l as usize].as_str())).collect()
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label("From");
+                            self.board_view.inspector.enum_dropdown(ui, "via_from", &choices(0..to), &mut from);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("To");
+                            self.board_view.inspector.enum_dropdown(ui, "via_to", &choices(from + 1..count), &mut to);
+                        });
+                        if (from, to) != v.layers(count) {
+                            let span = (from, to);
+                            self.transaction(|d| {
+                                if let Some(via) = d.board.vias.iter_mut().find(|via| via.id == id) {
+                                    via.span = (span != (0, count - 1)).then_some(span);
+                                }
+                            });
+                        }
+                    }
                     let delete = ui.button("Delete via");
                     self.board_view.inspector.mark("delete", &delete);
                     if delete.clicked() {
@@ -2078,10 +2457,14 @@ impl Editor {
                 }
             }
             Some(BoardSelection::Zone(id)) => self.zone_inspector(ui, id),
+            Some(BoardSelection::Drawing(id)) => self.drawing_inspector(ui, id),
+            Some(BoardSelection::Cutout(id)) => self.cutout_inspector(ui, id),
             None if self.board_view.tool == BoardTool::Zone => self.new_zone_inspector(ui),
+            None if self.board_view.tool == BoardTool::Cutout => self.new_cutout_inspector(ui),
+            None if matches!(self.board_view.tool, BoardTool::Draw | BoardTool::Text) => self.new_drawing_inspector(ui),
             None => {
                 ui.label(
-                    "Select a part, a pad, a silkscreen line, a track, a via or a zone to see it here.",
+                    "Select a part, a pad, a silkscreen line, a track, a via, a zone, a drawn item or a cutout to see it here.",
                 );
             }
         }
@@ -2157,6 +2540,108 @@ impl Editor {
             if close.clicked() {
                 self.finish_zone();
             }
+        }
+    }
+    /// The Inspector while the Draw or Text tool is in hand and nothing is
+    /// selected: the layer it draws on and its pen.
+    fn new_drawing_inspector(&mut self, ui: &mut egui::Ui) {
+        let text = self.board_view.tool == BoardTool::Text;
+        ui.label(egui::RichText::new(if text { "New text" } else { "New line" }).color(accent(ui)));
+        let mut layer = self.board_view.draw_layer;
+        ui.horizontal(|ui| {
+            self.board_view.inspector.enum_dropdown(ui, "draw_layer", &board_layers(), &mut layer);
+            ui.label("Draw on");
+        });
+        if layer != self.board_view.draw_layer {
+            self.board_view.draw_layer = layer;
+            self.board_view.draw_width = None;
+        }
+        let mut width = mm(self.board_view.draw_width.unwrap_or(layer.default_width()));
+        ui.horizontal(|ui| {
+            ui.label("Pen width");
+            let field = ui.add(egui::DragValue::new(&mut width).speed(0.01).range(0.001..=10.0).max_decimals(3).suffix(" mm"));
+            self.board_view.inspector.mark("pen_width", &field);
+        });
+        let width = um(width);
+        self.board_view.draw_width = (width != layer.default_width()).then_some(width);
+        ui.small(match layer {
+            GraphicLayer::FrontSilk | GraphicLayer::BackSilk => "Silkscreen: printed on its side's legend film, back text mirrored so it reads from the back.",
+            _ => "Fabrication drawing: shown in the editors, never manufactured.",
+        });
+        if !text {
+            let n = self.board_view.drawing_draft.len();
+            ui.small(format!("{n} corner(s) placed."));
+            if n >= 2 {
+                let finish = ui.button("Finish line");
+                self.board_view.inspector.mark("finish_line", &finish);
+                if finish.clicked() {
+                    self.finish_drawing();
+                }
+            }
+        }
+    }
+    /// The Inspector while the Cutout tool is in hand: the corners placed so
+    /// far, and the button that closes the cutout.
+    fn new_cutout_inspector(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("New cutout").color(accent(ui)));
+        let n = self.board_view.cutout_draft.len();
+        ui.small(format!(
+            "A hole milled through the board (Edge.Cuts), wholly inside its outline. {n} corner(s) placed."
+        ));
+        if n >= 3 {
+            let close = ui.button("Close cutout");
+            self.board_view.inspector.mark("close_cutout", &close);
+            if close.clicked() {
+                self.finish_cutout();
+            }
+        }
+    }
+    /// A selected cutout: its size and corners, and Delete. Drag it on the
+    /// canvas to move it.
+    fn cutout_inspector(&mut self, ui: &mut egui::Ui, id: Uuid) {
+        let Some(cutout) = self.document.board.cutouts.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        let mut name = self.board_cutout_name(id);
+        name[..1].make_ascii_uppercase();
+        ui.label(egui::RichText::new(name).color(accent(ui)));
+        let area = zones::ring_area(&cutout.points).abs() / 1e6;
+        ui.small(format!(
+            "Milled through the board · {} corners · {area:.2} mm². Copper keeps {:.2} mm from it, as from the outline; drag it to move it.",
+            cutout.points.len(),
+            mm(self.document.board.rules.edge_clearance)
+        ));
+        let delete = ui.button("Delete cutout");
+        self.board_view.inspector.mark("delete", &delete);
+        if delete.clicked() {
+            self.delete_board_selection();
+        }
+    }
+    /// A selected board drawing: the shared drawn-item fields, each change one
+    /// undo step (a field held under drag is one step).
+    fn drawing_inspector(&mut self, ui: &mut egui::Ui, id: Uuid) {
+        let Some(item) = self.document.board.graphics.iter().find(|g| g.id == id).cloned() else {
+            return;
+        };
+        ui.label(egui::RichText::new(self.board_drawing_name(id)).color(accent(ui)));
+        ui.small("Drawn on the board itself, owned by no part.");
+        let mut graphic = item.graphic.clone();
+        edit_graphic(ui, &mut self.board_view.inspector, &mut graphic, &board_layers());
+        if graphic != item.graphic {
+            if let Some(problem) = graphic.problem() {
+                self.board_view.message = format!("Not changed: the {} {problem}.", graphic_kind(&graphic).to_lowercase());
+            } else {
+                self.transaction_as(Some(format!("drawing:{id}:edit")), |d| {
+                    if let Some(g) = d.board.graphics.iter_mut().find(|g| g.id == id) {
+                        g.graphic = graphic;
+                    }
+                });
+            }
+        }
+        let delete = ui.button("Delete");
+        self.board_view.inspector.mark("delete", &delete);
+        if delete.clicked() {
+            self.delete_board_selection();
         }
     }
     /// A selected zone: what its fill did, its net, its layer and its fill rules,
@@ -2406,11 +2891,17 @@ impl Editor {
         let at = placement.transform(pad.at);
         ui.small(format!(
             "{} · {} · {:.2} × {:.2} mm · at {:.2}, {:.2} mm",
-            match pad.drill {
-                None => "Surface mount".to_owned(),
-                Some(drill) if pad.plated =>
-                    format!("Plated through hole, {:.2} mm drill", mm(drill)),
-                Some(drill) => format!("Unplated hole, {:.2} mm drill", mm(drill)),
+            match (pad.hole_size(), pad.drill_height.is_some()) {
+                (None, _) => "Surface mount".to_owned(),
+                (Some(hole), slot) => format!(
+                    "{}, {}",
+                    if pad.plated { "Plated through hole" } else { "Unplated hole" },
+                    if slot {
+                        format!("{:.2} × {:.2} mm slot", mm(hole.x), mm(hole.y))
+                    } else {
+                        format!("{:.2} mm drill", mm(hole.x))
+                    }
+                ),
             },
             layers,
             mm(pad.size.x),
@@ -2456,14 +2947,21 @@ impl Editor {
             .windows(2)
             .map(|s| f64::from(s[1].x - s[0].x).hypot(f64::from(s[1].y - s[0].y)))
             .sum();
-        ui.label(
-            egui::RichText::new(format!("{reference} · silkscreen line {index}")).color(accent(ui)),
-        );
-        ui.small(format!(
-            "{} points · {:.2} mm long · {side} silkscreen",
-            line.len(),
-            length / 1000.
-        ));
+        let name = self.drawing_name(id, index);
+        ui.label(egui::RichText::new(format!("{reference} · {name}")).color(accent(ui)));
+        // The board layer it lands on: a part on the bottom swaps the sides.
+        let on = match self.document.board.placement(id).and_then(|p| Some((p.bottom, p.footprint.drawing().nth(index)?))) {
+            Some((bottom, d)) => {
+                let layer = if bottom { d.layer.flipped() } else { d.layer };
+                match (layer.is_silk(), layer.front()) {
+                    (true, true) => "top silkscreen".to_owned(),
+                    (true, false) => "bottom silkscreen".to_owned(),
+                    _ => layer.name().to_owned(),
+                }
+            }
+            None => format!("{side} silkscreen"),
+        };
+        ui.small(format!("{} points · {:.2} mm long · {on}", line.len(), length / 1000.));
         ui.small("Decoration: it prints on the silkscreen film. It carries no pin and no net.");
         ui.add_space(6.);
         ui.horizontal_wrapped(|ui| {
@@ -2654,9 +3152,17 @@ impl Editor {
             let apply = ui.add_enabled(changed, egui::Button::new("Apply size"));
             self.board_view.inspector.mark("apply_size", &apply);
             if apply.clicked() {
-                self.transaction(|d| {
-                    d.board.outline = rectangle(min, Point::new(min.x + um(w), min.y + um(h)))
+                let mut resized = self.document.board.clone();
+                resized.outline = rectangle(min, Point::new(min.x + um(w), min.y + um(h)));
+                // A cutout the smaller board would leave hanging off it says so.
+                let stranded = resized.cutouts.iter().enumerate().find_map(|(n, c)| {
+                    resized.cutout_problem(&c.points, Some(n)).map(|why| format!("Not resized: cutout {} would then be {}.", n + 1, why.trim_start_matches("is ")))
                 });
+                if let Some(words) = stranded {
+                    self.board_view.message = words;
+                } else {
+                    self.transaction(|d| d.board.outline = resized.outline);
+                }
                 self.board_view.outline = None;
             }
         } else {
@@ -2784,6 +3290,27 @@ impl Editor {
             self.board_view.inspector.mark("rule:solder_mask_expansion", &field);
             if field.changed() {
                 rules.mask_expansion = um(v);
+            }
+        });
+        let tent = ui
+            .checkbox(&mut rules.tent_vias, "Tent vias")
+            .on_hover_text("On: the solder mask covers every via. Off: the mask opens over each via's ring on both sides.");
+        self.board_view.inspector.mark("rule:tent_vias", &tent);
+        ui.horizontal(|ui| {
+            ui.label("Minimum annular ring");
+            let mut v = mm(rules.min_annular_ring);
+            let field = ui
+                .add(
+                    egui::DragValue::new(&mut v)
+                        .speed(0.005)
+                        .range(0.0..=1.0)
+                        .fixed_decimals(3)
+                        .suffix(" mm"),
+                )
+                .on_hover_text("The narrowest copper ring a plated pad or via may keep round its hole.");
+            self.board_view.inspector.mark("rule:minimum_annular_ring", &field);
+            if field.changed() {
+                rules.min_annular_ring = um(v);
             }
         });
         ui.label("Net widths");
@@ -3158,6 +3685,7 @@ impl Editor {
                 at,
                 diameter,
                 drill,
+                span: None,
             });
             draft.layer = layer;
         }
@@ -3199,9 +3727,16 @@ impl Editor {
                 }
             }
         }
+        // A track ends on a via only where the via has copper: on the layer the
+        // track being drawn is on (a blind or buried via reaches some layers only).
+        let draft_layer = view.draft.as_ref().map(|d| d.layer);
         for via in &board.vias {
+            let layers = via.layers(board.layer_count);
+            if draft_layer.is_some_and(|l| !(layers.0..=layers.1).contains(&l)) {
+                continue;
+            }
             if Shape::circle(via.at, via.diameter / 2).distance_to_point(q) <= tolerance {
-                return (via.at, Some(Anchor::Via));
+                return (via.at, Some(Anchor::Via { layers }));
             }
         }
         for track in board.tracks.iter().filter(|t| view.visible(t.layer)) {
@@ -3489,15 +4024,11 @@ impl Editor {
     /// layer at the board's default width.
     fn start_draft(&mut self, at: Point, anchor: Option<Anchor>) {
         let active = self.board_view.active_layer;
+        let on = |layers: (u8, u8)| if (layers.0..=layers.1).contains(&active) { active } else { layers.0 };
         let (layer, width) = match anchor {
-            Some(Anchor::Pad { layers, width }) => (
-                if (layers.0..=layers.1).contains(&active) {
-                    active
-                } else {
-                    layers.0
-                },
-                width,
-            ),
+            Some(Anchor::Pad { layers, width }) => (on(layers), width),
+            // From a via: on the active layer if the via reaches it, else its first.
+            Some(Anchor::Via { layers }) => (on(layers), self.document.board.rules.track_width),
             Some(Anchor::Track { layer, width }) => (layer, width),
             _ => (active, self.document.board.rules.track_width),
         };
@@ -3548,9 +4079,13 @@ impl Editor {
             // covers that middle, the next longest segment whose middle the canvas
             // DOES answer with this line is used instead, so a click on the rect's
             // centre always selects what the key names.
-            for (index, line) in p.footprint.silk.iter().enumerate() {
-                let mut middles: Vec<(f32, Pos2)> = line
-                    .windows(2)
+            // A drawn item is keyed the same way, after the lines
+            // (`Footprint::drawing`'s order).
+            for (index, drawn) in p.footprint.drawing().enumerate() {
+                let mut middles: Vec<(f32, Pos2)> = drawn
+                    .strokes
+                    .iter()
+                    .flat_map(|line| line.windows(2))
                     .map(|s| {
                         (
                             view.screen(p.transform(s[0])),
@@ -3621,6 +4156,45 @@ impl Editor {
                 for (j, m) in edge_middles(&zone.outline).into_iter().enumerate() {
                     out.push((format!("zone:{i}.edge:{j}"), Rect::from_center_size(view.screen(m), Vec2::splat(8.))));
                 }
+            }
+        }
+        // A board drawing by its index, where a click selects it: text at the
+        // middle of its letters' box; a line at the middle of its longest
+        // segment, else at a quarter, three quarters, a tenth or nine tenths of
+        // it, else along the next longest. A drawing that copper covers at every
+        // one of those points publishes no key: a key that clicks the copper
+        // instead would select, and let Delete remove, the wrong thing.
+        for (i, g) in board.graphics.iter().enumerate() {
+            let strokes = g.graphic.strokes(!g.graphic.layer.front());
+            let candidates: Vec<Pos2> = if matches!(g.graphic.shape, GraphicShape::Text { .. }) {
+                let all: Vec<Pos2> = strokes.iter().flatten().map(|p| view.screen(*p)).collect();
+                (!all.is_empty()).then(|| Rect::from_points(&all).center()).into_iter().collect()
+            } else {
+                let mut segments: Vec<(Pos2, Pos2)> = strokes
+                    .iter()
+                    .flat_map(|line| line.windows(2))
+                    .map(|s| (view.screen(s[0]), view.screen(s[1])))
+                    .collect();
+                segments.sort_by(|a, b| b.0.distance(b.1).total_cmp(&a.0.distance(a.1)));
+                segments
+                    .into_iter()
+                    .flat_map(|(a, b)| [0.5, 0.25, 0.75, 0.1, 0.9].map(|t| a.lerp(b, t)))
+                    .collect()
+            };
+            if let Some(at) = candidates.into_iter().find(|&m| self.hit_board(m) == Some(BoardSelection::Drawing(g.id))) {
+                out.push((format!("drawing:{i}"), Rect::from_center_size(at, Vec2::splat(8.))));
+            }
+        }
+        // A cutout by its index, where a click selects it: the middle of its
+        // corners' box, else the middle of one of its edges. None where some
+        // other item answers at every one of those points.
+        for (i, c) in board.cutouts.iter().enumerate() {
+            let corners: Vec<Pos2> = c.points.iter().map(|p| view.screen(*p)).collect();
+            let n = corners.len();
+            let candidates = std::iter::once(Rect::from_points(&corners).center())
+                .chain((0..n).map(|k| corners[k].lerp(corners[(k + 1) % n], 0.5)));
+            if let Some(at) = candidates.into_iter().find(|&m| self.hit_board(m) == Some(BoardSelection::Cutout(c.id))) {
+                out.push((format!("cutout:{i}"), Rect::from_center_size(at, Vec2::splat(8.))));
             }
         }
         out.extend(view.menu.iter().cloned());
@@ -3728,9 +4302,10 @@ impl Editor {
         // when the two cross, and the courtyard around it is what they get when
         // they miss the line. A line is caught within the pointer tolerance of
         // any of its segments, the topmost part's first, as it is drawn.
+        // A part's other drawn items answer the same way, after its lines.
         for placement in board.placements.iter().rev() {
-            for (index, line) in placement.footprint.silk.iter().enumerate() {
-                let near = line.windows(2).any(|s| {
+            for (index, drawn) in placement.footprint.drawing().enumerate() {
+                let near = drawn.strokes.iter().flat_map(|line| line.windows(2)).any(|s| {
                     let (a, b) = (placement.transform(s[0]), placement.transform(s[1]));
                     Shape::segment(a, b, 0).distance_to_point(q) <= tolerance
                 });
@@ -3738,6 +4313,11 @@ impl Editor {
                     return Some(BoardSelection::Silk(placement.component, index));
                 }
             }
+        }
+        // What is drawn on the board itself, after the parts' own legend: within
+        // the pointer tolerance of its lines, or inside it when it is filled.
+        if let Some(g) = board.graphics.iter().rev().find(|g| board_drawing_hit(g, q, tolerance)) {
+            return Some(BoardSelection::Drawing(g.id));
         }
         // A zone's OUTLINE, after all the copper and legend that sit on it and
         // before the courtyards it runs through: the active layer's zones first.
@@ -3750,6 +4330,18 @@ impl Editor {
             })
         }) {
             return Some(BoardSelection::Zone(z.id));
+        }
+        // A cutout, after everything drawn over the board and before the parts
+        // whose courtyards it may cut into: within the pointer tolerance of its
+        // edge, or inside it.
+        if let Some(c) = board.cutouts.iter().rev().find(|c| {
+            brep_ecad_core::board::polygon_contains(&c.points, q)
+                || (0..c.points.len()).any(|i| {
+                    let (a, b) = (c.points[i], c.points[(i + 1) % c.points.len()]);
+                    Shape::segment(a, b, 0).distance_to_point(q) <= tolerance
+                })
+        }) {
+            return Some(BoardSelection::Cutout(c.id));
         }
         let bottom_first = view.active_layer + 1 == board.layer_count && board.layer_count > 1;
         let part = board
@@ -3838,7 +4430,7 @@ impl Editor {
                         .unwrap_or_default()
                 }
                 Some(BoardSelection::Silk(id, index)) => {
-                    format!(" · silkscreen line {index} of {}", self.reference_of(id))
+                    format!(" · {} of {}", self.drawing_name(id, index), self.reference_of(id))
                 }
                 Some(BoardSelection::Zone(id)) => self
                     .document
@@ -3848,6 +4440,8 @@ impl Editor {
                     .find(|z| z.id == id)
                     .map(|z| format!(" · {}", zones::describe(z, self.document.board.layer_count)))
                     .unwrap_or_default(),
+                Some(BoardSelection::Drawing(id)) => format!(" · {}", self.board_drawing_name(id)),
+                Some(BoardSelection::Cutout(id)) => format!(" · {}", self.board_cutout_name(id)),
                 _ => String::new(),
             };
             // A draft too close to another net says so on the line the pointer
@@ -3944,10 +4538,8 @@ impl Editor {
                     // A silk line's menu is its part's too, named the same way.
                     if let Some(BoardSelection::Silk(id, index)) = self.board_view.selected {
                         let reference = self.reference_of(id).to_owned();
-                        ui.label(
-                            egui::RichText::new(format!("{reference} · silkscreen line {index}"))
-                                .small(),
-                        );
+                        let name = self.drawing_name(id, index);
+                        ui.label(egui::RichText::new(format!("{reference} · {name}")).small());
                         let select = ui.button(format!("Select {reference}"));
                         self.board_view.menu.push(("menuitem:select_part".into(), select.rect));
                         if select.clicked() {
@@ -4047,6 +4639,8 @@ impl Editor {
                             .and_then(|t| grip(board, t, q, self.board_view.tolerance()))
                             .map(|g| (Subject::Track(id, g), q)),
                         Some(BoardSelection::Zone(id)) => zone_grip.map(|g| (Subject::Zone(id, g), q)),
+                        Some(BoardSelection::Drawing(id)) => Some((Subject::Drawing(id), q)),
+                        Some(BoardSelection::Cutout(id)) => Some((Subject::Cutout(id), q)),
                         None => None,
                     };
                     if let Some((what, at)) = grabbed {
@@ -4106,6 +4700,18 @@ impl Editor {
                             }
                         }
                         Subject::Zone(..) => {}
+                        Subject::Drawing(id) => {
+                            if let Some(g) = board.graphics.iter_mut().find(|g| g.id == id) {
+                                move_graphic(&mut g.graphic, delta);
+                            }
+                        }
+                        Subject::Cutout(id) => {
+                            if let Some(c) = board.cutouts.iter_mut().find(|c| c.id == id) {
+                                for p in &mut c.points {
+                                    *p = Point::new(p.x + delta.x, p.y + delta.y);
+                                }
+                            }
+                        }
                     }
                     if let Subject::Part(id) = what
                         && let Some((before, _)) = &self.board_view.placing
@@ -4160,17 +4766,33 @@ impl Editor {
                             .iter()
                             .zip(&self.document.board.zones)
                             .any(|(a, b)| a.outline != b.outline);
-                    if zone_moved {
-                        let reports = self.document.fill_zones();
-                        self.note_filled();
-                        let words = self.zone_reports_words(&reports);
-                        if let Some(BoardSelection::Zone(id)) = self.board_view.selected
-                            && let Some(k) = self.document.board.zones.iter().position(|z| z.id == id)
-                        {
-                            self.board_view.message = words.get(k).cloned().unwrap_or_default();
+                    // A cutout moved off the board, or onto another, is put back,
+                    // and said; one moved fairly is refilled round, as a zone is.
+                    let cutout_moved = before.board.cutouts != self.document.board.cutouts;
+                    let board = &self.document.board;
+                    let refused = cutout_moved
+                        .then(|| {
+                            board.cutouts.iter().enumerate().find_map(|(n, c)| {
+                                board.cutout_problem(&c.points, Some(n)).map(|why| format!("Not moved: cutout {} {why}.", n + 1))
+                            })
+                        })
+                        .flatten();
+                    if let Some(words) = refused {
+                        self.document = before;
+                        self.board_view.message = words;
+                    } else {
+                        if zone_moved || (cutout_moved && !self.document.board.zones.is_empty()) {
+                            let reports = self.document.fill_zones();
+                            self.note_filled();
+                            let words = self.zone_reports_words(&reports);
+                            if let Some(BoardSelection::Zone(id)) = self.board_view.selected
+                                && let Some(k) = self.document.board.zones.iter().position(|z| z.id == id)
+                            {
+                                self.board_view.message = words.get(k).cloned().unwrap_or_default();
+                            }
                         }
+                        self.commit(before, None);
                     }
-                    self.commit(before, None);
                 }
                 if response.clicked_by(PointerButton::Primary)
                     && let Some(p) = pointer
@@ -4185,6 +4807,31 @@ impl Editor {
                     && let Some(p) = pointer
                 {
                     self.zone_click(p);
+                }
+            }
+            BoardTool::Draw => {
+                if response.double_clicked_by(PointerButton::Primary) {
+                    self.finish_drawing();
+                } else if response.clicked_by(PointerButton::Primary)
+                    && let Some(p) = pointer
+                {
+                    self.drawing_click(p);
+                }
+            }
+            BoardTool::Cutout => {
+                if response.double_clicked_by(PointerButton::Primary) {
+                    self.finish_cutout();
+                } else if response.clicked_by(PointerButton::Primary)
+                    && let Some(p) = pointer
+                {
+                    self.cutout_click(p);
+                }
+            }
+            BoardTool::Text => {
+                if response.clicked_by(PointerButton::Primary)
+                    && let Some(p) = pointer
+                {
+                    self.text_click(p);
                 }
             }
             BoardTool::Route => {
@@ -4209,6 +4856,12 @@ impl Editor {
             painter.rect_filled(Rect::from_points(&outline), 0., SUBSTRATE);
         }
         painter.add(egui::Shape::closed_line(outline, Stroke::new(1.5, EDGE)));
+        // Each cutout is a hole: the background shows through it. Its edge is
+        // drawn over the copper, further down.
+        for c in &board.cutouts {
+            let ring: Vec<Pos2> = c.points.iter().map(|p| view.screen(*p)).collect();
+            paint_filled(painter, &ring, BACKGROUND);
+        }
         let paint_shape = |shape: &Shape, color: Color32| match *shape {
             Shape::Rect { min, max } => {
                 painter.rect_filled(
@@ -4216,6 +4869,18 @@ impl Editor {
                     0.,
                     color,
                 );
+            }
+            Shape::RoundRect { min, max, radius } if view.px(radius) <= crate::footprint_editor::MAX_PAINTED_CORNER => {
+                painter.rect_filled(
+                    Rect::from_two_pos(view.screen(min), view.screen(max)),
+                    view.px(radius),
+                    color,
+                );
+            }
+            // Wider on screen than egui keeps a corner (a byte): the outline itself.
+            Shape::RoundRect { .. } => {
+                let ring: Vec<Pos2> = shape.outline(16).into_iter().map(|p| view.screen(p)).collect();
+                painter.add(egui::Shape::convex_polygon(ring, color, Stroke::NONE));
             }
             Shape::Capsule { a, b, radius } => {
                 let r = view.px(radius).max(0.5);
@@ -4311,22 +4976,19 @@ impl Editor {
         }
         let paint_via = |via: &Via, selected: bool| {
             let at = view.screen(via.at);
-            painter.circle_filled(
-                at,
-                view.px(via.diameter / 2).max(1.5),
-                if selected { ACCENT } else { VIA },
-            );
+            // A blind or buried via that does not reach the active layer is drawn
+            // faint: it is not copper there.
+            let (from, to) = via.layers(count);
+            let here = (from..=to).contains(&view.active_layer.min(count - 1));
+            let color = if selected { ACCENT } else if here { VIA } else { VIA.gamma_multiply(0.35) };
+            painter.circle_filled(at, view.px(via.diameter / 2).max(1.5), color);
             painter.circle_filled(at, view.px(via.drill / 2).max(0.8), BACKGROUND);
         };
         for placement in &board.placements {
             for pad in placement.footprint.pads.iter() {
-                if let Some(drill) = pad.drill {
+                if let Some(hole) = placement.pad_hole(pad) {
                     paint_shape(&placement.pad_shape(pad), THROUGH_HOLE);
-                    painter.circle_filled(
-                        view.screen(placement.transform(pad.at)),
-                        view.px(drill / 2).max(0.8),
-                        BACKGROUND,
-                    );
+                    paint_shape(&hole, BACKGROUND);
                 }
             }
         }
@@ -4407,6 +5069,26 @@ impl Editor {
         }
         // The zone being drawn: its corners so far, the edge to the pointer, and
         // the closing edge back to the first corner dashed.
+        // The cutouts' edges, over the copper: Edge.Cuts, the selected one in the
+        // accent.
+        for c in &board.cutouts {
+            let ring: Vec<Pos2> = c.points.iter().map(|p| view.screen(*p)).collect();
+            let chosen = view.selected == Some(BoardSelection::Cutout(c.id));
+            painter.add(egui::Shape::closed_line(ring, Stroke::new(if chosen { 2.5 } else { 1.5 }, if chosen { ACCENT } else { EDGE })));
+        }
+        if view.tool == BoardTool::Cutout && !view.cutout_draft.is_empty() {
+            let mut points: Vec<Pos2> = view.cutout_draft.iter().map(|p| view.screen(*p)).collect();
+            if let Some(p) = pointer {
+                points.push(view.screen(snap(view.world(p), PLACE_GRID)));
+            }
+            painter.add(egui::Shape::line(points.clone(), Stroke::new(1.5, EDGE)));
+            if points.len() >= 3 {
+                painter.extend(egui::Shape::dashed_line(&[*points.last().unwrap(), points[0]], Stroke::new(1., EDGE.gamma_multiply(0.7)), 5., 4.));
+            }
+            for (i, &c) in view.cutout_draft.iter().enumerate() {
+                painter.circle_filled(view.screen(c), if i == 0 { 5. } else { 3.5 }, EDGE);
+            }
+        }
         if view.tool == BoardTool::Zone && !view.zone_draft.is_empty() {
             let colour = layer_color(active, count);
             let mut points: Vec<Pos2> = view.zone_draft.iter().map(|p| view.screen(*p)).collect();
@@ -4428,11 +5110,25 @@ impl Editor {
             }
         }
         if let Some(p) = pointer
-            && view.tool == BoardTool::Zone
+            && matches!(view.tool, BoardTool::Zone | BoardTool::Draw | BoardTool::Text | BoardTool::Cutout)
         {
             let at = view.screen(snap(view.world(p), PLACE_GRID));
             painter.circle_stroke(at, 5., Stroke::new(1.5, ACCENT));
             painter.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        // The line being drawn: its corners so far and the segment to the pointer,
+        // in its layer's colour at its pen.
+        if view.tool == BoardTool::Draw && !view.drawing_draft.is_empty() {
+            let colour = graphic_color(view.draw_layer);
+            let width = (view.draw_width.unwrap_or(view.draw_layer.default_width()) as f32 * view.zoom).max(1.);
+            let mut points: Vec<Pos2> = view.drawing_draft.iter().map(|p| view.screen(*p)).collect();
+            if let Some(p) = pointer {
+                points.push(view.screen(snap(view.world(p), PLACE_GRID)));
+            }
+            painter.add(egui::Shape::line(points, Stroke::new(width, colour)));
+            for (i, &c) in view.drawing_draft.iter().enumerate() {
+                painter.circle_filled(view.screen(c), if i == 0 { 5. } else { 3.5 }, colour);
+            }
         }
         // The pad a dragged free end is coming down on: the accent where it
         // snaps to the centre, the warning colour where it is another net's.
@@ -4455,6 +5151,23 @@ impl Editor {
             .iter()
             .map(|c| (c.id, c.reference.as_str()))
             .collect();
+        // What is drawn on the board itself, each item with its pen, the
+        // selected one in the accent.
+        for g in &board.graphics {
+            let chosen = view.selected == Some(BoardSelection::Drawing(g.id));
+            let color = if chosen { ACCENT } else { graphic_color(g.graphic.layer) };
+            let width = (g.graphic.width() as f32 * view.zoom).max(if chosen { 2. } else { 1. });
+            let strokes = g.graphic.strokes(!g.graphic.layer.front());
+            if g.graphic.filled
+                && let Some(line) = strokes.first()
+            {
+                let outline: Vec<Pos2> = line.iter().map(|p| view.screen(*p)).collect();
+                paint_filled(painter, &outline, color.gamma_multiply(0.6));
+            }
+            for line in strokes {
+                painter.add(egui::Shape::line(line.iter().map(|p| view.screen(*p)).collect(), Stroke::new(width, color)));
+            }
+        }
         for placement in &board.placements {
             let silk = if placement.bottom {
                 Color32::from_rgb(142, 154, 186)
@@ -4486,6 +5199,27 @@ impl Editor {
                         Stroke::new(1., silk.gamma_multiply(0.7))
                     },
                 ));
+            }
+            // The footprint's drawn items, each with its own pen: silkscreen in
+            // its side's colour, fabrication drawing and a drawn courtyard dimmer.
+            let silk_lines = placement.footprint.silk.len();
+            for (k, graphic) in placement.footprint.graphics.iter().enumerate() {
+                let (layer, strokes) = placement.place_graphic(graphic);
+                let chosen = view.selected == Some(BoardSelection::Silk(placement.component, silk_lines + k));
+                let color = if chosen { ACCENT } else { graphic_color(layer) };
+                let width = (graphic.width() as f32 * view.zoom).max(1.);
+                if graphic.filled
+                    && let Some(line) = strokes.first()
+                {
+                    let outline: Vec<Pos2> = line.iter().map(|p| view.screen(*p)).collect();
+                    paint_filled(painter, &outline, color.gamma_multiply(0.6));
+                }
+                for line in strokes {
+                    painter.add(egui::Shape::line(
+                        line.iter().map(|p| view.screen(*p)).collect(),
+                        Stroke::new(width, color),
+                    ));
+                }
             }
             if bounds.width() > 12. {
                 painter.text(

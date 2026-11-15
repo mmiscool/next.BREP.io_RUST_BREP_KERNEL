@@ -508,7 +508,22 @@ fn expressions_get(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 fn expressions_set(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: ExpressionsArgs = parse_args(args)?;
     let r = ctx.app.docs.engine_mut().set_expressions(&a.script);
-    report(ctx, &r)
+    match report(ctx, &r)? {
+        Outcome::Done(mut reply) => {
+            reply["expressions"] = Value::String(ctx.app.docs.engine().expressions_json());
+            Ok(Outcome::Done(reply))
+        }
+        other => Ok(other),
+    }
+}
+
+fn expressions_set_result_schema() -> Value {
+    let mut schema = schema_of::<Report>();
+    schema["properties"]["expressions"] = json!({"type":"string","description":"The script as stored: one statement per line (statements sent on one line are split; text that does not parse is stored as sent)."});
+    if let Some(required) = schema["required"].as_array_mut() {
+        required.push(json!("expressions"));
+    }
+    schema
 }
 
 pub static COMMANDS: &[CommandSpec] = &[
@@ -531,5 +546,5 @@ pub static COMMANDS: &[CommandSpec] = &[
     app_command!("history", "history_group_end", "Close the undo group `token`. With `rollback: true` the group's edits are taken back (the document as it was when the group opened, no undo step left) and the history re-runs. Answers `{rolledBack}`.", GroupEndArgs, history_group_end, Mutate, MUTATE_NOWAIT, history_group_end_result_schema),
     app_command!("history", "next_feature_id", "Reserve the next unique feature id for a base (the feature's shortName), the way the add palette does.", NextIdArgs, next_feature_id, Mutate, MUTATE_NOWAIT, next_feature_id_result_schema),
     app_command!("history", "expressions_get", "The Expressions panel script, the variables it defines, and the configurator values.", NoArgs, expressions_get, Read, READ, expressions_get_result_schema),
-    app_command!("history", "expressions_set", "Replace the Expressions script and rerun the history.", ExpressionsArgs, expressions_set, Mutate, MUTATE, schema_of::<Report>),
+    app_command!("history", "expressions_set", "Replace the Expressions script and rerun the history. The script is stored one statement per line (statements sent on one line are split onto lines of their own; text that does not parse is stored as sent); `expressions` in the reply is the stored script.", ExpressionsArgs, expressions_set, Mutate, MUTATE, expressions_set_result_schema),
 ];

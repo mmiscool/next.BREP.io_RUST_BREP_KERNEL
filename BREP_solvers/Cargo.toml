@@ -1,0 +1,46 @@
+[package]
+name = "BREP_solvers"
+version = "0.20.0"
+edition = "2021"
+license-file = "LICENSE.md"
+description = "Constraint solvers of the BREP kernel: 2D and 3D sketches and assemblies."
+readme = "README.md"
+repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
+homepage = "https://v2.brep.io"
+keywords = ["cad", "brep", "geometry", "nurbs", "kernel"]
+categories = ["mathematics", "graphics", "algorithms"]
+include = [
+    "src/**/*.rs",
+    "/build.rs",
+    "/Cargo.toml",
+    "/LICENSE.md",
+    "/README.md",
+    "!src/**/tests/**",
+    "!**/tests.rs",
+    "!**/*_tests.rs",
+    "!**/test_support.rs",
+    "!**/testdata/**",
+]
+
+[lib]
+name = "brep_solvers"
+
+[dependencies]
+BREP_geometry = { version = "0.20.0", path = "../BREP_geometry" }
+BREP_topology = { version = "0.20.0", path = "../BREP_topology" }
+BREP_RANSAC = { version = "0.2.1", path = "../BREP_RANSAC" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+slotmap = "1"
+rustc-hash = "2"
+wasm-bindgen = "0.2"
+web-time = "1"
+spade = "=2.15.1"
+rayon = { version = "1", optional = true }
+
+[features]
+profile-wall = []
+parallel = ["dep:rayon"]
+# Marker for the facade's profiled allocator wrapper (wall_profile).
+native-rusty-alloc = []
+

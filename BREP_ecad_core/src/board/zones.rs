@@ -582,6 +582,11 @@ fn fill_zone(board: &Board, conn: &Connectivity, stitch: &Stitching, index: usiz
             obstacles.push(Obstacle::Zone(earlier.outline.clone(), clearance));
         }
     }
+    // A cutout is a hole in the board: the fill keeps the edge clearance from it
+    // as it does from the outline.
+    for cutout in &board.cutouts {
+        obstacles.push(Obstacle::Zone(cutout.points.clone(), f64::from(rules.edge_clearance)));
+    }
     let clearance = obstacles
         .iter()
         .map(|o| match o {

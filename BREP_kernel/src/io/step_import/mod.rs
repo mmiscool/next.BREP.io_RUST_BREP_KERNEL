@@ -42,6 +42,10 @@ mod styles;
 mod pmi;
 mod precision;
 mod trim_readings;
+/// The projected-foot refinement's body face cap (`0` = uncapped); the
+/// soundness fixture sweep reads it to know which trims the import refined.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use builder::loops::projected_foot_refine_body_faces;
 
 use crate::appearance::{BodyAppearance, ImportedColor};
 use parse::*;

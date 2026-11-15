@@ -40,15 +40,17 @@ pub const CLASSES: [(&str, &str, &str, &str); 3] = [
 /// The files the app imports that the OS may offer it for, never as their
 /// default opener: `(MIME type, its globs, what a file manager calls it)`.
 /// The standard `model/*` types (IANA registers `model/step`, `model/iges`,
-/// `model/stl`, `model/3mf`, `model/obj`); the install declares them with
+/// `model/vnd.parasolid.transmit.text`, `model/stl`, `model/3mf`,
+/// `model/obj`); the install declares them with
 /// their globs too, because an older shared-mime-info has no `model/step`
 /// and a desktop entry naming an unknown type routes nothing. Declaring a
 /// type the system already has merges the globs; it replaces nothing.
 /// KiCad files are imported too but have no registered type, and KiCad's own
 /// association owns them, so they are not offered here.
-pub const IMPORT_TYPES: [(&str, &[&str], &str); 5] = [
+pub const IMPORT_TYPES: [(&str, &[&str], &str); 6] = [
     ("model/step", &["step", "stp", "p21"], "STEP 3D model"),
     ("model/iges", &["iges", "igs"], "IGES 3D model"),
+    ("model/vnd.parasolid.transmit.text", &["x_t", "xmt_txt"], "Parasolid part"),
     ("model/stl", &["stl"], "STL mesh"),
     ("model/3mf", &["3mf"], "3MF mesh package"),
     ("model/obj", &["obj"], "OBJ mesh"),
@@ -304,7 +306,12 @@ mod platform {
     }
 
     pub fn uninstall() -> Vec<Step> {
-        let data = data_home();
+        uninstall_at(&data_home(), None)
+    }
+
+    /// [`uninstall`] from `data` (an `XDG_DATA_HOME`), with the helpers found
+    /// on `path` when given.
+    pub(super) fn uninstall_at(data: &Path, path: Option<&std::ffi::OsStr>) -> Vec<Step> {
         let mime_dir = data.join("mime");
         let mut steps = Vec::new();
         for (path, what) in [
@@ -319,11 +326,11 @@ mod platform {
                 Err(e) => Step::failed(what, format!("remove {}: {e}", path.display())),
             });
         }
-        steps.push(run("update-mime-database", &[&mime_dir.to_string_lossy()], None));
+        steps.push(run("update-mime-database", &[&mime_dir.to_string_lossy()], path));
         steps.push(run(
             "update-desktop-database",
             &[&data.join("applications").to_string_lossy()],
-            None,
+            path,
         ));
         steps
     }

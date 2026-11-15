@@ -1,6 +1,6 @@
 [package]
 name = "BREP_kernel"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "A boundary representation (BREP) geometry kernel for building CAD applications."
@@ -40,6 +40,15 @@ panic = "abort"         # drop unwinding code (wasm can't unwind anyway) — sma
 overflow-checks = false # no arithmetic overflow checks in hot paths
 
 [dependencies]
+BREP_solvers = { version = "0.20.0", path = "../BREP_solvers" }
+BREP_surface_offset = { version = "0.20.0", path = "../BREP_surface_offset" }
+BREP_boolean = { version = "0.20.0", path = "../BREP_boolean" }
+BREP_construction = { version = "0.20.0", path = "../BREP_construction" }
+BREP_blend = { version = "0.20.0", path = "../BREP_blend" }
+BREP_offset = { version = "0.20.0", path = "../BREP_offset" }
+BREP_direct_edit = { version = "0.20.0", path = "../BREP_direct_edit" }
+BREP_geometry = { version = "0.20.0", path = "../BREP_geometry" }
+BREP_topology = { version = "0.20.0", path = "../BREP_topology" }
 # Robust single-region surface fitting for the Refit Faces edit (the same
 # RANSAC + least-squares pass the mesh import runs). A geometry leaf: no cycle.
 BREP_RANSAC = { version = "0.2.1", path = "../BREP_RANSAC" }
@@ -65,14 +74,14 @@ rusty_alloc-api = { version = "=2.2.6", optional = true }
 
 [features]
 # Diagnostic wall-time partition; ordinary builds compile the hooks away.
-profile-wall = []
+profile-wall = ["BREP_geometry/profile-wall", "BREP_topology/profile-wall", "BREP_surface_offset/profile-wall", "BREP_boolean/profile-wall", "BREP_construction/profile-wall", "BREP_blend/profile-wall", "BREP_offset/profile-wall", "BREP_direct_edit/profile-wall", "BREP_solvers/profile-wall"]
 # `parallel` turns the per-face tessellation loop into a rayon par_iter. It
 # works on native (rayon's own pool) and on wasm built with atomics. The
 # DEFAULT build enables neither feature, so the shipped wasm is byte-identical
 # to before. `wasm-threads` additionally pulls in wasm-bindgen-rayon so the
 # browser can spin up a shared-memory thread pool (requires an atomics build +
 # COOP/COEP headers — see build:rust-kernel:threads).
-parallel = ["dep:rayon"]
+parallel = ["dep:rayon", "BREP_geometry/parallel", "BREP_topology/parallel", "BREP_surface_offset/parallel", "BREP_boolean/parallel", "BREP_construction/parallel", "BREP_blend/parallel", "BREP_offset/parallel", "BREP_direct_edit/parallel", "BREP_solvers/parallel"]
 wasm-threads = ["parallel", "dep:wasm-bindgen-rayon"]
 # `wasm-talc` replaces Rust's default wasm allocator (dlmalloc) with talc on
 # single-threaded wasm builds. Native builds are unaffected.
@@ -81,5 +90,5 @@ wasm-talc = ["dep:talc"]
 # builds (headless drivers, benches, servers). Never in a graph that already has
 # a global allocator, such as BREP_app's (rusty_h264-common installs this same
 # allocator there): Rust allows one per program.
-native-rusty-alloc = ["dep:rusty_alloc-api"]
+native-rusty-alloc = ["dep:rusty_alloc-api", "BREP_geometry/native-rusty-alloc", "BREP_topology/native-rusty-alloc", "BREP_surface_offset/native-rusty-alloc", "BREP_boolean/native-rusty-alloc", "BREP_construction/native-rusty-alloc", "BREP_blend/native-rusty-alloc", "BREP_offset/native-rusty-alloc", "BREP_direct_edit/native-rusty-alloc", "BREP_solvers/native-rusty-alloc"]
 

@@ -113,6 +113,19 @@ fn disc_inside(shape: &Shape, at: Point, radius: i32) -> bool {
         Shape::Capsule { a, b, radius: r } => {
             crate::board::point_segment_distance(at, a, b) + f64::from(radius) <= f64::from(r)
         }
+        // A disc at least as round as the corners fits as in the plain box; a
+        // smaller one must keep within the corner arcs, i.e. within `r - radius`
+        // of the core rectangle.
+        Shape::RoundRect { min, max, radius: r } if radius >= r => {
+            disc_inside(&Shape::Rect { min, max }, at, radius)
+        }
+        Shape::RoundRect { min, max, radius: r } => {
+            let core = Shape::Rect {
+                min: Point::new(min.x + r, min.y + r),
+                max: Point::new(max.x - r, max.y - r),
+            };
+            core.distance_to_point(at) + f64::from(radius) <= f64::from(r)
+        }
     }
 }
 
@@ -246,6 +259,9 @@ pub struct RouteJob {
     /// Claim owner of each static item: a routed net index or `BLOCKED`.
     owners: Vec<u32>,
     outline: Vec<Point>,
+    /// The board's cutouts, holes in the outline a route keeps the edge
+    /// clearance from as it does from the outline.
+    cutouts: Vec<Vec<Point>>,
     edge_clearance: i32,
     static_claims: Vec<Claims>,
     route_claims: Vec<Claims>,
@@ -424,6 +440,7 @@ impl RouteJob {
             item_class,
             owners: vec![],
             outline: board.outline.clone(),
+            cutouts: board.cutouts.iter().map(|c| c.points.clone()).collect(),
             edge_clearance: rules.edge_clearance,
             static_claims: vec![Claims::new(cells); maps],
             route_claims: vec![Claims::new(cells); maps],
@@ -753,8 +770,12 @@ impl RouteJob {
                     || shape.distance(&item.shape) >= f64::from(gaps[*class])
             });
         let inside = crate::board::polygon_contains(&self.outline, shape.center())
+            && !self.cutouts.iter().any(|c| crate::board::polygon_contains(c, shape.center()))
             && self.outline_edges().all(|(a, b)| {
-                shape.distance(&Shape::segment(a, b, 0)) >= f64::from(self.edge_clearance)
+                // Copper ON an edge is never clear, even with no edge clearance:
+                // the mill would cut it.
+                let gap = shape.distance(&Shape::segment(a, b, 0));
+                gap >= f64::from(self.edge_clearance) && gap > 0.
             });
         let routes = self.states.iter().enumerate().all(|(j, state)| {
             let clearance = f64::from(gaps[self.nets[j].class]);
@@ -773,8 +794,10 @@ impl RouteJob {
         statics && inside && routes
     }
     fn outline_edges(&self) -> impl Iterator<Item = (Point, Point)> + '_ {
-        let n = self.outline.len();
-        (0..n).map(move |i| (self.outline[i], self.outline[(i + 1) % n]))
+        std::iter::once(&self.outline).chain(&self.cutouts).flat_map(|ring| {
+            let n = ring.len();
+            (0..n).map(move |i| (ring[i], ring[(i + 1) % n]))
+        })
     }
 
     fn cell_box(&self, nodes: impl Iterator<Item = u32>) -> Option<(i64, i64, i64, i64)> {
@@ -1047,6 +1070,7 @@ impl RouteJob {
                 at,
                 diameter,
                 drill,
+                span: None,
             });
         }
     }

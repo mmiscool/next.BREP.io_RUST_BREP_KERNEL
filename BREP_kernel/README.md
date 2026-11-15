@@ -2,7 +2,7 @@
 
 A native/WASM B-rep geometry kernel for building CAD applications, written in
 Rust. Published on crates.io as **`BREP_kernel`** with library name
-`brep_kernel`; this is version **0.19.0**.
+`brep_kernel`; this is version **0.20.0**.
 It is the authoritative geometry engine behind the BREP CAD application
 (`BREP_app` + `BREP_render` in this repository, re-exported as `brep::kernel` by
 the umbrella `BREP` crate), and is usable standalone as a
@@ -15,6 +15,26 @@ On the public [brep-bench](https://brepbench.org) board (368 modelling cases run
 by an independent harness), version 0.18.0 passed 322 cases with no wrong
 results in its 2026-11-12 run: the most passes, and the only kernel on the board
 with no wrong result. The board is live; read it for current standings.
+
+## Crate layout
+
+Since 0.20.0 the kernel is built from implementation crates, released together
+at one version: [`BREP_geometry`](https://crates.io/crates/BREP_geometry)
+(vectors, NURBS, projection, intersection),
+[`BREP_topology`](https://crates.io/crates/BREP_topology) (B-rep solids,
+validation, mass properties, tessellation, classification),
+[`BREP_surface_offset`](https://crates.io/crates/BREP_surface_offset),
+[`BREP_boolean`](https://crates.io/crates/BREP_boolean) (booleans and healing),
+[`BREP_solvers`](https://crates.io/crates/BREP_solvers) (sketch and assembly
+solvers), [`BREP_construction`](https://crates.io/crates/BREP_construction)
+(extrude, revolve, sweep, loft), [`BREP_blend`](https://crates.io/crates/BREP_blend)
+(fillets and chamfers), [`BREP_offset`](https://crates.io/crates/BREP_offset)
+(shells and thickening) and
+[`BREP_direct_edit`](https://crates.io/crates/BREP_direct_edit). `BREP_kernel`
+re-exports their public API at its root and adds the feature-history pipeline,
+the WebAssembly boundary and the STEP, IGES, Parasolid (import), 3MF, GLB, STL
+and OBJ exchange. Depend on `BREP_kernel`; the implementation crates come with
+it.
 
 Current port coverage is intentionally capability-gated:
 
@@ -167,7 +187,7 @@ is `BREP_kernel`, the Rust library is the idiomatic lowercase `brep_kernel`:
 
 ```toml
 [dependencies]
-brep_kernel = { package = "BREP_kernel", version = "0.19" }
+brep_kernel = { package = "BREP_kernel", version = "0.20" }
 ```
 
 ```rust

@@ -230,6 +230,21 @@ pub fn scene_metadata_colors_json() -> String {
     })
 }
 
+/// Every weld bead's last-applied weld colour (`weldColor`), keyed by name: the
+/// app replaces a bead's saved colour with a new weld colour only while that
+/// saved colour is still the one the weld applied, never a colour the user set.
+pub fn scene_metadata_weld_colors_json() -> String {
+    SCENE_METADATA.with(|store| {
+        let mut out = serde_json::Map::new();
+        for (name, record) in store.borrow().iter() {
+            if let Some(color) = record.get("weldColor").and_then(|value| value.as_str()) {
+                out.insert(name.clone(), serde_json::Value::String(color.to_string()));
+            }
+        }
+        serde_json::Value::Object(out).to_string()
+    })
+}
+
 /// The OWN metadata record for a name (no inheritance) — the snapshot capture
 /// read (`io/snapshot.rs` embeds the record verbatim so a restored part carries
 /// its stamped topology metadata). `None` when the name has no record.

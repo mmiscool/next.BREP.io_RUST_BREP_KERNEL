@@ -51,6 +51,7 @@
 
 use super::*;
 use brep_ecad_core::board::{self, Board, CopperItem, Shape};
+use brep_ecad_core::graphic::GraphicLayer;
 use brep_ecad_core::Netlist;
 use brep_kernel::{DisplaySolidPayload, Mesh, Vec3};
 use std::collections::BTreeMap;
@@ -83,6 +84,9 @@ const LACQUER_FACE: &str = "Lacquer";
 /// `PCB_Board/Side 3`. One wall per side of the outline between two corners,
 /// so a rectangular board has four, as a box does.
 const SIDE_FACE: &str = "Side";
+/// The face name of one cutout's walls, numbered from 1 in the board's order of
+/// cutouts — `PCB_Board/Cutout 2`. A cutout is one wall all the way round.
+const CUTOUT_FACE: &str = "Cutout";
 /// A board outline corner turning by more than this, in radians, gets a
 /// vertical display edge down the wall. A corner a polygon rounds with many
 /// short sides turns a little at each and gets none, so a rounded board is not
@@ -336,6 +340,13 @@ fn fan_or_ears(loop_xy: &[[f64; 2]]) -> Vec<[usize; 3]> {
 /// (a circle when its ends coincide).
 fn shape_loop(shape: &Shape) -> Vec<[f64; 2]> {
     match *shape {
+        Shape::RoundRect { .. } => {
+            // Board y points down, so the outline's turn reverses in millimetres:
+            // walk it backwards to stay counter-clockwise.
+            let mut out: Vec<[f64; 2]> = shape.outline(ARC_FACETS).into_iter().map(xy).collect();
+            out.reverse();
+            out
+        }
         Shape::Rect { min, max } => {
             let (a, b) = (xy(min), xy(max));
             let (x0, x1) = (a[0].min(b[0]), a[0].max(b[0]));
@@ -416,17 +427,7 @@ const LACQUER_TOP: i32 = board::COPPER_THICKNESS + MASK_OVER_COPPER;
 /// mask OPENING, which [`board::DesignRules::mask_expansion`] sizes. The same
 /// growth `fabrication`'s Gerber writer applies when it flashes the aperture.
 fn grown(shape: Shape, grow: i32) -> Shape {
-    match shape {
-        Shape::Rect { min, max } => Shape::Rect {
-            min: brep_ecad_core::Point::new(min.x - grow, min.y - grow),
-            max: brep_ecad_core::Point::new(max.x + grow, max.y + grow),
-        },
-        Shape::Capsule { a, b, radius } => Shape::Capsule {
-            a,
-            b,
-            radius: radius + grow,
-        },
-    }
+    shape.grown(grow)
 }
 
 /// The board outline in millimetres, wound counter-clockwise for the caps and
@@ -577,7 +578,7 @@ fn body_color(body: &str) -> [f32; 3] {
 /// the role, so a net that happens to be called `Opening` is still a net.
 fn face_color(body: &str, role: &str) -> [f32; 3] {
     if body == "Board" {
-        if role.starts_with(SIDE_FACE) {
+        if role.starts_with(SIDE_FACE) || role.starts_with(CUTOUT_FACE) {
             EDGE_COLOR
         } else {
             SUBSTRATE_COLOR
@@ -637,7 +638,7 @@ fn body(name: String, color: [f32; 3], faces: Vec<String>, soup: Soup) -> Option
 /// hole rim to draw either: the drilled board is the STEP export's.
 fn substrate(board: &Board) -> Option<Body> {
     let outline = oriented_outline(board)?;
-    let triangles = fan_or_ears(&outline);
+    let cutouts = cutout_rings(board);
     let (lo, hi) = (mm(-board::SUBSTRATE_THICKNESS), 0.);
     let n = outline.len();
     // The outline's SIDES: the runs between its corners. An outline with no
@@ -654,10 +655,20 @@ fn substrate(board: &Board) -> Option<Body> {
         })
         .collect();
     let mut soup = Soup::default();
-    soup.cap(&outline, &triangles, hi, true, 0);
-    soup.cap(&outline, &triangles, lo, false, 1);
+    // A board with no cutout keeps the ear-clipped caps it always had; one with
+    // cutouts takes the even-odd caps a zone's fill uses, which draw holes.
+    let (corners_xy, triangles) = if board.cutouts.is_empty() {
+        (outline.clone(), fan_or_ears(&outline))
+    } else {
+        holed_cap(board)
+    };
+    soup.cap(&corners_xy, &triangles, hi, true, 0);
+    soup.cap(&corners_xy, &triangles, lo, false, 1);
     for (k, side) in sides.iter().enumerate() {
         soup.walls_open(side, lo, hi, 2 + k as u32);
+    }
+    for (k, ring) in cutouts.iter().enumerate() {
+        soup.walls(ring, lo, hi, (2 + sides.len() + k) as u32);
     }
     // Named under the body like every other board face, so the walls can
     // carry a colour of their own ([`default_color`]) and hovering one says
@@ -666,6 +677,8 @@ fn substrate(board: &Board) -> Option<Body> {
     let side = |k: usize| face(format!("{SIDE_FACE} {}", k + 1));
     let mut faces = vec![face("Top".into()), face("Bottom".into())];
     faces.extend((0..sides.len()).map(side));
+    let cutout_face = |k: usize| face(format!("{CUTOUT_FACE} {}", k + 1));
+    faces.extend((0..cutouts.len()).map(cutout_face));
     let mut body = body(SUBSTRATE_SOLID.to_string(), SUBSTRATE_COLOR, faces.clone(), soup)?;
     // The edges a box has: each side's top and bottom edge, and a vertical
     // where two sides meet — named, in the kernel's `faceA|faceB` spelling, by
@@ -680,6 +693,13 @@ fn substrate(board: &Board) -> Option<Body> {
             push(format!("{cap}|{}", side(k)), points);
         }
     }
+    // Each cutout's rim on the top and the bottom.
+    for (k, ring) in cutouts.iter().enumerate() {
+        for (cap, z) in [(&faces[0], hi), (&faces[1], lo)] {
+            let points = ring.iter().chain(&ring[..1]).map(|p| Vec3::new(p[0], p[1], z)).collect();
+            push(format!("{cap}|{}", cutout_face(k)), points);
+        }
+    }
     if sides.len() > 1 {
         for k in 0..sides.len() {
             let p = outline[at[k]];
@@ -691,6 +711,53 @@ fn substrate(board: &Board) -> Option<Body> {
         }
     }
     Some(body)
+}
+
+/// The board's cutouts in millimetres (+Y up), each wound clockwise so walls
+/// swept round it face into the hole.
+fn cutout_rings(board: &Board) -> Vec<Vec<[f64; 2]>> {
+    board
+        .cutouts
+        .iter()
+        .map(|c| {
+            let mut ring: Vec<[f64; 2]> = c.points.iter().copied().map(xy).collect();
+            if signed_area2(&ring) > 0. {
+                ring.reverse();
+            }
+            ring
+        })
+        .collect()
+}
+
+/// The substrate's cap for a board with cutouts: the outline and every cutout
+/// as one even-odd region ([`board::zones::fill_triangles`]), as corners in
+/// millimetres (+Y up) and counter-clockwise triangles over them. Corners are
+/// shared, so the cap is watertight and only its rims are outline edges.
+fn holed_cap(board: &Board) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
+    let rings: Vec<&[brep_ecad_core::Point]> = std::iter::once(board.outline.as_slice())
+        .chain(board.cutouts.iter().map(|c| c.points.as_slice()))
+        .collect();
+    let mut corners: Vec<[f64; 2]> = vec![];
+    let mut index: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+    let mut triangles = vec![];
+    for tri in board::zones::fill_triangles(&rings) {
+        let mut t = tri.map(|(x, y)| {
+            *index.entry((x.to_bits(), y.to_bits())).or_insert_with(|| {
+                corners.push([x / 1000., -y / 1000.]);
+                corners.len() - 1
+            })
+        });
+        let [a, b, c] = t.map(|i| corners[i]);
+        let turn = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        if turn == 0. {
+            continue;
+        }
+        if turn < 0. {
+            t.swap(1, 2);
+        }
+        triangles.push(t);
+    }
+    (corners, triangles)
 }
 
 /// The indices of the outline's CORNERS: every vertex where the outline turns
@@ -827,15 +894,27 @@ fn copper_layer(
 /// [`board::DesignRules::mask_expansion`], the same growth the Gerber writer
 /// flashes.
 fn mask_openings(board: &Board, top: bool) -> impl Iterator<Item = Shape> + '_ {
-    let side = if top { 0 } else { board.layer_count.saturating_sub(1) };
-    board.placements.iter().flat_map(move |placement| {
-        placement.footprint.pads.iter().filter_map(move |pad| {
-            let (from, to) = placement.pad_layers(pad, board.layer_count);
-            let reaches = (from..=to).contains(&side) && (top || side != 0);
-            (reaches || (!top && pad.drill.is_some()))
-                .then(|| grown(placement.pad_shape(pad), board.rules.mask_expansion))
+    // Vias open when the board's rules leave them untented, on a side they
+    // reach: a blind via on its outer side only, a buried one on neither.
+    let last = board.layer_count.saturating_sub(1);
+    let vias = board
+        .vias
+        .iter()
+        .filter(move |via| {
+            let (from, to) = via.layers(board.layer_count);
+            !board.rules.tent_vias && if top { from == 0 } else { to == last }
         })
-    })
+        .map(move |via| grown(Shape::circle(via.at, via.diameter / 2), board.rules.mask_expansion));
+    vias.chain(board.placements.iter().flat_map(move |placement| {
+        placement.footprint.pads.iter().filter_map(move |pad| {
+            brep_ecad_core::fabrication::pad_mask_open(board, placement, pad, top).then(|| {
+                grown(
+                    placement.pad_shape(pad),
+                    pad.layers.mask_margin.unwrap_or(board.rules.mask_expansion),
+                )
+            })
+        })
+    }))
 }
 
 /// One side's SOLDER MASK: the lacquer sheet over the whole outline, and the
@@ -880,7 +959,18 @@ fn mask_layer(board: &Board, top: bool) -> Option<Body> {
     }
     let mut soup = Soup::default();
     let (lo, hi) = side_span(top, 0, LACQUER_TOP);
-    soup.prism(&outline, lo, hi, 0);
+    if board.cutouts.is_empty() {
+        soup.prism(&outline, lo, hi, 0);
+    } else {
+        // The lacquer has the board's cutouts in it, as the substrate does.
+        let (corners_xy, triangles) = holed_cap(board);
+        soup.cap(&corners_xy, &triangles, lo, false, 0);
+        soup.cap(&corners_xy, &triangles, hi, true, 0);
+        soup.walls(&outline, lo, hi, 0);
+        for ring in cutout_rings(board) {
+            soup.walls(&ring, lo, hi, 0);
+        }
+    }
     let (open_lo, open_hi) = side_span(top, 0, LACQUER_TOP + board::COPPER_THICKNESS);
     for loop_xy in &apertures {
         soup.prism(loop_xy, open_lo, open_hi, 1);
@@ -893,34 +983,51 @@ fn mask_layer(board: &Board, top: bool) -> Option<Body> {
     body(name, MASK_COLOR, faces, soup)
 }
 
-/// One side's SILKSCREEN: every silk polyline of every footprint mounted on
-/// that side, inked on top of the mask.
+/// One side's SILKSCREEN: every drawn item of every footprint that lands on
+/// that side's silkscreen (`Placement::drawing_on`, the part's `silk` lines
+/// among them), inked on top of the mask.
 ///
 /// A polyline is drawn the way the Gerber writer strokes it — a round pen of
-/// `fabrication::SILK_WIDTH` dragged along it — which here is one capsule prism
-/// per segment, the same primitive a track segment is. A footprint's silk is a
-/// handful of segments, so a whole board's ink is a rounding error beside its
-/// copper.
+/// the item's width dragged along it — which here is one capsule prism per
+/// segment, the same primitive a track segment is; a filled shape is also its
+/// own prism. A footprint's silk is a handful of segments, so a whole board's
+/// ink is a rounding error beside its copper.
 ///
-/// Reference designators are NOT drawn. The Gerber legend strokes them with
-/// `fabrication::text_strokes`, which is private to that module; exporting it
-/// is a change to `brep_ecad_core` and not this one.
+/// Reference designators are NOT drawn here; the Gerber legend writes them.
 fn silkscreen(board: &Board, top: bool) -> Option<Body> {
     let (lo, hi) = side_span(top, LACQUER_TOP, LACQUER_TOP + SILK_THICKNESS);
     let mut soup = Soup::default();
-    // A footprint is on the FRONT silkscreen when it is not mounted on the
-    // bottom — the same test `fabrication::legend` makes.
-    for placement in board.placements.iter().filter(|p| p.bottom != top) {
-        for line in &placement.footprint.silk {
-            for pair in line.windows(2) {
-                let shape = Shape::segment(
-                    placement.transform(pair[0]),
-                    placement.transform(pair[1]),
-                    brep_ecad_core::fabrication::SILK_WIDTH,
-                );
-                let loop_xy = shape_loop(&shape);
-                if loop_xy.len() >= 3 {
-                    soup.prism(&loop_xy, lo, hi, 0);
+    let layer = if top { GraphicLayer::FrontSilk } else { GraphicLayer::BackSilk };
+    // What is drawn on the board itself, then each part's own.
+    let drawn = board
+        .drawing_on(layer)
+        .into_iter()
+        .chain(board.placements.iter().flat_map(|p| p.drawing_on(layer)));
+    {
+        for (width, filled, strokes) in drawn {
+            for line in strokes {
+                if filled && line.len() >= 4 {
+                    let mut loop_xy: Vec<[f64; 2]> = line[..line.len() - 1].iter().map(|p| xy(*p)).collect();
+                    // The prism wants its outline counter-clockwise.
+                    let area: f64 = (0..loop_xy.len())
+                        .map(|i| {
+                            let (a, b) = (loop_xy[i], loop_xy[(i + 1) % loop_xy.len()]);
+                            a[0] * b[1] - b[0] * a[1]
+                        })
+                        .sum();
+                    if area < 0. {
+                        loop_xy.reverse();
+                    }
+                    if area.abs() > 0. {
+                        soup.prism(&loop_xy, lo, hi, 0);
+                    }
+                }
+                for pair in line.windows(2).filter(|_| width > 0) {
+                    let shape = Shape::segment(pair[0], pair[1], width);
+                    let loop_xy = shape_loop(&shape);
+                    if loop_xy.len() >= 3 {
+                        soup.prism(&loop_xy, lo, hi, 0);
+                    }
                 }
             }
         }
@@ -929,12 +1036,17 @@ fn silkscreen(board: &Board, top: bool) -> Option<Body> {
 }
 
 /// The plated via barrels: for each via, the tube the plating makes on the wall
-/// of its drilled hole, from the top copper plane to the bottom one.
+/// of its drilled hole, from the plane of the first copper layer it joins to
+/// the plane of the last (top to bottom for a through via).
 fn via_barrels(board: &Board) -> Option<Body> {
-    let (lo, hi) = (mm(-board::SUBSTRATE_THICKNESS), 0.);
     let mut soup = Soup::default();
     let facets = ARC_FACETS * 2;
     for via in &board.vias {
+        let (from, to) = via.layers(board.layer_count);
+        let (lo, hi) = (
+            mm(board::layer_z(to, board.layer_count)),
+            mm(board::layer_z(from, board.layer_count)),
+        );
         let centre = xy(via.at);
         let inner = mm(via.drill.max(1) / 2).max(1e-4);
         let outer = inner + mm(board::COPPER_THICKNESS);

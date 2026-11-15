@@ -1,0 +1,48 @@
+use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, VertexRecord};
+use crate::{fit, NurbsCurve, NurbsSurface, Vec3, Vec4};
+use super::stations::*;
+pub use super::corner::*;
+
+mod closed;
+mod keep;
+mod open;
+pub(super) use open::{RailWindowReader, network_rail_reuse_on};
+pub mod support;
+mod split_floor;
+
+pub use closed::{blend_closed_edge, blend_closed_edge_knot_aware, blend_edge_variable, is_pcurve_floor_refusal, with_pcurve_knot_retry};
+pub use open::blend_open_edge;
+
+pub use keep::{blend_closed_edge_keep, fit_preserved_pcurve, KeepStation};
+pub use support::{
+    boundary_edge_at_vertex, detect_row_coincidence, end_face_id, spoke_crossing, support_crossing,
+    support_crossing_uv, transverse_curve, trim_edge_at, CapEnd, CornerEnd, EndPlan, EndSurgery,
+    MiterEnd, RimResolution, RowSew, SewnStripe, SpokeCrossings,
+};
+pub(super) use support::{locate_end_corner, resolve_free_end, splice_end_corner, RIM_MARGIN};
+pub(super) use support::{overshoot_reach_active, refine_overshoot_on, with_overshoot_reach};
+pub use support::trim_parameter_at_point;
+pub(super) use closed::{refit_closed_support_pcurve, replace_rim_in_face, trim_seam_edges};
+pub use support::{
+    consumed_band, is_consumed_snap, is_rail_collapse, END_TANGENT_CONTINUATION_WHAT, RAIL_COLLAPSE_UNSUPPORTED,
+    RAIL_COLLAPSE_WHAT,
+};
+pub(super) use support::BLEND_WIDER_THAN_FACE;
+pub(super) use support::check_snap_closure;
+
+pub use open::{build_open_surgery_with_tail, fresh_id_source, prune_orphan_vertices};
+pub use open::{
+    acceptance_deficit, exact_extrusion_wall_readings, open_wall_readings_why, rails_on_shipped_windows, shipped_window, OpenRungReading, OPEN_REQUEST_RUNGS,
+    OPEN_WALL_CENTRES,
+};
+pub use support::{
+    extrusion_direction, fit_open_rows, fit_open_rows_breaking_at, fit_rows_breaking, interpolate_piece, march_open_stations,
+    march_open_stations_core, open_station_parameters, pole_end, rails_off_carriers,
+    vertex_stations, OpenDenseCentres,
+};
+pub(super) use support::{exact_revolution_rows, revolution_lane_axis, ExactRevolution};
+pub(super) use open::exact_revolution_wall_readings;
+
+
+
+use open::blend_open_edge_impl;

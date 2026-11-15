@@ -566,6 +566,10 @@ pub struct RunOutput {
     /// this one.
     #[serde(default)]
     pub imported_colors: Vec<(String, String)>,
+    /// Weld beads' last-applied weld colours (name, `#rrggbb`), same filter: a
+    /// bead's saved colour still equal to its saved weld colour takes the new one.
+    #[serde(default)]
+    pub weld_colors: Vec<(String, String)>,
     /// Every output name some feature of this run CONSUMED — the union of the
     /// per-feature `removed` lists, sorted. The committed-sketch refresh hides a
     /// sketch a downstream extrude/revolve/sheet-metal consumer absorbed, and it
@@ -901,6 +905,19 @@ impl SceneRunner {
         })
         .unwrap_or_default();
 
+        let weld_colors: Vec<(String, String)> = serde_json::from_str::<serde_json::Value>(
+            &brep_kernel::scene_metadata_weld_colors_json(),
+        )
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .map(|map| {
+            map.into_iter()
+                .filter(|(name, _)| layout.handles.contains_key(name))
+                .filter_map(|(name, hex)| hex.as_str().map(|hex| (name, hex.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
         RunOutput {
             snapshot,
             report,
@@ -910,6 +927,7 @@ impl SceneRunner {
             assembly_fixed,
             moved_solids,
             imported_colors,
+            weld_colors,
             consumed,
             assembly,
             stale_parts: result.stale_parts.clone(),

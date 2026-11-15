@@ -167,7 +167,50 @@ fn improved_projected_analytic_trim(surface: &NurbsSurface, edge: &EdgeRecord, f
     Some(if new <= 1e-9 && new < old { candidate } else { standing.curve })
 }
 
+/// The most control points an edge curve may have for its coedges to take
+/// the projected-foot refinement. The refinement's probes and fits grow with
+/// the edge curve's spans: a three-face body of rational patches whose four
+/// trimming curves carry 192-203 control points spent about six release
+/// seconds (ten times that unoptimised) refining them, about five times the
+/// rest of its import. The coedges the refinement measurably improves across
+/// the reviewed corpus are on curves of 128 control points or fewer, apart
+/// from a few at 183-308.
+pub(super) const PROJECTED_FOOT_REFINE_EDGE_CONTROLS: usize = 128;
+
+/// The largest body (faces in the file) the projected-foot refinement runs
+/// on when it is on; `BREP_STEP_REFINE_BODY_FACES` overrides it, and `0` lifts
+/// both this and [`PROJECTED_FOOT_REFINE_EDGE_CONTROLS`] (the refinement on
+/// every freeform coedge).
+/// The refinement re-projects every probe of every coedge it reads, which on
+/// large freeform bodies costs many times the ordinary fit: on a large
+/// production assembly the bodies over this size carried about 99% of the
+/// refinement's time, so they keep the ordinary fit.
+pub(in crate::step_import) const PROJECTED_FOOT_REFINE_BODY_FACES: usize = 60;
+
+pub(crate) fn projected_foot_refine_body_faces() -> usize {
+    env_read!("BREP_STEP_REFINE_BODY_FACES")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(PROJECTED_FOOT_REFINE_BODY_FACES)
+}
+
 impl<'a> SolidBuilder<'a> {
+    /// Whether a coedge on `surface` along `edge_curve` takes the
+    /// projected-foot refinement (`BREP_STEP_PROJECTED_FOOT_TRACKING`, off by
+    /// default, `1` on): freeform carriers of closed shells only, on bodies
+    /// within the face cap and edge curves within
+    /// [`PROJECTED_FOOT_REFINE_EDGE_CONTROLS`] unless the cap is lifted
+    /// (`BREP_STEP_REFINE_BODY_FACES=0`). Every input is read from the file,
+    /// so the choice is the same on every run and thread count.
+    fn refines_projected_feet(&self, surface: &NurbsSurface, edge_curve: &NurbsCurve) -> bool {
+        if !switch!("BREP_STEP_PROJECTED_FOOT_TRACKING", false) || surface.analytic().is_some() || self.open_shell {
+            return false;
+        }
+        let cap = projected_foot_refine_body_faces();
+        cap == 0
+            || (self.body_faces <= cap
+                && edge_curve.control_points.len() <= PROJECTED_FOOT_REFINE_EDGE_CONTROLS)
+    }
+
     /// Build a loop's coedges, deriving pcurves by projection, placing seam
     /// coedges on opposite domain boundaries and re-synthesising collapsed pole
     /// boundaries as degenerate edges so the parameter loop closes.
@@ -317,7 +360,7 @@ impl<'a> SolidBuilder<'a> {
                             refitted = true;
                         }
                     }
-                    if switch!("BREP_STEP_PROJECTED_FOOT_TRACKING", false) && surface.analytic().is_none() {
+                    if self.refines_projected_feet(surface, &edge.curve) {
                         fit = crate::pcurve::refine_import_projected_range(surface, &edge.curve,
                             edge.t0, edge.t1, *forward, fit);
                     }

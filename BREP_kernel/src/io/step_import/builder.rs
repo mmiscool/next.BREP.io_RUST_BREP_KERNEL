@@ -46,6 +46,13 @@ struct SolidBuilder<'a> {
     /// projection onto one carrier: their standoff from another carrier is
     /// the pass's, not the file's, and the closure gate says which.
     reconciled_edges: HashSet<u64>,
+    /// The body's face count in the file (every shell of a BREP_WITH_VOIDS):
+    /// the projected-foot refinement runs only on bodies at or under
+    /// `BREP_STEP_REFINE_BODY_FACES` (see `refines_projected_feet`).
+    body_faces: usize,
+    /// The body is an OPEN_SHELL: a sheet the importer refuses as a solid
+    /// (its edges are used once), so the projected-foot refinement is skipped.
+    open_shell: bool,
 }
 
 /// Per-body tally of the supplied-pcurve lane. A supplied pcurve is an

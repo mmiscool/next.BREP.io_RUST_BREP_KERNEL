@@ -10,7 +10,8 @@
 //! into the single-source-of-truth `EngineState.history` and re-run the rolled-to
 //! prefix so var-referencing params update live. The panel holds only a transient
 //! editor buffer (mirrored from the engine when unfocused, committed on
-//! Apply / focus-loss) and the per-frame widget hit-rects the headed verifier reads.
+//! Apply / focus-loss, where statements typed on one line are split one per
+//! line) and the per-frame widget hit-rects the headed verifier reads.
 
 use crate::automation::hit_keys::HitKeyDoc;
 use brep_render::engine_state::EngineState;
@@ -104,11 +105,16 @@ impl ExpressionsPanel {
 
         let commit = editor.lost_focus() || apply.clicked();
         if commit {
+            // The sheet is stored one statement per line: statements typed on
+            // one line are split on commit (never per keystroke, so the caret
+            // does not jump), and the editor shows what was stored.
+            let formatted = brep_render::brep_kernel::format_expressions(&self.buf);
             // Re-run only on a real change (each commit re-runs the rolled-to
             // prefix); a no-op commit must not thrash the kernel.
-            if self.buf != state.expressions_json() {
-                let _ = state.set_expressions(&self.buf);
+            if formatted != state.expressions_json() {
+                let _ = state.set_expressions(&formatted);
             }
+            self.buf = state.expressions_json();
         } else if !editor.has_focus() {
             // Not editing → mirror the engine (an Open / New / undo / redo may have
             // replaced the document out from under the buffer).
@@ -279,6 +285,14 @@ impl ExpressionsPanel {
         if let Some(coalesce) = changed {
             apply_inputs(state, &inputs, coalesce.as_deref());
         }
+    }
+
+    /// The editor's text as drawn this frame (the stored script while the
+    /// editor is not being edited), published in `__brepExpr.editor`; `None`
+    /// while the pane is not drawn (closed, behind another tab or collapsed),
+    /// when the buffer is not kept in step with the document.
+    pub fn editor_text(&self) -> Option<&str> {
+        self.hits.contains_key("expr:editor").then_some(self.buf.as_str())
     }
 
     /// The published widget hit-rects (egui points) for the headed verifier.

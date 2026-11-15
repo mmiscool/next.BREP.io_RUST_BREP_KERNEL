@@ -1800,8 +1800,8 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
         ToolSpec::new(
             "document_import",
             "document",
-            "Import a STEP / IGES / STL / OBJ / 3MF file from the host's files (the filesystem natively; the page's document store in the browser, which holds text formats only — a binary file goes through `doc_import` with its content) as an Import 3D Model feature (format by extension unless given).",
-            object_schema(json!({ "path": { "type": "string" }, "format": { "type": "string", "enum": ["step", "iges", "stl", "obj", "3mf"] }, "timeout_ms": { "type": "integer", "default": 120000 } }), &["path"]),
+            "Import a STEP / IGES / Parasolid (.x_t) / STL / OBJ / 3MF file from the host's files (the filesystem natively; the page's document store in the browser, which holds text formats only — a binary file goes through `doc_import` with its content) as an Import 3D Model feature (format by extension unless given).",
+            object_schema(json!({ "path": { "type": "string" }, "format": { "type": "string", "enum": ["step", "iges", "parasolid", "stl", "obj", "3mf"] }, "timeout_ms": { "type": "integer", "default": 120000 } }), &["path"]),
             Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
             move |args| {
                 let slot = import_slot.clone();
@@ -1812,6 +1812,7 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                     let format = s(&args, "format").unwrap_or(match ext.as_str() {
                         "step" | "stp" => "step".into(),
                         "iges" | "igs" => "iges".into(),
+                        "x_t" | "xmt_txt" => "parasolid".into(),
                         "stl" => "stl".into(),
                         "obj" => "obj".into(),
                         "3mf" => "3mf".into(),
@@ -1835,7 +1836,7 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
         ToolSpec::new(
             "document_open_with",
             "document",
-            "Open a file from the host's files as the OS \"Open with\" does when it is not a model document: a STEP (.step/.stp/.p21), IGES, STL, 3MF, OBJ or KiCad file goes through the File > Import importer for its extension into a NEW untitled tab labelled with the file's stem. Any other extension is refused. Returns the tabs once the import has settled (a mesh waits in its preview).",
+            "Open a file from the host's files as the OS \"Open with\" does when it is not a model document: a STEP (.step/.stp/.p21), IGES, Parasolid (.x_t/.xmt_txt), STL, 3MF, OBJ or KiCad file goes through the File > Import importer for its extension into a NEW untitled tab labelled with the file's stem. Any other extension is refused. Returns the tabs once the import has settled (a mesh waits in its preview).",
             object_schema(json!({ "path": { "type": "string" }, "timeout_ms": { "type": "integer", "default": 120000 } }), &["path"]),
             Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
             move |args| {

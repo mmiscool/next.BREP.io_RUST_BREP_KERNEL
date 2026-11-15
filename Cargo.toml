@@ -2,6 +2,15 @@
 [workspace]
 resolver = "2"
 members = [
+    "BREP_geometry",
+    "BREP_topology",
+    "BREP_surface_offset",
+    "BREP_boolean",
+    "BREP_construction",
+    "BREP_blend",
+    "BREP_offset",
+    "BREP_direct_edit",
+    "BREP_solvers",
     "BREP_kernel",
     "BREP_gizmos",
     "BREP_RANSAC",

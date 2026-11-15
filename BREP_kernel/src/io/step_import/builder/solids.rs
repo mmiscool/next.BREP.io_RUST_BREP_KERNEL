@@ -476,6 +476,8 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
         readings: capture.then(readings::TrimCapture::default),
         face_refs: HashMap::default(),
         reconciled_edges: HashSet::default(),
+        body_faces: all_face_refs.len(),
+        open_shell: false,
     };
     let mut shells = Vec::with_capacity(face_lists.len());
     for ((_, same_sense), faces) in shell_specs.iter().zip(&face_lists) {
@@ -485,7 +487,7 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
             faces: shell_faces,
         };
         if !same_sense {
-            crate::offset_shell::flip_shell_faces(&mut shell)?;
+            crate::orientation::flip_shell_faces(&mut shell)?;
         }
         shells.push(shell);
     }
@@ -541,7 +543,7 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
             .skip(1)
             .all(|volume| *volume > tolerance);
     if globally_reversed {
-        crate::offset_shell::flip_all_faces(&mut solid)?;
+        crate::orientation::flip_all_faces(&mut solid)?;
         for volume in &mut shell_volumes {
             *volume = -*volume;
         }
@@ -554,7 +556,7 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
         // still refuses a "void" that does not lie inside the outer shell.
         for (shell, volume) in solid.shells.iter_mut().zip(&mut shell_volumes).skip(1) {
             if *volume > tolerance {
-                crate::offset_shell::flip_shell_faces(shell)?;
+                crate::orientation::flip_shell_faces(shell)?;
                 *volume = -*volume;
             }
         }
@@ -605,6 +607,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     capture: bool,
 ) -> Result<(BrepSolid, Option<readings::TrimCapture>, readings::BodyReadings), StepBodyError> {
     let shell_entity = resolver.get(shell_ref)?;
+    let open_shell = shell_entity.find("CLOSED_SHELL").is_none();
     let face_refs = shell_entity
         .find("CLOSED_SHELL")
         .or_else(|| shell_entity.find("OPEN_SHELL"))
@@ -629,6 +632,8 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
         readings: capture.then(readings::TrimCapture::default),
         face_refs: HashMap::default(),
         reconciled_edges: HashSet::default(),
+        body_faces: face_refs.len(),
+        open_shell,
     };
 
     // Phase 1: resolve every face's surface + coedge bounds (this also builds
@@ -761,7 +766,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     let signed = crate::solid_signed_volume_for_sign(&solid, 0.0).or_else(|_| crate::solid_signed_volume(&solid));
     if let Ok(volume) = signed {
         if volume < 0.0 {
-            crate::offset_shell::flip_all_faces(&mut solid)?;
+            crate::orientation::flip_all_faces(&mut solid)?;
         }
     }
     lap("signed_volume", &mut lap_started, &mut laps);

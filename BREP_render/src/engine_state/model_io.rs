@@ -519,6 +519,25 @@ impl EngineState {
         self.add_feature(&feature.to_string())
     }
 
+    /// Import a Parasolid text part (`.x_t`, `.xmt_txt`) as an IMPORT3D
+    /// feature whose `inputParams.xtText` is the raw text (the kernel reads it
+    /// via [`brep_kernel::parasolid::import_parasolid_report`]), as
+    /// [`Self::import_iges_feature`] does for IGES. Refuses a non-Parasolid
+    /// payload up front so a bad upload never leaves a dead feature.
+    pub fn import_xt_feature(&mut self, xt_text: &str) -> Result<String, String> {
+        if !brep_kernel::parasolid::is_xt_text(xt_text) {
+            return Err("not a Parasolid text part (no transmit header or part data found)".into());
+        }
+        let id = self.next_feature_id(&crate::features::feature_short_name("IMPORT3D"));
+        let feature = serde_json::json!({
+            "type": "IMPORT3D",
+            "inputParams": { "id": id, "xtText": xt_text },
+            "persistentData": {},
+        });
+        self.pending_fit = true;
+        self.add_feature(&feature.to_string())
+    }
+
     /// Export the CURRENT model to an IGES 5.3 document of Manifold Solid
     /// B-Reps — the IGES analogue of [`Self::export_step_text`].
     pub fn export_iges_text(&self) -> Result<String, String> {
@@ -576,10 +595,13 @@ impl EngineState {
         brep_kernel::export_iges_assembly(&assembly, &colors, document_name, "MM", "")
     }
 
-    /// The flat import of a STEP or an IGES text, whichever it is: the lane a
-    /// structureless probe, or a structure nothing built out of, falls back to.
+    /// The flat import of a STEP, IGES or Parasolid text, whichever it is: the
+    /// lane a structureless probe, or a structure nothing built out of, falls
+    /// back to.
     pub fn import_model_text_feature(&mut self, text: &str) -> Result<String, String> {
-        if is_iges_text(text) {
+        if brep_kernel::parasolid::is_xt_text(text) {
+            self.import_xt_feature(text)
+        } else if is_iges_text(text) {
             self.import_iges_feature(text)
         } else {
             self.import_step_feature(text)
@@ -1073,8 +1095,11 @@ impl EngineState {
         self.pending_step_assembly = None;
         let id = self.next_step_probe_id;
         self.next_step_probe_id = self.next_step_probe_id.wrapping_add(1);
-        // IGES structure is a subfigure instance (408) in the directory.
-        let may_have_structure = if is_iges_text(step_text) {
+        // IGES structure is a subfigure instance (408) in the directory; a
+        // Parasolid part is read flat (its assemblies are not read yet).
+        let may_have_structure = if brep_kernel::parasolid::is_xt_text(step_text) {
+            false
+        } else if is_iges_text(step_text) {
             iges_has_instances(step_text)
         } else {
             step_text.contains("NEXT_ASSEMBLY_USAGE_OCCURRENCE")

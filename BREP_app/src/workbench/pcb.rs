@@ -56,6 +56,9 @@ static BUTTONS: &[WorkbenchButton] = &[
     ecad_button!("pcb.board.tool.select", "\u{1F446}", "Select", "Home/PCB/Select", toggle),
     ecad_button!("pcb.board.tool.route", "\u{E082}", "Route track", "Home/PCB/Route track", toggle),
     ecad_button!("pcb.board.tool.zone", "\u{E0B0}", "Draw zone", "Home/PCB/Draw zone", toggle),
+    ecad_button!("pcb.board.tool.draw", "\u{E06E}", "Draw line", "Home/PCB/Draw line", toggle),
+    ecad_button!("pcb.board.tool.text", "\u{E089}", "Place text", "Home/PCB/Place text", toggle),
+    ecad_button!("pcb.board.tool.cutout", "\u{E0D7}", "Draw cutout", "Home/PCB/Draw cutout", toggle),
     WorkbenchButton {
         id: LAYER_MENU_ID,
         glyph: "\u{E08C}",
@@ -73,6 +76,8 @@ static BUTTONS: &[WorkbenchButton] = &[
     ecad_button!("pcb.board.route.via", "\u{E086}", "Place via", "Home/PCB/Place via", command),
     ecad_button!("pcb.board.route.finish", "\u{E087}", "Finish track", "Home/PCB/Finish track", command),
     ecad_button!("pcb.board.zone.finish", "\u{E0B2}", "Close zone", "Home/PCB/Close zone", command),
+    ecad_button!("pcb.board.draw.finish", "\u{E087}", "Finish line", "Home/PCB/Finish line", command),
+    ecad_button!("pcb.board.cutout.finish", "\u{E0B2}", "Close cutout", "Home/PCB/Close cutout", command),
     ecad_button!("pcb.board.zones.fill", "\u{E0B1}", "Fill zones", "Home/PCB/Fill zones", command),
 ];
 

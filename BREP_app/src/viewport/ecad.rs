@@ -665,6 +665,9 @@ fn item_words(target: Target, editors: &Editors, key: &str, history: &History) -
     if let Some(index) = key.strip_prefix("silk:") {
         return format!("silkscreen line {index}");
     }
+    if let Some(index) = key.strip_prefix("graphic:") {
+        return format!("drawn item {index}");
+    }
     key.to_string()
 }
 
@@ -1304,8 +1307,33 @@ pub(crate) fn keys_json(state: &mut serde_json::Value, ctx: &egui::Context) {
     state["keysReachEditor"] = brep_ecad_egui::keys_reach_editor(ctx).into();
 }
 
+/// A drawn item on a non-copper layer as `ecad_state` reports it: its layer,
+/// kind, pen (the layer's own when it names none), fill and defining points — a
+/// polyline's points, an arc's start, through and end, a circle's centre (with
+/// its radius), a text's anchor (with its words and height).
+fn graphic_json(g: &brep_ecad_core::graphic::LayerGraphic) -> serde_json::Value {
+    use brep_ecad_core::graphic::GraphicShape;
+    use serde_json::json;
+    let mut item = json!({ "layer": g.layer.name(), "width": g.width(), "filled": g.filled });
+    let (kind, points) = match &g.shape {
+        GraphicShape::Polyline { points } => ("polyline", points.clone()),
+        GraphicShape::Arc { start, mid, end } => ("arc", vec![*start, *mid, *end]),
+        GraphicShape::Circle { center, radius } => {
+            item["radius"] = json!(radius);
+            ("circle", vec![*center])
+        }
+        GraphicShape::Text { at, text, height } => {
+            item["text"] = json!(text);
+            item["height"] = json!(height);
+            ("text", vec![*at])
+        }
+    };
+    item["kind"] = json!(kind);
+    item["points"] = points.iter().map(|p| json!([p.x, p.y])).collect::<Vec<_>>().into();
+    item
+}
 /// What `__brepEcad` and the `ecad_state` command say about an editor.
-pub(crate) const STATE_DOC: &str = "the eCAD editor drawn in the central tile: target (diagram|pcb|symbol|pads, null when none); inStep, true when the editor's document is exactly its block of the document (or the empty document when there is no block) — false after ANY edit that did not reach the document or any document change that did not reach the editor; the history revision; pan [x,y] in points and zoom in points per micrometre; why its block is not being edited (unreadable), and while it is not, the parts at fault by name (offender, null when the host cannot name them) and the unreadable card's one-click repair (repair, its button's words, null when there is none); for the sheet editors the view, tool, selection, components, wires (connections, by terminal name), labels, nets (the Connectivity panel's, each net's name and pins), erc (the Connectivity panel's electrical rule check: run, whether its button has been pressed; findings, each with severity, kind, message, at in micrometres, pins and the fix it offers; noConnects and powerFlags, the pins its fixes marked) and board (counts; each placement's pads with their centres on the board; each track's net, layer, width and points in micrometres as trackPaths; each copper zone as zones — its net, layer, outline, and its fill's pieces, holes, vertices, area in mm² and, once filled in this session, the spokes each relieved pad got — with zonesStale, true when copper has changed since the fill on show was made, and selectedZone, the selected zone's index or null; the board's selected pad by reference and number, its selected silkscreen line by reference and index, and its message, the Inspector's line from the last sync, autoroute or refused board edit, \"\" once spent); for Symbol its tool (select|line|rectangle|circle|pin|text) and pins; for Pads its tool (select|smd|through_hole|line|rectangle|circle), pads, its silkscreen lines and the selection (a pad by number, a silk line by index); popupOpen, a menu or combo box open as the frame ends (the popup clause of the editors' key rule); modalOpen, a modal up last pass; keysReachEditor, the key rule's answer (no text field focused, no popup, no modal); status, the status strip under the editor: its text, the pointer's place in the editor's micrometres and the hit key under it (both null off the canvas); and outdated, for the sheet editors the components placed from a part whose saved version changed after they were placed, each as its reference and part (what the Update parts card lists and the canvas rings; empty when none)";
+pub(crate) const STATE_DOC: &str = "the eCAD editor drawn in the central tile: target (diagram|pcb|symbol|pads, null when none); inStep, true when the editor's document is exactly its block of the document (or the empty document when there is no block) — false after ANY edit that did not reach the document or any document change that did not reach the editor; the history revision; pan [x,y] in points and zoom in points per micrometre; why its block is not being edited (unreadable), and while it is not, the parts at fault by name (offender, null when the host cannot name them) and the unreadable card's one-click repair (repair, its button's words, null when there is none); for the sheet editors the view, tool, selection, components, wires (connections, by terminal name), labels, nets (the Connectivity panel's, each net's name and pins), erc (the Connectivity panel's electrical rule check: run, whether its button has been pressed; findings, each with severity, kind, message, at in micrometres, pins and the fix it offers; noConnects and powerFlags, the pins its fixes marked) and board (counts; each placement's pads with their centres on the board; each track's net, layer, width and points in micrometres as trackPaths; each copper zone as zones — its net, layer, outline, and its fill's pieces, holes, vertices, area in mm² and, once filled in this session, the spokes each relieved pad got — with zonesStale, true when copper has changed since the fill on show was made, and selectedZone, the selected zone's index or null; drawings, what is drawn on the board itself on F/B.SilkS or F/B.Fab, each reported as a Pads drawn item is (layer, kind, width, filled, points, radius/text/height), and selectedDrawing, the selected one's index or null; cutouts, the holes milled through the board inside its outline, each its corners in micrometres, and selectedCutout, the selected one's index or null; the board's selected pad by reference and number, its selected silkscreen line or drawn item by reference and index (the part's silkscreen lines first, then its drawn items), and its message, the Inspector's line from the last sync, autoroute or refused board edit, \"\" once spent); for Symbol its tool (select|line|rectangle|circle|pin|text) and pins; for Pads its tool (select|smd|through_hole|line|rectangle|circle|arc|text), pads, its silkscreen lines, its graphics (each drawn item on F/B.SilkS, F/B.Fab or F/B.CrtYd: layer, kind polyline|arc|circle|text, width in micrometres, filled, points — a polyline's points, an arc's start, through and end, a circle's centre with radius, a text's anchor with text and height) and the selection (a pad by number, a silk line or drawn item by index); popupOpen, a menu or combo box open as the frame ends (the popup clause of the editors' key rule); modalOpen, a modal up last pass; keysReachEditor, the key rule's answer (no text field focused, no popup, no modal); status, the status strip under the editor: its text, the pointer's place in the editor's micrometres and the hit key under it (both null off the canvas); and outdated, for the sheet editors the components placed from a part whose saved version changed after they were placed, each as its reference and part (what the Update parts card lists and the canvas rings; empty when none)";
 
 /// Whether the editor's document is exactly its block of `history` — the empty
 /// document when there is no block. One comparison that fails whatever the
@@ -1564,14 +1592,25 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
                     findings.into_iter().map(|(kind, message)| json!({ "kind": kind, "message": message })).collect::<Vec<_>>()
                 }),
                 "selectedZone": editor.selected_board_zone(),
+                // What is drawn on the board itself, owned by no part, each as a
+                // Pads drawn item is reported; `selectedDrawing` the selected one's
+                // index (what a click on `drawing:<index>` selects) or null.
+                "drawings": document.board.graphics.iter().map(|g| graphic_json(&g.graphic)).collect::<Vec<_>>(),
+                "selectedDrawing": editor.selected_board_drawing(),
+                // The board's cutouts, holes milled through it, each its corners in
+                // micrometres; `selectedCutout` the selected one's index (what a
+                // click on `cutout:<index>` selects) or null.
+                "cutouts": document.board.cutouts.iter().map(|c| c.points.iter().map(|p| point(*p)).collect::<Vec<_>>()).collect::<Vec<_>>(),
+                "selectedCutout": editor.selected_board_cutout(),
                 // The board's selected PAD, by part and number — what a click on
                 // `pad:<reference>.<number>` selects. `null` for any other board
                 // selection, and on the sheet.
                 "selectedPad": editor
                     .selected_board_pad()
                     .map(|(id, number)| json!({ "reference": reference(&id), "number": number })),
-                // The board's selected SILKSCREEN line, by part and index — what
-                // a click on `silk:<reference>.<index>` selects. `null` for any
+                // The board's selected SILKSCREEN line or other drawn item of a
+                // part, by part and index (its lines first, then its drawn
+                // items) — what a click on `silk:<reference>.<index>` selects. `null` for any
                 // other board selection, and on the sheet.
                 "selectedSilk": editor
                     .selected_board_silk()
@@ -1600,7 +1639,22 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
             let pads = &editors.pads.footprint.pads;
             state["pads"] = pads
                 .iter()
-                .map(|pad| json!({ "number": pad.number, "at": point(pad.at) }))
+                .map(|pad| {
+                    // The pad's preset and its overrides, as the films get them:
+                    // the side its copper is on (or both, drilled) and whether
+                    // the mask is open and paste applied on each face.
+                    json!({
+                        "number": pad.number,
+                        "at": point(pad.at),
+                        "shape": format!("{:?}", pad.shape),
+                        "cornerRadius": pad.effective_corner_radius(),
+                        "side": match (pad.drill, pad.back) { (Some(_), _) => "both", (None, true) => "back", (None, false) => "front" },
+                        "maskOpen": [pad.mask_open(true), pad.mask_open(false)],
+                        "paste": pad.paste_open(true) || pad.paste_open(false),
+                        // The hole's width and height (equal for a round one), or null.
+                        "hole": pad.hole_size().map(|h| point(h)),
+                    })
+                })
                 .collect::<Vec<_>>()
                 .into();
             state["pinsWithoutPads"] = symbol_pins(history)
@@ -1616,12 +1670,23 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
                 .map(|line| line.iter().map(|p| point(*p)).collect::<Vec<_>>())
                 .collect::<Vec<_>>()
                 .into();
-            // What a click on `pad:` or `silk:` selected: a pad by its number, a
-            // silkscreen line by its index, the identities those keys carry.
-            state["selection"] = match (editors.pads.selected_pad(), editors.pads.selected_silk()) {
-                (Some(number), _) => json!({ "kind": "pad", "number": number }),
-                (None, Some(index)) => json!({ "kind": "silk", "index": index }),
-                (None, None) => serde_json::Value::Null,
+            // Each drawn item on a non-copper layer: its layer, kind, pen (the
+            // layer's own when it names none), fill and defining points — a
+            // polyline's points, an arc's start, through and end, a circle's
+            // centre (with its radius), a text's anchor (with its words and height).
+            state["graphics"] = editors.pads.footprint.graphics.iter().map(graphic_json).collect::<Vec<_>>().into();
+            // What a click on `pad:`, `silk:` or `graphic:` selected: a pad by its
+            // number, a silkscreen line or drawn item by its index, the identities
+            // those keys carry.
+            state["selection"] = match (
+                editors.pads.selected_pad(),
+                editors.pads.selected_silk(),
+                editors.pads.selected_graphic(),
+            ) {
+                (Some(number), _, _) => json!({ "kind": "pad", "number": number }),
+                (None, Some(index), _) => json!({ "kind": "silk", "index": index }),
+                (None, None, Some(index)) => json!({ "kind": "graphic", "index": index }),
+                (None, None, None) => serde_json::Value::Null,
             };
         }
     }

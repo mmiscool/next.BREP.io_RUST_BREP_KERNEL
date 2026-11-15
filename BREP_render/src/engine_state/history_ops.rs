@@ -558,6 +558,7 @@ impl EngineState {
             assembly_fixed,
             moved_solids,
             imported_colors,
+            weld_colors,
             consumed,
             assembly,
             stale_parts,
@@ -648,9 +649,22 @@ impl EngineState {
         // name-keyed store and the one the Info window edits and the document
         // saves. NON-overwriting on purpose: an import re-stamps its colour on
         // every replay, and a colour the user changed in the panel must win.
+        // A weld bead is the one exception: its colour follows the weld's
+        // Weld colour while the saved colour is still the one the weld applied
+        // (`weldColor`); a colour the user set differs from it and wins.
+        let weld_colors: std::collections::HashMap<String, String> = weld_colors.into_iter().collect();
         for (name, hex) in imported_colors {
-            if self.metadata.attribute(&name, "color").is_none() {
-                self.metadata.set_attribute(&name, "color", &hex);
+            let saved = self.metadata.attribute(&name, "color").map(str::to_string);
+            match weld_colors.get(&name) {
+                Some(applied) => {
+                    let saved_weld = self.metadata.attribute(&name, "weldColor").map(str::to_string);
+                    if saved.is_none() || saved == saved_weld {
+                        self.metadata.set_attribute(&name, "color", &hex);
+                        self.metadata.set_attribute(&name, "weldColor", applied);
+                    }
+                }
+                None if saved.is_none() => self.metadata.set_attribute(&name, "color", &hex),
+                None => {}
             }
         }
 
@@ -1019,6 +1033,14 @@ impl EngineState {
         // script that never enters sketch mode. See the kernel's
         // `features/sketch/loop_ids`.
         stamp_sketch_loop_ids(&mut document);
+        // Expressions are kept one statement per line: a document whose sheet
+        // was written on one line opens (and so next saves) split, the same
+        // normalisation the editor and the automation setter apply. It is part
+        // of the loaded baseline, so it adds no undo step and does not mark the
+        // document dirty.
+        if let Some(serde_json::Value::String(source)) = document.get_mut("expressions") {
+            *source = brep_kernel::format_expressions(source);
+        }
         // Mass / Material / Density are PART attributes: an older document
         // that stored them on occurrences has them lifted onto the part here,
         // before the library is installed, and the move is reported once.

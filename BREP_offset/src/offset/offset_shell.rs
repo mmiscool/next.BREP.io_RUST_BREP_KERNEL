@@ -1,0 +1,162 @@
+use crate::boolean::{assemble_open_fragments, edge_interior_lies_on, finalize_assembled_solid};
+pub use crate::classification::{parameter_point_in_face, PolygonClass};
+use crate::face_merge::merge_same_surface_faces_open;
+use crate::fragment::{fragment_solid, FaceFragmentRecord, FragmentEdgeSource};
+use crate::imprint::{
+    EdgeSplitRecord, FaceImprints, FaceKey, FacePcurve, ImprintOptions, ImprintPieceRecord,
+    ImprintResultRecord, ImprintVertex,
+};
+pub use crate::mass_properties::parameter_space_area;
+pub use crate::project_point_to_surface;
+pub use crate::topology::{
+    BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord, VertexRecord,
+};
+pub use crate::{
+    apply_edge_splits, build_imprints, classify_point, DiagnosticSeverity,
+    KernelDiagnostics, KernelOutcome, KernelStage, KernelTolerances, PointClass, Vec2, Vec3,
+};
+pub use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use serde::Serialize;
+
+pub const SOURCE_OPERAND: u8 = 250;
+
+/// The smallest |distance| an offset shell answers: at or under it the shell
+/// refuses ("distance must be finite and non-zero"). One constant, because the
+/// revolved-wedge lane runs in FRONT of that refusal and must stand down exactly
+/// where it fires — it once took (−1e-7, 0) as an outward distance and built a
+/// sliver where the shell had always refused.
+const MINIMUM_DISTANCE: f64 = 1e-7;
+
+fn debug_enabled() -> bool {
+    env_read!("BREP_OS_DEBUG").is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+macro_rules! os_debug {
+    ($($arg:tt)*) => {
+        if debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OffsetFaceRole {
+    Source,
+    Offset,
+    Wall,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OffsetShellResultRecord {
+    pub solid: BrepSolid,
+    pub face_images: Vec<OffsetShellFaceImageRecord>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct OffsetShellFaceImageRecord {
+    pub role: OffsetFaceRole,
+    pub source_face_id: u64,
+}
+
+#[derive(Clone)]
+struct Carrier {
+    solid: BrepSolid,
+    source_face_id: u64,
+    kind: OffsetFaceRole,
+}
+
+#[path = "offset_shell/carriers.rs"]
+pub mod carriers;
+#[path = "offset_shell/smooth_sync.rs"]
+mod smooth_sync;
+#[path = "offset_shell/carrier_rebuild.rs"]
+pub mod carrier_rebuild;
+#[path = "offset_shell/connectors.rs"]
+mod connectors;
+#[path = "offset_shell/orientation.rs"]
+mod orientation;
+#[path = "offset_shell/rim_welds.rs"]
+mod rim_welds;
+#[path = "offset_shell/rim_round.rs"]
+pub mod rim_round;
+
+#[path = "offset_shell/revolved_wedge.rs"]
+pub mod revolved_wedge;
+#[path = "offset_shell/planar_shell.rs"]
+pub mod planar_shell;
+#[path = "offset_shell/sphere_body.rs"]
+pub mod sphere_body;
+#[path = "offset_shell/sphere_cut_shell.rs"]
+pub mod sphere_cut_shell;
+#[path = "offset_shell/outline_offset.rs"]
+pub mod outline_offset;
+#[path = "offset_shell/vacated_rim.rs"]
+mod vacated_rim;
+#[path = "offset_shell/pipeline.rs"]
+pub mod pipeline;
+#[path = "offset_shell/acceptance.rs"]
+pub mod acceptance;
+#[path = "offset_shell/profile.rs"]
+mod profile;
+#[path = "offset_shell/solid.rs"]
+pub mod solid;
+#[path = "offset_shell/joint_offset.rs"]
+mod joint_offset;
+#[path = "offset_shell/refusals.rs"]
+pub mod refusals;
+#[path = "offset_shell/torus_body.rs"]
+pub mod torus_body;
+#[path = "offset_shell/bore_dimples.rs"]
+mod bore_dimples;
+#[path = "offset_shell/revolved_parallel.rs"]
+pub mod revolved_parallel;
+#[path = "offset_shell/rim_witness.rs"]
+mod rim_witness;
+#[path = "offset_shell/tangent_rim_cuts.rs"]
+mod tangent_rim_cuts;
+
+pub use carrier_rebuild::*;
+pub use carriers::*;
+use connectors::*;
+use orientation::*;
+pub use outline_offset::*;
+pub use vacated_rim::*;
+pub use rim_welds::*;
+pub use smooth_sync::*;
+
+pub use pipeline::{offset_shell, offset_shell_with_diagnostics};
+pub use solid::{offset_shell_by_boolean, offset_shell_closed, offset_solid, OffsetCorners};
+pub use refusals::{is_offset_shell_no_retained_face, is_offset_shell_open_curved_rim};
+pub use orientation::{flip_all_faces, flip_shell_faces, orient_open_solid_faces};
+
+/// Merge connected shells, preserving the first shell record and face encounter order.
+pub fn merge_connected_shells(solid: &mut BrepSolid, shell_unions: Vec<(usize, usize)>) {
+    if shell_unions.is_empty() {
+        return;
+    }
+    let mut parent = (0..solid.shells.len()).collect::<Vec<_>>();
+    fn root(parent: &mut [usize], index: usize) -> usize {
+        crate::union_find::find_root(parent, index)
+    }
+    for (first, second) in shell_unions {
+        let first_root = root(&mut parent, first);
+        let second_root = root(&mut parent, second);
+        if first_root != second_root {
+            parent[second_root] = first_root;
+        }
+    }
+    let original = std::mem::take(&mut solid.shells);
+    let mut merged = Vec::<ShellRecord>::new();
+    let mut group_of = HashMap::<usize, usize>::default();
+    for (index, shell) in original.into_iter().enumerate() {
+        let group = root(&mut parent, index);
+        if let Some(target) = group_of.get(&group).copied() {
+            merged[target].faces.extend(shell.faces);
+        } else {
+            group_of.insert(group, merged.len());
+            merged.push(shell);
+        }
+    }
+    solid.shells = merged;
+}

@@ -14,6 +14,8 @@
 //! - [`autoroute`]: the board autorouter.
 //! - [`fabrication`]: Gerber X2, Excellon drill files, pick-and-place, BOM and a zip bundle.
 //! - [`footprint`]: natural ordering of pad and pin labels.
+//! - [`graphic`]: drawn geometry on a footprint's silkscreen, fabrication and courtyard layers.
+//! - [`font`]: the silkscreen's stroke font.
 //!
 //! Object IDs are random version 4 UUIDs. On `wasm32-unknown-unknown` the randomness
 //! comes from the host: enable the `uuid` crate's `js` feature or configure another
@@ -22,7 +24,9 @@ pub mod autoroute;
 pub mod board;
 pub mod erc;
 pub mod fabrication;
+pub mod font;
 pub mod footprint;
+pub mod graphic;
 pub mod kicad;
 pub mod kicad_git;
 pub mod netlist;
@@ -1740,6 +1744,8 @@ impl Document {
             .chain(self.labels.iter().map(|l| l.id))
             .chain(self.board.tracks.iter().map(|t| t.id))
             .chain(self.board.vias.iter().map(|v| v.id))
+            .chain(self.board.graphics.iter().map(|g| g.id))
+            .chain(self.board.cutouts.iter().map(|c| c.id))
         {
             if !ids.insert(id) {
                 return Err("Duplicate object ID".into());

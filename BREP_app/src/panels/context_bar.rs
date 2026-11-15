@@ -1023,7 +1023,7 @@ fn offer_fields(engine: Option<&EngineState>, ty: &str, kinds: &[&str]) -> Vec<O
                 .then(|| OfferField {
                     path: field.path.clone(),
                     filter: filter.clone(),
-                    multiple: *multiple && ty != "WELD",
+                    multiple: *multiple,
                 })
         })
         .collect()
@@ -1155,7 +1155,7 @@ fn pmi_offers(
 /// the geometry being annotated; the plane is picked in the form. The new
 /// annotation's form opens (the engine sets the open annotation).
 pub(crate) fn add_pmi_from_selection(state: &mut EngineState, type_id: &str) -> Result<String, String> {
-    let catalogue = brep_kernel::pmi_schema_catalogue();
+    let catalogue = brep_render::pmi_weld_symbol::pmi_schema_catalogue();
     let schema = catalogue
         .as_array()
         .and_then(|entries| entries.iter().find(|e| e.get("type").and_then(Value::as_str) == Some(type_id)))

@@ -311,6 +311,12 @@ pub fn form_fields_from_schema(schema: &Value) -> Vec<FormField> {
                     }
                 }
             }
+            "color" => fields.push(FormField {
+                path: vec![name.clone()],
+                label: field_label(spec, name),
+                group: "Parameters".into(),
+                kind: FieldKind::Color,
+            }),
             "boolean" => {
                 // A plain checkbox param (e.g. ACOMP `isFixed`, constraint
                 // `reverse`/`opposeNormals`/`exteriorAngle`). Label from the

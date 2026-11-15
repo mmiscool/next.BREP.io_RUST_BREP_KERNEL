@@ -159,7 +159,7 @@ fn pmi_state(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 fn pmi_catalogue(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let _: NoArgs = parse_args(args)?;
     let _ = ctx;
-    Ok(Outcome::Done(json!({ "annotations": brep_render::brep_kernel::pmi_schema_catalogue() })))
+    Ok(Outcome::Done(json!({ "annotations": brep_render::pmi_weld_symbol::pmi_schema_catalogue() })))
 }
 
 fn pmi_capture_view(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {

@@ -13,8 +13,13 @@ impl EngineState {
     /// Replace the `expressions` source and re-run the rolled-to prefix so every
     /// feature param referencing a variable (e.g. `sizeX = "boxW"`) rebuilds with
     /// the new value — the panel's live-update path. Returns the build-report JSON.
+    ///
+    /// The source is stored one statement per line
+    /// ([`brep_kernel::format_expressions`]): statements typed or sent on one
+    /// line are split onto lines of their own, text that does not parse is
+    /// stored as given. [`Self::expressions_json`] reads back what was stored.
     pub fn set_expressions(&mut self, expressions: &str) -> String {
-        self.history.set_expressions(expressions);
+        self.history.set_expressions(&brep_kernel::format_expressions(expressions));
         self.rerun_history()
     }
 
@@ -176,3 +181,4 @@ impl ExpressionPreview {
         Self { expressions: expressions.into(), label: label.into(), serial: 0 }
     }
 }
+

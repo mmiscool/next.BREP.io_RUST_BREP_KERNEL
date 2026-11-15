@@ -434,7 +434,7 @@ fn press_refusal_in(registry: &[&'static Workbench], id: &str, state: &ButtonSta
 /// U+2713 ✓ is a status tick (a resolved annotation, the switcher's active
 /// entry), not "finish". Rotate and finish have pictures of their own.
 pub const SYNONYMS: &[(&[&str], &str)] = &[
-    (&["sketch.tool.text", "symbol.tool.text"], "places text in the active editor"),
+    (&["sketch.tool.text", "symbol.tool.text", "pads.tool.text", "pcb.board.tool.text"], "places text in the active editor"),
     (
         &[
             "sketch.tool.select",
@@ -447,14 +447,15 @@ pub const SYNONYMS: &[(&[&str], &str)] = &[
         ],
         "select and drag, in every editor",
     ),
-    (&["sketch.tool.line", "sketch3d.tool.line", "symbol.tool.line", "pads.tool.line"], "draws a straight line"),
+    (&["sketch.tool.line", "sketch3d.tool.line", "symbol.tool.line", "pads.tool.line", "pcb.board.tool.draw"], "draws a straight line (on the board, corner by corner)"),
     (&["sketch.tool.point", "sketch3d.tool.point"], "places a point"),
-    (&["sketch.tool.arc", "sketch3d.tool.arc"], "draws an arc from centre, start and end"),
+    (&["sketch.tool.arc", "sketch3d.tool.arc", "pads.tool.arc"], "draws an arc (a sketch's from centre, start and end; the Pads editor's along a chord)"),
     (&["sketch.tool.bezier", "sketch3d.tool.bezier"], "draws a cubic bezier"),
     (&["sketch.tool.pickEdges", "sketch3d.tool.pickRef"], "links model geometry into the sketch as a fixed reference"),
     (&["sketch.tool.rect", "symbol.tool.rectangle", "pads.tool.rectangle"], "draws a rectangle"),
     (&["sketch.tool.circle", "symbol.tool.circle", "pads.tool.circle"], "draws a circle"),
-    (&["pcb.sheet.wire.finish", "pcb.board.route.finish"], "ends the path being drawn"),
+    (&["pcb.sheet.wire.finish", "pcb.board.route.finish", "pcb.board.draw.finish"], "ends the path being drawn"),
+    (&["pcb.board.zone.finish", "pcb.board.cutout.finish"], "closes the outline being drawn"),
 ];
 
 /// Every DECLARED workbench: the dropdown's ([`WORKBENCHES`]), then the ones

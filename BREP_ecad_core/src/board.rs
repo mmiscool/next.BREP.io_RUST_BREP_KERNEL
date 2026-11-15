@@ -3,6 +3,7 @@
 //! Board coordinates use the schematic's integer micrometres with positive Y down.
 //! Copper connectivity is derived purely from geometry and net identity comes from
 //! the schematic netlist, so the schematic remains the single source of truth.
+use crate::graphic::{GraphicLayer, LayerGraphic};
 use crate::{Document, Netlist, Point, Uuid, footprint};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +27,38 @@ pub enum PadShape {
     Rect,
     Circle,
     Oval,
+    /// A rectangle with rounded corners, of [`Pad::corner_radius`].
+    RoundRect,
+}
+
+/// What a pad's PRESET (its kind, side and shape) would put on the solder mask and
+/// paste layers, overridden where the user says otherwise. The default is "as the
+/// preset says", and serializes as nothing, so a pad with no overrides is stored
+/// exactly as it was before overrides existed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadLayers {
+    /// Solder mask stays OVER the pad on the footprint's front (tented): no opening.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cover_front: bool,
+    /// Solder mask stays over the pad on the footprint's back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cover_back: bool,
+    /// No solder paste aperture for this surface-mount pad.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_paste: bool,
+    /// The mask opening's growth beyond the copper, replacing the board's
+    /// [`DesignRules::mask_expansion`] for this pad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask_margin: Option<i32>,
+    /// The paste aperture's growth beyond the copper (negative shrinks it), in
+    /// place of the default 0: the aperture matches the copper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paste_margin: Option<i32>,
+}
+impl PadLayers {
+    pub fn is_auto(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,15 +70,136 @@ pub struct Pad {
     pub size: Point,
     #[serde(default)]
     pub shape: PadShape,
-    /// Through-hole drill diameter; `None` for surface-mount pads.
+    /// Through-hole drill diameter; `None` for surface-mount pads. For an OVAL
+    /// (slotted) hole, its width along the pad's x ([`Pad::drill_height`]).
     #[serde(default)]
     pub drill: Option<i32>,
+    /// An oval (slotted) hole's height along the pad's y, KiCad's
+    /// `(drill oval <width> <height>)`; `None` for a round hole of [`Pad::drill`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drill_height: Option<i32>,
     /// Whether a drilled hole is plated. Unplated holes go to the NPTH drill file.
     #[serde(default = "plated_by_default")]
     pub plated: bool,
+    /// Corner radius of a [`PadShape::RoundRect`] pad, at most half its smaller side.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub corner_radius: i32,
+    /// A surface-mount pad on the footprint's BACK copper (B.Cu) rather than its
+    /// front. A part mounted on the bottom flips this with the rest of the part.
+    /// Ignored for a drilled pad, which spans every copper layer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub back: bool,
+    /// Mask and paste overrides of what the pad's preset generates.
+    #[serde(default, skip_serializing_if = "PadLayers::is_auto")]
+    pub layers: PadLayers,
 }
 fn plated_by_default() -> bool {
     true
+}
+fn is_zero(v: &i32) -> bool {
+    *v == 0
+}
+impl Pad {
+    /// A pad of the given number, place, size and shape with every other property
+    /// at its default: surface mount, front, no overrides.
+    pub fn smd(number: impl Into<String>, at: Point, size: Point, shape: PadShape) -> Self {
+        Self {
+            number: number.into(),
+            at,
+            size,
+            shape,
+            drill: None,
+            drill_height: None,
+            plated: true,
+            corner_radius: 0,
+            back: false,
+            layers: PadLayers::default(),
+        }
+    }
+    /// The corner radius actually drawn: the stored one for a rounded rectangle,
+    /// clamped to half the smaller side, else 0.
+    pub fn effective_corner_radius(&self) -> i32 {
+        if self.shape == PadShape::RoundRect {
+            self.corner_radius.clamp(0, self.size.x.min(self.size.y) / 2)
+        } else {
+            0
+        }
+    }
+    /// The pad's copper in footprint coordinates.
+    pub fn local_shape(&self) -> Shape {
+        Shape::rounded_pad(self.at, self.size, self.shape, self.effective_corner_radius())
+    }
+    /// Which sides of the FOOTPRINT the pad's copper reaches: (front, back).
+    pub fn copper_sides(&self) -> (bool, bool) {
+        match self.drill {
+            Some(_) => (true, true),
+            None => (!self.back, self.back),
+        }
+    }
+    /// Whether the pad gets a solder mask opening on the footprint's front (or back).
+    pub fn mask_open(&self, front: bool) -> bool {
+        let (f, b) = self.copper_sides();
+        if front {
+            f && !self.layers.cover_front
+        } else {
+            b && !self.layers.cover_back
+        }
+    }
+    /// Whether the pad gets a paste aperture on the footprint's front (or back).
+    pub fn paste_open(&self, front: bool) -> bool {
+        self.drill.is_none() && !self.layers.no_paste && self.back != front
+    }
+    /// The hole's extent, width (x) and height (y) in footprint coordinates: a
+    /// round hole's diameter both ways, a slot's own two. `None` with no drill.
+    pub fn hole_size(&self) -> Option<Point> {
+        let width = self.drill?;
+        Some(Point::new(width, self.drill_height.unwrap_or(width)))
+    }
+    /// The hole in footprint coordinates: a circle, or a slot's stadium.
+    pub fn local_hole(&self) -> Option<Shape> {
+        Some(Shape::pad(self.at, self.hole_size()?, PadShape::Oval))
+    }
+    /// The plated copper ring left round the drill, at its narrowest. `None` for
+    /// a pad with no drill or an unplated hole; negative where the hole breaks
+    /// out of the copper.
+    pub fn annular_ring(&self) -> Option<i32> {
+        let drill = self.drill.filter(|_| self.plated)?;
+        if self.drill_height.is_none() {
+            // A round hole: half the pad's smaller side less the drill's radius,
+            // as it has always been measured.
+            return Some((self.size.x.min(self.size.y) - drill) / 2);
+        }
+        Some(self.hole_clearance()?.floor() as i32)
+    }
+    /// How far the hole stays inside the pad's copper at its nearest: the hole is
+    /// a disc swept along a segment and every pad shape is convex, so the depth
+    /// of the copper over the segment is least at one of its ends.
+    fn hole_clearance(&self) -> Option<f64> {
+        let Shape::Capsule { a, b, radius } = self.local_hole()? else {
+            return None;
+        };
+        let copper = self.local_shape();
+        Some(copper.depth(a).min(copper.depth(b)) - f64::from(radius))
+    }
+    /// Why the hole does not fit the pad, if it does not: a drill must be
+    /// positive and no wider or taller than the pad.
+    fn hole_problem(&self) -> Option<&'static str> {
+        let hole = self.hole_size()?;
+        let far = |v: i32| !(-100_000_000..=100_000_000).contains(&v);
+        if [self.at.x, self.at.y, self.size.x, self.size.y, hole.x, hole.y].into_iter().any(far) {
+            // Measured nowhere: the geometry would overflow before it could say why.
+            return Some("lies outside the drawing area");
+        }
+        if hole.x <= 0 || hole.y <= 0 {
+            Some("needs a positive drill")
+        } else if self.drill_height.is_some() && self.hole_clearance().is_some_and(|c| c < 0.) {
+            Some("has a slot larger than the pad")
+        } else if self.drill_height.is_none() && hole.x > self.size.x.max(self.size.y) {
+            Some("has a drill larger than the pad")
+        } else {
+            None
+        }
+    }
 }
 
 /// The 3D model a footprint names, as KiCad's `(model …)` entry gives it: the file and
@@ -87,6 +241,14 @@ pub struct Footprint {
     /// The 3D model this footprint names, if it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Model>,
+    /// Courtyard clearance round the pads and silkscreen, in place of
+    /// [`COURTYARD_MARGIN`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub courtyard_margin: Option<i32>,
+    /// Drawn items on the silkscreen, fabrication and courtyard layers of either
+    /// side, beside the front silkscreen polylines in `silk`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graphics: Vec<LayerGraphic>,
 }
 impl Footprint {
     /// Check a footprint on its own, with messages that name the offending pad: the
@@ -112,15 +274,30 @@ impl Footprint {
             if pad.size.x <= 0 || pad.size.y <= 0 {
                 return Err(format!("{name} needs a positive width and height."));
             }
-            if pad
-                .drill
-                .is_some_and(|d| d <= 0 || d > pad.size.x.max(pad.size.y))
-            {
-                return Err(format!("{name} has a drill larger than the pad."));
+            if let Some(problem) = pad.hole_problem() {
+                return Err(format!("{name} {problem}."));
             }
+            if !(0..=100_000).contains(&pad.corner_radius) {
+                return Err(format!("{name} needs a corner radius between 0 and 100 mm."));
+            }
+            let margins = [pad.layers.mask_margin, pad.layers.paste_margin];
+            if margins.into_iter().flatten().any(|m| !(-10_000..=10_000).contains(&m)) {
+                return Err(format!("{name} has a mask or paste margin beyond 10 mm."));
+            }
+        }
+        if self.courtyard_margin.is_some_and(|m| !(0..=100_000).contains(&m)) {
+            return Err("The courtyard clearance must be between 0 and 100 mm.".into());
         }
         if self.silk.iter().any(|line| line.len() < 2) {
             return Err("Silkscreen lines need at least two points.".into());
+        }
+        if self.graphics.len() > 100_000 {
+            return Err("A footprint can carry at most 100000 drawn items.".into());
+        }
+        for (i, graphic) in self.graphics.iter().enumerate() {
+            if let Some(problem) = graphic.problem() {
+                return Err(format!("Drawing {} on {} {problem}.", i + 1, graphic.layer.name()));
+            }
         }
         if let Some(model) = &self.model {
             let numbers = model
@@ -145,7 +322,38 @@ impl Footprint {
         };
         board.validate(&BTreeSet::from([id]))
     }
-    /// Bounds of pads and silkscreen in footprint coordinates.
+    /// Every drawn item as (layer, pen width, filled, centre lines) in footprint
+    /// coordinates: the `silk` polylines as front silkscreen at
+    /// [`crate::fabrication::SILK_WIDTH`], then the graphics. Text on a back layer
+    /// is written mirrored, so it reads from the back.
+    pub fn drawing(&self) -> impl Iterator<Item = Drawn> + '_ {
+        let silk = self.silk.iter().map(|line| Drawn {
+            layer: GraphicLayer::FrontSilk,
+            width: crate::fabrication::SILK_WIDTH,
+            filled: false,
+            strokes: vec![line.clone()],
+        });
+        silk.chain(self.graphics.iter().map(|g| Drawn {
+            layer: g.layer,
+            width: g.width(),
+            filled: g.filled,
+            strokes: g.strokes(!g.layer.front()),
+        }))
+    }
+    /// The bounds of the courtyard drawn on the footprint's front (F.CrtYd,
+    /// `front`) or back (B.CrtYd), if it has one. The front one replaces the
+    /// rectangle generated round pads and legend.
+    pub fn drawn_courtyard(&self, front: bool) -> Option<(Point, Point)> {
+        let layer = if front { GraphicLayer::FrontCourtyard } else { GraphicLayer::BackCourtyard };
+        let points: Vec<Point> = self
+            .graphics
+            .iter()
+            .filter(|g| g.layer == layer)
+            .flat_map(LayerGraphic::points)
+            .collect();
+        bounds_of(&points)
+    }
+    /// Bounds of pads and silkscreen (on either side) in footprint coordinates.
     pub fn bounds(&self) -> (Point, Point) {
         let mut points: Vec<Point> = self
             .pads
@@ -156,8 +364,24 @@ impl Footprint {
             })
             .collect();
         points.extend(self.silk.iter().flatten().copied());
+        points.extend(
+            self.graphics
+                .iter()
+                .filter(|g| g.layer.is_silk())
+                .flat_map(LayerGraphic::points),
+        );
         bounds_of(&points).unwrap_or_default()
     }
+}
+
+/// One drawn item of a footprint, read by [`Footprint::drawing`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Drawn {
+    pub layer: GraphicLayer,
+    pub width: i32,
+    pub filled: bool,
+    /// Centre lines in footprint coordinates.
+    pub strokes: Vec<Vec<Point>>,
 }
 
 /// One footprint instance, bound to a schematic component by ID.
@@ -187,26 +411,92 @@ impl Placement {
         } else {
             pad.size
         };
-        Shape::pad(self.transform(pad.at), size, pad.shape)
+        Shape::rounded_pad(self.transform(pad.at), size, pad.shape, pad.effective_corner_radius())
     }
-    /// Inclusive copper layer range of a pad.
+    /// A drilled pad's hole on the board: a circle, or a slot turned with the part.
+    pub fn pad_hole(&self, pad: &Pad) -> Option<Shape> {
+        let hole = pad.hole_size()?;
+        let hole = if self.rotation % 2 == 1 { Point::new(hole.y, hole.x) } else { hole };
+        Some(Shape::pad(self.transform(pad.at), hole, PadShape::Oval))
+    }
+    /// Inclusive copper layer range of a pad: a drilled pad spans every layer, a
+    /// surface-mount pad sits on the board side its footprint side faces.
     pub fn pad_layers(&self, pad: &Pad, layer_count: u8) -> (u8, u8) {
         let last = layer_count.saturating_sub(1);
-        match (pad.drill, self.bottom) {
+        match (pad.drill, self.bottom != pad.back) {
             (Some(_), _) => (0, last),
             (None, false) => (0, 0),
             (None, true) => (last, last),
         }
     }
-    /// World-space courtyard rectangle.
+    /// Whether a surface-mount pad of this placement sits on the board's BOTTOM
+    /// copper: a back pad of a top part, or a front pad of a bottom part.
+    pub fn has_back_copper_pad(&self) -> bool {
+        self.footprint.pads.iter().any(|pad| pad.drill.is_none() && pad.back != self.bottom)
+    }
+    /// The footprint side that faces the board's top (true) or bottom (false):
+    /// true means the footprint's front.
+    pub fn front_faces(&self, board_top: bool) -> bool {
+        board_top != self.bottom
+    }
+    /// Every drawn item of the footprint that lands on `layer` of the BOARD, as
+    /// (pen width, filled, centre lines) in board coordinates: a part on the
+    /// bottom puts its front layers on the board's back.
+    pub fn drawing_on(&self, layer: GraphicLayer) -> Vec<(i32, bool, Vec<Vec<Point>>)> {
+        self.footprint
+            .drawing()
+            .filter(|d| if self.bottom { d.layer.flipped() } else { d.layer } == layer)
+            .map(|d| {
+                let strokes = d
+                    .strokes
+                    .into_iter()
+                    .map(|line| line.into_iter().map(|p| self.transform(p)).collect())
+                    .collect();
+                (d.width, d.filled, strokes)
+            })
+            .collect()
+    }
+    /// The board layer one of the footprint's graphics lands on, and its centre
+    /// lines in board coordinates.
+    pub fn place_graphic(&self, graphic: &LayerGraphic) -> (GraphicLayer, Vec<Vec<Point>>) {
+        let layer = if self.bottom { graphic.layer.flipped() } else { graphic.layer };
+        let strokes = graphic
+            .strokes(!graphic.layer.front())
+            .into_iter()
+            .map(|line| line.into_iter().map(|p| self.transform(p)).collect())
+            .collect();
+        (layer, strokes)
+    }
+    /// The world-space rectangle round a courtyard drawn on the footprint's
+    /// BACK (B.CrtYd), which is on the board side opposite the one the part is
+    /// mounted on.
+    pub fn back_courtyard(&self) -> Option<(Point, Point)> {
+        let (min, max) = self.footprint.drawn_courtyard(false)?;
+        let corners = [min, max, Point::new(min.x, max.y), Point::new(max.x, min.y)]
+            .map(|p| self.transform(p));
+        bounds_of(&corners)
+    }
+    /// The courtyard rectangles this part occupies on the board's top (`true`)
+    /// or bottom side: its own on the side it is mounted on, and a drawn back
+    /// courtyard on the other.
+    pub fn courtyard_on(&self, top: bool) -> Option<(Point, Point)> {
+        if self.bottom != top { Some(self.courtyard()) } else { self.back_courtyard() }
+    }
+    /// World-space courtyard rectangle: round the drawn courtyard when the
+    /// footprint has one, otherwise round the pads and legend plus the clearance.
     pub fn courtyard(&self) -> (Point, Point) {
-        let (min, max) = self.footprint.bounds();
+        let drawn = self.footprint.drawn_courtyard(true);
+        let (min, max) = drawn.unwrap_or_else(|| self.footprint.bounds());
         let corners = [min, max, Point::new(min.x, max.y), Point::new(max.x, min.y)]
             .map(|p| self.transform(p));
         let (min, max) = bounds_of(&corners).unwrap_or_default();
+        let margin = match drawn {
+            Some(_) => 0,
+            None => self.footprint.courtyard_margin.unwrap_or(COURTYARD_MARGIN),
+        };
         (
-            Point::new(min.x - COURTYARD_MARGIN, min.y - COURTYARD_MARGIN),
-            Point::new(max.x + COURTYARD_MARGIN, max.y + COURTYARD_MARGIN),
+            Point::new(min.x - margin, min.y - margin),
+            Point::new(max.x + margin, max.y + margin),
         )
     }
 }
@@ -245,6 +535,44 @@ pub struct Via {
     pub at: Point,
     pub diameter: i32,
     pub drill: i32,
+    /// The copper layers a BLIND or BURIED via joins, inclusive and top first
+    /// (`from < to`). `None` is a through via, joining every layer, and is how
+    /// every via was stored before spans existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<(u8, u8)>,
+}
+/// What a via joins: every layer, an outer layer to an inner one, or inner
+/// layers only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ViaKind {
+    Through,
+    /// From the top or bottom copper to an inner layer.
+    Blind,
+    /// Between inner layers only.
+    Buried,
+}
+impl Via {
+    /// A through via.
+    pub fn through(at: Point, diameter: i32, drill: i32) -> Self {
+        Self { id: Uuid::new_v4(), at, diameter, drill, span: None }
+    }
+    /// The inclusive copper layer range the via joins on a board of
+    /// `layer_count` layers.
+    pub fn layers(&self, layer_count: u8) -> (u8, u8) {
+        let last = layer_count.saturating_sub(1);
+        match self.span {
+            Some((from, to)) => (from.min(last), to.min(last)),
+            None => (0, last),
+        }
+    }
+    pub fn kind(&self, layer_count: u8) -> ViaKind {
+        let last = layer_count.saturating_sub(1);
+        match self.layers(layer_count) {
+            (0, to) if to == last => ViaKind::Through,
+            (from, to) if from == 0 || to == last => ViaKind::Blind,
+            _ => ViaKind::Buried,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -274,9 +602,33 @@ pub struct DesignRules {
     /// Explicit net → class assignments, which beat every pattern.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub net_class_of: BTreeMap<String, String>,
+    /// The narrowest plated copper ring a drilled pad or via may keep round its
+    /// hole. Written only when it differs from the default, so a board that never
+    /// changed it is stored as before.
+    #[serde(
+        default = "default_min_annular_ring",
+        skip_serializing_if = "is_default_min_annular_ring"
+    )]
+    pub min_annular_ring: i32,
+    /// Whether the solder mask covers every via (tented, the default) or opens
+    /// over each via's ring on both sides. Written only when off.
+    #[serde(default = "tented_by_default", skip_serializing_if = "Clone::clone")]
+    pub tent_vias: bool,
+}
+fn tented_by_default() -> bool {
+    true
 }
 fn default_mask_expansion() -> i32 {
     50
+}
+/// The default minimum annular ring, 0.13 mm: the ring most board houses quote
+/// for their standard process (KiCad's own default is 0.1 mm).
+pub const DEFAULT_MIN_ANNULAR_RING: i32 = 130;
+fn default_min_annular_ring() -> i32 {
+    DEFAULT_MIN_ANNULAR_RING
+}
+fn is_default_min_annular_ring(v: &i32) -> bool {
+    *v == DEFAULT_MIN_ANNULAR_RING
 }
 
 /// How the autorouter trades vias against track length.
@@ -307,6 +659,8 @@ impl Default for DesignRules {
             autoroute_vias: ViaPolicy::default(),
             net_classes: vec![],
             net_class_of: BTreeMap::new(),
+            min_annular_ring: DEFAULT_MIN_ANNULAR_RING,
+            tent_vias: true,
         }
     }
 }
@@ -330,6 +684,91 @@ pub struct Board {
     /// before zones existed (the host compares the block byte for byte).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub zones: Vec<Zone>,
+    /// Lines, shapes and text drawn on the board itself, on a silkscreen or
+    /// fabrication layer, belonging to no part: a board's name and revision, a
+    /// connector's legend, an outline on its assembly drawing. Written only when
+    /// there are some, as zones are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub graphics: Vec<BoardGraphic>,
+    /// Holes milled through the board inside its outline (KiCad's inner
+    /// Edge.Cuts loops): closed polygons, each wholly inside the outline and
+    /// apart from every other. Copper keeps the edge clearance from them as it
+    /// does from the outline. Written only when there are some, as zones are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cutouts: Vec<BoardCutout>,
+}
+/// The most corners one cutout may have.
+pub const MAX_CUTOUT_CORNERS: usize = 1000;
+/// The most cutouts one board may have.
+pub const MAX_CUTOUTS: usize = 1000;
+/// A hole milled through the board: a closed polygon (its last corner joins
+/// its first), with the identity a selection and an undo step hold it by.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BoardCutout {
+    pub id: Uuid,
+    pub points: Vec<Point>,
+}
+impl BoardCutout {
+    pub fn new(points: Vec<Point>) -> Self {
+        Self { id: Uuid::new_v4(), points }
+    }
+}
+/// The edges of a closed ring, edge `i` running from corner `i` to the next.
+fn ring_edges(ring: &[Point]) -> impl Iterator<Item = (Point, Point)> + '_ {
+    let n = ring.len();
+    (0..n).map(move |i| (ring[i], ring[(i + 1) % n]))
+}
+/// True when two edges of `ring` that do not share a corner touch.
+fn ring_crosses_itself(ring: &[Point]) -> bool {
+    let n = ring.len();
+    (0..n).any(|i| {
+        (i + 2..n).any(|j| {
+            (i, j) != (0, n - 1)
+                && segments_intersect(ring[i], ring[(i + 1) % n], ring[j], ring[(j + 1) % n])
+        })
+    })
+}
+/// True when an edge of `a` touches an edge of `b`.
+fn rings_touch(a: &[Point], b: &[Point]) -> bool {
+    ring_edges(a).any(|(p, q)| ring_edges(b).any(|(r, s)| segments_intersect(p, q, r, s)))
+}
+/// A drawn item on the board itself: a [`LayerGraphic`] with the identity a
+/// selection and an undo step hold it by.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BoardGraphic {
+    pub id: Uuid,
+    #[serde(flatten)]
+    pub graphic: LayerGraphic,
+}
+impl BoardGraphic {
+    pub fn new(graphic: LayerGraphic) -> Self {
+        Self { id: Uuid::new_v4(), graphic }
+    }
+    /// Why this item cannot be on a board, if it cannot: what any drawn item
+    /// is refused for ([`LayerGraphic::problem`]), and a courtyard, which is the
+    /// room a PART needs and means nothing on the board by itself.
+    pub fn problem(&self) -> Option<String> {
+        if self.graphic.layer.is_courtyard() {
+            return Some(format!(
+                "is on {}: a courtyard belongs to a part's footprint, not to the board",
+                self.graphic.layer.name()
+            ));
+        }
+        self.graphic.problem().map(str::to_owned)
+    }
+}
+impl Board {
+    /// Every item drawn on the board ITSELF on `layer`, as (pen width, filled,
+    /// centre lines) in board coordinates — the board-level counterpart of
+    /// [`Placement::drawing_on`]. Back-layer text is written mirrored, so it reads
+    /// from the board's back.
+    pub fn drawing_on(&self, layer: GraphicLayer) -> Vec<(i32, bool, Vec<Vec<Point>>)> {
+        self.graphics
+            .iter()
+            .filter(|g| g.graphic.layer == layer)
+            .map(|g| (g.graphic.width(), g.graphic.filled, g.graphic.strokes(!layer.front())))
+            .collect()
+    }
 }
 impl Default for Board {
     fn default() -> Self {
@@ -341,6 +780,8 @@ impl Default for Board {
             vias: vec![],
             rules: DesignRules::default(),
             zones: vec![],
+            graphics: vec![],
+            cutouts: vec![],
         }
     }
 }
@@ -388,6 +829,28 @@ pub fn layer_name(layer: u8, layer_count: u8) -> String {
     }
 }
 
+/// The box grown by `grow` on every side; a shrink stops at a 1-unit box about
+/// the middle and never turns the box inside out. Growing by 0 is the identity.
+fn grow_box(min: Point, max: Point, grow: i32) -> (Point, Point) {
+    if grow >= 0 {
+        return (
+            Point::new(min.x - grow, min.y - grow),
+            Point::new(max.x + grow, max.y + grow),
+        );
+    }
+    let shrink = |lo: i32, hi: i32| {
+        let (a, b) = (lo - grow, hi + grow);
+        if a < b {
+            (a, b)
+        } else {
+            let mid = (i64::from(lo) + i64::from(hi)).div_euclid(2) as i32;
+            (mid, mid + 1)
+        }
+    };
+    let (x0, x1) = shrink(min.x, max.x);
+    let (y0, y1) = shrink(min.y, max.y);
+    (Point::new(x0, y0), Point::new(x1, y1))
+}
 pub fn rectangle(min: Point, max: Point) -> Vec<Point> {
     vec![min, Point::new(max.x, min.y), max, Point::new(min.x, max.y)]
 }
@@ -405,12 +868,34 @@ pub enum Shape {
         b: Point,
         radius: i32,
     },
+    /// A rectangle with corners rounded by `radius`: the rectangle `min..max`
+    /// shrunk by `radius` on every side, swept by a disc of `radius`.
+    RoundRect {
+        min: Point,
+        max: Point,
+        radius: i32,
+    },
 }
 impl Shape {
+    /// A pad's copper, a rounded rectangle taken square-cornered
+    /// ([`Shape::rounded_pad`] gives it its corners).
     pub fn pad(center: Point, size: Point, shape: PadShape) -> Self {
+        Self::rounded_pad(center, size, shape, 0)
+    }
+    /// A pad's copper. `corner` is the corner radius of a rounded rectangle (0
+    /// makes it an ordinary rectangle); other shapes ignore it.
+    pub fn rounded_pad(center: Point, size: Point, shape: PadShape, corner: i32) -> Self {
         let half = Point::new(size.x / 2, size.y / 2);
         match shape {
-            PadShape::Rect => {
+            PadShape::RoundRect if corner > 0 => {
+                let min = Point::new(center.x - half.x, center.y - half.y);
+                Self::RoundRect {
+                    min,
+                    max: Point::new(min.x + size.x, min.y + size.y),
+                    radius: corner.min(size.x.min(size.y) / 2),
+                }
+            }
+            PadShape::Rect | PadShape::RoundRect => {
                 let min = Point::new(center.x - half.x, center.y - half.y);
                 Self::Rect {
                     min,
@@ -443,9 +928,91 @@ impl Shape {
             radius: width / 2,
         }
     }
+    /// The shape grown by `grow` on every side (shrunk when negative): a pad's
+    /// solder mask opening or paste aperture. A shrink never inverts the shape.
+    pub fn grown(&self, grow: i32) -> Self {
+        if grow == 0 {
+            return *self;
+        }
+        match *self {
+            Self::Rect { min, max } => {
+                let (min, max) = grow_box(min, max, grow);
+                Self::Rect { min, max }
+            }
+            Self::RoundRect { min, max, radius } => {
+                let (min, max) = grow_box(min, max, grow);
+                let radius = (radius + grow).clamp(0, (max.x - min.x).min(max.y - min.y) / 2);
+                // Shrunk past its corners, it is a plain rectangle.
+                if radius == 0 { Self::Rect { min, max } } else { Self::RoundRect { min, max, radius } }
+            }
+            Self::Capsule { a, b, radius } => Self::Capsule {
+                a,
+                b,
+                radius: (radius + grow).max(1),
+            },
+        }
+    }
+    /// The rectangle a rounded rectangle's disc sweeps: `min..max` less `radius`.
+    fn core(min: Point, max: Point, radius: i32) -> (Point, Point) {
+        (
+            Point::new(min.x + radius, min.y + radius),
+            Point::new(max.x - radius, max.y - radius),
+        )
+    }
+    /// The outline as a closed polygon, counter-clockwise in a y-up frame, arcs
+    /// faceted `facets` to the quarter turn, each vertex ON the true outline.
+    pub fn outline(&self, facets: usize) -> Vec<Point> {
+        let arc = |out: &mut Vec<Point>, c: Point, r: i32, from: f64, steps: usize, sweep: f64| {
+            for i in 0..=steps {
+                let t = from + sweep * i as f64 / steps.max(1) as f64;
+                out.push(Point::new(
+                    c.x + (f64::from(r) * t.cos()).round() as i32,
+                    c.y + (f64::from(r) * t.sin()).round() as i32,
+                ));
+            }
+        };
+        let quarter = std::f64::consts::FRAC_PI_2;
+        let facets = facets.max(1);
+        match *self {
+            Self::Rect { min, max } => rectangle(min, max),
+            Self::RoundRect { min, max, radius } => {
+                let (lo, hi) = Self::core(min, max, radius);
+                let mut out = vec![];
+                for (k, c) in [Point::new(hi.x, lo.y), hi, Point::new(lo.x, hi.y), lo]
+                    .into_iter()
+                    .enumerate()
+                {
+                    arc(&mut out, c, radius, quarter * (k as f64 - 1.), facets, quarter);
+                }
+                out.dedup();
+                if out.len() > 1 && out.first() == out.last() {
+                    out.pop();
+                }
+                out
+            }
+            Self::Capsule { a, b, radius } => {
+                let (dx, dy) = (f64::from(b.x - a.x), f64::from(b.y - a.y));
+                let base = if dx == 0. && dy == 0. { 0. } else { dy.atan2(dx) } - quarter;
+                let mut out = vec![];
+                arc(&mut out, b, radius, base, 2 * facets, 2. * quarter);
+                if a == b {
+                    out.pop();
+                    arc(&mut out, a, radius, base + 2. * quarter, 2 * facets, 2. * quarter);
+                    out.pop();
+                } else {
+                    arc(&mut out, a, radius, base + 2. * quarter, 2 * facets, 2. * quarter);
+                }
+                out.dedup();
+                if out.len() > 1 && out.first() == out.last() {
+                    out.pop();
+                }
+                out
+            }
+        }
+    }
     pub fn bounds(&self) -> (Point, Point) {
         match *self {
-            Self::Rect { min, max } => (min, max),
+            Self::Rect { min, max } | Self::RoundRect { min, max, .. } => (min, max),
             Self::Capsule { a, b, radius } => (
                 Point::new(a.x.min(b.x) - radius, a.y.min(b.y) - radius),
                 Point::new(a.x.max(b.x) + radius, a.y.max(b.y) + radius),
@@ -463,9 +1030,33 @@ impl Shape {
     pub fn distance_to_point(&self, p: Point) -> f64 {
         match *self {
             Self::Rect { min, max } => point_rect_distance(p, min, max),
+            Self::RoundRect { min, max, radius } => {
+                let (lo, hi) = Self::core(min, max, radius);
+                (point_rect_distance(p, lo, hi) - f64::from(radius)).max(0.)
+            }
             Self::Capsule { a, b, radius } => {
                 (point_segment_distance(p, a, b) - f64::from(radius)).max(0.)
             }
+        }
+    }
+    /// How deep `p` lies inside the shape: its distance to the boundary,
+    /// positive inside and negative outside.
+    pub fn depth(&self, p: Point) -> f64 {
+        let inside_box = |min: Point, max: Point| {
+            let d = [p.x - min.x, max.x - p.x, p.y - min.y, max.y - p.y];
+            f64::from(d.into_iter().min().unwrap_or(0))
+        };
+        match *self {
+            Self::Rect { min, max } => {
+                let inner = inside_box(min, max);
+                if inner >= 0. { inner } else { -point_rect_distance(p, min, max) }
+            }
+            Self::RoundRect { min, max, radius } => {
+                let (lo, hi) = Self::core(min, max, radius);
+                let inner = inside_box(lo, hi);
+                f64::from(radius) + if inner >= 0. { inner } else { -point_rect_distance(p, lo, hi) }
+            }
+            Self::Capsule { a, b, radius } => f64::from(radius) - point_segment_distance(p, a, b),
         }
     }
     pub fn contains(&self, p: Point) -> bool {
@@ -473,6 +1064,15 @@ impl Shape {
     }
     /// Gap between two shapes; zero when they touch or overlap.
     pub fn distance(&self, other: &Self) -> f64 {
+        // A rounded rectangle is its core rectangle swept by a disc: measure from
+        // the core and take the radius off.
+        if let Self::RoundRect { min, max, radius } = *self {
+            let (lo, hi) = Self::core(min, max, radius);
+            return (Self::Rect { min: lo, max: hi }.distance(other) - f64::from(radius)).max(0.);
+        }
+        if let Self::RoundRect { .. } = *other {
+            return other.distance(self);
+        }
         match (*self, *other) {
             (Self::Rect { min: a0, max: a1 }, Self::Rect { min: b0, max: b1 }) => {
                 let dx = (i64::from(a0.x) - i64::from(b1.x))
@@ -499,6 +1099,7 @@ impl Shape {
                     radius: rb,
                 },
             ) => (segment_distance(a0, a1, b0, b1) - f64::from(ra) - f64::from(rb)).max(0.),
+            (Self::RoundRect { .. }, _) | (_, Self::RoundRect { .. }) => unreachable!(),
         }
     }
 }
@@ -676,6 +1277,9 @@ pub enum ViolationKind {
     BoardEdge,
     MissingPad,
     Courtyard,
+    /// A plated hole whose copper ring is narrower than
+    /// [`DesignRules::min_annular_ring`].
+    AnnularRing,
     /// A via with no net that zones of two nets claim, and which is stitched to
     /// neither ([`Board::contested_vias`]).
     Stitching,
@@ -760,13 +1364,63 @@ impl Board {
             && min.x < max.x
             && min.y < max.y
     }
-    /// Even-odd point-in-polygon test for the outline.
+    /// True when `p` is on the board: inside the outline (even-odd) and in no
+    /// cutout.
     pub fn outline_contains(&self, p: Point) -> bool {
-        polygon_contains(&self.outline, p)
+        polygon_contains(&self.outline, p) && !self.cutouts.iter().any(|c| polygon_contains(&c.points, p))
     }
+    /// Every edge of the board: the outline's, then each cutout's. Copper keeps
+    /// the edge clearance from all of them.
     pub fn outline_edges(&self) -> impl Iterator<Item = (Point, Point)> + '_ {
-        let n = self.outline.len();
-        (0..n).map(move |i| (self.outline[i], self.outline[(i + 1) % n]))
+        std::iter::once(self.outline.as_slice())
+            .chain(self.cutouts.iter().map(|c| c.points.as_slice()))
+            .flat_map(ring_edges)
+    }
+    /// Why `points` cannot be a cutout of this board, if it cannot: fewer than
+    /// three corners, no area, edges that cross, a corner off the board or on
+    /// its outline, or touching another cutout. `except` is the index of the
+    /// cutout being replaced, which is not checked against itself.
+    pub fn cutout_problem(&self, points: &[Point], except: Option<usize>) -> Option<String> {
+        self.cutout_problem_among(points, &self.cutouts, except)
+    }
+    /// [`Board::cutout_problem`] against `others` only.
+    fn cutout_problem_among(&self, points: &[Point], others: &[BoardCutout], except: Option<usize>) -> Option<String> {
+        if points.len() < 3 {
+            return Some("needs at least three corners".into());
+        }
+        // The checks below compare every edge with every other: a cutout is a
+        // milled shape, and a thousand corners is far more than one needs.
+        if points.len() > MAX_CUTOUT_CORNERS {
+            return Some(format!("has more than {MAX_CUTOUT_CORNERS} corners"));
+        }
+        if zones::ring_area(points) == 0. {
+            return Some("encloses no area".into());
+        }
+        if ring_crosses_itself(points) {
+            return Some("crosses itself".into());
+        }
+        if points.iter().any(|&p| !polygon_contains(&self.outline, p)) || rings_touch(points, &self.outline) {
+            return Some("is not wholly inside the board outline".into());
+        }
+        let bounds = bounds_of(points);
+        for (k, other) in others.iter().enumerate() {
+            // Two cutouts whose boxes are apart can neither touch nor hold one
+            // another: the edge-by-edge checks are only for the near ones.
+            let apart = match (bounds, bounds_of(&other.points)) {
+                (Some((a0, a1)), Some((b0, b1))) => a1.x < b0.x || b1.x < a0.x || a1.y < b0.y || b1.y < a0.y,
+                _ => true,
+            };
+            if Some(k) == except || apart {
+                continue;
+            }
+            if rings_touch(points, &other.points)
+                || polygon_contains(&other.points, points[0])
+                || polygon_contains(points, other.points[0])
+            {
+                return Some(format!("overlaps cutout {}", k + 1));
+            }
+        }
+        None
     }
     /// Change the number of copper layers. Bottom-layer copper stays on the bottom;
     /// changes that would strand inner-layer tracks, or leave a single-layer board
@@ -796,12 +1450,40 @@ impl Board {
         }
         if count == 1
             && (!self.vias.is_empty()
-                || self.placements.iter().any(|p| p.bottom)
+                || self.placements.iter().any(|p| p.bottom || p.has_back_copper_pad())
                 || self.tracks.iter().any(|t| t.layer != 0))
         {
             return Err(
-                "A single-layer board cannot keep vias, bottom tracks, or bottom-side parts".into(),
+                "A single-layer board cannot keep vias, bottom tracks, bottom-side parts, or back-side pads".into(),
             );
+        }
+        // A via's span keeps its ends: an end on the bottom stays on the bottom,
+        // an end on a removed inner layer refuses the change.
+        let remap = |layer: u8| -> Option<u8> {
+            if layer == 0 {
+                Some(0)
+            } else if layer == old_last {
+                Some(new_last)
+            } else if layer < new_last {
+                Some(layer)
+            } else {
+                None
+            }
+        };
+        let mut spans = vec![];
+        for via in &self.vias {
+            spans.push(match via.span {
+                None => None,
+                Some((from, to)) => match (remap(from), remap(to)) {
+                    (Some(from), Some(to)) if from < to => Some((from, to)),
+                    _ => return Err("Move or delete the blind and buried vias on removed inner layers first".into()),
+                },
+            });
+        }
+        // Both ends kept means it still stops short of one outer layer (or both):
+        // a blind or buried via stays one.
+        for (via, span) in self.vias.iter_mut().zip(spans) {
+            via.span = span;
         }
         for track in &mut self.tracks {
             if track.layer == old_last && old_last != 0 {
@@ -821,7 +1503,6 @@ impl Board {
     }
     /// Every copper primitive on the board.
     pub fn copper(&self) -> Vec<CopperItem> {
-        let last = self.layer_count.saturating_sub(1);
         let mut items = vec![];
         for (pi, placement) in self.placements.iter().enumerate() {
             for (pad_index, pad) in placement.footprint.pads.iter().enumerate() {
@@ -848,7 +1529,7 @@ impl Board {
             items.push(CopperItem {
                 owner: CopperRef::Via(vi),
                 shape: Shape::circle(via.at, via.diameter / 2),
-                layers: (0, last),
+                layers: via.layers(self.layer_count),
             });
         }
         items
@@ -1196,7 +1877,16 @@ impl Board {
                             .map(move |(c, d)| edge.distance(&Shape::segment(c, d, 0)))
                     })
                     .fold(f64::INFINITY, f64::min);
-                if !self.outline_contains(piece.outer[0]) || edge_gap + 0.5 < edge_clearance {
+                // Copper ON an edge (crossing the outline or a cutout) is a
+                // finding even when the edge clearance is nil: the mill cuts it.
+                // A cutout the fill wholly covers touches none of its edges: a
+                // stale fill poured before the cutout was made.
+                let covers_cutout = self.cutouts.iter().any(|c| piece.contains(c.points[0]));
+                if !self.outline_contains(piece.outer[0])
+                    || edge_gap + 0.5 < edge_clearance
+                    || edge_gap == 0.
+                    || covers_cutout
+                {
                     violations.push(Violation {
                         kind: ViolationKind::BoardEdge,
                         message: format!(
@@ -1215,7 +1905,7 @@ impl Board {
                 .outline_edges()
                 .map(|(a, b)| item.shape.distance(&Shape::segment(a, b, 0)))
                 .fold(f64::INFINITY, f64::min);
-            if (!self.outline_contains(center) || gap + 0.5 < edge_clearance)
+            if (!self.outline_contains(center) || gap + 0.5 < edge_clearance || gap == 0.)
                 && reported.insert(object(item.owner))
             {
                 violations.push(Violation {
@@ -1268,12 +1958,15 @@ impl Board {
                 });
             }
         }
+        // Courtyards side by side: a part's own on the side it is mounted on,
+        // and a drawn back courtyard on the other.
+        let overlap = |a: Option<(Point, Point)>, b: Option<(Point, Point)>| match (a, b) {
+            (Some((a0, a1)), Some((b0, b1))) => a0.x < b1.x && b0.x < a1.x && a0.y < b1.y && b0.y < a1.y,
+            _ => false,
+        };
         for (i, a) in self.placements.iter().enumerate() {
-            let (a0, a1) = a.courtyard();
             for b in &self.placements[i + 1..] {
-                let (b0, b1) = b.courtyard();
-                if a.bottom == b.bottom && a0.x < b1.x && b0.x < a1.x && a0.y < b1.y && b0.y < a1.y
-                {
+                if [true, false].into_iter().any(|top| overlap(a.courtyard_on(top), b.courtyard_on(top))) {
                     violations.push(Violation {
                         kind: ViolationKind::Courtyard,
                         message: format!(
@@ -1284,6 +1977,52 @@ impl Board {
                         at: Point::new((a.at.x + b.at.x) / 2, (a.at.y + b.at.y) / 2),
                     });
                 }
+            }
+        }
+        // A one-layer board has no bottom copper: a surface-mount pad that would
+        // face the bottom (a back pad of a top part) has nowhere to go.
+        if self.layer_count == 1 {
+            for placement in self.placements.iter().filter(|p| p.has_back_copper_pad()) {
+                violations.push(Violation {
+                    kind: ViolationKind::MissingPad,
+                    message: format!(
+                        "{} has pads on the back copper, which a one-layer board does not have",
+                        references.get(&placement.component).map_or("?", String::as_str)
+                    ),
+                    at: placement.at,
+                });
+            }
+        }
+        let ring = self.rules.min_annular_ring;
+        for placement in &self.placements {
+            for pad in &placement.footprint.pads {
+                if let Some(have) = pad.annular_ring().filter(|r| *r < ring) {
+                    let reference = references.get(&placement.component).map_or("?", String::as_str);
+                    let name = if pad.number.is_empty() { "unnumbered pad".to_owned() } else { format!("pad {}", pad.number) };
+                    violations.push(Violation {
+                        kind: ViolationKind::AnnularRing,
+                        message: format!(
+                            "{reference} {name}: annular ring {:.3} mm, {:.3} mm required",
+                            f64::from(have) / 1000.,
+                            f64::from(ring) / 1000.
+                        ),
+                        at: placement.transform(pad.at),
+                    });
+                }
+            }
+        }
+        for via in &self.vias {
+            let have = (via.diameter - via.drill) / 2;
+            if have < ring {
+                violations.push(Violation {
+                    kind: ViolationKind::AnnularRing,
+                    message: format!(
+                        "Via: annular ring {:.3} mm, {:.3} mm required",
+                        f64::from(have) / 1000.,
+                        f64::from(ring) / 1000.
+                    ),
+                    at: via.at,
+                });
             }
         }
         for net in netlist.nets.iter().filter(|n| n.pins.len() > 1) {
@@ -1336,6 +2075,7 @@ impl Board {
             || !(10..=100_000).contains(&r.routing_grid)
             || r.net_widths.values().any(|w| !size(*w))
             || !(0..=10_000).contains(&r.mask_expansion)
+            || !(0..=10_000).contains(&r.min_annular_ring)
         {
             return Err("Invalid design rules".into());
         }
@@ -1355,15 +2095,62 @@ impl Board {
                 if !valid(pad.at)
                     || !size(pad.size.x)
                     || !size(pad.size.y)
-                    || pad
-                        .drill
-                        .is_some_and(|d| !size(d) || d > pad.size.x.max(pad.size.y))
+                    || pad.hole_problem().is_some()
+                    || pad.hole_size().is_some_and(|h| !size(h.x) || !size(h.y))
+                    || !(0..=100_000).contains(&pad.corner_radius)
+                    || [pad.layers.mask_margin, pad.layers.paste_margin]
+                        .into_iter()
+                        .flatten()
+                        .any(|m| !(-10_000..=10_000).contains(&m))
                 {
                     return Err(format!("Invalid pad in footprint {}", p.footprint.name));
                 }
             }
+            if p.footprint.courtyard_margin.is_some_and(|m| !(0..=100_000).contains(&m)) {
+                return Err(format!("Invalid courtyard clearance in footprint {}", p.footprint.name));
+            }
             if p.footprint.silk.iter().flatten().any(|q| !valid(*q)) {
                 return Err("Invalid footprint silkscreen".into());
+            }
+            if p.footprint.graphics.len() > 100_000
+                || p.footprint.graphics.iter().any(|g| g.problem().is_some())
+            {
+                return Err(format!("Invalid drawing in footprint {}", p.footprint.name));
+            }
+        }
+        if self.graphics.len() > 100_000 {
+            return Err("A board holds at most 100000 drawn items".into());
+        }
+        // A drawn item is selected, edited and deleted by its id: two sharing
+        // one would be edited as one and deleted together.
+        let mut ids = BTreeSet::new();
+        if !self.graphics.iter().all(|g| ids.insert(g.id)) {
+            return Err("Two board drawings share an id".into());
+        }
+        if let Some((n, problem)) = self
+            .graphics
+            .iter()
+            .enumerate()
+            .find_map(|(n, g)| g.problem().map(|p| (n, p)))
+        {
+            return Err(format!("Board drawing {} {problem}", n + 1));
+        }
+        if self.cutouts.len() > MAX_CUTOUTS {
+            return Err(format!("A board holds at most {MAX_CUTOUTS} cutouts"));
+        }
+        // A cutout is selected, moved and deleted by its id, as a drawing is.
+        let mut ids = BTreeSet::new();
+        if !self.cutouts.iter().all(|c| ids.insert(c.id)) {
+            return Err("Two board cutouts share an id".into());
+        }
+        for (n, c) in self.cutouts.iter().enumerate() {
+            if c.points.iter().any(|q| !valid(*q)) {
+                return Err(format!("Cutout {} has a corner off the drawing area", n + 1));
+            }
+            // Each against the ones before it, so of two that overlap the later
+            // one, the one just drawn, is named.
+            if let Some(problem) = self.cutout_problem_among(&c.points, &self.cutouts[..n], None) {
+                return Err(format!("Cutout {} {problem}", n + 1));
             }
         }
         for t in &self.tracks {
@@ -1379,6 +2166,9 @@ impl Board {
         for v in &self.vias {
             if !valid(v.at) || !size(v.drill) || v.diameter <= v.drill {
                 return Err("Invalid via".into());
+            }
+            if v.span.is_some_and(|(from, to)| from >= to || to >= self.layer_count) {
+                return Err("A blind or buried via needs two different layers of the board".into());
             }
         }
         for zone in &self.zones {
@@ -1566,14 +2356,18 @@ impl Document {
             };
             let mut placement = self.board.placements[index].clone();
             placement.at = Point::default();
-            let courtyards: Vec<Shape> = seated
-                .iter()
-                .filter(|p| p.bottom == placement.bottom)
-                .map(|p| {
-                    let (min, max) = p.courtyard();
-                    Shape::Rect { min, max }
-                })
-                .collect();
+            // The seated parts' courtyards on the side this part is mounted on,
+            // and on the other side, which a back courtyard of its own occupies.
+            let mounted_top = !placement.bottom;
+            let on_side = |top: bool| -> Vec<Shape> {
+                seated
+                    .iter()
+                    .filter_map(|p| p.courtyard_on(top))
+                    .map(|(min, max)| Shape::Rect { min, max })
+                    .collect()
+            };
+            let (courtyards, other_side) = (on_side(mounted_top), on_side(!mounted_top));
+            let back = placement.back_courtyard();
             let copper: Vec<Shape> = self
                 .board
                 .copper()
@@ -1619,6 +2413,10 @@ impl Document {
                         .outline_edges()
                         .all(|(a, b)| body.distance(&Shape::segment(a, b, 0)) >= gap)
                     && courtyards.iter().all(|c| body.distance(c) >= gap)
+                    && back.is_none_or(|(b0, b1)| {
+                        let back = Shape::Rect { min: b0.offset(at), max: b1.offset(at) };
+                        other_side.iter().all(|c| back.distance(c) >= gap)
+                    })
                     && copper.iter().all(|c| body.distance(c) >= clearance)
             });
             match free {
@@ -1769,6 +2567,7 @@ impl Document {
             })
             .chain(self.board.tracks.iter().flat_map(|t| t.points.clone()))
             .chain(self.board.vias.iter().map(|v| v.at))
+            .chain(self.board.cutouts.iter().flat_map(|c| c.points.clone()))
             .collect();
         if let Some((min, max)) = bounds_of(&corners) {
             self.board.outline = rectangle(

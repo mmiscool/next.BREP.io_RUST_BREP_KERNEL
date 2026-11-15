@@ -177,16 +177,16 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                 };
             }
             FaceCarrier::Sphere => {
-                solid = crate::offset_sphere_face(&solid, *face_id, distance)?;
+                solid = crate::offset_sphere_face_unchecked(&solid, *face_id, distance)?;
             }
             FaceCarrier::Torus => {
-                solid = crate::offset_torus_face(&solid, *face_id, distance)?;
+                solid = crate::offset_torus_face_unchecked(&solid, *face_id, distance)?;
             }
             FaceCarrier::Revolution => {
-                solid = crate::offset_revolution_face(&solid, *face_id, distance)?;
+                solid = crate::offset_revolution_face_unchecked(&solid, *face_id, distance)?;
             }
             FaceCarrier::Freeform => {
-                solid = crate::offset_freeform_face(&solid, *face_id, distance)?;
+                solid = crate::offset_freeform_face_unchecked(&solid, *face_id, distance)?;
             }
         }
     }

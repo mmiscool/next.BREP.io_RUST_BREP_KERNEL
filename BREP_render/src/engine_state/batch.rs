@@ -584,10 +584,11 @@ impl EngineState {
             .unwrap_or_default()["featureCounter"]
             .clone();
         if let Some(expressions) = args.get("expressions") {
-            if !expressions.is_string() {
+            let Some(script) = expressions.as_str() else {
                 return Err("expressions must be a script string".into());
-            }
-            document["expressions"] = expressions.clone();
+            };
+            // Stored one statement per line, like every expressions write.
+            document["expressions"] = Value::String(brep_kernel::format_expressions(script));
         }
         // Constraints use the native catalogue and descriptor shape.
         if let Some(constraints) = args.get("constraints") {

@@ -170,6 +170,8 @@ fn param_schema(name: &str, spec: &Value) -> Option<Value> {
             s
         }
         "boolean" => json!({ "type": "boolean" }),
+        // A display colour as `#rrggbb` (the form's colour picker writes it).
+        "color" => json!({ "type": "string", "pattern": "^#[0-9a-fA-F]{6}$" }),
         "vec3" => {
             // A bare three-component vector param (Transform Face's `pivot`).
             // Each component is a number OR an expression string, exactly as the
@@ -212,9 +214,7 @@ fn param_schema(name: &str, spec: &Value) -> Option<Value> {
             } else {
                 format!("{description} — {accepts}")
             };
-            if multiple && spec.get("allowSingleReference").and_then(Value::as_bool).unwrap_or(false) {
-                json!({ "type": ["array", "string", "null"], "items": { "type": "string" }, "x-selectionFilter": spec.get("selectionFilter").cloned().unwrap_or(json!([])), "description": note })
-            } else if multiple {
+            if multiple {
                 json!({ "type": "array", "items": { "type": "string" }, "x-selectionFilter": spec.get("selectionFilter").cloned().unwrap_or(json!([])), "description": note })
             } else {
                 json!({ "type": ["string", "null"], "x-selectionFilter": spec.get("selectionFilter").cloned().unwrap_or(json!([])), "description": note })

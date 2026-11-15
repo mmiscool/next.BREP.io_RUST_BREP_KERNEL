@@ -511,7 +511,7 @@ fn step_document_name(file_name: &str) -> String {
     let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name);
     let cut = base
         .rfind('.')
-        .filter(|dot| is_step_name(&base[*dot..]) || is_iges_name(&base[*dot..]))
+        .filter(|dot| is_step_name(&base[*dot..]) || is_iges_name(&base[*dot..]) || is_parasolid_name(&base[*dot..]))
         .unwrap_or(base.len());
     let stem = &base[..cut];
     if stem.is_empty() {
@@ -764,6 +764,9 @@ pub(crate) enum ImportKind {
     Step,
     /// IGES: the STEP lane's probe (subfigure instances raise the same choice).
     Iges,
+    /// Parasolid text (`.x_t`, `.xmt_txt`): the STEP lane's probe, which
+    /// answers flat; the Import 3D Model feature reads it.
+    Parasolid,
     /// STL: the mesh reconstruction preview.
     Stl,
     /// 3MF: the STL lane — the same preview, tolerances and accept.
@@ -780,6 +783,8 @@ pub(crate) const IMPORT_TABLE: &[(&str, ImportKind)] = &[
     ("p21", ImportKind::Step),
     ("iges", ImportKind::Iges),
     ("igs", ImportKind::Iges),
+    ("x_t", ImportKind::Parasolid),
+    ("xmt_txt", ImportKind::Parasolid),
     ("stl", ImportKind::Stl),
     ("3mf", ImportKind::ThreeMf),
     ("obj", ImportKind::Obj),
@@ -790,7 +795,7 @@ pub(crate) const IMPORT_TABLE: &[(&str, ImportKind)] = &[
 /// The extensions of [`IMPORT_TABLE`], for the explorer's filter and the
 /// system file chooser (a test holds the two lists equal).
 const IMPORT_EXTENSIONS: &[&str] =
-    &["step", "stp", "p21", "iges", "igs", "stl", "3mf", "obj", "kicad_sym", "kicad_mod"];
+    &["step", "stp", "p21", "iges", "igs", "x_t", "xmt_txt", "stl", "3mf", "obj", "kicad_sym", "kicad_mod"];
 
 /// The import kind of a file name or path, by its last extension in any case;
 /// `None` for a model document or anything the app does not import. Model
@@ -812,6 +817,12 @@ fn is_step_name(name: &str) -> bool {
 /// Whether an imported file name is an IGES file (`.iges` / `.igs`, any case).
 fn is_iges_name(name: &str) -> bool {
     import_kind(name) == Some(ImportKind::Iges)
+}
+
+/// Whether an imported file name is a Parasolid text part (`.x_t` /
+/// `.xmt_txt`, any case).
+fn is_parasolid_name(name: &str) -> bool {
+    import_kind(name) == Some(ImportKind::Parasolid)
 }
 
 /// The name a file imported into a tab of its own is shown under: the file's
@@ -1476,7 +1487,7 @@ impl FileDialog {
             match store.begin_import_filtered(("CAD / mesh", EXTENSIONS)) {
                 Ok(()) => {
                     self.status =
-                        "choose a STEP, IGES, STL, 3MF, OBJ, or KiCad file\u{2026}".into();
+                        "choose a STEP, IGES, Parasolid, STL, 3MF, OBJ, or KiCad file\u{2026}".into();
                     self.open = false;
                 }
                 Err(e) => self.status = format!("import failed: {e}"),
@@ -3891,7 +3902,9 @@ impl FileDialog {
                 self.take_kicad_file(&name, &bytes, store);
                 return false;
             }
-            ImportKind::Step | ImportKind::Iges => self.import_text(state, &name, &bytes, Self::import_step),
+            ImportKind::Step | ImportKind::Iges | ImportKind::Parasolid => {
+                self.import_text(state, &name, &bytes, Self::import_step)
+            }
             ImportKind::Stl => self.stage_mesh_preview(MeshImportFormat::Stl, name, bytes),
             ImportKind::ThreeMf => self.stage_mesh_preview(MeshImportFormat::ThreeMf, name, bytes),
             ImportKind::Obj => self.import_obj(state, &name, &bytes),

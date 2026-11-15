@@ -47,6 +47,7 @@ pub mod render;
 pub mod run_trace;
 pub mod runner;
 pub mod scene;
+pub mod pmi_weld_symbol;
 pub mod sheets;
 pub mod sketch;
 pub mod sketch3d;
