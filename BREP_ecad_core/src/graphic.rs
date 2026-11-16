@@ -96,8 +96,52 @@ pub enum GraphicShape {
     /// The circular arc from `start` through `mid` to `end`.
     Arc { start: Point, mid: Point, end: Point },
     Circle { center: Point, radius: i32 },
-    /// Stroke-font text, centred on `at` with its baseline there.
-    Text { at: Point, text: String, height: i32 },
+    /// Stroke-font text, centred on `at` with its baseline there, turned
+    /// `angle` whole degrees counter-clockwise as seen (KiCad's sense) about
+    /// `at`. An unturned text writes no angle, so older files read unchanged.
+    Text {
+        at: Point,
+        text: String,
+        height: i32,
+        #[serde(default, skip_serializing_if = "no_angle")]
+        angle: i32,
+    },
+}
+
+/// Whether a text angle is none, which a file leaves out.
+pub fn no_angle(angle: &i32) -> bool {
+    *angle == 0
+}
+
+/// Whole degrees brought into `0..360`.
+pub fn normal_angle(degrees: i64) -> i32 {
+    degrees.rem_euclid(360) as i32
+}
+
+/// `p` turned `degrees` counter-clockwise as seen (y down) about `about`. A
+/// quarter turn is exact; any other angle rounds to the micrometre.
+pub fn turn_about(p: Point, about: Point, degrees: i32) -> Point {
+    let (dx, dy) = (i64::from(p.x) - i64::from(about.x), i64::from(p.y) - i64::from(about.y));
+    let (x, y) = match normal_angle(i64::from(degrees)) {
+        0 => (dx, dy),
+        90 => (dy, -dx),
+        180 => (-dx, -dy),
+        270 => (-dy, dx),
+        a => {
+            let (sin, cos) = f64::from(a).to_radians().sin_cos();
+            let (fx, fy) = (dx as f64, dy as f64);
+            ((fx * cos + fy * sin).round() as i64, (fy * cos - fx * sin).round() as i64)
+        }
+    };
+    let clamp = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    Point::new(clamp(i64::from(about.x) + x), clamp(i64::from(about.y) + y))
+}
+
+/// Up the letters of text turned `degrees` (counter-clockwise as seen), as a
+/// unit vector on the canvas (y down): straight up the page when unturned.
+pub fn text_up(degrees: i32) -> (f64, f64) {
+    let (sin, cos) = f64::from(degrees).to_radians().sin_cos();
+    (-sin, -cos)
 }
 
 /// One drawn item on a non-copper layer.
@@ -118,6 +162,8 @@ pub struct LayerGraphic {
 const LIMIT: i32 = 100_000_000;
 /// Longest text a graphic may carry.
 pub const MAX_TEXT: usize = 200;
+/// The smallest and largest text height a graphic may have, in micrometres.
+pub const TEXT_HEIGHTS: std::ops::RangeInclusive<i32> = 100..=100_000;
 /// Facets of a full circle when it is stroked as a polyline.
 const CIRCLE_FACETS: i32 = 64;
 
@@ -173,15 +219,18 @@ impl LayerGraphic {
                     return Some("needs a radius between 0.001 mm and 100 m");
                 }
             }
-            GraphicShape::Text { at, text, height } => {
+            GraphicShape::Text { at, text, height, angle } => {
                 if !inside(at) {
                     return Some("is outside the drawing area");
                 }
                 if text.trim().is_empty() || text.chars().count() > MAX_TEXT {
                     return Some("needs text of 1 to 200 characters");
                 }
-                if !(100..=100_000).contains(height) {
+                if !TEXT_HEIGHTS.contains(height) {
                     return Some("needs a text height between 0.1 and 100 mm");
+                }
+                if !(0..360).contains(angle) {
+                    return Some("needs a text angle from 0 to 359 degrees");
                 }
             }
         }
@@ -205,8 +254,14 @@ impl LayerGraphic {
                     })
                     .collect()]
             }
-            GraphicShape::Text { at, text, height } => {
-                font::text_strokes(text, *at, *height, mirrored, &mut Default::default())
+            GraphicShape::Text { at, text, height, angle } => {
+                let mut strokes = font::text_strokes(text, *at, *height, mirrored, &mut Default::default());
+                if *angle != 0 {
+                    for p in strokes.iter_mut().flatten() {
+                        *p = turn_about(*p, *at, *angle);
+                    }
+                }
+                strokes
             }
         }
     }

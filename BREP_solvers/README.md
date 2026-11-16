@@ -1,7 +1,7 @@
 # BREP_solvers
 
 `BREP_solvers` holds the constraint solvers of the BREP kernel. Its Rust library
-target is `brep_solvers`; this is version **0.23.0**.
+target is `brep_solvers`; this is version **0.24.0**.
 
 It is one of the implementation crates the kernel is built from. Applications
 should depend on [`BREP_kernel`](https://crates.io/crates/BREP_kernel), which

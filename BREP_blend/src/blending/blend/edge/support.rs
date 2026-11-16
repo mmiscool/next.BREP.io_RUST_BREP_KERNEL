@@ -195,6 +195,54 @@ pub(in crate::blend) fn refine_overshoot_on() -> bool {
     switch!("BREP_BLEND_REFINE_OVERSHOOT", true)
 }
 
+/// `BREP_BLEND_POLE_SEED` (default on; `=0` keeps the refusal): an open march
+/// whose middle station refuses from the edge's own pcurve seed is solved
+/// again from [`pole_station_seed`]. Only a refused middle station asks, so
+/// every march that solved before solves exactly as it did.
+pub(in crate::blend) fn pole_seed_on() -> bool {
+    switch!("BREP_BLEND_POLE_SEED", true)
+}
+
+/// A station seed read off the ball rather than the edge: the centre the two
+/// mates' unit raw normals place at the edge point (`p + ρ₁·n₁ + ρ₂·n₂`, the
+/// centre itself where the mates meet square), projected onto each carrier.
+/// Each normal is the mean of the normals one station step either side along
+/// the edge, so a mate whose pcurve passes through its carrier's pole at `t`
+/// (where `S_u × S_v` vanishes and the normal is a one-sided limit) still
+/// reads the normal it has there. `None` when any reading fails or the seed
+/// is the edge's own.
+fn pole_station_seed(
+    edge: &EdgeRecord,
+    first: &BlendMate,
+    second: &BlendMate,
+    rho: [f64; 2],
+    t: f64,
+    station_step: f64,
+) -> Option<[f64; 4]> {
+    let point = edge.curve.evaluate(t.clamp(edge.t0, edge.t1)).ok()?;
+    let mean_normal = |mate: &BlendMate| -> Option<Vec3> {
+        let mut sum = Vec3::default();
+        for side in [-1.0, 1.0] {
+            let at = (t + side * station_step).clamp(edge.t0, edge.t1);
+            let [u, v] = edge_uv_on_face(mate.coedge, edge, at).ok()?;
+            sum = sum.add(crate::blend::stations::raw_normal(&mate.face.surface, u, v).ok()?.normalized().ok()?);
+        }
+        sum.normalized().ok()
+    };
+    let center = point.add(mean_normal(first)?.scale(rho[0])).add(mean_normal(second)?.scale(rho[1]));
+    let mut seed = [0.0; 4];
+    for (slot, mate) in [first, second].into_iter().enumerate() {
+        let foot = crate::project_point_to_surface(&mate.face.surface, center).ok()?;
+        if !(foot.u.is_finite() && foot.v.is_finite()) {
+            return None;
+        }
+        seed[2 * slot] = foot.u;
+        seed[2 * slot + 1] = foot.v;
+    }
+    let own = [edge_uv_on_face(first.coedge, edge, t).ok()?, edge_uv_on_face(second.coedge, edge, t).ok()?];
+    (seed != [own[0][0], own[0][1], own[1][0], own[1][1]]).then_some(seed)
+}
+
 thread_local! {
     /// Per edge id, the native-parameter reach `[low, high]` the refinement extends to.
     static OVERSHOOT_REACH: std::cell::RefCell<Option<rustc_hash::FxHashMap<u64, [f64; 2]>>> = const { std::cell::RefCell::new(None) };
@@ -357,7 +405,26 @@ pub fn march_open_stations_core(
             native: Some([edge.t0, edge.t1]),
             ..Default::default()
         };
-        let (uv, center) = crate::blend::stations::with_newton_context(context, || solve_centered(station_t(mid_index), mid_seed))?;
+        let t_mid = station_t(mid_index);
+        let first_try = crate::blend::stations::with_newton_context(context, || solve_centered(t_mid, mid_seed));
+        // An edge that runs through a carrier's pole (a ball's meridian edge
+        // crossing its axis) can put the middle station's seed ON the pole:
+        // there one parameter moves nothing and the step across the domain
+        // end flips the normal, so the first Newton is singular although
+        // the ball's contacts lie a radius away, at regular points. Only
+        // that refusal asks: the middle is re-seeded at the contacts of the
+        // ball the two raw normals near the edge place
+        // (`pole_station_seed`; `BREP_BLEND_POLE_SEED=0` off).
+        let (uv, center) = match first_try {
+            Err(refusal) if pole_seed_on() => {
+                match pole_station_seed(edge, first, second, rho_at(t_mid), t_mid, station_step) {
+                    Some(seed) => crate::blend::stations::with_newton_context(context, || solve_centered(t_mid, seed))
+                        .map_err(|_| refusal)?,
+                    None => return Err(refusal),
+                }
+            }
+            other => other?,
+        };
         solutions[mid_index] = uv;
         centers[mid_index] = Some(center);
     }

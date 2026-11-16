@@ -737,6 +737,57 @@ impl<'a> SolidBuilder<'a> {
             });
         }
 
+        // The FIRST coedge has no continuity cursor, so a coedge lying on a
+        // periodic seam (a half cone's ruling on u = u0 = u1, used once by this
+        // face) keeps whichever branch its projection landed on. When that is
+        // the wrong one, the rest of the loop -- placed by continuity -- returns
+        // to the other side, and the loop closes with a whole-period jump: the
+        // gap-fill then spans the apex across the face's complementary half, and
+        // the trimmed region the mesher sees is the wrong one. Move the first
+        // coedge across the seam when that removes the closing jump, keeps it in
+        // the domain, and opens no whole-period jump to the second coedge.
+        // Only a coedge that RIDES the seam qualifies: used once by this loop
+        // (a seam pair is placed by the pair logic above), not degenerate (a
+        // pole's representative is the gap-fill's), and constant in the
+        // periodic coordinate on a domain end.
+        let first_rides_seam = |axis: usize| -> Result<bool, String> {
+            let first = &placed[0];
+            if occurrence.get(&first.edge_id).copied().unwrap_or(0) != 1
+                || self.edge_record(first.edge_id).degenerate
+            {
+                return Ok(false);
+            }
+            let (u_lo, u_hi, v_lo, v_hi) = pcurve_extent(&first.pcurve)?;
+            let (lo, hi, d0, d1) = if axis == 0 { (u_lo, u_hi, u0, u1) } else { (v_lo, v_hi, v0, v1) };
+            let tol = 1e-6 * (d1 - d0).abs().max(1e-12);
+            Ok(hi - lo <= tol && ((lo - d0).abs() <= tol || (hi - d1).abs() <= tol))
+        };
+        if joint.is_none() && placed.len() >= 2 && (closed_u != closed_v) && first_rides_seam(if closed_u { 0 } else { 1 })? {
+            let (span, axis) = if closed_u { (u_span, 0) } else { (v_span, 1) };
+            // Relative to the PERIOD alone: a long open direction must not
+            // widen what counts as a whole-period jump.
+            let tol = 1e-3 * span.abs();
+            let coord = |point: (f64, f64)| if axis == 0 { point.0 } else { point.1 };
+            let whole_jump = |from: f64, to: f64| -> f64 {
+                let k = ((from - to) / span).round();
+                if k != 0.0 && ((from - to) - k * span).abs() <= tol { k * span } else { 0.0 }
+            };
+            let closing = whole_jump(coord(placed[placed.len() - 1].end), coord(placed[0].start));
+            if span > 1e-12 && closing != 0.0 {
+                let (du, dv) = if axis == 0 { (closing, 0.0) } else { (0.0, closing) };
+                let shifted = shift_pcurve(&placed[0].pcurve, du, dv)?;
+                if pcurve_in_domain(&shifted, u0, u1, v0, v1) {
+                    let dom = shifted.domain()?;
+                    let (s, e) = (shifted.evaluate(dom[0])?, shifted.evaluate(dom[1])?);
+                    if whole_jump(coord((e.x, e.y)), coord(placed[1].start)) == 0.0 {
+                        placed[0].pcurve = shifted;
+                        placed[0].start = (s.x, s.y);
+                        placed[0].end = (e.x, e.y);
+                    }
+                }
+            }
+        }
+
         // An explicit collapsed EDGE_CURVE/VERTEX_LOOP must span the two
         // neighboring seam endpoints in UV. Leaving it at one arbitrary pole
         // representative disconnects the parameter wire after seam placement.

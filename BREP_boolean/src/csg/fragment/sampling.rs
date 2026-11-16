@@ -322,6 +322,13 @@ pub(super) fn enforce_boundary_crossing_parity(
                     );
                 }
                 // Revert: drop the inserted points, keep the raw chord.
+                if env_read!("BREP_DEBUG_SAG_REVERT").is_some() {
+                    let dropped = run[1..run.len() - 1]
+                        .iter()
+                        .map(|point| point_segment_distance(*point, anchor_start, anchor_end))
+                        .fold(0.0f64, f64::max);
+                    eprintln!("sag-revert: face {face_id} chord sag {dropped:.3e} arrangement tolerance {tolerance:.3e} ratio {:.3e}", dropped / tolerance);
+                }
             } else {
                 kept.extend(run[1..run.len() - 1].iter().copied());
             }

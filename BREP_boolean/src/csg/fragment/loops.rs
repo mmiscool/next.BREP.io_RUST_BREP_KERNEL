@@ -302,8 +302,47 @@ pub fn interior_points_in_polygons_indexed(
             clearance
         }
     };
-    for factor in [0.25, 0.1, 0.05, 0.01, 0.002, 4e-4] {
-        let epsilon = scale * factor;
+    // THIN-REGION STEPS (`BREP_FRAGMENT_THIN_INTERIOR`, default on, `=0` off):
+    // the steps in from an edge scale with the region's area, the smallest
+    // 4e-4·√area. A strip far narrower than that has no candidate inside it,
+    // and the region was dropped with no fragment: a square tube 100 across
+    // with walls 2e-5 thick (a ring of area 8e-3, its smallest step 3.6e-5)
+    // lost both end rings and came back a valid solid a third of its volume.
+    // Only where those steps found nothing, step in by a half and a quarter of
+    // the region's mean width (2·area over its whole boundary's length).
+    let thin_steps: Vec<f64> = if switch!("BREP_FRAGMENT_THIN_INTERIOR", true) {
+        let perimeter: f64 = std::iter::once(&outer_edges)
+            .chain(hole_edges.iter())
+            .flatten()
+            .map(|(a, b)| b.sub(*a).length())
+            .sum();
+        let width = 2.0 * area.abs() / perimeter;
+        // A strip within a thousand float spacings of the chart's coordinates
+        // is round-off (two images of one curve), not material: it keeps no
+        // point. Anything wider is representable where it lies, however long
+        // it runs and wherever its chart is placed.
+        let magnitude = std::iter::once(outer_polygon)
+            .chain(hole_polygons.iter().map(Vec::as_slice))
+            .flatten()
+            .fold(1.0f64, |most, p| most.max(p.x.abs()).max(p.y.abs()));
+        if width.is_finite() && width > 1024.0 * f64::EPSILON * magnitude && width < scale * 4e-4 {
+            vec![0.5 * width, 0.25 * width]
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let standard = [0.25, 0.1, 0.05, 0.01, 0.002, 4e-4].map(|factor| scale * factor);
+    // Whether the standard steps found the point (the loop may break out early).
+    let mut found_by_standard = true;
+    for (step, epsilon) in standard.iter().chain(thin_steps.iter()).copied().enumerate() {
+        if step == standard.len() {
+            found_by_standard = best.is_some();
+        }
+        if step >= standard.len() && best.is_some() {
+            break;
+        }
         for &(a, b) in &outer_edges {
             let direction = b.sub(a);
             let length = direction.length();
@@ -348,6 +387,9 @@ pub fn interior_points_in_polygons_indexed(
     let Some(primary) = best else {
         return Vec::new();
     };
+    if !thin_steps.is_empty() && env_read!("BREP_DEBUG_THIN_INTERIOR").is_some() && !found_by_standard {
+        eprintln!("thin-interior: region area {area:.3e} width {:.3e} point ({:.6},{:.6})", 2.0 * thin_steps[0], primary.x, primary.y);
+    }
     let mut picked = vec![primary];
     let separation = (scale * 0.05).max(1e-12);
     // Repeated maxima among separated candidates yield the stable sort's

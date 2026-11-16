@@ -52,6 +52,22 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // silently (the engine annotates both with the rename hint).
     result.note_partial_resolution(&common::reference_names(ctx.param("edges")));
 
+    // A picked SEAM (an edge with the same face on both sides: the line
+    // where a cylinder's surface closes on itself) has no corner to round.
+    // It is skipped with a note, and the rest of the selection is blended;
+    // before 2026-11-16 the blend refused the whole selection ("edge borders
+    // 1 faces") over the seam a user picked with the cylinder's edges.
+    let seams = drop_seam_edges(&mut target)?;
+    if !seams.is_empty() {
+        result.notes.push(format!(
+            "Fillet: {} closes a face on itself (a seam, not a corner) and was skipped",
+            seams.join(", ")
+        ));
+        if target.edge_points.is_empty() {
+            return Ok(result);
+        }
+    }
+
     let radius = ctx.number("radius")?;
     // A non-positive / non-finite radius is a soft no-op.
     if !(radius.is_finite() && radius > 0.0) {
@@ -171,6 +187,48 @@ fn follow_tangent(ctx: &FeatureContext) -> bool {
 /// points, names and ids parallel; returns the added edges' names. An edge a
 /// picked face already gathered is not added twice: the walk treats every
 /// selected edge as taken.
+/// Remove the target's seam edges (the same face on both sides), returning
+/// their names.
+fn drop_seam_edges(target: &mut common::BlendTarget) -> Result<Vec<String>, FeatureRefusal> {
+    let seams: Vec<u64> = crate::with_registered_solid_str(target.handle, |solid| {
+        Ok(target
+            .edge_ids
+            .iter()
+            .copied()
+            .filter(|edge_id| {
+                let mut faces = solid
+                    .shells
+                    .iter()
+                    .flat_map(|shell| &shell.faces)
+                    .filter(|face| face.loops.iter().any(|lp| lp.coedges.iter().any(|coedge| coedge.edge_id == *edge_id)));
+                let uses: usize = solid
+                    .shells
+                    .iter()
+                    .flat_map(|shell| &shell.faces)
+                    .flat_map(|face| &face.loops)
+                    .flat_map(|lp| &lp.coedges)
+                    .filter(|coedge| coedge.edge_id == *edge_id)
+                    .count();
+                faces.next().is_some() && faces.next().is_none() && uses == 2
+            })
+            .collect())
+    })
+    .map_err(|error| KernelRefusal::internal(KernelStage::Collect, "seam_edges", error))?;
+    let mut names = Vec::new();
+    let mut index = 0;
+    while index < target.edge_ids.len() {
+        if seams.contains(&target.edge_ids[index]) {
+            let id = target.edge_ids.remove(index);
+            target.edge_points.remove(index);
+            names.push(target.edge_names.remove(index));
+            target.picked_edge_ids.retain(|picked| *picked != id);
+        } else {
+            index += 1;
+        }
+    }
+    Ok(names)
+}
+
 fn follow_tangent_chains(target: &mut common::BlendTarget) -> Result<Vec<String>, FeatureRefusal> {
     let expansion = crate::with_registered_solid_str(target.handle, |solid| {
         common::tangent_chain_expansion(solid, &target.picked_edge_ids, &target.edge_ids)

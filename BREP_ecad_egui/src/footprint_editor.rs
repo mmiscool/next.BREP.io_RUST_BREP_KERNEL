@@ -3,7 +3,7 @@ use super::*;
 use crate::editor_core::EditorCore;
 use crate::actions::{Action, ActionGroup, action, command, key};
 use crate::board_view::{BACKGROUND, SILK, THROUGH_HOLE, WARNING, layer_color};
-use crate::symbol_editor::{InspectorHits, LIST_SHARE, grip_under, key_word, list_height};
+use crate::symbol_editor::{InspectorHits, LIST_SHARE, angle_field, grip_under, key_word, list_height};
 use brep_ecad_core::board::{COURTYARD_MARGIN, DesignRules, Footprint, Pad, PadShape, PadVias, PasteWindows, Shape};
 use brep_ecad_core::graphic::{GraphicLayer, GraphicShape, LayerGraphic};
 use crate::board_view::graphic_color;
@@ -446,8 +446,8 @@ impl FootprintEditor {
         }
     }
     /// Whether R turns the selection: a pad, a silkscreen line, or a drawn
-    /// item that looks different turned (not text, which has no angle, nor a
-    /// circle).
+    /// item that looks different turned (text turns its letters; a circle
+    /// looks the same turned).
     fn can_rotate(&self) -> bool {
         match self.core.selected {
             Some(Item::Pad(i)) => i < self.footprint.pads.len(),
@@ -456,7 +456,7 @@ impl FootprintEditor {
                 .footprint
                 .graphics
                 .get(i)
-                .is_some_and(|g| matches!(g.shape, GraphicShape::Polyline { .. } | GraphicShape::Arc { .. })),
+                .is_some_and(|g| !matches!(g.shape, GraphicShape::Circle { .. })),
             None => false,
         }
     }
@@ -507,6 +507,7 @@ impl FootprintEditor {
                         let p = pad.at.offset(*pad.polygon.get(k)?);
                         format!("{}, {} mm", mm(p.x), mm(p.y))
                     }
+                    Handle::Height => return None,
                 })
             }
             Item::Graphic(i) => {
@@ -517,6 +518,7 @@ impl FootprintEditor {
                         format!("{} × {} mm", mm(max.x - min.x), mm(max.y - min.y))
                     }
                     (GraphicShape::Circle { radius, .. }, _) => format!("r {} mm", mm(*radius)),
+                    (GraphicShape::Text { height, .. }, _) => format!("height {} mm", mm(*height)),
                     _ => {
                         let (_, at) = grips::graphic_handles(&g.shape).into_iter().find(|(h, _)| *h == handle)?;
                         format!("{}, {} mm", mm(at.x), mm(at.y))
@@ -2128,7 +2130,7 @@ impl FootprintEditor {
                         radius: f64::from(b.x - a.x).hypot(f64::from(b.y - a.y)).round().min(1e8) as i32,
                     },
                     DrawTool::Arc => GraphicShape::Arc { start: a, mid: arc_through(a, b), end: b },
-                    _ => GraphicShape::Text { at: a, text: "TEXT".into(), height: 1000 },
+                    _ => GraphicShape::Text { at: a, text: "TEXT".into(), height: 1000, angle: 0 },
                 };
                 let mut graphic = LayerGraphic::new(self.draw_layer, shape);
                 graphic.width = self.draw_width;
@@ -2201,11 +2203,12 @@ pub(crate) fn edit_graphic(
         hits.mark("filled", &fill);
     }
     match &mut graphic.shape {
-        GraphicShape::Text { at, text, height } => {
+        GraphicShape::Text { at, text, height, angle } => {
             ui.label("Text");
             let field = ui.text_edit_singleline(text);
             hits.mark("text", &field);
             mm_field(ui, hits, "Text height", height, 0.1..=100.);
+            angle_field(ui, hits, "Text angle", angle);
             point_fields(ui, hits, "Position", at);
         }
         GraphicShape::Circle { center, radius } => {

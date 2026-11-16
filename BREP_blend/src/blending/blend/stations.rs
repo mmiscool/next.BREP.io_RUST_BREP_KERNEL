@@ -380,6 +380,9 @@ pub(in crate::blend) fn solve_station_state_chord(
         }
         if jacobian.is_none() || error > 0.25 * previous_error {
             let mut fresh = [[0.0f64; 4]; 4];
+            // Forward always: a stall here (a difference straddling an open
+            // domain end, `difference_step`) falls back to the full solve
+            // below, which takes the one-sided difference.
             let step = 1e-7;
             let mut readable = true;
             for column in 0..4 {
@@ -422,10 +425,48 @@ pub(in crate::blend) fn solve_station_state_chord(
     solve_station_state(first, second, rho, fallback_seed, section_point, section_tangent, scale)
 }
 
-/// The station Newton itself. `trace`, when given, only RECORDS what each
-/// iteration read (its residual, the Jacobian's conditioning, the exit); it is
-/// never read back, so a traced solve takes exactly the steps an untraced one
-/// does.
+/// The forward-difference step of the station Newton's Jacobian.
+const DIFFERENCE_STEP: f64 = 1e-7;
+
+/// Each Newton column's parameter domain when that direction is OPEN (not
+/// periodic), in column order: the first surface's (u, v), then the second's.
+fn open_column_domains(surfaces: [&NurbsSurface; 2]) -> [Option<[f64; 2]>; 4] {
+    let mut domains = [None; 4];
+    for (index, surface) in surfaces.into_iter().enumerate() {
+        let (Ok([u0, u1]), Ok([v0, v1]), Ok((closed_u, closed_v))) =
+            (surface.domain_u(), surface.domain_v(), surface.closed_directions())
+        else {
+            continue;
+        };
+        domains[2 * index] = (!closed_u).then_some([u0, u1]);
+        domains[2 * index + 1] = (!closed_v).then_some([v0, v1]);
+    }
+    domains
+}
+
+/// The Jacobian's difference step for a column at `value`: forward, unless the
+/// forward probe would cross an end of the column's open domain, where it is
+/// taken backward so both reads lie on the iterate's own side of that end.
+///
+/// Past an open end a carrier is read on its C¹ extension (the tangent plane
+/// along that boundary, `deriv1_extended`), so the offset point's derivative
+/// JUMPS there: on a quarter-round past its rim the normal stops turning and
+/// the centre moves at half the rate it does just inside (reported 2026-11-16:
+/// the concave ring along a rounded rib's foot on a cylinder, whose
+/// flush-join station sits 5e-11 inside the round's rim).
+/// A forward difference straddling the rim read that half rate, every Newton
+/// step overshot by two, and the iterate cycled ±1.4e-10 about the root for
+/// all its iterations.
+fn difference_step(value: f64, domain: Option<[f64; 2]>) -> f64 {
+    match domain {
+        Some([low, high]) if (value <= high && value + DIFFERENCE_STEP > high) || (value < low && value + DIFFERENCE_STEP >= low) => -DIFFERENCE_STEP,
+        _ => DIFFERENCE_STEP,
+    }
+}
+
+/// The station Newton, retried once with side-aware differences
+/// ([`difference_step`]) when its forward differences do not converge: a
+/// solve that converges is the plain forward-difference Newton, bit for bit.
 #[allow(clippy::too_many_arguments)]
 fn solve_station_state_traced(
     first: &NurbsSurface,
@@ -437,6 +478,31 @@ fn solve_station_state_traced(
     scale: f64,
     mut trace: Option<&mut NewtonTrace>,
 ) -> Result<([f64; 4], TangencyState), KernelRefusal> {
+    match solve_station_state_sided(first, second, rho, seed, section_point, section_tangent, scale, false, trace.as_deref_mut()) {
+        Err(refusal) if matches!(&refusal.class, crate::RefusalClass::NonConvergence { what } if what == "tangency_newton") => {
+            crate::blend::record_count("count.march.sided_newton_retry", 1);
+            solve_station_state_sided(first, second, rho, seed, section_point, section_tangent, scale, true, trace)
+        }
+        result => result,
+    }
+}
+
+/// The station Newton itself. `trace`, when given, only RECORDS what each
+/// iteration read (its residual, the Jacobian's conditioning, the exit); it is
+/// never read back, so a traced solve takes exactly the steps an untraced one
+/// does.
+#[allow(clippy::too_many_arguments)]
+fn solve_station_state_sided(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    rho: [f64; 2],
+    seed: [f64; 4],
+    section_point: Vec3,
+    section_tangent: Vec3,
+    scale: f64,
+    sided: bool,
+    mut trace: Option<&mut NewtonTrace>,
+) -> Result<([f64; 4], TangencyState), KernelRefusal> {
     let memo_enabled = offset_memo::enabled();
     let mut memo = memo_enabled.then(|| offset_memo::Samples::new([first, second]));
     let mut read = |uv| match memo.as_mut() {
@@ -445,6 +511,10 @@ fn solve_station_state_traced(
     };
     let mut uv = seed;
     let tolerance = 1e-11 * (1.0 + scale);
+    // On the retry, each column's open (non-periodic) parameter domain: a
+    // difference that would straddle one of its ends is taken on the
+    // iterate's own side.
+    let open_domains = if sided { open_column_domains([first, second]) } else { [None; 4] };
     let mut evaluations = 0u64;
     for _ in 0..NEWTON_ITERATIONS {
         evaluations += 1;
@@ -479,8 +549,8 @@ fn solve_station_state_traced(
             return Ok((uv, state));
         }
         let mut jacobian = [[0.0f64; 4]; 4];
-        let step = 1e-7;
         for column in 0..4 {
+            let step = difference_step(uv[column], open_domains[column]);
             let mut probe = uv;
             probe[column] += step;
             evaluations += 1;
@@ -499,6 +569,8 @@ fn solve_station_state_traced(
                 jacobian[row][column] = (probed.residual[row] - state.residual[row]) / step;
             }
         }
+        // A stationary chart's column is re-read on its chart, forward.
+        let step = DIFFERENCE_STEP;
         let charts = station_charts([first, second], uv, &jacobian)?;
         for (column, chart) in charts.iter().enumerate() {
             let Some(chart) = chart else {

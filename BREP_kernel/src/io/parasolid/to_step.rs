@@ -610,7 +610,9 @@ impl<'a> Translator<'a> {
             let (inner, tube) = self.blend_supports(s, depth + 1).map_err(|e| format!("blend {id}: supporting blend {support_id}: {e}"))?;
             let spine = file.follow(s, "spine").ok_or_else(|| format!("blend {id}'s supporting blend {support_id} has no spine"))?;
             let spine = self.spine_curve(spine).map_err(|e| format!("blend {id}: supporting blend {support_id}: spine: {e}"))?;
-            let inner = inner.iter().any(|s| !matches!(s, Support::Surface(_))).then(|| Box::new((inner, tube)));
+            // Carried always: its centres are refined past an open spine's
+            // ends even between two surfaces (cross review).
+            let inner = Some(Box::new((inner, tube)));
             Ok(Support::Pipe { spine, radius: tube, inner })
         };
         let supports = [read(first)?, read(second)?];
@@ -640,7 +642,6 @@ impl<'a> Translator<'a> {
         }
         let spine = self.spine_curve(spine_node).map_err(|e| format!("blend {id}: spine: {e}"))?;
         let points = self.face_boundary_points(face);
-        let [t0, t1] = spine_range(&spine, &points, 1.0 / 50.0).ok_or_else(|| format!("blend {id}: the face does not lie along its spine"))?;
         let section = |t: f64| blend_section(&supports, radius, &spine, t);
         // A blend whose supports are only C1 (or C0) along some knot lines (a
         // B-surface's, or a swept B-curve's) has sections that kink where a
@@ -650,17 +651,29 @@ impl<'a> Translator<'a> {
             let breaks = support_knot_crossings(&supports, &section, t0, t1);
             fit_blend_pieces(&section, t0, t1, &breaks).ok()
         };
-        let surface = match fit_blend(&section, t0, t1) {
-            Ok(surface) => surface,
-            Err(e) => match pieces(t0, t1) {
-                Some(surface) => surface,
-                // The fiftieth past the face each way can run past where a
-                // support is (a swept section's end): the face's own span.
-                None => {
-                    let [a, b] = spine_range(&spine, &points, 0.0).ok_or_else(|| format!("blend {id}: {e}"))?;
-                    pieces(a, b).ok_or_else(|| format!("blend {id}: {e}"))?
-                }
-            },
+        // Within the spine's domain first, as every blend was read; past an
+        // open spine's ends (feet taken on its extension, where a face runs
+        // past the spine curve) only when that refuses: the extension can run
+        // where the sections fail (cross review: a SolidWorks report's blend).
+        let fit = |extend: bool| -> Result<(NurbsSurface, [f64; 2]), String> {
+            let [t0, t1] = spine_range(&spine, &points, 1.0 / 50.0, extend).ok_or_else(|| "the face does not lie along its spine".to_string())?;
+            let surface = match fit_blend(&section, t0, t1) {
+                Ok(surface) => surface,
+                Err(e) => match pieces(t0, t1) {
+                    Some(surface) => surface,
+                    // The fiftieth past the face each way can run past where
+                    // a support is (a swept section's end): the face's span.
+                    None => {
+                        let [a, b] = spine_range(&spine, &points, 0.0, extend).ok_or_else(|| e.clone())?;
+                        pieces(a, b).ok_or(e)?
+                    }
+                },
+            };
+            Ok((surface, [t0, t1]))
+        };
+        let (surface, [t0, t1]) = match fit(false) {
+            Ok(fitted) => fitted,
+            Err(e) => fit(true).map_err(|_| format!("blend {id}: {e}"))?,
         };
         self.fitted_curves += 1;
         let step = self.emit_nurbs_surface(&surface);
@@ -849,6 +862,16 @@ impl<'a> Translator<'a> {
                 // An edge curve that is an SP-curve on a blend: through the
                 // blend, as for a fin's (it has no other statement).
                 Err(e) if !self.read_blend_sp => {
+                    // A whole cross-section of a blend: placed by its vertices
+                    // (the spine point the radius from both), as a fin's is.
+                    // Only when it reads: it centres on the raw spine, which
+                    // past an open spine's end the refined sections leave
+                    // (cross review); the SP-curve path below refines.
+                    if let Some((blend, uv)) = self.blend_under(curve) {
+                        if let Some(Ok(section)) = self.blend_cross_section(blend, &uv).transpose() {
+                            return Ok(section);
+                        }
+                    }
                     self.read_blend_sp = true;
                     let again = self.curve(curve);
                     self.read_blend_sp = false;
@@ -996,6 +1019,18 @@ impl<'a> Translator<'a> {
                 // the curve, so the fitted curve must start there, or the
                 // trim runs the long way round through the chart's seam.
                 if let Some((begin, finish)) = self.anchor.take() {
+                    // Vertices closer together than the chart's chords are
+                    // long, on a loop that passes near them more than once
+                    // (a lobe whose ends meet 0.45 mm apart, chords of
+                    // 2-3 mm): the chart refined first, so each vertex is
+                    // placed on the passage it is on, not the nearer chord.
+                    let closed = chart.len() > 3 && chart[0].sub(chart[chart.len() - 1]).length() <= 1e-6;
+                    let longest = chart.windows(2).map(|w| w[1].sub(w[0]).length()).fold(0.0f64, f64::max);
+                    if closed && begin.sub(finish).length() < longest {
+                        if let Some(crossing) = self.intersection_crossing(node) {
+                            chart = ChartStations::new(Some(&crossing), &chart).refined(16);
+                        }
+                    }
                     chart = reseat_closed_chart(chart, begin, finish);
                     // An open chart is cut to the stretch between the edge's
                     // vertices: a trimmed intersection's chart can run far
@@ -1034,6 +1069,20 @@ impl<'a> Translator<'a> {
                 let blend_id = blend.int("node_id").unwrap_or(blend.index as i64);
                 let (mut supports, radius) = self.blend_supports(blend, 0)?;
                 let spine_node = self.file.follow(blend, "spine").ok_or_else(|| format!("blend {blend_id} has no spine"))?;
+                // u is the file's spine parameter: only an exact spine has it.
+                // A fitted intersection spine is parameterised by its fit, so
+                // a point at the file's u would land elsewhere along the blend
+                // (a section had landed 11.5 mm from its vertices).
+                let mut basis = spine_node;
+                for _ in 0..8 {
+                    match self.file.follow(basis, "basis_curve") {
+                        Some(b) if basis.type_name() == "TRIMMED_CURVE" => basis = b,
+                        _ => break,
+                    }
+                }
+                if basis.type_name() == "INTERSECTION" {
+                    return Err(format!("an SP-curve on blend {blend_id}, whose spine is an intersection curve, is not read yet"));
+                }
                 if spine_node.char("sense") == Some(b'-') {
                     supports.swap(0, 1);
                 }
@@ -2290,7 +2339,7 @@ pub(super) fn edge_fins<'f>(file: &'f XtFile, edge: &Node) -> Result<(&'f Node, 
 
 /// The parameter range of `spine` that the points lie along, widened by a
 /// fiftieth each way (within a bounded curve's own range).
-pub(super) fn spine_range(spine: &Curve, points: &[Vec3], margin: f64) -> Option<[f64; 2]> {
+pub(super) fn spine_range(spine: &Curve, points: &[Vec3], margin: f64, extend: bool) -> Option<[f64; 2]> {
     let params: Vec<f64> = match spine {
         Curve::Line { point, direction } => points.iter().map(|p| p.sub(*point).dot(*direction) / MM_PER_METRE).collect(),
         Curve::Circle { frame, .. } | Curve::Ellipse { frame, .. } => {
@@ -2348,7 +2397,23 @@ pub(super) fn spine_range(spine: &Curve, points: &[Vec3], margin: f64) -> Option
                 let pad = (span * margin).min(0.5 * gap);
                 return Some([after - pad, after + span + pad]);
             }
-            feet
+            // An open spine's feet are taken on its extension too: a face
+            // can run past where the spine curve stops (by 0.2 mm on one
+            // part), and the sections follow the extension there.
+            let [a, b] = curve.domain().ok()?;
+            if !extend {
+                return range_of(&feet, margin, [a, b]);
+            }
+            points
+                .iter()
+                .zip(&feet)
+                .map(|(p, &foot)| {
+                    if foot > a && foot < b {
+                        return foot;
+                    }
+                    geometry::nearest_parameter(spine, [true, true], |q| q.sub(*p).length()).unwrap_or(foot)
+                })
+                .collect()
         }
     };
     let (lo, hi) = params.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
@@ -2357,11 +2422,23 @@ pub(super) fn spine_range(spine: &Curve, points: &[Vec3], margin: f64) -> Option
     }
     let margin = (hi - lo) * margin;
     let (mut lo, mut hi) = (lo - margin, hi + margin);
+    // Past the spine's ends only as far as the face goes.
     if let Curve::Nurbs(curve) = spine {
         let [a, b] = curve.domain().ok()?;
-        (lo, hi) = (lo.max(a), hi.min(b));
+        let (first, last) = params.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(x, y), &t| (x.min(t), y.max(t)));
+        (lo, hi) = (lo.max(a.min(first)), hi.min(b.max(last)));
     }
     Some([lo, hi])
+}
+
+/// `params`' span, widened by `margin` of itself each way, within `domain`.
+fn range_of(params: &[f64], margin: f64, [a, b]: [f64; 2]) -> Option<[f64; 2]> {
+    let (lo, hi) = params.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(x, y), &t| (x.min(t), y.max(t)));
+    if !(hi > lo) {
+        return None;
+    }
+    let pad = (hi - lo) * margin;
+    Some([(lo - pad).max(a), (hi + pad).min(b)])
 }
 
 /// A blend's cross-section at spine parameter `t`: the arc about the spine
@@ -2470,7 +2547,12 @@ fn support_distance(s: &Support, x: Vec3) -> Option<(f64, Vec3)> {
 /// (Newton on the two distances; an edge's is to its nearest point).
 fn ball_centre(supports: &[Support; 2], radius: f64, spine: &Curve, t: f64) -> Result<Vec3, String> {
     let mut centre = geometry::extended_point(spine, t)?;
-    if supports.iter().all(|s| matches!(s, Support::Surface(_))) {
+    // Past an open spine's ends the extension is only the spine's tangent
+    // line, not the ball's path: refined there as well.
+    let beyond = matches!(spine, Curve::Nurbs(_))
+        && geometry::closed_range(spine).is_none()
+        && spine.natural_range().is_some_and(|[a, b]| t < a || t > b);
+    if supports.iter().all(|s| matches!(s, Support::Surface(_))) && !beyond {
         return Ok(centre);
     }
     let Some(tangent) = geometry::curve_tangent(spine, t) else { return Ok(centre) };

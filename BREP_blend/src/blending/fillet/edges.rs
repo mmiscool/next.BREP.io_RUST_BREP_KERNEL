@@ -1121,6 +1121,21 @@ pub fn fillet_edges_reported(
     // two stripes' rails on the face they share meet and the section shrinks
     // to a point. Two carrier switches and a degenerate terminus, not a march
     // with a stop.
+    // A convex spine dying into two concave edges on a CURVED floor is built
+    // spine first, then the rest with the spine's foot on the floor added to
+    // the concave chain (`spine_first.rs`); taken by the selection's shape
+    // alone, and declined to the lanes below when a stage does not build.
+    // Only where the corner analysis below sees no mixed corner (a closed
+    // edge in the selection, such as the cylinder's rim, blinds it): where it
+    // sees them, the rounded-boss and runout compositions already build the
+    // class (the 2026-10-12 sprocket's spine over its cylindrical rim).
+    if !chamfer && crate::blend::mixed_convexity_corners(solid, &selected_ids, radius).is_empty() {
+        if let Some(built) = super::spine_first::spine_first_composition(
+            solid, &selected_ids, edge_points, edge_names, radius, name,
+        ) {
+            return Ok(built);
+        }
+    }
     if !chamfer {
         // The class is BUILT where the runout composition applies — the ring
         // first, then one wall per spine from pole to pole (`blend/runout.rs`,

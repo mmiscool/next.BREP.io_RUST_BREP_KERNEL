@@ -7,6 +7,24 @@ use brep_ecad_core::Pin;
 /// The pitch every symbol coordinate is snapped to, in micrometres: 1.27 mm,
 /// the 50 mil schematic grid a sheet's wires run on.
 const GRID: i32 = 1270;
+/// Which way a symbol's text turned `angle` grows from its anchor, the
+/// top-left corner of its letters: down the letters, straight down the page
+/// (y down) when unturned.
+fn text_down(angle: i32) -> (f64, f64) {
+    let (x, y) = brep_ecad_core::graphic::text_up(angle);
+    (-x, -y)
+}
+/// The corners of the box a symbol's text fills, top-left (its anchor) first,
+/// turned with it: as wide as its letters are drawn, `size` tall.
+/// Worked in `i64`: a long text at the edge of the drawing area reaches past
+/// the `i32` range, and is held at its edge rather than wrapping round.
+fn text_corners(at: Point, text: &str, size: i32, angle: i32) -> [Point; 4] {
+    let w = (text.chars().count() as f64 * f64::from(size) * 0.65).round() as i64;
+    let clamp = |v: i64| v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    let (x, y, h) = (i64::from(at.x), i64::from(at.y), i64::from(size));
+    [at, Point::new(clamp(x + w), at.y), Point::new(clamp(x + w), clamp(y + h)), Point::new(at.x, clamp(y + h))]
+        .map(|p| brep_ecad_core::graphic::turn_about(p, at, angle))
+}
 /// A pin's length when nothing else says: two grid steps, which is what a
 /// schematic symbol's pins are drawn at very nearly everywhere.
 const DEFAULT_PIN_LENGTH: i32 = 2 * GRID;
@@ -318,6 +336,15 @@ impl SymbolEditor {
     pub fn selected_pin(&self) -> Option<&str> {
         match self.core.selected {
             Some(Item::Pin(index)) => self.symbol.pins.get(index).map(|pin| pin.number.as_str()),
+            _ => None,
+        }
+    }
+    /// The index of the selected drawn item in `Symbol::graphics`, as
+    /// `row:graphic:<index>` names it, or `None` when the selection is a pin
+    /// or empty.
+    pub fn selected_graphic(&self) -> Option<usize> {
+        match self.core.selected {
+            Some(Item::Graphic(index)) if index < self.symbol.graphics.len() => Some(index),
             _ => None,
         }
     }
@@ -815,10 +842,11 @@ impl SymbolEditor {
                         point_fields(ui, hits, "Center", center);
                         mm_field(ui, hits, "Radius", radius, 0.001..=100000.);
                     }
-                    Graphic::Text { at, text, size } => {
+                    Graphic::Text { at, text, size, angle } => {
                         hits.mark("text", &ui.text_edit_multiline(text));
                         point_fields(ui, hits, "Position", at);
                         mm_field(ui, hits, "Text size", size, 0.1..=100.);
+                        angle_field(ui, hits, "Text angle", angle);
                     }
                 }
             }
@@ -926,6 +954,44 @@ impl SymbolEditor {
             .unwrap()
     }
     /// Whether the selected item is a pin this symbol still has.
+    /// Whether R turns the selection: a pin, a drawn line or outline, or text
+    /// (its letters). A circle looks the same turned.
+    fn can_rotate(&self) -> bool {
+        match self.core.selected {
+            Some(Item::Pin(_)) => self.pin_selected(),
+            Some(Item::Graphic(i)) => matches!(self.symbol.graphics.get(i), Some(Graphic::Path(_) | Graphic::Text { .. })),
+            _ => false,
+        }
+    }
+    /// R: turn whatever is selected a quarter turn clockwise as seen, one
+    /// undo step: a pin about its body end ([`Self::rotate_pin`]), a drawn
+    /// line or outline about [`grips::pivot`] (its middle, so four turns put
+    /// it back), text about its anchor. A turn past the drawing area is not
+    /// made.
+    fn rotate_selected(&mut self) {
+        match self.core.selected {
+            Some(Item::Pin(_)) => self.rotate_pin(),
+            Some(Item::Graphic(i)) => {
+                let before = self.symbol.clone();
+                let turned = match self.symbol.graphics.get_mut(i) {
+                    Some(Graphic::Path(points)) => {
+                        grips::pivot(points).is_some_and(|about| grips::turn_points(points, about))
+                    }
+                    Some(Graphic::Text { angle, .. }) => {
+                        *angle = grips::turned_angle(*angle);
+                        true
+                    }
+                    _ => false,
+                };
+                if turned {
+                    self.record(before);
+                } else {
+                    self.symbol = before;
+                }
+            }
+            _ => {}
+        }
+    }
     fn pin_selected(&self) -> bool {
         matches!(self.core.selected, Some(Item::Pin(index)) if index < self.symbol.pins.len())
     }
@@ -965,7 +1031,9 @@ impl SymbolEditor {
     /// Asked before the general hit test: a handle sits on top of the pin's own
     /// body, and taking hold of one is what aims the pin rather than moving it.
     /// The grab handles of the selected drawn item, in symbol units: a
-    /// rectangle's box, a line's corners, a circle's radius; none for text.
+    /// rectangle's box, a line's corners, a circle's radius, text's height (at
+    /// the foot of its letters, which hang from `at`, their top-left corner,
+    /// as the canvas draws them).
     fn graphic_handles(&self) -> Vec<(Handle, Point)> {
         let Some(Item::Graphic(i)) = self.core.selected else {
             return vec![];
@@ -973,7 +1041,10 @@ impl SymbolEditor {
         match self.symbol.graphics.get(i) {
             Some(Graphic::Path(points)) => grips::path_handles(points),
             Some(Graphic::Circle { center, radius }) => vec![(Handle::Radius, Point::new(center.x + radius, center.y))],
-            _ => vec![],
+            Some(Graphic::Text { at, size, angle, .. }) => {
+                vec![(Handle::Height, grips::text_height_point(*at, text_down(*angle), *size))]
+            }
+            None => vec![],
         }
     }
     fn grab_at(&self, p: Pos2, screen: impl Fn(Point) -> Pos2) -> Option<Grab> {
@@ -1005,15 +1076,9 @@ impl SymbolEditor {
                 Graphic::Circle { center, radius } => {
                     (p.distance(screen(*center)) - *radius as f32 * self.core.zoom).abs() < 8.
                 }
-                Graphic::Text { at, text, size } => Rect::from_min_size(
-                    screen(*at),
-                    Vec2::new(
-                        text.len() as f32 * *size as f32 * self.core.zoom * 0.65,
-                        *size as f32 * self.core.zoom,
-                    ),
-                )
-                .expand(5.)
-                .contains(p),
+                Graphic::Text { at, text, size, angle } => {
+                    Rect::from_points(&text_corners(*at, text, *size, *angle).map(&screen)).expand(5.).contains(p)
+                }
             };
             if hit {
                 return Some(Item::Graphic(i));
@@ -1139,6 +1204,11 @@ impl SymbolEditor {
                     match (&mut self.symbol.graphics[i], &drag.before.graphics[i]) {
                         (Graphic::Path(points), Graphic::Path(was)) => grips::drag_path(points, was, h, q, keep),
                         (Graphic::Circle { center, radius }, _) => *radius = grips::radius_to(*center, q),
+                        // One grid step at least (the pointer's grid point is
+                        // what sizes it), 100 mm at most.
+                        (Graphic::Text { at, size, angle, .. }, _) if h == Handle::Height => {
+                            *size = grips::text_height_to(*at, text_down(*angle), q, GRID, 100_000);
+                        }
                         _ => {}
                     }
                 }
@@ -1240,12 +1310,12 @@ impl SymbolEditor {
                         Stroke::new(2., color),
                     );
                 }
-                Graphic::Text { at, text, size } => {
+                Graphic::Text { at, text, size, angle } => {
                     let galley = crate::zoomed_text(
                         ui.ctx(), text.clone(),
                         FontId::proportional((*size as f32 * zoom).max(2.)), color,
                     );
-                    painter.galley(screen(*at), galley, color);
+                    crate::turned_text(&painter, screen(*at), Align2::LEFT_TOP, galley, color, *angle);
                 }
             }
         }
@@ -1326,6 +1396,7 @@ impl SymbolEditor {
                 let mm = grips::mm;
                 let text = match self.symbol.graphics.get(i) {
                     Some(Graphic::Circle { radius, .. }) => Some(format!("r {} mm", mm(*radius))),
+                    Some(Graphic::Text { size, .. }) => Some(format!("height {} mm", mm(*size))),
                     Some(Graphic::Path(points)) => match (h, grips::upright_rectangle(points)) {
                         (Handle::Box(..), Some((lo, hi))) => Some(format!("{} × {} mm", mm(hi.x - lo.x), mm(hi.y - lo.y))),
                         (Handle::Vertex(k), _) => points.get(k).map(|q| format!("{}, {} mm", mm(q.x), mm(q.y))),
@@ -1382,6 +1453,7 @@ impl SymbolEditor {
                 at: a,
                 text: "Text".into(),
                 size: 1270,
+                angle: 0,
             }),
             DrawTool::Pin => {
                 let number = self.free_number();
@@ -1523,12 +1595,19 @@ static SYMBOL_ACTIONS: &[Action<SymbolEditor>] = &[
     .keys(&[key(Key::Delete), key(Key::Backspace)])
     .enabled_when(|e| e.core.selected.is_some()),
     symbol_action(
+        "symbol.rotate",
+        "Rotate 90°",
+        ActionGroup::Selection,
+        SymbolEditor::rotate_selected,
+    )
+    .keys(&[key(Key::R)])
+    .enabled_when(SymbolEditor::can_rotate),
+    symbol_action(
         "symbol.pin.rotate",
         "Rotate pin 90°",
         ActionGroup::Selection,
         SymbolEditor::rotate_pin,
     )
-    .keys(&[key(Key::R)])
     .enabled_when(SymbolEditor::pin_selected),
     // Length without a pointer. Two stepped commands rather than one taking a
     // value: every action in these tables takes none, a host runs them by id
@@ -1735,6 +1814,20 @@ fn mm_field(
         hits.mark(key, &field);
         if field.changed() {
             *value = (mm * 1000.).round() as i32;
+        }
+    });
+}
+
+/// An angle in whole degrees counter-clockwise, `0` to `359`, keyed by its
+/// name ([`key_word`]); a value typed past either end comes round.
+pub(crate) fn angle_field(ui: &mut egui::Ui, hits: &mut InspectorHits, name: &str, angle: &mut i32) {
+    let mut degrees = *angle;
+    ui.horizontal(|ui| {
+        ui.label(name);
+        let field = ui.add(egui::DragValue::new(&mut degrees).speed(1.).suffix("°"));
+        hits.mark(key_word(name), &field);
+        if field.changed() {
+            *angle = brep_ecad_core::graphic::normal_angle(i64::from(degrees));
         }
     });
 }

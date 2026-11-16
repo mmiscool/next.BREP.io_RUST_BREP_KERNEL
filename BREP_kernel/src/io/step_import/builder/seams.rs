@@ -441,6 +441,10 @@ impl<'a> SolidBuilder<'a> {
         // the rim already sits on the seam (u≈u0 or u≈u1, the same meridian on a
         // periodic surface); v is the rim's axial station for the iso circle.
         let on_seam_tol = 0.05 * (u1 - u0).abs().max(1e-9);
+        // How far an iso circle may stand from the rim it replaces: the
+        // reconciliation band (`reconcile_edges_onto_surfaces`).
+        let iso_band = 0.5
+            * crate::KernelTolerances::for_scale(1.0 + solid_like_scale(&self.vertices), 1e-7).pcurve_consistency;
         let [v_lo, v_hi] = surface.domain_v()?;
         // (edge_id, Some(v_rim) = true iso rim to rebuild | None = general
         // closed girdling curve to rotate onto the seam, geometry preserved)
@@ -474,16 +478,24 @@ impl<'a> SolidBuilder<'a> {
                 // its geometry preserved: it is rotated so its seam vertex
                 // lands on the wall's seam meridian instead (leaving edges up
                 // to 0.09 model-units off-surface).
+                //
+                // The test is in model space too: a parameter band alone
+                // admits a rim that wanders well off the iso on a wall with
+                // many v spans (an offset B-surface's plane section read as
+                // its iso, leaving the plane by 0.18 mm).
                 let mut v_min = f64::INFINITY;
                 let mut v_max = f64::NEG_INFINITY;
+                let mut off_iso = 0.0f64;
                 let edge = self.edge_record(edge_id).clone();
                 for index in 0..=16 {
                     let t = edge.t0 + (edge.t1 - edge.t0) * index as f64 / 16.0;
-                    let sample = crate::project_point_to_surface(surface, edge.curve.evaluate(t)?)?;
+                    let point = edge.curve.evaluate(t)?;
+                    let sample = crate::project_point_to_surface(surface, point)?;
                     v_min = v_min.min(sample.v);
                     v_max = v_max.max(sample.v);
+                    off_iso = off_iso.max(surface.evaluate(sample.u, projection.v)?.sub(point).length());
                 }
-                let iso = (v_max - v_min) <= 0.02 * (v_hi - v_lo).abs().max(1e-9);
+                let iso = (v_max - v_min) <= 0.02 * (v_hi - v_lo).abs().max(1e-9) && off_iso <= iso_band;
                 plan.push((edge_id, iso.then_some(projection.v)));
             }
         }

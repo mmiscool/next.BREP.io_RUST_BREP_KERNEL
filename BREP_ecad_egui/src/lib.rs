@@ -108,6 +108,23 @@ fn zoomed_text(ctx: &egui::Context, text: String, mut font: FontId, color: Color
     shape.galley
 }
 
+/// `galley` placed by `align` about `anchor` as it would be unturned, then
+/// turned `degrees` counter-clockwise as seen about `anchor`.
+pub(crate) fn turned_text(
+    painter: &egui::Painter,
+    anchor: Pos2,
+    align: Align2,
+    galley: std::sync::Arc<egui::Galley>,
+    color: Color32,
+    degrees: i32,
+) {
+    let min = align.anchor_size(anchor, galley.size()).min;
+    // egui turns clockwise; the model's angles are counter-clockwise.
+    let angle = -(degrees as f32).to_radians();
+    let pos = anchor + egui::emath::Rot2::from_angle(angle) * (min - anchor);
+    painter.add(egui::epaint::TextShape::new(pos, galley, color).with_angle(angle));
+}
+
 const INK: Color32 = Color32::from_rgb(211, 220, 233);
 const ACCENT: Color32 = Color32::from_rgb(89, 218, 180);
 const WIRE: Color32 = Color32::from_rgb(93, 186, 228);
@@ -2760,14 +2777,10 @@ impl Editor {
                 r.extend_with(p);
             };
             match g {
-                Graphic::Text { at, text, size } => {
-                    painter.text(
-                        transform(*at),
-                        Align2::CENTER_CENTER,
-                        text,
-                        FontId::proportional((*size as f32 * self.zoom).clamp(6., 36.)),
-                        color,
-                    );
+                Graphic::Text { at, text, size, angle } => {
+                    let font = FontId::proportional((*size as f32 * self.zoom).clamp(6., 36.));
+                    let galley = painter.layout_no_wrap(text.clone(), font, color);
+                    turned_text(painter, transform(*at), Align2::CENTER_CENTER, galley, color, *angle);
                 }
                 Graphic::Path(points) => {
                     let points: Vec<Pos2> = points.iter().map(|p| transform(*p)).collect();
@@ -3138,14 +3151,10 @@ fn paint_symbol_preview(painter: &egui::Painter, symbol: &Symbol, rect: Rect, in
     let transform = |p: Point| rect.center() + (point(p) - bounds.center()) * scale;
     for g in &symbol.graphics {
         match g {
-            Graphic::Text { at, text, size } => {
-                painter.text(
-                    transform(*at),
-                    Align2::CENTER_CENTER,
-                    text,
-                    FontId::proportional((*size as f32 * scale).clamp(4., 10.)),
-                    ink,
-                );
+            Graphic::Text { at, text, size, angle } => {
+                let font = FontId::proportional((*size as f32 * scale).clamp(4., 10.));
+                let galley = painter.layout_no_wrap(text.clone(), font, ink);
+                turned_text(painter, transform(*at), Align2::CENTER_CENTER, galley, ink, *angle);
             }
             Graphic::Path(points) => {
                 painter.add(egui::Shape::line(

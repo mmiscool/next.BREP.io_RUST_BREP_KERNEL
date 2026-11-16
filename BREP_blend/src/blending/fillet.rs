@@ -51,6 +51,8 @@ mod chamfer_star;
 pub mod edges;
 #[path = "fillet/tool.rs"]
 pub mod tool;
+#[path = "fillet/spine_first.rs"]
+mod spine_first;
 
 pub use edges::{
     chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,

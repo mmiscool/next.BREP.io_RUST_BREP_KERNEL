@@ -1757,7 +1757,7 @@ impl Editor {
     fn text_click(&mut self, p: Pos2) {
         let at = snap(self.board_view.world(p), PLACE_GRID);
         let layer = self.board_view.draw_layer;
-        self.add_drawing(LayerGraphic::new(layer, GraphicShape::Text { at, text: "TEXT".into(), height: 1500 }));
+        self.add_drawing(LayerGraphic::new(layer, GraphicShape::Text { at, text: "TEXT".into(), height: 1500, angle: 0 }));
     }
     /// What a board drawing is called where the board names it: "silkscreen
     /// text 2" (its place among the board's drawn items).
@@ -1893,13 +1893,13 @@ impl Editor {
         }
     }
     /// Whether the selection is a cutout, or a drawing that looks different
-    /// turned (not text, which has no angle, nor a circle).
+    /// turned (text turns its letters; a circle looks the same turned).
     fn turnable_drawing_or_cutout(&self) -> bool {
         let board = &self.document.board;
         match self.board_view.selected {
             Some(BoardSelection::Cutout(id)) => board.cutouts.iter().any(|c| c.id == id),
             Some(BoardSelection::Drawing(id)) => board.graphics.iter().any(|g| {
-                g.id == id && matches!(g.graphic.shape, GraphicShape::Polyline { .. } | GraphicShape::Arc { .. })
+                g.id == id && !matches!(g.graphic.shape, GraphicShape::Circle { .. })
             }),
             _ => false,
         }
@@ -4343,6 +4343,7 @@ impl Editor {
         };
         Some(match (shape, handle) {
             (Some(GraphicShape::Circle { radius, .. }), _) => format!("r {} mm", mm(radius)),
+            (Some(GraphicShape::Text { height, .. }), _) => format!("height {} mm", mm(height)),
             (_, Handle::Box(..)) => {
                 let handles = self.board_handles();
                 let xs = handles.iter().map(|(_, p)| p.x);

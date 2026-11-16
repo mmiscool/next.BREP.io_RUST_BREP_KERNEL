@@ -9,7 +9,7 @@
 //! drag that goes back where it started leaves the shape exactly as it was.
 use brep_ecad_core::Point;
 use brep_ecad_core::board::{Pad, PadShape};
-use brep_ecad_core::graphic::GraphicShape;
+use brep_ecad_core::graphic::{GraphicShape, TEXT_HEIGHTS, normal_angle, text_up};
 use egui::{Color32, CursorIcon, Pos2, Rect, Stroke, Vec2};
 
 /// One handle of a shape.
@@ -29,6 +29,11 @@ pub(crate) enum Handle {
     /// A trapezoid's taper, on its top-right corner: dragged up or down it
     /// tapers the left and right sides, left or right the top and bottom.
     Taper,
+    /// Text's height, on the side of its letters away from their anchor (in
+    /// Pads and on the board the top of the letters over the baseline, in
+    /// Symbol their foot below the top-left corner): the anchor holds and the
+    /// letters grow or shrink as it is dragged.
+    Height,
 }
 
 /// The smallest side a drag leaves a shape with, in micrometres: a box dragged
@@ -57,6 +62,7 @@ impl Handle {
             Handle::Vertex(i) => format!("vertex:{i}"),
             Handle::Rounding => "rounding".into(),
             Handle::Taper => "taper".into(),
+            Handle::Height => "height".into(),
         }
     }
     /// Where the handle is drawn and taken, from the screen point of its place:
@@ -75,7 +81,7 @@ impl Handle {
             Handle::Box(-1, -1) | Handle::Box(1, 1) => CursorIcon::ResizeNwSe,
             Handle::Box(1, -1) | Handle::Box(-1, 1) => CursorIcon::ResizeNeSw,
             Handle::Box(_, 0) => CursorIcon::ResizeHorizontal,
-            Handle::Box(0, _) => CursorIcon::ResizeVertical,
+            Handle::Box(0, _) | Handle::Height => CursorIcon::ResizeVertical,
             Handle::Box(..) | Handle::Radius | Handle::Rounding | Handle::Taper => CursorIcon::Crosshair,
             Handle::Vertex(_) => CursorIcon::Move,
         }
@@ -239,6 +245,8 @@ pub(crate) fn drag_pad(pad: &mut Pad, before: &Pad, handle: Handle, q: Point, ke
                 Point::new(0, clamp32(along_y.clamp(-most, most)))
             };
         }
+        // A pad has no text.
+        Handle::Height => {}
     }
 }
 
@@ -321,9 +329,24 @@ pub(crate) fn radius_to(center: Point, q: Point) -> i32 {
     clamp32(dx.hypot(dy).round() as i64).max(LEAST)
 }
 
+/// Where a text's height handle sits: `height` up from its anchor `at`, along
+/// `up` (a unit vector).
+pub(crate) fn text_height_point(at: Point, up: (f64, f64), height: i32) -> Point {
+    let h = f64::from(height);
+    Point::new(clamp32((f64::from(at.x) + up.0 * h).round() as i64), clamp32((f64::from(at.y) + up.1 * h).round() as i64))
+}
+
+/// A text's height with its handle dragged to `q`: how far `q` is from the
+/// anchor `at` along `up`, held within `least..=most`. Only the reach along
+/// `up` counts, so a pointer that wanders sideways sizes the text the same.
+pub(crate) fn text_height_to(at: Point, up: (f64, f64), q: Point, least: i32, most: i32) -> i32 {
+    let (dx, dy) = (f64::from(q.x) - f64::from(at.x), f64::from(q.y) - f64::from(at.y));
+    clamp32((dx * up.0 + dy * up.1).round() as i64).clamp(least, most)
+}
+
 /// The handles a drawn item wears: an upright rectangle its box, any other line
-/// or polygon its corners, a circle its radius, an arc its three points; text
-/// none (it is moved, and sized in the Inspector).
+/// or polygon its corners, a circle its radius, an arc its three points, text
+/// its height.
 pub(crate) fn graphic_handles(shape: &GraphicShape) -> Vec<(Handle, Point)> {
     match shape {
         GraphicShape::Polyline { points } => path_handles(points),
@@ -331,7 +354,9 @@ pub(crate) fn graphic_handles(shape: &GraphicShape) -> Vec<(Handle, Point)> {
         GraphicShape::Arc { start, mid, end } => {
             vec![(Handle::Vertex(0), *start), (Handle::Vertex(1), *mid), (Handle::Vertex(2), *end)]
         }
-        GraphicShape::Text { .. } => vec![],
+        GraphicShape::Text { at, height, angle, .. } => {
+            vec![(Handle::Height, text_height_point(*at, text_up(*angle), *height))]
+        }
     }
 }
 
@@ -348,6 +373,12 @@ pub(crate) fn drag_graphic(shape: &mut GraphicShape, before: &GraphicShape, hand
             if let Some(p) = [start, mid, end].into_iter().nth(i) {
                 *p = q;
             }
+        }
+        // Held within the heights a drawing may have, so a drag past either
+        // stops there rather than being refused back to where it began.
+        (GraphicShape::Text { at, height, angle, .. }, Handle::Height) => {
+            let (least, most) = (*TEXT_HEIGHTS.start(), *TEXT_HEIGHTS.end());
+            *height = text_height_to(*at, text_up(*angle), q, least, most);
         }
         _ => {}
     }
@@ -428,9 +459,9 @@ pub(crate) fn pivot(points: &[Point]) -> Option<Point> {
     }
 }
 
-/// A drawn shape turned a quarter turn about `about`. Text and a circle look
-/// the same turned (text has no angle), and a turn past the drawing area is
-/// not made: those answer `false`, the shape untouched.
+/// A drawn shape turned a quarter turn about `about`, as a pad turns: text
+/// turns its letters with it. A circle looks the same turned, and a turn past
+/// the drawing area is not made: those answer `false`, the shape untouched.
 pub(crate) fn turn_graphic(shape: &mut GraphicShape, about: Point) -> bool {
     match shape {
         GraphicShape::Polyline { points } => turn_points(points, about),
@@ -440,8 +471,23 @@ pub(crate) fn turn_graphic(shape: &mut GraphicShape, about: Point) -> bool {
             [*start, *mid, *end] = three;
             turned
         }
-        GraphicShape::Circle { .. } | GraphicShape::Text { .. } => false,
+        GraphicShape::Text { at, angle, .. } => {
+            let mut one = [*at];
+            let turned = turn_points(&mut one, about);
+            if turned {
+                [*at] = one;
+                *angle = turned_angle(*angle);
+            }
+            turned
+        }
+        GraphicShape::Circle { .. } => false,
     }
+}
+
+/// A text angle after the quarter turn R makes, (x, y) to (−y, x) on the
+/// canvas: clockwise as seen, so a quarter less counter-clockwise.
+pub(crate) fn turned_angle(angle: i32) -> i32 {
+    normal_angle(i64::from(angle) - 90)
 }
 
 /// The points a drawn shape is turned about: its corners or its arc's three.
@@ -496,7 +542,7 @@ pub(crate) fn paint_handles(
                 let ring = vec![c + Vec2::new(0., -r), c + Vec2::new(r, 0.), c + Vec2::new(0., r), c + Vec2::new(-r, 0.)];
                 painter.add(egui::Shape::convex_polygon(ring, fill, edge));
             }
-            Handle::Box(..) | Handle::Vertex(_) => {
+            Handle::Box(..) | Handle::Vertex(_) | Handle::Height => {
                 painter.rect(Rect::from_center_size(c, Vec2::splat(7.)), 0., fill, edge, egui::StrokeKind::Middle);
             }
         }

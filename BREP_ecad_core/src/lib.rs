@@ -66,7 +66,16 @@ impl Point {
 pub enum Graphic {
     Path(Vec<Point>),
     Circle { center: Point, radius: i32 },
-    Text { at: Point, text: String, size: i32 },
+    /// Text with its top-left corner at `at`, `size` tall, turned `angle`
+    /// whole degrees counter-clockwise as seen about `at`. An unturned text
+    /// writes no angle, so older files read unchanged.
+    Text {
+        at: Point,
+        text: String,
+        size: i32,
+        #[serde(default, skip_serializing_if = "graphic::no_angle")]
+        angle: i32,
+    },
 }
 fn unit_is_unset(unit: &u32) -> bool {
     *unit == 0
@@ -222,7 +231,7 @@ impl Symbol {
             .iter()
             .enumerate()
             .filter_map(|(i, g)| match g {
-                Graphic::Text { at, text, size } if *size == 1270 && at.y == -15000 => text
+                Graphic::Text { at, text, size, .. } if *size == 1270 && at.y == -15000 => text
                     .strip_prefix("Unit ")
                     .and_then(|n| n.parse::<u32>().ok())
                     .map(|n| (i, n)),
@@ -1793,8 +1802,8 @@ impl Document {
                     {
                         return Err("Invalid circle".into());
                     }
-                    Graphic::Text { at, size, .. }
-                        if !valid(*at) || !(1..=100_000_000).contains(size) =>
+                    Graphic::Text { at, size, angle, .. }
+                        if !valid(*at) || !(1..=100_000_000).contains(size) || !(0..360).contains(angle) =>
                     {
                         return Err("Invalid symbol text".into());
                     }

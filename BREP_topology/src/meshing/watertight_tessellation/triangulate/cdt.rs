@@ -411,9 +411,10 @@ pub fn direct_planar_cdt(
     let mut cdt = ConstrainedDelaunayTriangulation::<IndexedPoint>::new();
     let mut handles = Vec::new();
     for (i, p) in vertices.iter().enumerate() {
+        // Underflow residues are zero (see `surface_cdt`).
         let h = cdt
             .insert(IndexedPoint {
-                position: Point2::new(p.uv[0], p.uv[1]),
+                position: spade::mitigate_underflow(Point2::new(p.uv[0], p.uv[1])),
                 authored: i,
             })
             .ok()?;
@@ -576,7 +577,7 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
         .iter()
         .any(|p| !seen.insert((p.uv[0].to_bits(), p.uv[1].to_bits())))
     {
-        return None;
+        return decline("exact uv duplicate");
     }
     let [su, sv] = [scale[0].max(1e-12), scale[1].max(1e-12)];
     let build_timer = stage_timer(Stage::CdtBuild);
@@ -585,19 +586,25 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
     let insert_timer = stage_timer(Stage::CdtInsert);
     for (i, p) in vertices.iter().enumerate() {
         // Metric-scaled uv: Delaunay quality is judged in ~unrolled 3D lengths.
-        let h = cdt
-            .insert(IndexedPoint {
-                position: Point2::new(p.uv[0] * su, p.uv[1] * sv),
-                authored: i,
-            })
-            .ok()?;
+        // A station on a domain end can carry a residue like 8e-44 for its
+        // zero (a rational pcurve evaluated at its clamped end); spade refuses
+        // any nonzero coordinate below 2^-142, which declined the whole face to
+        // the ear clip. Such a value IS zero at every scale this mesher works at.
+        let position = spade::mitigate_underflow(Point2::new(p.uv[0] * su, p.uv[1] * sv));
+        let h = cdt.insert(IndexedPoint { position, authored: i });
+        let Ok(h) = h else {
+            if std::env::var("BREP_DEBUG_CDT").is_ok() {
+                eprintln!("[cdt] insert {i}: {:?} uv=({:e},{:e}) scaled=({:e},{:e})", h.err(), p.uv[0], p.uv[1], position.x, position.y);
+            }
+            return decline("insert error");
+        };
         if h.index() != i {
             return decline("coincident insert");
         }
         handles.push(h);
     }
     if cdt.num_vertices() != vertices.len() {
-        return None;
+        return decline("vertex count mismatch");
     }
     drop(insert_timer);
     let constraint_timer = stage_timer(Stage::CdtConstraint);

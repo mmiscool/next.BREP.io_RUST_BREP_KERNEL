@@ -293,10 +293,15 @@ fn resolve(
                         .and_then(|f| f.child("size"))
                         .and_then(|s| s.number(1).ok())
                         .unwrap_or(1.27);
+                    // A symbol's text angle is in tenths of a degree (900 is
+                    // a quarter turn), unlike a footprint's.
+                    let at = item.required("at")?;
+                    let tenths = at.number(3).unwrap_or(0.);
                     graphics.push(Graphic::Text {
-                        at: item.required("at")?.point()?,
+                        at: at.point()?,
                         text: item.arg(1).into(),
                         size: (size * 1000.).round().max(1.) as i32,
+                        angle: crate::graphic::normal_angle((tenths / 10.).round() as i64),
                     });
                 }
                 "pin" => {
@@ -772,9 +777,13 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
                     .map_or(1000, um);
                 // `${REFERENCE}` and the like stand for the placed part's fields.
                 if !text.is_empty() && !text.contains("${") {
-                    if at.number(3).unwrap_or(0.) != 0. {
-                        warnings.push(format!("Text \"{text}\" is imported unrotated"));
+                    // The angle is whole degrees counter-clockwise, as KiCad
+                    // writes it; a fraction of a degree is rounded off.
+                    let degrees = at.number(3).unwrap_or(0.);
+                    if degrees.fract() != 0. {
+                        warnings.push(format!("Text \"{text}\" is turned to the nearest whole degree"));
                     }
+                    let angle = crate::graphic::normal_angle(degrees.round() as i64);
                     let at = xy(at)?;
                     // The stroke font's pen is the font's thickness.
                     let thickness = item
@@ -784,7 +793,7 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
                         .and_then(|t| t.number(1).ok())
                         .filter(|t| *t > 0.)
                         .map(um);
-                    draw(GraphicShape::Text { at, text, height: height.clamp(100, 100_000) }, false, thickness);
+                    draw(GraphicShape::Text { at, text, height: height.clamp(100, 100_000), angle }, false, thickness);
                 }
             }
             _ => {}

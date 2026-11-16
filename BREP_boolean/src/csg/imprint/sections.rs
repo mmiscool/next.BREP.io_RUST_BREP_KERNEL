@@ -523,6 +523,19 @@ fn shared_section_straddle_enabled() -> bool {
 }
 
 
+/// SHARED-SECTION IDENTITY FIRST (`BREP_SHARED_SECTION_IDENTITY_FIRST`,
+/// default on, `=0` off): a section that retraces one of its support faces'
+/// boundary edges within the weld gate IS that edge, so it is never swapped
+/// for another boundary edge it merely grazes. A cylinder of radius 0.5 less
+/// a coaxial one of radius 0.49999 between the same end planes: the inner
+/// rim's arcs on the outer cylinder's ends lie 9e-8 from the inner
+/// cylinder's own rim and 1.0e-5 from the outer rim, just past the gate, and
+/// one arc was swapped for the outer rim's: the tube came back valid, its
+/// end rings a quarter short (22% of its volume).
+pub fn shared_section_identity_first_enabled() -> bool {
+    crate::switch!("BREP_SHARED_SECTION_IDENTITY_FIRST", true)
+}
+
 pub(super) fn reuse_boundary_section_edges(
     result: &mut ImprintResultRecord,
     face_edge_lists: &HashMap<FaceKey, Vec<&EdgeRecord>>,
@@ -692,6 +705,9 @@ pub(super) fn reuse_boundary_section_edges(
         // Each redundant face's closest boundary sub-arc, for the straddle
         // check below (`BREP_SHARED_SECTION_STRADDLE`).
         let mut redundant_arcs: Vec<(FaceKey, NurbsCurve, f64)> = Vec::new();
+        // A boundary edge the section retraces within the weld gate: the
+        // section IS that edge (see `shared_section_identity_first_enabled`).
+        let mut identical_to: Option<(FaceKey, u64)> = None;
         for face_key in &piece.support_faces {
             let Some(edges) = face_edge_lists.get(face_key) else {
                 continue;
@@ -787,6 +803,9 @@ pub(super) fn reuse_boundary_section_edges(
                 // welds those as-is, and dropping their cut would strand the
                 // coincident face's split (revolve_pole_union one-use edges).
                 let span_dev = sec_to_arc.max(arc_to_sec);
+                if span_dev <= endpoint_gate {
+                    identical_to = Some((*face_key, edge.id));
+                }
                 if span_dev > endpoint_gate && span_dev <= span_band {
                     if !redundant.contains(face_key) {
                         redundant.push(*face_key);
@@ -811,6 +830,17 @@ pub(super) fn reuse_boundary_section_edges(
                         });
                     }
                 }
+            }
+        }
+        if let (Some(reuse), Some((key, edge_id))) = (&chosen, identical_to) {
+            if shared_section_identity_first_enabled() {
+                if debug {
+                    eprintln!(
+                        "shared-section KEEP piece {}: it is edge {}:{edge_id} (within the weld gate), not a graze of edge {}:{}",
+                        piece.id, key.operand, reuse.owning.operand, reuse.edge_id
+                    );
+                }
+                continue;
             }
         }
         if let Some(mut reuse) = chosen {

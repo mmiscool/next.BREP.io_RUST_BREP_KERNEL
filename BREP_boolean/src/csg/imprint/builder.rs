@@ -244,6 +244,10 @@ fn pcurve_images_apart(
     Ok((apart, worst_t))
 }
 
+fn near_seam_ring_vertex_enabled() -> bool {
+    crate::switch!("BREP_NEAR_SEAM_RING_VERTEX", true)
+}
+
 fn pole_split_enabled() -> bool {
     crate::switch!("BREP_SECTION_POLE_SPLIT", true)
 }
@@ -538,6 +542,12 @@ impl<'a> ImprintBuilder<'a> {
     }
 
     fn face_has_seam_at(&self, face: TaggedFace<'_>, point: Vec3) -> Result<bool, KernelRefusal> {
+        self.face_has_seam_within(face, point, WELD_FLOOR * merge_scale(self.scale))
+    }
+
+    /// Whether `point` lies within `tolerance` of an edge the face uses
+    /// twice (its seam).
+    fn face_has_seam_within(&self, face: TaggedFace<'_>, point: Vec3, tolerance: f64) -> Result<bool, KernelRefusal> {
         let mut counts = HashMap::default();
         for coedge in face
             .face
@@ -547,7 +557,6 @@ impl<'a> ImprintBuilder<'a> {
         {
             *counts.entry(coedge.edge_id).or_insert(0usize) += 1;
         }
-        let tolerance = WELD_FLOOR * merge_scale(self.scale);
         for (edge_id, count) in counts {
             let edge = self.edges[&(face.operand, edge_id)];
             if count >= 2
@@ -1646,8 +1655,38 @@ impl<'a> ImprintBuilder<'a> {
                     start.x, start.y, start.z, end.x, end.y, end.z, start_fuzzy.is_some(), end_fuzzy.is_some()
                 );
             }
-            let ((start_vertex_id, canonical_start), (end_vertex_id, canonical_end)) =
-                self.section_vertices(start, start_radius, end, end_radius);
+            // NEAR-SEAM RING VERTEX (`BREP_NEAR_SEAM_RING_VERTEX`, default on,
+            // `=0` off): a section cut where it crosses the seam of a face it
+            // attaches to, with its other end farther than the assembler weld
+            // but inside the registry's size-relative band, has both ends
+            // fused into one vertex, placed where the first end registered.
+            // Placed off the seam, the face's ring no longer meets its seam
+            // and the fragment's loop opens. The seam end registers first, so
+            // the shared vertex lies on the seam the face is cut along.
+            let seam_end_first = near_seam_ring_vertex_enabled() && {
+                let apart = start.sub(end).length();
+                let weld = assembler_weld(self.tolerance);
+                if apart > weld && apart <= self.tolerance * 10.0 * merge_scale(self.scale) {
+                    let mut on_seam = [false; 2];
+                    for (slot, point) in [start, end].into_iter().enumerate() {
+                        for face in &attach {
+                            if self.face_has_seam_within(*face, point, weld)? {
+                                on_seam[slot] = true;
+                                break;
+                            }
+                        }
+                    }
+                    on_seam == [false, true]
+                } else {
+                    false
+                }
+            };
+            let ((start_vertex_id, canonical_start), (end_vertex_id, canonical_end)) = if seam_end_first {
+                let (at_end, at_start) = self.section_vertices(end, end_radius, start, start_radius);
+                (at_start, at_end)
+            } else {
+                self.section_vertices(start, start_radius, end, end_radius)
+            };
             if debug_process {
                 eprintln!("process_curve[{:?}/{:?}]: VERTS start=v{start_vertex_id} end=v{end_vertex_id}", first.key(), second.key());
             }

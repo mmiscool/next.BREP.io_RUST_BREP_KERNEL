@@ -89,11 +89,16 @@ pub(super) fn ecad_state() -> Value {
     let mut symbol=common.clone();symbol["target"]=json!({"const":"symbol"});
     symbol["unitCount"]=count.clone();symbol["gateCount"]=count.clone();
     symbol["pins"]=array(closed_object_optional(json!({"number":text,"name":text,"at":point,"end":point,"unit":count,"gate":count}),&[]));
+    symbol["graphics"]=array(closed_object_optional(json!({"kind":{"enum":["path","circle","text"]},"points":array(point.clone()),
+        "radius":count,"text":text,"size":count,"angle":count}),&["radius","text","size","angle"]));
+    symbol["selection"]=nullable(json!({"oneOf":[
+        closed_object_optional(json!({"kind":{"const":"pin"},"number":text}),&[]),
+        closed_object_optional(json!({"kind":{"const":"graphic"},"index":count}),&[])]}));
     let mut pads=common.clone();pads["target"]=json!({"const":"pads"});pads["pads"]=array(pad.clone());
     pads["pinsWithoutPads"]=strings.clone();pads["silk"]=array(array(point.clone()));
     let graphic=closed_object_optional(json!({"layer":{"enum":["F.SilkS","B.SilkS","F.Fab","B.Fab","F.CrtYd","B.CrtYd"]},
         "kind":{"enum":["polyline","arc","circle","text"]},"width":count,"filled":boolean,"points":array(point.clone()),
-        "radius":count,"text":text,"height":count}),&["radius","text","height"]);
+        "radius":count,"text":text,"height":count,"angle":count}),&["radius","text","height","angle"]);
     pads["graphics"]=array(graphic.clone());
     pads["selection"]=nullable(json!({"oneOf":[
         closed_object_optional(json!({"kind":{"const":"pad"},"number":text}),&[]),closed_object_optional(json!({"kind":{"const":"silk"},"index":count}),&[]),

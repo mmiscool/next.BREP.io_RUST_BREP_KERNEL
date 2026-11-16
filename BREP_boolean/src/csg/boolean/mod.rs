@@ -1197,6 +1197,93 @@ pub fn unresolved_merge_refusal_enabled() -> bool {
     crate::switch!("BREP_UNRESOLVED_MERGE_REFUSAL", false)
 }
 
+/// SLIVER SHELLS (`BREP_SLIVER_SHELL_DROP`, default on, `=0` off). A solid
+/// result of several shells, one of which is closed and encloses no material
+/// (its volume over its area, the thickness of the slab it would be, under
+/// [`SLIVER_SHELL_THICKNESS`] of the body's size: round-off), carries a sheet the arrangement could not
+/// resolve, left closed on itself: a measure-zero set, not a void. A cylinder
+/// of radius 5 with a coaxial one of radius 4.99999 between the same end
+/// planes gave their common part the inner cylinder plus 64 closed sheets
+/// over the 1e-5 rings at its ends, 6e-4 over in area and refused by STEP
+/// export ("a void shell lies inside no outward shell"). Such shells are
+/// dropped, with the edges and vertices only they used; the point set is
+/// unchanged. Sheet and other non-solid bodies, open shells, and a body whose
+/// every shell would go are left as they are.
+pub fn sliver_shell_drop_enabled() -> bool {
+    crate::switch!("BREP_SLIVER_SHELL_DROP", true)
+}
+
+/// The thickness, as a fraction of the body's size, under which a closed shell
+/// encloses nothing: round-off. The sheets read 0 and 7e-17 thick; a real
+/// slab 1e-7 thick beside a unit cube is material and stays.
+const SLIVER_SHELL_THICKNESS: f64 = 1e-12;
+
+/// Drops the sliver shells of `solid` (see [`sliver_shell_drop_enabled`]) and
+/// returns how many went.
+fn drop_sliver_shells(solid: &mut BrepSolid) -> usize {
+    if !sliver_shell_drop_enabled() || !solid.kind.is_solid() || solid.shells.len() < 2 {
+        return 0;
+    }
+    let floor = SLIVER_SHELL_THICKNESS * crate::solid_tolerance::solid_scale(solid).max(1.0);
+    let degenerate: std::collections::HashSet<u64> = solid.edges.iter().filter(|edge| edge.degenerate).map(|edge| edge.id).collect();
+    let mut drop = vec![false; solid.shells.len()];
+    for (index, shell) in solid.shells.iter().enumerate() {
+        if shell.faces.is_empty() {
+            continue;
+        }
+        // Closed: every proper edge the shell uses, used exactly twice by it.
+        let mut uses: HashMap<u64, usize> = HashMap::default();
+        for coedge in shell.faces.iter().flat_map(|face| &face.loops).flat_map(|lp| &lp.coedges) {
+            if !degenerate.contains(&coedge.edge_id) {
+                *uses.entry(coedge.edge_id).or_default() += 1;
+            }
+        }
+        if uses.is_empty() || uses.values().any(|&count| count != 2) {
+            continue;
+        }
+        let alone = BrepSolid { shells: vec![shell.clone()], mass_properties_cache: Default::default(), ..solid.clone() };
+        let Ok(mass) = crate::solid_mass_properties(&alone) else {
+            continue;
+        };
+        let thickness = mass.volume.abs() / mass.surface_area.max(f64::MIN_POSITIVE);
+        if env_read!("BREP_DEBUG_SLIVER_SHELL").is_some() {
+            eprintln!(
+                "sliver-shell: shell {index} of {}: volume {:.6e} area {:.6e} thickness {thickness:.3e}",
+                solid.shells.len(),
+                mass.volume,
+                mass.surface_area
+            );
+        }
+        drop[index] = thickness < floor;
+    }
+    let dropped = drop.iter().filter(|&&d| d).count();
+    if dropped == 0 || dropped == solid.shells.len() {
+        return 0;
+    }
+    let mut index = 0;
+    solid.shells.retain(|_| {
+        let keep = !drop[index];
+        index += 1;
+        keep
+    });
+    let used_edges: std::collections::HashSet<u64> = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .flat_map(|face| &face.loops)
+        .flat_map(|lp| &lp.coedges)
+        .map(|coedge| coedge.edge_id)
+        .collect();
+    solid.edges.retain(|edge| used_edges.contains(&edge.id));
+    let used_vertices: std::collections::HashSet<u64> =
+        solid.edges.iter().flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id]).collect();
+    solid.vertices.retain(|vertex| used_vertices.contains(&vertex.id));
+    solid.mass_properties_cache = Default::default();
+    // A dropped shell may have carried handles: the genus is read again.
+    refresh_derived_genus(solid);
+    dropped
+}
+
 fn unresolved_merge_refusal(first: &BrepSolid, second: &BrepSolid) -> Option<KernelRefusal> {
     let (lower, upper) = (crate::tolerance::COINCIDENCE_DISTANCE_FLOOR, crate::tolerance::WELD_FLOOR);
     let (face_a, face_b, separation) = planar_faces_apart_within(first, second, lower, upper)?;
@@ -2018,9 +2105,18 @@ pub fn boolean_operation_with_diagnostics(
         let started = Instant::now();
         let (first, second) = reseat::reseat_tangent_seams(first, second, later, options.tolerance);
         profile_stage("seam_prepare_ms", started.elapsed().as_secs_f64() * 1000.0);
-        return boolean_operation_with_diagnostics_impl(&first, &second, operation, options, closed_inputs);
+        return boolean_operation_with_diagnostics_impl(&first, &second, operation, options, closed_inputs).map(without_sliver_shells);
     }
-    boolean_operation_with_diagnostics_impl(first, second, operation, options, closed_inputs)
+    boolean_operation_with_diagnostics_impl(first, second, operation, options, closed_inputs).map(without_sliver_shells)
+}
+
+/// [`drop_sliver_shells`] on a boolean's outcome, counted in its diagnostics.
+fn without_sliver_shells(mut outcome: KernelOutcome<BrepSolid>) -> KernelOutcome<BrepSolid> {
+    let dropped = drop_sliver_shells(&mut outcome.value);
+    if dropped > 0 {
+        outcome.diagnostics.count_n("sliver_shell.dropped", dropped as u64);
+    }
+    outcome
 }
 
 pub fn boolean_operation_with_diagnostics_impl(

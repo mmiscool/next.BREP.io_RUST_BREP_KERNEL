@@ -25,6 +25,32 @@ pub(super) fn raw_wheel_delta_y(ctx: &egui::Context) -> f32 {
     })
 }
 
+/// The zoom a trackpad pinch asks for this frame: the product of its
+/// `Event::Zoom` factors (above 1 zooms in), 1 when there is none or the
+/// product is not a finite positive factor. Not egui's `zoom_delta`, which also
+/// carries a ctrl-wheel the raw wheel has already taken.
+pub(super) fn pinch_zoom(events: &[egui::Event]) -> f32 {
+    let factor: f32 = events
+        .iter()
+        .filter_map(|e| match e {
+            egui::Event::Zoom(f) => Some(*f),
+            _ => None,
+        })
+        .product();
+    if factor.is_finite() && factor > 0.0 { factor } else { 1.0 }
+}
+
+/// A trackpad pinch over the viewport zooms about the pointer `at`
+/// (viewport-local points), as it does in the eCAD views and on a drawing
+/// sheet, and as the wheel already does here. A touch screen's pinch arrives
+/// as touches, which the touch navigation takes.
+fn pinch_about(ctx: &egui::Context, at: Option<(f64, f64)>, state: &mut brep_render::engine_state::EngineState) {
+    let factor = ctx.input(|i| pinch_zoom(&i.events));
+    if let (true, Some((x, y))) = (factor != 1.0, at) {
+        state.touch_navigation([x, y], [x, y], f64::from(factor));
+    }
+}
+
 /// The shortest dwell that may ever open the pick list, whatever the style says.
 /// A point-and-click ends with a corrective sub-movement and the button goes down
 /// within roughly one to two tenths of a second of the pointer settling, so any
@@ -430,6 +456,7 @@ impl Viewport {
                 });
                 state.wheel(-(scroll_y as f64), cursor);
             }
+            pinch_about(ui.ctx(), response.hover_pos().map(|p| local(p)), state);
         }
     }
 
@@ -634,6 +661,7 @@ impl Viewport {
                 });
                 state.wheel(-(scroll_y as f64), cursor);
             }
+            pinch_about(ui.ctx(), response.hover_pos().map(|p| local(p)), state);
         }
     }
 
@@ -1224,6 +1252,7 @@ impl Viewport {
                 // negative delta_y as zoom-in (see desktop.rs), so negate.
                 state.wheel(-(scroll_y as f64), cursor);
             }
+            pinch_about(ui.ctx(), response.hover_pos().map(|p| local(p)), state);
         }
     }
 
