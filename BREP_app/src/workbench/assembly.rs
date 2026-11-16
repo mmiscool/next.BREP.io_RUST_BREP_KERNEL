@@ -16,9 +16,11 @@ pub const CONSTRAINTS_PANEL_ID: &str = "assemblyConstraints";
 /// The BOM panel's id (the columned parts list).
 pub const BOM_PANEL_ID: &str = "assemblyBom";
 
-/// Datum / Plane / Sketch / Component (`ACOMP`) / Pattern Component (`APAT`).
+/// Datum / Plane / Sketch / Component (`ACOMP`) / Pattern Component (`APAT`)
+/// and the weld types (the Welding tab).
 fn includes(feature: &FeatureInfo<'_>) -> bool {
-    matches!(feature.type_code, "S" | "D" | "P" | "ACOMP" | "APAT" | "WELD")
+    super::welding::is_weld_type(feature.type_code)
+        || matches!(feature.type_code, "S" | "D" | "P" | "ACOMP" | "APAT")
 }
 
 /// Add Component's id — named because the shell arm that answers for it and

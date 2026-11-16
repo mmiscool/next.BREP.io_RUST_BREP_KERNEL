@@ -538,6 +538,30 @@ impl EngineState {
         self.add_feature(&feature.to_string())
     }
 
+    /// Import a binary Parasolid part or partition (`.x_b`, `.xmt_bin`, the
+    /// body a SolidWorks part embeds) as an IMPORT3D feature whose
+    /// `inputParams.xtBinary` is the file as base64 (the kernel reads it via
+    /// [`brep_kernel::parasolid::import_parasolid_bytes_report`]). A text part
+    /// handed over as bytes takes the `xtText` lane. Refuses anything else up
+    /// front so a bad upload never leaves a dead feature.
+    pub fn import_xt_bytes_feature(&mut self, bytes: &[u8]) -> Result<String, String> {
+        if !brep_kernel::parasolid::is_xt_binary(bytes) {
+            return match std::str::from_utf8(bytes) {
+                Ok(text) => self.import_xt_feature(text),
+                Err(_) => Err("not a Parasolid part (no binary flag, and not text)".into()),
+            };
+        }
+        use base64::Engine as _;
+        let id = self.next_feature_id(&crate::features::feature_short_name("IMPORT3D"));
+        let feature = serde_json::json!({
+            "type": "IMPORT3D",
+            "inputParams": { "id": id, "xtBinary": base64::engine::general_purpose::STANDARD.encode(bytes) },
+            "persistentData": {},
+        });
+        self.pending_fit = true;
+        self.add_feature(&feature.to_string())
+    }
+
     /// Export the CURRENT model to an IGES 5.3 document of Manifold Solid
     /// B-Reps — the IGES analogue of [`Self::export_step_text`].
     pub fn export_iges_text(&self) -> Result<String, String> {

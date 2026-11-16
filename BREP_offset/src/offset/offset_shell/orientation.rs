@@ -137,7 +137,9 @@ pub(super) fn weld_coplanar_orphan_rims(solid: &mut BrepSolid, tolerance: f64) -
         let mut target: Option<(usize, usize)> = None;
         'search: for (shell_index, shell) in solid.shells.iter().enumerate() {
             for (face_index, face) in shell.faces.iter().enumerate() {
-                if !face.surface.is_affine().unwrap_or(false) {
+                // A plane in any representation (degree-elevated, revolved):
+                // the cap of a collapsed round's rim tube may be one.
+                if !super::rim_welds::surface_is_planar(&face.surface, tolerance)? {
                     continue;
                 }
                 if face

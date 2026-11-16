@@ -412,7 +412,7 @@ pub use draft_roof::{extrude_profile_brep_draft_roof, DRAFT_ROOF_REFUSAL};
 #[path = "feature_pipeline/mod.rs"]
 pub mod feature_pipeline;
 pub use feature_pipeline::execute_history_json;
-pub use feature_pipeline::{first_reference_name, imported_solid_names, reference_names};
+pub use feature_pipeline::{first_reference_name, imported_solid_names, is_weld_type, reference_names};
 // Transform Face's default pivot (the selection's boundary centre) over the
 // results of a replayed prefix, so the gizmo and the stored `pivot` agree with
 // the feature by construction.

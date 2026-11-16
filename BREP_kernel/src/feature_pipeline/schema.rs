@@ -35,6 +35,14 @@ pub fn feature_schema_catalogue() -> serde_json::Value {
             super::features::spline::schema(),
             super::features::waypoint::schema(),
             super::features::weld::schema(),
+            super::features::weld::groove::schema(),
+            super::features::weld::tack_schema(),
+            super::features::weld::lap::spot_schema(),
+            super::features::weld::lap::seam_schema(),
+            super::features::weld::lap::plug_schema(),
+            super::features::weld::groove::edge::edge_schema(),
+            super::features::weld::groove::edge::corner_schema(),
+            super::features::weld::groove::edge::surfacing_schema(),
             super::features::helix::schema(),
             super::features::extrude::schema(),
             super::features::boolean::schema(),
@@ -96,6 +104,9 @@ pub fn feature_hidden_params(feature_type: &str, values: &serde_json::Value) -> 
     let keys: Vec<&'static str> = match feature_type {
         "H" => super::features::hole::hidden_params(values),
         "SM.CLOSED_CORNER" => super::features::sheet_metal_closed_corner::hidden_params(values),
+        "WELD" => super::features::weld::hidden_params(values),
+        "WELD.GROOVE" => super::features::weld::groove::hidden_params(values),
+        "WELD.TACK" => super::features::weld::tack_hidden_params(values),
         _ => Vec::new(),
     };
     keys.into_iter().map(str::to_owned).collect()

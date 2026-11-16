@@ -27,7 +27,7 @@ under:
 `segment_for_hybrid` (crate root) exposes the mesh partition the hybrid builder starts
 from.
 
-It is a library-only package, version 0.18.0. The kernel dependency is pinned
-EXACTLY (`BREP_kernel = "=0.21.0"`), so the two move in lockstep; it also depends on
+It is a library-only package, version 0.19.0. The kernel dependency is pinned
+EXACTLY (`BREP_kernel = "=0.22.0"`), so the two move in lockstep; it also depends on
 `BREP_RANSAC`, `serde` and `web-time`. Licence: the Autodrop3d licence in
 `LICENSE.md`, shipped in the crate.

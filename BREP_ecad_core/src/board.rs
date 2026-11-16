@@ -161,7 +161,29 @@ pub struct Pad {
     /// to [`Pad::at`], which it covers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub polygon: Vec<Point>,
+    /// A grid of through vias in a surface-mount pad (a thermal pad's), owned
+    /// by the footprint: on a board each is a via on every layer, joined to the
+    /// pad's copper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vias: Option<PadVias>,
 }
+/// A pad's grid of through vias: `columns` by `rows` about the pad's position,
+/// `pitch` apart, each of `diameter` copper round a `drill` hole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PadVias {
+    pub columns: u8,
+    pub rows: u8,
+    pub pitch: Point,
+    pub drill: i32,
+    pub diameter: i32,
+    /// The solder mask stays over the vias on the side away from the pad
+    /// (tented), so solder cannot wick through and out. On the pad's own side
+    /// the pad's mask opening exposes them either way.
+    #[serde(default = "plated_by_default")]
+    pub tented: bool,
+}
+/// The most vias one pad's grid may have each way.
+pub const MAX_PAD_VIAS_EACH_WAY: u8 = 20;
 fn plated_by_default() -> bool {
     true
 }
@@ -188,7 +210,48 @@ impl Pad {
             layers: PadLayers::default(),
             trapezoid_delta: Point::default(),
             polygon: vec![],
+            vias: None,
         }
+    }
+    /// The centres of the pad's vias in footprint coordinates, row by row from
+    /// the top left; none without a grid.
+    pub fn via_points(&self) -> Vec<Point> {
+        let Some(v) = self.vias else { return vec![] };
+        let at = |k: i64, n: u8, pitch: i32, centre: i32| {
+            let offset = (2 * k - (i64::from(n) - 1)) * i64::from(pitch) / 2;
+            (i64::from(centre) + offset).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+        };
+        let mut out = vec![];
+        for row in 0..i64::from(v.rows) {
+            for column in 0..i64::from(v.columns) {
+                out.push(Point::new(
+                    at(column, v.columns, v.pitch.x, self.at.x),
+                    at(row, v.rows, v.pitch.y, self.at.y),
+                ));
+            }
+        }
+        out
+    }
+    /// Why the pad's via grid cannot be built, if it cannot.
+    pub fn vias_problem(&self) -> Option<String> {
+        let v = self.vias?;
+        if self.drill.is_some() {
+            return Some("carries a via grid only as a surface-mount pad".into());
+        }
+        if !(1..=MAX_PAD_VIAS_EACH_WAY).contains(&v.columns) || !(1..=MAX_PAD_VIAS_EACH_WAY).contains(&v.rows) {
+            return Some(format!("needs between 1 and {MAX_PAD_VIAS_EACH_WAY} vias each way"));
+        }
+        if !(1..=10_000).contains(&v.drill) || v.diameter <= v.drill || v.diameter > 20_000 {
+            return Some("needs a via drill up to 10 mm and a via diameter larger than its drill".into());
+        }
+        if (v.columns > 1 && v.pitch.x < v.diameter) || (v.rows > 1 && v.pitch.y < v.diameter) || v.pitch.x > 100_000 || v.pitch.y > 100_000 {
+            return Some("needs a via pitch at least the via diameter".into());
+        }
+        let copper = self.local_shape();
+        if self.via_points().iter().any(|p| copper.depth(*p) < f64::from(v.diameter) / 2.) {
+            return Some("has a via that leaves its copper".into());
+        }
+        None
     }
     /// The corner radius actually drawn: the stored one for a rounded rectangle,
     /// clamped to half the smaller side, a custom pad's rounding, else 0.
@@ -460,6 +523,9 @@ impl Footprint {
             if let Some(problem) = pad.layers.paste_windows.and_then(|w| w.problem()) {
                 return Err(format!("{name} {problem}."));
             }
+            if let Some(problem) = pad.vias_problem() {
+                return Err(format!("{name} {problem}."));
+            }
         }
         if self.courtyard_margin.is_some_and(|m| !(0..=100_000).contains(&m)) {
             return Err("The courtyard clearance must be between 0 and 100 mm.".into());
@@ -598,6 +664,25 @@ impl Placement {
             None => Shape::rounded_pad(self.transform(pad.at), size, pad.shape, pad.effective_corner_radius()),
         }
     }
+    /// A pad's grid of vias on the board, each a through via with an identity
+    /// fixed by the part, the pad and its place in the grid.
+    pub fn pad_vias(&self, pad_index: usize) -> Vec<Via> {
+        let Some(pad) = self.footprint.pads.get(pad_index) else { return vec![] };
+        let Some(grid) = pad.vias else { return vec![] };
+        pad.via_points()
+            .into_iter()
+            .enumerate()
+            .map(|(k, p)| Via {
+                id: Uuid::from_u128(
+                    self.component.as_u128() ^ (0x7061_6476_6961_u128 << 80) ^ ((pad_index as u128) << 32) ^ (k as u128 + 1),
+                ),
+                at: self.transform(p),
+                diameter: grid.diameter,
+                drill: grid.drill,
+                span: None,
+            })
+            .collect()
+    }
     /// A surface-mount pad's paste on the board: its copper grown by its paste
     /// margin, cut into windows when it has a windowpane. The windows are cut in
     /// the footprint's own frame, so columns and rows turn with the part.
@@ -606,10 +691,16 @@ impl Placement {
         let Some(windows) = pad.layers.paste_windows else {
             return self.pad_shape(pad).grown_parts(margin);
         };
+        // A window over a via's hole would print paste into it: not cut.
+        let holes: Vec<Shape> = match pad.vias {
+            Some(grid) => pad.via_points().into_iter().map(|p| Shape::circle(p, grid.drill / 2)).collect(),
+            None => vec![],
+        };
         pad.local_shape()
             .grown_parts(margin)
             .iter()
             .flat_map(|aperture| windows.cut(aperture))
+            .filter(|window| holes.iter().all(|hole| hole.distance(window) > 0.))
             .filter_map(|window| {
                 let Shape::Rect { min, max } = window else { return None };
                 let (a, b) = (self.transform(min), self.transform(max));
@@ -821,6 +912,14 @@ pub struct DesignRules {
     /// over each via's ring on both sides. Written only when off.
     #[serde(default = "tented_by_default", skip_serializing_if = "Clone::clone")]
     pub tent_vias: bool,
+    /// The narrowest web of board left between two drilled holes, edge to edge
+    /// (KiCad's hole to hole). 0 turns the check off, though holes that touch
+    /// are always a finding. Written only when it differs from the default.
+    #[serde(
+        default = "default_min_hole_spacing",
+        skip_serializing_if = "is_default_min_hole_spacing"
+    )]
+    pub min_hole_spacing: i32,
 }
 fn tented_by_default() -> bool {
     true
@@ -836,6 +935,15 @@ fn default_min_annular_ring() -> i32 {
 }
 fn is_default_min_annular_ring(v: &i32) -> bool {
     *v == DEFAULT_MIN_ANNULAR_RING
+}
+/// The default minimum hole spacing, 0.25 mm: KiCad's own default, and the web
+/// board houses quote between drills for their standard process.
+pub const DEFAULT_MIN_HOLE_SPACING: i32 = 250;
+fn default_min_hole_spacing() -> i32 {
+    DEFAULT_MIN_HOLE_SPACING
+}
+fn is_default_min_hole_spacing(v: &i32) -> bool {
+    *v == DEFAULT_MIN_HOLE_SPACING
 }
 
 /// How the autorouter trades vias against track length.
@@ -868,6 +976,7 @@ impl Default for DesignRules {
             net_class_of: BTreeMap::new(),
             min_annular_ring: DEFAULT_MIN_ANNULAR_RING,
             tent_vias: true,
+            min_hole_spacing: DEFAULT_MIN_HOLE_SPACING,
         }
     }
 }
@@ -1886,6 +1995,9 @@ pub enum ViolationKind {
     /// A plated hole whose copper ring is narrower than
     /// [`DesignRules::min_annular_ring`].
     AnnularRing,
+    /// Two drilled holes nearer than [`DesignRules::min_hole_spacing`], or an
+    /// unplated hole cutting copper of its own net.
+    Hole,
     /// A via with no net that zones of two nets claim, and which is stitched to
     /// neither ([`Board::contested_vias`]).
     Stitching,
@@ -1920,6 +2032,15 @@ impl Dsu {
 }
 
 /// Visit item pairs whose bounds, expanded by `slack`, overlap on a shared layer.
+/// One key per object a finding names: a pad, a whole track (whichever of its
+/// segments), a via.
+fn object_key(owner: CopperRef) -> (u8, usize, usize) {
+    match owner {
+        CopperRef::Pad { placement, pad } => (0, placement, pad),
+        CopperRef::Track { track, .. } => (1, track, 0),
+        CopperRef::Via(v) => (2, v, 0),
+    }
+}
 fn near_pairs(items: &[CopperItem], slack: i32, mut visit: impl FnMut(usize, usize)) {
     let bounds: Vec<_> = items.iter().map(|i| i.shape.bounds()).collect();
     let mut order: Vec<usize> = (0..items.len()).collect();
@@ -2056,11 +2177,12 @@ impl Board {
         }
         if count == 1
             && (!self.vias.is_empty()
+                || !self.pad_vias().is_empty()
                 || self.placements.iter().any(|p| p.bottom || p.has_back_copper_pad())
                 || self.tracks.iter().any(|t| t.layer != 0))
         {
             return Err(
-                "A single-layer board cannot keep vias, bottom tracks, bottom-side parts, or back-side pads".into(),
+                "A single-layer board cannot keep vias (a pad's own included), bottom tracks, bottom-side parts, or back-side pads".into(),
             );
         }
         // A via's span keeps its ends: an end on the bottom stays on the bottom,
@@ -2108,6 +2230,29 @@ impl Board {
         self.placements.iter().find(|p| p.component == component)
     }
     /// Every copper primitive on the board.
+    /// Every via its parts' pads carry ([`Pad::vias`]), with whether each is
+    /// tented on the side away from its pad, and that side (true: the board's
+    /// bottom).
+    pub fn pad_vias(&self) -> Vec<(Via, bool, bool)> {
+        let mut out = vec![];
+        for placement in &self.placements {
+            for (index, pad) in placement.footprint.pads.iter().enumerate() {
+                let Some(grid) = pad.vias else { continue };
+                let (layer, _) = placement.pad_layers(pad, self.layer_count);
+                let far_is_bottom = layer == 0;
+                out.extend(placement.pad_vias(index).into_iter().map(|via| (via, grid.tented, far_is_bottom)));
+            }
+        }
+        out
+    }
+    /// The board's own vias, then every via its pads carry: what the copper,
+    /// the checks, the drill file and the 3D board see. An index below
+    /// `vias.len()` is the board's own via of that index.
+    pub fn all_vias(&self) -> Vec<Via> {
+        let mut out = self.vias.clone();
+        out.extend(self.pad_vias().into_iter().map(|(via, _, _)| via));
+        out
+    }
     pub fn copper(&self) -> Vec<CopperItem> {
         let mut items = vec![];
         for (pi, placement) in self.placements.iter().enumerate() {
@@ -2131,7 +2276,7 @@ impl Board {
                 });
             }
         }
-        for (vi, via) in self.vias.iter().enumerate() {
+        for (vi, via) in self.all_vias().iter().enumerate() {
             items.push(CopperItem {
                 owner: CopperRef::Via(vi),
                 shape: Shape::circle(via.at, via.diameter / 2),
@@ -2329,6 +2474,202 @@ impl Board {
         } else {
             format!("{what} ({})", nets.iter().cloned().collect::<Vec<_>>().join(", "))
         }
+    }
+    /// Every drilled hole on the board, as a [`CopperItem`] whose shape is the
+    /// hole and whose layers are the DIELECTRIC gaps the drill passes through
+    /// (gap `k` lies between copper layers `k` and `k + 1`), so a blind via from
+    /// layer 0 to 1 and a buried one from 1 to 2 share no drilling. Pad holes
+    /// first, then [`Board::all_vias`] in its order, with whether each is plated.
+    fn drilled_holes(&self) -> Vec<(CopperItem, bool)> {
+        let gaps = |(from, to): (u8, u8)| (from, to.saturating_sub(1).max(from));
+        let mut holes = vec![];
+        for (pi, placement) in self.placements.iter().enumerate() {
+            for (pad_index, pad) in placement.footprint.pads.iter().enumerate() {
+                let Some(shape) = placement.pad_hole(pad) else { continue };
+                let item = CopperItem {
+                    owner: CopperRef::Pad { placement: pi, pad: pad_index },
+                    shape,
+                    layers: gaps(placement.pad_layers(pad, self.layer_count)),
+                };
+                holes.push((item, pad.plated));
+            }
+        }
+        for (vi, via) in self.all_vias().iter().enumerate() {
+            let item = CopperItem {
+                owner: CopperRef::Via(vi),
+                shape: Shape::circle(via.at, via.drill / 2),
+                layers: gaps(via.layers(self.layer_count)),
+            };
+            holes.push((item, true));
+        }
+        holes
+    }
+    /// The drilling checks: two holes whose drilling meets nearer than
+    /// [`DesignRules::min_hole_spacing`] edge to edge, or touching whatever the
+    /// rule, and an UNPLATED hole that copper comes within the clearance of, or
+    /// touches whatever the clearance, a zone's fill included. Copper the copper
+    /// check already reports against the unplated pad's own copper is left to
+    /// that finding; a hole larger than its pad is measured itself, and held to
+    /// the edge clearance from the outline and the cutouts as its pad is. The vias of
+    /// one pad's grid too close together are one finding for the pad.
+    fn hole_findings(&self, conn: &Connectivity, references: &BTreeMap<Uuid, String>) -> Vec<Violation> {
+        let holes = self.drilled_holes();
+        let own_vias = self.vias.len();
+        // The pad each of a pad's grid vias belongs to, by its index in all_vias.
+        let grid_owner: Vec<CopperRef> = self
+            .placements
+            .iter()
+            .enumerate()
+            .flat_map(|(pi, placement)| {
+                (0..placement.footprint.pads.len()).flat_map(move |pad_index| {
+                    let count = placement.pad_vias(pad_index).len();
+                    std::iter::repeat_n(CopperRef::Pad { placement: pi, pad: pad_index }, count)
+                })
+            })
+            .collect();
+        let pad_of_via = |owner: CopperRef| match owner {
+            CopperRef::Via(v) if v >= own_vias => grid_owner.get(v - own_vias).copied(),
+            _ => None,
+        };
+        let label = |owner: CopperRef| match (owner, pad_of_via(owner)) {
+            (_, Some(pad)) => format!("a via in {}", self.describe(pad, references)),
+            (CopperRef::Via(_), None) => "via".to_owned(),
+            (owner, None) => format!("{} hole", self.describe(owner, references)),
+        };
+        let spacing = f64::from(self.rules.min_hole_spacing);
+        let mm = |v: f64| v / 1000.;
+        let mut violations = vec![];
+        let items: Vec<CopperItem> = holes.iter().map(|(item, _)| item.clone()).collect();
+        let mut grids_reported = BTreeSet::new();
+        near_pairs(&items, self.rules.min_hole_spacing.max(1), |i, j| {
+            let (a, b) = (&items[i], &items[j]);
+            let gap = a.shape.distance(&b.shape);
+            if !(gap + 0.5 < spacing || gap == 0.) {
+                return;
+            }
+            let (ca, cb) = (a.shape.center(), b.shape.center());
+            let at = Point::new(
+                ((i64::from(ca.x) + i64::from(cb.x)) / 2) as i32,
+                ((i64::from(ca.y) + i64::from(cb.y)) / 2) as i32,
+            );
+            let message = match (pad_of_via(a.owner), pad_of_via(b.owner)) {
+                (Some(pa), Some(pb)) if pa == pb => {
+                    if !grids_reported.insert(pa) {
+                        return;
+                    }
+                    format!(
+                        "{}'s vias: {:.3} mm between holes, minimum hole spacing {:.3} mm",
+                        self.describe(pa, references),
+                        mm(gap),
+                        mm(spacing)
+                    )
+                }
+                _ => format!(
+                    "{} to {}: {:.3} mm between holes, minimum hole spacing {:.3} mm",
+                    label(a.owner),
+                    label(b.owner),
+                    mm(gap),
+                    mm(spacing)
+                ),
+            };
+            violations.push(Violation { kind: ViolationKind::Hole, message, at });
+        });
+        let nets_of = |island: usize| conn.island_nets[island].iter().map(String::as_str);
+        let mut pad_items = BTreeMap::new();
+        for (i, item) in conn.items.iter().enumerate() {
+            if let CopperRef::Pad { .. } = item.owner {
+                pad_items.insert(object_key(item.owner), i);
+            }
+        }
+        for (hole, _) in holes.iter().filter(|(_, plated)| !plated) {
+            let Some(&own) = pad_items.get(&object_key(hole.owner)) else { continue };
+            let own_island = conn.islands[own];
+            let own_net = conn.island_net(own_island);
+            let unplated = format!("{}'s unplated hole", self.describe(hole.owner, references));
+            let pad_copper = &conn.items[own].shape;
+            // Copper the copper check already holds to the clearance from the
+            // pad: of another island and not of the pad's one net, and near the
+            // pad's copper. A hole larger than its pad reaches past that copper,
+            // so everything else is measured against the hole itself.
+            let reported_by_copper = |related: bool, gap_to_pad: f64, required: i32| {
+                !related && gap_to_pad + 0.5 < f64::from(required)
+            };
+            // Copper the drill touches is always cut, whatever the clearance.
+            let too_near = |gap: f64, required: i32| gap + 0.5 < f64::from(required) || gap == 0.;
+            let mut reported = BTreeSet::new();
+            for (i, item) in conn.items.iter().enumerate() {
+                let island = conn.islands[i];
+                if i == own || !(item.layers.0 <= hole.layers.1 + 1 && hole.layers.0 <= item.layers.1) {
+                    continue;
+                }
+                let related = island == own_island || own_net.is_some() && conn.island_net(island) == own_net;
+                let (required, class) = self.rules.clearance_between_nets(nets_of(own_island), nets_of(island));
+                if reported_by_copper(related, pad_copper.distance(&item.shape), required) {
+                    continue;
+                }
+                let gap = hole.shape.distance(&item.shape);
+                if too_near(gap, required) && reported.insert(object_key(item.owner)) {
+                    violations.push(Violation {
+                        kind: ViolationKind::Hole,
+                        message: format!(
+                            "{unplated} to {}: {:.3} mm gap, {} clearance {:.3} mm required",
+                            self.describe_on(item.owner, &conn.island_nets[island], references),
+                            mm(gap),
+                            class.name,
+                            mm(f64::from(required))
+                        ),
+                        at: hole.shape.center(),
+                    });
+                }
+            }
+            // The edge clearance, from the outline and every cutout: the
+            // copper check holds the pad to it, so only a hole reaching past
+            // its pad is this check's.
+            let edge_clearance = f64::from(self.rules.edge_clearance);
+            let off_edge = |shape: &Shape| {
+                let gap = self
+                    .outline_edges()
+                    .map(|(a, b)| shape.distance(&Shape::segment(a, b, 0)))
+                    .fold(f64::INFINITY, f64::min);
+                !self.outline_contains(shape.center()) || gap + 0.5 < edge_clearance || gap == 0.
+            };
+            if off_edge(&hole.shape) && !off_edge(pad_copper) {
+                violations.push(Violation {
+                    kind: ViolationKind::Hole,
+                    message: format!(
+                        "{unplated} is outside the board or within {:.3} mm of its edge",
+                        mm(edge_clearance)
+                    ),
+                    at: hole.shape.center(),
+                });
+            }
+            for (z, zone) in self.zones.iter().enumerate() {
+                for (k, piece) in zone.fill.iter().enumerate() {
+                    let island = conn.zone_islands[z][k];
+                    let related = island == own_island || own_net == Some(zone.net.as_str());
+                    let (required, class) = self.rules.clearance_between_nets(nets_of(own_island), [zone.net.as_str()]);
+                    if reported_by_copper(related, piece.distance(pad_copper), required) {
+                        continue;
+                    }
+                    let gap = piece.distance(&hole.shape);
+                    if too_near(gap, required) {
+                        violations.push(Violation {
+                            kind: ViolationKind::Hole,
+                            message: format!(
+                                "{unplated} to {}: {:.3} mm gap, {} clearance {:.3} mm required",
+                                zones::describe(zone, self.layer_count),
+                                mm(gap),
+                                class.name,
+                                mm(f64::from(required))
+                            ),
+                            at: hole.shape.center(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+        violations
     }
     /// Design rule check against exact copper geometry.
     pub fn drc(&self, netlist: &Netlist) -> Vec<Violation> {
@@ -2598,6 +2939,17 @@ impl Board {
                     at: placement.at,
                 });
             }
+            // Nor can a pad's vias go through to a layer that is not there.
+            for placement in self.placements.iter().filter(|p| p.footprint.pads.iter().any(|pad| pad.vias.is_some())) {
+                violations.push(Violation {
+                    kind: ViolationKind::MissingPad,
+                    message: format!(
+                        "{} has vias in its pads, which a one-layer board cannot carry",
+                        references.get(&placement.component).map_or("?", String::as_str)
+                    ),
+                    at: placement.at,
+                });
+            }
         }
         let ring = self.rules.min_annular_ring;
         for placement in &self.placements {
@@ -2617,7 +2969,7 @@ impl Board {
                 }
             }
         }
-        for via in &self.vias {
+        for via in &self.all_vias() {
             let have = (via.diameter - via.drill) / 2;
             if have < ring {
                 violations.push(Violation {
@@ -2631,6 +2983,7 @@ impl Board {
                 });
             }
         }
+        violations.extend(self.hole_findings(&conn, &references));
         for net in netlist.nets.iter().filter(|n| n.pins.len() > 1) {
             for pin in &net.pins {
                 if let Some(placement) = self.placement(pin.component_id)
@@ -2682,6 +3035,7 @@ impl Board {
             || r.net_widths.values().any(|w| !size(*w))
             || !(0..=10_000).contains(&r.mask_expansion)
             || !(0..=10_000).contains(&r.min_annular_ring)
+            || !(0..=10_000).contains(&r.min_hole_spacing)
         {
             return Err("Invalid design rules".into());
         }
@@ -2703,6 +3057,7 @@ impl Board {
                     || !size(pad.size.y)
                     || pad.outline_problem().is_some()
                     || pad.layers.paste_windows.is_some_and(|w| w.problem().is_some())
+                    || pad.vias_problem().is_some()
                     || pad.hole_problem().is_some()
                     || pad.hole_size().is_some_and(|h| !size(h.x) || !size(h.y))
                     || !(0..=100_000).contains(&pad.corner_radius)

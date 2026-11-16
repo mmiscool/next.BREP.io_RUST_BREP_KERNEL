@@ -62,6 +62,24 @@ pub(super) struct Fit {
     pub skip: [f64; 2],
 }
 
+impl Fit {
+    /// This fit carried `fraction` along `seam`: the section and the joint
+    /// faces' normals where that fraction of the run starts.
+    pub(super) fn carried(&self, seam: &Seam, fraction: f64) -> Fit {
+        let face = |face: &JointFace| JointFace {
+            normal: seam.carry(fraction, face.normal),
+            gap: face.gap.map(|gap| seam.carry(fraction, gap)),
+            ..face.clone()
+        };
+        Fit {
+            faces: [face(&self.faces[0]), face(&self.faces[1])],
+            legs: [seam.carry(fraction, self.legs[0]), seam.carry(fraction, self.legs[1])],
+            root: seam.carry(fraction, self.root),
+            skip: self.skip,
+        }
+    }
+}
+
 /// Why a seam has no fitted section. AUTO placement falls back to the manual
 /// orientation on any of these; FITTED placement reports them.
 pub(super) type NoFit = String;
@@ -76,6 +94,7 @@ pub(super) enum Run {
     Arc { centre: Vec3, axis: Vec3, angle: f64 },
 }
 
+#[derive(Clone, Debug)]
 pub(super) struct Seam {
     pub start: Vec3,
     /// The unit tangent at the start.
@@ -141,6 +160,16 @@ impl Seam {
         }
     }
 
+    /// The stretch of this run from `from` to `to` (fractions of it) as a run
+    /// of its own.
+    pub(super) fn part(&self, from: f64, to: f64) -> Seam {
+        let run = match self.run {
+            Run::Line => Run::Line,
+            Run::Arc { centre, axis, angle } => Run::Arc { centre, axis, angle: angle * (to - from) },
+        };
+        Seam { start: self.at(from), tangent: self.carry(from, self.tangent), length: self.length * (to - from), run, owner: self.owner.clone() }
+    }
+
     pub(super) fn end_tangent(&self) -> Vec3 {
         self.carry(1.0, self.tangent)
     }
@@ -166,14 +195,115 @@ pub(super) struct Trim {
 /// carried along the seam: extruded along a straight run (and mitred where
 /// `trim` says), revolved along an arc.
 pub(super) fn sweep(seam: &Seam, points: &[Vec3], trim: &Trim) -> Result<crate::BrepSolid, String> {
+    sweep_section(seam, points, None, trim)
+}
+
+/// A circular arc from `a` to `b` in the plane of `a`, `b` and `root`,
+/// bulging `height` away from `root` (negative: towards it) at its middle:
+/// its centre, radius, the angle it turns through (more than a half turn
+/// where the height exceeds half the chord) and the point at its middle.
+pub(super) fn contour_arc(root: Vec3, a: Vec3, b: Vec3, height: f64) -> Result<(Vec3, f64, f64, Vec3), String> {
+    let chord = b.sub(a);
+    let half = chord.length() * 0.5;
+    let middle = a.add(chord.scale(0.5));
+    // Away from the root, square to the chord, in the section's plane.
+    let toward = middle.sub(root);
+    let out = toward.sub(chord.scale(toward.dot(chord) / chord.dot(chord))).normalized()?;
+    let depth = height.abs();
+    let radius = (half * half + depth * depth) / (2.0 * depth);
+    let bulge = if height > 0.0 { out } else { out.scale(-1.0) };
+    // The centre stands `radius − depth` back from the chord (past it, for
+    // more than a half turn).
+    let centre = middle.sub(bulge.scale(radius - depth));
+    let angle = 2.0 * half.atan2(radius - depth);
+    Ok((centre, radius, angle, middle.add(bulge.scale(depth))))
+}
+
+/// How far the bead sections (root offset, then the toe offsets from the
+/// root) reach from the seam, a convex face's whole circle included (a
+/// bound past the arc itself).
+pub(super) fn section_reach(sections: &[[Vec3; 3]], contour: Option<f64>) -> Result<f64, String> {
+    let mut reach = 0.0_f64;
+    for [root, a, b] in sections {
+        reach = reach.max(root.length()).max(root.add(*a).length()).max(root.add(*b).length());
+        // A concave arc stays inside the section's triangle.
+        if let Some(height) = contour.filter(|height| *height > 0.0) {
+            let (centre, radius, _, _) = contour_arc(*root, root.add(*a), root.add(*b), height)?;
+            reach = reach.max(centre.length() + radius);
+        }
+    }
+    Ok(reach)
+}
+
+/// [`sweep`] of a three-point bead section (root, toe, toe) whose face from
+/// the first toe to the second is the circular arc [`contour_arc`] of
+/// `contour` height when one is given.
+pub(super) fn sweep_section(seam: &Seam, points: &[Vec3], contour: Option<f64>, trim: &Trim) -> Result<crate::BrepSolid, String> {
+    let mut outline = Vec::with_capacity(points.len());
+    for i in 0..points.len() {
+        let (from, to) = (points[i], points[(i + 1) % points.len()]);
+        match contour {
+            Some(height) if i == 1 && points.len() == 3 => {
+                let (centre, _, _, apex) = contour_arc(points[0], from, to, height)?;
+                outline.push(Side::Arc { from, to, centre, through: apex });
+            }
+            _ => outline.push(Side::Line(from, to)),
+        }
+    }
+    sweep_outline(seam, &outline, trim)
+}
+
+/// One side of a closed section outline at a run's start, square to it.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Side {
+    Line(Vec3, Vec3),
+    /// A circular arc about `centre` from `from` to `to`, through `through`
+    /// (any point of it strictly between the ends).
+    Arc { from: Vec3, to: Vec3, centre: Vec3, through: Vec3 },
+}
+
+impl Side {
+    fn moved(self, shift: Vec3) -> Side {
+        match self {
+            Side::Line(a, b) => Side::Line(a.add(shift), b.add(shift)),
+            Side::Arc { from, to, centre, through } => Side::Arc { from: from.add(shift), to: to.add(shift), centre: centre.add(shift), through: through.add(shift) },
+        }
+    }
+
+    fn curve(self) -> Result<NurbsCurve, String> {
+        match self {
+            Side::Line(a, b) => crate::make_line(a, b),
+            Side::Arc { from, to, centre, through } => {
+                let radius = from.sub(centre).length();
+                let x_axis = from.sub(centre).normalized()?;
+                // The turn from `from` that passes `through`: its plane's
+                // normal, then the angle to `to` measured that way round.
+                let mut normal = x_axis.cross(through.sub(centre));
+                let toward = to.sub(centre);
+                if normal.length() <= 1e-12 * radius {
+                    return Err("an arc's middle point is opposite its start".into());
+                }
+                normal = normal.normalized()?;
+                let y_axis = normal.cross(x_axis);
+                let mut angle = toward.dot(y_axis).atan2(toward.dot(x_axis));
+                if angle <= 0.0 {
+                    angle += std::f64::consts::TAU;
+                }
+                crate::make_arc(centre, x_axis, y_axis, radius, 0.0, angle)
+            }
+        }
+    }
+}
+
+/// The closed outline `sides` carried along the seam: extruded along a
+/// straight run (and mitred where `trim` says), revolved along an arc.
+pub(super) fn sweep_outline(seam: &Seam, sides: &[Side], trim: &Trim) -> Result<crate::BrepSolid, String> {
     match seam.run {
         Run::Line => {
             let before = trim.ends[0].map_or(0.0, |(_, _, extend)| extend);
             let after = trim.ends[1].map_or(0.0, |(_, _, extend)| extend);
             let shift = seam.tangent.scale(-before);
-            let moved: Vec<Vec3> = points.iter().map(|point| point.add(shift)).collect();
-            let profile = (0..moved.len()).map(|i| crate::make_line(moved[i], moved[(i + 1) % moved.len()]))
-                .collect::<Result<Vec<_>, _>>()?;
+            let profile = sides.iter().map(|side| side.moved(shift).curve()).collect::<Result<Vec<_>, _>>()?;
             let mut solid = crate::extrude_profile_brep(&profile, seam.tangent, seam.length + before + after)
                 .map_err(|error| error.to_string())?;
             for (end, cut) in trim.ends.iter().enumerate() {
@@ -189,8 +319,7 @@ pub(super) fn sweep(seam: &Seam, points: &[Vec3], trim: &Trim) -> Result<crate::
             if trim.ends.iter().any(Option::is_some) {
                 return Err("an arc is never mitred".into());
             }
-            let profile = (0..points.len()).map(|i| crate::make_line(points[i], points[(i + 1) % points.len()]))
-                .collect::<Result<Vec<_>, _>>()?;
+            let profile = sides.iter().map(|side| side.curve()).collect::<Result<Vec<_>, _>>()?;
             crate::revolve_profile_brep(&profile, centre, axis, angle)
         }
     }
@@ -272,10 +401,16 @@ fn is_weld_bead(solid: &crate::BrepSolid) -> bool {
         .all(|face| face.name.as_deref().is_some_and(|name| name.contains(":BeadFace")))
 }
 
+/// Whether scene solid `name` is one of weld `weld`'s own beads (`{weld}`,
+/// or `{weld}:Bead{n}` for a bead in several bodies).
+pub(super) fn owned_by(name: &str, weld: &str) -> bool {
+    name == weld || name.strip_prefix(weld).is_some_and(|rest| rest.starts_with(":Bead"))
+}
+
 /// Every resident face that carries the seam, in scene-name order.
 fn candidates(scene: &SceneMap, seam: &Seam, exclude: &str) -> Result<Vec<JointFace>, String> {
     let ends = [seam.at(0.0), seam.at(1.0)];
-    let mut names: Vec<(&String, &u32)> = scene.solids.iter().filter(|(name, _)| name.as_str() != exclude).collect();
+    let mut names: Vec<(&String, &u32)> = scene.solids.iter().filter(|(name, _)| !owned_by(name, exclude)).collect();
     names.sort();
     let mut found = Vec::new();
     for (solid_name, &handle) in names {
@@ -526,6 +661,80 @@ pub(super) fn fit(scene: &SceneMap, seam: &Seam, explicit: &[String], exclude: &
     Ok(Ok(Fit { faces: [first, second], legs: legs_dir, root, skip }))
 }
 
+/// The far side of a fitted joint on one run: the mirror corner across the
+/// member standing on the joint (a T joint's web, a tube's wall). One joint
+/// face is the member's; the nearest face of the member's body straight
+/// across it (its outward normal opposite, at the member's thickness) meets
+/// the other, through face along the run carried across that thickness.
+/// Returned as that run and its fit; leg 1 stays on the through face when it
+/// is there on the near side, else on the member's far face. Each joint face
+/// is tried as the member; exactly one may give a far corner.
+pub(super) fn other_side(scene: &SceneMap, seam: &Seam, near: &Fit, exclude: &str, legs: [f64; 2]) -> Result<Result<(Seam, Fit), NoFit>, String> {
+    if near.faces.iter().any(|face| face.gap.is_some()) {
+        return Ok(Err("the joint has a root gap; weld the far side's seam as its own weld".into()));
+    }
+    let tolerance = seam.tolerance();
+    let mut found: Vec<(Seam, Fit)> = Vec::new();
+    for member in 0..2 {
+        let face = &near.faces[member];
+        let through = &near.faces[1 - member];
+        // A point on the member's face halfway along the seam and up its leg.
+        let point = seam.at(0.5).add(seam.carry(0.5, near.root.add(near.legs[member].scale(legs[member] * 0.5))));
+        let inward = seam.carry(0.5, face.normal).scale(-1.0);
+        let far = crate::with_registered_solid_str(face.handle, |solid| {
+            let mut best: Option<(f64, u64)> = None;
+            for record in solid.shells.iter().flat_map(|shell| &shell.faces) {
+                if record.id == face.face_id {
+                    continue;
+                }
+                let Ok((foot, outward)) = crate::fillet::face_plane_normal(record, point) else { continue };
+                let across = foot.sub(point);
+                let thickness = across.dot(inward);
+                if thickness <= tolerance || across.sub(inward.scale(thickness)).length() > tolerance
+                    || outward.dot(inward) < 1.0 - 1e-9 {
+                    continue;
+                }
+                if !matches!(face_class(record, foot, tolerance)?, Some(PolygonClass::Inside | PolygonClass::Boundary)) {
+                    continue;
+                }
+                if best.is_none_or(|(nearest, _)| thickness < nearest) {
+                    best = Some((thickness, record.id));
+                }
+            }
+            Ok(best)
+        })?;
+        let Some((thickness, far_id)) = far else { continue };
+        // The seam carried across the member: along an arc the far run is
+        // the coaxial arc at the far face's radius.
+        let shift = face.normal.scale(-thickness);
+        let start = seam.start.add(shift);
+        let far_seam = match seam.run {
+            Run::Line => Seam::line(start, seam.tangent, seam.length, None),
+            Run::Arc { centre, axis, angle } => {
+                let radial = start.sub(centre);
+                let radius = radial.sub(axis.scale(radial.dot(axis))).length();
+                if radius <= tolerance {
+                    continue;
+                }
+                Seam { start, tangent: seam.tangent, length: radius * angle, run: seam.run, owner: None }
+            }
+        };
+        let joints = candidates(scene, &far_seam, exclude)?;
+        let Some(far_face) = joints.iter().find(|joint| joint.handle == face.handle && joint.face_id == far_id) else { continue };
+        let Some(through_face) = joints.iter().find(|joint| same(joint, through)) else { continue };
+        let picks = if member == 0 { [far_face.name.clone(), through_face.name.clone()] } else { [through_face.name.clone(), far_face.name.clone()] };
+        match fit(scene, &far_seam, &picks, exclude, legs, None)? {
+            Ok(joint) => found.push((far_seam, joint)),
+            Err(_) => continue,
+        }
+    }
+    Ok(match found.len() {
+        0 => Err("no far-side corner: neither joint face belongs to a member with a face straight across it on the other face".into()),
+        1 => Ok(found.pop().expect("one far side")),
+        _ => Err("both joint faces belong to members that continue past the joint; weld the far side's seam as its own weld".into()),
+    })
+}
+
 /// Does the named face carry the whole seam (on or inside its trim)?
 pub(super) fn carries(scene: &SceneMap, seam: &Seam, name: &str) -> Result<bool, String> {
     for face in scene.resolve_face_group(name) {
@@ -709,44 +918,108 @@ impl Chain {
         Ok(Ok(fits))
     }
 
-    /// The bead: each run's section (its root's offset from the run's start
-    /// and the toe offsets of its two legs from the root) carried along the run and mitred at corners, united, its
-    /// faces named `{id}:BeadFace{n}`.
-    pub(super) fn bead(&self, id: &str, sections: &[[Vec3; 3]], trims: &[Trim]) -> Result<crate::BrepSolid, String> {
-        let mut bead: Option<crate::BrepSolid> = None;
-        for ((run, [root, a, b]), trim) in self.runs.iter().zip(sections).zip(trims) {
-            // Keep the section counter-clockwise about the seam.
-            let (a, b) = if a.cross(*b).dot(run.tangent) >= 0.0 { (*a, *b) } else { (*b, *a) };
-            let start = run.start.add(*root);
-            let piece = sweep(run, &[start, start.add(a), start.add(b)], trim)?;
-            bead = Some(match bead {
-                None => piece,
-                Some(sum) => crate::boolean_operation(&sum, &piece, crate::BooleanOperation::Union, &crate::BooleanOptions::default())
-                    .map_err(|refusal| format!("could not join the bead's segments: {refusal}"))?,
-            });
-        }
-        let mut bead = bead.ok_or("the seam is empty")?;
-        for (i, face) in bead.shells.iter_mut().flat_map(|shell| &mut shell.faces).enumerate() {
-            face.name = Some(format!("{id}:BeadFace{}", i + 1));
-        }
-        Ok(bead)
+    /// The seam's length along all its runs.
+    pub(super) fn length(&self) -> f64 {
+        self.runs.iter().map(|run| run.length).sum()
     }
 
-    /// The exact checks on a fitted bead: clear of every body, every leg
-    /// backed along every run.
-    pub(super) fn verify(&self, scene: &SceneMap, fits: &[Fit], legs: [f64; 2], bead: &crate::BrepSolid, trims: &[Trim], exclude: &str) -> Result<Result<(), NoFit>, String> {
+    /// Whether the last run ends where the first starts.
+    pub(super) fn is_closed(&self) -> bool {
+        self.corners.iter().any(|(a, b, _)| *b == 0 && *a + 1 == self.runs.len() && self.runs.len() > 1)
+    }
+
+    /// The pieces of the bead along the stretch `from..to` of the seam (by
+    /// length from its start): the part of every run the stretch overlaps,
+    /// with that run's section carried to where the part starts. A mitre cut
+    /// is kept where the stretch runs on through its corner (and, for the
+    /// whole of a closed seam, at the corner where it closes); the stretch's
+    /// own ends are square to the seam, at a corner too.
+    pub(super) fn pieces(&self, sections: &[[Vec3; 3]], trims: &[Trim], from: f64, to: f64) -> Vec<Piece> {
+        let mut pieces = Vec::new();
+        let mut start = 0.0;
+        let total = self.length();
+        let last = self.runs.len().saturating_sub(1);
+        let closing = self.is_closed() && from <= self.runs[0].tolerance() && to >= total - self.runs[last].tolerance();
+        for (k, run) in self.runs.iter().enumerate() {
+            let end = start + run.length;
+            let (low, high) = (from.max(start), to.min(end));
+            let tolerance = run.tolerance();
+            if high - low > tolerance {
+                let f0 = if low - start <= tolerance { 0.0 } else { (low - start) / run.length };
+                let f1 = if end - high <= tolerance { 1.0 } else { (high - start) / run.length };
+                let [root, a, b] = sections[k];
+                let through_start = from < start - tolerance || (closing && k == 0);
+                let through_end = to > end + tolerance || (closing && k == last);
+                let trim = Trim { ends: [
+                    if f0 == 0.0 && through_start { trims[k].ends[0] } else { None },
+                    if f1 == 1.0 && through_end { trims[k].ends[1] } else { None },
+                ] };
+                pieces.push(Piece {
+                    run: run.part(f0, f1),
+                    section: [run.carry(f0, root), run.carry(f0, a), run.carry(f0, b)],
+                    trim,
+                    index: k,
+                    from: f0,
+                });
+            }
+            start = end;
+        }
+        pieces
+    }
+
+    /// The exact checks on one body of pieces of a fitted bead: clear of
+    /// every body, and each piece's legs backed along it.
+    pub(super) fn verify_pieces(&self, scene: &SceneMap, fits: &[Fit], legs: [f64; 2], bead: &crate::BrepSolid, pieces: &[Piece], exclude: &str) -> Result<Result<(), NoFit>, String> {
         let tolerance = self.runs.iter().map(Seam::tolerance).fold(0.0, f64::max);
         if let Err(reason) = clear(scene, bead, exclude, tolerance)? {
             return Ok(Err(reason));
         }
-        for (k, ((run, joint), trim)) in self.runs.iter().zip(fits).zip(trims).enumerate() {
-            if let Err(reason) = supported(run, joint, legs, trim)? {
-                return Ok(Err(format!("{}{reason}", self.label(k))));
+        for piece in pieces {
+            let joint = fits[piece.index].carried(&self.runs[piece.index], piece.from);
+            if let Err(reason) = supported(&piece.run, &joint, legs, &piece.trim)? {
+                return Ok(Err(format!("{}{reason}", self.label(piece.index))));
             }
         }
         Ok(Ok(()))
     }
+}
 
+/// One piece of a bead: a run (or a stretch of one), the section at its
+/// start (the root's offset from the start, then the two toe offsets from
+/// the root), its cuts, and which seam run it comes from and where on it.
+#[derive(Clone, Debug)]
+pub(super) struct Piece {
+    pub run: Seam,
+    pub section: [Vec3; 3],
+    pub trim: Trim,
+    pub index: usize,
+    pub from: f64,
+}
+
+/// The pieces swept and united into one body, its faces named
+/// `{id}:BeadFace{n}`; each face between the toes is the circular arc of
+/// `contour` height when one is given.
+pub(super) fn build_bead(id: &str, pieces: &[Piece], contour: Option<f64>) -> Result<crate::BrepSolid, String> {
+    let mut bead: Option<crate::BrepSolid> = None;
+    for Piece { run, section: [root, a, b], trim, .. } in pieces {
+        // Keep the section counter-clockwise about the seam.
+        let (a, b) = if a.cross(*b).dot(run.tangent) >= 0.0 { (*a, *b) } else { (*b, *a) };
+        let start = run.start.add(*root);
+        let piece = sweep_section(run, &[start, start.add(a), start.add(b)], contour, trim)?;
+        bead = Some(match bead {
+            None => piece,
+            Some(sum) => crate::boolean_operation(&sum, &piece, crate::BooleanOperation::Union, &crate::BooleanOptions::default())
+                .map_err(|refusal| format!("could not join the bead's segments: {refusal}"))?,
+        });
+    }
+    let mut bead = bead.ok_or("the seam is empty")?;
+    for (i, face) in bead.shells.iter_mut().flat_map(|shell| &mut shell.faces).enumerate() {
+        face.name = Some(format!("{id}:BeadFace{}", i + 1));
+    }
+    Ok(bead)
+}
+
+impl Chain {
     /// The normal of the plane every run lies in (an arc's axis), for placing
     /// a section by Orientation; `None` when the runs do not share one.
     pub(super) fn plane(&self) -> Option<Vec3> {
@@ -800,7 +1073,7 @@ fn empty(refusal: &crate::KernelRefusal) -> bool {
 }
 
 /// The volume two bodies share; a touching-only pair shares none.
-fn common_volume(a: &crate::BrepSolid, b: &crate::BrepSolid) -> Result<f64, NoFit> {
+pub(super) fn common_volume(a: &crate::BrepSolid, b: &crate::BrepSolid) -> Result<f64, NoFit> {
     match boolean(a, b, crate::BooleanOperation::Intersect) {
         Ok(common) => crate::solid_mass_properties(&common).map(|m| m.volume.abs())
             .map_err(|error| format!("could not measure the common part: {error}")),
@@ -812,7 +1085,7 @@ fn common_volume(a: &crate::BrepSolid, b: &crate::BrepSolid) -> Result<f64, NoFi
 /// Check the built bead exactly: it shares no volume with any resident body.
 pub(super) fn clear(scene: &SceneMap, bead: &crate::BrepSolid, exclude: &str, tolerance: f64) -> Result<Result<(), NoFit>, String> {
     let (low, high) = bounds(bead);
-    let mut names: Vec<(&String, &u32)> = scene.solids.iter().filter(|(name, _)| name.as_str() != exclude).collect();
+    let mut names: Vec<(&String, &u32)> = scene.solids.iter().filter(|(name, _)| !owned_by(name, exclude)).collect();
     names.sort();
     for (name, &handle) in names {
         let body = crate::registered_solid_clone(handle)?;
@@ -829,6 +1102,46 @@ pub(super) fn clear(scene: &SceneMap, bead: &crate::BrepSolid, exclude: &str, to
         }
     }
     Ok(Ok(()))
+}
+
+/// [`clear`] with some bodies as the weld leaves them: each `(name, body)`
+/// in `replaced` stands for the resident body of that name (a part the weld
+/// prepares), and the weld's own beads are skipped.
+pub(super) fn clear_of(scene: &SceneMap, bead: &crate::BrepSolid, exclude: &str, replaced: &[(&str, &crate::BrepSolid)], tolerance: f64) -> Result<Result<(), NoFit>, String> {
+    let (low, high) = bounds(bead);
+    let mut names: Vec<(&String, &u32)> = scene.solids.iter().filter(|(name, _)| !owned_by(name, exclude)).collect();
+    names.sort();
+    for (name, &handle) in names {
+        let body = match replaced.iter().find(|(replaced, _)| *replaced == name.as_str()) {
+            Some((_, body)) => (*body).clone(),
+            None => crate::registered_solid_clone(handle)?,
+        };
+        let (body_low, body_high) = bounds(&body);
+        let apart = body_low.x > high.x + tolerance || body_low.y > high.y + tolerance || body_low.z > high.z + tolerance
+            || body_high.x < low.x - tolerance || body_high.y < low.y - tolerance || body_high.z < low.z - tolerance;
+        if apart {
+            continue;
+        }
+        match common_volume(bead, &body) {
+            Ok(shared) if shared > LEFTOVER_VOLUME => return Ok(Err(format!("the bead would overlap {name}"))),
+            Ok(_) => {}
+            Err(reason) => return Ok(Err(reason)),
+        }
+    }
+    Ok(Ok(()))
+}
+
+/// Whether `body` backs the thin `slab` under a contact: nothing of the slab
+/// is left once the body is removed.
+pub(super) fn backed(slab: &crate::BrepSolid, body: &crate::BrepSolid) -> Result<Result<(), NoFit>, String> {
+    match boolean(slab, body, crate::BooleanOperation::Subtract) {
+        Err(refusal) if empty(&refusal) => Ok(Ok(())),
+        Ok(rest) => {
+            let left = crate::solid_mass_properties(&rest).map(|m| m.volume.abs()).unwrap_or(f64::INFINITY);
+            Ok(if left > LEFTOVER_VOLUME { Err(format!("{left} of the support slab lies outside the part")) } else { Ok(()) })
+        }
+        Err(refusal) => Ok(Err(format!("could not check the support: {refusal}"))),
+    }
 }
 
 /// Check each leg's whole strip on its joint face is backed by that face's

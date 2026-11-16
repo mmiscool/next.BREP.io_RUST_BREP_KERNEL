@@ -373,6 +373,12 @@ pub(super) fn step_body_face_count(resolver: &Resolver, body: StepBody) -> usize
 /// exactly as before. In both paths a body that fails to reconstruct is skipped
 /// (counted in `failed`) rather than aborting the whole file.
 pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> {
+    collect_step_solids_with(text, false)
+}
+
+/// [`collect_step_solids`], with `sheets` building each OPEN_SHELL as a sheet
+/// body instead of skipping it ([`Resolver::sheets`]).
+pub(super) fn collect_step_solids_with(text: &str, sheets: bool) -> Result<ImportedBodies, String> {
     if !text.contains("ISO-10303-21") {
         return Err("step_import: not an ISO-10303-21 Part 21 file".into());
     }
@@ -382,7 +388,9 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
     if let Some(started) = parse_started {
         eprintln!("PHASE parse: {:?} ({} entities)", started.elapsed(), entities.len());
     }
-    let resolver = Resolver::new(&entities, derive_length_scale_mm(&entities));
+    let mut resolver = Resolver::new(&entities, derive_length_scale_mm(&entities));
+    resolver.sheets = sheets;
+    let resolver = resolver;
     // The file's presentation entities, read ONCE. An uncoloured file leaves the
     // table empty and every appearance lookup short-circuits.
     let styles = StyleTable::read(&entities);
@@ -501,6 +509,7 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
             // MANIFOLD_SOLID_BREP parts (>= 2 faces) are unaffected.
             Ok((solid, _, _, _))
                 if opportunistic
+                    && solid.kind != crate::BodyKind::Sheet
                     && solid.shells.iter().map(|s| s.faces.len()).sum::<usize>() <= 1 => {}
             // Solid, appearance, face refs and bounded trims are pushed
             // together — the vectors are parallel by construction, through
@@ -515,7 +524,8 @@ pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> 
             // An open surface-model sheet is not a solid: skip it, whether its
             // builder said so in text or, since 2026-10-03, in a typed class;
             // counted since 2026-10-12 (`SHEETS_SKIPPED`), never failed.
-            Err(error) if opportunistic && !error.closure_refusal() => sheets_skipped += 1,
+            // Where sheets were asked for, a shell that fails is a failure.
+            Err(error) if opportunistic && !resolver.sheets && !error.closure_refusal() => sheets_skipped += 1,
             Err(error) => {
                 // A closure refusal counts on an opportunistic shell too: it
                 // reached the gate, so it closed topologically and built as a

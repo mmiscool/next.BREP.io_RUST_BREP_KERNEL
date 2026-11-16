@@ -414,7 +414,9 @@ pub fn view_annotations<'a>(view: &PmiView, camera: &PmiCamera, rows: &'a brep_k
             plane: row.plane.or(Some(PmiPlane { origin: row.label_world, normal: [-forward[0], -forward[1], -forward[2]], x_axis: right })),
             ..style
         };
-        let drawn = pmi_present(&row.geometry, row.label_world, &row.text, &row_style);
+        // A weld callout draws its weld symbol, as the 3D view does.
+        let drawn = brep_kernel::feature_pipeline::pmi::weld_symbol::present_row(row, &row_style)
+            .unwrap_or_else(|| pmi_present(&row.geometry, row.label_world, &row.text, &row_style));
         let mut lines: Vec<Vec<[f64; 3]>> = drawn.polylines.iter().chain(&drawn.frames).cloned().collect();
         for run in &drawn.texts {
             lines.extend(run.strokes());

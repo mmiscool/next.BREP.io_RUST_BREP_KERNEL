@@ -6,12 +6,32 @@ fn curve_subrange(
     curve: &crate::NurbsCurve,
     start_fraction: f64,
     end_fraction: f64,
+    absolute_split: bool,
 ) -> Result<crate::NurbsCurve, KernelRefusal> {
-    let [start, end] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
+    let mut result = curve.clone();
+    // With `absolute_split` the pieces were already judged distinct in model
+    // space; a piece narrower than `NurbsCurve::split`'s absolute knot floor
+    // (a seam gap of 1e-6 on a rim of length 3000 is a fraction of 3e-10)
+    // is cut from the same curve with its knots spread over a longer domain.
+    if absolute_split {
+        let [start, end] = result.domain().or_refuse(KernelStage::Sew, "domain")?;
+        let narrowest = [start_fraction, end_fraction - start_fraction, 1.0 - end_fraction]
+            .into_iter()
+            .filter(|width| *width > 0.0)
+            .fold(f64::INFINITY, f64::min)
+            * (end - start);
+        if narrowest < 1e-6 {
+            let factor = 1e-6 / narrowest;
+            let knots = result.knots.iter().map(|knot| start + (knot - start) * factor).collect();
+            result = crate::NurbsCurve::new(result.degree, knots, result.control_points.clone())
+                .or_refuse(KernelStage::Sew, "NurbsCurve::new")?;
+        }
+    }
+    let [start, end] = result.domain().or_refuse(KernelStage::Sew, "domain")?;
     let first = start + (end - start) * start_fraction;
     let second = start + (end - start) * end_fraction;
     let epsilon = (1e-9 * (end - start)).max(2e-9);
-    let mut result = curve.clone();
+    let epsilon = if absolute_split { 2.0 * crate::curve::KNOT_IDENTITY_TOL } else { epsilon };
     if first > start + epsilon && first < end - epsilon {
         result = result.split(first).or_refuse(KernelStage::Sew, "split")?.1;
     }
@@ -79,11 +99,55 @@ pub fn edge_interior_lies_on(
     Ok(true)
 }
 
+/// The fraction in [0, 1] at which `at` comes closest to `target`, refined by
+/// Gauss-Newton from each of `starts` (clamped to [0, 1]); a residual tie
+/// keeps the start nearest `preferred`. Used near a closed curve's seam,
+/// where one projection may return the wrong end of the period.
+fn closest_fraction(
+    at: impl Fn(f64) -> Result<Vec3, String>,
+    target: Vec3,
+    starts: &[f64],
+    preferred: f64,
+) -> Result<f64, String> {
+    let mut best: Option<(f64, f64)> = None;
+    for &start in starts {
+        let mut s = start.clamp(0.0, 1.0);
+        for _ in 0..40 {
+            let h = 1e-6;
+            let (low, high) = ((s - h).max(0.0), (s + h).min(1.0));
+            let tangent = at(high)?.sub(at(low)?).scale(1.0 / (high - low));
+            let squared = tangent.dot(tangent);
+            if !(squared > 0.0) {
+                break;
+            }
+            let next = (s - at(s)?.sub(target).dot(tangent) / squared).clamp(0.0, 1.0);
+            let settled = (next - s).abs() <= 4.0 * f64::EPSILON;
+            s = next;
+            if settled {
+                break;
+            }
+        }
+        let residual = at(s)?.sub(target).length();
+        let better = match best {
+            None => true,
+            Some((best_s, best_residual)) => {
+                residual < best_residual * (1.0 - 1e-9)
+                    || (residual <= best_residual * (1.0 + 1e-9) && (s - preferred).abs() < (best_s - preferred).abs())
+            }
+        };
+        if better {
+            best = Some((s, residual));
+        }
+    }
+    Ok(best.map_or(preferred, |(s, _)| s))
+}
+
 fn pcurve_fraction_at_edge_fraction(
     face: &FaceRecord,
     coedge: &CoedgeRecord,
     edge: &EdgeRecord,
     edge_fraction: f64,
+    absolute_split: bool,
 ) -> Result<f64, KernelRefusal> {
     // Closed edges have the same spatial point at both parameter ends.
     // Preserve the named traversal endpoint instead of projecting it onto an
@@ -100,7 +164,39 @@ fn pcurve_fraction_at_edge_fraction(
         Vec3::new(surface_projection.u, surface_projection.v, 0.0),
     ).or_refuse(KernelStage::Sew, "csg.boolean.assemble.edge_conform")?;
     let [start, end] = coedge.pcurve.domain().or_refuse(KernelStage::Sew, "domain")?;
-    Ok(((pcurve_projection.u - start) / (end - start)).clamp(0.0, 1.0))
+    let projected = ((pcurve_projection.u - start) / (end - start)).clamp(0.0, 1.0);
+    // Only a point beside a seam can take the wrong preimage; elsewhere the
+    // projection stands as before.
+    if !absolute_split || (edge_fraction.min(1.0 - edge_fraction) >= 1e-6 && projected.min(1.0 - projected) >= 1e-6) {
+        return Ok(projected);
+    }
+    // Near a closed rim's seam the surface projection may report the other
+    // end of the period; settle the preimage in model space, preferring the
+    // traversal fraction the coedge implies.
+    let expected = if coedge.forward { edge_fraction } else { 1.0 - edge_fraction };
+    // A pcurve may run a period outside the surface's chart (lifted into
+    // the face's band); on a closed direction its uv is wrapped back before
+    // evaluating, never clamped onto the chart's edge.
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Sew, "domain")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Sew, "domain")?;
+    let closes = |a: Vec3, b: Vec3| a.sub(b).length() <= 1e-9 * (1.0 + a.length());
+    let (um, vm) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
+    let closed_u = closes(
+        face.surface.evaluate(u0, vm).or_refuse(KernelStage::Sew, "evaluate")?,
+        face.surface.evaluate(u1, vm).or_refuse(KernelStage::Sew, "evaluate")?,
+    );
+    let closed_v = closes(
+        face.surface.evaluate(um, v0).or_refuse(KernelStage::Sew, "evaluate")?,
+        face.surface.evaluate(um, v1).or_refuse(KernelStage::Sew, "evaluate")?,
+    );
+    let wrap = |x: f64, low: f64, high: f64, closed: bool| {
+        if closed && high > low && (x < low || x > high) { low + (x - low).rem_euclid(high - low) } else { x }
+    };
+    let image = |f: f64| {
+        let uv = coedge.pcurve.evaluate(start + (end - start) * f)?;
+        face.surface.evaluate(wrap(uv.x, u0, u1, closed_u), wrap(uv.y, v0, v1, closed_v))
+    };
+    closest_fraction(image, point, &[projected, expected, 0.0, 1.0], expected).or_refuse(KernelStage::Sew, "evaluate")
 }
 
 /// Diagnostic: (#one-use edges, #coedges, geometry-hash of the one-use set).
@@ -289,6 +385,17 @@ fn conform_overlapping_one_use_edges_pass(
     // point ≫ weld tol from both endpoints) is untouched. Escape hatch for A/B.
     let endpoint_sliver_guard = std::env::var("BREP_CONFORM_ENDPOINT_GUARD").as_deref() != Ok("0");
     let endpoint_weld = assembler_weld(assembler.tolerance);
+    // Splits are judged in absolute geometry at the vertex identity radius,
+    // the radius at which `Assembler::vertex` fuses points and
+    // `Assembler::edge` stamps a piece degenerate. Two operands whose seam
+    // vertices sit between that radius and the weld radius apart on one
+    // shared rim (a cone turned a few microradians about a cylinder's axis)
+    // keep both vertices, so each rim must be split at the other's vertex
+    // for the pieces to weld. Judged at the weld radius, or by parameter
+    // fraction (a few 1e-6 on a rim of length 30 is a fraction of 1e-7),
+    // the split was dropped and both rims stayed one-use closed rings.
+    let absolute_split = crate::switch!("BREP_NEAR_SEAM_RIM_SPLIT", true);
+    let identity_radius = assembler.tolerance.max(1e-7);
     // A conformance split at `other`'s endpoints only ELIMINATES a one-use edge
     // if the resulting sub-piece of `edge` can WELD to a piece of `other` — that
     // is the entire purpose of the split. `Assembler::edge` welds only at the
@@ -331,6 +438,9 @@ fn conform_overlapping_one_use_edges_pass(
                 continue;
             }
             let mut fractions = vec![0.0, 1.0];
+            // Whether a split this coedge takes came from the near-seam rule:
+            // its pieces are then cut and mapped in model space too.
+            let mut seam_split = false;
             for other in &candidates {
                 // A conformance split at `other`'s endpoint only helps if the
                 // resulting piece can later WELD to `other` (share one edge
@@ -375,10 +485,28 @@ fn conform_overlapping_one_use_edges_pass(
                     }
                     continue;
                 }
+                // The near-seam rule is for two closed one-use rings on one
+                // carrier (each rim still whole, its seam vertex on the
+                // other): every other pair keeps the weld-radius judgement,
+                // which a near-coincident cap's vertex beside an edge needs.
+                let pair_seam = absolute_split
+                    && edge.start_vertex_id == edge.end_vertex_id
+                    && other.start_vertex_id == other.end_vertex_id;
+                let split_guard_radius = if pair_seam { identity_radius } else { endpoint_weld };
                 for vertex_id in [other.start_vertex_id, other.end_vertex_id] {
                     if let Some(fraction) =
                         edge_fraction_at_point(edge, vertex_map[&vertex_id], geometric_tolerance)?
                     {
+                        // The projection onto a closed rim can land on the
+                        // seam end when the point sits a few 1e-10 of the
+                        // period inside it; settle the side by the residual.
+                        let fraction = if pair_seam && fraction.min(1.0 - fraction) < 1e-6 {
+                            let at = |f: f64| edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * f);
+                            closest_fraction(at, vertex_map[&vertex_id], &[fraction, 0.0, 1.0], fraction)
+                                .or_refuse(KernelStage::Sew, "evaluate")?
+                        } else {
+                            fraction
+                        };
                         // Endpoint-sliver guard, in ABSOLUTE geometry (the
                         // fraction's scale varies with edge length): reject a
                         // split whose point lands within the weld radius of this
@@ -396,9 +524,37 @@ fn conform_overlapping_one_use_edges_pass(
                             let dstart =
                                 split_pt.sub(vertex_map[&edge.start_vertex_id]).length();
                             let dend = split_pt.sub(vertex_map[&edge.end_vertex_id]).length();
-                            if dstart <= endpoint_weld || dend <= endpoint_weld {
+                            if dstart <= split_guard_radius || dend <= split_guard_radius {
                                 continue;
                             }
+                            // Inside the weld band of an endpoint the split is
+                            // kept only for a vertex ON this edge (a seam
+                            // vertex of the same rim); a vertex merely beside
+                            // it (a cap a few 1e-6 off) is the endpoint's
+                            // weld partner, as before.
+                            if pair_seam
+                                && (dstart <= endpoint_weld || dend <= endpoint_weld)
+                                && split_pt.sub(vertex_map[&vertex_id]).length() > identity_radius
+                            {
+                                continue;
+                            }
+                        }
+                        if pair_seam {
+                            if fraction <= 0.0 || fraction >= 1.0 {
+                                continue;
+                            }
+                            let at = |f: f64| edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * f);
+                            let split_pt = at(fraction).or_refuse(KernelStage::Sew, "evaluate")?;
+                            let mut distinct = true;
+                            for &value in &fractions {
+                                let existing = at(value).or_refuse(KernelStage::Sew, "evaluate")?;
+                                distinct &= existing.sub(split_pt).length() > identity_radius;
+                            }
+                            if distinct {
+                                fractions.push(fraction);
+                                seam_split = true;
+                            }
+                            continue;
                         }
                         if fraction > 1e-7
                             && fraction < 1.0 - 1e-7
@@ -407,6 +563,27 @@ fn conform_overlapping_one_use_edges_pass(
                                 .any(|value| (*value - fraction).abs() <= 1e-6)
                         {
                             fractions.push(fraction);
+                        } else if absolute_split && fraction > 0.0 && fraction < 1.0 {
+                            // The fractional thresholds above are relative to
+                            // the edge: on an arc of length 25 a seam vertex
+                            // 1.1e-5 (past the weld radius) from its end is a
+                            // fraction of 4.4e-7 and was dropped, so the arc
+                            // never met its mate's pieces. Take such a split
+                            // when the vertex lies ON the edge and the split
+                            // is past the weld radius from the ends and every
+                            // other split, in model space.
+                            let at = |f: f64| edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * f);
+                            let split_pt = at(fraction).or_refuse(KernelStage::Sew, "evaluate")?;
+                            let mut far = split_pt.sub(vertex_map[&vertex_id]).length() <= identity_radius
+                                && split_pt.sub(vertex_map[&edge.start_vertex_id]).length() > endpoint_weld
+                                && split_pt.sub(vertex_map[&edge.end_vertex_id]).length() > endpoint_weld;
+                            for &value in &fractions {
+                                far &= at(value).or_refuse(KernelStage::Sew, "evaluate")?.sub(split_pt).length() > endpoint_weld;
+                            }
+                            if far {
+                                fractions.push(fraction);
+                                seam_split = true;
+                            }
                         }
                     }
                 }
@@ -426,10 +603,26 @@ fn conform_overlapping_one_use_edges_pass(
             };
             let mut replacements = Vec::new();
             let mut plan_valid = true;
+            // A piece narrower than the split knot floor (relative to a long
+            // domain, absolute on a short one) cannot be trimmed later from
+            // the whole curve:
+            // `snap_edge_curve_endpoints` skips such a trim and would keep
+            // the full domain. Every piece of such an edge is cut as its own
+            // curve here, so a snap only moves its end poles.
+            let [domain_start, domain_end] = edge.curve.domain().or_refuse(KernelStage::Sew, "domain")?;
+            let domain_span = domain_end - domain_start;
+            let cut_pieces = seam_split
+                && traversal_fractions
+                    .windows(2)
+                    .map(|pair| (pair[1] - pair[0]) * (edge.t1 - edge.t0).abs())
+                    .filter(|width| *width > 0.0)
+                    // Relative to a long domain, absolute on a short one (the
+                    // snap's trim floor is 2e-9 in parameter).
+                    .any(|width| width < 1e-6 * domain_span.max(1.0));
             for pair in traversal_fractions.windows(2) {
                 let traversal_a = pair[0];
                 let traversal_b = pair[1];
-                if traversal_b - traversal_a <= 1e-7 {
+                if traversal_b - traversal_a <= if seam_split { 0.0 } else { 1e-7 } {
                     continue;
                 }
                 let edge_a = if coedge.forward {
@@ -454,11 +647,23 @@ fn conform_overlapping_one_use_edges_pass(
                 // pieces of the SAME original edge, never to a coincident twin.
                 let parent_key = assembler.edge_boundary_key.get(&edge.id).copied();
                 let parent_constructed = assembler.imprint_edges.contains(&edge.id);
+                let (piece_curve, piece_t0, piece_t1) = if cut_pieces {
+                    let piece = curve_subrange(
+                        &edge.curve,
+                        (t0.min(t1) - domain_start) / domain_span,
+                        (t0.max(t1) - domain_start) / domain_span,
+                        true,
+                    )?;
+                    let [first, last] = piece.domain().or_refuse(KernelStage::Sew, "domain")?;
+                    if t0 <= t1 { (piece, first, last) } else { (piece, last, first) }
+                } else {
+                    (edge.curve.clone(), t0, t1)
+                };
                 let (edge_id, reversed) = assembler.edge(
                     SourceEdge {
-                        curve: edge.curve.clone(),
-                        t0,
-                        t1,
+                        curve: piece_curve,
+                        t0: piece_t0,
+                        t1: piece_t1,
                         start,
                         end,
                         degenerate: false,
@@ -469,14 +674,14 @@ fn conform_overlapping_one_use_edges_pass(
                     },
                     forward,
                 )?;
-                let pcurve_start = pcurve_fraction_at_edge_fraction(face, coedge, edge, edge_a)?;
-                let pcurve_end = pcurve_fraction_at_edge_fraction(face, coedge, edge, edge_b)?;
+                let pcurve_start = pcurve_fraction_at_edge_fraction(face, coedge, edge, edge_a, seam_split)?;
+                let pcurve_end = pcurve_fraction_at_edge_fraction(face, coedge, edge, edge_b, seam_split)?;
                 // A piece that spans real edge length but collapses in
                 // pcurve space means the pcurve mapping is unreliable here;
                 // emitting a degenerate piece would open the loop, so keep
                 // the original coedge untouched (the assembly then reports
                 // a clean error instead of building an invalid solid).
-                if (pcurve_end - pcurve_start).abs() <= 1e-9 {
+                if (pcurve_end - pcurve_start).abs() <= if seam_split { 0.0 } else { 1e-9 } {
                     plan_valid = false;
                     break;
                 }
@@ -484,6 +689,7 @@ fn conform_overlapping_one_use_edges_pass(
                     &coedge.pcurve,
                     pcurve_start.min(pcurve_end),
                     pcurve_start.max(pcurve_end),
+                    seam_split,
                 )?;
                 if pcurve_start > pcurve_end {
                     pcurve = pcurve.reversed().or_refuse(KernelStage::Sew, "reversed")?;

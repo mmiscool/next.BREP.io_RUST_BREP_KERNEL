@@ -69,6 +69,7 @@ mod expression;
 #[path = "features/mod.rs"]
 pub(crate) mod features;
 pub use features::common::{first_reference_name, reference_names};
+pub use features::weld::is_weld_type;
 /// The NURBS Solid's cage resolver, which the engine's cage editor reads its
 /// handles through (`resolve_cage`, `primitive_cage`, `has_persisted_cage`).
 pub use features::nurbs_solid;
@@ -1698,6 +1699,14 @@ pub(crate) fn execute_feature_with_later(
         // --- Non-solid construction geometry: editor-drawn pass-throughs ---
         "SP" | "SPLINE" => features::spline::execute(&ctx),
         "WELD" => features::weld::execute(&ctx),
+        "WELD.GROOVE" => features::weld::groove::execute(&ctx),
+        "WELD.TACK" => features::weld::execute_tack(&ctx),
+        "WELD.SPOT" => features::weld::lap::execute_spot(&ctx),
+        "WELD.RSEAM" => features::weld::lap::execute_seam(&ctx),
+        "WELD.PLUG" => features::weld::lap::execute_plug(&ctx),
+        "WELD.EDGE" => features::weld::groove::edge::execute_edge(&ctx),
+        "WELD.CORNER" => features::weld::groove::edge::execute_corner(&ctx),
+        "WELD.SURF" => features::weld::groove::edge::execute_surfacing(&ctx),
         "WP" | "WAYPOINT" => features::waypoint::execute(&ctx),
         "HX" | "HELIX" => features::helix::execute(&ctx),
         // --- Scoped extensions cannot replace built-ins. ---
@@ -2473,7 +2482,7 @@ pub fn execute_history_observed(
     let weld_poses = capture_weld_poses(request, &results, &scene);
     assembly::finish_history_run(request, &mut scene, &env);
     let moved_welds = pose_weld_outputs(request, &env, &mut results, &mut scene, weld_poses);
-    if results.iter().any(|result| result.feature_type == "WELD") {
+    if results.iter().any(|result| features::weld::is_weld_type(&result.feature_type)) {
         assembly::publish_weld_scene(&scene, &moved_welds);
     }
     // Wire-harness tail: route the block's connections over the ports and
@@ -2528,7 +2537,7 @@ fn capture_weld_poses(request: &HistoryRequest, results: &[FeatureResult], scene
     }
     let mut inherited: HashMap<String, (String, crate::AffineTransform)> = HashMap::new();
     for (index, result) in results.iter().enumerate() {
-        if result.feature_type != "WELD" || result.error.is_some() { continue; }
+        if !features::weld::is_weld_type(&result.feature_type) || result.error.is_some() { continue; }
         let Some(feature) = request.features.get(index) else { continue; };
         let Some(seam) = result.weld_source_seam.clone()
             .or_else(|| features::common::first_reference_name(feature.input_params.get("seam"))) else { continue; };
@@ -2597,7 +2606,7 @@ fn withdraw_weld(results: &mut [FeatureResult], scene: &mut SceneMap, index: usi
     for (name, _) in &result.points { scene.points.remove(name); }
     for (name, _) in &result.paths { scene.paths.remove(name); }
     for (name, _) in &result.frames { scene.frames.remove(name); }
-    let mut removal = FeatureResult::empty(&result.id, "WELD");
+    let mut removal = FeatureResult::empty(&result.id, &result.feature_type);
     removal.removed = result.added.iter().map(|added| added.name.clone()).collect();
     scene.apply(&removal);
     // The cache entry stays and keeps owning the weld: it no longer holds the
@@ -2645,8 +2654,10 @@ fn pose_weld_outputs(request: &HistoryRequest, env: &Env, results: &mut [Feature
     // before any weld is withdrawn, so a chained seam still reads as resident.
     let rebuildable: Vec<bool> = weld_poses.iter().map(|(index, _, _)| {
         let result = &results[*index];
+        // A groove or lap weld is placed from a face, a fillet from an edge or path.
         let seam = result.weld_source_seam.as_deref()
-            .is_some_and(|seam| scene.resolve_edge(seam).is_some() || scene.resolve_path(seam).is_some());
+            .is_some_and(|seam| scene.resolve_edge(seam).is_some() || scene.resolve_path(seam).is_some()
+                || !scene.resolve_face_group(seam).is_empty());
         seam && result.weld_joint_solids.iter().all(|solid| scene.solids.contains_key(solid))
     }).collect();
     // Rebuilds run after every other weld is posed and every rebuilt weld is
@@ -2686,7 +2697,7 @@ fn pose_weld_outputs(request: &HistoryRequest, env: &Env, results: &mut [Feature
             result.points.clear();
             result.paths.clear();
             // Remove failed geometry from the scene, result and its owning cache.
-            let mut removal = FeatureResult::empty(&result.id, "WELD");
+            let mut removal = FeatureResult::empty(&result.id, &result.feature_type);
             removal.removed = result.added.iter()
                 .filter(|added| scene.solids.get(&added.name) == Some(&added.handle))
                 .map(|added| added.name.clone()).collect();

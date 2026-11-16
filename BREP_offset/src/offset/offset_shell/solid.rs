@@ -122,6 +122,9 @@ fn offset_solid_joined(
                 if let Some(grown) = super::revolved_parallel::revolved_parallel(source, distance) {
                     return Ok(grown);
                 }
+                if let Some(grown) = super::pipe_parallel::pipe_parallel(source, distance) {
+                    return Ok(grown);
+                }
             }
             return Err(error);
         }
@@ -140,7 +143,9 @@ fn offset_solid_joined(
                         .collect();
                     Ok(OffsetShellResultRecord { solid, face_images })
                 }
-                _ => super::revolved_parallel::revolved_parallel(source, distance).ok_or(error),
+                _ => super::revolved_parallel::revolved_parallel(source, distance)
+                    .or_else(|| super::pipe_parallel::pipe_parallel(source, distance))
+                    .ok_or(error),
             },
         },
     }

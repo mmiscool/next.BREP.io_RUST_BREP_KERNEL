@@ -897,6 +897,13 @@ fn mask_openings(board: &Board, top: bool) -> impl Iterator<Item = Shape> + '_ {
     // Vias open when the board's rules leave them untented, on a side they
     // reach: a blind via on its outer side only, a buried one on neither.
     let last = board.layer_count.saturating_sub(1);
+    // A pad's vias open on the side away from the pad unless tented there.
+    let pad_vias: Vec<Shape> = board
+        .pad_vias()
+        .into_iter()
+        .filter(|(_, tented, far_is_bottom)| !tented && *far_is_bottom != top)
+        .map(|(via, _, _)| grown(Shape::circle(via.at, via.diameter / 2), board.rules.mask_expansion))
+        .collect();
     let vias = board
         .vias
         .iter()
@@ -904,7 +911,8 @@ fn mask_openings(board: &Board, top: bool) -> impl Iterator<Item = Shape> + '_ {
             let (from, to) = via.layers(board.layer_count);
             !board.rules.tent_vias && if top { from == 0 } else { to == last }
         })
-        .map(move |via| grown(Shape::circle(via.at, via.diameter / 2), board.rules.mask_expansion));
+        .map(move |via| grown(Shape::circle(via.at, via.diameter / 2), board.rules.mask_expansion))
+        .chain(pad_vias);
     vias.chain(board.placements.iter().flat_map(move |placement| {
         placement.footprint.pads.iter().filter_map(move |pad| {
             brep_ecad_core::fabrication::pad_mask_open(board, placement, pad, top).then(|| {
@@ -1041,7 +1049,7 @@ fn silkscreen(board: &Board, top: bool) -> Option<Body> {
 fn via_barrels(board: &Board) -> Option<Body> {
     let mut soup = Soup::default();
     let facets = ARC_FACETS * 2;
-    for via in &board.vias {
+    for via in &board.all_vias() {
         let (from, to) = via.layers(board.layer_count);
         let (lo, hi) = (
             mm(board::layer_z(to, board.layer_count)),

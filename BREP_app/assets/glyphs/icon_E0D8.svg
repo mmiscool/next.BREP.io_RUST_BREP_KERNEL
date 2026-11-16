@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="groove_weld" brep:unicode="E0D8">
+  <path d="M80 420H440L480 820H80Z" fill="#7a4d10"/>
+  <path d="M120 460H404L436 780H120Z" fill="#f0b840"/>
+  <path d="M920 420H560L520 820H920Z" fill="#7a4d10"/>
+  <path d="M880 460H596L564 780H880Z" fill="#f0b840"/>
+  <path d="M440 420H560L520 820H480Z" fill="#125236"/>
+  <path d="M400 420C430 300 570 300 600 420Z" fill="#125236"/>
+  <path d="M460 440H540L510 760H490Z" fill="#a5e8c4"/>
+  <path d="M440 400C470 340 530 340 560 400Z" fill="#a5e8c4"/>
+</svg>

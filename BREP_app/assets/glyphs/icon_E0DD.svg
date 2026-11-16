@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="edge_weld" brep:unicode="E0DD">
+  <path d="M200 420H480V900H200ZM520 420H800V900H520Z" fill="#7a4d10"/>
+  <path d="M240 460H440V860H240ZM560 460H760V860H560Z" fill="#f0b840"/>
+  <path d="M200 420C200 220 800 220 800 420Z" fill="#125236"/>
+  <path d="M250 400C270 280 730 280 750 400Z" fill="#a5e8c4"/>
+</svg>

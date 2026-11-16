@@ -1800,7 +1800,7 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
         ToolSpec::new(
             "document_import",
             "document",
-            "Import a STEP / IGES / Parasolid (.x_t) / STL / OBJ / 3MF file from the host's files (the filesystem natively; the page's document store in the browser, which holds text formats only — a binary file goes through `doc_import` with its content) as an Import 3D Model feature (format by extension unless given).",
+            "Import a STEP / IGES / Parasolid (.x_t, .x_b) / STL / OBJ / 3MF file from the host's files (the filesystem natively; the page's document store in the browser, which holds text formats only — a binary file goes through `doc_import` with its content) as an Import 3D Model feature (format by extension unless given).",
             object_schema(json!({ "path": { "type": "string" }, "format": { "type": "string", "enum": ["step", "iges", "parasolid", "stl", "obj", "3mf"] }, "timeout_ms": { "type": "integer", "default": 120000 } }), &["path"]),
             Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
             move |args| {
@@ -1812,7 +1812,7 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                     let format = s(&args, "format").unwrap_or(match ext.as_str() {
                         "step" | "stp" => "step".into(),
                         "iges" | "igs" => "iges".into(),
-                        "x_t" | "xmt_txt" => "parasolid".into(),
+                        "x_t" | "xmt_txt" | "p_t" | "x_b" | "xmt_bin" | "p_b" => "parasolid".into(),
                         "stl" => "stl".into(),
                         "obj" => "obj".into(),
                         "3mf" => "3mf".into(),

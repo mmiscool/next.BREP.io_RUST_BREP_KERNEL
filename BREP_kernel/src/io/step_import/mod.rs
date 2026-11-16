@@ -446,7 +446,18 @@ fn bounded_trim_diagnostics(
 /// feature pipeline has no diagnostics channel to carry the answer, and a
 /// measurement nobody reads is not worth its cost on every IMPORT3D.
 pub fn import_step_report(text: &str) -> Result<StepImportReport, String> {
-    let imported = collect_step_solids(text)?;
+    import_step_report_with(text, false)
+}
+
+/// [`import_step_report`] building every OPEN_SHELL as a sheet body
+/// (`BodyKind::Sheet`) among its solids, not skipping it: the Parasolid
+/// lane's, whose translation writes a sheet body as an open shell.
+pub(crate) fn import_step_report_with_sheets(text: &str) -> Result<StepImportReport, String> {
+    import_step_report_with(text, true)
+}
+
+fn import_step_report_with(text: &str, sheets: bool) -> Result<StepImportReport, String> {
+    let imported = bodies::collect_step_solids_with(text, sheets)?;
     let mut diagnostics =
         precision::stated_precision_diagnostics(&imported.stated_precisions_mm, &imported.solids);
     bounded_trim_diagnostics(&imported.bounded_trims, &mut diagnostics);

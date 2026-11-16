@@ -325,32 +325,10 @@ impl EngineState {
     /// annotations: `[{id, type, icon, text, status, message, color:[r,g,b],
     /// world:[x,y,z], enabled, open, selected, textSizePt}]`. Empty without an
     /// active view. The automation registry's copy of [`Self::pmi_labels`].
-    /// The weld symbol a `weldCallout` row asks for: `None` for another type,
-    /// the text-leader style or a weld feature not in the history; `Err` when
-    /// one of its numbers does not evaluate (the row then shows the error).
-    pub(crate) fn weld_symbol_result(&self, row: &brep_kernel::PmiAnnotationReport) -> Option<Result<crate::pmi_weld_symbol::WeldSymbol, String>> {
-        if row.kind != crate::pmi_weld_symbol::WELD_CALLOUT {
-            return None;
-        }
-        let state = self.pmi_state_shared();
-        let (_, annotation) = state.find_annotation(&row.id)?;
-        let weld_id = annotation.params.get("weld")?.as_str()?.trim().to_string();
-        let mut index = 0;
-        let weld = loop {
-            let id = self.feature_id_at(index)?;
-            if id == weld_id && self.feature_type_at(index).as_deref() == Some("WELD") {
-                break serde_json::from_str::<serde_json::Value>(&self.feature_params_json(index)).ok()?;
-            }
-            index += 1;
-        };
-        let env = brep_kernel::Env::build(&self.history.expressions(), &self.history.configurator()).ok();
-        let evaluate = |source: &str| env.as_ref().and_then(|env| env.eval(source).ok());
-        crate::pmi_weld_symbol::WeldSymbol::from_params(&annotation.params, &weld, &evaluate).transpose()
-    }
-
-    /// The weld symbol a row draws, when it draws one.
+    /// The weld symbol a row draws, when it draws one: the kernel builds it
+    /// on the report row (`weldSymbol`) for every consumer alike.
     pub(crate) fn weld_symbol(&self, row: &brep_kernel::PmiAnnotationReport) -> Option<crate::pmi_weld_symbol::WeldSymbol> {
-        self.weld_symbol_result(row).and_then(Result::ok)
+        row.weld_symbol.clone()
     }
 
     /// Everything a weld symbol row is drawn from: the symbol, the seam point
@@ -432,10 +410,6 @@ impl EngineState {
                 // nobody sees.
                 let (status, message) = if row.status == PmiStatus::Ok && self.balloon_target_hidden_live(row) {
                     (PmiStatus::Error, LIVE_HIDDEN_MESSAGE.to_string())
-                } else if let (PmiStatus::Ok, Some(Err(error))) = (row.status, self.weld_symbol_result(row)) {
-                    // A weld symbol number that does not evaluate: the row shows
-                    // its text leader and this error, never a silently empty field.
-                    (PmiStatus::Error, error)
                 } else {
                     (row.status, row.message.clone())
                 };

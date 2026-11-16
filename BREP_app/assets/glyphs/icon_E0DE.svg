@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="corner_weld" brep:unicode="E0DE">
+  <path d="M140 300H560V480H320V880H140Z" fill="#7a4d10"/>
+  <path d="M180 340H520V440H280V840H180Z" fill="#f0b840"/>
+  <path d="M560 300A180 180 0 1 1 320 480H560Z" fill="#125236"/>
+  <path d="M560 340A140 140 0 0 1 700 480H560Z" fill="#a5e8c4"/>
+</svg>

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="plug_weld" brep:unicode="E0DB">
+  <path d="M80 360H380V540H80ZM620 360H920V540H620Z" fill="#7a4d10"/>
+  <path d="M120 400H380V500H120ZM620 400H880V500H620Z" fill="#f0b840"/>
+  <path d="M80 540H920V720H80Z" fill="#7a4d10"/>
+  <path d="M120 580H880V680H120Z" fill="#d4901f"/>
+  <path d="M380 340H620V540H380Z" fill="#125236"/>
+  <path d="M410 370H590V520H410Z" fill="#a5e8c4"/>
+</svg>

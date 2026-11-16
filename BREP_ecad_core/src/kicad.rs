@@ -707,6 +707,7 @@ pub fn import_footprint(text: &str) -> Result<(Footprint, Vec<String>), String> 
                     layers,
                     trapezoid_delta,
                     polygon,
+                    vias: None,
                 });
             }
             "fp_line" if layer.is_some() => {

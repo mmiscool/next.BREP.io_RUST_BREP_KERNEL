@@ -169,6 +169,9 @@ pub struct XtFile {
     pub schema: String,
     /// The header's `KEY=value` pairs (parts 1 to 3).
     pub header: Vec<(String, String)>,
+    /// A partition (`TRANSMIT FILE (partition)`): its root is the WORLD,
+    /// whose bodies are the partition's.
+    pub partition: bool,
     nodes: Vec<Node>,
     by_index: HashMap<u32, usize>,
 }
@@ -206,18 +209,17 @@ const NULL_INT: i64 = -32764;
 
 /// Read a text transmit file (`.x_t`, `.xmt_txt`).
 pub fn parse_xt_text(text: &str) -> Result<XtFile, String> {
-    let bytes = text.as_bytes();
-    if bytes.starts_with(b"PS") {
-        return Err("this is a binary Parasolid file (.x_b); only text .x_t files are read".into());
-    }
     let (header, body_start) = split_header(text);
+    if text.as_bytes()[body_start..].starts_with(b"PS") {
+        return Err("this is a binary Parasolid file (.x_b); read its bytes, not its text".into());
+    }
     let data = join_records(&text[body_start..]);
-    let mut stream = Stream { data: &data, at: 0 };
+    let mut stream = Stream { data: &data, at: 0, encoding: Encoding::Text };
     stream.skip_blank();
     match stream.next_byte() {
         Some(b'T') => {}
         Some(b'P' | b'B') => {
-            return Err("this is a binary Parasolid file (.x_b); only text .x_t files are read".into())
+            return Err("this is a binary Parasolid file (.x_b); read its bytes, not its text".into())
         }
         other => {
             return Err(format!(
@@ -226,11 +228,67 @@ pub fn parse_xt_text(text: &str) -> Result<XtFile, String> {
             ))
         }
     }
-    let modeller_version = stream.string()?;
-    if modeller_version.contains("(partition)") {
-        return Err("this is a Parasolid partition file; only part files are read".into());
+    parse_data(header, stream)
+}
+
+/// Read a transmit file, text or binary, from its bytes: a text part, a
+/// neutral binary (`PS\0\0`, big-endian) or typed binary (`PS\0\1` and the
+/// writer's machine description) part or partition, with or without the
+/// keyword header (§3.1, §3.3). A SolidWorks body is such a partition.
+pub fn parse_xt(bytes: &[u8]) -> Result<XtFile, String> {
+    // The keyword header is text in every format; the data follows the line
+    // that ends it. Only a file that starts with the header's preamble has
+    // one: a headerless binary file may hold that text in its own data.
+    let has_header = bytes.trim_ascii_start().starts_with(b"**ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    let body_start = match find(bytes, b"**END_OF_HEADER").filter(|_| has_header) {
+        Some(end) => bytes[end..].iter().position(|&b| b == b'\n').map_or(bytes.len(), |n| end + n + 1),
+        None => 0,
+    };
+    let data = &bytes[body_start..];
+    let flag = data.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(data.len());
+    if !data[flag..].starts_with(b"PS") && !data[flag..].starts_with(b"B") {
+        return parse_xt_text(&String::from_utf8_lossy(bytes));
     }
-    let schema_name = stream.string()?;
+    let (header, _) = split_header(&String::from_utf8_lossy(&bytes[..body_start]));
+    let data = &data[flag..];
+    let (little, at) = match data {
+        [b'P', b'S', 0, 0, ..] => (false, 4),
+        [b'P', b'S', 0, 1, order, double, character, ..] => {
+            if *double != 0 || *character != 0 {
+                return Err(format!(
+                    "this typed binary Parasolid file was written with {} reals and {} characters; only IEEE reals and \
+                     ASCII characters are read",
+                    if *double == 0 { "IEEE" } else { "VAX D-float" },
+                    if *character == 0 { "ASCII" } else { "EBCDIC" }
+                ));
+            }
+            (*order == 1, 7)
+        }
+        [b'P', b'S', ..] => return Err("this binary Parasolid file has an unknown flag sequence after 'PS'".into()),
+        _ => {
+            return Err("this is a bare binary Parasolid file, written in its machine's own format with no \
+                        description of that machine; only neutral and typed binary are read"
+                .into())
+        }
+    };
+    parse_data(header, Stream::binary(&data[at..], little))
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The part data after its flag sequence: the modeller version, the schema,
+/// the user field size, then the nodes to the terminator (§2.1, §3.2, §3.3).
+fn parse_data(header: Vec<(String, String)>, mut stream: Stream) -> Result<XtFile, String> {
+    // Binary writes the modeller version's length in two bytes and the
+    // schema's in four (§3.3).
+    let modeller_version = stream.header_string(2)?;
+    let partition = modeller_version.contains("(partition)");
+    if modeller_version.contains("(deltas)") {
+        return Err("this is a Parasolid partition's deltas (its rollback history), which holds no bodies".into());
+    }
+    let schema_name = stream.header_string(4)?;
     // `SCH_1400068_14000_13006`: the base suffix marks embedded schema deltas,
     // followed by the maximum node type (§2.1.2.2).
     let embedded = schema_name.split('_').count() >= 4;
@@ -242,7 +300,7 @@ pub fn parse_xt_text(text: &str) -> Result<XtFile, String> {
                 schema::BASE_SCHEMA
             ));
         }
-        stream.int()?;
+        stream.short()?;
     }
     // Without embedded deltas the layouts are the named schema's own: the
     // base's, or a stored schema's.
@@ -259,16 +317,16 @@ pub fn parse_xt_text(text: &str) -> Result<XtFile, String> {
             schema::STORED_SCHEMAS.join(", ")
         ));
     }
-    let user_field_size = stream.int()?.unwrap_or(0).max(0) as usize;
+    let user_field_size = stream.long()?.unwrap_or(0).max(0) as usize;
     let mut layouts: HashMap<u16, Rc<NodeLayout>> = HashMap::default();
     let mut nodes = Vec::new();
     let mut by_index = HashMap::default();
     loop {
         let at = stream.at;
-        let node_type = stream.int()?.ok_or("a node type is unset")?;
+        let node_type = stream.short()?.ok_or("a node type is unset")?;
         if node_type == 1 {
             // Terminator: type 1, index 0.
-            if stream.int()? == Some(0) {
+            if stream.index()? == 0 {
                 break;
             }
             return Err(format!("node type 1 at byte {at} is not followed by the terminating 0"));
@@ -298,7 +356,7 @@ pub fn parse_xt_text(text: &str) -> Result<XtFile, String> {
     if nodes.is_empty() {
         return Err("the file holds no nodes".into());
     }
-    Ok(XtFile { modeller_version, schema: schema_name, header, nodes, by_index })
+    Ok(XtFile { modeller_version, schema: schema_name, header, partition, nodes, by_index })
 }
 
 fn base_layout(node_type: u16) -> Result<NodeLayout, String> {
@@ -314,15 +372,15 @@ fn stored_layout(stored: &str, node_type: u16) -> Result<NodeLayout, String> {
         let name = schema::base(node_type).map_or_else(|| format!("node type {node_type}"), |(n, _)| format!("node type {node_type} ({n})"));
         format!("{name} has no known layout in schema {stored} and the file does not describe it")
     })?;
-    read_layout(&mut Stream { data: delta.as_bytes(), at: 0 }, node_type)
+    read_layout(&mut Stream { data: delta.as_bytes(), at: 0, encoding: Encoding::Text }, node_type)
         .map_err(|e| format!("the stored schema {stored} layout of node type {node_type}: {e}"))
 }
 
 /// A node type's layout from its first occurrence (§2.1.2.2): 255 for "as the
 /// base", a new type's full description, or an edit script against the base.
 fn read_layout(stream: &mut Stream, node_type: u16) -> Result<NodeLayout, String> {
-    let count = stream.int()?.ok_or("a field count is unset")?;
     // A field count is a byte (§2.1.2.2); 255 means "as the base".
+    let count = stream.byte_int()?.ok_or("a field count is unset")?;
     if !(0..=255).contains(&count) {
         return Err(format!("node type {node_type} declares {count} fields"));
     }
@@ -380,7 +438,7 @@ fn carries_user_field(node_type: u16) -> bool {
 
 fn read_node(stream: &mut Stream, layout: Rc<NodeLayout>, user_field_size: usize) -> Result<Node, String> {
     let length = if layout.variable() {
-        let n = stream.int()?.ok_or("a variable length is unset")?;
+        let n = stream.long()?.ok_or("a variable length is unset")?;
         let n = usize::try_from(n).map_err(|_| format!("variable length {n} is negative"))?;
         // Every element takes at least one byte of the data.
         if n > stream.remaining() {
@@ -390,22 +448,22 @@ fn read_node(stream: &mut Stream, layout: Rc<NodeLayout>, user_field_size: usize
     } else {
         0
     };
-    let index = stream.int()?.ok_or("a node index is unset")?;
+    let index = stream.index()?;
     let index = u32::try_from(index).ok().filter(|&i| i > 0).ok_or_else(|| format!("node index {index} is invalid"))?;
     let mut values = Vec::with_capacity(layout.fields.len());
     for field in &layout.fields {
         let value = match field.count {
-            Count::Scalar => stream.value(field.kind),
-            Count::Variable if matches!(field.kind, Kind::Char) => stream.chars(length).map(Value::Text),
-            Count::Variable => (0..length).map(|_| stream.value(field.kind)).collect::<Result<_, _>>().map(Value::Array),
-            Count::Fixed(n) => (0..n).map(|_| stream.value(field.kind)).collect::<Result<_, _>>().map(Value::Array),
+            Count::Scalar => stream.value(field),
+            Count::Variable if field.code == b'c' => stream.chars(length).map(Value::Text),
+            Count::Variable => (0..length).map(|_| stream.value(field)).collect::<Result<_, _>>().map(Value::Array),
+            Count::Fixed(n) => (0..n).map(|_| stream.value(field)).collect::<Result<_, _>>().map(Value::Array),
         }
         .map_err(|e| format!("{} field {}: {e}", layout.name, field.name))?;
         values.push(value);
     }
     if layout.node_type < 1000 && carries_user_field(layout.node_type) {
         for _ in 0..user_field_size {
-            stream.int()?;
+            stream.long()?;
         }
     }
     Ok(Node { index, layout, values })
@@ -472,12 +530,26 @@ fn join_records(text: &str) -> Vec<u8> {
     data
 }
 
-struct Stream<'a> {
-    data: &'a [u8],
-    at: usize,
+/// How the part data is encoded: text tokens, or binary (§3.3), neutral
+/// binary big-endian and typed binary in its writer's byte order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Encoding {
+    Text,
+    Binary { little: bool },
 }
 
-impl Stream<'_> {
+pub(super) struct Stream<'a> {
+    data: &'a [u8],
+    at: usize,
+    encoding: Encoding,
+}
+
+impl<'a> Stream<'a> {
+    /// A binary stream from its first byte.
+    pub(super) fn binary(data: &'a [u8], little: bool) -> Self {
+        Stream { data, at: 0, encoding: Encoding::Binary { little } }
+    }
+
     fn skip_blank(&mut self) {
         while self.at < self.data.len() && self.data[self.at].is_ascii_whitespace() {
             self.at += 1;
@@ -496,6 +568,95 @@ impl Stream<'_> {
         let b = self.peek()?;
         self.at += 1;
         Some(b)
+    }
+
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let bytes = self
+            .data
+            .get(self.at..self.at + N)
+            .ok_or("the data ends inside a binary value")?
+            .try_into()
+            .map_err(|_| "a binary value is cut short".to_string())?;
+        self.at += N;
+        Ok(bytes)
+    }
+
+    fn little(&self) -> bool {
+        matches!(self.encoding, Encoding::Binary { little: true })
+    }
+
+    fn raw_i16(&mut self) -> Result<i16, String> {
+        let b = self.take::<2>()?;
+        Ok(if self.little() { i16::from_le_bytes(b) } else { i16::from_be_bytes(b) })
+    }
+
+    fn raw_i32(&mut self) -> Result<i32, String> {
+        let b = self.take::<4>()?;
+        Ok(if self.little() { i32::from_le_bytes(b) } else { i32::from_be_bytes(b) })
+    }
+
+    fn raw_f64(&mut self) -> Result<f64, String> {
+        let b = self.take::<8>()?;
+        Ok(if self.little() { f64::from_le_bytes(b) } else { f64::from_be_bytes(b) })
+    }
+
+    /// A one-byte integer (a field count); text writes it as any integer.
+    fn byte_int(&mut self) -> Result<Option<i64>, String> {
+        match self.encoding {
+            Encoding::Text => self.int(),
+            Encoding::Binary { .. } => Ok(Some(i64::from(self.next_byte().ok_or("the data ends inside a byte")?))),
+        }
+    }
+
+    /// A two-byte integer (a node type, a pointer class); null is -32764.
+    fn short(&mut self) -> Result<Option<i64>, String> {
+        match self.encoding {
+            Encoding::Text => self.int(),
+            Encoding::Binary { .. } => Ok(Some(i64::from(self.raw_i16()?)).filter(|&v| v != NULL_INT)),
+        }
+    }
+
+    /// A four-byte integer (a variable length, the user field size, an
+    /// integer field); null is -32764.
+    fn long(&mut self) -> Result<Option<i64>, String> {
+        match self.encoding {
+            Encoding::Text => self.int(),
+            Encoding::Binary { .. } => Ok(Some(i64::from(self.raw_i32()?)).filter(|&v| v != NULL_INT)),
+        }
+    }
+
+    /// A node index or pointer (§3.3.3): in binary, index + 1 in two bytes
+    /// below 32767; above, the negated remainder + 1 and then the quotient.
+    /// Null is 0.
+    pub(super) fn index(&mut self) -> Result<i64, String> {
+        match self.encoding {
+            Encoding::Text => Ok(self.int()?.unwrap_or(0)),
+            Encoding::Binary { .. } => {
+                let r = i64::from(self.raw_i16()?);
+                match r {
+                    0 => Err(format!("a pointer at byte {} is 0, which no writer emits", self.at - 2)),
+                    r if r > 0 => Ok(r - 1),
+                    r => {
+                        let q = i64::from(self.raw_i16()?);
+                        Ok(q * 32767 - r - 1)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The modeller version and schema strings: in binary, a length of
+    /// `width` bytes then the characters.
+    fn header_string(&mut self, width: usize) -> Result<String, String> {
+        let n = match (self.encoding, width) {
+            (Encoding::Text, _) => return self.string(),
+            (_, 2) => i64::from(self.raw_i16()?),
+            _ => i64::from(self.raw_i32()?),
+        };
+        let n = usize::try_from(n).map_err(|_| format!("a header string length {n} is negative"))?;
+        let bytes = self.data.get(self.at..self.at + n).ok_or("a header string runs past the end of the data")?;
+        self.at += n;
+        Ok(String::from_utf8_lossy(bytes).into_owned())
     }
 
     /// A space-terminated token.
@@ -559,7 +720,11 @@ impl Stream<'_> {
         })
     }
 
-    fn value(&mut self, kind: Kind) -> Result<Value, String> {
+    fn value(&mut self, field: &FieldDef) -> Result<Value, String> {
+        if let Encoding::Binary { .. } = self.encoding {
+            return self.binary_value(field);
+        }
+        let kind = field.kind;
         Ok(match kind {
             Kind::Int => Value::Int(self.int()?),
             Kind::Real => Value::Real(self.real()?),
@@ -587,9 +752,53 @@ impl Stream<'_> {
         })
     }
 
-    /// A short string: its length, a space, then the characters (§2.1.2.1).
+    /// A field in binary (§3.3): by its type code's width. A logical is 0 or
+    /// 1 in its byte and is read as text writes it, `F` or `T`.
+    fn binary_value(&mut self, field: &FieldDef) -> Result<Value, String> {
+        let real = |stream: &mut Self| -> Result<Option<f64>, String> {
+            let value = stream.raw_f64()?;
+            if !value.is_finite() {
+                return Err(format!("a non-finite real at byte {}", stream.at - 8));
+            }
+            Ok((value != -3.14158e13).then_some(value))
+        };
+        Ok(match field.code {
+            b'p' => Value::Int(Some(self.index()?)),
+            b'u' => Value::Int(Some(i64::from(self.next_byte().ok_or("the data ends inside a byte field")?))),
+            b'n' | b'w' => Value::Int(self.short()?),
+            b'd' | b't' => Value::Int(self.long()?),
+            b'f' => Value::Real(real(self)?),
+            b'v' | b'h' => {
+                let (x, y, z) = (real(self)?, real(self)?, real(self)?);
+                Value::Vector(match (x, y, z) {
+                    (Some(x), Some(y), Some(z)) => Some([x, y, z]),
+                    _ => None,
+                })
+            }
+            b'i' => Value::Interval([real(self)?, real(self)?]),
+            b'b' => {
+                let mut out = [None; 6];
+                for v in &mut out {
+                    *v = real(self)?;
+                }
+                Value::Box(out)
+            }
+            b'l' => Value::Char(match self.next_byte().ok_or("the data ends inside a logical field")? {
+                0 => b'F',
+                1 => b'T',
+                other => return Err(format!("a logical byte {other}, expected 0 or 1")),
+            }),
+            b'c' => Value::Char(self.next_byte().ok_or("the data ends inside a character field")?),
+            _ => {
+                return Err("the base schema layout of this field is not known (it is deleted in every schema seen)".into())
+            }
+        })
+    }
+
+    /// A short string: its length, a space, then the characters (§2.1.2.1);
+    /// in binary a one-byte length, then the characters.
     fn string(&mut self) -> Result<String, String> {
-        let n = self.int()?.ok_or("a string length is unset")?;
+        let n = self.byte_int()?.ok_or("a string length is unset")?;
         let n = usize::try_from(n).map_err(|_| format!("string length {n} is negative"))?;
         if n > self.remaining() {
             return Err(format!("string length {n} runs past the end of the data"));
@@ -601,6 +810,11 @@ impl Stream<'_> {
     /// (`\0`, `\n`, `\r`, `\\`, and `\<d>` for d spaces) each counting as the
     /// characters they stand for.
     fn chars(&mut self, n: usize) -> Result<String, String> {
+        if let Encoding::Binary { .. } = self.encoding {
+            let bytes = self.data.get(self.at..self.at + n).ok_or("the data ends inside a string")?;
+            self.at += n;
+            return Ok(String::from_utf8_lossy(bytes).into_owned());
+        }
         let mut out = Vec::with_capacity(n);
         while out.len() < n {
             let b = self.next_byte().ok_or("the data ends inside a string")?;
@@ -629,14 +843,19 @@ impl Stream<'_> {
     /// element count, type (when not a pointer), transmit flag (when variable).
     fn field_def(&mut self) -> Result<FieldDef, String> {
         let name = self.string()?;
-        let pointer_class = self.int()?.unwrap_or(0);
-        let elements = self.int()?.ok_or("a field's element count is unset")?;
-        let kind = if pointer_class != 0 {
-            Kind::Int
+        let pointer_class = self.short()?.unwrap_or(0);
+        // Binary writes the element count as it writes an index (+1, two
+        // bytes): every SolidWorks partition's deltas read to their end so.
+        let elements = match self.encoding {
+            Encoding::Text => self.int()?.ok_or("a field's element count is unset")?,
+            Encoding::Binary { .. } => self.index()?,
+        };
+        let (kind, code) = if pointer_class != 0 {
+            (Kind::Int, b'p')
         } else {
             let code = self.string()?;
             let code = code.bytes().next().ok_or_else(|| format!("field {name} has an empty type"))?;
-            schema::kind_of(code).ok_or_else(|| format!("field {name} has unknown type {:?}", char::from(code)))?
+            (schema::kind_of(code).ok_or_else(|| format!("field {name} has unknown type {:?}", char::from(code)))?, code)
         };
         if elements == 1 {
             self.next_byte().ok_or("the data ends inside a field description")?;
@@ -647,6 +866,6 @@ impl Stream<'_> {
             n if n > 1 && (n as u64) <= self.remaining() as u64 => Count::Fixed(n as usize),
             n => return Err(format!("field {name} has element count {n}")),
         };
-        Ok(FieldDef { name, kind, count })
+        Ok(FieldDef { name, kind, count, code })
     }
 }

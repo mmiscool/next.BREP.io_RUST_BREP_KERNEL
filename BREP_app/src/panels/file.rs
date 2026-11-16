@@ -764,9 +764,12 @@ pub(crate) enum ImportKind {
     Step,
     /// IGES: the STEP lane's probe (subfigure instances raise the same choice).
     Iges,
-    /// Parasolid text (`.x_t`, `.xmt_txt`): the STEP lane's probe, which
-    /// answers flat; the Import 3D Model feature reads it.
+    /// Parasolid text (`.x_t`, `.xmt_txt`, a `.p_t` partition): the STEP
+    /// lane's probe, which answers flat; the Import 3D Model feature reads it.
     Parasolid,
+    /// Parasolid binary (`.x_b`, `.xmt_bin`, a `.p_b` partition): straight to
+    /// the Import 3D Model feature, which reads the bytes.
+    ParasolidBinary,
     /// STL: the mesh reconstruction preview.
     Stl,
     /// 3MF: the STL lane — the same preview, tolerances and accept.
@@ -785,6 +788,10 @@ pub(crate) const IMPORT_TABLE: &[(&str, ImportKind)] = &[
     ("igs", ImportKind::Iges),
     ("x_t", ImportKind::Parasolid),
     ("xmt_txt", ImportKind::Parasolid),
+    ("p_t", ImportKind::Parasolid),
+    ("x_b", ImportKind::ParasolidBinary),
+    ("xmt_bin", ImportKind::ParasolidBinary),
+    ("p_b", ImportKind::ParasolidBinary),
     ("stl", ImportKind::Stl),
     ("3mf", ImportKind::ThreeMf),
     ("obj", ImportKind::Obj),
@@ -795,7 +802,7 @@ pub(crate) const IMPORT_TABLE: &[(&str, ImportKind)] = &[
 /// The extensions of [`IMPORT_TABLE`], for the explorer's filter and the
 /// system file chooser (a test holds the two lists equal).
 const IMPORT_EXTENSIONS: &[&str] =
-    &["step", "stp", "p21", "iges", "igs", "x_t", "xmt_txt", "stl", "3mf", "obj", "kicad_sym", "kicad_mod"];
+    &["step", "stp", "p21", "iges", "igs", "x_t", "xmt_txt", "p_t", "x_b", "xmt_bin", "p_b", "stl", "3mf", "obj", "kicad_sym", "kicad_mod"];
 
 /// The import kind of a file name or path, by its last extension in any case;
 /// `None` for a model document or anything the app does not import. Model
@@ -819,10 +826,10 @@ fn is_iges_name(name: &str) -> bool {
     import_kind(name) == Some(ImportKind::Iges)
 }
 
-/// Whether an imported file name is a Parasolid text part (`.x_t` /
-/// `.xmt_txt`, any case).
+/// Whether an imported file name is a Parasolid part or partition, text or
+/// binary (`.x_t`, `.x_b`, …, any case).
 fn is_parasolid_name(name: &str) -> bool {
-    import_kind(name) == Some(ImportKind::Parasolid)
+    matches!(import_kind(name), Some(ImportKind::Parasolid | ImportKind::ParasolidBinary))
 }
 
 /// The name a file imported into a tab of its own is shown under: the file's
@@ -3879,6 +3886,15 @@ impl FileDialog {
         self.pending_stl_import.take()
     }
 
+    /// A binary Parasolid file has no assembly probe: its bodies go straight
+    /// into one Import 3D Model feature.
+    fn import_parasolid_bytes(&mut self, state: &mut EngineState, name: &str, contents: &[u8]) {
+        match state.import_xt_bytes_feature(contents) {
+            Ok(_) => self.status = format!("imported {name}"),
+            Err(e) => self.status = format!("import failed: {e}"),
+        }
+    }
+
     fn import_obj(&mut self, state: &mut EngineState, name: &str, contents: &[u8]) {
         match state.import_obj_bytes_feature(contents) {
             Ok(_) => self.status = format!("reconstructing {name} in background…"),
@@ -3905,6 +3921,7 @@ impl FileDialog {
             ImportKind::Step | ImportKind::Iges | ImportKind::Parasolid => {
                 self.import_text(state, &name, &bytes, Self::import_step)
             }
+            ImportKind::ParasolidBinary => self.import_parasolid_bytes(state, &name, &bytes),
             ImportKind::Stl => self.stage_mesh_preview(MeshImportFormat::Stl, name, bytes),
             ImportKind::ThreeMf => self.stage_mesh_preview(MeshImportFormat::ThreeMf, name, bytes),
             ImportKind::Obj => self.import_obj(state, &name, &bytes),

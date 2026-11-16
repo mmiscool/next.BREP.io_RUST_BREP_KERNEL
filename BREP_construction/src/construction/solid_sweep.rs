@@ -319,22 +319,48 @@ fn whole_level_on() -> bool {
     crate::switch!("BREP_SWEEP_WHOLE_LEVEL", true)
 }
 
-/// `BREP_SWEEP_SCREW_CARRY` (default off; `=1` on): every screw sweep's walls
-/// are carried along the screw to high order, as a bar's and a crest's already
-/// are, instead of lofted as a cubic through 64 sections a turn (which stands
-/// r·h⁴/384 off the screw: 1e-6 at a groove's floor).
+/// `BREP_SWEEP_SCREW_CARRY` (default on; `=0` restores the cubic loft): every
+/// screw sweep's walls are carried along the screw to high order, as a bar's
+/// and a crest's always are, instead of lofted as a cubic through 64 sections a
+/// turn (which stands r·h⁴/384 off the screw: 1e-6 at a groove's floor).
 fn screw_carry_on() -> bool {
-    crate::switch!("BREP_SWEEP_SCREW_CARRY", false)
+    crate::switch!("BREP_SWEEP_SCREW_CARRY", true)
 }
 
-/// `BREP_SWEEP_APEX_TIP` (default off; `=1` on): a point of a solid of
+/// `BREP_SWEEP_APEX_TIP` (default on; `=0` off): a point of a solid of
 /// revolution on its own axis (a cone's apex) is a critical point of the faces
 /// that meet there. It revolves into nothing, so no edge carries it, and a
-/// groove whose tip it cuts was ended where bisection first saw the level's
+/// groove whose tip it cuts would end where bisection first sees the level's
 /// contour (3.5e-7 short of a cone point's tip) instead of at the point itself.
 fn apex_tip_on() -> bool {
-    crate::switch!("BREP_SWEEP_APEX_TIP", false)
+    crate::switch!("BREP_SWEEP_APEX_TIP", true)
 }
+
+/// `BREP_SWEEP_LEAN_WALLS` (default on; `=0` restores the quintic through 48
+/// sections a turn and the cubic through every sample): a carried screw
+/// sweep's walls in few spans. Along the screw, the carry is of degree 2·`LEAN_CARRY_ORDER` + 1
+/// through that many derivatives, `LEAN_CARRY_PER_TURN` spans a turn, instead
+/// of the quintic through 48. Across it, each boundary piece is a quintic
+/// fitted to its exact envelope samples and checked against the exact envelope
+/// between them (`lean_fit_piece`), instead of the cubic through all of them.
+/// Off, a wall has some 100 by 84 spans: a reader that integrates over its
+/// spans pays their product.
+fn lean_walls_on() -> bool {
+    crate::switch!("BREP_SWEEP_LEAN_WALLS", true)
+}
+
+/// Derivatives the lean carry matches at each span's ends (degree 2m + 1, C^m
+/// at the joints). Its error is r·(h/2)^(2m+2)/(2m+2)!: at m = 4 and eight
+/// spans a turn, 2.4e-11·r.
+const LEAN_CARRY_ORDER: usize = 4;
+
+/// Spans of the lean carry a turn.
+const LEAN_CARRY_PER_TURN: f64 = 8.0;
+
+/// How near (of the scale) the exact envelope a lean boundary piece passes at
+/// the mid-points between its samples, where the cubic it replaces passes
+/// further from it: a tenth of what `sample_band` holds that cubic to.
+const LEAN_FIT_TOLERANCE: f64 = 1e-9;
 
 fn refuse(what: &'static str, message: String) -> KernelRefusal {
     KernelRefusal::unsupported(KernelStage::Classify, what, format!("{SOLID_SWEEP_REFUSAL}: {message}"))
@@ -2165,6 +2191,9 @@ pub fn sweep_solid_within(
 /// what lets a long fine thread be built with few spans. Sections, caps and
 /// parameters are the loft's, so the trims stay as they are.
 fn carry_along_screw(body: &mut BrepSolid, engine: &Engine, c: f64, span: f64, segments: usize) -> Result<(), KernelRefusal> {
+    if lean_walls_on() {
+        return carry_along_screw_to_order(body, engine, c, span, segments, LEAN_CARRY_ORDER);
+    }
     let origin = engine.clip.axis_origin;
     let ez = engine.frame.ez;
     // The six Bézier points of each span collapse to three a span, C² at the joints.
@@ -2261,6 +2290,158 @@ fn carry_along_screw(body: &mut BrepSolid, engine: &Engine, c: f64, span: f64, s
 /// `rows` copies of `row` along the screw, each the image of the last, sharing
 /// the section edges and vertices between neighbours; only the first bottom cap
 /// and the last top cap stay.
+/// Knots of the carry of order `m` (degree 2m + 1, C^m) over [lo, hi] in
+/// `segments` even spans.
+fn carry_knots_of_order(lo: f64, hi: f64, segments: usize, m: usize) -> Vec<f64> {
+    let degree = 2 * m + 1;
+    let mut knots = vec![lo; degree + 1];
+    for k in 1..segments {
+        knots.extend(std::iter::repeat_n(lo + (hi - lo) * k as f64 / segments as f64, m + 1));
+    }
+    knots.extend(std::iter::repeat_n(hi, degree + 1));
+    knots
+}
+
+/// The polar form of the Bézier curve `b` at `ts` (de Casteljau with a
+/// parameter of its own at each level).
+fn bezier_blossom(b: &[Vec3], ts: &[f64]) -> Vec3 {
+    let mut p = b.to_vec();
+    for (level, &t) in ts.iter().enumerate() {
+        for i in 0..p.len() - 1 - level {
+            p[i] = p[i].scale(1.0 - t).add(p[i + 1].scale(t));
+        }
+    }
+    p[0]
+}
+
+/// Control points of the C^m spline of degree 2m + 1 that matches a path and
+/// its first m derivatives at `segments + 1` even steps of [0, h·segments]:
+/// `jet(k)` is the path's derivatives 0..=m at step k (per unit parameter).
+/// Each span is the Hermite interpolant of its two ends' jets; the spline's
+/// points are the spans' polar forms at its knots (`carry_knots_of_order`), which
+/// adjacent spans share where they meet to order m.
+fn carry_points_of_order(jet: impl Fn(usize) -> Vec<Vec3>, h: f64, segments: usize, m: usize) -> Vec<Vec3> {
+    let degree = 2 * m + 1;
+    let binomial = |n: usize, k: usize| -> f64 { (0..k).fold(1.0, |acc, i| acc * (n - i) as f64 / (i + 1) as f64) };
+    // (n - k)!/n!, the factor from a k-th derivative to a k-th difference.
+    let falling = |k: usize| -> f64 { (0..k).fold(1.0, |acc, i| acc / (degree - i) as f64) };
+    let bezier = |k: usize| -> Vec<Vec3> {
+        let (start, end) = (jet(k), jet(k + 1));
+        let mut b = vec![Vec3::new(0.0, 0.0, 0.0); degree + 1];
+        for j in 0..=m {
+            let scale = h.powi(j as i32) * falling(j);
+            // Δ^j b_0 = start_j·scale, so b_j = Σ_i C(j, i) Δ^i b_0.
+            let mut front = start[j].scale(scale);
+            for i in 0..j {
+                // Δ^j b_0 = Σ_i (-1)^(j-i) C(j, i) b_i
+                let sign = if (j - i) % 2 == 0 { 1.0 } else { -1.0 };
+                front = front.sub(b[i].scale(sign * binomial(j, i)));
+            }
+            b[j] = front;
+            // ∇^j b_n = Σ_i (-1)^i C(j, i) b_(n-i) = end_j·scale.
+            let mut back = end[j].scale(scale);
+            for i in 0..j {
+                let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                back = back.sub(b[degree - i].scale(sign * binomial(j, i)));
+            }
+            b[degree - j] = back.scale(if j % 2 == 0 { 1.0 } else { -1.0 });
+        }
+        b
+    };
+    let spans: Vec<Vec<Vec3>> = (0..segments).map(bezier).collect();
+    // Knots in units of a span.
+    let knots = carry_knots_of_order(0.0, segments as f64, segments, m);
+    let count = knots.len() - degree - 1;
+    (0..count)
+        .map(|i| {
+            let args = &knots[i + 1..=i + degree];
+            let k = (args[0].floor() as usize).min(segments - 1);
+            let local: Vec<f64> = args.iter().map(|t| t - k as f64).collect();
+            bezier_blossom(&spans[k], &local)
+        })
+        .collect()
+}
+
+/// `carry_along_screw` to order `m`: each wall's columns and each carried edge
+/// as the C^m spline of degree 2m + 1 through the exact screw and m of its
+/// derivatives at `segments + 1` turns.
+fn carry_along_screw_to_order(body: &mut BrepSolid, engine: &Engine, c: f64, span: f64, segments: usize, m: usize) -> Result<(), KernelRefusal> {
+    let origin = engine.clip.axis_origin;
+    let ez = engine.frame.ez;
+    let degree = 2 * m + 1;
+    let h = span / segments as f64;
+    let carry = |start: Vec3| -> Vec<Vec3> {
+        let axial = ez.scale(start.sub(origin).dot(ez));
+        let radial = start.sub(origin).sub(axial);
+        let jet = |k: usize| -> Vec<Vec3> {
+            let angle = h * k as f64;
+            let mut out = Vec::with_capacity(m + 1);
+            out.push(origin.add(axial).add(radial.rotate_about(ez, angle)).add(ez.scale(c * angle)));
+            for j in 1..=m {
+                // The j-th derivative of the turned radius is the radius turned a further j quarter turns.
+                let turned = radial.rotate_about(ez, angle + j as f64 * std::f64::consts::FRAC_PI_2);
+                out.push(if j == 1 { turned.add(ez.scale(c)) } else { turned });
+            }
+            out
+        };
+        carry_points_of_order(jet, h, segments, m)
+    };
+    let point = |p: &crate::Vec4| Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w);
+    let moved = |p: &crate::Vec4, angle: f64| -> Vec3 { rotate(point(p), origin, ez, angle).add(ez.scale(c * angle)) };
+    let tolerance = 1e-7 * engine.scale;
+    for face in body.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
+        let rows = &face.surface.control_points;
+        if rows[0].len() != segments + 1 {
+            continue; // a cap
+        }
+        if rows.iter().any(|row| moved(&row[0], span).sub(point(&row[segments])).length() > tolerance) {
+            return Err(refuse("screw_loft", "a lofted wall does not follow the screw".into()));
+        }
+        let lifted: Vec<Vec<crate::Vec4>> = rows
+            .iter()
+            .map(|row| {
+                let w = row[0].w;
+                carry(point(&row[0])).into_iter().map(|q| crate::Vec4::from_point(q, w)).collect()
+            })
+            .collect();
+        let v = &face.surface.knots_v;
+        let (lo, hi) = (v[0], *v.last().expect("knots"));
+        face.surface = crate::NurbsSurface::new(face.surface.degree_u, degree, face.surface.knots_u.clone(), carry_knots_of_order(lo, hi, segments, m), lifted)
+            .or_refuse(KernelStage::Fragment, "screw_surface")?;
+    }
+    let height = c * span;
+    let points: rustc_hash::FxHashMap<u64, Vec3> = body.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
+    for edge in &mut body.edges {
+        let (from, to) = (points[&edge.start_vertex_id], points[&edge.end_vertex_id]);
+        let rise = to.sub(from).dot(ez);
+        if (rise.abs() - height.abs()).abs() > tolerance.min(0.25 * height.abs()) {
+            continue; // lies in a cap
+        }
+        let domain = edge.curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
+        let forward = rise * height > 0.0;
+        let mut path = carry(if forward { from } else { to });
+        if !forward {
+            path.reverse();
+        }
+        edge.curve = NurbsCurve::new(
+            degree,
+            carry_knots_of_order(domain[0], domain[1], segments, m),
+            path.into_iter().map(|q| crate::Vec4::from_point(q, 1.0)).collect(),
+        )
+        .or_refuse(KernelStage::Fragment, "screw_edge")?;
+    }
+    Ok(())
+}
+
+/// Control points a carried wall has along the screw, in `segments` spans.
+fn carried_columns(segments: usize) -> usize {
+    if lean_walls_on() {
+        (LEAN_CARRY_ORDER + 1) * (segments + 1)
+    } else {
+        3 * segments + 3
+    }
+}
+
 fn stack_screw_rows(
     row: &BrepSolid,
     engine: &Engine,
@@ -2321,7 +2502,7 @@ fn stack_screw_rows(
         Some(&below) if copy > 0 => below + stride * (copy as u64 - 1),
         _ => id + stride * copy as u64,
     };
-    let is_cap = |face: &crate::FaceRecord| face.surface.control_points[0].len() != 3 * segments + 3;
+    let is_cap = |face: &crate::FaceRecord| face.surface.control_points[0].len() != carried_columns(segments);
     let cap_level = |face: &crate::FaceRecord, level: f64| {
         face.loops.iter().flat_map(|l| &l.coedges).all(|coedge| {
             row.edges.iter().find(|edge| edge.id == coedge.edge_id).is_some_and(|edge| in_level(edge, level))
@@ -2839,6 +3020,185 @@ fn fit_piece(points: &[Vec3]) -> Result<NurbsCurve, KernelRefusal> {
     interpolate_curve(points, 3, &chord_parameters(points)).or_refuse(KernelStage::Fragment, "piece_fit")
 }
 
+/// A boundary piece in few spans: the least-squares quintic through its exact
+/// samples `points` (`reduced`, the same in reduced coordinates), its ends
+/// held, in the fewest spans whose curve stands within the larger of
+/// `LEAN_FIT_TOLERANCE` of the scale and the cubic `fit_piece`'s own worst
+/// miss of the exact envelope at every mid-point between samples (the points
+/// `sample_band` judges the cubic at, here every one): never further from the
+/// envelope than the cubic it replaces. Else that cubic. The knots sit at the
+/// chord parameters of evenly spaced samples (which gather where the samples
+/// do, by the piece's ends, its critical levels), with a ramp of them by each
+/// end, where it turns fastest.
+fn lean_fit_piece(engine: &Engine, reduced: &[(f64, f64)], points: &[Vec3]) -> Result<NurbsCurve, KernelRefusal> {
+    const DEGREE: usize = 5;
+    let last = points.len() - 1;
+    let parameters = chord_parameters(points);
+    let cubic = fit_piece(points)?;
+    // The exact envelope between each two samples, at the mid-point of their
+    // σ (the levels run a + (b − a)(1 − cos πσ)/2 along a band's piece).
+    let (a, b) = (reduced[0].0, reduced[last].0);
+    if (b - a).abs() <= 1e-12 * engine.scale {
+        return Ok(cubic);
+    }
+    let sigma = |level: f64| (1.0 - 2.0 * (level - a) / (b - a)).clamp(-1.0, 1.0).acos() / PI;
+    let mut truths = Vec::with_capacity(last);
+    for k in 0..last {
+        let s = 0.5 * (sigma(reduced[k].0) + sigma(reduced[k + 1].0));
+        let level = a + (b - a) * (1.0 - (PI * s).cos()) / 2.0;
+        let guess = 0.5 * (reduced[k].1 + reduced[k + 1].1);
+        let exact = engine
+            .intervals_at(level)?
+            .iter()
+            .flat_map(|x| [x.lo, x.hi])
+            .map(|o| guess + engine.o_difference(o, guess))
+            .min_by(|x, y| (x - guess).abs().total_cmp(&(y - guess).abs()));
+        let Some(exact) = exact else { return Ok(cubic) };
+        truths.push(reduced_to_plane(engine, level, exact));
+    }
+    let miss = |curve: &NurbsCurve| -> Result<f64, KernelRefusal> {
+        let mut worst = 0.0f64;
+        for (k, truth) in truths.iter().enumerate() {
+            let bracket = (parameters[k.saturating_sub(1)], parameters[(k + 2).min(last)]);
+            worst = worst.max(distance_in_bracket(curve, *truth, bracket.0, bracket.1)?);
+        }
+        Ok(worst)
+    };
+    let tolerance = (LEAN_FIT_TOLERANCE * engine.scale).max(miss(&cubic)?);
+    let debug = std::env::var("BREP_DEBUG_SOLID_SWEEP").is_ok();
+    for even in [4usize, 6, 8, 12, 16, 24, 32, 48, 64] {
+        let mut at: Vec<usize> = (1..even).map(|k| (k * last + even / 2) / even).collect();
+        for ramp in [1usize, 2, 4] {
+            if 4 * ramp < last {
+                at.extend([ramp, last - ramp]);
+            }
+        }
+        at.sort_unstable();
+        at.dedup();
+        let spans = at.len() + 1;
+        let count = spans + DEGREE;
+        if 3 * count > 2 * points.len() {
+            break;
+        }
+        let mut knots = vec![0.0; DEGREE + 1];
+        knots.extend(at.iter().map(|&k| parameters[k]));
+        knots.extend([1.0; DEGREE + 1]);
+        if (DEGREE..DEGREE + spans).any(|k| knots[k + 1] <= knots[k]) {
+            continue;
+        }
+        let Some(controls) = least_squares_controls(points, &parameters, &knots, DEGREE, count) else { continue };
+        let Ok(curve) = NurbsCurve::new(DEGREE, knots, controls.iter().map(|p| crate::Vec4::from_point(*p, 1.0)).collect()) else {
+            continue;
+        };
+        let worst = miss(&curve)?;
+        if debug {
+            eprintln!("  lean fit {} samples {spans} spans: worst mid-point {worst:.3e} (tolerance {tolerance:.3e})", points.len());
+        }
+        if worst <= tolerance {
+            return Ok(curve);
+        }
+    }
+    Ok(cubic)
+}
+
+/// The B-spline basis of `degree` on `knots` at `t`: (first index, values).
+fn bspline_basis(knots: &[f64], degree: usize, count: usize, t: f64) -> (usize, Vec<f64>) {
+    let mut span = degree;
+    while span + 1 < count && knots[span + 1] <= t {
+        span += 1;
+    }
+    let mut values = vec![0.0; degree + 1];
+    values[0] = 1.0;
+    let (mut left, mut right) = (vec![0.0; degree + 1], vec![0.0; degree + 1]);
+    for j in 1..=degree {
+        left[j] = t - knots[span + 1 - j];
+        right[j] = knots[span + j] - t;
+        let mut saved = 0.0;
+        for r in 0..j {
+            let temp = values[r] / (right[r + 1] + left[j - r]);
+            values[r] = saved + right[r + 1] * temp;
+            saved = left[j - r] * temp;
+        }
+        values[j] = saved;
+    }
+    (span - degree, values)
+}
+
+/// Control points of the B-spline on `knots` nearest `points` at `parameters`
+/// in least squares, its first and last points held at the first and last
+/// sample.
+fn least_squares_controls(points: &[Vec3], parameters: &[f64], knots: &[f64], degree: usize, count: usize) -> Option<Vec<Vec3>> {
+    let (first, last) = (points[0], points[points.len() - 1]);
+    let unknowns = count - 2;
+    let mut normal = vec![vec![0.0; unknowns]; unknowns];
+    let mut rhs = vec![[0.0; 3]; unknowns];
+    for (point, &t) in points.iter().zip(parameters).skip(1).take(points.len() - 2) {
+        let (start, values) = bspline_basis(knots, degree, count, t);
+        // What the held ends contribute here moves to the right side.
+        let mut target = *point;
+        for (offset, value) in values.iter().enumerate() {
+            let index = start + offset;
+            if index == 0 {
+                target = target.sub(first.scale(*value));
+            } else if index == count - 1 {
+                target = target.sub(last.scale(*value));
+            }
+        }
+        for (a, va) in values.iter().enumerate() {
+            let row = start + a;
+            if row == 0 || row == count - 1 {
+                continue;
+            }
+            for (b, vb) in values.iter().enumerate() {
+                let column = start + b;
+                if column == 0 || column == count - 1 {
+                    continue;
+                }
+                normal[row - 1][column - 1] += va * vb;
+            }
+            rhs[row - 1][0] += va * target.x;
+            rhs[row - 1][1] += va * target.y;
+            rhs[row - 1][2] += va * target.z;
+        }
+    }
+    // Gaussian elimination with partial pivoting (symmetric positive definite, small).
+    for column in 0..unknowns {
+        let pivot = (column..unknowns).max_by(|a, b| normal[*a][column].abs().total_cmp(&normal[*b][column].abs()))?;
+        if normal[pivot][column].abs() < 1e-300 {
+            return None;
+        }
+        normal.swap(column, pivot);
+        rhs.swap(column, pivot);
+        for row in column + 1..unknowns {
+            let factor = normal[row][column] / normal[column][column];
+            if factor == 0.0 {
+                continue;
+            }
+            for k in column..unknowns {
+                normal[row][k] -= factor * normal[column][k];
+            }
+            for axis in 0..3 {
+                rhs[row][axis] -= factor * rhs[column][axis];
+            }
+        }
+    }
+    let mut solved = vec![[0.0; 3]; unknowns];
+    for row in (0..unknowns).rev() {
+        for axis in 0..3 {
+            let mut value = rhs[row][axis];
+            for k in row + 1..unknowns {
+                value -= normal[row][k] * solved[k][axis];
+            }
+            solved[row][axis] = value / normal[row][row];
+        }
+    }
+    let mut controls = Vec::with_capacity(count);
+    controls.push(first);
+    controls.extend(solved.iter().map(|p| Vec3::new(p[0], p[1], p[2])));
+    controls.push(last);
+    controls.iter().all(|p| p.x.is_finite() && p.y.is_finite() && p.z.is_finite()).then_some(controls)
+}
+
 /// Distance from `target` to `curve` over the parameter bracket [a, b].
 fn distance_in_bracket(curve: &NurbsCurve, target: Vec3, a: f64, b: f64) -> Result<f64, KernelRefusal> {
     let distance = |t: f64| -> Result<f64, KernelRefusal> {
@@ -3082,7 +3442,11 @@ fn build_body(engine: &Engine, pieces: &[Piece]) -> Result<BrepSolid, KernelRefu
         points[0] = start;
         let last = points.len() - 1;
         points[last] = end;
-        profile.push(fit_piece(&points)?);
+        profile.push(if lean_walls_on() && matches!(engine.class, Class::Screw(_)) {
+            lean_fit_piece(engine, &piece.points, &points)?
+        } else {
+            fit_piece(&points)?
+        });
     }
     match engine.class {
         Class::Screw(c) => {
@@ -3092,7 +3456,15 @@ fn build_body(engine: &Engine, pieces: &[Piece]) -> Result<BrepSolid, KernelRefu
             // sections a turn stands r·h⁴/384 off the screw (1e-6 at a groove's
             // floor), the quintic through 48 below 1e-9.
             let carried = engine.crest_gap || engine.bar.is_some() || screw_carry_on();
-            let per_turn = if engine.crest_gap { 12.0 } else if carried { 48.0 } else { 64.0 };
+            let per_turn = if engine.crest_gap {
+                12.0
+            } else if carried && lean_walls_on() {
+                LEAN_CARRY_PER_TURN
+            } else if carried {
+                48.0
+            } else {
+                64.0
+            };
             // Every turn is the screw image of the first: build one and stack
             // copies, so no surface or edge runs the thread's whole length.
             let rows = if carried && thread_rows_on() { (span.abs() / TAU / TURNS_PER_ROW).round().max(1.0) as usize } else { 1 };

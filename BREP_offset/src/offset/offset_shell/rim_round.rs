@@ -27,6 +27,87 @@ pub(super) fn tangent_rim_round_enabled() -> bool {
 }
 
 
+/// `BREP_OFFSET_COLLAPSED_RIM_TUBE` (default on; `=0` restores): see [`planar_rim_tube`].
+pub(super) fn collapsed_rim_tube_enabled() -> bool {
+    switch!("BREP_OFFSET_COLLAPSED_RIM_TUBE", true)
+}
+
+/// The wall where a COLLAPSED round meets a PLANAR opening tangentially along
+/// a circle: the round's radius is under the shell's distance, so it has no
+/// offset (it is omitted), and the material within `distance` of the round
+/// near the opening is the set within `distance` of its END circle on the
+/// opening's plane. The cavity is bounded there by the torus of tube radius
+/// `distance` about that circle, from the mouth it opens on the plane down to
+/// where it meets the next face's offset (a rounded frustum's top rim, a
+/// rounded puck's: both refused "unwelded rim leaves a non-watertight shell").
+/// The carrier is the tube's half on the material side of the plane, from its
+/// inward point on the plane (the mouth) to its outward one; the selection
+/// keeps the part the next offset leaves on the skin. `None` where the rim is
+/// not a circle on the opening's plane, the shell is not inward, or the tube
+/// would not fit inside the circle.
+pub(super) fn planar_rim_tube(
+    rim: &EdgeRecord,
+    opening: &FaceRecord,
+    distance: f64,
+    tolerance: f64,
+) -> Result<Option<BrepSolid>, KernelRefusal> {
+    let Some(circle) = fit_rim_circle(rim, tolerance)? else {
+        return Ok(None);
+    };
+    // The fit admits a rim within a thousandth of its radius; the tube is
+    // exact about the FITTED circle, so the rim itself must lie on it to the
+    // model's own accuracy (a fitted round's rim reads a few 1e-7 off), or the
+    // wall would come out off its asked thickness (an ellipse 4.004 by 4 would
+    // open a round mouth 0.002 off its true intercepts).
+    let on_circle = tolerance.max(circle.radius * 1e-6);
+    for index in 0..=96 {
+        let point = rim.curve.evaluate(rim.t0 + (rim.t1 - rim.t0) * index as f64 / 96.0).or_refuse(KernelStage::Refine, "evaluate")?;
+        let offset = point.sub(circle.center);
+        let along = offset.dot(circle.axis);
+        let radial = offset.sub(circle.axis.scale(along)).length();
+        if along.abs() > on_circle || (radial - circle.radius).abs() > on_circle {
+            os_debug!("collapsed rim tube declined: rim edge {} leaves its fitted circle by {:.3e}", rim.id, along.abs().max((radial - circle.radius).abs()));
+            return Ok(None);
+        }
+    }
+    if !(distance > 0.0) || distance >= circle.radius {
+        return Ok(None);
+    }
+    // The opening must be a plane by its geometry, in any representation
+    // (degree-elevated, revolved), holding the circle, with the circle's axis
+    // its normal; the face's own normal only gives the side.
+    let Some((plane_point, plane_normal)) = super::rim_welds::planar_surface_frame(&opening.surface, tolerance.max(1e-7))? else {
+        return Ok(None);
+    };
+    if circle.axis.cross(plane_normal).length() > 1e-6 || plane_point.sub(circle.center).dot(plane_normal).abs() > tolerance.max(1e-7) {
+        return Ok(None);
+    }
+    let [u0, u1] = opening.surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = opening.surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    let outward = super::face_normal(opening, (u0 + u1) * 0.5, (v0 + v1) * 0.5)?;
+    // The tube's section runs outward (v 0), INTO the material (0.25), inward
+    // (0.5), so v in [0, 0.5] is the half under the plane and the sheet ends ON
+    // the plane: its mouth (v 0.5) is an orphan rim the wall's cap takes in.
+    // Turning the section that way (not the torus's own sense) points the
+    // sheet's normal at the tube's core circle, the side the round's own
+    // outward normal faces, as every inward carrier is oriented: the torus's
+    // sense put the cavity inside out (the weld then turned the cavity's
+    // other walls to agree with it).
+    let axis = if circle.axis.dot(outward) > 0.0 { circle.axis } else { circle.axis.scale(-1.0) };
+    let x_axis = axis.perpendicular().or_refuse(KernelStage::Refine, "perpendicular")?;
+    let section = crate::make_arc(
+        circle.center.add(x_axis.scale(circle.radius)),
+        x_axis,
+        axis.scale(-1.0),
+        distance,
+        0.0,
+        std::f64::consts::TAU,
+    )
+    .or_refuse(KernelStage::Refine, "make_arc")?;
+    let surface = crate::make_revolution(circle.center, axis, &section, std::f64::consts::TAU).or_refuse(KernelStage::Refine, "make_revolution")?;
+    Ok(Some(tube_sheet(surface, 0.0, 0.5)?))
+}
+
 /// A tangent rim's round carrier where the rim is a CIRCLE: the torus about
 /// it with tube radius `distance`, as the half tube from the skin tangency
 /// (toward the circle's axis) through the opening's side of the rim plane

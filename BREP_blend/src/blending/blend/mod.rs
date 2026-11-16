@@ -35,6 +35,7 @@ pub mod rollover_surgery;
 pub mod setback;
 pub mod runout;
 pub mod split_rim;
+pub mod turned_rim;
 pub mod sheet_ends;
 pub mod stations;
 pub mod rows;

@@ -788,6 +788,11 @@ fn offset_shell_impl(
     // Lane O item 705: (neighbour face, opening face, rim edge) of every
     // tangent junction with a curved opening the neighbour cannot reach.
     let mut tangent_rim_rounds: Vec<(u64, u64, u64)> = Vec::new();
+    // Supports omitted because their offset collapsed (`planar_rim_tube`).
+    let mut collapsed_supports: Vec<u64> = Vec::new();
+    // The carriers that are such tubes, by index, with the opening each
+    // tube's mouth lies on.
+    let mut rim_tubes: HashMap<usize, u64> = HashMap::default();
     let mut shielded_cusps = HashSet::<u64>::default();
 
     for face_id in &retained {
@@ -797,6 +802,7 @@ fn offset_shell_impl(
         profile::lap(&mut clock, profile::CARRIER_REGULARITY);
         if collapsed {
             os_debug!("omitting collapsed offset support for source face {face_id}");
+            collapsed_supports.push(*face_id);
             continue;
         }
         // A support a previous pass found SHADOWED contributes no skin, and its
@@ -847,17 +853,41 @@ fn offset_shell_impl(
             outward_carrier_extension(source, face, &source_faces, &opening_set, distance.abs())?
         } else {
             let mut inward = crate::CarrierExtension::uniform(reflex_extension.unwrap_or(0.0));
+            // Only a carrier that becomes its trim box's full rectangle (an
+            // affine plane with a curved outline element, below) has the box's
+            // room past a reflex rim INSIDE the box; a slid trim (a straight
+            // L-shaped outline) needs every side's pad for its inner corners.
+            if reflex_extension.is_some()
+                && super::carrier_rebuild::reflex_pad_convex_sides_on()
+                && face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")?
+                && outline_has_curved_element(source, face)?
+            {
+                let [u_min, u_max, v_min, v_max] = super::carrier_rebuild::convex_box_sides(source, face, reflex_extension.unwrap_or(0.0))?;
+                // Never every side: an all-zero extension is not a carrier
+                // the size of its trim but NO slide at all, which leaves an
+                // affine plane at its whole source net (a boss's floor, a
+                // third of its plane's domain, ran far past its convex rims
+                // and the shell crossed itself). A face
+                // whose sides are all convex keeps the uniform pad.
+                if !(u_min && u_max && v_min && v_max) {
+                    if u_min { inward.u_min = 0.0; }
+                    if u_max { inward.u_max = 0.0; }
+                    if v_min { inward.v_min = 0.0; }
+                    if v_max { inward.v_max = 0.0; }
+                }
+                os_debug!("carrier for src face {face_id}: reflex pad u=({:.4},{:.4}) v=({:.4},{:.4})", inward.u_min, inward.u_max, inward.v_min, inward.v_max);
+            }
             // `BREP_OFFSET_THIN_SKIN_PAD` (default on; `=0` restores): a skin thinner than
             // the fragmenter's graze band is padded past its source rims
             // (`thin_skin_pad`), so its sections end far from its corners.
             if let Some(pad) = thin_skin_pad(source, face, distance)? {
-                inward = crate::CarrierExtension::uniform(inward.u_min.max(pad));
+                inward = crate::CarrierExtension { u_min: inward.u_min.max(pad), u_max: inward.u_max.max(pad), v_min: inward.v_min.max(pad), v_max: inward.v_max.max(pad) };
                 os_debug!("carrier for src face {face_id}: thin skin padded by {pad:.6}");
                 thin_padded = true;
             }
             if let Some(reach) = planar_reach {
                 let grown = reach + REACH_CLEARANCE * distance;
-                inward = crate::CarrierExtension::uniform(inward.u_min.max(grown));
+                inward = crate::CarrierExtension { u_min: inward.u_min.max(grown), u_max: inward.u_max.max(grown), v_min: inward.v_min.max(grown), v_max: inward.v_max.max(grown) };
                 os_debug!("carrier for src face {face_id}: planar reach to its opening {reach:.6}");
             }
             if reflex_extension.is_some() {
@@ -1305,6 +1335,36 @@ fn offset_shell_impl(
                         "offset_shell: the round about the tangent rim (edge {edge_id}) between source face {neighbour_id} and \
                          curved opening face {opening_id} is built only for a circular rim inside its own circle"
                     )));
+                }
+            }
+        }
+    }
+    // A collapsed round's END on a planar opening: the tube about it
+    // (`rim_round::planar_rim_tube`), riding the round's id as a synthetic
+    // carrier the way an apex cap rides its cone's.
+    if distance > 0.0 && super::rim_round::collapsed_rim_tube_enabled() {
+        let tolerance = 1e-7f64.max(crate::solid_scale(source) * 1e-9);
+        for collapsed_id in &collapsed_supports {
+            let Some(face) = source_by_id_lookup(&source_faces, *collapsed_id) else { continue };
+            for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+                let Some((mate, mate_use)) = junction_mate(&source_faces, face, coedge.edge_id) else { continue };
+                // Planarity is read from the geometry in `planar_rim_tube`
+                // (a plane may arrive degree-elevated or revolved).
+                if !opening_set.contains(&mate.id)
+                    || !uses_are_tangent(face, coedge, mate, mate_use)?
+                {
+                    continue;
+                }
+                let Some(edge) = source.edges.iter().find(|edge| edge.id == coedge.edge_id) else { continue };
+                if let Some(tube) = super::rim_round::planar_rim_tube(edge, mate, distance, tolerance)? {
+                    os_debug!(
+                        "collapsed rim tube: about edge {} (collapsed face {collapsed_id}, opening {}) as carrier {}",
+                        edge.id,
+                        mate.id,
+                        carriers.len()
+                    );
+                    rim_tubes.insert(carriers.len(), mate.id);
+                    carriers.push(Carrier { solid: tube, source_face_id: *collapsed_id, kind: OffsetFaceRole::Offset });
                 }
             }
         }
@@ -2198,6 +2258,29 @@ fn offset_shell_impl(
             )
         })
         .collect::<HashMap<_, _>>();
+    // A rim tube ends ON its opening's plane: its mouth reaches that
+    // opening's wall as an orphan rim, welded into the cap like any skin's.
+    // That wall's own copy of the section would cut the mouth a second time;
+    // a section with any OTHER wall (a second opening the tube crosses) is a
+    // true trim and stays.
+    if !rim_tubes.is_empty() {
+        for entry in imprint.by_face.iter_mut() {
+            let Some(wall) = carriers.get(entry.operand as usize) else { continue };
+            if !matches!(wall.kind, OffsetFaceRole::Wall) {
+                continue;
+            }
+            let wall_opening = wall.source_face_id;
+            entry.piece_ids.retain(|piece_id| {
+                !imprint.pieces.iter().any(|piece| {
+                    piece.id == *piece_id
+                        && piece
+                            .support_faces
+                            .iter()
+                            .any(|face| rim_tubes.get(&(face.operand as usize)) == Some(&wall_opening))
+                })
+            });
+        }
+    }
     for (index, carrier) in carriers.iter().enumerate() {
         if !matches!(carrier.kind, OffsetFaceRole::Offset) {
             continue;

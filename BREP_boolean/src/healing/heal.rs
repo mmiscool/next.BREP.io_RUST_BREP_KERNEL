@@ -800,14 +800,21 @@ pub fn refit_inherited_trims(
     // [`UnsplitView`]. `BREP_TRIM_REFIT_UNSPLIT=0` reads the solid as it
     // stands (the behaviour before the 2026-11-05 promotion).
     let view = if unsplit_view_enabled() { UnsplitView::of(solid) } else { None };
+    // The gate reads its BEFORE scan on the operand as it is carried, which
+    // the pass never writes, so whether that scan measures is known before
+    // any candidate is read; read once, at the first trim off the floor.
+    let mut measured: Option<bool> = None;
     let Some(view) = view else {
-        return refit_inherited_trims_with(solid, policy, |before, after| trim_refit_gate(before, after, policy));
+        return refit_inherited_trims_gated(solid, policy, |before, after| trim_refit_gate(before, after, policy), |before| {
+            *measured.get_or_insert_with(|| trim_refit_before_measured(before))
+        });
     };
     let mut whole = view.whole.clone();
     let mut admitted: Option<BrepSolid> = None;
     let report = {
         let halves: &BrepSolid = solid;
-        refit_inherited_trims_with(&mut whole, policy, |before, after| {
+        let admissible = |_: &BrepSolid| *measured.get_or_insert_with(|| trim_refit_before_measured(halves));
+        refit_inherited_trims_gated(&mut whole, policy, |before, after| {
             // The transaction is judged on the operand as it is carried: the
             // new whole trims cut back onto the halves.
             let Some(candidate) = view.cut_back(halves, before, after) else {
@@ -818,7 +825,7 @@ pub fn refit_inherited_trims(
                 admitted = Some(candidate);
             }
             verdict
-        })?
+        }, admissible)?
     };
     if let Some(candidate) = admitted {
         *solid = candidate;
@@ -1115,12 +1122,71 @@ fn join_cut_trims(pieces: &[&crate::NurbsCurve]) -> Option<crate::NurbsCurve> {
     crate::NurbsCurve::new(degree, knots, controls).ok()
 }
 
+/// Whether [`trim_refit_gate`]'s BEFORE scan of `before` measures every
+/// shell. When one is unmeasured (the scan reached its span budget) the gate
+/// rolls back every transaction (`VectorAreaUnmeasured`), whatever the trims
+/// become.
+pub fn trim_refit_before_measured(before: &BrepSolid) -> bool {
+    // Asking costs a scan the full pass may never have run (it scans only
+    // when a refit survives), so a body whose trims hold too few knot spans
+    // to come near the budget is not asked: its answer would be the full
+    // pass's anyway. Only the cost moves; the result is the same either way.
+    if trim_knot_spans(before) < TRIM_REFIT_SPAN_BUDGET / 4 {
+        return true;
+    }
+    trim_refit_before_measured_with_budget(before, TRIM_REFIT_SPAN_BUDGET)
+}
+
+/// The trims' knot spans over the whole body: the spans a closure scan
+/// starts from before it bisects any (no curve is evaluated). Sizes the
+/// question [`trim_refit_before_measured`] asks; decides nothing.
+pub fn trim_knot_spans(solid: &BrepSolid) -> usize {
+    solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .flat_map(|face| &face.loops)
+        .flat_map(|record| &record.coedges)
+        .map(|coedge| {
+            let Ok([low, high]) = coedge.pcurve.domain() else { return 1 };
+            let mut inside: Vec<f64> = coedge.pcurve.knots.iter().copied().filter(|k| *k > low && *k < high).collect();
+            inside.dedup();
+            inside.len() + 1
+        })
+        .sum()
+}
+
+/// [`trim_refit_before_measured`] at an explicit scan budget: false exactly
+/// when [`trim_refit_gate_with_budget`] at that budget must roll back.
+pub fn trim_refit_before_measured_with_budget(before: &BrepSolid, span_budget: usize) -> bool {
+    let report = crate::soundness::shell_vector_areas_with_budget(before, span_budget);
+    let measured = !report.shells.iter().any(|shell| matches!(shell.reading(), crate::ClosureReading::Unmeasured { .. }));
+    if !measured && trim_refit_tracing().is_some() {
+        eprintln!("TRIM-REFIT-HALT the gate's before scan is unmeasured: no transaction can be admitted, no candidate is read");
+    }
+    measured
+}
+
 /// [`refit_inherited_trims`] with the whole-transaction gate supplied, so a
 /// control can show that a refused transaction restores every trim.
 pub fn refit_inherited_trims_with(
     solid: &mut BrepSolid,
     policy: &KernelTolerances,
+    gate: impl FnMut(&BrepSolid, &BrepSolid) -> Option<TrimRefitRollback>,
+) -> Result<TrimRefitReport, KernelRefusal> {
+    refit_inherited_trims_gated(solid, policy, gate, |_| true)
+}
+
+/// [`refit_inherited_trims_with`], asking `admissible` (with the solid as
+/// handed in) once, before the first trim off the floor is read further.
+/// When it answers false the gate could admit no transaction, so the pass
+/// stops there: no candidate is read, the solid is untouched, and the report
+/// holds the entries read so far. When it answers true it is not asked again.
+pub fn refit_inherited_trims_gated(
+    solid: &mut BrepSolid,
+    policy: &KernelTolerances,
     mut gate: impl FnMut(&BrepSolid, &BrepSolid) -> Option<TrimRefitRollback>,
+    mut admissible: impl FnMut(&BrepSolid) -> bool,
 ) -> Result<TrimRefitReport, KernelRefusal> {
     let trace = trim_refit_tracing();
     // Profiling opens here under its own switch unless a control opened it.
@@ -1159,7 +1225,8 @@ pub fn refit_inherited_trims_with(
     // (use, replacement, entry index)
     let mut replacements: Vec<(CoedgeIndex, crate::NurbsCurve, usize)> = Vec::new();
     let mut working: Option<BrepSolid> = None;
-    for (shell_index, shell) in solid.shells.iter().enumerate() {
+    let mut assented = false;
+    'faces: for (shell_index, shell) in solid.shells.iter().enumerate() {
         for (face_index, face) in shell.faces.iter().enumerate() {
             for (loop_index, lp) in face.loops.iter().enumerate() {
                 for (coedge_index, coedge) in lp.coedges.iter().enumerate() {
@@ -1225,6 +1292,14 @@ pub fn refit_inherited_trims_with(
                     entry.miss = miss;
                     if miss <= floor {
                         continue;
+                    }
+                    // Nothing has been read past the floor yet, so stopping
+                    // here leaves no claim, candidate or working copy behind.
+                    if !assented {
+                        if !admissible(&*solid) {
+                            break 'faces;
+                        }
+                        assented = true;
                     }
                     // The standoff on this face's own carrier decides
                     // candidacy only (the binding proof is the edge claim).

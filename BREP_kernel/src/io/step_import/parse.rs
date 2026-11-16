@@ -408,6 +408,11 @@ pub(super) struct Resolver<'a> {
     /// for the report (`builder::readings::BoundedTrim`). On by default; off
     /// for builds whose readings are dropped, where the reads only cost time.
     pub(super) trim_readings: bool,
+    /// Whether an OPEN_SHELL builds as a sheet body (`BodyKind::Sheet`)
+    /// instead of failing as an open solid. Off for STEP files, whose open
+    /// surface models stay skipped and counted; the Parasolid lane turns it
+    /// on for sheet bodies, which its translation writes as open shells.
+    pub(super) sheets: bool,
 }
 
 impl<'a> Resolver<'a> {
@@ -419,6 +424,7 @@ impl<'a> Resolver<'a> {
             length_scale,
             angle_scale: std::sync::OnceLock::new(),
             trim_readings: true,
+            sheets: false,
         }
     }
 
@@ -429,6 +435,7 @@ impl<'a> Resolver<'a> {
             length_scale: self.length_scale,
             angle_scale: self.angle_scale.clone(),
             trim_readings: false,
+            sheets: self.sheets,
         }
     }
 

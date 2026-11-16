@@ -64,8 +64,13 @@ pub(super) fn pmi_state_schema() -> Value {
     ]});
     defs["AnnotationReport"] = closed_object_required(json!({"persistentData":{},"pluginReplay":reference("PluginReplay"),"id":text,"type":text,
         "enabled":boolean,"status":{"enum":["ok","error"]},"message":text,"text":text,"value":number,"unit":text,
-        "references":strings,"labelWorld":v3,"plane":reference("Plane"),"geometry":reference("Geometry")}),
+        "references":strings,"labelWorld":v3,"plane":reference("Plane"),"geometry":reference("Geometry"),
+        "weldSymbol":reference("WeldSymbol")}),
         &["id","type","enabled","status","message","text","unit","references","labelWorld","geometry"]);
+    defs["WeldSymbol"] = closed_object_required(json!({"standard":{"enum":["Aws","Iso"]},"side":{"enum":["Arrow","Other","Both"]},
+        "glyph":{"enum":["Fillet","Square","V","Bevel","U","J","Plug","Spot","Seam","Surfacing"]},"size":text,"length":text,
+        "allAround":boolean,"fieldWeld":boolean,"tail":text,"staggered":boolean}),
+        &["standard","side","glyph","size","length","allAround","fieldWeld","tail","staggered"]);
     defs["ViewReport"] = closed_object_required(json!({"id":text,"annotations":array(reference("AnnotationReport")),
         "sectionPlane":pair,"sectionError":text,"hidden":strings}), &["id","annotations"]);
     defs["Report"] = closed_object_required(json!({"views":array(reference("ViewReport"))}), &["views"]);

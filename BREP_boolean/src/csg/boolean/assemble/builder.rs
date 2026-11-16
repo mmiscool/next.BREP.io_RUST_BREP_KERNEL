@@ -624,7 +624,8 @@ impl Assembler {
                                     && projection.u >= low - margin
                                     && projection.u <= high + margin
                             })
-                    });
+                    }) && (!crate::switch!("BREP_NEAR_SEAM_RIM_SPLIT", true)
+                        || reaches_into(&edge.curve, edge.t0, edge.t1, &source.curve, source.t0, source.t1, weld_tolerance));
                 if same_curve {
                     // Two coedges on one edge must have OPPOSITE sense; a
                     // same-sense pair is non-manifold (topology.rs). When a
@@ -988,3 +989,20 @@ pub(super) fn weld_refused_by_identity(
     }
 }
 
+
+/// Whether the middle of `curve` over [`t0`, `t1`] lies on `other` over
+/// [`other_t0`, `other_t1`] within `tolerance`. The projection fallback of the
+/// weld tests one direction only (the source's samples on the candidate), and
+/// its parameter margin is relative: on a closed rim split a few 1e-6 from
+/// its seam, the short piece's samples all land inside the margin of the
+/// long piece, so the two pieces welded into one edge used twice by the same
+/// face. A real mate also holds the candidate's middle in the source's span.
+fn reaches_into(curve: &crate::NurbsCurve, t0: f64, t1: f64, other: &crate::NurbsCurve, other_t0: f64, other_t1: f64, tolerance: f64) -> bool {
+    let Ok(middle) = curve.evaluate(0.5 * (t0 + t1)) else { return false };
+    let Ok(projection) = project_point_to_curve(other, middle) else { return false };
+    // Measured in model space at the span's nearest point: a parameter
+    // margin would again be relative to the span.
+    let (low, high) = (other_t0.min(other_t1), other_t0.max(other_t1));
+    projection.distance <= tolerance
+        && other.evaluate(projection.u.clamp(low, high)).is_ok_and(|nearest| nearest.sub(middle).length() <= tolerance)
+}

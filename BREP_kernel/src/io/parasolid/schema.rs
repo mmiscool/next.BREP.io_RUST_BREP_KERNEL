@@ -45,6 +45,10 @@ pub struct FieldDef {
     pub name: String,
     pub kind: Kind,
     pub count: Count,
+    /// The schema type code (§2.1.4; `p` for a pointer): binary data is laid
+    /// out by it (`u`, `c`, `l` one byte, `n`, `w` two, `d`, `t` four, a
+    /// pointer two or four), text by [`Kind`] alone.
+    pub code: u8,
 }
 
 /// The kind a schema type code names (§2.1.4).
@@ -202,6 +206,7 @@ pub fn base(node_type: u16) -> Option<(&'static str, Vec<FieldDef>)> {
         .map(|&(name, code, n)| FieldDef {
             name: name.to_string(),
             kind: kind_of(code).expect("base schema type codes are known"),
+            code,
             count: match n {
                 0 => Count::Scalar,
                 1 => Count::Variable,
@@ -218,7 +223,11 @@ type BaseNode = (u16, &'static str, &'static [(&'static str, u8, usize)]);
 
 #[rustfmt::skip]
 const BASE: &[BaseNode] = &[
-    (10, "ASSEMBLY", &[("highest_node_id", b'd', 0), ("attributes_features", b'p', 0), ("attribute_chains", b'p', 0), ("list", b'p', 0), ("lattice", b'p', 0), ("surface", b'p', 0), ("curve", b'p', 0), ("point", b'p', 0), ("mesh", b'p', 0), ("polyline", b'p', 0), ("key", b'p', 0), ("res_size", b'f', 0), ("res_linear", b'f', 0), ("ref_instance", b'p', 0), ("next", b'p', 0), ("previous", b'p', 0), ("state", b'u', 0), ("owner", b'p', 0), ("type", b'u', 0), ("sub_instance", b'p', 0), ("mesh_offset_data", b'p', 0)]),
+    // The base ASSEMBLY has seventeen fields: SolidWorks 2009 assemblies
+    // (schema 19008 with deltas) write it "as the base" and their data reads
+    // these to the next node; the reference's later layout adds lattice, mesh,
+    // polyline and mesh_offset_data.
+    (10, "ASSEMBLY", &[("highest_node_id", b'd', 0), ("attributes_features", b'p', 0), ("attribute_chains", b'p', 0), ("list", b'p', 0), ("surface", b'p', 0), ("curve", b'p', 0), ("point", b'p', 0), ("key", b'p', 0), ("res_size", b'f', 0), ("res_linear", b'f', 0), ("ref_instance", b'p', 0), ("next", b'p', 0), ("previous", b'p', 0), ("state", b'u', 0), ("owner", b'p', 0), ("type", b'u', 0), ("sub_instance", b'p', 0)]),
     (11, "INSTANCE", &[("node_id", b'd', 0), ("attributes_features", b'p', 0), ("type", b'u', 0), ("part", b'p', 0), ("transform", b'p', 0), ("assembly", b'p', 0), ("next_in_part", b'p', 0), ("prev_in_part", b'p', 0), ("next_of_part", b'p', 0), ("prev_of_part", b'p', 0)]),
     (12, "BODY", &[("highest_node_id", b'd', 0), ("attributes_features", b'p', 0), ("attribute_chains", b'p', 0), ("surface", b'p', 0), ("curve", b'p', 0), ("point", b'p', 0), ("key", b'p', 0), ("res_size", b'f', 0), ("res_linear", b'f', 0), ("ref_instance", b'p', 0), ("next", b'p', 0), ("previous", b'p', 0), ("state", b'u', 0), ("base_owner", b'p', 0), ("body_type", b'u', 0), ("nom_geom_state", b'u', 0), ("shell", b'p', 0), ("boundary_surface", b'p', 0), ("boundary_curve", b'p', 0), ("boundary_point", b'p', 0), ("region", b'p', 0), ("edge", b'p', 0), ("vertex", b'p', 0)]),
     (13, "SHELL", &[("node_id", b'd', 0), ("attributes_features", b'p', 0), ("body", b'p', 0), ("next", b'p', 0), ("face", b'p', 0), ("edge", b'p', 0), ("vertex", b'p', 0), ("region", b'p', 0), ("front_face", b'p', 0)]),
@@ -264,7 +273,11 @@ const BASE: &[BaseNode] = &[
     (98, "UNICODE_VALUES", &[("values", b'w', 1)]),
     (99, "FIELD_NAMES", &[("names", b'p', 1)]),
     (100, "TRANSFORM", &[("node_id", b'd', 0), ("owner", b'p', 0), ("next", b'p', 0), ("previous", b'p', 0), ("rotation_matrix", b'f', 9), ("translation_vector", b'v', 0), ("scale", b'f', 0), ("flag", b'd', 0), ("perspective_vector", b'v', 0)]),
-    (101, "WORLD", &[("assembly", b'p', 0), ("attribute", b'p', 0), ("body", b'p', 0), ("transform", b'p', 0), ("lattice", b'p', 0), ("surface", b'p', 0), ("curve", b'p', 0), ("point", b'p', 0), ("mesh", b'p', 0), ("polyline", b'p', 0), ("alive", b'l', 0), ("attrib_def", b'p', 0), ("attdef_list", b'p', 0), ("highest_id", b'd', 0), ("current_id", b'd', 0), ("index_map", b'p', 0), ("schema_embedding_map", b'p', 0), ("mesh_offset_data", b'p', 0)]),
+    // The base WORLD has eleven fields: every SolidWorks partition (schemas
+    // 28002, 28101, 30000 and 32001, each with deltas against this base) edits
+    // these eleven to the end of its data; the reference's later layout adds
+    // lattice, mesh, polyline and the maps.
+    (101, "WORLD", &[("assembly", b'p', 0), ("attribute", b'p', 0), ("body", b'p', 0), ("transform", b'p', 0), ("surface", b'p', 0), ("curve", b'p', 0), ("point", b'p', 0), ("alive", b'l', 0), ("attrib_def", b'p', 0), ("highest_id", b'd', 0), ("current_id", b'd', 0)]),
     (120, "PE_SURF", &[("node_id", b'd', 0), ("attributes_features", b'p', 0), ("owner", b'p', 0), ("next", b'p', 0), ("previous", b'p', 0), ("geometric_owner", b'p', 0), ("sense", b'c', 0), ("type", b'c', 0), ("data", b'p', 0), ("tf", b'p', 0), ("internal_geom", b'p', 1)]),
     (121, "INT_PE_DATA", &[("geom_type", b'd', 0), ("real_array", b'p', 0), ("int_array", b'p', 0)]),
     (122, "EXT_PE_DATA", &[("key", b'p', 0), ("real_array", b'p', 0), ("int_array", b'p', 0)]),

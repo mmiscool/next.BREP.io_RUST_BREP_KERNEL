@@ -2884,7 +2884,9 @@ fn annotations(
             continue;
         }
         let row_style = PmiLayoutStyle { plane: row.plane, ..style };
-        let drawn = pmi_present(&row.geometry, row.label_world, &row.text, &row_style);
+        // A weld callout draws its weld symbol, as the 3D view does.
+        let drawn = brep_kernel::feature_pipeline::pmi::weld_symbol::present_row(row, &row_style)
+            .unwrap_or_else(|| pmi_present(&row.geometry, row.label_world, &row.text, &row_style));
         // Paper millimetres, through the view camera — the ONE map every
         // piece of an annotation's geometry goes through.
         let project = |p: [f64; 3]| -> [f64; 2] {

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="seam_weld" brep:unicode="E0DA">
+  <path d="M80 380H920V540H80Z" fill="#2b4c63"/>
+  <path d="M120 410H880V510H120Z" fill="#bcd7e8"/>
+  <path d="M80 540H920V700H80Z" fill="#2b4c63"/>
+  <path d="M120 570H880V670H120Z" fill="#5c86a6"/>
+  <path d="M160 470H840V610H160Z" fill="#125236"/>
+  <path d="M190 500H810V580H190Z" fill="#a5e8c4"/>
+</svg>

@@ -2,19 +2,22 @@
 use super::{ButtonState, WorkbenchButton};
 use brep_render::engine_state::EngineState;
 
-/// The Ribbon's tabs, in strip order. "PMI" is drawn only where a PMI command
-/// is offered ([`ribbon_tab_shown`]); the others always.
-pub const RIBBON_TABS: [&str; 4] = ["Home", super::pmi::TAB, "View", "Help"];
+/// The Ribbon's tabs, in strip order. "Welding" and "PMI" are drawn only where
+/// one of their commands is offered ([`ribbon_tab_shown`]); the others always.
+pub const RIBBON_TABS: [&str; 5] = ["Home", super::welding::TAB, super::pmi::TAB, "View", "Help"];
 
-/// Whether the Ribbon draws `tab` for this command list: the PMI tab exists
-/// only in a workbench that offers PMI commands.
+/// The tabs a workbench shows only when it offers a command on them.
+const OPTIONAL_TABS: [&str; 2] = [super::welding::TAB, super::pmi::TAB];
+
+/// Whether the Ribbon draws `tab` for this command list: the Welding and PMI
+/// tabs exist only in a workbench that offers one of their commands.
 pub fn ribbon_tab_shown(tab: &str, commands: &[OfferedCommand]) -> bool {
-    tab != super::pmi::TAB || commands.iter().any(|c| c.segments()[0] == tab)
+    !OPTIONAL_TABS.contains(&tab) || commands.iter().any(|c| c.segments()[0] == tab)
 }
 
 /// The tabs whose creation commands the Classic strip draws, in order: it has
-/// no tab strip, so the PMI tab's groups follow Home's.
-pub const CREATION_TABS: [&str; 2] = ["Home", super::pmi::TAB];
+/// no tab strip, so the Welding and PMI tabs' groups follow Home's.
+pub const CREATION_TABS: [&str; 3] = ["Home", super::welding::TAB, super::pmi::TAB];
 
 /// [`command_groups`] over every creation tab: what the Classic strip draws.
 pub fn creation_groups(commands: &[OfferedCommand]) -> Vec<(&str, Vec<&OfferedCommand>)> {
@@ -626,8 +629,11 @@ pub fn validate_builtin_presentations() -> Result<(), String> {
         let path = feature["ribbonPath"]
             .as_str()
             .ok_or_else(|| format!("feature has no ribbonPath: {}", feature["type"]))?;
-        if ribbon_segments(path)?[0] != "Home" {
-            return Err(format!("feature outside Home: {path}"));
+        // Features sit on Home; the weld types, and only they, on Welding.
+        let ty = feature["type"].as_str().unwrap_or("");
+        let tab = if super::welding::is_weld_type(ty) { super::welding::TAB } else { "Home" };
+        if ribbon_segments(path)?[0] != tab {
+            return Err(format!("feature outside {tab}: {path}"));
         }
         if !matches!(feature["commandSize"].as_str(), Some("Large" | "Compact")) {
             return Err(format!("feature has no commandSize: {path}"));

@@ -11,9 +11,12 @@
 
 use super::{FeatureInfo, Workbench, WorkbenchButton};
 
-/// The sheet-metal (`SM.*`) features plus the shared building blocks `S`/`D`/`P`.
+/// The sheet-metal (`SM.*`) features, the weld types (the Welding tab) and the
+/// shared building blocks `S`/`D`/`P`.
 fn includes(feature: &FeatureInfo<'_>) -> bool {
-    feature.type_code.starts_with("SM.") || matches!(feature.type_code, "S" | "D" | "P")
+    feature.type_code.starts_with("SM.")
+        || super::welding::is_weld_type(feature.type_code)
+        || matches!(feature.type_code, "S" | "D" | "P")
 }
 
 /// Phase 2: the flat-pattern (unfold) export button. A click surfaces

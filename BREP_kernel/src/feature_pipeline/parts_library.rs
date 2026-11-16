@@ -858,7 +858,7 @@ fn run_isolated_features(
             // A weld rebuilt after the solve frees its old bead and owns a new
             // one: the free loop below must follow the swap.
             let weld_handles = |results: &[super::FeatureResult]| -> Vec<u32> {
-                results.iter().filter(|result| result.feature_type == "WELD")
+                results.iter().filter(|result| super::features::weld::is_weld_type(&result.feature_type))
                     .flat_map(|result| result.added.iter().map(|added| added.handle)).collect()
             };
             let before = weld_handles(&results);

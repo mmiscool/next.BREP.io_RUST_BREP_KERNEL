@@ -176,7 +176,7 @@ impl ContextBarPanel {
         // Welds consume component seams without editing the source part.
         let mut offers = feature_offers_scoped(&probe, &sel, &state.settings.workbench, Some(state));
         if comp.suppress_features() {
-            offers.retain(|offer| offer.type_code == "WELD");
+            offers.retain(|offer| crate::workbench::welding::is_weld_type(&offer.type_code));
         }
         let constraint_types =
             constraint_offers(&probe, &state.settings.workbench, &crate::workbench::ButtonState::of(state));
@@ -1043,7 +1043,7 @@ pub(crate) fn prefill_from_selection(state: &EngineState, type_code: &str, param
     }
     let sel = Selection::read(state);
     let kinds = sel.kinds_present();
-    if kinds.is_empty() || (type_code != "WELD" && component_selection(&sel, state).suppress_features()) {
+    if kinds.is_empty() || (!crate::workbench::welding::is_weld_type(type_code) && component_selection(&sel, state).suppress_features()) {
         return 0;
     }
     let writes = prefill_references(&offer_fields(Some(state), type_code, &kinds), &sel);

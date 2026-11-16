@@ -1614,6 +1614,141 @@ pub(super) fn face_reflex_miter_tan(source: &BrepSolid, face: &FaceRecord) -> Re
     Ok(worst)
 }
 
+/// `BREP_OFFSET_REFLEX_PAD_CONVEX_SIDES` (default on; `=0` restores): see
+/// [`convex_box_sides`].
+pub(super) fn reflex_pad_convex_sides_on() -> bool {
+    switch!("BREP_OFFSET_REFLEX_PAD_CONVEX_SIDES", true)
+}
+
+/// The sides of `face`'s trim box (u_min, u_max, v_min, v_max) whose line
+/// holds only CONVEX rims (at least one): an inward carrier's reflex pad has
+/// nothing to reach there, its offset meeting the neighbour's inside the
+/// trim. Every other side keeps the pad.
+///
+/// Cause (a user's stepped bar with a revolved blind bore, shelled through its
+/// end cap past 0.697, refused "connector edge left its plane: faces 10 and 19
+/// end on two curved rims 1.557 apart"): the bar's side plane has reflex steps
+/// at one end, so its carrier was padded 1.5 d on EVERY side, also 1.5 d past
+/// its long convex rim along the bar's underside. That sheet's section with
+/// the bore wall's offset then crossed the bore wall's whole skin strip (from
+/// d 0.623, admitted as a pair from 0.697) and split it along a line off the
+/// skin. A side whose rims are all convex has no reach to pad. The caller asks
+/// only for a carrier that becomes its trim box's full rectangle, which has
+/// the box's room past a reflex rim inside the box.
+pub(super) fn convex_box_sides(source: &BrepSolid, face: &FaceRecord, extension: f64) -> Result<[bool; 4], KernelRefusal> {
+    let edge_by_id = source.edges.iter().map(|edge| (edge.id, edge)).collect::<HashMap<_, _>>();
+    let faces = source.shells.iter().flat_map(|shell| &shell.faces).collect::<Vec<_>>();
+    let samples = |coedge: &CoedgeRecord| -> Result<Vec<Vec2>, KernelRefusal> {
+        let [t0, t1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        (0..=8)
+            .map(|k| {
+                let p = coedge.pcurve.evaluate(t0 + (t1 - t0) * k as f64 / 8.0).or_refuse(KernelStage::Refine, "evaluate")?;
+                Ok(Vec2 { x: p.x, y: p.y })
+            })
+            .collect()
+    };
+    let mut lo = [f64::INFINITY; 2];
+    let mut hi = [f64::NEG_INFINITY; 2];
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        for p in samples(coedge)? {
+            lo = [lo[0].min(p.x), lo[1].min(p.y)];
+            hi = [hi[0].max(p.x), hi[1].max(p.y)];
+        }
+    }
+    let span = [hi[0] - lo[0], hi[1] - lo[1]];
+    if !(span[0] > 0.0 && span[1] > 0.0) {
+        return Ok([false; 4]);
+    }
+    // Per side: (rims on its line, all of them convex).
+    let mut seen = [false; 4];
+    let mut convex = [true; 4];
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let points = samples(coedge)?;
+        let on = |axis: usize, line: f64| points.iter().all(|p| ((if axis == 0 { p.x } else { p.y }) - line).abs() <= 1e-6 * span[axis]);
+        let lines = [on(0, lo[0]), on(0, hi[0]), on(1, lo[1]), on(1, hi[1])];
+        if !lines.iter().any(|hit| *hit) {
+            continue;
+        }
+        let rim_convex = match (edge_by_id.get(&coedge.edge_id), junction_mate(&faces, face, coedge.edge_id)) {
+            (Some(edge), Some((mate, _))) if !edge.degenerate => {
+                let stations = junction_stations(face, coedge, edge, mate)?;
+                !stations.is_empty() && stations.iter().all(JunctionStation::is_convex)
+            }
+            _ => false,
+        };
+        for (side, hit) in lines.iter().enumerate() {
+            if *hit {
+                seen[side] = true;
+                convex[side] &= rim_convex;
+            }
+        }
+    }
+    // A REFLEX rim inside the box needs its reach (`extension`) past it
+    // toward every side its outward normal faces: a side it would overrun
+    // keeps the pad (cross review: a step 0.1 in from a convex side, shelled
+    // 0.2, reaches past that side). An outward side the probe cannot read
+    // keeps every pad.
+    let mut reached = [false; 4];
+    let inside = |uv: Vec2| -> Result<bool, KernelRefusal> {
+        Ok(parameter_point_in_face(face, uv, 1e-9).or_refuse(KernelStage::Refine, "parameter_point_in_face")? == PolygonClass::Inside)
+    };
+    let probe = 1e-3 * span[0].min(span[1]);
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let reflex = match (edge_by_id.get(&coedge.edge_id), junction_mate(&faces, face, coedge.edge_id)) {
+            (Some(edge), Some((mate, _))) if !edge.degenerate => {
+                junction_stations(face, coedge, edge, mate)?.iter().any(|station| !station.is_convex())
+            }
+            _ => false,
+        };
+        if !reflex {
+            continue;
+        }
+        let points = samples(coedge)?;
+        let mut read = false;
+        for window in points.windows(3) {
+            let (before, at, after) = (window[0], window[1], window[2]);
+            let tangent = [(after.x - before.x) / span[0], (after.y - before.y) / span[1]];
+            let length = tangent[0].hypot(tangent[1]);
+            if !(length > 1e-12) {
+                continue;
+            }
+            let normal = [tangent[1] / length, -tangent[0] / length];
+            let scale = span[0].min(span[1]);
+            let step = |sign: f64| Vec2 { x: at.x + sign * probe * normal[0] * span[0] / scale, y: at.y + sign * probe * normal[1] * span[1] / scale };
+            let outward = match (inside(step(1.0))?, inside(step(-1.0))?) {
+                (false, true) => normal,
+                (true, false) => [-normal[0], -normal[1]],
+                _ => continue,
+            };
+            read = true;
+            let point = face.surface.evaluate(at.x, at.y).or_refuse(KernelStage::Refine, "evaluate")?;
+            let rate = |axis: usize| -> Result<f64, KernelRefusal> {
+                let h = 1e-6 * span[axis];
+                let moved = if axis == 0 { face.surface.evaluate(at.x + h, at.y) } else { face.surface.evaluate(at.x, at.y + h) }
+                    .or_refuse(KernelStage::Refine, "evaluate")?;
+                Ok(moved.sub(point).length() / h)
+            };
+            let rooms = [
+                (at.x - lo[0]) * rate(0)?,
+                (hi[0] - at.x) * rate(0)?,
+                (at.y - lo[1]) * rate(1)?,
+                (hi[1] - at.y) * rate(1)?,
+            ];
+            let faces_side = [outward[0] < -1e-3, outward[0] > 1e-3, outward[1] < -1e-3, outward[1] > 1e-3];
+            for side in 0..4 {
+                if faces_side[side] && rooms[side] < extension {
+                    reached[side] = true;
+                }
+            }
+        }
+        if !read {
+            return Ok([false; 4]);
+        }
+    }
+    os_debug!("convex box sides of face {}: box u [{:.4},{:.4}] v [{:.4},{:.4}] seen {seen:?} convex {convex:?} reached {reached:?}", face.id, lo[0], hi[0], lo[1], hi[1]);
+    Ok([0, 1, 2, 3].map(|side| seen[side] && convex[side] && !reached[side]))
+}
+
 /// The factor an OUTWARD pad of |d| grows by so a junction whose offsets
 /// meet `worst_tan`·d past the source rim (the worst sampled tan(θn/2),
 /// `None` when no such junction bounds the pad) lands strictly INSIDE the

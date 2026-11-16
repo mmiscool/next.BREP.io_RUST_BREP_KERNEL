@@ -59,6 +59,16 @@ impl Document {
                     "{reference} has pads on the back copper, which a one-layer board does not have: add a second copper layer or move those pads to the front."
                 ));
             }
+            if let Some(p) = self.board.placements.iter().find(|p| p.footprint.pads.iter().any(|pad| pad.vias.is_some())) {
+                let reference = self
+                    .components
+                    .iter()
+                    .find(|c| c.id == p.component)
+                    .map_or("A part", |c| c.reference.as_str());
+                return Err(format!(
+                    "{reference} has vias in its pads, which a one-layer board cannot carry: add a second copper layer or take the vias out of its pads."
+                ));
+            }
         }
         // The zones are refilled on a copy first: what is sent to be made is the
         // fill the copper as it stands asks for, never a stale one the user forgot
@@ -688,8 +698,9 @@ fn copper(board: &Board, origin: &Origin, layer: u8) -> Gerber {
         gerber.select(Aperture::Circle(track.width), Some("Conductor"));
         gerber.stroke(track.points.iter().map(|p| origin.point(*p)));
     }
-    // A via's pad is on every layer it joins, and only those.
-    for via in board.vias.iter().filter(|v| {
+    // A via's pad is on every layer it joins, and only those; a pad's own
+    // vias are through vias.
+    for via in board.all_vias().iter().filter(|v| {
         let (from, to) = v.layers(board.layer_count);
         (from..=to).contains(&layer)
     }) {
@@ -717,6 +728,13 @@ fn mask(board: &Board, origin: &Origin, top: bool) -> Gerber {
             let (from, to) = v.layers(board.layer_count);
             if top { from == 0 } else { to == last }
         }) {
+            gerber.shape(origin, Shape::circle(via.at, via.diameter / 2), board.rules.mask_expansion, None);
+        }
+    }
+    // A pad's vias open on the side away from the pad unless tented there; on
+    // the pad's own side its opening exposes them.
+    for (via, tented, far_is_bottom) in board.pad_vias() {
+        if !tented && far_is_bottom != top {
             gerber.shape(origin, Shape::circle(via.at, via.diameter / 2), board.rules.mask_expansion, None);
         }
     }
@@ -844,7 +862,7 @@ type Drills = BTreeMap<(i32, Hole), Vec<((i64, i64), (i64, i64))>>;
 fn drills(board: &Board, origin: &Origin) -> (Drills, Drills, BTreeMap<(u8, u8), Drills>) {
     let (mut plated, mut unplated) = (Drills::new(), Drills::new());
     let mut spans: BTreeMap<(u8, u8), Drills> = BTreeMap::new();
-    for via in &board.vias {
+    for via in &board.all_vias() {
         let at = origin.point(via.at);
         let target = match via.kind(board.layer_count) {
             crate::board::ViaKind::Through => &mut plated,

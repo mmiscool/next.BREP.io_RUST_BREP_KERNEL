@@ -337,6 +337,19 @@ pub fn read_pair(
     bar: f64,
     reuse_feet: bool,
 ) -> PairRead {
+    read_pair_gated(faces, edge, coedges, bar, reuse_feet, || true).expect("an assenting read is never halted")
+}
+
+/// [`read_pair`], asking `proceed` before the first candidate fit: when it
+/// answers false the read stops there (`None`) and no fit is made.
+pub fn read_pair_gated(
+    faces: [&crate::FaceRecord; 2],
+    edge: &crate::topology::EdgeRecord,
+    coedges: [&crate::topology::CoedgeRecord; 2],
+    bar: f64,
+    reuse_feet: bool,
+    proceed: impl FnOnce() -> bool,
+) -> Option<PairRead> {
     // The two tracking reads' feet are kept but not hashed unless a candidate
     // read follows (`pcurve::defer_foot_inserts`): most pairs read clean.
     let first_feet = reuse_feet.then(|| crate::pcurve::FootMemoScope::open(&faces[0].surface));
@@ -344,10 +357,13 @@ pub fn read_pair(
     let second_feet = reuse_feet.then(|| crate::pcurve::FootMemoScope::open(&faces[1].surface));
     let second = crate::pcurve::defer_foot_inserts(|| old_tracking(faces[1], edge, coedges[1]));
     let (Some((first, first_tracking)), Some((second, second_tracking))) = (first, second) else {
-        return PairRead::Unread;
+        return Some(PairRead::Unread);
     };
     if first_tracking <= bar && second_tracking <= bar {
-        return PairRead::Clean;
+        return Some(PairRead::Clean);
+    }
+    if !proceed() {
+        return None;
     }
     let read_first = || candidate_memoized(faces[0], edge, coedges[0], &first, bar);
     let read_second = || candidate_memoized(faces[1], edge, coedges[1], &second, bar);
@@ -362,7 +378,7 @@ pub fn read_pair(
         // The placeholder is never admitted and never memoised.
         if matches!(second.0, UseRead::Declined(_)) {
             drop(first_feet);
-            return PairRead::Candidates(vec![UseRead::Declined(SKIPPED_FIRST.into()), second.0], usize::from(second.1));
+            return Some(PairRead::Candidates(vec![UseRead::Declined(SKIPPED_FIRST.into()), second.0], usize::from(second.1)));
         }
         let first = read_first();
         drop(first_feet);
@@ -371,7 +387,7 @@ pub fn read_pair(
         // The original ordering remains the independent test oracle.
         (read_first(), read_second())
     };
-    PairRead::Candidates(vec![first.0, second.0], usize::from(first.1) + usize::from(second.1))
+    Some(PairRead::Candidates(vec![first.0, second.0], usize::from(first.1) + usize::from(second.1)))
 }
 
 fn candidate(face: &crate::FaceRecord, edge: &crate::topology::EdgeRecord, coedge: &crate::topology::CoedgeRecord, old: &NurbsCurve, bar: f64) -> UseRead {
@@ -587,6 +603,20 @@ pub fn challenge_inherited_trims_scoped(
     let before_memo = crate::reading_memo::counts();
     let (mut eligible, mut endpoints, mut tracking, mut candidates) = (0usize, 0usize, 0usize, 0usize);
     let (mut far_reused, mut far_read, mut fits_served) = (0usize, 0usize, 0usize);
+    // The body gate below admits the moves only when the closed shells'
+    // residuals read finite BEFORE them, and this loop writes nothing to the
+    // solid, so that reading is taken once, when the first pair needs a fit.
+    // Unreadable, nothing can be admitted: the fits are not made.
+    let closed_residuals = |solid: &BrepSolid| -> Option<Vec<f64>> {
+        let report = crate::shell_vector_areas(solid);
+        report.unreadable.is_empty().then(|| report.shells.iter().filter(|shell| shell.closed).map(|shell| shell.trim_residual.length()).collect())
+    };
+    let mut before: Option<Option<Vec<f64>>> = None;
+    // Taking that reading early costs a scan the pass skips when no move is
+    // accepted, so only a body whose trims hold enough knot spans to near the
+    // scan's budget is read early (the result is the same either way).
+    let read_early = crate::heal::trim_knot_spans(solid) >= crate::soundness::VECTOR_AREA_SPAN_BUDGET / 4;
+    let mut halted = false;
     for edge in edges {
         if edge.degenerate || !(edge.t1 != edge.t0) || constructed.contains(&edge.id) {
             continue;
@@ -626,15 +656,23 @@ pub fn challenge_inherited_trims_scoped(
             &pair_faces[0].loops[edge_uses[0].1].coedges[edge_uses[0].2],
             &pair_faces[1].loops[edge_uses[1].1].coedges[edge_uses[1].2],
         ];
-        let reads = match read_pair(pair_faces, edge, pair_coedges, bar, true) {
-            PairRead::Unread => {
+        let proceed = || !read_early || before.get_or_insert_with(|| closed_residuals(solid)).is_some();
+        let reads = match read_pair_gated(pair_faces, edge, pair_coedges, bar, true, proceed) {
+            None => {
+                if debug {
+                    eprintln!("inherited: edge {} {:?} (operand {operand} edge {source_edge}): the body's closure scan is unreadable before any move, so no refit can be admitted; no fits are made", edge.id, edge.name);
+                }
+                halted = true;
+                break;
+            }
+            Some(PairRead::Unread) => {
                 if debug {
                     eprintln!("inherited: edge {} {:?} (operand {operand} edge {source_edge}) declined: an old trim is unread", edge.id, edge.name);
                 }
                 continue;
             }
-            PairRead::Clean => continue,
-            PairRead::Candidates(reads, served) => {
+            Some(PairRead::Clean) => continue,
+            Some(PairRead::Candidates(reads, served)) => {
                 // Profile only: a use skipped after the other declined is
                 // neither fitted nor served.
                 candidates += reads.iter().filter(|read| !matches!(read, UseRead::Declined(why) if why == SKIPPED_FIRST)).count();
@@ -686,18 +724,15 @@ pub fn challenge_inherited_trims_scoped(
     }
     if profile {
         let after = crate::reading_memo::counts();
-        profile_line!("assemble.inherited_reads faces={} scoped={} eligible={eligible} far_reused={far_reused} far_read={far_read} endpoints={endpoints} tracking={tracking} candidates={candidates} fits={} fits_served={fits_served} reused={} reread={}",
+        profile_line!("assemble.inherited_reads faces={} scoped={} eligible={eligible} far_reused={far_reused} far_read={far_read} endpoints={endpoints} tracking={tracking} candidates={candidates} fits={} fits_served={fits_served} reused={} reread={} halted={halted}",
             faces.len(), scope.map_or(faces.len(), |s| s.len()), candidates - fits_served, after.0 - before_memo.0, after.1 - before_memo.1);
     }
     drop(faces);
-    if order.is_empty() {
+    if halted || order.is_empty() {
         return Ok(Vec::new());
     }
-    let closed_residuals = |solid: &BrepSolid| -> Option<Vec<f64>> {
-        let report = crate::shell_vector_areas(solid);
-        report.unreadable.is_empty().then(|| report.shells.iter().filter(|shell| shell.closed).map(|shell| shell.trim_residual.length()).collect())
-    };
-    let before = closed_residuals(solid);
+    // Read when the first pair asked for fits (on a body read early).
+    let before = before.unwrap_or_else(|| closed_residuals(solid));
     // Debug only, deciding nothing: per-shell strip locations and every
     // shell's residual vector and volume reference BEFORE the moves, for the
     // volume-reference trace below.

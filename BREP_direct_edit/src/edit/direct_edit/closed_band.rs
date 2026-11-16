@@ -499,7 +499,14 @@ pub(super) fn heal_closed_band(
     // can carry its seam edge at u = ½ and cross u = 0 at a vertex that splits
     // each rim in two. A trim pcurve cannot jump across the branch cut in the
     // middle of a coedge, so the healed rim is split there as well.
+    //
+    // Each curved neighbour's run starts on that neighbour's seam edge, and
+    // two curved neighbours need not stand their seams at one azimuth (a cone
+    // turned about the axis before the union). The rim then takes a vertex
+    // where each seam meets it — the old start vertex's nearest point on the
+    // rim, as for the origin — and each neighbour's grown seam ends there.
     let mut stations: [Option<f64>; 2] = [None, None];
+    let mut seam_targets: [Option<Vec3>; 2] = [None, None];
     let mut splits: Vec<f64> = Vec::new();
     for index in 0..2 {
         if !curved[index] {
@@ -507,6 +514,21 @@ pub(super) fn heal_closed_band(
         }
         let surface = &surfaces[index];
         let neighbour = band.rims[index].neighbour;
+        let old_start = solid
+            .vertices
+            .iter()
+            .find(|vertex| vertex.id == band.rims[index].start_vertex)
+            .map(|vertex| vertex.point)
+            .ok_or_else(|| {
+                KernelRefusal::internal(
+                    KernelStage::Collect,
+                    "vertex",
+                    format!("{op}: missing vertex {}", band.rims[index].start_vertex),
+                )
+            })?;
+        let seam_hit = project_point_to_curve(&new_curve, old_start).or_refuse(KernelStage::Classify, "project")?;
+        seam_targets[index] = Some(rim_at(seam_hit.u)?);
+        splits.push(seam_hit.u);
         let station = match surface.analytic() {
             Some(AnalyticSurface::RuledRevolution { frame, height, .. }) => {
                 let axial = new_point.sub(frame.origin).dot(frame.axis);
@@ -597,6 +619,38 @@ pub(super) fn heal_closed_band(
         });
         piece_vertices.push(id);
     }
+    // The rim vertex each curved neighbour's seam ends on.
+    let mut seam_vertices: [u64; 2] = [new_vertex_id; 2];
+    for index in 0..2 {
+        let Some(target) = seam_targets[index] else {
+            continue;
+        };
+        let mut nearest: Option<(f64, u64)> = None;
+        for (position, &vertex_id) in piece_vertices.iter().enumerate() {
+            let distance = rim_at(bounds[position])?.sub(target).length();
+            if nearest.map_or(true, |(best, _)| distance < best) {
+                nearest = Some((distance, vertex_id));
+            }
+        }
+        match nearest {
+            Some((distance, vertex_id)) if distance <= tolerance => seam_vertices[index] = vertex_id,
+            _ => {
+                return Err(KernelRefusal::internal(
+                    KernelStage::Sew,
+                    "seam_vertex",
+                    refusal(&format!(
+                        "no healed rim vertex stands where neighbour {}'s seam meets it",
+                        band.rims[index].neighbour
+                    )),
+                ))
+            }
+        }
+    }
+    let vertex_point: HashMap<u64, Vec3> = piece_vertices
+        .iter()
+        .zip(&bounds)
+        .map(|(&id, &bound)| Ok((id, rim_at(bound)?)))
+        .collect::<Result<_, KernelRefusal>>()?;
     // Each piece is its own curve over its whole domain, so a planar
     // neighbour's pcurve is the exact affine preimage rather than a fit.
     let mut piece_curves: Vec<NurbsCurve> = Vec::with_capacity(pieces);
@@ -638,10 +692,16 @@ pub(super) fn heal_closed_band(
             ));
         }
         let forward = sense > 0.0;
+        // The loop goes on from the run's start vertex, so the rim's coedges
+        // start (and end) at this neighbour's seam vertex.
+        let first = piece_vertices
+            .iter()
+            .position(|&id| id == seam_vertices[index])
+            .expect("a seam vertex is a piece vertex");
         let order: Vec<usize> = if forward {
-            (0..pieces).collect()
+            (0..pieces).map(|step| (first + step) % pieces).collect()
         } else {
-            (0..pieces).rev().collect()
+            (0..pieces).map(|step| (first + pieces - 1 - step) % pieces).collect()
         };
         let surface = &surfaces[index];
         let mut coedges: Vec<CoedgeRecord> = Vec::with_capacity(pieces);
@@ -697,26 +757,63 @@ pub(super) fn heal_closed_band(
                 // Which way the traversal runs in the carrier's own u,
                 // measured an eighth of a turn along it.
                 let eighth = (nt1 - nt0) / 8.0;
-                let ahead = rim_at(if forward { nt0 + eighth } else { nt1 - eighth })?;
-                let mut u = u_of(new_point)?;
-                let ascending = (u_of(ahead)? - u + 0.5 * span).rem_euclid(span) > 0.5 * span;
+                let start = bounds[first];
+                let ahead = rim_at(if forward {
+                    if start + eighth > nt1 { start + eighth - (nt1 - nt0) } else { start + eighth }
+                } else if start - eighth < nt0 {
+                    start - eighth + (nt1 - nt0)
+                } else {
+                    start - eighth
+                })?;
+                let ascending = (u_of(ahead)? - u_of(rim_at(start)?)? + 0.5 * span).rem_euclid(span) > 0.5 * span;
+                // The one rim vertex on the carrier's own seam takes the
+                // domain's ends; every other vertex keeps its projected u, so
+                // an arc a few microradians long beside the seam stays that
+                // arc. It is the vertex nearest the seam crossing among those
+                // whose u reads as the seam.
+                let crossing = surface.evaluate(u_low, v_new).or_refuse(KernelStage::Sew, "evaluate")?;
+                let mut seam_index: Option<(f64, usize)> = None;
+                for position in 0..pieces {
+                    let point = rim_at(bounds[position])?;
+                    let raw = u_of(point)?;
+                    if (raw - u_low).abs() > eps && (raw - u_high).abs() > eps {
+                        continue;
+                    }
+                    let distance = point.sub(crossing).length();
+                    if seam_index.map_or(true, |(best, _)| distance < best) {
+                        seam_index = Some((distance, position));
+                    }
+                }
+                let seam_index = seam_index.map(|(_, position)| position);
+                if pieces == 1 && seam_index.is_none() {
+                    return Err(KernelRefusal::internal(
+                        KernelStage::Sew,
+                        "rim_misses_seam",
+                        refusal(&format!(
+                            "the healed rim has no vertex on neighbour {}'s seam",
+                            rim.neighbour
+                        )),
+                    ));
+                }
+                let mut u = u_of(rim_at(start)?)?;
                 for piece in order {
-                    let end_parameter = if forward { bounds[piece + 1] } else { bounds[piece] };
-                    if ascending && (u - u_high).abs() <= eps {
-                        u = u_low;
+                    let (start_index, end_index) =
+                        if forward { (piece, (piece + 1) % pieces) } else { ((piece + 1) % pieces, piece) };
+                    // Leaving the seam vertex, the walk enters the domain at
+                    // its other end.
+                    if seam_index == Some(start_index) {
+                        u = if ascending { u_low } else { u_high };
                     }
-                    if !ascending && (u - u_low).abs() <= eps {
-                        u = u_high;
-                    }
-                    let end_raw = u_of(rim_at(end_parameter)?)?;
-                    let delta = if ascending {
-                        let delta = (end_raw - u).rem_euclid(span);
-                        if delta <= eps { span } else { delta }
+                    let end_u = if seam_index == Some(end_index) {
+                        if ascending { u_high } else { u_low }
                     } else {
-                        let delta = (u - end_raw).rem_euclid(span);
-                        -(if delta <= eps { span } else { delta })
+                        let end_raw = u_of(rim_at(bounds[end_index])?)?;
+                        if ascending {
+                            u + (end_raw - u).rem_euclid(span)
+                        } else {
+                            u - (u - end_raw).rem_euclid(span)
+                        }
                     };
-                    let end_u = u + delta;
                     if end_u < u_low - eps || end_u > u_high + eps {
                         return Err(KernelRefusal::internal(
                             KernelStage::Sew,
@@ -755,12 +852,12 @@ pub(super) fn heal_closed_band(
         .filter_map(|edge_id| edge_map.get(edge_id))
         .flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id])
         .collect();
-    let collapsed: HashSet<u64> = band
+    let collapsed: HashMap<u64, u64> = band
         .rims
         .iter()
-        .zip(curved)
-        .filter(|(_, curved)| *curved)
-        .map(|(rim, _)| rim.start_vertex)
+        .enumerate()
+        .filter(|(index, _)| curved[*index])
+        .map(|(index, rim)| (rim.start_vertex, seam_vertices[index]))
         .collect();
     let mut extended: HashMap<u64, (bool, bool)> = HashMap::default();
     let mut refit: HashSet<u64> = HashSet::default();
@@ -773,8 +870,8 @@ pub(super) fn heal_closed_band(
         if !(start_hit || end_hit) {
             continue;
         }
-        if (start_hit && !collapsed.contains(&edge.start_vertex_id))
-            || (end_hit && !collapsed.contains(&edge.end_vertex_id))
+        if (start_hit && !collapsed.contains_key(&edge.start_vertex_id))
+            || (end_hit && !collapsed.contains_key(&edge.end_vertex_id))
         {
             return Err(KernelRefusal::unsupported(
                 KernelStage::Sew,
@@ -785,11 +882,17 @@ pub(super) fn heal_closed_band(
                 )),
             ));
         }
+        let target_vertex = if start_hit {
+            collapsed[&edge.start_vertex_id]
+        } else {
+            collapsed[&edge.end_vertex_id]
+        };
+        let target_point = vertex_point[&target_vertex];
         if start_hit {
-            edge.start_vertex_id = new_vertex_id;
+            edge.start_vertex_id = target_vertex;
         }
         if end_hit {
-            edge.end_vertex_id = new_vertex_id;
+            edge.end_vertex_id = target_vertex;
         }
         if start_hit && end_hit {
             return Err(KernelRefusal::unsupported(
@@ -805,7 +908,7 @@ pub(super) fn heal_closed_band(
             } else {
                 edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?
             };
-            let (from, to) = if start_hit { (new_point, anchor) } else { (anchor, new_point) };
+            let (from, to) = if start_hit { (target_point, anchor) } else { (anchor, target_point) };
             edge.curve = make_line(from, to).or_refuse(KernelStage::Sew, "make_line")?;
             [edge.t0, edge.t1] = edge.curve.domain().or_refuse(KernelStage::Sew, "domain")?;
             if redundant {
@@ -813,7 +916,7 @@ pub(super) fn heal_closed_band(
             }
         } else {
             let projection =
-                project_point_to_curve(&edge.curve, new_point).or_refuse(KernelStage::Sew, "project")?;
+                project_point_to_curve(&edge.curve, target_point).or_refuse(KernelStage::Sew, "project")?;
             if projection.distance > tolerance {
                 return Err(KernelRefusal::unsupported(
                     KernelStage::Sew,
@@ -845,9 +948,8 @@ pub(super) fn heal_closed_band(
         .iter()
         .map(|edge| (edge.id, edge.clone()))
         .collect();
-    // A grown edge has to stay on every carrier it borders. Two curved
-    // neighbours whose seams stand at different azimuths would pull one seam
-    // off its own wall to reach the rim's single start vertex.
+    // A grown edge has to stay on every carrier it borders: a seam grown to
+    // a rim vertex that is not on its own ruling would leave its wall.
     for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
         for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
             if !extended.contains_key(&coedge.edge_id) {

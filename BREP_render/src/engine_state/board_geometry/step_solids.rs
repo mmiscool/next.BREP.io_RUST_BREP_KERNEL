@@ -399,9 +399,10 @@ fn fill_solid(piece: &board::FillPiece, lo: f64, hi: f64) -> Result<BrepSolid, S
 }
 
 /// The drill a copper primitive surrounds: a via's, or a drilled pad's.
-fn item_hole(board: &Board, owner: &CopperRef) -> Option<Hole> {
+/// `vias` is [`Board::all_vias`], which a `CopperRef::Via` indexes.
+fn item_hole(board: &Board, vias: &[board::Via], owner: &CopperRef) -> Option<Hole> {
     match *owner {
-        CopperRef::Via(index) => board.vias.get(index).map(|via| Hole::round(xy(via.at), mm(via.drill))),
+        CopperRef::Via(index) => vias.get(index).map(|via| Hole::round(xy(via.at), mm(via.drill))),
         CopperRef::Pad { placement, pad } => {
             let placement = board.placements.get(placement)?;
             let pad = placement.footprint.pads.get(pad)?;
@@ -414,6 +415,18 @@ fn item_hole(board: &Board, owner: &CopperRef) -> Option<Hole> {
         }
         CopperRef::Track { .. } => None,
     }
+}
+
+/// The holes of `holes` (board millimetres) whose centre `covers` (board
+/// micrometres) and whose depth reaches `lo..hi`, less the one at `own`.
+fn bores_in(holes: &[Hole], covers: impl Fn(brep_ecad_core::Point) -> bool, own: Option<[f64; 2]>, lo: f64, hi: f64) -> Vec<Hole> {
+    holes
+        .iter()
+        .filter(|h| own.is_none_or(|at| (at[0] - h.at[0]).hypot(at[1] - h.at[1]) > 1e-6))
+        .filter(|h| h.depth.is_none_or(|(a, b)| a.min(b) < hi && lo < a.max(b)))
+        .filter(|h| covers(brep_ecad_core::Point::new((h.at[0] * 1000.).round() as i32, (-h.at[1] * 1000.).round() as i32)))
+        .cloned()
+        .collect()
 }
 
 /// Every hole in the board: each through via's drill and each drilled pad's,
@@ -433,14 +446,13 @@ fn board_holes(board: &Board) -> Vec<Hole> {
             Hole { depth: Some(depth), ..Hole::round(xy(via.at), mm(via.drill)) }
         })
         .collect();
-    let vias = (0..board.vias.len())
-        .filter(|&v| board.vias[v].kind(count) == board::ViaKind::Through)
-        .map(CopperRef::Via);
+    let all = board.all_vias();
+    let vias = (0..all.len()).filter(|&v| all[v].kind(count) == board::ViaKind::Through).map(CopperRef::Via);
     let pads = board.placements.iter().enumerate().flat_map(|(placement, p)| {
         (0..p.footprint.pads.len()).map(move |pad| CopperRef::Pad { placement, pad })
     });
     vias.chain(pads)
-        .filter_map(|owner| item_hole(board, &owner))
+        .filter_map(|owner| item_hole(board, &all, &owner))
         .chain(blind)
         .filter(|hole| hole.diameter > 1e-6)
         .collect()
@@ -492,6 +504,7 @@ pub(crate) fn board_step_solids(board: &Board, netlist: Option<&Netlist>) -> Opt
     }
 
     // The copper, layer by layer, one solid per primitive.
+    let all_vias = board.all_vias();
     let (copper, nets) = copper_and_nets(board, netlist);
     for layer in 0..board.layer_count.max(1) {
         let (lo, hi) = super::copper_span(layer, board.layer_count);
@@ -503,9 +516,15 @@ pub(crate) fn board_step_solids(board: &Board, netlist: Option<&Netlist>) -> Opt
             }
             count += 1;
             let name = format!("{layer_name}/{}#{count}", net_part(net.as_deref()));
-            let solid = match item_hole(board, &item.owner) {
-                Some(hole) => drilled(&item.shape, hole, lo, hi),
-                None => shape_curves(&item.shape, lo).and_then(|curves| prism(&curves, lo, hi)),
+            // Every other hole whose centre this copper covers is bored through it
+            // too (a pad's own vias, a track run over a via): the drill opens it.
+            let own = item_hole(board, &all_vias, &item.owner);
+            let bores = bores_in(&holes, |p| item.shape.contains(p), own.as_ref().map(|h| h.at), lo, hi);
+            let solid = match own {
+                Some(hole) => drilled(&item.shape, hole, lo, hi).and_then(|body| drill(body, &bores, lo, hi)),
+                None => shape_curves(&item.shape, lo)
+                    .and_then(|curves| prism(&curves, lo, hi))
+                    .and_then(|body| drill(body, &bores, lo, hi)),
             };
             match solid {
                 Ok(body) => {
@@ -520,7 +539,8 @@ pub(crate) fn board_step_solids(board: &Board, netlist: Option<&Netlist>) -> Opt
             for piece in &zone.fill {
                 count += 1;
                 let name = format!("{layer_name}/{}#{count}", net_part(Some(&zone.net)));
-                match fill_solid(piece, lo, hi) {
+                let bores = bores_in(&holes, |p| piece.contains(p), None, lo, hi);
+                match fill_solid(piece, lo, hi).and_then(|body| drill(body, &bores, lo, hi)) {
                     Ok(body) => {
                         out.colors.push((name.clone(), COPPER_RGB));
                         out.bodies.push((name, body));
@@ -532,7 +552,7 @@ pub(crate) fn board_step_solids(board: &Board, netlist: Option<&Netlist>) -> Opt
     }
 
     // The plated via barrels, as tubes: the bore's wall plus the plating.
-    for (index, via) in board.vias.iter().enumerate() {
+    for (index, via) in board.all_vias().iter().enumerate() {
         let name = format!("{VIAS_SOLID}#{}", index + 1);
         let inner = mm(via.drill) / 2.;
         let outer = inner + mm(board::COPPER_THICKNESS);

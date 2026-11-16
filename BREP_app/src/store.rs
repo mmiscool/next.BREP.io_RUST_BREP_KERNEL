@@ -266,7 +266,8 @@ pub fn media_type(file_name: &str) -> &'static str {
         // zipped STEP; a plain `.step` file is `model/step`.
         "step" | "stp" => "model/step",
         "iges" | "igs" => "model/iges",
-        "x_t" | "xmt_txt" => "model/vnd.parasolid.transmit.text",
+        "x_t" | "xmt_txt" | "p_t" => "model/vnd.parasolid.transmit.text",
+        "x_b" | "xmt_bin" | "p_b" => "model/vnd.parasolid.transmit.binary",
         "stl" => "model/stl",
         "obj" => "model/obj",
         "dxf" => "image/vnd.dxf",

@@ -47,10 +47,11 @@ pub const CLASSES: [(&str, &str, &str, &str); 3] = [
 /// type the system already has merges the globs; it replaces nothing.
 /// KiCad files are imported too but have no registered type, and KiCad's own
 /// association owns them, so they are not offered here.
-pub const IMPORT_TYPES: [(&str, &[&str], &str); 6] = [
+pub const IMPORT_TYPES: [(&str, &[&str], &str); 7] = [
     ("model/step", &["step", "stp", "p21"], "STEP 3D model"),
     ("model/iges", &["iges", "igs"], "IGES 3D model"),
-    ("model/vnd.parasolid.transmit.text", &["x_t", "xmt_txt"], "Parasolid part"),
+    ("model/vnd.parasolid.transmit.text", &["x_t", "xmt_txt", "p_t"], "Parasolid part"),
+    ("model/vnd.parasolid.transmit.binary", &["x_b", "xmt_bin", "p_b"], "Parasolid binary part"),
     ("model/stl", &["stl"], "STL mesh"),
     ("model/3mf", &["3mf"], "3MF mesh package"),
     ("model/obj", &["obj"], "OBJ mesh"),

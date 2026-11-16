@@ -608,6 +608,25 @@ pub fn fillet_edges(
                 }
                 other => other,
             };
+            // A closed ridge split into two arcs because its walls' seams sit
+            // a hair apart is blended on the body with one wall turned about
+            // the axis onto the other's seam and the arcs joined into one
+            // closed edge (`blend/turned_rim.rs`; default on,
+            // `BREP_FILLET_TURNED_RIM=0` off). Only a refusal asks.
+            let answered = match answered {
+                Err(refusal) if crate::blend::turned_rim::turned_rim_on() => {
+                    match crate::blend::turned_rim::turn_rim_seams_together(solid, edge_points, edge_names, &resolve_edge_by_point) {
+                        Some(turned) => fillet_edges_prepared(&turned.solid, &turned.points, turned.names.as_deref(), radius, chamfer, name)
+                            .map_err(|turned_refusal| {
+                                refusal.with_message(|message| {
+                                    format!("{message} The rim turned into one closed edge refused too: {}", turned_refusal.message)
+                                })
+                            }),
+                        None => Err(refusal),
+                    }
+                }
+                other => other,
+            };
             // A sheet's edge that runs out at the free boundary has no face
             // across its end: each such end is closed by a temporary planar
             // face, the body blended, and the faces removed again
@@ -3158,6 +3177,230 @@ fn fillet_edges_group_unchecked(
     }
 }
 
+/// `BREP_FILLET_CONCAVE_FIRST_STAGES` (default on; `=0` restores the cutter
+/// composition): a selection the network refuses for MIXED CONVEXITY whose
+/// concave edges also meet each other at a corner no selected convex edge
+/// reaches is built in two network stages, concave edges first.
+///
+/// Cause: a boss standing across a block's top edge, filleted along its base
+/// (two vertical concave edges on the block's side, the concave arc on its
+/// top) together with the boss's bottom face. The bottom corners are
+/// re-entrant stars (one concave, two convex edges), which the network
+/// refuses by convexity, so the WHOLE selection went to the sequential
+/// cutter build; that build runs each concave cutter past the block's sharp
+/// top edge and closes it with folded flat caps (a crease of 180 degrees)
+/// instead of the miter the network builds where the two concave pads meet
+/// over that edge.
+/// The stage name a concave pad carries between the two stages of
+/// [`concave_first_stages`], followed by its selection index.
+const CONCAVE_FIRST_PAD: &str = "FILLET:CONCAVE_FIRST:";
+
+fn concave_first_stages_on() -> bool {
+    switch!("BREP_FILLET_CONCAVE_FIRST_STAGES", true)
+}
+
+/// One network stage of [`concave_first_stages`], under the acceptance the
+/// group's own network result gets (heal, planar charts, validation,
+/// interference, loop scans). `None` when the network refuses or the result
+/// fails any check.
+fn concave_first_network_stage(
+    input: &BrepSolid,
+    edge_ids: &[u64],
+    network_names: &[Option<String>],
+    corner_name: &dyn Fn(&[usize]) -> Option<String>,
+    radius: f64,
+    wrap_concave: bool,
+) -> Option<BrepSolid> {
+    let debug = std::env::var("BREP_DEBUG_NETWORK").is_ok();
+    let mut body = match crate::blend::blend_star_network_with_corner_policy(
+        input, edge_ids, radius, false, network_names, corner_name, wrap_concave,
+    ) {
+        Ok(body) => body,
+        Err(refusal) => {
+            if debug {
+                eprintln!("concave-first stage on {edge_ids:?} refused: {refusal}");
+            }
+            return None;
+        }
+    };
+    let entry = "fillet_edges";
+    let healed = heal_edge_vertex_gaps(&mut body, radius);
+    let charts = crate::blend::fit_planar_charts_to_trims(input, &mut body);
+    let issues = body.validate_memoised();
+    let interference = check_blend_interference(input, &body, edge_ids, entry);
+    let bowtie = check_loop_self_crossings(&body, entry).and_then(|()| check_blend_wall_loops(&body, entry));
+    if healed.is_ok() && charts.is_ok() && issues.is_empty() && interference.is_ok() && bowtie.is_ok() {
+        return Some(body);
+    }
+    if debug {
+        eprintln!(
+            "concave-first stage on {edge_ids:?} rejected: heal={healed:?} charts={charts:?} issues={issues:?} \
+             interference={interference:?} bowtie={bowtie:?}"
+        );
+    }
+    None
+}
+
+/// The two-stage build [`concave_first_stages_on`] describes: the concave
+/// edges through the network on the input, then the convex edges through the
+/// network on that body. Where a concave pad now separates two selected
+/// convex edges that met it at a re-entrant star, the pad's own edge on their
+/// shared face joins the second stage, so the star closes as one rounded run
+/// (named as the star's corner) rather than with flat caps. `None` when the
+/// selection is not of this shape or either stage fails: the caller's ladder
+/// then goes on unchanged.
+#[allow(clippy::too_many_arguments)]
+fn concave_first_stages(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    selected_edge_ids: &[u64],
+    radius: f64,
+    name: Option<&str>,
+    wrap_concave: bool,
+) -> Option<BrepSolid> {
+    let debug = std::env::var("BREP_DEBUG_NETWORK").is_ok();
+    let convex = crate::blend::selection_convexity(solid, selected_edge_ids, radius)?;
+    let concave_indices: Vec<usize> = (0..convex.len()).filter(|&index| !convex[index]).collect();
+    let convex_indices: Vec<usize> = (0..convex.len()).filter(|&index| convex[index]).collect();
+    if concave_indices.is_empty() || convex_indices.is_empty() {
+        return None;
+    }
+    let edge = |id: u64| solid.edges.iter().find(|edge| edge.id == id);
+    let ends = |id: u64| edge(id).map(|edge| [edge.start_vertex_id, edge.end_vertex_id]);
+    // The shape this answers: two concave edges meeting where no selected
+    // convex edge ends (the miter the cutter build caps).
+    let concave_corner = concave_indices.iter().enumerate().any(|(slot, &a)| {
+        concave_indices[slot + 1..].iter().any(|&b| {
+            let (Some(ends_a), Some(ends_b)) = (ends(selected_edge_ids[a]), ends(selected_edge_ids[b])) else {
+                return false;
+            };
+            ends_a.iter().any(|vertex| {
+                ends_b.contains(vertex)
+                    && !convex_indices.iter().any(|&c| ends(selected_edge_ids[c]).is_some_and(|ends_c| ends_c.contains(vertex)))
+            })
+        })
+    });
+    if !concave_corner {
+        return None;
+    }
+    let names_of = |indices: &[usize]| -> Vec<Option<String>> {
+        indices.iter().map(|&index| per_edge_name(edge_names, name, index).map(str::to_string)).collect()
+    };
+    // Stage 1: the concave edges on the input. Each pad carries a stage name
+    // of its own until the end, so finding a pad below never depends on the
+    // names the caller supplied (or did not).
+    let concave_ids: Vec<u64> = concave_indices.iter().map(|&index| selected_edge_ids[index]).collect();
+    let stage_name = |index: usize| format!("{CONCAVE_FIRST_PAD}{index}");
+    let concave_names: Vec<Option<String>> = concave_indices.iter().map(|&index| Some(stage_name(index))).collect();
+    let concave_corner_name = |adjacent: &[usize]| {
+        let members: Vec<usize> = adjacent.iter().map(|&slot| concave_indices[slot]).collect();
+        corner_face_name(edge_names, name, &members)
+    };
+    let staged = concave_first_network_stage(solid, &concave_ids, &concave_names, &concave_corner_name, radius, wrap_concave)?;
+    let original_faces: rustc_hash::FxHashSet<u64> =
+        solid.shells.iter().flat_map(|shell| &shell.faces).map(|face| face.id).collect();
+    let faces_of = |id: u64| -> Vec<&FaceRecord> {
+        staged
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| face.loops.iter().flat_map(|rim| &rim.coedges).any(|coedge| coedge.edge_id == id))
+            .collect()
+    };
+    // Stage 2: the convex edges, resolved on the staged body by their pick
+    // points (a concave pad trims a convex edge at its end, never at the
+    // point it was picked by).
+    let mut stage_ids: Vec<u64> = Vec::with_capacity(convex_indices.len() + 2);
+    let mut members: Vec<Vec<usize>> = Vec::with_capacity(convex_indices.len() + 2);
+    for &index in &convex_indices {
+        let id = resolve_edge_by_point(&staged, edge_points[index]).ok()?;
+        // A pick that now lands on a pad (one made inside the stretch the pad
+        // trimmed away) is not the convex edge it named.
+        if stage_ids.contains(&id) || faces_of(id).iter().any(|face| !original_faces.contains(&face.id)) {
+            return None;
+        }
+        stage_ids.push(id);
+        members.push(vec![index]);
+    }
+    let staged_edge = |id: u64| staged.edges.iter().find(|edge| edge.id == id);
+    let convex_count = stage_ids.len();
+    for pad in &staged.edges {
+        if pad.degenerate || stage_ids.contains(&pad.id) || pad.start_vertex_id == pad.end_vertex_id {
+            continue;
+        }
+        let faces = faces_of(pad.id);
+        if faces.len() != 2 {
+            continue;
+        }
+        // One side is a stage-1 pad, named after the concave edge it rounds.
+        let Some(concave_index) = faces.iter().find(|face| !original_faces.contains(&face.id)).and_then(|face| {
+            concave_indices.iter().copied().find(|&index| face.name.as_deref() == Some(stage_name(index).as_str()))
+        }) else {
+            continue;
+        };
+        // Its two ends are ends of two DIFFERENT selected convex edges.
+        let ender = |vertex: u64| {
+            (0..convex_count).find(|&slot| {
+                staged_edge(stage_ids[slot]).is_some_and(|edge| edge.start_vertex_id == vertex || edge.end_vertex_id == vertex)
+            })
+        };
+        let (Some(first), Some(second)) = (ender(pad.start_vertex_id), ender(pad.end_vertex_id)) else {
+            continue;
+        };
+        if first == second {
+            continue;
+        }
+        // And the other side is a face both of those convex edges run along.
+        let Some(other) = faces.iter().find(|face| original_faces.contains(&face.id)) else {
+            continue;
+        };
+        let borders = |slot: usize| faces_of(stage_ids[slot]).iter().any(|face| face.id == other.id);
+        if !borders(first) || !borders(second) {
+            continue;
+        }
+        match super::analyze::scan_dihedral(&staged, pad.id) {
+            Ok(profile) if profile.samples > 0 && profile.any_convex && !profile.any_concave => {}
+            _ => continue,
+        }
+        let mut star = vec![concave_index, convex_indices[first], convex_indices[second]];
+        star.sort_unstable();
+        stage_ids.push(pad.id);
+        members.push(star);
+    }
+    let mut stage_names = names_of(&convex_indices);
+    stage_names.extend(members[convex_count..].iter().map(|star| corner_face_name(edge_names, name, star)));
+    let stage_corner_name = |adjacent: &[usize]| {
+        let mut flat: Vec<usize> = adjacent.iter().flat_map(|&slot| members[slot].iter().copied()).collect();
+        flat.sort_unstable();
+        flat.dedup();
+        corner_face_name(edge_names, name, &flat)
+    };
+    let mut built = concave_first_network_stage(&staged, &stage_ids, &stage_names, &stage_corner_name, radius, wrap_concave)?;
+    for face in built.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
+        // The stage name, and anything a stage appended to it, back to the
+        // pad's own name.
+        let Some(tail) = face.name.as_deref().and_then(|value| value.strip_prefix(CONCAVE_FIRST_PAD)) else {
+            continue;
+        };
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        let Ok(index) = tail[..digits].parse::<usize>() else {
+            return None;
+        };
+        let rest = tail[digits..].to_string();
+        face.name = per_edge_name(edge_names, name, index).map(|own| format!("{own}{rest}"));
+    }
+    if debug {
+        eprintln!(
+            "concave-first stages: {} concave, {} convex and {} star pad edge(s) built",
+            concave_ids.len(),
+            convex_count,
+            stage_ids.len() - convex_count
+        );
+    }
+    Some(built)
+}
+
 fn fillet_edges_group_lanes(
     solid: &BrepSolid,
     edge_points: &[Vec3],
@@ -3521,6 +3764,17 @@ fn fillet_edges_group_lanes(
             Err(refusal) => {
                 if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                     eprintln!("network refused: {refusal}");
+                }
+                // A mixed-convexity refusal over a selection whose concave
+                // edges also miter each other: build them first, then the
+                // convex edges (`concave_first_stages_on`).
+                let mixed = matches!(&refusal.class, RefusalClass::UnsupportedGeometry { what } if what == "mixed_convexity");
+                if !chamfer && mixed && concave_first_stages_on() {
+                    if let Some(body) = concave_first_stages(
+                        solid, edge_points, edge_names, &selected_edge_ids, radius, name, wrap_concave,
+                    ) {
+                        return Ok(GroupBody { body, bowtie_clean: true });
+                    }
                 }
                 // A stripe whose TAPER to a cusp reaches its full radius only
                 // inside the corner setback at its other end has no constant

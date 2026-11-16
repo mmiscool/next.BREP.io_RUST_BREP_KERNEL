@@ -197,15 +197,6 @@ impl Surface {
         )
     }
 
-    /// Whether [`Self::distance`] answers for this surface.
-    pub fn has_distance(&self) -> bool {
-        match self {
-            Surface::Spun { .. } | Surface::Swept { .. } => false,
-            Surface::Offset { base, .. } => base.has_distance(),
-            _ => true,
-        }
-    }
-
     /// The signed distance (mm) from `x` to the surface and its gradient (a
     /// unit vector), where the surface has one the reader can compute; the
     /// sign is arbitrary but consistent with the gradient.
@@ -255,9 +246,225 @@ impl Surface {
                 // normals point; a B-surface's is measured along its normal.
                 Some((f - normal_side, g))
             }
-            Surface::Spun { .. } | Surface::Swept { .. } => None,
+            // A swept surface is its section's cylinder: the nearest point
+            // is the section's nearest across the sweep, then slid along it.
+            // Measured along the natural normal, dC/du × sweep.
+            Surface::Swept { section, direction } => {
+                let d = unit(*direction)?;
+                let across = |p: Vec3| p.sub(d.scale(p.dot(d)));
+                let u = nearest_parameter(section, [true, true], |c| across(c.sub(x)).length())?;
+                let c = extended_point(section, u).ok()?;
+                let foot = c.add(d.scale(x.sub(c).dot(d)));
+                let normal = unit(curve_tangent(section, u)?.cross(d))?;
+                Some((x.sub(foot).dot(normal), normal))
+            }
+            // A spun surface in the half-plane through the axis and `x` is
+            // its profile's (height, radius) trace: the nearest point is that
+            // trace's nearest to x's (height, radius), turned to x's side.
+            // Measured along the natural normal, dP/du × dP/dv.
+            Surface::Spun { profile, axis_point, axis } => {
+                let k = unit(*axis)?;
+                let split = |p: Vec3| {
+                    let d = p.sub(*axis_point);
+                    let h = d.dot(k);
+                    (h, d.sub(k.scale(h)))
+                };
+                let (h, radial) = split(x);
+                let e = unit(radial)?;
+                // A profile is not continued past an end on the axis (a
+                // dome's pole): past it the trace folds back on itself.
+                let off_axis = |t: f64| profile.point(t).is_ok_and(|c| split(c).1.length() > 1e-6);
+                let extend = profile.natural_range().map_or([true, true], |[a, b]| [off_axis(a), off_axis(b)]);
+                let u = nearest_parameter(profile, extend, |c| {
+                    let (hc, rc) = split(c);
+                    (hc - h).hypot(rc.length() - radial.length())
+                })?;
+                let (hc, rc) = split(extended_point(profile, u).ok()?);
+                let foot = axis_point.add(k.scale(hc)).add(e.scale(rc.length()));
+                let t = curve_tangent(profile, u)?;
+                // The profile's tangent, turned with its point onto x's side.
+                let along = k.scale(t.dot(k)).add(e.scale(unit(rc).map_or(0.0, |r| t.dot(r))));
+                let normal = unit(along.cross(k.cross(e)))?;
+                Some((x.sub(foot).dot(normal), normal))
+            }
         }
     }
+}
+
+/// A point of `curve` at `t`, a bounded B-curve continued past its ends
+/// along its end tangents at its end speeds: Parasolid extends the sections
+/// of swept and spun surfaces so (a SolidWorks part's blend spine runs
+/// 123 mm along a swept section's straight extension).
+/// A closed B-curve is not extended: it wraps round its period.
+pub fn extended_point(curve: &Curve, t: f64) -> Result<Vec3, String> {
+    let Curve::Nurbs(nurbs) = curve else { return curve.point(t) };
+    if let Some([a, b]) = closed_range(curve) {
+        return nurbs.evaluate(a + (t - a).rem_euclid(b - a));
+    }
+    let [a, b] = nurbs.domain()?;
+    let h = 1e-6 * (b - a);
+    if t < a {
+        let p = nurbs.evaluate(a)?;
+        let velocity = nurbs.evaluate(a + h)?.sub(p).scale(1.0 / h);
+        Ok(p.add(velocity.scale(t - a)))
+    } else if t > b {
+        let p = nurbs.evaluate(b)?;
+        let velocity = p.sub(nurbs.evaluate(b - h)?).scale(1.0 / h);
+        Ok(p.add(velocity.scale(t - b)))
+    } else {
+        nurbs.evaluate(t)
+    }
+}
+
+/// A B-curve's range when its ends meet (to 1e-6 mm): a closed section or
+/// profile, which is searched round its period and never extended.
+fn closed_range(curve: &Curve) -> Option<[f64; 2]> {
+    let Curve::Nurbs(nurbs) = curve else { return None };
+    let [a, b] = nurbs.domain().ok()?;
+    (b > a && nurbs.evaluate(a).ok()?.sub(nurbs.evaluate(b).ok()?).length() <= 1e-6).then_some([a, b])
+}
+
+/// The parameter of `curve` (extended, [`extended_point`]) where `distance`
+/// (from some fixed point) is least: the best of eight samples in every knot
+/// span (fewer, but at least two, when spans are many), refined by Brent's
+/// method between its neighbouring samples. A closed curve is searched over
+/// its period, a bounded B-curve over its range and as far again past each
+/// end `extend` names, a line over ±1 km about its point.
+pub fn nearest_parameter(curve: &Curve, extend: [bool; 2], distance: impl Fn(Vec3) -> f64) -> Option<f64> {
+    let f = |t: f64| extended_point(curve, t).ok().map_or(f64::INFINITY, &distance);
+    // The samples, and the bounds the search may not pass: a B-curve's ends
+    // it is not extended past. A closed curve's search is unbounded (its
+    // foot just below the seam lies before the first sample) and wraps.
+    let (mut floor, mut ceiling) = (f64::NEG_INFINITY, f64::INFINITY);
+    let closed = closed_range(curve);
+    let samples: Vec<f64> = match curve {
+        Curve::Nurbs(nurbs) => {
+            let [a, b] = nurbs.domain().ok()?;
+            let extend = if closed.is_some() { [false, false] } else { extend };
+            if closed.is_none() {
+                if !extend[0] {
+                    floor = a;
+                }
+                if !extend[1] {
+                    ceiling = b;
+                }
+            }
+            let mut knots: Vec<f64> = nurbs.knots.iter().copied().filter(|k| (a..=b).contains(k)).collect();
+            knots.dedup();
+            let spans = knots.len().saturating_sub(1).max(1);
+            let per_span = (1024 / spans).clamp(2, 8);
+            let mut samples = Vec::with_capacity(spans * per_span + 2 * 8 * spans + 1);
+            // Each extension is as long as the range, sampled as densely as
+            // the range is on average.
+            let outside = (8 * spans).min(256);
+            if extend[0] {
+                samples.extend((0..outside).map(|k| a - (b - a) + (b - a) * k as f64 / outside as f64));
+            }
+            for pair in knots.windows(2) {
+                samples.extend((0..per_span).map(|k| pair[0] + (pair[1] - pair[0]) * k as f64 / per_span as f64));
+            }
+            samples.push(b);
+            if extend[1] {
+                samples.extend((1..=outside).map(|k| b + (b - a) * k as f64 / outside as f64));
+            }
+            samples
+        }
+        _ => {
+            // Thirty-two samples round a circle or ellipse, as many along a
+            // line's ±1 km.
+            let [a, b] = curve.natural_range().unwrap_or([-1000.0, 1000.0]);
+            (0..=32).map(|k| a + (b - a) * k as f64 / 32.0).collect()
+        }
+    };
+    let best = (0..samples.len()).min_by(|&i, &j| f(samples[i]).total_cmp(&f(samples[j])))?;
+    // The neighbouring samples bracket the minimum; at the first or last
+    // sample, the bracket runs as far again outwards (a closed curve's foot
+    // just below its seam, a B-curve's foot past its last sample on its
+    // extension), within the bounds.
+    let t = samples[best];
+    let below = if best > 0 { samples[best - 1] } else { t - (samples[1.min(samples.len() - 1)] - t) };
+    let above = if best + 1 < samples.len() { samples[best + 1] } else { t + (t - samples[best.saturating_sub(1)]) };
+    let (lo, hi) = (below.max(floor), above.min(ceiling));
+    let tolerance = 1e-12 * (samples[samples.len() - 1] - samples[0]).abs().max(1e-300);
+    let t = brent_minimum(&f, lo, hi, tolerance);
+    let t = match closed {
+        Some([a, b]) => a + (t - a).rem_euclid(b - a),
+        None => t,
+    };
+    f(t).is_finite().then_some(t)
+}
+
+/// Brent's minimisation of `f` over [lo, hi] (golden sections and
+/// parabolic steps), to an absolute parameter tolerance `tolerance`.
+fn brent_minimum(f: &impl Fn(f64) -> f64, mut lo: f64, mut hi: f64, tolerance: f64) -> f64 {
+    let golden = 0.5 * (3.0 - 5f64.sqrt());
+    let mut x = lo + golden * (hi - lo);
+    let (mut w, mut v) = (x, x);
+    let mut fx = f(x);
+    let (mut fw, mut fv) = (fx, fx);
+    let (mut d, mut e) = (0.0f64, 0.0f64);
+    for _ in 0..100 {
+        let mid = 0.5 * (lo + hi);
+        let tol1 = tolerance + 1e-10 * x.abs();
+        let tol2 = 2.0 * tol1;
+        if (x - mid).abs() <= tol2 - 0.5 * (hi - lo) {
+            break;
+        }
+        let mut golden_step = true;
+        if e.abs() > tol1 {
+            // A parabola through x, w and v.
+            let r = (x - w) * (fx - fv);
+            let mut q = (x - v) * (fx - fw);
+            let mut p = (x - v) * q - (x - w) * r;
+            q = 2.0 * (q - r);
+            if q > 0.0 {
+                p = -p;
+            }
+            q = q.abs();
+            if p.abs() < (0.5 * q * e).abs() && p > q * (lo - x) && p < q * (hi - x) {
+                e = d;
+                d = p / q;
+                let u = x + d;
+                if u - lo < tol2 || hi - u < tol2 {
+                    d = if mid >= x { tol1 } else { -tol1 };
+                }
+                golden_step = false;
+            }
+        }
+        if golden_step {
+            e = if x >= mid { lo - x } else { hi - x };
+            d = golden * e;
+        }
+        let u = if d.abs() >= tol1 { x + d } else if d > 0.0 { x + tol1 } else { x - tol1 };
+        let fu = f(u);
+        if fu <= fx {
+            if u >= x {
+                lo = x;
+            } else {
+                hi = x;
+            }
+            (v, fv, w, fw, x, fx) = (w, fw, x, fx, u, fu);
+        } else {
+            if u < x {
+                lo = u;
+            } else {
+                hi = u;
+            }
+            if fu <= fw || w == x {
+                (v, fv, w, fw) = (w, fw, u, fu);
+            } else if fu <= fv || v == x || v == w {
+                (v, fv) = (u, fu);
+            }
+        }
+    }
+    x
+}
+
+/// A curve's unit tangent at `t` (extended, [`extended_point`]), by central
+/// differences.
+fn curve_tangent(curve: &Curve, t: f64) -> Option<Vec3> {
+    let h = 1e-7;
+    extended_point(curve, t + h).ok()?.sub(extended_point(curve, t - h).ok()?).normalized().ok()
 }
 
 /// Read the surface node `node`.

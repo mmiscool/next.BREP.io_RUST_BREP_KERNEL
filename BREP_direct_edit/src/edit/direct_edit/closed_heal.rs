@@ -914,6 +914,11 @@ pub(super) fn heal_closed_transition(
     // neighbour, because that is where those neighbours' seam meridians end.
     // A planar neighbour has no seam and imposes nothing; two seamed
     // neighbours that disagree are not a configuration this heal can serve.
+    // Each seam is read where it meets the NEW rim (its nearest point there,
+    // as `align_closed_rim_origin` re-origins it): the two OLD rims are
+    // different curves a blend's width apart, so their seam vertices never
+    // coincide, even when both seams sit at one azimuth (a round between a
+    // cylinder and a cone, two cones, or a cylinder and a ball).
     let seam_target: Option<Vec3> = {
         let mut wanted: Option<Vec3> = None;
         for (index, rim) in rims.iter().enumerate() {
@@ -952,9 +957,13 @@ pub(super) fn heal_closed_transition(
                 .find(|edge| edge.id == *rim)
                 .ok_or_else(|| missing_rim(*rim))?;
             let seam_point = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Classify, "evaluate")?;
+            let on_new_rim = |point: Vec3| -> Result<Vec3, KernelRefusal> {
+                let hit = project_point_to_curve(&new_curve, point).or_refuse(KernelStage::Classify, "project")?;
+                new_curve.evaluate(hit.u).or_refuse(KernelStage::Classify, "evaluate")
+            };
             match wanted {
                 None => wanted = Some(seam_point),
-                Some(known) if known.sub(seam_point).length() <= tolerance => {}
+                Some(known) if on_new_rim(known)?.sub(on_new_rim(seam_point)?).length() <= tolerance => {}
                 Some(_) => {
                     return Err(KernelRefusal::unsupported(
                         KernelStage::Classify,
@@ -1316,6 +1325,30 @@ pub(super) fn heal_closed_transition(
             } else {
                 edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?
             };
+            // Exact only when the new vertex lies on that line: a seam read
+            // off the wrong ruling would lift the meridian off its carrier.
+            let moved = if start_hit {
+                edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Sew, "evaluate")?
+            } else {
+                edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Sew, "evaluate")?
+            };
+            let along = moved.sub(anchor);
+            let reach = new_point.sub(anchor);
+            let off_line = match along.normalized() {
+                Ok(direction) => reach.sub(direction.scale(reach.dot(direction))).length(),
+                Err(_) => f64::INFINITY,
+            };
+            if off_line > tolerance {
+                return Err(KernelRefusal::unsupported(
+                    KernelStage::Sew,
+                    "seam_off_line",
+                    format!(
+                        "{op}: the healed rim's vertex lies {off_line:.3e} off the line of straight \
+                     seam edge {} — refusing rather than tilting it off its carrier (deferred)",
+                        edge.id
+                    ),
+                ));
+            }
             let (from, to) = if start_hit {
                 (new_point, anchor)
             } else {

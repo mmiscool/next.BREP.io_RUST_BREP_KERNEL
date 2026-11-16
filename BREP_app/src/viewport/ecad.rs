@@ -1652,6 +1652,8 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
                         "corners": pad.corners().map(|c| c.len()),
                         // A windowpane paste's [columns, rows], or null.
                         "pasteWindows": pad.layers.paste_windows.map(|w| [w.columns, w.rows]),
+                        // A via grid's [columns, rows] and whether it is tented, or null.
+                        "vias": pad.vias.map(|v| json!({"grid": [v.columns, v.rows], "tented": v.tented})),
                         "side": match (pad.drill, pad.back) { (Some(_), _) => "both", (None, true) => "back", (None, false) => "front" },
                         "maskOpen": [pad.mask_open(true), pad.mask_open(false)],
                         "paste": pad.paste_open(true) || pad.paste_open(false),

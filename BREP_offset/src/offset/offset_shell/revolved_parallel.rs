@@ -240,6 +240,122 @@ fn on_face(face: &FaceRecord, axis: &Axis, p: P2, tolerance: f64) -> bool {
     parameter_point_in_face(face, Vec2 { x: hit.u, y: hit.v }, 1e-9).is_ok_and(|class| class == PolygonClass::Inside)
 }
 
+/// `BREP_OFFSET_REVOLVED_COLLAPSED_ARC` (default on; `=0` restores the
+/// refusal): a concave section arc grown by exactly its radius.
+fn collapsed_arc_enabled() -> bool {
+    switch!("BREP_OFFSET_REVOLVED_COLLAPSED_ARC", true)
+}
+
+/// `BREP_OFFSET_REVOLVED_FITTED_TORUS` (default on; `=0` restores): see
+/// [`fitted_meridian_circle`].
+fn fitted_meridian_circle_enabled() -> bool {
+    switch!("BREP_OFFSET_REVOLVED_FITTED_TORUS", true)
+}
+
+/// The meridian circle (centre, radius) a face with no analytic reading lies
+/// on, or `None`: its surface sampled over the face's parameter box (and its
+/// boundary), every sample read in the meridian half-plane, a circle fitted
+/// to them, and every sample within `tolerance` of it. A filleted ball's root
+/// (a ball on a plate, its tangent fillet rolled round the circle where they
+/// meet) is such a patch: the lane declined the body ("not read") and its
+/// rounded growth refused.
+fn fitted_meridian_circle(face: &FaceRecord, axis: &Axis, tolerance: f64) -> Result<Option<(P2, f64)>, KernelRefusal> {
+    // Stations that SETTLE the question, not a sample of it: on one knot
+    // span the surface is (X, Y, Z) / W with polynomials of degree p in u and
+    // q in v, so the torus's implicit quartic times W^4 is a polynomial of
+    // degree 4p by 4q there. It vanishes on the whole span (the patch lies on
+    // the torus) when it is small at 4p + 1 by 4q + 1 Chebyshev stations, up
+    // to their Lebesgue constant (about 3 at these counts), which the
+    // tolerance below keeps a factor 4 of. A bump of any shape on the span
+    // (degree-elevated or not) is a non-zero polynomial of that degree, and
+    // shows at its stations.
+    let stations = |knots: &[f64], degree: usize| -> Vec<f64> {
+        let mut distinct: Vec<f64> = Vec::new();
+        for &knot in knots {
+            if distinct.last().is_none_or(|last| knot > *last) {
+                distinct.push(knot);
+            }
+        }
+        let count = 4 * degree.max(1) + 1;
+        let mut out = Vec::new();
+        for pair in distinct.windows(2) {
+            out.push(pair[0]);
+            for k in 0..count {
+                let node = 0.5 - 0.5 * (std::f64::consts::PI * (2 * k + 1) as f64 / (2 * count) as f64).cos();
+                out.push(pair[0] + (pair[1] - pair[0]) * node);
+            }
+        }
+        if let Some(last) = distinct.last() {
+            out.push(*last);
+        }
+        out
+    };
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Classify, "domain_u")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Classify, "domain_v")?;
+    let in_domain = |t: f64, lo: f64, hi: f64| t >= lo && t <= hi;
+    let us: Vec<f64> = stations(&face.surface.knots_u, face.surface.degree_u).into_iter().filter(|t| in_domain(*t, u0, u1)).collect();
+    let vs: Vec<f64> = stations(&face.surface.knots_v, face.surface.degree_v).into_iter().filter(|t| in_domain(*t, v0, v1)).collect();
+    if us.len() < 2 || vs.len() < 2 || us.len() * vs.len() > 40_000 {
+        return Ok(None);
+    }
+    let mut points = Vec::new();
+    for &u in &us {
+        for &v in &vs {
+            let p = face.surface.evaluate(u, v).or_refuse(KernelStage::Classify, "evaluate")?;
+            points.push(axis.to_2d(p));
+        }
+    }
+    // Algebraic (Kasa) fit: rho^2 + z^2 + D rho + E z + F = 0, centred on the
+    // mean for conditioning.
+    let n = points.len() as f64;
+    let (mr, mz) = (points.iter().map(|p| p.rho).sum::<f64>() / n, points.iter().map(|p| p.z).sum::<f64>() / n);
+    let mut m = [[0.0f64; 3]; 3];
+    let mut rhs = [0.0f64; 3];
+    for p in &points {
+        let (x, y) = (p.rho - mr, p.z - mz);
+        let row = [x, y, 1.0];
+        let target = -(x * x + y * y);
+        for r in 0..3 {
+            for c in 0..3 {
+                m[r][c] += row[r] * row[c];
+            }
+            rhs[r] += row[r] * target;
+        }
+    }
+    let det = |m: &[[f64; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let whole = det(&m);
+    if !(whole.abs() > 1e-300) {
+        return Ok(None);
+    }
+    let mut solution = [0.0f64; 3];
+    for k in 0..3 {
+        let mut replaced = m;
+        for r in 0..3 {
+            replaced[r][k] = rhs[r];
+        }
+        solution[k] = det(&replaced) / whole;
+    }
+    let [d, e, f] = solution;
+    let center = P2 { rho: mr - d * 0.5, z: mz - e * 0.5 };
+    let squared = d * d * 0.25 + e * e * 0.25 - f;
+    if !(squared > 0.0) {
+        return Ok(None);
+    }
+    let radius = squared.sqrt();
+    let worst = points
+        .iter()
+        .map(|p| ((p.rho - center.rho).hypot(p.z - center.z) - radius).abs())
+        .fold(0.0f64, f64::max);
+    if worst > tolerance * 0.25 {
+        os_debug!("revolved parallel lane: face {} leaves its meridian circle by {worst:.3e}", face.id);
+        return Ok(None);
+    }
+    Ok(Some((center, radius)))
+}
+
 fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<BrepSolid>, KernelRefusal> {
     let [shell] = source.shells.as_slice() else { return Ok(None) };
     let scale = crate::solid_scale(source).max(1.0);
@@ -308,6 +424,13 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
                 let h = frame.origin.sub(axis.origin).dot(axis.axis);
                 Some((P2 { rho: *major_radius, z: h }, *minor_radius))
             }
+            // A face with no analytic reading (a fillet rolled round a
+            // rim is a fitted NURBS patch): it lies on a torus about the axis
+            // when every point of it lies on one circle of the meridian plane.
+            None if fitted_meridian_circle_enabled() => match fitted_meridian_circle(face, &axis, 1e-7 * scale)? {
+                Some(circle) => Some(circle),
+                None => return Ok(None),
+            },
             _ => return Ok(None),
         };
         let piece = match (ends.as_slice(), generatrix) {
@@ -368,6 +491,18 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
     let chain = order_pieces(&pieces, &rims, tolerance)?;
     let Some(mut chain) = chain else { return Ok(None) };
     let touches_axis = chain.first().is_some_and(|p| p.start().rho.abs() <= tolerance);
+    // A closed loop has no first piece: start it on a piece that does not
+    // collapse (a concave arc grown by its radius is dropped between its two
+    // neighbours, so it must not sit at either end of the walk).
+    if !touches_axis {
+        let collapses = |piece: &Piece| {
+            matches!(*piece, Piece::Arc { radius, ccw: false, .. } if (radius - distance).abs() <= 1e-7 * scale)
+        };
+        let count = chain.len();
+        if let Some(start) = (0..count).find(|&k| !collapses(&chain[k]) && !collapses(&chain[(k + count - 1) % count])) {
+            chain.rotate_left(start);
+        }
+    }
     // The closing run along the axis (ρ = 0) sweeps no area about the origin
     // of (ρ, z), so the pieces alone give the orientation.
     let area2: f64 = chain.iter().map(Piece::area2).sum();
@@ -380,6 +515,11 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
         piece.tangent(at_end).map(|t| P2 { rho: t.z, z: -t.rho })
     };
     let mut grown: Vec<Piece> = Vec::new();
+    // A concave arc grown by exactly its radius (a fillet's root grown by the
+    // fillet's radius) shrinks to its centre: it is dropped, and its two
+    // neighbours' offsets meet there in a sharp edge, with no corner arc.
+    let collapse = 1e-7 * scale;
+    let mut after_collapse = false;
     for (k, piece) in chain.iter().enumerate() {
         let moved = match *piece {
             Piece::Line { start, end } => {
@@ -388,6 +528,10 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
             }
             Piece::Arc { center, radius, start, end, ccw } => {
                 let r = if ccw { radius + distance } else { radius - distance };
+                if !ccw && r.abs() <= collapse && collapsed_arc_enabled() && k > 0 && k + 1 < chain.len() {
+                    after_collapse = true;
+                    continue;
+                }
                 if !(r > tolerance) {
                     return Ok(None);
                 }
@@ -395,12 +539,23 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
                 Piece::Arc { center, radius: r, start: center.add(start.sub(center).scale(k)), end: center.add(end.sub(center).scale(k)), ccw }
             }
         };
+        if after_collapse {
+            after_collapse = false;
+            let Some(last) = grown.last() else { return Ok(None) };
+            if last.end().sub(moved.start()).length() > collapse {
+                os_debug!("revolved parallel lane: the offsets beside a collapsed arc miss by {:.3e}", last.end().sub(moved.start()).length());
+                return Ok(None);
+            }
+            grown.push(moved);
+            continue;
+        }
         if k > 0 {
             let previous = &chain[k - 1];
             let corner = piece.start();
             let (Some(n1), Some(n2)) = (outward(previous, true), outward(piece, false)) else { return Ok(None) };
             let turn = n1.cross(n2);
             if turn < -1e-12 {
+                os_debug!("revolved parallel lane: concave corner at ({:.6}, {:.6}), turn {turn:.3e}", corner.rho, corner.z);
                 return Ok(None); // concave
             }
             if turn > 1e-12 || n1.rho * n2.rho + n1.z * n2.z < 0.0 {
@@ -510,6 +665,11 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
             Piece::Arc { center, radius, start, end, ccw } => {
                 let a0 = (start.z - center.z).atan2(start.rho - center.rho);
                 let sweep = Piece::sweep(center, start, end, ccw);
+                // A corner arc at a join the fitted faces leave a hair off
+                // tangent (a fillet's rims) sweeps nothing: the pieces meet.
+                if sweep.abs() * radius <= tolerance.max(1e-7 * radius) {
+                    continue;
+                }
                 let c = axis.to_3d(center, 0.0);
                 if ccw {
                     make_arc(c, axis.x, axis.axis, radius, a0, a0 + sweep).or_refuse(KernelStage::Sew, "make_arc")?

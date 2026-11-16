@@ -980,6 +980,20 @@ fn fragment_face_arranged(
     } else {
         HashSet::default()
     };
+    // Vertices where two or more cut pieces of this face meet: an interior
+    // junction of the section, never a boundary vertex it merely nears.
+    let junction_keys: HashSet<String> = if crate::switch!("BREP_NEAR_SEAM_CLOSED_RUN", false) {
+        let mut seen: HashMap<u64, usize> = HashMap::default();
+        for piece in active_pieces.iter().filter_map(|piece_id| pieces_by_id.get(piece_id)) {
+            if piece.start_vertex_id != piece.end_vertex_id {
+                *seen.entry(piece.start_vertex_id).or_default() += 1;
+                *seen.entry(piece.end_vertex_id).or_default() += 1;
+            }
+        }
+        seen.into_iter().filter(|(_, uses)| *uses >= 2).map(|(id, _)| format!("i:{id}")).collect()
+    } else {
+        HashSet::default()
+    };
     let mut add_chain = |mut points: Vec<Vec2>,
                          source: ChainSource,
                          vertex_start_key: String,
@@ -994,6 +1008,7 @@ fn fragment_face_arranged(
         ] {
             let point = points[at];
             let bridged = bridge_keys.contains(&key);
+            let junction = junction_keys.contains(&key);
             let images = vertex_images.entry(key).or_default();
             let canonical = images
                 .iter()
@@ -1023,7 +1038,7 @@ fn fragment_face_arranged(
                                     // image when 3D-coincident (same physical
                                     // vertex); cut endpoints keep the graze bridge.
                                     && (boundary_vertex_anchor_off
-                                        || !is_boundary
+                                        || (!is_boundary && !junction)
                                         || candidate3.sub(point3).length() <= 1e-5)
                             })
                             .map(|(candidate, _)| *candidate)
@@ -1500,11 +1515,40 @@ fn fragment_face_arranged(
         let last = points.len() - 1;
         // A rim bridge's ends keep their own place (see RIM BRIDGE above): the
         // end inside the face is a distinct vertex a chart hair from the edge.
+        // A cut's end at a vertex INSIDE the face a few 1e-5 of the period
+        // from the seam (another body's seam vertex on a section that runs
+        // along this face's seam) is inside the snap band, and snapping it
+        // onto the domain edge moved that vertex to the seam: the section's
+        // short piece then closed into a whole ring and the face never split.
+        // With `BREP_NEAR_SEAM_CLOSED_RUN` an end snaps only when the edge's
+        // image is at least as near the piece's own vertex as its place is.
+        // The end's own vertex is the piece's vertex nearest its image (the
+        // piece's vertex order need not follow its pcurve).
+        let keeps_vertex = |snapped: Vec2, original: Vec2, _vertex_id: u64| -> bool {
+            if !crate::switch!("BREP_NEAR_SEAM_CLOSED_RUN", false) || (snapped.x == original.x && snapped.y == original.y) {
+                return true;
+            }
+            let (Ok(at), Ok(moved)) = (face.surface.evaluate(original.x, original.y), face.surface.evaluate(snapped.x, snapped.y)) else {
+                return true;
+            };
+            let own = [piece.start_vertex_id, piece.end_vertex_id]
+                .iter()
+                .filter_map(|id| index.vertex_points.get(id))
+                .min_by(|a, b| a.sub(at).length().total_cmp(&b.sub(at).length()));
+            let keep = own.is_none_or(|vertex| moved.sub(*vertex).length() <= at.sub(*vertex).length());
+            keep
+        };
         if !bridge_keys.contains(&format!("i:{}", piece.start_vertex_id)) {
-            points[0] = snap_endpoint_to_domain(points[0]);
+            let snapped = snap_endpoint_to_domain(points[0]);
+            if keeps_vertex(snapped, points[0], piece.start_vertex_id) {
+                points[0] = snapped;
+            }
         }
         if !bridge_keys.contains(&format!("i:{}", piece.end_vertex_id)) {
-            points[last] = snap_endpoint_to_domain(points[last]);
+            let snapped = snap_endpoint_to_domain(points[last]);
+            if keeps_vertex(snapped, points[last], piece.end_vertex_id) {
+                points[last] = snapped;
+            }
         }
         for point in &mut points {
             *point = rebase_point(*point);

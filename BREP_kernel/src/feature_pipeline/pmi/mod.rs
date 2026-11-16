@@ -69,6 +69,7 @@ pub mod annotations;
 pub mod font;
 pub mod layout;
 pub mod resolve;
+pub mod weld_symbol;
 mod plugin;
 pub use plugin::{PluginAnnotationOutput, PluginAnnotationReplay};
 
@@ -905,6 +906,11 @@ pub struct PmiAnnotationReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plane: Option<PmiPlane>,
     pub geometry: PmiGeometry,
+    /// A weld callout's standard weld symbol (absent for the text style, a
+    /// weld kind drawn as text, and every other type): what every consumer
+    /// draws in place of the text leader ([`weld_symbol::present_row`]).
+    #[serde(default, rename = "weldSymbol", skip_serializing_if = "Option::is_none")]
+    pub weld_symbol: Option<weld_symbol::WeldSymbol>,
 }
 
 /// A resolved annotation plane: the plane the annotation lies in (its
@@ -1408,6 +1414,10 @@ pub fn resolve_annotation(
     match outcome {
         Ok((resolved, plane)) => {
             let label = annotation.label_world.unwrap_or(resolved.default_label);
+            // A symbol that cannot be built leaves the row its text leader.
+            let weld_symbol = (annotation.kind == annotations::weld_callout::DEF.type_id)
+                .then(|| annotations::weld_callout::symbol(annotation, context).ok().flatten())
+                .flatten();
             PmiAnnotationReport {
                 persistent_data,
                 plugin_replay,
@@ -1423,6 +1433,7 @@ pub fn resolve_annotation(
                 label_world: plane.map_or(label, |plane| plane.project(label)),
                 plane,
                 geometry: resolved.geometry,
+                weld_symbol,
             }
         }
         Err(message) => PmiAnnotationReport {
@@ -1445,6 +1456,7 @@ pub fn resolve_annotation(
                 .unwrap_or([0.0; 3]),
             plane: None,
             geometry: PmiGeometry::None,
+            weld_symbol: None,
         },
     }
 }

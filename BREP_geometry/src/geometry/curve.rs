@@ -668,6 +668,14 @@ impl NurbsCurve {
     pub fn evaluate_homogeneous(&self, parameter: f64) -> Result<Vec4, String> {
         let _reader = crate::reader_profile::Point::open(crate::reader_profile::CURVE, std::panic::Location::caller());
     let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::POINT);
+        if crate::switch!("BREP_CURVE_POINT_FIXED", true) {
+            match self.degree {
+                1 => return self.evaluate_homogeneous_fixed::<1, 2>(parameter),
+                2 => return self.evaluate_homogeneous_fixed::<2, 3>(parameter),
+                3 => return self.evaluate_homogeneous_fixed::<3, 4>(parameter),
+                _ => {}
+            }
+        }
         self.ensure_valid()?;
         let span = knot_find_span(&self.knots, self.degree, parameter);
         let parameter = knot_clamp(&self.knots, self.degree, parameter);
@@ -691,6 +699,39 @@ impl NurbsCurve {
             for (index, value) in basis.iter().enumerate() {
                 point = point.add(self.control_points[span - self.degree + index].scale(*value));
             }
+        }
+        Ok(point)
+    }
+
+    // Same Cox–de Boor recurrence and accumulation order as the general
+    // reader, with the common degrees and scratch widths known at compile time.
+    fn evaluate_homogeneous_fixed<const DEGREE: usize, const ORDER: usize>(&self, parameter: f64) -> Result<Vec4, String> {
+        self.ensure_valid()?;
+        let span = knot_find_span(&self.knots, DEGREE, parameter);
+        let parameter = knot_clamp(&self.knots, DEGREE, parameter);
+        let mut basis = [0.0f64; ORDER];
+        let mut left = [0.0f64; ORDER];
+        let mut right = [0.0f64; ORDER];
+        {
+            let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::BASIS);
+            basis[0] = 1.0;
+            for j in 1..=DEGREE {
+                left[j] = parameter - self.knots[span + 1 - j];
+                right[j] = self.knots[span + j] - parameter;
+                let mut saved = 0.0;
+                for r in 0..j {
+                    let denominator = right[r + 1] + left[j - r];
+                    let temporary = if denominator.abs() <= EPS { 0.0 } else { basis[r] / denominator };
+                    basis[r] = saved + right[r + 1] * temporary;
+                    saved = left[j - r] * temporary;
+                }
+                basis[j] = saved;
+            }
+        }
+        let mut point = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+        let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
+        for (index, value) in basis.iter().enumerate() {
+            point = point.add(self.control_points[span - DEGREE + index].scale(*value));
         }
         Ok(point)
     }
@@ -1143,10 +1184,45 @@ impl NurbsCurve {
         Ok(result)
     }
 
+    /// First derivative with the low degree and recurrence width fixed at
+    /// compile time. Accumulation and rational conversion keep the ordinary
+    /// reader's operation order.
+    fn deriv1_fixed<const DEGREE: usize, const ORDER: usize>(&self, parameter: f64) -> Result<(Vec3, Vec3), String> {
+        self.ensure_valid()?;
+        let parameter = knot_clamp(&self.knots, DEGREE, parameter);
+        let span = knot_find_span(&self.knots, DEGREE, parameter);
+        let mut rows = [[0.0; MAX_STACK_ORDER]; 2];
+        basis_derivatives_scratch::<ORDER>(&self.knots, DEGREE, span, parameter, 1, &mut rows);
+        let zero = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+        let mut homogeneous = [zero; 2];
+        let reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
+        for k in 0..2 {
+            let mut point = zero;
+            for index in 0..=DEGREE {
+                point = point.add(self.control_points[span - DEGREE + index].scale(rows[k][index]));
+            }
+            homogeneous[k] = point;
+        }
+        drop(reader_part);
+        let inverse = 1.0 / homogeneous[0].w;
+        let point = Vec3::new(homogeneous[0].x, homogeneous[0].y, homogeneous[0].z).scale(inverse);
+        let tangent = Vec3::new(homogeneous[1].x, homogeneous[1].y, homogeneous[1].z)
+            .sub(point.scale(1.0 * homogeneous[1].w)).scale(inverse);
+        Ok((point, tangent))
+    }
+
     /// Point and first derivative `(C, C')` with zero heap allocation.
     /// Bit-identical to `derivatives(t, 1)` at indices `[0]` and `[1]`.
     #[inline]
     pub fn deriv1(&self, parameter: f64) -> Result<(Vec3, Vec3), String> {
+        if switch!("BREP_CURVE_DERIV1_FIXED", true) {
+            match self.degree {
+                1 => return self.deriv1_fixed::<1, 2>(parameter),
+                2 => return self.deriv1_fixed::<2, 3>(parameter),
+                3 => return self.deriv1_fixed::<3, 4>(parameter),
+                _ => {}
+            }
+        }
         let d = self.derivatives_small(parameter, 1)?;
         Ok((d[0], d[1]))
     }

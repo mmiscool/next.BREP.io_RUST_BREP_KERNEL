@@ -2,14 +2,13 @@
 //!
 //! Three headless sources, tried in order:
 //! 0. **`inputParams.nativeBrep`** — a native [`crate::snapshot_solids`] payload
-//!    (`io/snapshot.rs`): the exact solids of an earlier import, already carrying their
-//!    final IMPORT3D names. Tried FIRST and EXCLUSIVE — a feature carrying it must not
-//!    also carry `stepText`/`igesText`/`xtText` (an error, not a precedence puzzle).
-//!    The solids register VERBATIM under their stored names: re-deriving them would
-//!    break every scene-metadata record and every constraint keyed to a face name. This
-//!    is the lane a STEP-assembly part document rides on, and the reason the snapshot
-//!    container is a DURABLE format, not a cache (§6 there, and the `io/snapshot.rs`
-//!    module doc).
+//!    (`io/snapshot.rs`): the exact solids of an earlier import, already carrying their final
+//!    IMPORT3D names. Tried FIRST and EXCLUSIVE — a feature carrying it must not also carry
+//!    `stepText`/`igesText`/`xtText`/`xtBinary` (an error, not a precedence puzzle). The solids
+//!    register VERBATIM under their stored names: re-deriving them would break every
+//!    scene-metadata record and every constraint keyed to a face name. This is the lane a
+//!    STEP-assembly part document rides on, and the reason the snapshot container is a DURABLE
+//!    format, not a cache (§6 there, and the `io/snapshot.rs` module doc).
 //! 1. **`inputParams.stepText`** — the raw ISO-10303-21 document, baked in by the
 //!    toolbar Import lane ([`crate`]'s host: `EngineState::import_step_feature`).
 //!    Runs the exact Rust STEP importer
@@ -86,9 +85,9 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     //    successful `as_str`, so a non-string `nativeBrep` errors here instead of
     //    falling through to a different source.
     if let Some(native) = ctx.param("nativeBrep").filter(|value| !value.is_null()) {
-        if ctx.param("stepText").is_some() || ctx.param("igesText").is_some() || ctx.param("xtText").is_some() {
+        if ["stepText", "igesText", "xtText", "xtBinary"].iter().any(|key| ctx.param(key).is_some()) {
             return Err(
-                "import3d: `nativeBrep` is exclusive — a feature carrying it must not also carry `stepText`/`igesText`/`xtText`"
+                "import3d: `nativeBrep` is exclusive — a feature carrying it must not also carry `stepText`/`igesText`/`xtText`/`xtBinary`"
                     .into(),
             );
         }
@@ -147,6 +146,20 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // 1c. Fresh Parasolid text (baked into `xtText` by the toolbar Import lane).
     if let Some(xt_text) = ctx.param("xtText").and_then(|v| v.as_str()) {
         let report = crate::parasolid::import_parasolid_report(xt_text)
+            .map_err(|error| format!("import3d: Parasolid import failed: {error}"))?;
+        if report.solids.is_empty() {
+            return Err("import3d: Parasolid file contained no importable solids".into());
+        }
+        return Ok(add_named_bodies(ctx, report.solids, &report.appearances, &feature_name));
+    }
+
+    // 1d. Fresh binary Parasolid (`.x_b`, or the body partition a SolidWorks
+    //     part embeds), as base64 in `xtBinary`.
+    if let Some(encoded) = ctx.param("xtBinary").filter(|value| !value.is_null()) {
+        let encoded = encoded.as_str().ok_or("import3d: param `xtBinary` must be a base64 string")?;
+        let bytes = crate::snapshot::base64_decode(encoded)
+            .map_err(|error| format!("import3d: param `xtBinary` is not base64: {}", error.trim_start_matches("snapshot: ")))?;
+        let report = crate::parasolid::import_parasolid_bytes_report(&bytes)
             .map_err(|error| format!("import3d: Parasolid import failed: {error}"))?;
         if report.solids.is_empty() {
             return Err("import3d: Parasolid file contained no importable solids".into());
@@ -488,7 +501,8 @@ pub fn context_applicable(_probe: &crate::feature_pipeline::SelectionProbe) -> b
 /// bakes its payload in — the toolbar Import lane
 /// ([`EngineState::import_step_feature`] / `import_iges_feature` /
 /// `import_xt_feature`) writes the raw document text into
-/// `inputParams.stepText` / `igesText` / `xtText`, and the native lane
+/// `inputParams.stepText` / `igesText` / `xtText` (a binary Parasolid file,
+/// base64, into `xtBinary`), and the native lane
 /// ([`native_import_payload`], the STEP-assembly part document) writes
 /// `inputParams.nativeBrep`. None of them is form-editable, so none is
 /// exposed. (The former `fileToImport` "file" param was a JS-era vestige: nothing

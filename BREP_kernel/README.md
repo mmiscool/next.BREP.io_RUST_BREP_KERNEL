@@ -2,7 +2,7 @@
 
 A native/WASM B-rep geometry kernel for building CAD applications, written in
 Rust. Published on crates.io as **`BREP_kernel`** with library name
-`brep_kernel`; this is version **0.21.0**.
+`brep_kernel`; this is version **0.22.0**.
 It is the authoritative geometry engine behind the BREP CAD application
 (`BREP_app` + `BREP_render` in this repository, re-exported as `brep::kernel` by
 the umbrella `BREP` crate), and is usable standalone as a
@@ -187,7 +187,7 @@ is `BREP_kernel`, the Rust library is the idiomatic lowercase `brep_kernel`:
 
 ```toml
 [dependencies]
-brep_kernel = { package = "BREP_kernel", version = "0.21" }
+brep_kernel = { package = "BREP_kernel", version = "0.22" }
 ```
 
 ```rust

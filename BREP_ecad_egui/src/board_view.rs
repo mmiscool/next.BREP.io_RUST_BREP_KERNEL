@@ -797,6 +797,7 @@ fn violation_kind(kind: ViolationKind) -> &'static str {
         ViolationKind::MissingPad => "Pad",
         ViolationKind::Courtyard => "Courtyard",
         ViolationKind::AnnularRing => "Ring",
+        ViolationKind::Hole => "Hole",
         ViolationKind::Stitching => "Stitching",
         ViolationKind::Unrouted => "Unrouted",
     }
@@ -3313,6 +3314,25 @@ impl Editor {
                 rules.min_annular_ring = um(v);
             }
         });
+        ui.horizontal(|ui| {
+            ui.label("Minimum hole spacing");
+            let mut v = mm(rules.min_hole_spacing);
+            let field = ui
+                .add(
+                    egui::DragValue::new(&mut v)
+                        .speed(0.005)
+                        .range(0.0..=10.0)
+                        .fixed_decimals(3)
+                        .suffix(" mm"),
+                )
+                .on_hover_text(
+                    "The narrowest web of board left between two drilled holes, edge to edge. 0 turns the check off; holes that touch are still a finding.",
+                );
+            self.board_view.inspector.mark("rule:minimum_hole_spacing", &field);
+            if field.changed() {
+                rules.min_hole_spacing = um(v);
+            }
+        });
         ui.label("Net widths");
         let mut remove = None;
         for (net, width) in &rules.net_widths {
@@ -4999,6 +5019,10 @@ impl Editor {
         }
         for via in &board.vias {
             paint_via(via, view.selected == Some(BoardSelection::Via(via.id)));
+        }
+        // A pad's own vias: the part's, selected and moved with it.
+        for (via, _, _) in board.pad_vias() {
+            paint_via(&via, false);
         }
         for (_, vias) in &routed {
             for via in *vias {

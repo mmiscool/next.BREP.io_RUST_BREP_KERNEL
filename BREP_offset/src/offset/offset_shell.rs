@@ -111,6 +111,8 @@ pub mod torus_body;
 mod bore_dimples;
 #[path = "offset_shell/revolved_parallel.rs"]
 pub mod revolved_parallel;
+#[path = "offset_shell/pipe_parallel.rs"]
+pub mod pipe_parallel;
 #[path = "offset_shell/rim_witness.rs"]
 mod rim_witness;
 #[path = "offset_shell/tangent_rim_cuts.rs"]

@@ -1,6 +1,6 @@
 use super::*;
 pub use super::recognition::{generatrix_is_meridional_half_ray, surface_scale};
-use super::revolution::{intersect_coaxial_revolutions, rotate_curve_about_axis};
+use super::revolution::{intersect_coaxial_revolutions, intersect_cylinder_radius_invariant, rotate_curve_about_axis};
 
 /// Exact plane data extracted from an affine patch.
 struct PlaneData {
@@ -123,6 +123,14 @@ pub fn intersect_analytic_pair_with(
     if let Some(curves) = intersect_coaxial_revolutions(first, second, tolerance) {
         return Some(curves);
     }
+    if coaxial_iso_section_enabled() {
+        if let Some(curves) = intersect_cylinder_radius_invariant(first, second, tolerance) {
+            return Some(curves);
+        }
+        if let Some(curves) = intersect_cylinder_radius_invariant(second, first, tolerance) {
+            return Some(curves);
+        }
+    }
     // Only under the production gate: the count gate is the escape hatch that
     // measures the old routing (`ruled_gate_admits_a_straight_generatrix_
     // whatever_it_counts` reads it sending a re-weighted cone to the marcher).
@@ -138,6 +146,14 @@ pub fn intersect_analytic_pair_with(
         return Some(curves);
     }
     intersect_axial_plane_revolution(second, first, tolerance)
+}
+
+/// `BREP_COAXIAL_ISO_SECTION` (default on; `=0` leaves the pair to the
+/// marcher): a cylinder against a surface
+/// whose radius about its axis is invariant along one parameter
+/// ([`intersect_cylinder_radius_invariant`]).
+fn coaxial_iso_section_enabled() -> bool {
+    crate::switch!("BREP_COAXIAL_ISO_SECTION", true)
 }
 
 /// PLANE x REVOLUTION SECTION (2026-11-06;

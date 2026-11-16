@@ -4,7 +4,7 @@ use crate::editor_core::EditorCore;
 use crate::actions::{Action, ActionGroup, action, command, key};
 use crate::board_view::{BACKGROUND, SILK, THROUGH_HOLE, WARNING, layer_color};
 use crate::symbol_editor::{InspectorHits, LIST_SHARE, grip_under, key_word, list_height};
-use brep_ecad_core::board::{COURTYARD_MARGIN, DesignRules, Footprint, Pad, PadShape, PasteWindows, Shape};
+use brep_ecad_core::board::{COURTYARD_MARGIN, DesignRules, Footprint, Pad, PadShape, PadVias, PasteWindows, Shape};
 use brep_ecad_core::graphic::{GraphicLayer, GraphicShape, LayerGraphic};
 use crate::board_view::graphic_color;
 
@@ -1086,6 +1086,7 @@ impl FootprintEditor {
                     layers: Default::default(),
                     trapezoid_delta: Default::default(),
                     polygon,
+                    vias: None,
                 });
                 return;
             }
@@ -1382,6 +1383,45 @@ impl FootprintEditor {
             layers.paste_margin = None;
             layers.paste_windows = None;
         }
+        if kind == PadKind::SurfaceMount {
+            // A thermal pad's vias, through the board under it.
+            let mut gridded = pad.vias.is_some();
+            let check = ui.checkbox(&mut gridded, "Vias in the pad").on_hover_text(
+                "A grid of through vias in this pad, carried by the footprint: heat and a ground connection to the other layers, as a thermal pad's.",
+            );
+            hits.mark("pad_vias", &check);
+            if gridded {
+                let mut grid = pad.vias.unwrap_or_else(|| {
+                    let fit = |side: i32| u8::try_from(((side - 600) / 1000 + 1).clamp(1, 20)).unwrap_or(1);
+                    PadVias { columns: fit(pad.size.x), rows: fit(pad.size.y), pitch: Point::new(1000, 1000), drill: 300, diameter: 600, tented: true }
+                });
+                for (key, label, n) in [("via_columns", "Via columns", &mut grid.columns), ("via_rows", "Via rows", &mut grid.rows)] {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        let field = ui.add(egui::DragValue::new(n).range(1..=20));
+                        hits.mark(key, &field);
+                    });
+                }
+                mm_field(ui, hits, "Via pitch X", &mut grid.pitch.x, 0.05..=100.);
+                mm_field(ui, hits, "Via pitch Y", &mut grid.pitch.y, 0.05..=100.);
+                mm_field(ui, hits, "Via drill", &mut grid.drill, 0.05..=10.);
+                mm_field(ui, hits, "Via diameter", &mut grid.diameter, 0.05..=20.);
+                let mut tented = grid.tented;
+                let check = ui.checkbox(&mut tented, "Tent vias on the far side").on_hover_text(
+                    "Keeps the solder mask over the vias on the side away from the pad, so solder cannot wick through. On the pad's own side its opening shows them.",
+                );
+                hits.mark("tent_pad_vias", &check);
+                grid.tented = tented;
+                pad.vias = Some(grid);
+                if let Some(problem) = pad.vias_problem() {
+                    ui.colored_label(ui.visuals().warn_fg_color, format!("This pad {problem}."));
+                }
+            } else {
+                pad.vias = None;
+            }
+        } else {
+            pad.vias = None;
+        }
         let rotate = ui.button("Rotate pad 90°");
         hits.mark("rotate", &rotate);
         if rotate.clicked() {
@@ -1392,9 +1432,13 @@ impl FootprintEditor {
             for p in &mut pad.polygon {
                 *p = Point::new(-p.y, p.x);
             }
-            // A windowpane's columns run where its rows did.
+            // A windowpane's columns run where its rows did, and a via grid's.
             if let Some(windows) = pad.layers.paste_windows.as_mut() {
                 (windows.columns, windows.rows) = (windows.rows, windows.columns);
+            }
+            if let Some(grid) = pad.vias.as_mut() {
+                (grid.columns, grid.rows) = (grid.rows, grid.columns);
+                grid.pitch = Point::new(grid.pitch.y, grid.pitch.x);
             }
             // A slot turns with its pad.
             if let (Some(width), Some(height)) = (pad.drill, pad.drill_height) {
@@ -1719,6 +1763,12 @@ impl FootprintEditor {
                 (Some(_), false) => None,
             };
             paint_shape(shape.clone(), fill, None, 0.);
+            if let Some(grid) = pad.vias {
+                for at in pad.via_points() {
+                    painter.circle_filled(screen(at), (grid.diameter as f32 * zoom / 2.).max(1.), THROUGH_HOLE);
+                    painter.circle_filled(screen(at), (grid.drill as f32 * zoom / 2.).max(0.5), BACKGROUND);
+                }
+            }
             if let Some(hole) = pad.local_hole() {
                 let edge = (!pad.plated).then(|| Stroke::new(1., SILK));
                 paint_shape(hole, Some(BACKGROUND), edge, 0.);
@@ -1895,6 +1945,7 @@ impl FootprintEditor {
                     layers: Default::default(),
                     trapezoid_delta: Default::default(),
                     polygon: vec![],
+                    vias: None,
                 });
             }
             DrawTool::Line | DrawTool::Rectangle | DrawTool::Circle | DrawTool::Arc | DrawTool::Text

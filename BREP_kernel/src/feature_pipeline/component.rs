@@ -503,10 +503,10 @@ pub fn enforce_reference_fence(
             | "PATTERN COMPONENT"
             | "WP"
             | "WAYPOINT"
-            | "WELD"
             | "SP"
             | "SPLINE"
-    ) {
+    ) || super::features::weld::is_weld_type(feature_type)
+    {
         return Ok(());
     }
     if let Some(name) = first_component_owned(&descriptor.input_params, scene)

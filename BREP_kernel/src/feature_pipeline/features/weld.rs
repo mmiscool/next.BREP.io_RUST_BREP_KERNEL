@@ -6,6 +6,10 @@ use crate::Vec3;
 
 #[path = "weld_fit.rs"]
 mod fit;
+#[path = "weld_groove.rs"]
+pub(crate) mod groove;
+#[path = "weld_lap.rs"]
+pub(crate) mod lap;
 
 /// How the bead section is placed around a straight seam.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,12 +36,151 @@ fn placement(ctx: &FeatureContext) -> Result<Placement, String> {
     }
 }
 
-pub fn execute(ctx: &FeatureContext) -> FeatureResult {
-    build(ctx).unwrap_or_else(|error| ctx.fail(format!("weld: {error}")))
+/// Which sides of the joint carry a bead.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sides {
+    /// The corner the seam picks.
+    One,
+    /// That corner and the mirror corner across the member standing on the
+    /// joint (a T joint's far side).
+    Both,
 }
 
-fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+/// How the bead runs along the seam.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Intermittent {
+    Continuous,
+    /// Segments at a pitch, opposite each other on both sides.
+    Chain,
+    /// Segments at a pitch, the far side's half a pitch along.
+    Staggered,
+}
+
+/// The bead's face between its toes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Contour {
+    Flat,
+    Convex,
+    Concave,
+}
+
+/// A dropdown's value, its schema default when the key is absent.
+fn choice<T: Copy>(ctx: &FeatureContext, key: &str, label: &str, default: T, options: &[(&str, T)]) -> Result<T, String> {
+    let names = || options.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(", ");
+    match ctx.param(key) {
+        None => Ok(default),
+        Some(serde_json::Value::String(value)) => options.iter().find(|(name, _)| *name == value.as_str()).map(|(_, v)| *v)
+            .ok_or_else(|| format!("unknown {label} '{value}' ({})", names())),
+        Some(_) => Err(format!("{label} must be one of {}", names())),
+    }
+}
+
+/// The schema fields the fillet weld's dialog hides for these values.
+pub fn hidden_params(values: &serde_json::Value) -> Vec<&'static str> {
+    let mut hidden = Vec::new();
+    if values.get("intermittent").and_then(serde_json::Value::as_str).unwrap_or("CONTINUOUS") == "CONTINUOUS" {
+        hidden.extend(["segmentLength", "pitch"]);
+    }
+    if values.get("contour").and_then(serde_json::Value::as_str).unwrap_or("FLAT") == "FLAT" {
+        hidden.push("contourHeight");
+    }
+    if values.get("placement").and_then(serde_json::Value::as_str) == Some("FITTED") {
+        hidden.push("orientation");
+    }
+    hidden
+}
+
+/// The stretches of seam (from..to, by length from its start) an
+/// intermittent weld lays: segments of `segment` every `pitch`, as many as
+/// fit, the pattern centred on the seam; `half` moves them half a pitch
+/// along (the far side of a staggered weld), keeping those that still fit.
+fn stretches(total: f64, segment: f64, pitch: f64, half: bool) -> Result<Vec<(f64, f64)>, String> {
+    let tolerance = 1e-9 * total.max(1.0);
+    if segment > total + tolerance {
+        return Ok(Vec::new());
+    }
+    let count = ((total - segment) / pitch + 1e-9).floor() + 1.0;
+    if !(count <= MAX_SEGMENTS as f64) {
+        return Err(format!("{count} intermittent segments on the {total} long seam; at most {MAX_SEGMENTS} (lengthen the pitch)"));
+    }
+    let count = count as i64;
+    let margin = (total - (segment + (count - 1) as f64 * pitch)) * 0.5;
+    let shift = if half { pitch * 0.5 } else { 0.0 };
+    Ok((-1..=count).map(|i| margin + shift + i as f64 * pitch)
+        .filter(|start| *start >= -tolerance && start + segment <= total + tolerance)
+        .map(|start| (start.max(0.0), (start + segment).min(total)))
+        .collect())
+}
+
+/// The most segments one intermittent side may lay: each is its own body.
+const MAX_SEGMENTS: usize = 1000;
+
+pub fn execute(ctx: &FeatureContext) -> FeatureResult {
+    build(ctx, None).unwrap_or_else(|error| ctx.fail(format!("weld: {error}")))
+}
+
+/// A tack weld: `count` short fillet segments of `length` each, the first
+/// and last at the seam's ends (one tack sits in the middle).
+#[derive(Clone, Copy, Debug)]
+struct Tacks {
+    length: f64,
+    count: usize,
+}
+
+/// Tack welds (`WELD.TACK`): short fillet beads spread along a seam, fitted
+/// and checked exactly as fillet welds are.
+pub fn execute_tack(ctx: &FeatureContext) -> FeatureResult {
+    let tacks = (|| -> Result<Tacks, String> {
+        let length = common::optional_number(ctx, "tackLength")?.unwrap_or(5.0);
+        if !length.is_finite() || length <= 0.0 {
+            return Err("tack length must be finite and positive".into());
+        }
+        let count = common::optional_number(ctx, "count")?.unwrap_or(3.0);
+        if !count.is_finite() || count < 1.0 || count.fract() != 0.0 || count > MAX_SEGMENTS as f64 {
+            return Err(format!("tack count must be a whole number from 1 to {MAX_SEGMENTS}"));
+        }
+        Ok(Tacks { length, count: count as usize })
+    })();
+    match tacks {
+        Ok(tacks) => build(ctx, Some(tacks)),
+        Err(error) => Err(error),
+    }
+    .unwrap_or_else(|error| ctx.fail(format!("tack weld: {error}")))
+}
+
+/// The tack weld's schema: the fillet weld's seam, legs, sides, placement and
+/// colour, with the tacks' length and count in place of its run options.
+pub fn tack_schema() -> serde_json::Value {
+    let mut schema = schema();
+    schema["type"] = "WELD.TACK".into();
+    schema["shortName"] = "TACK".into();
+    schema["longName"] = "Tack weld".into();
+    schema["ribbonPath"] = "Welding/Sheet metal and lap/Tack weld".into();
+    schema["commandSize"] = "Compact".into();
+    let fields = schema["inputParamsSchema"].as_object_mut().expect("fields");
+    for key in ["intermittent", "segmentLength", "pitch", "allAround", "contour", "contourHeight"] {
+        fields.remove(key);
+    }
+    fields.insert("tackLength".into(), serde_json::json!({"type": "number", "label": "Tack length", "default_value": 5,
+        "hint": "Length of each tack along the seam, in model units."}));
+    fields.insert("count".into(), serde_json::json!({"type": "number", "label": "Count", "default_value": 3,
+        "hint": "How many tacks: the first and last at the seam's ends, the rest evenly between (one tack sits in the middle)."}));
+    schema
+}
+
+/// The schema fields the tack weld's dialog hides for these values.
+pub fn tack_hidden_params(values: &serde_json::Value) -> Vec<&'static str> {
+    hidden_params(values).into_iter().filter(|key| *key == "orientation").collect()
+}
+
+fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, String> {
     let (seams, joint_faces) = selected_seam(ctx.scene, ctx.param("seam"))?;
+    let all_around = match ctx.param("allAround") {
+        None => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(_) => return Err("All around must be a boolean".into()),
+    };
+    let seams = if all_around { around(ctx, seams, &joint_faces)? } else { seams };
     let seam = seams[0].clone();
     let curves: Vec<crate::NurbsCurve> = common::resolve_path_chain(ctx, &seams)?.into_iter().map(|segment| segment.curve).collect();
     let curve = curves.first().ok_or("the seam is empty")?;
@@ -70,6 +213,37 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     if !angle.is_finite() {
         return Err("orientation must be finite".into());
     }
+    let sides = choice(ctx, "sides", "sides", Sides::One, &[("ONE", Sides::One), ("BOTH", Sides::Both)])?;
+    let intermittent = choice(ctx, "intermittent", "intermittent", Intermittent::Continuous,
+        &[("CONTINUOUS", Intermittent::Continuous), ("CHAIN", Intermittent::Chain), ("STAGGERED", Intermittent::Staggered)])?;
+    let contour = choice(ctx, "contour", "contour", Contour::Flat,
+        &[("FLAT", Contour::Flat), ("CONVEX", Contour::Convex), ("CONCAVE", Contour::Concave)])?;
+    let contour = match contour {
+        Contour::Flat => None,
+        bulge => {
+            let height = common::optional_number(ctx, "contourHeight")?.unwrap_or(0.5);
+            if !height.is_finite() || height <= 0.0 {
+                return Err("contour height must be finite and positive".into());
+            }
+            Some(if bulge == Contour::Convex { height } else { -height })
+        }
+    };
+    let intermittent = if tacks.is_some() { Intermittent::Chain } else { intermittent };
+    let pattern = match intermittent {
+        _ if tacks.is_some() => None,
+        Intermittent::Continuous => None,
+        _ => {
+            let segment = common::optional_number(ctx, "segmentLength")?.unwrap_or(10.0);
+            let pitch = common::optional_number(ctx, "pitch")?.unwrap_or(25.0);
+            if !segment.is_finite() || segment <= 0.0 {
+                return Err("segment length must be finite and positive".into());
+            }
+            if !pitch.is_finite() || pitch <= segment {
+                return Err("pitch (centre to centre) must be finite and longer than the segment length".into());
+            }
+            Some((segment, pitch))
+        }
+    };
     let mut result = FeatureResult::empty(&ctx.id, &ctx.feature_type);
     let generate = match ctx.param("generateSolid") {
         None => true,
@@ -150,13 +324,75 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         _ => None,
     };
     if generate {
+        // The stretches a side's bead runs along its own seam (the far side's
+        // is as long as the far run): the whole seam, or the intermittent
+        // segments (the far side's half a pitch along when staggered).
+        let spans = |total: f64, far: bool| -> Result<Vec<(f64, f64)>, String> {
+            if let Some(Tacks { length, count }) = tacks {
+                let tolerance = 1e-9 * total.max(1.0);
+                if length * count as f64 > total + tolerance {
+                    return Err(format!("{count} tacks of length {length} do not fit on the {total} long seam"));
+                }
+                if count == 1 {
+                    let from = (total - length) * 0.5;
+                    return Ok(vec![(from, from + length)]);
+                }
+                let pitch = (total - length) / (count - 1) as f64;
+                return Ok((0..count).map(|i| {
+                    let from = pitch * i as f64;
+                    (from, (from + length).min(total))
+                }).collect());
+            }
+            let Some((segment, pitch)) = pattern else { return Ok(vec![(0.0, total)]) };
+            let spans = stretches(total, segment, pitch, far && intermittent == Intermittent::Staggered)?;
+            if spans.is_empty() {
+                return Err(format!("segment length {segment} does not fit on the {total} long seam"));
+            }
+            Ok(spans)
+        };
+        // The bodies of one side's bead: one per stretch (a continuous bead is
+        // one body), each the stretch's pieces swept and united, named
+        // `{id}` first and `{id}:Bead{n}` after it.
+        let first_body = std::cell::Cell::new(0usize);
+        let lay = |chain: &fit::Chain, sections: &[[Vec3; 3]], trims: &[fit::Trim], far: bool| -> Result<Vec<(String, Vec<fit::Piece>, crate::BrepSolid)>, String> {
+            // A convex face can stand past the legs: the mitres are cut for
+            // the section's own reach then.
+            let widest = fit::section_reach(sections, contour)? + 100.0 * crate::tolerance::WELD_FLOOR;
+            let wider;
+            let trims = if widest > reach {
+                wider = chain.trims(widest).map_err(|reason| format!("with its contour, {reason}"))?;
+                &wider[..]
+            } else {
+                trims
+            };
+            if let Some(height) = contour.filter(|height| *height < 0.0) {
+                for [_, a, b] in sections {
+                    // A concave face may not reach the root: its depth stays
+                    // below the section's height over the line between the toes.
+                    let reach = a.cross(*b).length() / b.sub(*a).length();
+                    if -height >= reach {
+                        return Err(format!("contour height {} reaches the root of the {reach} deep bead section", -height));
+                    }
+                }
+            }
+            let mut bodies = Vec::new();
+            for (from, to) in spans(chain.length(), far)? {
+                let pieces = chain.pieces(sections, trims, from, to);
+                let n = first_body.get() + bodies.len();
+                let name = if n == 0 { ctx.id.clone() } else { format!("{}:Bead{}", ctx.id, n + 1) };
+                let body = fit::build_bead(&name, &pieces, contour)?;
+                bodies.push((name, pieces, body));
+            }
+            Ok(bodies)
+        };
         // MANUAL builds at the authored Orientation: about the seam frame on a
         // single straight seam, else from the plane the seam lies in (0 lays
         // leg 1 across the seam in that plane, leg 2 along its normal). An AUTO
         // weld with no corner turns the bead in quarter turns from it until the
         // bead sits outside every body, so it is never hidden inside the metal.
         let plane = chain.plane();
-        let manual = |turn: f64| -> Result<Result<(crate::BrepSolid, Vec3), String>, String> {
+        type Bodies = Vec<(String, Vec<fit::Piece>, crate::BrepSolid)>;
+        let manual = |turn: f64| -> Result<Result<(Bodies, Vec3), String>, String> {
             let a = angle + turn;
             let sections: Vec<[Vec3; 3]> = if chain.is_single_line() {
                 let u = frame.x_axis.scale(a.cos()).add(frame.y_axis.scale(a.sin()));
@@ -176,22 +412,24 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                 Ok(trims) => trims,
                 Err(reason) => return Ok(Err(reason)),
             };
-            // The section triangle's centroid, halfway along the first run.
-            let [_, toe_u, toe_v] = sections[0];
-            let centroid = first.at(0.5).add(first.carry(0.5, toe_u.add(toe_v).scale(1.0 / 3.0)));
-            Ok(Ok((chain.bead(&ctx.id, &sections, &trims)?, centroid)))
+            // The section triangle's centroid, halfway along the first stretch.
+            let bodies = lay(&chain, &sections, &trims, false)?;
+            let piece = &bodies[0].1[0];
+            let [root, toe_u, toe_v] = piece.section;
+            let centroid = piece.run.at(0.5).add(piece.run.carry(0.5, root.add(toe_u.add(toe_v).scale(1.0 / 3.0))));
+            Ok(Ok((bodies, centroid)))
         };
-        let auto_manual = |reason: &str, result: &mut FeatureResult| -> Result<Option<crate::BrepSolid>, String> {
+        let auto_manual = |reason: &str, result: &mut FeatureResult| -> Result<Bodies, String> {
             // A turn whose bead cannot be built (a section across an arc's axis)
             // is skipped; the next turn may build.
-            let mut first_built: Option<crate::BrepSolid> = None;
+            let mut first_built: Option<Bodies> = None;
             let mut failure: Option<String> = None;
             for quarter in 0..4 {
-                let (solid, centroid) = match manual(quarter as f64 * std::f64::consts::FRAC_PI_2) {
+                let (bodies, centroid) = match manual(quarter as f64 * std::f64::consts::FRAC_PI_2) {
                     Ok(Ok(built)) => built,
                     Ok(Err(why)) => {
                         not_built(result, &seam, format!("has no weld bead: {reason}; {why}"));
-                        return Ok(None);
+                        return Ok(Vec::new());
                     }
                     Err(error) => {
                         failure.get_or_insert(error);
@@ -201,34 +439,84 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
                 if outside_bodies(ctx.scene, centroid, &ctx.id)? {
                     not_built(result, &seam, format!("has an unfitted bead: {reason}; the bead is placed by Orientation{}",
                         if quarter == 0 { String::new() } else { format!(", turned {} degrees to sit outside the parts", quarter * 90) }));
-                    return Ok(Some(solid));
+                    return Ok(bodies);
                 }
-                first_built.get_or_insert(solid);
+                first_built.get_or_insert(bodies);
             }
             match first_built {
-                Some(solid) => {
+                Some(bodies) => {
                     not_built(result, &seam, format!("has an unfitted bead: {reason}; no Orientation keeps the bead outside the parts"));
-                    Ok(Some(solid))
+                    Ok(bodies)
                 }
                 None => {
                     not_built(result, &seam, format!("has no weld bead: {reason}; no Orientation builds one ({})", failure.unwrap_or_default()));
-                    Ok(None)
+                    Ok(Vec::new())
                 }
             }
         };
-        let solid = match &fitted {
+        // The far side of a single-run seam: its mirror joint, its chain and cuts.
+        let far_side = |chain: &fit::Chain, near: &fit::Fit| -> Result<Result<(fit::Chain, fit::Fit, Vec<fit::Trim>), String>, String> {
+            if chain.runs.len() != 1 {
+                return Ok(Err("both sides is built on a single straight or circular seam; weld the far side's seam as its own weld".into()));
+            }
+            let (far_seam, far_fit) = match fit::other_side(ctx.scene, &chain.runs[0], near, &ctx.id, legs)? {
+                Ok(found) => found,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            let far_chain = match fit::Chain::new(vec![far_seam]) {
+                Ok(chain) => chain,
+                Err(reason) => return Ok(Err(reason)),
+            };
+            Ok(far_chain.trims(reach).map(|trims| (far_chain, far_fit, trims)))
+        };
+        let bodies: Bodies = match &fitted {
             Some((fits, trims)) => {
                 let sections: Vec<[Vec3; 3]> = fits.iter().map(|joint| [joint.root, joint.legs[0].scale(legs[0]), joint.legs[1].scale(legs[1])]).collect();
-                let solid = chain.bead(&ctx.id, &sections, trims)?;
-                match chain.verify(ctx.scene, fits, legs, &solid, trims, &ctx.id)? {
+                let mut built = lay(&chain, &sections, trims, false)?;
+                let mut checked = Ok(());
+                for (_, pieces, body) in &built {
+                    checked = chain.verify_pieces(ctx.scene, fits, legs, body, pieces, &ctx.id)?;
+                    if checked.is_err() { break; }
+                }
+                match checked {
                     Ok(()) => {
+                        let far_fit;
+                        let mut joints: Vec<&fit::Fit> = fits.iter().collect();
+                        // The far side: the mirror joint across the standing
+                        // member, built and checked the same way. FITTED
+                        // refuses without it; AUTO keeps the near side and says so.
+                        let far = if sides == Sides::Both { Some(far_side(&chain, &fits[0])?) } else { None };
+                        match far {
+                            None => {}
+                            Some(Ok((far_chain, fit, far_trims))) => {
+                                let far_sections = [[fit.root, fit.legs[0].scale(legs[0]), fit.legs[1].scale(legs[1])]];
+                                first_body.set(built.len());
+                                let far = lay(&far_chain, &far_sections, &far_trims, true)?;
+                                let mut outcome = Ok(());
+                                for (_, pieces, body) in &far {
+                                    outcome = far_chain.verify_pieces(ctx.scene, std::slice::from_ref(&fit), legs, body, pieces, &ctx.id)?;
+                                    if outcome.is_err() { break; }
+                                }
+                                match outcome {
+                                    Ok(()) => {
+                                        far_fit = fit;
+                                        joints.push(&far_fit);
+                                        built.extend(far);
+                                    }
+                                    Err(reason) if placement == Placement::Fitted => return Err(format!("fitted placement: far side: {reason}")),
+                                    Err(reason) => not_built(&mut result, &seam, format!("has a bead on one side only: far side: {reason}")),
+                                }
+                            }
+                            Some(Err(reason)) if placement == Placement::Fitted => return Err(format!("fitted placement: both sides: {reason}")),
+                            Some(Err(reason)) => not_built(&mut result, &seam, format!("has a bead on one side only: {reason}")),
+                        }
                         // Leg order, each body once.
-                        for solid in fits.iter().flat_map(|joint| joint.faces.iter().map(|face| face.solid.clone())) {
+                        for solid in joints.iter().flat_map(|joint| joint.faces.iter().map(|face| face.solid.clone())) {
                             if !result.weld_joint_solids.contains(&solid) {
                                 result.weld_joint_solids.push(solid);
                             }
                         }
-                        Some(solid)
+                        built
                     }
                     Err(reason) if placement == Placement::Fitted => return Err(format!("fitted placement: {reason}")),
                     Err(reason) => auto_manual(&reason, &mut result)?,
@@ -237,20 +525,85 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             None => match &unfitted {
                 Some(reason) => auto_manual(reason, &mut result)?,
                 None => match manual(0.0)? {
-                    Ok((solid, _)) => Some(solid),
+                    Ok((bodies, _)) => bodies,
                     Err(why) => {
                         not_built(&mut result, &seam, format!("has no weld bead: {why}"));
-                        None
+                        Vec::new()
                     }
                 },
             },
         };
-        if let Some(solid) = solid {
-            result.added.push(common::register_added(solid, &ctx.id));
-            paint_bead(&ctx.id, &colour);
+        if sides == Sides::Both && fitted.is_none() && !bodies.is_empty() && result.fulfilment.is_none() {
+            not_built(&mut result, &seam, "has a bead on one side only: both sides mirrors a fitted joint, and Placement is MANUAL".into());
+        }
+        for (name, _, solid) in bodies {
+            result.added.push(common::register_added(solid, &name));
+            paint_bead(&name, &colour);
         }
     }
     Ok(finish(ctx, result, seam, curves, anchor))
+}
+
+/// All around: one picked seam edge grown to the closed loop it runs on, the
+/// picked edge first. Of the loops through the edge (one per face of its body
+/// next to it), the one whose every edge is a weldable concave corner — a
+/// part's foot outline on the face it stands on, a boss's outline on its
+/// plate — is the seam; the other (the side face's own outline) has convex
+/// edges. A seam that already closes is kept as picked.
+fn around(ctx: &FeatureContext, seams: Vec<String>, joint_faces: &[String]) -> Result<Vec<String>, String> {
+    let closes = |names: &[String]| -> Result<bool, String> {
+        let curves = common::resolve_path_chain(ctx, names)?;
+        let (Some(first), Some(last)) = (curves.first(), curves.last()) else { return Ok(false) };
+        let [s0, _] = first.curve.domain()?;
+        let [_, s1] = last.curve.domain()?;
+        let (start, end) = (first.curve.evaluate(s0)?, last.curve.evaluate(s1)?);
+        Ok(start.sub(end).length() <= 1e-6_f64.max(start.length() * 1e-12) * 10.0)
+    };
+    if closes(&seams)? {
+        return Ok(seams);
+    }
+    let [picked] = seams.as_slice() else {
+        return Err("all around grows one seam edge to its closed loop; select one edge, or every edge of the closed seam".into());
+    };
+    let edge = ctx.scene.resolve_edge(picked).ok_or("all around needs a resident seam edge (an edge of a part)")?;
+    let loops: Vec<Vec<u64>> = crate::with_registered_solid_str(edge.handle, |solid| {
+        let mut loops: Vec<Vec<u64>> = Vec::new();
+        for record in solid.shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| &face.loops) {
+            let mut ids: Vec<u64> = record.coedges.iter().map(|coedge| coedge.edge_id).collect();
+            if !ids.contains(&edge.edge_id) { continue; }
+            ids.sort_unstable();
+            ids.dedup();
+            if !loops.contains(&ids) { loops.push(ids); }
+        }
+        Ok(loops)
+    })?;
+    let name_of = |edge_id: u64| ctx.scene.edges.iter()
+        .filter(|(_, other)| other.handle == edge.handle && other.edge_id == edge_id)
+        .map(|(name, _)| name.clone()).min();
+    let mut weldable: Vec<Vec<String>> = Vec::new();
+    for ids in loops {
+        let Some(mut names) = ids.iter().filter(|id| **id != edge.edge_id).map(|id| name_of(*id)).collect::<Option<Vec<String>>>() else { continue };
+        names.insert(0, picked.clone());
+        let Ok(segments) = common::resolve_path_chain(ctx, &names) else { continue };
+        let mut runs = Vec::new();
+        for segment in &segments {
+            match fit::Seam::from_curve(&segment.curve, None)? {
+                Some(run) => runs.push(run),
+                None => break,
+            }
+        }
+        if runs.len() != segments.len() { continue; }
+        let Ok(chain) = fit::Chain::new(runs) else { continue };
+        if !chain.is_closed() { continue; }
+        if let Ok(Ok(_)) = chain.fit(ctx.scene, joint_faces, &ctx.id, [1e-3, 1e-3]) {
+            weldable.push(names);
+        }
+    }
+    match weldable.len() {
+        1 => Ok(weldable.pop().expect("one loop")),
+        0 => Err("all around: no closed loop through the seam edge is a concave corner all the way round; select every seam edge".into()),
+        _ => Err("all around: several closed loops through the seam edge can be welded; select every seam edge".into()),
+    }
 }
 
 /// Publish the seam path, its source name and the callout point.
@@ -306,7 +659,7 @@ fn not_built(result: &mut FeatureResult, seam: &str, reason: String) {
 /// other welds included).
 fn outside_bodies(scene: &crate::feature_pipeline::SceneMap, centroid: Vec3, exclude: &str) -> Result<bool, String> {
     for (name, handle) in &scene.solids {
-        if name == exclude { continue; }
+        if fit::owned_by(name, exclude) { continue; }
         let inside = crate::with_registered_solid_str(*handle, |body| {
             Ok(crate::classify_point(centroid, body, 1e-7)?.class != crate::PointClass::Out)
         })?;
@@ -427,12 +780,27 @@ pub(crate) fn pose(result: &mut FeatureResult, delta: crate::AffineTransform) ->
     Ok(())
 }
 
+/// Whether `type_code` is a weld feature: the fillet weld `WELD`, or one of
+/// the other weld kinds `WELD.<kind>` (groove, spot, plug, ...). Everything
+/// that treats welds alike (history refits, post-solve posing, callouts,
+/// component scoping) asks this, never the literal `WELD`.
+pub fn is_weld_type(type_code: &str) -> bool {
+    type_code == "WELD" || type_code.starts_with("WELD.")
+}
+
 /// Whether a weld descriptor may fit its bead to faces it does not name: the
 /// history cache must then treat every resident body as an input.
 pub(crate) fn fits_joint_faces(descriptor: &crate::feature_pipeline::FeatureDescriptor) -> bool {
-    matches!(descriptor.feature_type.as_str(), "WELD")
+    is_weld_type(&descriptor.feature_type)
         && descriptor.input_params.get("placement").and_then(|value| value.as_str()) != Some("MANUAL")
         && descriptor.input_params.get("generateSolid") != Some(&serde_json::Value::Bool(false))
+}
+
+/// The weld kinds the context bar does not offer (tack, plug or slot, edge,
+/// corner, surfacing): their picks are too general to tell from a selection
+/// (any edge, any face), so they are created from the Welding tab.
+pub fn ribbon_only(_: &SelectionProbe) -> bool {
+    false
 }
 
 pub fn context_applicable(probe: &SelectionProbe) -> bool {
@@ -442,7 +810,7 @@ pub fn context_applicable(probe: &SelectionProbe) -> bool {
 pub fn schema() -> serde_json::Value {
     serde_json::json!({
         "type": "WELD", "shortName": "WELD", "longName": "Fillet weld",
-        "ribbonPath": "Home/Welding/Fillet weld", "commandSize": "Large", "displayBuilder": true,
+        "ribbonPath": "Welding/Fillet and groove/Fillet weld", "commandSize": "Large", "displayBuilder": true,
         "inputParamsSchema": {
             "id": {"type": "string", "default_value": null},
             "seam": {"type": "reference_selection", "label": "Weld references", "selectionFilter": ["EDGE", "SKETCH", "FACE", "SOLID", "COMPONENT"], "multiple": true, "default_value": null,
@@ -450,6 +818,17 @@ pub fn schema() -> serde_json::Value {
             "legSize": {"type": "number", "label": "Leg size", "default_value": 3, "hint": "Fillet weld leg along the first joint face, in model units."},
             "legSize2": {"type": "number", "label": "Second leg", "default_value": 0, "hint": "Leg along the second joint face. 0 = equal legs."},
             "swapLegs": {"type": "boolean", "label": "Swap legs", "default_value": false, "hint": "Exchange which joint face each leg runs along."},
+            "sides": {"type": "options", "label": "Sides", "options": ["ONE", "BOTH"], "default_value": "ONE",
+                "hint": "ONE welds the corner the seam picks. BOTH also welds the mirror corner across the member standing on the joint (a T joint's far side), fitted and checked the same way."},
+            "intermittent": {"type": "options", "label": "Intermittent", "options": ["CONTINUOUS", "CHAIN", "STAGGERED"], "default_value": "CONTINUOUS",
+                "hint": "CONTINUOUS runs the bead along the whole seam. CHAIN lays segments at a pitch, centred on the seam (opposite each other on both sides). STAGGERED moves the far side's segments half a pitch along."},
+            "segmentLength": {"type": "number", "label": "Segment length", "default_value": 10, "hint": "Length of each intermittent segment, in model units."},
+            "pitch": {"type": "number", "label": "Pitch", "default_value": 25, "hint": "Centre-to-centre distance of intermittent segments; longer than the segment."},
+            "allAround": {"type": "boolean", "label": "All around", "default_value": false,
+                "hint": "Weld all the way round: one picked seam edge grows to the closed loop of concave corners it runs on (a part's foot on the plate it stands on, a boss's outline). Linked callouts show the all-around circle."},
+            "contour": {"type": "options", "label": "Contour", "options": ["FLAT", "CONVEX", "CONCAVE"], "default_value": "FLAT",
+                "hint": "The bead face between the toes: flat, or a circular arc bulging out of (CONVEX) or into (CONCAVE) the bead by Contour height."},
+            "contourHeight": {"type": "number", "label": "Contour height", "default_value": 0.5, "hint": "How far a convex or concave face stands off the flat face at its middle, in model units."},
             "placement": {"type": "options", "label": "Placement", "options": ["AUTO", "FITTED", "MANUAL"], "default_value": "AUTO",
                 "hint": "AUTO fits the bead into the corner of the two faces that meet along the seam and uses Orientation where no corner is found. FITTED requires the corner. MANUAL uses Orientation only."},
             "generateSolid": {"type": "boolean", "label": "Generate weld solid", "default_value": true,

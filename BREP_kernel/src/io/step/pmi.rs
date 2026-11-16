@@ -520,7 +520,9 @@ impl Emitter<'_, '_> {
         report: &crate::feature_pipeline::pmi::PmiAnnotationReport,
         style: &LayoutStyle,
     ) -> Result<CalloutOut, String> {
-        let drawn = present(&report.geometry, report.label_world, &report.text, style);
+        // A weld callout presents its weld symbol, as every view draws it.
+        let drawn = crate::feature_pipeline::pmi::weld_symbol::present_row(report, style)
+            .unwrap_or_else(|| present(&report.geometry, report.label_world, &report.text, style));
         let name = step_text(&report.id);
         let set_name = step_text(&curve_set_name(report));
         let polyline = |emitter: &mut Self, points: &[[f64; 3]], stats: &mut PolylineStats| -> Result<Option<usize>, String> {

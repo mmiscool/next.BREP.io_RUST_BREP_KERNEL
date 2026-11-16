@@ -298,9 +298,18 @@ pub fn split_at_surface_breaks(
     cut_on_level: bool,
 ) -> Result<Vec<f64>, String> {
     let interior: Vec<f64> = levels[1..levels.len().saturating_sub(1)].to_vec();
-    // The same levels, sorted, for the windowed walk below (`BREP_SURFACE_BREAKS_WINDOW`).
+    // The same levels, sorted, for the windowed walk below (`BREP_SURFACE_BREAKS_WINDOW`)
+    // and the hull test (`BREP_SURFACE_BREAKS_HULL`).
     let window = surface_breaks_window();
-    let sorted: Vec<f64> = if window {
+    // The hull test needs a valid curve (so no sample below could have
+    // failed) and a finite positive period (so the level images are a
+    // finite, ordered family).
+    let hull = surface_breaks_hull()
+        && !levels.is_empty()
+        && period.is_finite()
+        && period > 0.0
+        && pcurve.domain().is_ok();
+    let sorted: Vec<f64> = if window || hull {
         let mut sorted: Vec<f64> = interior.iter().copied().chain(levels.first().copied()).collect();
         sorted.sort_by(f64::total_cmp);
         sorted
@@ -316,6 +325,9 @@ pub fn split_at_surface_breaks(
         let (a, b) = (pair[0], pair[1]);
         out.push(a);
         if b - a <= 0.0 {
+            continue;
+        }
+        if hull && hull_clears_levels(pcurve, a, b, &sorted, period, take_u) {
             continue;
         }
         const SAMPLES: usize = 32;
@@ -417,6 +429,109 @@ pub fn split_at_surface_breaks(
 /// so the breaks are the same numbers.
 fn surface_breaks_window() -> bool {
     crate::switch!("BREP_SURFACE_BREAKS_WINDOW", true)
+}
+
+/// `BREP_SURFACE_BREAKS_HULL` (default off): [`split_at_surface_breaks`]
+/// skips the 32 samples of a span whose control-point hull, in the taken
+/// coordinate, holds no level image. Every sample (and every bisection
+/// point) of such a span is a convex combination of those control points, so
+/// none can equal a level or lie on either side of one; the walk would cut
+/// nothing, and the span's breaks are the same numbers unread.
+fn surface_breaks_hull() -> bool {
+    crate::switch!("BREP_SURFACE_BREAKS_HULL", false)
+}
+
+/// Whether no level image `l + n·period` (`l` in `sorted`, computed as the
+/// walk computes it) can fall within reach of `pcurve`'s `take_u` coordinate
+/// on `[a, b]`.
+///
+/// Reach is the hull of the control points of every knot span a parameter
+/// in `[a, b]` evaluates on, plus the next one (a sample computed as
+/// `a + (b − a)·k/32` can round a few ulps past `b`, onto the next span),
+/// widened by a margin far above the evaluation's rounding: the basis
+/// functions are products of non-negative factors and the weights are within
+/// a factor of 1e3 of each other, so a computed sample departs from the exact
+/// convex combination by a few ulps of the largest coordinate times that
+/// ratio, against a margin of 1e-9 of it. Anything this cannot bound (a knot
+/// that steps back, a knot support too wide to subtract, a span narrower than the basis recurrence's own floor, a
+/// wide weight ratio, a non-finite value, a hull crossing many periods)
+/// answers `false` and the span is sampled as before.
+#[doc(hidden)]
+pub fn hull_clears_levels(pcurve: &NurbsCurve, a: f64, b: f64, sorted: &[f64], period: f64, take_u: bool) -> bool {
+    let (Some(&first_level), Some(&last_level)) = (sorted.first(), sorted.last()) else {
+        return false;
+    };
+    if !(a.is_finite() && b.is_finite()) {
+        return false;
+    }
+    let degree = pcurve.degree;
+    let knots = &pcurve.knots;
+    let points = &pcurve.control_points;
+    let first_span = crate::curve::knot_find_span(knots, degree, a);
+    let last_span = crate::curve::knot_find_span(knots, degree, b);
+    if last_span < first_span || first_span < degree {
+        return false;
+    }
+    let last_index = (last_span + 1).min(points.len() - 1);
+    // The basis on a span `s` reads knots `s + 1 − degree ..= s + degree`.
+    // Validation admits a knot vector that steps back by up to its own
+    // floor; there a basis function can turn negative and a sample leave
+    // the hull, so every knot those spans read must be non-decreasing.
+    let support = &knots[first_span + 1 - degree.min(first_span + 1)..=(last_span + 1 + degree).min(knots.len() - 1)];
+    if support.windows(2).any(|pair| !(pair[0] <= pair[1])) {
+        return false;
+    }
+    // Every denominator of that recurrence is a difference of two of these
+    // knots, at most the support's width: a finite width keeps the basis
+    // (and so the evaluation's success) free of overflow.
+    if !(support[support.len() - 1] - support[0]).is_finite() {
+        return false;
+    }
+    for span in first_span..=(last_span + 1).min(knots.len() - 2) {
+        let width = knots[span + 1] - knots[span];
+        if width > 0.0 && width <= 1e-9 {
+            return false;
+        }
+    }
+    let (mut low, mut high, mut largest) = (f64::INFINITY, f64::NEG_INFINITY, 0.0f64);
+    let (mut lightest, mut heaviest) = (f64::INFINITY, 0.0f64);
+    for point in &points[first_span - degree..=last_index] {
+        let value = (if take_u { point.x } else { point.y }) / point.w;
+        if !value.is_finite() || !(point.w > 0.0) {
+            return false;
+        }
+        low = low.min(value);
+        high = high.max(value);
+        largest = largest.max(value.abs());
+        lightest = lightest.min(point.w);
+        heaviest = heaviest.max(point.w);
+    }
+    if lightest <= 1e-9 || heaviest > 1e3 * lightest {
+        return false;
+    }
+    let margin = 1e-9 * (largest + 1.0);
+    let (low, high) = (low - margin, high + margin);
+    let first_turn = ((low - last_level) / period).floor() - 1.0;
+    let last_turn = ((high - first_level) / period).ceil() + 1.0;
+    if !(first_turn.is_finite() && last_turn.is_finite()) || last_turn - first_turn > 64.0 {
+        return false;
+    }
+    let (first_turn, last_turn) = (first_turn as i64, last_turn as i64);
+    for n in first_turn..=last_turn {
+        let shift = n as f64 * period;
+        // Candidates by a widened binary search, each then judged on the
+        // walk's own arithmetic `l + n·period`.
+        let slack = margin + 64.0 * f64::EPSILON * (low.abs() + high.abs() + shift.abs() + first_level.abs() + last_level.abs() + 1.0);
+        let start = sorted.partition_point(|value| *value < low - shift - slack);
+        let end = sorted.partition_point(|value| *value <= high - shift + slack);
+        for &l in &sorted[start..end.max(start)] {
+            let level = l + n as f64 * period;
+            if !(level < low || level > high) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// `∫_{from}^{to} g(fixed, s) ds` (or `g(s, fixed)` when `across_v` is false)

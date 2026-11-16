@@ -730,7 +730,8 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
             faces,
         }],
         genus: 0,
-        kind: crate::BodyKind::Solid,
+        // An open shell is a sheet where the caller asked for sheets.
+        kind: if open_shell && resolver.sheets { crate::BodyKind::Sheet } else { crate::BodyKind::Solid },
     };
     solid = finalize_imported_solid(solid)?;
     solid.genus = euler_genus(&solid);
@@ -752,6 +753,11 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
             format!("step_import: reconstructed solid failed validation: {:?}", issues),
         )
         .into());
+    }
+    // A sheet bounds nothing: no material side to restore, and no closure to
+    // certify. Its faces keep the senses the file gives them.
+    if solid.kind == crate::BodyKind::Sheet {
+        return Ok((solid, captured, readings::BodyReadings { bounded, closure: ClosureNote::Unjudged }));
     }
     // Vendor face senses can leave the whole shell pointing inward; a closed
     // shell's material side is defined by its signed volume, so restore the

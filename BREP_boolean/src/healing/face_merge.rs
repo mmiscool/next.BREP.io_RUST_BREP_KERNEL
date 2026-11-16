@@ -2784,12 +2784,12 @@ pub fn boundary_area_checks() -> (usize, usize) {
     BOUNDARY_AREA_CHECKS.with(|counts| counts.get())
 }
 
-/// `BREP_MERGE_AREA_BOUNDARY` (default off): the partial-turn lane's area
+/// `BREP_MERGE_AREA_BOUNDARY` (default on; `=0` restores the surface integration): the partial-turn lane's area
 /// check reads the three areas as boundary integrals first
 /// ([`translational_boundary_area`]) and integrates over the surfaces only
 /// when that reading cannot admit the merge.
 fn boundary_area_check_on() -> bool {
-    switch!("BREP_MERGE_AREA_BOUNDARY", false)
+    switch!("BREP_MERGE_AREA_BOUNDARY", true)
 }
 
 /// How far below the area check's 5e-3 the boundary reading must find the

@@ -842,6 +842,65 @@ impl EngineState {
         }))
     }
 
+    /// The weld list: every weld feature in the history with its kind, its
+    /// size and run texts (as its weld symbol states them), its seam's length,
+    /// and its weld metal: how many bodies, their volume and their mass (each
+    /// bead's own density, the default where it has none). For BOM and
+    /// instructions, and the `weld_list` command. Only the weld's own bead
+    /// bodies count (`{id}`, `{id}:Bead{n}`): a prepared groove's cut parts
+    /// are the parts', not weld metal.
+    pub fn weld_list_json(&self) -> String {
+        let handles = self.resident_solid_handles();
+        let mut rows = Vec::new();
+        let (mut total_volume, mut total_mass) = (0.0_f64, 0.0_f64);
+        let env = brep_kernel::Env::build(&self.history.expressions(), &self.history.configurator()).ok();
+        for index in 0..self.history_len() {
+            let Some(kind) = self.feature_type_at(index) else { continue };
+            if !brep_kernel::is_weld_type(&kind) { continue; }
+            let Some(id) = self.feature_id_at(index) else { continue };
+            let params: serde_json::Value = serde_json::from_str(&self.feature_params_json(index)).unwrap_or_default();
+            use brep_kernel::feature_pipeline::pmi::weld_symbol as symbols;
+            // The seam's length: its published path, measured along the curves.
+            let seam = format!("{id}:Seam");
+            let length: f64 = self.sketch_paths.iter().filter(|(name, _)| *name == seam).map(|(_, curves)| symbols::path_length(curves)).sum();
+            // Expressions read as the history reads them.
+            let evaluate = |source: &str| env.as_ref().and_then(|env| env.eval(source).ok());
+            let segments = symbols::segments(&kind, &params, length, &evaluate);
+            let symbol = symbols::WeldSymbol::from_params(&serde_json::json!({}), &kind, &params, &evaluate, segments).ok().flatten();
+            let number = |key: &str| params.get(key).and_then(serde_json::Value::as_f64);
+            let size = match &symbol {
+                Some(symbol) => symbol.size.clone(),
+                None => number(if kind == "WELD.EDGE" { "reinforcement" } else { "size" }).map(|v| v.to_string()).unwrap_or_default(),
+            };
+            let mut bodies: Vec<&String> = handles.keys()
+                .filter(|name| **name == id || name.strip_prefix(id.as_str()).is_some_and(|rest| rest.starts_with(":Bead")))
+                .collect();
+            bodies.sort();
+            let (mut volume, mut mass) = (0.0, 0.0);
+            for body in &bodies {
+                let density = self.metadata.density(body);
+                if let Ok(properties) = brep_kernel::mass_properties_handle_native(handles[*body], density) {
+                    volume += properties.volume.abs();
+                    mass += properties.mass.abs();
+                }
+            }
+            total_volume += volume;
+            total_mass += mass;
+            rows.push(serde_json::json!({
+                "id": id,
+                "type": kind,
+                "name": crate::features::feature_plain_name(&kind),
+                "size": size,
+                "run": symbol.as_ref().map(|symbol| symbol.length.clone()).unwrap_or_default(),
+                "seamLength": length,
+                "bodies": bodies.len(),
+                "volume": volume,
+                "mass": mass,
+            }));
+        }
+        serde_json::json!({ "welds": rows, "volume": total_volume, "mass": total_mass }).to_string()
+    }
+
     pub fn mass_properties_json(&self, name: Option<&str>, density: f64) -> String {
         let handles = self.resident_solid_handles();
 

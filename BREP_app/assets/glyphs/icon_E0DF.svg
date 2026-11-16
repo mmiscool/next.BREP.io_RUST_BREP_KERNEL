@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="surfacing_weld" brep:unicode="E0DF">
+  <path d="M100 520H900V860H100Z" fill="#7a4d10"/>
+  <path d="M140 560H860V820H140Z" fill="#f0b840"/>
+  <path d="M100 380H900V520H100Z" fill="#125236"/>
+  <path d="M140 410H860V490H140Z" fill="#a5e8c4"/>
+</svg>

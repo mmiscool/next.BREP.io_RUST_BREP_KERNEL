@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="tack_weld" brep:unicode="E0DC">
+  <path d="M120 120H300V700H880V880H120Z" fill="#7a4d10"/>
+  <path d="M160 160H260V740H840V840H160Z" fill="#f0b840"/>
+  <path d="M300 520L480 700H300Z" fill="#125236"/>
+  <path d="M330 590L420 680H330Z" fill="#a5e8c4"/>
+  <path d="M560 520L740 700H560Z" fill="#125236"/>
+</svg>

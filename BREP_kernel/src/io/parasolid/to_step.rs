@@ -162,6 +162,8 @@ struct Translator<'a> {
     /// positions, and then where it begins and ends along the curve.
     edge_ends: Option<(Vec3, Vec3)>,
     anchor: Option<(Vec3, Vec3)>,
+    /// Blend spines, fitted once each.
+    spines: HashMap<u32, Curve>,
 }
 
 /// Translate one BODY node to a Part 21 document.
@@ -178,6 +180,7 @@ pub fn body_to_step(file: &XtFile, body: &Node, tag: usize) -> Result<BodyStep, 
         unverified_curves: 0,
         edge_ends: None,
         anchor: None,
+        spines: HashMap::default(),
     };
     t.body(body)?;
     // The loosest tolerance the file gives its edges and vertices (at least
@@ -310,12 +313,13 @@ impl<'a> Translator<'a> {
             }
             3 => {
                 let mut shells = Vec::new();
+                // A sheet's faces have void on both sides: each appears on a
+                // shell's back or front chain (or both), and a closed sheet's
+                // faces on the shells of both its void regions. Take each once
+                // in the body.
+                let mut seen = rustc_hash::FxHashSet::default();
                 for region in &regions {
                     for shell in chain(self.file, region.ptr("shell"), "next") {
-                        // A sheet's faces have the same void region on both
-                        // sides: each appears on the shell's back or front
-                        // chain (or both); take each once.
-                        let mut seen = rustc_hash::FxHashSet::default();
                         let mut ids = Vec::new();
                         let back = chain(self.file, shell.ptr("face"), "next");
                         let front: Vec<&Node> = chain(self.file, shell.ptr("front_face"), "next_front").collect();
@@ -408,9 +412,15 @@ impl<'a> Translator<'a> {
         let range = match (&curve, ends) {
             (Curve::Line { .. }, _) => return Vec::new(),
             (Curve::Circle { frame, .. } | Curve::Ellipse { frame, .. }, Some((start, end))) => {
+                // A vertex's parameter: the polar angle on a circle, the
+                // eccentric angle on an ellipse.
+                let (major, minor) = match curve {
+                    Curve::Ellipse { major, minor, .. } => (major, minor),
+                    _ => (1.0, 1.0),
+                };
                 let angle = |p: Vec3| {
                     let d = p.sub(frame.origin);
-                    d.dot(frame.y()).atan2(d.dot(frame.x))
+                    (d.dot(frame.y()) / minor).atan2(d.dot(frame.x) / major)
                 };
                 let (a, b) = (angle(start), angle(end));
                 let sweep = if forward { (b - a).rem_euclid(std::f64::consts::TAU) } else { -(a - b).rem_euclid(std::f64::consts::TAU) };
@@ -545,14 +555,7 @@ impl<'a> Translator<'a> {
         if node.char("blend_type") != Some(b'R') {
             return Err(format!("blend {id} is a cliff-edge blend, which is not read yet"));
         }
-        let read = |s: &Node| -> Result<Surface, String> {
-            let surface = geometry::surface(file, s, 0)?;
-            if surface.has_distance() {
-                Ok(surface)
-            } else {
-                Err(format!("blend {id} is supported by a {}, which is not read for blends yet", s.type_name()))
-            }
-        };
+        let read = |s: &Node| geometry::surface(file, s, 0);
         let supports: Vec<&Node> = node.ints("surface").into_iter().filter_map(|i| u32::try_from(i).ok()).filter_map(|i| file.node(i)).collect();
         let [first, second]: [&Node; 2] = supports.try_into().map_err(|_| format!("blend {id} does not have two supporting surfaces"))?;
         if first.type_name() == "BLENDED_EDGE" || second.type_name() == "BLENDED_EDGE" {
@@ -593,6 +596,15 @@ impl<'a> Translator<'a> {
     /// A blend's spine as a curve the translator can evaluate: the exact
     /// curve, or an intersection curve fitted as an edge's is.
     fn spine_curve(&mut self, node: &Node) -> Result<Curve, String> {
+        if let Some(curve) = self.spines.get(&node.index) {
+            return Ok(curve.clone());
+        }
+        let curve = self.spine_curve_uncached(node)?;
+        self.spines.insert(node.index, curve.clone());
+        Ok(curve)
+    }
+
+    fn spine_curve_uncached(&mut self, node: &Node) -> Result<Curve, String> {
         let mut node = node;
         for _ in 0..8 {
             if node.type_name() != "TRIMMED_CURVE" {
@@ -606,7 +618,7 @@ impl<'a> Translator<'a> {
             if refined_intersection(surfaces.as_ref(), &chart, 2).len() == chart.len() {
                 self.unverified_curves += 1;
             }
-            return Ok(Curve::Nurbs(fit_adaptively(|splits| Ok(refined_intersection(surfaces.as_ref(), &chart, splits)), 8)?));
+            return Ok(Curve::Nurbs(fit_intersection(surfaces.as_ref(), &chart)?));
         }
         geometry::curve(self.file, node)
     }
@@ -732,8 +744,11 @@ impl<'a> Translator<'a> {
             return Ok((id, sense, closing));
         }
         // A tolerant edge: no edge curve; each fin carries a trimmed
-        // SP-curve (§4.3.8). Use the first fin that has one.
+        // SP-curve (§4.3.8). Use the first fin whose curve reads; a fin on a
+        // blend reads as the blend's cross-section when nothing else does.
         let mut at = positive.index;
+        let mut first_error = None;
+        let mut on_blend = None;
         for _ in 0..64 {
             let fin = self.node(at, "fin")?;
             if let Some(curve) = self.file.follow(fin, "curve") {
@@ -741,15 +756,80 @@ impl<'a> Translator<'a> {
                 let fin_sense = fin.char("sense") != Some(b'-');
                 let curve_sense = runs_forward(self.file, curve);
                 self.anchor = self.edge_ends.map(|(start, end)| if fin_sense == curve_sense { (start, end) } else { (end, start) });
-                let (id, closing) = self.curve(curve)?;
-                return Ok((id, fin_sense == curve_sense, closing));
+                match self.curve(curve) {
+                    Ok((id, closing)) => return Ok((id, fin_sense == curve_sense, closing)),
+                    Err(e) => {
+                        if on_blend.is_none() {
+                            on_blend = self.blend_under(curve);
+                        }
+                        first_error.get_or_insert(e);
+                    }
+                }
             }
             at = fin.ptr("other");
             if at == positive.index || at == 0 {
                 break;
             }
         }
-        Err("the edge has no curve and none of its fins has one".into())
+        if let Some((blend, uv)) = on_blend {
+            if let Some(result) = self.blend_cross_section(blend, &uv).transpose() {
+                return result;
+            }
+        }
+        Err(first_error.unwrap_or_else(|| "the edge has no curve and none of its fins has one".into()))
+    }
+
+    /// The blend and 2D curve of a fin's SP-curve that lies on a rolling-ball
+    /// blend (through trimmed curves).
+    fn blend_under(&self, curve: &Node) -> Option<(&'a Node, NurbsCurve)> {
+        let mut node = self.file.node(curve.index)?;
+        for _ in 0..8 {
+            if node.type_name() != "TRIMMED_CURVE" {
+                break;
+            }
+            node = self.file.follow(node, "basis_curve")?;
+        }
+        if node.type_name() != "SP_CURVE" {
+            return None;
+        }
+        let blend = self.file.follow(node, "surface").filter(|s| s.type_name() == "BLENDED_EDGE")?;
+        let uv = geometry::parameter_curve(self.file, self.file.follow(node, "b_curve")?).ok()?;
+        Some((blend, uv))
+    }
+
+    /// An edge along a whole cross-section of a rolling-ball blend: its
+    /// SP-curve runs at one spine parameter from v = 0 to v = 1, so the
+    /// edge is the arc of the blend's radius about the spine point between
+    /// its vertices, exactly; the spine point is the one standing the radius
+    /// from both. `None` when the SP-curve is not such a section; an error
+    /// when it is but the spine has no point the radius from both vertices.
+    fn blend_cross_section(&mut self, blend: &Node, uv: &NurbsCurve) -> Result<Option<(usize, bool, Option<Vec3>)>, String> {
+        let plain: Vec<(f64, f64)> = uv.control_points.iter().map(|c| (c.x / c.w, c.y / c.w)).collect();
+        let (Some(first), Some(last)) = (plain.first(), plain.last()) else { return Ok(None) };
+        let (u_low, u_high) = plain.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), p| (a.min(p.0), b.max(p.0)));
+        let spans = ((first.1 - last.1).abs() - 1.0).abs() < 1e-6;
+        if !(u_high - u_low <= 1e-6 * (1.0 + u_low.abs()) && spans) {
+            return Ok(None);
+        }
+        let Some((start, end)) = self.edge_ends else { return Ok(None) };
+        let id = blend.int("node_id").unwrap_or(blend.index as i64);
+        let radius = blend.reals("range").iter().map(|r| r.abs()).fold(0.0f64, f64::max) * MM_PER_METRE;
+        let spine_node = self.file.follow(blend, "spine").ok_or_else(|| format!("blend {id} has no spine"))?;
+        let spine = self.spine_curve(spine_node).map_err(|e| format!("blend {id}: spine: {e}"))?;
+        let miss = |c: Vec3| (start.sub(c).length() - radius).hypot(end.sub(c).length() - radius);
+        let t = geometry::nearest_parameter(&spine, [true, true], miss)
+            .ok_or_else(|| format!("blend {id}: no spine point for a cross-section edge"))?;
+        let centre = geometry::extended_point(&spine, t)?;
+        if miss(centre) > 1e-3 {
+            return Err(format!(
+                "blend {id}: a cross-section edge's vertices stand {:.3e} mm off the radius from the spine",
+                miss(centre)
+            ));
+        }
+        let x = start.sub(centre).normalized()?;
+        let z = x.cross(end.sub(centre)).normalized()?;
+        let circle = Curve::Circle { frame: Frame { origin: centre, z, x }, radius };
+        Ok(Some((self.emit_curve(&circle)?, true, None)))
     }
 
     // -----------------------------------------------------------------
@@ -759,10 +839,12 @@ impl<'a> Translator<'a> {
     /// The STEP curve of an XT curve node and a point on it to close a ring
     /// edge at (its parameter start).
     fn curve(&mut self, node: &Node) -> Result<(usize, Option<Vec3>), String> {
-        self.curve_at(node, 0)
+        self.curve_at(node, 0, None)
     }
 
-    fn curve_at(&mut self, node: &Node, depth: usize) -> Result<(usize, Option<Vec3>), String> {
+    /// `trim`: the basis parameters a trimmed curve directly over this one
+    /// keeps, which an SP-curve is fitted over alone.
+    fn curve_at(&mut self, node: &Node, depth: usize, trim: Option<[f64; 2]>) -> Result<(usize, Option<Vec3>), String> {
         if depth > 8 {
             return Err("trimmed curves nest more than 8 deep".into());
         }
@@ -776,7 +858,11 @@ impl<'a> Translator<'a> {
                 // The vertices bound the edge; the STEP lane trims by them.
                 let basis = self.file.follow(node, "basis_curve").ok_or("a trimmed curve has no basis curve")?;
                 let closing = node.vector("point_1").map(geometry::position);
-                let (id, basis_closing) = self.curve_at(basis, depth + 1)?;
+                let trim = match (node.real("parm_1"), node.real("parm_2")) {
+                    (Some(a), Some(b)) => Some([a.min(b), a.max(b)]),
+                    _ => None,
+                };
+                let (id, basis_closing) = self.curve_at(basis, depth + 1, trim)?;
                 Ok((id, closing.or(basis_closing)))
             }
             "INTERSECTION" => {
@@ -787,6 +873,12 @@ impl<'a> Translator<'a> {
                 // trim runs the long way round through the chart's seam.
                 if let Some((begin, finish)) = self.anchor.take() {
                     chart = reseat_closed_chart(chart, begin, finish);
+                    // An open chart is cut to the stretch between the edge's
+                    // vertices: a trimmed intersection's chart can run far
+                    // past its edge (54 mm past a 7.8 mm one along a
+                    // B-surface's crease, where the STEP lane cannot tell
+                    // where to trim it).
+                    chart = cut_open_chart(chart, begin, finish);
                 }
                 let surfaces = self.intersection_surfaces(node);
                 // With nothing solved between chart points the densities all
@@ -795,21 +887,51 @@ impl<'a> Translator<'a> {
                 if refined_intersection(surfaces.as_ref(), &chart, 2).len() == chart.len() {
                     self.unverified_curves += 1;
                 }
-                let fitted = fit_adaptively(|splits| Ok(refined_intersection(surfaces.as_ref(), &chart, splits)), 8)
+                let fitted = fit_intersection(surfaces.as_ref(), &chart)
                     .map_err(|e| format!("intersection curve {}: {e}", node.int("node_id").unwrap_or(node.index as i64)))?;
                 self.fitted_curves += 1;
                 Ok((self.emit_curve(&Curve::Nurbs(fitted))?, chart.first().copied()))
             }
             "SP_CURVE" => {
                 let (surface, uv) = self.sp_curve_parts(node)?;
+                // An open SP-curve is taken over the stretch its trimmed
+                // curve keeps: past that it can run on along a crease of its
+                // surface, or on into the next edge on the same curve, where
+                // the STEP lane cannot tell where to trim it (a SolidWorks
+                // part's B-surface face; two edges splitting one curve at a
+                // 0.03 mm sliver). A closed one is taken whole, as its trim
+                // may wrap through its seam.
+                let [t0, t1] = uv.domain()?;
+                let open = uv.evaluate(t0)?.sub(uv.evaluate(t1)?).length() > 1e-9;
+                let range = trim
+                    .filter(|_| open)
+                    .map(|[a, b]| [a.max(t0), b.min(t1)])
+                    .filter(|[a, b]| b - a > 1e-9 * (t1 - t0))
+                    .unwrap_or([t0, t1]);
+                let trimmed = range != [t0, t1];
                 if let Some(exact) = exact_sp_curve(&surface, &uv) {
-                    let closing = sp_curve_points(&surface, &uv, 1)?.first().copied();
+                    let closing = sp_curve_points(&surface, &uv, 1, uv.domain()?)?.first().copied();
+                    // A B-curve on a plane is cut at the trim exactly.
+                    let exact = match (exact, self.edge_ends) {
+                        (Curve::Nurbs(nurbs), Some(ends)) if trimmed => {
+                            Curve::Nurbs(snap_ends(crate::trimmed_curve::trimmed_curve(&nurbs, range[0], range[1])?, ends))
+                        }
+                        (exact, _) => exact,
+                    };
                     return Ok((self.emit_curve(&exact)?, closing));
                 }
-                let fitted = fit_adaptively(|per_span| sp_curve_points(&surface, &uv, per_span), 8)
+                let fitted = fit_sp_curve(&surface, &uv, range)
                     .map_err(|e| format!("SP-curve {}: {e}", node.int("node_id").unwrap_or(node.index as i64)))?;
+                // A trimmed SP-curve ends at its trim parameters, which a
+                // tolerant edge's vertices stand off by up to their
+                // tolerance: move its ends onto them, so the edge runs
+                // exactly vertex to vertex and nothing is left to trim.
+                let fitted = match self.edge_ends {
+                    Some(ends) if trimmed => snap_ends(fitted, ends),
+                    _ => fitted,
+                };
                 self.fitted_curves += 1;
-                let closing = sp_curve_points(&surface, &uv, 1)?.first().copied();
+                let closing = sp_curve_points(&surface, &uv, 1, range)?.first().copied();
                 Ok((self.emit_curve(&Curve::Nurbs(fitted))?, closing))
             }
             other => Err(format!(
@@ -851,8 +973,7 @@ impl<'a> Translator<'a> {
         Ok(points)
     }
 
-    /// The two surfaces of an intersection curve, when the reader has a
-    /// distance for both.
+    /// The two surfaces of an intersection curve, when the reader reads both.
     fn intersection_surfaces(&self, node: &Node) -> Option<[Surface; 2]> {
         let surfaces: Vec<Surface> = node
             .ints("surface")
@@ -861,8 +982,7 @@ impl<'a> Translator<'a> {
             .filter_map(|i| self.file.node(i))
             .filter_map(|s| geometry::surface(self.file, s, 0).ok())
             .collect();
-        let [first, second]: [Surface; 2] = surfaces.try_into().ok()?;
-        (first.has_distance() && second.has_distance()).then_some([first, second])
+        surfaces.try_into().ok()
     }
 
     /// An SP-curve's surface and 2D curve (§5.2.1.8).
@@ -996,7 +1116,14 @@ impl<'a> Translator<'a> {
                 // The STEP lane cannot build a revolution whose profile
                 // reaches its axis (its poles are not analytic ones).
                 if profile_meets_axis(profile, *axis_point, *axis) {
-                    return Err("a spun surface whose profile meets its axis is not read yet".into());
+                    // Said instead as the exact rational B-surface of
+                    // revolution (u along the profile, v round the axis
+                    // right-handedly, as XT's: the same natural normal),
+                    // whose row on the axis the STEP lane reads as a pole.
+                    let Curve::Nurbs(nurbs) = profile else {
+                        return Err("a spun surface whose profile meets its axis is not read yet".into());
+                    };
+                    return Ok((self.emit_nurbs_surface(&revolve(nurbs, *axis_point, *axis)?), false));
                 }
                 if matches!(profile, Curve::Line { .. }) {
                     return Err("a line spun about an axis skew to it (a hyperboloid) is not read yet".into());
@@ -1147,6 +1274,35 @@ fn analytic_outward(surface: &Surface, p: Vec3) -> Result<Vec3, String> {
     }
 }
 
+/// The rational B-surface of `profile` turned once about the axis through
+/// `axis_point` along unit `axis`, right-handedly: u is the profile's
+/// parameter and v runs once round, a quadratic circle of nine vertices.
+fn revolve(profile: &NurbsCurve, axis_point: Vec3, axis: Vec3) -> Result<NurbsSurface, String> {
+    let axis = axis.normalized()?;
+    let half = std::f64::consts::FRAC_1_SQRT_2;
+    let net = profile
+        .control_points
+        .iter()
+        .map(|c| {
+            let p = Vec3::new(c.x / c.w, c.y / c.w, c.z / c.w);
+            let foot = axis_point.add(axis.scale(p.sub(axis_point).dot(axis)));
+            let radial = p.sub(foot);
+            let turned = axis.cross(radial);
+            (0..9)
+                .map(|j| {
+                    let angle = std::f64::consts::FRAC_PI_4 * j as f64;
+                    let (stretch, weight) = if j % 2 == 0 { (1.0, 1.0) } else { (std::f64::consts::SQRT_2, half) };
+                    let q = foot.add(radial.scale(stretch * angle.cos())).add(turned.scale(stretch * angle.sin()));
+                    let w = c.w * weight;
+                    crate::Vec4 { x: q.x * w, y: q.y * w, z: q.z * w, w }
+                })
+                .collect()
+        })
+        .collect();
+    let around = vec![0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0];
+    NurbsSurface::new(profile.degree, 2, profile.knots.clone(), around, net)
+}
+
 /// Whether a spun profile comes within a micron of its axis over its range.
 fn profile_meets_axis(profile: &Curve, axis_point: Vec3, axis: Vec3) -> bool {
     let Some([a, b]) = profile.natural_range() else { return false };
@@ -1187,6 +1343,46 @@ fn offset_analytic(base: &Surface, base_sense: bool, distance: f64) -> Result<Su
         }
         _ => return Err("an offset of a non-analytic surface is not read yet".into()),
     })
+}
+
+/// An open chart cut to the stretch between `begin` and `finish` (each
+/// placed along it where it comes nearest, within a millimetre), in the
+/// chart's own direction, with those two points as its ends. A closed chart,
+/// or one either point stands off, is left as it is.
+pub(super) fn cut_open_chart(chart: Vec<Vec3>, begin: Vec3, finish: Vec3) -> Vec<Vec3> {
+    let n = chart.len();
+    if n < 2 || chart[0].sub(chart[n - 1]).length() <= 1e-6 {
+        return chart;
+    }
+    // A point's position along the chart (chord index plus the fraction
+    // along it) and its distance from it.
+    let place = |p: Vec3| -> (f64, f64) {
+        let mut best = (f64::INFINITY, 0.0);
+        for i in 0..n - 1 {
+            let (a, b) = (chart[i], chart[i + 1]);
+            let ab = b.sub(a);
+            let t = (p.sub(a).dot(ab) / ab.dot(ab).max(1e-300)).clamp(0.0, 1.0);
+            let d = p.sub(a.add(ab.scale(t))).length();
+            if d < best.0 {
+                best = (d, i as f64 + t);
+            }
+        }
+        best
+    };
+    let ((db, sb), (df, sf)) = (place(begin), place(finish));
+    if db > 1.0 || df > 1.0 || (sb - sf).abs() < 1e-12 {
+        return chart;
+    }
+    let ((lo, first), (hi, last)) = if sb <= sf { ((sb, begin), (sf, finish)) } else { ((sf, finish), (sb, begin)) };
+    let mut out = vec![first];
+    for (j, p) in chart.iter().enumerate() {
+        let s = j as f64;
+        if s > lo && s < hi && p.sub(first).length() > 1e-9 && p.sub(last).length() > 1e-9 {
+            out.push(*p);
+        }
+    }
+    out.push(last);
+    out
 }
 
 /// A closed chart (its last point its first) restarted in the gap an edge on
@@ -1294,37 +1490,142 @@ const FIT_REFUSAL: f64 = 1e-3;
 const FIT_DOUBLINGS: usize = 7;
 const MAX_FIT_STATIONS: usize = 4096;
 
-/// A cubic through `stations(d)` at doubling densities d from `start`, kept
-/// once every station of `stations(2d)` (the same stations and those between
-/// them) lies within [`FIT_TOLERANCE`] of it. The densest fit is used if none
-/// gets there, unless it misses by more than [`FIT_REFUSAL`].
-pub(super) fn fit_adaptively(stations: impl Fn(usize) -> Result<Vec<Vec3>, String>, start: usize) -> Result<NurbsCurve, String> {
-    let mut density = start;
+/// A cubic through points taken piece by piece: `points(i, s)` gives piece
+/// i sampled `s` times (its start included, its end not), and `last` ends
+/// the run. Each piece starts at `start` samples; a piece where the fit
+/// strays more than [`FIT_TOLERANCE`] from that piece sampled twice as
+/// densely is doubled, and the others are left, until every piece is held,
+/// one has doubled [`FIT_DOUBLINGS`] times, or every piece that misses is
+/// within ten times the tolerance and no longer halves its miss when
+/// doubled. Doubling only where the fit
+/// misses keeps a curve whose curvature changes in one place (an
+/// intersection on a swept surface running on into its section's
+/// extension) from being sampled densely all along. The best fit is used if
+/// none gets there, unless it misses by more than [`FIT_REFUSAL`].
+pub(super) fn fit_by_pieces(
+    pieces: usize,
+    points: impl Fn(usize, usize) -> Result<Vec<Vec3>, String>,
+    last: Vec3,
+    start: usize,
+) -> Result<NurbsCurve, String> {
+    if pieces == 0 {
+        return Err("the curve has no points".into());
+    }
+    let most = start << FIT_DOUBLINGS;
+    let mut samples = vec![start; pieces];
+    // Each piece's miss at the last round (none yet).
+    let mut misses = vec![f64::INFINITY; pieces];
+    let mut cache: HashMap<(usize, usize), Vec<Vec3>> = HashMap::default();
+    let sampled = |i: usize, s: usize, cache: &mut HashMap<(usize, usize), Vec<Vec3>>| -> Result<Vec<Vec3>, String> {
+        if let Some(found) = cache.get(&(i, s)) {
+            return Ok(found.clone());
+        }
+        let found = points(i, s)?;
+        cache.insert((i, s), found.clone());
+        Ok(found)
+    };
     let mut best: Option<(NurbsCurve, f64)> = None;
-    for _ in 0..=FIT_DOUBLINGS {
-        let fit = fit_through(&stations(density)?)?;
-        let check = stations(density * 2)?;
-        let worst = check
-            .iter()
-            .map(|p| crate::project_point_to_curve(&fit, *p).map(|f| f.distance).unwrap_or(f64::INFINITY))
-            .fold(0.0f64, f64::max);
-        if worst <= FIT_TOLERANCE {
+    loop {
+        let mut run = Vec::new();
+        for (i, &s) in samples.iter().enumerate() {
+            run.extend(sampled(i, s, &mut cache)?);
+        }
+        run.push(last);
+        let fit = fit_through(&run)?;
+        let mut worst = 0.0f64;
+        let mut missing = Vec::new();
+        let mut doubling = Vec::new();
+        for (i, &s) in samples.iter().enumerate() {
+            let check = sampled(i, 2 * s, &mut cache)?;
+            // A piece with nothing between its points (an intersection with
+            // a surface the reader cannot measure gives only its chart) has
+            // nothing to check: the fit passes through every point it has.
+            let own = sampled(i, s, &mut cache)?;
+            if check.len() == own.len() && check.iter().zip(&own).all(|(a, b)| a.sub(*b).length() == 0.0) {
+                misses[i] = 0.0;
+                continue;
+            }
+            let miss = check
+                .iter()
+                .map(|p| crate::project_point_to_curve(&fit, *p).map(|f| f.distance).unwrap_or(f64::INFINITY))
+                .fold(0.0f64, f64::max);
+            worst = worst.max(miss);
+            if miss > FIT_TOLERANCE {
+                missing.push(i);
+                // A piece near the tolerance whose miss did not halve when it
+                // was last doubled has met the floor its points give (a chart
+                // end the file states only to its resolution): more samples
+                // will not help.
+                if miss > 10.0 * FIT_TOLERANCE || !(misses[i] <= 2.0 * miss) {
+                    doubling.push(i);
+                }
+            }
+            misses[i] = miss;
+        }
+        if missing.is_empty() {
             return Ok(fit);
         }
         if best.as_ref().map_or(true, |(_, b)| worst < *b) {
             best = Some((fit, worst));
         }
-        // The next check would sample twice as many points again.
-        if check.len() * 2 > MAX_FIT_STATIONS {
+        let total: usize = samples.iter().sum();
+        if doubling.is_empty()
+            || doubling.iter().any(|&i| samples[i] >= most)
+            || 2 * (total + doubling.iter().map(|&i| samples[i]).sum::<usize>()) > MAX_FIT_STATIONS
+        {
             break;
         }
-        density *= 2;
+        for i in doubling {
+            samples[i] *= 2;
+        }
     }
     match best {
         Some((fit, worst)) if worst <= FIT_REFUSAL => Ok(fit),
         Some((_, worst)) => Err(format!("no cubic through its points comes within {FIT_REFUSAL} mm of it (closest {worst:.2e} mm)")),
         None => Err("the curve has no points".into()),
     }
+}
+
+/// The points of chord `i` of the chart, `splits - 1` of them solved
+/// exactly between its ends (its start included, its end not): see
+/// [`refined_intersection`].
+fn refined_chord(surfaces: Option<&[Surface; 2]>, chart: &[Vec3], i: usize, splits: usize) -> Vec<Vec3> {
+    let (a, b) = (chart[i], chart[i + 1]);
+    let mut out = vec![a];
+    let Some([first, second]) = surfaces else { return out };
+    let chord = b.sub(a);
+    let Ok(direction) = chord.normalized() else { return out };
+    for k in 1..splits {
+        let station = a.add(chord.scale(k as f64 / splits as f64));
+        if let Some(p) = solve_on_both(first, second, station, direction, chord.length()) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// An intersection curve fitted chord by chord ([`fit_by_pieces`]).
+fn fit_intersection(surfaces: Option<&[Surface; 2]>, chart: &[Vec3]) -> Result<NurbsCurve, String> {
+    fit_by_pieces(chart.len() - 1, |i, s| Ok(refined_chord(surfaces, chart, i, s)), chart[chart.len() - 1], 8)
+}
+
+/// An SP-curve over [t0, t1] fitted knot span by knot span
+/// ([`fit_by_pieces`]).
+fn fit_sp_curve(surface: &Surface, uv: &NurbsCurve, [t0, t1]: [f64; 2]) -> Result<NurbsCurve, String> {
+    let mut breaks = vec![t0];
+    breaks.extend(uv.knots.iter().copied().filter(|&k| k > t0 && k < t1));
+    breaks.push(t1);
+    breaks.dedup();
+    let at = |t: f64| -> Result<Vec3, String> {
+        let p = uv.evaluate(t)?;
+        surface.point(p.x, p.y)
+    };
+    fit_by_pieces(
+        breaks.len() - 1,
+        |i, s| (0..s).map(|k| at(breaks[i] + (breaks[i + 1] - breaks[i]) * k as f64 / s as f64)).collect(),
+        at(t1)?,
+        8,
+    )
 }
 
 /// The chart with `splits - 1` exact points inside each chord: each solved
@@ -1357,12 +1658,14 @@ fn refined_intersection(surfaces: Option<&[Surface; 2]>, chart: &[Vec3], splits:
 
 /// Points of an SP-curve, `per_span` to each knot span of its 2D curve,
 /// mapped through its surface.
-fn sp_curve_points(surface: &Surface, uv: &NurbsCurve, per_span: usize) -> Result<Vec<Vec3>, String> {
-    let [t0, t1] = uv.domain()?;
-    let mut breaks: Vec<f64> = uv.knots.clone();
+fn sp_curve_points(surface: &Surface, uv: &NurbsCurve, per_span: usize, [t0, t1]: [f64; 2]) -> Result<Vec<Vec3>, String> {
+    // Knot spans clipped to [t0, t1].
+    let mut breaks = vec![t0];
+    breaks.extend(uv.knots.iter().copied().filter(|&k| k > t0 && k < t1));
+    breaks.push(t1);
     breaks.dedup();
     let mut params = Vec::new();
-    for pair in breaks.windows(2).filter(|w| w[1] > w[0] && w[0] >= t0 && w[1] <= t1) {
+    for pair in breaks.windows(2).filter(|w| w[1] > w[0]) {
         for k in 0..per_span {
             params.push(pair[0] + (pair[1] - pair[0]) * k as f64 / per_span as f64);
         }
@@ -1448,6 +1751,33 @@ fn exact_sp_curve(surface: &Surface, uv: &NurbsCurve) -> Option<Curve> {
     }
 }
 
+/// `curve` with its end control points moved onto the edge's vertices (the
+/// nearer to each end), where both stand within a tenth of a millimetre of
+/// the ends they replace; otherwise unchanged. A clamped B-spline's ends
+/// are its end control points, so only the spans at its ends move, by the
+/// gap.
+fn snap_ends(mut curve: NurbsCurve, (start, end): (Vec3, Vec3)) -> NurbsCurve {
+    let n = curve.control_points.len();
+    if n < 2 {
+        return curve;
+    }
+    let point = |c: &crate::Vec4| Vec3::new(c.x / c.w, c.y / c.w, c.z / c.w);
+    let (first, last) = (point(&curve.control_points[0]), point(&curve.control_points[n - 1]));
+    let (a, b) = if first.sub(start).length() + last.sub(end).length() <= first.sub(end).length() + last.sub(start).length() {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    if first.sub(a).length() > 0.1 || last.sub(b).length() > 0.1 {
+        return curve;
+    }
+    for (k, p) in [(0, a), (n - 1, b)] {
+        let w = curve.control_points[k].w;
+        curve.control_points[k] = crate::Vec4 { x: p.x * w, y: p.y * w, z: p.z * w, w };
+    }
+    curve
+}
+
 /// An edge's positive and negative fins. Parasolid points an edge at its
 /// positive fin, but not every writer does (a V12 file seen points 23 of
 /// its 54 edges at the negative one), so the fins' own senses decide.
@@ -1463,15 +1793,22 @@ fn spine_range(spine: &Curve, points: &[Vec3]) -> Option<[f64; 2]> {
     let params: Vec<f64> = match spine {
         Curve::Line { point, direction } => points.iter().map(|p| p.sub(*point).dot(*direction) / MM_PER_METRE).collect(),
         Curve::Circle { frame, .. } | Curve::Ellipse { frame, .. } => {
-            let angle = |p: &Vec3| {
-                let d = p.sub(frame.origin);
-                d.dot(frame.y()).atan2(d.dot(frame.x))
+            // A circle's foot is the point's polar angle; an ellipse's
+            // parameter is its eccentric angle, which the polar angle is not
+            // (off the axes it fell short of a face's ends and clipped a blend
+            // face by 2%), so its foot is searched for.
+            let angle = |p: &Vec3| match spine {
+                Curve::Ellipse { .. } => geometry::nearest_parameter(spine, [false, false], |q| q.sub(*p).length()).unwrap_or(f64::NAN),
+                _ => {
+                    let d = p.sub(frame.origin);
+                    d.dot(frame.y()).atan2(d.dot(frame.x))
+                }
             };
             // The face spans the circle less its largest gap between
             // boundary points; a face whose points leave no gap wider than
             // 45° (a ring all the way round, sampled) takes the whole circle,
             // which over-covers a face that is not quite whole, harmlessly.
-            let mut angles: Vec<f64> = points.iter().map(|p| angle(p).rem_euclid(std::f64::consts::TAU)).collect();
+            let mut angles: Vec<f64> = points.iter().map(|p| angle(p).rem_euclid(std::f64::consts::TAU)).filter(|a| a.is_finite()).collect();
             angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let first = *angles.first()?;
             let (mut gap, mut after) = (first + std::f64::consts::TAU - angles[angles.len() - 1], first);
@@ -1533,10 +1870,15 @@ fn blend_section(supports: &[Surface; 2], radius: f64, spine: &Curve, t: f64) ->
     Ok([at(centre.add(a), 1.0), at(apex, w), at(centre.add(b), 1.0)])
 }
 
-/// A degree (3, 2) B-surface through the cross-sections at doubling numbers
-/// of spine stations over [t0, t1], kept once it lies within
-/// [`FIT_TOLERANCE`] of the exact sections halfway between its stations.
-fn fit_blend(section: impl Fn(f64) -> Result<[crate::Vec4; 3], String>, t0: f64, t1: f64) -> Result<NurbsSurface, String> {
+/// A degree (3, 2) B-surface through the cross-sections at spine stations
+/// over [t0, t1], kept once it lies within [`FIT_TOLERANCE`] of the exact
+/// sections halfway between its stations. It starts from 8 even stations and
+/// adds a station halfway along each interval that misses: where a support
+/// changes curvature (a swept section running on into its straight
+/// extension) a cubic through the sections
+/// closes on them slowly and unevenly as even stations double past the
+/// change, but closes fast once stations gather there.
+pub(super) fn fit_blend(section: impl Fn(f64) -> Result<[crate::Vec4; 3], String>, t0: f64, t1: f64) -> Result<NurbsSurface, String> {
     let rational_point = |c: &[crate::Vec4; 3], v: f64| {
         let basis = [(1.0 - v) * (1.0 - v), 2.0 * v * (1.0 - v), v * v];
         let (mut x, mut y, mut z, mut w) = (0.0, 0.0, 0.0, 0.0);
@@ -1545,12 +1887,16 @@ fn fit_blend(section: impl Fn(f64) -> Result<[crate::Vec4; 3], String>, t0: f64,
         }
         Vec3::new(x / w, y / w, z / w)
     };
+    const MAX_STATIONS: usize = 1024;
     let mut best: Option<(NurbsSurface, f64)> = None;
-    let mut stations = 8usize;
-    while stations <= 512 {
-        let params: Vec<f64> = (0..=stations).map(|k| t0 + (t1 - t0) * k as f64 / stations as f64).collect();
-        let sections: Vec<[crate::Vec4; 3]> = params.iter().map(|&t| section(t)).collect::<Result<_, _>>()?;
-        let degree = stations.min(3);
+    let mut params: Vec<f64> = (0..=8).map(|k| t0 + (t1 - t0) * k as f64 / 8.0).collect();
+    let mut sections: Vec<[crate::Vec4; 3]> = params.iter().map(|&t| section(t)).collect::<Result<_, _>>()?;
+    // Rounds in a row that did not halve the best miss.
+    let mut stalled = 0;
+    // The exact section halfway along each interval, where known.
+    let mut kept: Vec<Option<[crate::Vec4; 3]>> = Vec::new();
+    loop {
+        let degree = (params.len() - 1).min(3);
         let mut columns = Vec::with_capacity(3);
         let mut knots = Vec::new();
         for j in 0..3 {
@@ -1569,28 +1915,54 @@ fn fit_blend(section: impl Fn(f64) -> Result<[crate::Vec4; 3], String>, t0: f64,
         }
         let net: Vec<Vec<crate::Vec4>> = (0..columns[0].len()).map(|i| columns.iter().map(|c| c[i]).collect()).collect();
         let surface = NurbsSurface::new(degree, 2, knots, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], net)?;
-        let mut worst = 0.0f64;
-        for pair in params.windows(2) {
+        // The miss halfway along each interval, with the exact section there
+        // (kept from the last round for an interval that was not split).
+        let mut misses = Vec::with_capacity(params.len() - 1);
+        for (k, pair) in params.windows(2).enumerate() {
             let t = 0.5 * (pair[0] + pair[1]);
-            let exact = section(t)?;
+            let exact = match kept.get(k) {
+                Some(&Some(exact)) => exact,
+                _ => section(t)?,
+            };
+            let mut miss = 0.0f64;
             for v in [0.0, 0.25, 0.5, 0.75, 1.0] {
-                worst = worst.max(surface.evaluate(t, v)?.sub(rational_point(&exact, v)).length());
+                miss = miss.max(surface.evaluate(t, v)?.sub(rational_point(&exact, v)).length());
             }
+            misses.push((t, exact, miss));
         }
+        let worst = misses.iter().map(|m| m.2).fold(0.0f64, f64::max);
         if worst <= FIT_TOLERANCE {
             return Ok(surface);
         }
-        // A cubic through exact sections closes on them ~16x per doubling;
-        // one that does not halve its miss is not converging (a section
-        // the spine or supports cannot give smoothly), so stop paying.
-        let stalled = best.as_ref().is_some_and(|(_, b)| worst > 0.5 * b);
+        // A cubic through exact sections closes on them at least 4x per
+        // halving of the stations where it misses; a fit that does not even
+        // halve its miss for three rounds running is not converging (a
+        // section the spine or supports cannot give smoothly), so stop paying.
+        stalled = if best.as_ref().is_some_and(|(_, b)| worst > 0.5 * b) { stalled + 1 } else { 0 };
         if best.as_ref().map_or(true, |(_, b)| worst < *b) {
             best = Some((surface, worst));
         }
-        if stalled {
+        let missing = misses.iter().filter(|m| m.2 > FIT_TOLERANCE).count();
+        if stalled >= 3 || params.len() + missing > MAX_STATIONS + 1 {
             break;
         }
-        stations *= 2;
+        let (mut next_params, mut next_sections) = (Vec::with_capacity(params.len() + missing), Vec::with_capacity(params.len() + missing));
+        let mut next_kept = Vec::with_capacity(params.len() + missing);
+        for (k, (t, exact, miss)) in misses.into_iter().enumerate() {
+            next_params.push(params[k]);
+            next_sections.push(sections[k]);
+            if miss > FIT_TOLERANCE {
+                next_params.push(t);
+                next_sections.push(exact);
+                next_kept.extend([None, None]);
+            } else {
+                next_kept.push(Some(exact));
+            }
+        }
+        kept = next_kept;
+        next_params.push(params[params.len() - 1]);
+        next_sections.push(sections[sections.len() - 1]);
+        (params, sections) = (next_params, next_sections);
     }
     match best {
         Some((surface, worst)) if worst <= FIT_REFUSAL => Ok(surface),
