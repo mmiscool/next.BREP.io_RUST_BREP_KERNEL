@@ -215,6 +215,39 @@ fn namespace_solid_names(solid: &mut BrepSolid, component_id: &str) {
     }
 }
 
+/// Register a member body a weld prepared in context (an assembly-level
+/// result replacing the member under its own name). Its names follow the
+/// component's convention as if the part had been cut in its own document and
+/// then placed: every face and edge name is read without the member's
+/// namespace path (`ACOMP2:` for `ACOMP2:Part`), the faces made unique, the
+/// topology edges re-derived from them, and the path put back on all of them.
+/// So the member's untouched faces and edges keep the names references hold,
+/// and the faces the cut leaves (named for the weld) live under the component,
+/// where the reference fence still sees them as component geometry.
+pub(crate) fn register_context_member(mut body: BrepSolid, member: &str) -> AddedSolid {
+    let path = member.rfind(':').map(|end| &member[..=end]).unwrap_or("");
+    let strip = |name: &mut Option<String>| {
+        if let Some(local) = name.as_deref().and_then(|name| name.strip_prefix(path)) {
+            *name = Some(local.to_string());
+        }
+    };
+    for face in body.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
+        strip(&mut face.name);
+    }
+    for edge in &mut body.edges {
+        strip(&mut edge.name);
+    }
+    crate::feature_pipeline::features::common::ensure_unique_face_names(&mut body);
+    crate::feature_pipeline::features::common::stamp_derived_edge_names(&mut body);
+    if let Some(prefix) = path.strip_suffix(':') {
+        namespace_solid_names(&mut body, prefix);
+    }
+    let face_names = collect_face_names(&body);
+    let edge_names = collect_edge_names(&body);
+    let handle = crate::register_solid_value(body);
+    AddedSolid { handle, name: member.to_string(), face_names, edge_names, ..AddedSolid::default() }
+}
+
 /// A component id must be a plain feature id: non-empty, no `:` (the namespace
 /// delimiter) and no `|` (the topology-vs-authored name discriminator).
 fn validate_component_id(id: &str) -> Result<(), String> {
@@ -381,24 +414,45 @@ pub fn update_component_transform(
     let delta = compose(&new_transform, &record.transform.rigid_inverse()?)?;
     let port_ids = record.ports.clone();
 
-    // Phase 1 (fallible): resolve + re-pose every member.
+    // Phase 1 (fallible): resolve + re-pose every member. A member a weld
+    // prepared in context has two bodies, the component's own and the
+    // prepared one under its name: both move (the weld re-cuts from the
+    // component's when it rebuilds, and a scene the weld never rebuilds,
+    // such as the assembly session's own solve, still shows it in place).
     let mut posed: Vec<(u32, BrepSolid)> = Vec::with_capacity(record.solids.len());
+    let mut prepared_by: Vec<String> = Vec::new();
     for name in &record.solids {
         let handle = scene
             .solids
             .get(name)
             .copied()
             .ok_or_else(|| format!("component '{id}': member '{name}' is not scene-resident"))?;
-        let body = crate::with_registered_solid_str(handle, |solid| {
-            transform_brep(solid, delta, false)
-        })
-        .map_err(|error| format!("component '{id}': member '{name}': {error}"))?;
-        posed.push((handle, body));
+        let mut handles = vec![handle];
+        if let Some(member) = scene.context_member(name) {
+            if member.prior != handle {
+                handles.push(member.prior);
+            }
+            prepared_by.push(member.weld.clone());
+        }
+        for handle in handles {
+            if posed.iter().any(|(seen, _)| *seen == handle) {
+                continue;
+            }
+            let body = crate::with_registered_solid_str(handle, |solid| {
+                transform_brep(solid, delta, false)
+            })
+            .map_err(|error| format!("component '{id}': member '{name}': {error}"))?;
+            posed.push((handle, body));
+        }
     }
 
     // Phase 2: commit under the existing handles, then update the record.
     for (handle, body) in posed {
         crate::replace_registered_solid(handle, body)?;
+    }
+    // The preparing weld's cache entry owns a body that just moved in place.
+    for weld in prepared_by {
+        super::mark_component_cache_posed(&weld);
     }
     if let Some(record) = scene.components.get_mut(id) {
         record.transform = new_transform;

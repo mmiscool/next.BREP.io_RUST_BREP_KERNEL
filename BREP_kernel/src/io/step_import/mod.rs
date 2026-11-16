@@ -42,6 +42,7 @@ mod styles;
 mod pmi;
 mod precision;
 mod trim_readings;
+pub(crate) use bodies::import_lean;
 /// The projected-foot refinement's body face cap (`0` = uncapped); the
 /// soundness fixture sweep reads it to know which trims the import refined.
 #[cfg_attr(not(test), allow(unused_imports))]
@@ -175,7 +176,9 @@ pub fn import_step(text: &str) -> Result<Vec<BrepSolid>, String> {
 /// behaviour (skipped, the rest returned) — changing that is the plan's
 /// migration of the builder boundary, not this gate's.
 pub fn import_step_bodies(text: &str) -> Result<ImportedStep, StepBodyError> {
-    let imported = collect_step_solids(text)?;
+    // The trim readings feed only the report's diagnostics, which this lane
+    // never builds.
+    let imported = bodies::collect_step_solids_dropping_readings(text)?;
     if let Some(first) = imported.refused_bodies.first() {
         let others = imported.refused_bodies.len() - 1;
         let refusal = if others == 0 {
@@ -446,18 +449,38 @@ fn bounded_trim_diagnostics(
 /// feature pipeline has no diagnostics channel to carry the answer, and a
 /// measurement nobody reads is not worth its cost on every IMPORT3D.
 pub fn import_step_report(text: &str) -> Result<StepImportReport, String> {
-    import_step_report_with(text, false)
+    import_step_report_with(text, false, true)
 }
 
 /// [`import_step_report`] building every OPEN_SHELL as a sheet body
 /// (`BodyKind::Sheet`) among its solids, not skipping it: the Parasolid
 /// lane's, whose translation writes a sheet body as an open shell.
 pub(crate) fn import_step_report_with_sheets(text: &str) -> Result<StepImportReport, String> {
-    import_step_report_with(text, true)
+    import_step_report_with(text, true, true)
 }
 
-fn import_step_report_with(text: &str, sheets: bool) -> Result<StepImportReport, String> {
-    let imported = bodies::collect_step_solids_with(text, sheets)?;
+/// [`import_step_report`] (with `sheets` as [`import_step_report_with_sheets`])
+/// for a caller that drops the report's trim-reading diagnostics: under
+/// `BREP_IMPORT_LEAN` the build skips them.
+pub(crate) fn import_step_report_dropping_readings(text: &str, sheets: bool) -> Result<StepImportReport, String> {
+    import_step_report_with(text, sheets, !bodies::import_lean())
+}
+
+/// Every `EDGE_BASED_WIREFRAME_MODEL` of a Part 21 document, in file order,
+/// as wire bodies (`BodyKind::Wire`, plan 3.3): the Parasolid lane's, whose
+/// translation writes a wire body as one. Ordinary STEP import does not read
+/// wireframes yet.
+pub(crate) fn import_step_wires(text: &str) -> Result<Vec<BrepSolid>, String> {
+    let entities = parse_data_section(text)?;
+    let resolver = Resolver::new(&entities, derive_length_scale_mm(&entities));
+    let mut models: Vec<usize> =
+        entities.iter().filter(|(_, e)| e.has("EDGE_BASED_WIREFRAME_MODEL")).map(|(&id, _)| id).collect();
+    models.sort_unstable();
+    models.into_iter().map(|id| build_wire(&resolver, id)).collect()
+}
+
+fn import_step_report_with(text: &str, sheets: bool, readings: bool) -> Result<StepImportReport, String> {
+    let imported = bodies::collect_step_solids_with(text, sheets, readings)?;
     let mut diagnostics =
         precision::stated_precision_diagnostics(&imported.stated_precisions_mm, &imported.solids);
     bounded_trim_diagnostics(&imported.bounded_trims, &mut diagnostics);

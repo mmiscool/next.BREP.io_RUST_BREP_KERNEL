@@ -29,6 +29,11 @@ pub(super) const TANGENT_OFFSETS: &str = "offset_shell_tangent_offsets";
 /// A cavity skin is sealed off from the opening and the assembly failed
 /// (`BREP_OFFSET_SEALED_HOLLOW`).
 pub(super) const SEALED_HOLLOW: &str = "offset_shell_sealed_hollow";
+/// A shadowed re-run would omit nothing new: a carrier riding an already
+/// omitted support read shadowed again.
+pub(super) const SHADOW_RETRY_STALLED: &str = "offset_shell_shadow_retry_stalled";
+/// The nested passes passed `MAXIMUM_PASS_DEPTH` without settling.
+pub(super) const PASS_BUDGET: &str = "offset_shell_pass_budget";
 pub(super) const UNWELDED_CURVED_RIM: &str = "offset_shell_unwelded_curved_rim";
 pub(super) const EMPTY_SHELL: &str = "offset_shell_empty_shell";
 /// The sharp-side lane could not continue a curved carrier past its sharp

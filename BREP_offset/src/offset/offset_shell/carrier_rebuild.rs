@@ -3226,6 +3226,28 @@ pub(super) fn apex_corner_reach(
     Ok(reach)
 }
 
+/// `BREP_OFFSET_REFLEX_SIDE_DOMAIN_END` (default on; `=0` restores the
+/// decline): a reflex side whose asked reach (the carrier padding, 1.5 times
+/// the distance) would carry it past its surface's domain stops at the
+/// domain's end when the offset there still runs past the mitre with its
+/// neighbour (`REFLEX_SIDE_MITRE_MARGIN` times the distance times the widest
+/// station's `miter_tan`).
+///
+/// Cause (a reported stepped bar ending in a revolved disc, shelled through
+/// its start cap): the disc's concave rim fillet meets the bar's side plane
+/// at a reflex junction. Up to a wall of 0.745 the padded reach fit inside the
+/// fillet surface's domain; past it the side declined, the fillet's offset
+/// kept its source-sized trim, the side plane's offset no longer cut it, and
+/// the shell refused as a sealed hollow that does not exist.
+pub(super) fn reflex_side_domain_end_on() -> bool {
+    switch!("BREP_OFFSET_REFLEX_SIDE_DOMAIN_END", true)
+}
+
+/// The mitre reach a side stopped at its domain's end must clear, as a
+/// multiple of the exact mitre overshoot: a chord across a curved strip
+/// overstates how far the strip runs across the neighbour's offset.
+const REFLEX_SIDE_MITRE_MARGIN: f64 = 1.25;
+
 /// REFLEX-SIDE lane: a curved retained face whose trim is a uv RECTANGLE
 /// strictly inside its surface's domain, with a u-side meeting a retained
 /// neighbour at a REFLEX junction, in an INWARD shell, has its offset carrier
@@ -3305,6 +3327,10 @@ pub(super) fn reflex_side_widened_source(
     // The u-sides to widen: asked to grow, mate retained, every sharp
     // station of the junction reflex.
     let mut grow = [0.0f64; 2];
+    // Per side, the widest mitre overshoot per unit distance over its reflex
+    // stations: how far past its rim the offset must run to meet the
+    // neighbour's offset.
+    let mut overshoot = [0.0f64; 2];
     for (coedge, (along_u, at)) in face.loops[0].coedges.iter().zip(&isolines) {
         if !*along_u {
             continue;
@@ -3331,6 +3357,7 @@ pub(super) fn reflex_side_widened_source(
             continue;
         }
         grow[slot] = asked;
+        overshoot[slot] = stations.iter().map(JunctionStation::miter_tan).fold(overshoot[slot], f64::max);
     }
     if grow == [0.0, 0.0] {
         return Ok(None);
@@ -3362,10 +3389,23 @@ pub(super) fn reflex_side_widened_source(
         // offset, no cusp); the strip must stay inside the domain.
         let mut delta = wanted / speed;
         let mut accepted = None;
+        // Where the asked reach would leave the domain, the side may stop at
+        // the domain's end if the offset still runs past the mitre there:
+        // the asked reach is a padding of the distance, the mitre is what the
+        // neighbour's offset needs to cut this one.
+        let needed = (distance * overshoot[slot] * REFLEX_SIDE_MITRE_MARGIN).min(wanted);
         for _ in 0..8 {
-            let far_u = u_end + sense * delta;
-            if far_u < u0 + band_u || far_u > u1 - band_u {
-                return Ok(None);
+            let mut far_u = u_end + sense * delta;
+            let past = far_u < u0 + band_u || far_u > u1 - band_u;
+            if past {
+                if !reflex_side_domain_end_on() || !(needed > 0.0) {
+                    return Ok(None);
+                }
+                far_u = if slot == 0 { u0 + 2.0 * band_u } else { u1 - 2.0 * band_u };
+                if sense * (far_u - u_end) <= 0.0 {
+                    return Ok(None);
+                }
+                delta = sense * (far_u - u_end);
             }
             let mut least = f64::INFINITY;
             for index in 0..=STATIONS {
@@ -3385,6 +3425,16 @@ pub(super) fn reflex_side_widened_source(
             }
             if least >= wanted * (1.0 - 1e-9) {
                 accepted = Some(far_u);
+                break;
+            }
+            if past {
+                if least >= needed {
+                    os_debug!(
+                        "reflex-side lane: face {} side {slot} stops at its domain's end, {least:.6} past its rim (asked {wanted:.6}, the mitre needs {needed:.6})",
+                        face.id
+                    );
+                    accepted = Some(far_u);
+                }
                 break;
             }
             delta *= (wanted / least.max(wanted * 1e-3)) * 1.05;

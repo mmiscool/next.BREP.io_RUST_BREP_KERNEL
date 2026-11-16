@@ -3232,6 +3232,7 @@ fn concave_first_network_stage(
     if healed.is_ok() && charts.is_ok() && issues.is_empty() && interference.is_ok() && bowtie.is_ok() {
         return Some(body);
     }
+    crate::blend::reject_wrapped_network();
     if debug {
         eprintln!(
             "concave-first stage on {edge_ids:?} rejected: heal={healed:?} charts={charts:?} issues={issues:?} \
@@ -3745,6 +3746,7 @@ fn fillet_edges_group_lanes(
                 if healed.is_ok() && issues.is_empty() && interference.is_ok() && bowtie.is_ok() {
                     return Ok(Some(GroupBody { body: network, bowtie_clean: true }));
                 }
+                crate::blend::reject_wrapped_network();
                 if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                     eprintln!(
                         "network result rejected: heal={healed:?} issues={issues:?} \

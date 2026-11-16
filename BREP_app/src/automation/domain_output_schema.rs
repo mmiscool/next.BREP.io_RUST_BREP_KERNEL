@@ -73,13 +73,13 @@ pub(super) fn ecad_state() -> Value {
     let count=json!({"type":"integer","minimum":0});let integer=json!({"type":"integer"});
     let maybe=nullable(text.clone());let strings=array(text.clone());
     let point=json!({"type":"array","items":integer,"minItems":2,"maxItems":2});
-    let pad=closed_object_optional(json!({"number":text,"at":point,"shape":{"enum":["Rect","Circle","Oval","RoundRect","Trapezoid","Custom"]},"cornerRadius":count,
+    let pad=closed_object_optional(json!({"number":text,"at":point,"size":point,"shape":{"enum":["Rect","Circle","Oval","RoundRect","Trapezoid","Custom"]},"cornerRadius":count,
         "corners":nullable(count.clone()),"pasteWindows":nullable(json!({"type":"array","items":count,"minItems":2,"maxItems":2})),
         "vias":nullable(closed_object_optional(json!({"grid":{"type":"array","items":count,"minItems":2,"maxItems":2},"tented":boolean}),&[])),
         "side":{"enum":["front","back","both"]},"maskOpen":{"type":"array","items":boolean,"minItems":2,"maxItems":2},"paste":boolean,
         "hole":nullable(point.clone())}),
         // The Pads workbench reports a pad's layers and hole; the board's pads (shared shape) name only number and place.
-        &["shape","cornerRadius","corners","pasteWindows","vias","side","maskOpen","paste","hole"]);
+        &["size","shape","cornerRadius","corners","pasteWindows","vias","side","maskOpen","paste","hole"]);
     let common=json!({"target":text,"inStep":boolean,"revision":count,
         "pan":{"type":"array","items":number,"minItems":2,"maxItems":2},"zoom":number,
         "unreadable":maybe,"offender":maybe,"repair":maybe,"tool":text,

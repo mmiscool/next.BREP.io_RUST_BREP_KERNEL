@@ -25,6 +25,11 @@ pub enum ImportFormat {
     /// A Parasolid part or partition, text (`.x_t`, `.xmt_txt`) or binary
     /// (`.x_b`, `.xmt_bin`, `.p_b`).
     Parasolid,
+    /// A SolidWorks part (`.sldprt`) or assembly (`.sldasm`, by the name's
+    /// extension). An assembly's parts are read from beside `name`, which is
+    /// then the file's path on disk.
+    #[serde(rename = "solidworks")]
+    SolidWorks,
     /// A 3MF package. Named for the extension, not the Rust variant, so the
     /// wire value is the one a caller types.
     #[serde(rename = "3mf")]
@@ -59,6 +64,12 @@ pub enum ExportFormat {
     Stl,
     Obj,
     Iges,
+    /// A Parasolid text part (`.x_t`, schema V30.1 with embedded deltas):
+    /// what SolidWorks, NX, Solid Edge and Onshape open natively.
+    Parasolid,
+    /// The same part in Parasolid neutral binary (`.x_b`). Binary, so
+    /// `base64`.
+    ParasolidBinary,
     /// Binary glTF 2.0 of the display mesh. A BINARY format, so it comes back
     /// in `base64` rather than `text`.
     Glb,
@@ -450,6 +461,7 @@ fn doc_import(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         ImportFormat::Step => engine.import_step_feature(&String::from_utf8_lossy(&bytes))?,
         ImportFormat::Iges => engine.import_iges_feature(&String::from_utf8_lossy(&bytes))?,
         ImportFormat::Parasolid => engine.import_xt_bytes_feature(&bytes)?,
+        ImportFormat::SolidWorks => engine.import_solidworks_feature(&bytes, &a.name, a.name.to_ascii_lowercase().ends_with(".sldasm"))?,
         ImportFormat::Stl => engine.import_stl_feature(&bytes)?,
         ImportFormat::Obj => engine.import_obj_bytes_feature(&bytes)?,
         ImportFormat::ThreeMf => engine.import_3mf_bytes_feature(&bytes)?,
@@ -471,8 +483,8 @@ fn doc_open_with(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 
 fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: ExportArgs = parse_args(args)?;
-    if a.solids.is_some() && !matches!(a.format, ExportFormat::Step | ExportFormat::Iges) {
-        return Err("`solids` selects what a STEP or IGES export writes; other formats export the whole document".into());
+    if a.solids.is_some() && !matches!(a.format, ExportFormat::Step | ExportFormat::Iges | ExportFormat::Parasolid | ExportFormat::ParasolidBinary) {
+        return Err("`solids` selects what a STEP, IGES or Parasolid export writes; other formats export the whole document".into());
     }
     // Files and the root PRODUCT take the document's DISPLAY name, as the
     // UI's Export does (its name field starts from `model_display_name`). A
@@ -493,6 +505,9 @@ fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let binary: Option<(&str, Vec<u8>, Option<usize>)> = match a.format {
         ExportFormat::Glb => {
             Some(("glb", ctx.app.docs.engine().export_glb_bytes(&document_name)?, None))
+        }
+        ExportFormat::ParasolidBinary => {
+            Some(("parasolid_binary", ctx.app.docs.engine().export_parasolid_selected(&document_name, a.solids.as_deref(), true)?, None))
         }
         ExportFormat::ThreeMf => {
             Some(("3mf", ctx.app.docs.engine().export_3mf_bytes(&document_name)?, None))
@@ -590,6 +605,11 @@ fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         ExportFormat::Stl => ("stl", engine.export_stl_text()?),
         ExportFormat::Obj => ("obj", engine.export_obj_text()?),
         ExportFormat::Iges => ("iges", engine.export_iges_text_selected(&document_name, a.solids.as_deref())?),
+        ExportFormat::Parasolid => (
+            "parasolid",
+            String::from_utf8(engine.export_parasolid_selected(&document_name, a.solids.as_deref(), false)?)
+                .map_err(|e| format!("export Parasolid: {e}"))?,
+        ),
         ExportFormat::Dxf => ("dxf", engine.export_flat_pattern_dxf()?),
         ExportFormat::Svg => ("svg", engine.export_flat_pattern_svg()?),
         ExportFormat::SheetSvg => {
@@ -607,7 +627,7 @@ fn doc_export(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         ExportFormat::KicadNetlist => {
             ("kicad_netlist", crate::panels::fabrication_export::text(engine, crate::panels::fabrication_export::Output::Netlist, &document_name)?)
         }
-        ExportFormat::Glb | ExportFormat::ThreeMf | ExportFormat::SheetPdf | ExportFormat::SheetPdf3d | ExportFormat::Fabrication => {
+        ExportFormat::Glb | ExportFormat::ParasolidBinary | ExportFormat::ThreeMf | ExportFormat::SheetPdf | ExportFormat::SheetPdf3d | ExportFormat::Fabrication => {
             unreachable!("the binary lane returned above")
         }
     };
@@ -702,7 +722,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     app_command!("document", "doc_new", "Open a new document as a tab and make it active. Parts start with a datum (D) and its XY/XZ/YZ reference planes. `title` labels the untitled tab; `activate: false` opens it behind the visible document.", NewArgs, doc_new, Mutate, MUTATE, doc_new_result_schema),
     app_command!("document", "doc_load", "Open a `.nbrep` document (passed as text) in a new tab, run its history and fit the camera. Returns the run report.", LoadArgs, doc_load, Mutate, MUTATE, doc_load_result_schema),
     app_command!("document", "doc_json", "The active document as `.nbrep` (the history request with metadata).", NoArgs, doc_json, Read, READ, doc_json_result_schema),
-    app_command!("document", "doc_import", "Append an Import 3D Model feature from STEP / IGES / Parasolid (text or binary) or STL / OBJ / 3MF bytes (base64). STL, OBJ and 3MF go through mesh reconstruction on the runner; a 3MF is read to the 3MF core specification and its build instances are flattened first.", ImportArgs, doc_import, Mutate, MUTATE, doc_import_result_schema),
+    app_command!("document", "doc_import", "Append an Import 3D Model feature from STEP / IGES / Parasolid (text or binary) / SolidWorks (.sldprt, or a .sldasm whose `name` is its path on disk, its parts beside it) or STL / OBJ / 3MF bytes (base64). STL, OBJ and 3MF go through mesh reconstruction on the runner; a 3MF is read to the 3MF core specification and its build instances are flattened first.", ImportArgs, doc_import, Mutate, MUTATE, doc_import_result_schema),
     app_command!("document", "doc_open_with", "Open a file the way the OS \"Open with\" / a double click hands it to the app, when it is not a model document: a STEP (.step/.stp/.p21), IGES, STL, 3MF, OBJ or KiCad file (`name` with its extension, content as `base64`) goes through the File > Import importer for its extension into a NEW untitled tab labelled with the file's stem (a plain Save then asks for a name). STEP assemblies raise the import-as-assembly choice and meshes the reconstruction preview, as from the menu. Any other extension is refused. Returns the tabs.", OpenWithArgs, doc_open_with, Mutate, MUTATE, schema_of::<Tabs>),
     app_command!("document", "doc_export", "Export the active document: brep (native JSON), step, stl, obj, iges, the sheet-metal flat pattern as dxf / svg, or the open drawing sheet as sheet_svg, all as `text`; glb (binary glTF 2.0 of the display mesh), 3mf (a 3MF package of the display mesh: one object per body, the document's colours as base materials) and EVERY drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order, with the count in `pages`) and the same set with the live 3D model as sheet_pdf_3d (PDF 1.7: a 3D box over every placement marked `threeD` and a last page given over to the model, read back in `model3d`) as `base64`. The two sheet formats also answer `texts`: every text string the file shows, read back from the bytes written. For a document whose PCB board has parts: fabrication (one zip of Gerber X2 layers, Excellon drills, the pick-and-place and parts-BOM CSVs and a README) as `base64`, with its `files` read back from the archive's directory, `readBack` (top/bottom copper flashes, plated/unplated drill hits, the outline's size in mm and the CSVs' row counts, counted from the files) and `warnings`; and the CSVs alone as pick_place_csv (JLCPCB CPL columns) and ecad_bom_csv (JLCPCB BOM columns), as `text` with their data `rows`. For a document with components or harness wires: bom_csv / bom_json, the assembly BOM the File menu exports (part rows carry material, densityGcm3, volumeMm3, massKg and totalMassKg read off each PART; waits for the measurements). For a document whose PCB schematic has parts: kicad_netlist, its KiCad netlist (`.net`, export version \"E\": the parts and every net with its pins, under the Connectivity panel's net names) as `text`.", ExportArgs, doc_export, Read, READ, schema_of::<Exported>),
     app_command!("document", "part_attributes_get", "The active document's own BOM part attributes (`partAttributes`) — the record the toolbar's Part Properties dialog edits, and the one an assembly's BOM reads off this part — with `record` (Mass in kg and Volume in mm³ computed from the document's geometry and density, Density in g/cm³ resolved from the Material when none is typed) and `massProperties`, the reading behind it. Waits for the measurement.", NoArgs, part_attributes_get, Read, READ, super::assembly_output_schema::part_attributes),

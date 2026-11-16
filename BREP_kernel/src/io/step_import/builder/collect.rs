@@ -64,7 +64,7 @@ impl<'a> SolidBuilder<'a> {
         Ok(id)
     }
 
-    fn edge(&mut self, edge_ref: usize) -> Result<u64, String> {
+    pub(super) fn edge(&mut self, edge_ref: usize) -> Result<u64, String> {
         if let Some(id) = self.edge_of_ref.get(&edge_ref) {
             return Ok(*id);
         }

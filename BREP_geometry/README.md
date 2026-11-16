@@ -1,7 +1,7 @@
 # BREP_geometry
 
 `BREP_geometry` holds the geometry layer of the BREP kernel: everything below topology. Its Rust library
-target is `brep_geometry`; this is version **0.22.0**.
+target is `brep_geometry`; this is version **0.23.0**.
 
 It is one of the implementation crates the kernel is built from. Applications
 should depend on [`BREP_kernel`](https://crates.io/crates/BREP_kernel), which

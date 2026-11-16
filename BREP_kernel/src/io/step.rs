@@ -448,16 +448,16 @@ fn polar_meridian_sphere(
 /// `radius` about `axis`, starting at angle 0 on `x_axis` and travelling
 /// counterclockwise through `sweep` — exactly the CIRCLE parameterization the
 /// importer trims between the edge's vertices.
-struct CircularArc {
-    center: Vec3,
-    axis: Vec3,
-    x_axis: Vec3,
+pub(crate) struct CircularArc {
+    pub(crate) center: Vec3,
+    pub(crate) axis: Vec3,
+    pub(crate) x_axis: Vec3,
     /// axis × x_axis — the second placement axis a STEP reader derives, so the
     /// emitted parameterization is C(a) = center + r(cos a·x̂ + sin a·ŷ).
-    y_axis: Vec3,
-    radius: f64,
+    pub(crate) y_axis: Vec3,
+    pub(crate) radius: f64,
     /// Total swept angle: the emitted entity's parameter range is [0, sweep].
-    sweep: f64,
+    pub(crate) sweep: f64,
     /// Rational-quadratic span count of the kernel arc this was recognized
     /// from — the bridge from the emitted ANGLE back to the kernel's own
     /// parameter, which a fitted pcurve on a B-spline carrier needs.
@@ -499,7 +499,7 @@ fn curves_match(a: &NurbsCurve, b: &NurbsCurve, scale: f64) -> bool {
 /// curve points, rebuild it with `make_arc`, and demand the identical net.
 /// Split subranges of a circle (whose knots are no longer the pristine
 /// make_arc pattern) are rejected and honestly stay NURBS.
-fn recognize_circular_arc(curve: &NurbsCurve) -> Option<CircularArc> {
+pub(crate) fn recognize_circular_arc(curve: &NurbsCurve) -> Option<CircularArc> {
     if curve.degree != 2
         || curve.control_points.len() < 3
         || curve.control_points.len() % 2 == 0

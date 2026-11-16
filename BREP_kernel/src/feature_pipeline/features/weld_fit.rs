@@ -333,7 +333,7 @@ fn with_face<T>(handle: u32, face_id: u64, f: impl FnOnce(&FaceRecord) -> Result
     })
 }
 
-fn face_class(face: &FaceRecord, point: Vec3, tolerance: f64) -> Result<Option<PolygonClass>, String> {
+pub(super) fn face_class(face: &FaceRecord, point: Vec3, tolerance: f64) -> Result<Option<PolygonClass>, String> {
     let projection = crate::project_point_to_surface(&face.surface, point)?;
     if projection.distance > tolerance {
         return Ok(None);
@@ -492,6 +492,43 @@ fn across_gap(scene: &SceneMap, seam: &Seam, name: &str, widest: f64) -> Result<
 /// Whether the named face stands a bridgeable root gap off a straight seam.
 pub(super) fn bridges(scene: &SceneMap, seam: &Seam, name: &str, legs: [f64; 2]) -> Result<bool, String> {
     Ok(across_gap(scene, seam, name, legs[0].max(legs[1]))?.is_some())
+}
+
+/// Whether the named face, standing a root gap off this run, lies there:
+/// the foot of the run's middle on its plane is on the face or within
+/// `widest` of its boundary (a face elsewhere in that plane is not this
+/// run's joint face).
+fn bridges_here(scene: &SceneMap, seam: &Seam, name: &str, legs: [f64; 2]) -> Result<bool, String> {
+    if !bridges(scene, seam, name, legs)? {
+        return Ok(false);
+    }
+    let widest = legs[0].max(legs[1]);
+    let tolerance = seam.tolerance();
+    let middle = seam.at(0.5);
+    for face in scene.resolve_face_group(name) {
+        let near = crate::with_registered_solid_str(face.handle, |body| {
+            let Some(record) = body.shells.iter().flat_map(|shell| &shell.faces).find(|f| f.id == face.face_id) else { return Ok(false) };
+            let Ok((on, normal)) = crate::fillet::face_plane_normal(record, middle) else { return Ok(false) };
+            let foot = middle.sub(normal.scale(middle.sub(on).dot(normal)));
+            if matches!(face_class(record, foot, tolerance)?, Some(PolygonClass::Inside | PolygonClass::Boundary)) {
+                return Ok(true);
+            }
+            for coedge in record.loops.iter().flat_map(|l| &l.coedges) {
+                let Some(edge) = body.edges.iter().find(|e| e.id == coedge.edge_id) else { continue };
+                for k in 0..=32 {
+                    let point = edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * k as f64 / 32.0)?;
+                    if point.sub(foot).length() <= widest {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        })?;
+        if near {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The section's root for a pair: the offset from the seam to it and how far
@@ -661,25 +698,44 @@ pub(super) fn fit(scene: &SceneMap, seam: &Seam, explicit: &[String], exclude: &
     Ok(Ok(Fit { faces: [first, second], legs: legs_dir, root, skip }))
 }
 
-/// The far side of a fitted joint on one run: the mirror corner across the
-/// member standing on the joint (a T joint's web, a tube's wall). One joint
-/// face is the member's; the nearest face of the member's body straight
-/// across it (its outward normal opposite, at the member's thickness) meets
-/// the other, through face along the run carried across that thickness.
-/// Returned as that run and its fit; leg 1 stays on the through face when it
-/// is there on the near side, else on the member's far face. Each joint face
-/// is tried as the member; exactly one may give a far corner.
-pub(super) fn other_side(scene: &SceneMap, seam: &Seam, near: &Fit, exclude: &str, legs: [f64; 2]) -> Result<Result<(Seam, Fit), NoFit>, String> {
-    if near.faces.iter().any(|face| face.gap.is_some()) {
-        return Ok(Err("the joint has a root gap; weld the far side's seam as its own weld".into()));
-    }
+// The far side of a fitted joint on one run: the mirror corner across the
+// member standing on the joint (a T joint's web, a tube's wall). One joint
+// face is the member's; the nearest face of the member's body straight
+// across it (its outward normal opposite, at the member's thickness) meets
+// the other, through face along the run carried across that thickness.
+// Leg 1 stays on the through face when it is there on the near side, else
+// on the member's far face. [`Chain::far_side`] joins the far runs of a
+// chain.
+
+/// A run's far side before it is fitted: the seam carried across the member
+/// (`member` indexes the near fit's faces) and the member's far face.
+#[derive(Clone, Debug)]
+pub(super) struct FarRun {
+    pub seam: Seam,
+    member: usize,
+    far_id: u64,
+}
+
+/// Find the far run of one fitted run: for each joint face as the member,
+/// the nearest face of its body straight across it (outward normal opposite,
+/// at the member's thickness) carries the seam carried across that
+/// thickness, and the through face holds that far seam (on it, or a root gap
+/// off it). Exactly one joint face may be the member.
+pub(super) fn far_run(scene: &SceneMap, seam: &Seam, near: &Fit, legs: [f64; 2]) -> Result<Result<FarRun, NoFit>, String> {
     let tolerance = seam.tolerance();
-    let mut found: Vec<(Seam, Fit)> = Vec::new();
+    let mut found: Vec<FarRun> = Vec::new();
     for member in 0..2 {
         let face = &near.faces[member];
         let through = &near.faces[1 - member];
-        // A point on the member's face halfway along the seam and up its leg.
-        let point = seam.at(0.5).add(seam.carry(0.5, near.root.add(near.legs[member].scale(legs[member] * 0.5))));
+        // The member carries the seam; a face a root gap off it is the
+        // through face (the plate the member stands the gap above).
+        if face.gap.is_some() {
+            continue;
+        }
+        // A point on the member's face halfway along the seam, halfway up the
+        // part of its leg the face carries (past any root gap it crosses).
+        let up = near.skip[member] + (legs[member] - near.skip[member]) * 0.5;
+        let point = seam.at(0.5).add(seam.carry(0.5, near.root.add(near.legs[member].scale(up))));
         let inward = seam.carry(0.5, face.normal).scale(-1.0);
         let far = crate::with_registered_solid_str(face.handle, |solid| {
             let mut best: Option<(f64, u64)> = None;
@@ -719,13 +775,15 @@ pub(super) fn other_side(scene: &SceneMap, seam: &Seam, near: &Fit, exclude: &st
                 Seam { start, tangent: seam.tangent, length: radius * angle, run: seam.run, owner: None }
             }
         };
-        let joints = candidates(scene, &far_seam, exclude)?;
-        let Some(far_face) = joints.iter().find(|joint| joint.handle == face.handle && joint.face_id == far_id) else { continue };
-        let Some(through_face) = joints.iter().find(|joint| same(joint, through)) else { continue };
-        let picks = if member == 0 { [far_face.name.clone(), through_face.name.clone()] } else { [through_face.name.clone(), far_face.name.clone()] };
-        match fit(scene, &far_seam, &picks, exclude, legs, None)? {
-            Ok(joint) => found.push((far_seam, joint)),
-            Err(_) => continue,
+        // The through face holds the far seam's middle: on it, or (a gapped
+        // through face) the root gap off it.
+        let holds = if through.gap.is_some() {
+            across_gap(scene, &far_seam, &through.name, legs[0].max(legs[1]))?.is_some()
+        } else {
+            runs_onto(through, far_seam.at(0.5), tolerance)?
+        };
+        if holds {
+            found.push(FarRun { seam: far_seam, member, far_id });
         }
     }
     Ok(match found.len() {
@@ -733,6 +791,29 @@ pub(super) fn other_side(scene: &SceneMap, seam: &Seam, near: &Fit, exclude: &st
         1 => Ok(found.pop().expect("one far side")),
         _ => Err("both joint faces belong to members that continue past the joint; weld the far side's seam as its own weld".into()),
     })
+}
+
+/// Fit a far run (its seam as found, or trimmed to a chain's corners): the
+/// member's far face and the through face, in the near fit's leg order.
+pub(super) fn fit_far(scene: &SceneMap, far: &FarRun, near: &Fit, exclude: &str, legs: [f64; 2]) -> Result<Result<Fit, NoFit>, String> {
+    let face = &near.faces[far.member];
+    let through = &near.faces[1 - far.member];
+    let joints = candidates(scene, &far.seam, exclude)?;
+    let Some(far_face) = joints.iter().find(|joint| joint.handle == face.handle && joint.face_id == far.far_id) else {
+        return Ok(Err("the member's far face does not carry the far side's seam".into()));
+    };
+    // A through face across a root gap is picked by name: the fit finds it
+    // the gap off the far seam too.
+    let through_name = if through.gap.is_some() {
+        through.name.clone()
+    } else {
+        let Some(through_face) = joints.iter().find(|joint| same(joint, through)) else {
+            return Ok(Err(format!("joint face {} does not carry the far side's seam", through.name)));
+        };
+        through_face.name.clone()
+    };
+    let picks = if far.member == 0 { [far_face.name.clone(), through_name] } else { [through_name, far_face.name.clone()] };
+    fit(scene, &far.seam, &picks, exclude, legs, None)
 }
 
 /// Does the named face carry the whole seam (on or inside its trim)?
@@ -876,7 +957,9 @@ impl Chain {
             }
             let mut names = Vec::new();
             for name in explicit {
-                if carries(scene, run, name)? {
+                // A picked face joins a run it carries, or one it stands a
+                // root gap off (a straight run, the gap narrower than the legs).
+                if carries(scene, run, name)? || bridges_here(scene, run, name, legs)? {
                     names.push(name.clone());
                 }
             }
@@ -916,6 +999,132 @@ impl Chain {
             }
         }
         Ok(Ok(fits))
+    }
+
+    /// The mitre cuts moved onto the bead's root: where a section's root
+    /// stands off the seam (across a root gap), the two runs' root lines meet
+    /// past the seam's corner, and the mitre plane passes through that point
+    /// (its normal, the bisector, unchanged). `roots[k]` is run `k`'s root
+    /// offset at its start. Refused where the root lines do not meet.
+    pub(super) fn rooted(&self, trims: &[Trim], roots: &[Vec3]) -> Result<Vec<Trim>, NoFit> {
+        let mut trims = trims.to_vec();
+        for (a, b, corner) in &self.corners {
+            let Some((point, normal)) = corner else { continue };
+            let (ra, rb) = (self.runs[*a].carry(1.0, roots[*a]), roots[*b]);
+            if ra.length() == 0.0 && rb.length() == 0.0 {
+                continue;
+            }
+            let tolerance = self.runs[*a].tolerance().max(self.runs[*b].tolerance()) * 10.0;
+            let Some(meet) = meet(point.add(ra), self.runs[*a].end_tangent(), point.add(rb), self.runs[*b].tangent, tolerance) else {
+                return Err(format!("the bead's root steps where segments {} and {} meet (a root gap on one of them only, or of different widths)", a + 1, b + 1));
+            };
+            let moved = meet.sub(*point).length();
+            for (run, end) in [(*a, 1), (*b, 0)] {
+                if let Some((_, _, extend)) = trims[run].ends[end] {
+                    trims[run].ends[end] = Some((meet, *normal, extend + 2.0 * moved));
+                }
+            }
+        }
+        Ok(trims)
+    }
+
+    /// The far side of every run (its mirror corner across the member
+    /// standing on the joint), joined into the far seam's chain: the far
+    /// runs of a mitred corner trimmed or extended to where they meet, those
+    /// of a tangent join meeting end to start. Returned with each far run's fit.
+    pub(super) fn far_side(&self, scene: &SceneMap, fits: &[Fit], exclude: &str, legs: [f64; 2]) -> Result<Result<(Chain, Vec<Fit>), NoFit>, String> {
+        let mut fars: Vec<FarRun> = Vec::new();
+        for (k, run) in self.runs.iter().enumerate() {
+            match far_run(scene, run, &fits[k], legs)? {
+                Ok(far) => fars.push(far),
+                Err(reason) => return Ok(Err(format!("{}{reason}", self.label(k)))),
+            }
+        }
+        let runs: Vec<Seam> = fars.iter().map(|far| far.seam.clone()).collect();
+        let runs = match self.rejoined(runs) {
+            Some(runs) => runs,
+            None => return Ok(Err("the far side's segments do not meet again at the member's corners".into())),
+        };
+        let mut far_fits = Vec::new();
+        for (k, (far, run)) in fars.iter_mut().zip(runs.iter()).enumerate() {
+            far.seam = run.clone();
+            match fit_far(scene, far, &fits[k], exclude, legs)? {
+                Ok(joint) => far_fits.push(joint),
+                Err(reason) => return Ok(Err(format!("{}no far-side corner: {reason}", self.label(k)))),
+            }
+        }
+        Ok(Chain::new(runs).map(|chain| (chain, far_fits)))
+    }
+
+    /// Runs moved off this chain's (one per run, each straight or circular
+    /// as before) joined again at this chain's joins: the straight runs of a
+    /// mitred corner trimmed or extended to where their lines meet (every
+    /// corner's point found first, so a short run between two corners is
+    /// measured between both), and tangent joins checked to run on. `None`
+    /// where moved lines no longer meet or a run is left with no length.
+    fn rejoined(&self, mut runs: Vec<Seam>) -> Option<Vec<Seam>> {
+        let count = runs.len();
+        let (mut starts, mut ends): (Vec<Option<Vec3>>, Vec<Option<Vec3>>) = (vec![None; count], vec![None; count]);
+        for (a, b, corner) in &self.corners {
+            let tolerance = runs[*a].tolerance().max(runs[*b].tolerance()) * 10.0;
+            match corner {
+                None => {
+                    if runs[*a].at(1.0).sub(runs[*b].start).length() > tolerance {
+                        return None;
+                    }
+                }
+                Some(_) => {
+                    let point = meet(runs[*a].start, runs[*a].tangent, runs[*b].start, runs[*b].tangent, tolerance)?;
+                    ends[*a] = Some(point);
+                    starts[*b] = Some(point);
+                }
+            }
+        }
+        for (k, run) in runs.iter_mut().enumerate() {
+            if starts[k].is_none() && ends[k].is_none() {
+                continue;
+            }
+            let start = starts[k].unwrap_or(run.start);
+            let end = ends[k].unwrap_or_else(|| run.at(1.0));
+            let length = end.sub(start).dot(run.tangent);
+            if length <= run.tolerance() * 10.0 {
+                return None;
+            }
+            *run = Seam::line(start, run.tangent, length, run.owner.clone());
+        }
+        Some(runs)
+    }
+
+    /// The chain moved `distance` across itself in the plane square to
+    /// `normal` (to the left of each run seen down `normal`'s tip; a negative
+    /// distance moves it right): each straight run shifted, each arc made the
+    /// concentric arc, the straight runs of a mitred corner trimmed or
+    /// extended to where they meet. `None` where a run vanishes (an arc
+    /// moved onto its centre, a run shorter than the move at a corner) or the
+    /// moved runs no longer meet.
+    pub(super) fn offset(&self, normal: Vec3, distance: f64) -> Result<Option<Chain>, String> {
+        let mut runs = Vec::new();
+        for run in &self.runs {
+            let left = normal.cross(run.tangent).normalized()?.scale(distance);
+            let start = run.start.add(left);
+            runs.push(match run.run {
+                Run::Line => Seam::line(start, run.tangent, run.length, None),
+                Run::Arc { centre, axis, angle } => {
+                    // The move is radial: towards the centre it shrinks the
+                    // arc, and at or past the centre the arc is gone.
+                    let radial = run.start.sub(centre);
+                    let radial = radial.sub(axis.scale(radial.dot(axis)));
+                    let radius = radial.length();
+                    let moved = radius + left.dot(radial.scale(1.0 / radius));
+                    if moved <= run.tolerance() {
+                        return Ok(None);
+                    }
+                    Seam { start, tangent: run.tangent, length: moved * angle, run: run.run, owner: None }
+                }
+            });
+        }
+        let Some(runs) = self.rejoined(runs) else { return Ok(None) };
+        Ok(Chain::new(runs).ok())
     }
 
     /// The seam's length along all its runs.
@@ -982,6 +1191,23 @@ impl Chain {
         }
         Ok(Ok(()))
     }
+}
+
+/// Where the straight lines through `a` along `da` and through `b` along
+/// `db` (unit directions) meet, within `tolerance`: `None` when they pass
+/// apart or run parallel.
+fn meet(a: Vec3, da: Vec3, b: Vec3, db: Vec3, tolerance: f64) -> Option<Vec3> {
+    let cos = da.dot(db);
+    let denominator = 1.0 - cos * cos;
+    if denominator <= 1e-12 {
+        return (a.sub(b).cross(da).length() <= tolerance).then_some(b);
+    }
+    let w = a.sub(b);
+    let (d, e) = (da.dot(w), db.dot(w));
+    let s = (cos * e - d) / denominator;
+    let t = (e - cos * d) / denominator;
+    let (p, q) = (a.add(da.scale(s)), b.add(db.scale(t)));
+    (p.sub(q).length() <= tolerance).then(|| p.add(q).scale(0.5))
 }
 
 /// One piece of a bead: a run (or a stretch of one), the section at its
@@ -1193,8 +1419,45 @@ pub(super) fn support_depth(_seam: &Seam) -> f64 {
 /// The seam two picked faces meet along: the one straight or circular edge of either face
 /// that the other face carries (a concave edge both faces bound, or a plate's
 /// edge standing on the other plate's face). Returned by its scene edge name.
-pub(super) fn seam_between(scene: &SceneMap, faces: [&str; 2]) -> Result<Result<String, String>, String> {
-    let mut found: Vec<(String, Vec3, Vec3, Vec3)> = Vec::new();
+///
+/// Where no such edge exists, a straight edge of either face that the other
+/// face stands a root gap off (parallel to it, nearer than the widest of
+/// `legs`) is the seam where the two faces fit a bead's corner across the
+/// gap: a closed sheet-metal corner, a plate standing a gap above another.
+/// Edges whose beads share one root line (the edge of either face at the
+/// same corner, or collinear pieces of one edge) are one seam: the longest.
+pub(super) fn seam_between(scene: &SceneMap, faces: [&str; 2], exclude: &str, legs: [f64; 2]) -> Result<Result<String, String>, String> {
+    let mut found = edges_between(scene, faces, None)?;
+    if found.is_empty() {
+        let mut roots: Vec<(Vec3, Vec3)> = Vec::new();
+        for candidate in edges_between(scene, faces, Some(legs[0].max(legs[1])))? {
+            let seam = &candidate.4;
+            let picks = [faces[0].to_string(), faces[1].to_string()];
+            let Ok(joint) = fit(scene, seam, &picks, exclude, legs, None)? else { continue };
+            let (point, tolerance) = (seam.start.add(joint.root), seam.tolerance() * 10.0);
+            let shared = roots.iter().position(|(other, along)| along.cross(seam.tangent).length() <= 1e-9
+                && point.sub(*other).cross(*along).length() <= tolerance);
+            match shared {
+                None => {
+                    roots.push((point, seam.tangent));
+                    found.push(candidate);
+                }
+                Some(k) if seam.length > found[k].4.length => found[k] = candidate,
+                Some(_) => {}
+            }
+        }
+    }
+    Ok(match found.as_slice() {
+        [(name, _, _, _, _)] => Ok(name.clone()),
+        [] => Err(format!("faces '{}' and '{}' do not meet along a straight or circular edge, nor stand a root gap narrower than the legs off one; select the seam edge", faces[0], faces[1])),
+        _ => Err(format!("faces '{}' and '{}' meet along several edges; select the seam edge", faces[0], faces[1])),
+    })
+}
+
+/// The scene edges of either face the other carries (`gap` None), or stands
+/// a root gap narrower than `gap` off: name, ends and middle.
+fn edges_between(scene: &SceneMap, faces: [&str; 2], gap: Option<f64>) -> Result<Vec<(String, Vec3, Vec3, Vec3, Seam)>, String> {
+    let mut found: Vec<(String, Vec3, Vec3, Vec3, Seam)> = Vec::new();
     for (own, other) in [(faces[0], faces[1]), (faces[1], faces[0])] {
         for face in scene.resolve_face_group(own) {
             let runs: Vec<(u64, NurbsCurve)> = crate::with_registered_solid_str(face.handle, |solid| {
@@ -1212,7 +1475,11 @@ pub(super) fn seam_between(scene: &SceneMap, faces: [&str; 2]) -> Result<Result<
                 let Ok(Some(seam)) = Seam::from_curve(&curve, None) else { continue };
                 if seam.length <= seam.tolerance() { continue; }
                 let (start, end, middle) = (seam.at(0.0), seam.at(1.0), seam.at(0.5));
-                if !carries(scene, &seam, other)? { continue; }
+                let meets = match gap {
+                    None => carries(scene, &seam, other)?,
+                    Some(widest) => across_gap(scene, &seam, other, widest)?.is_some(),
+                };
+                if !meets { continue; }
                 let mut names: Vec<&String> = scene.edges.iter()
                     .filter(|(_, edge)| edge.handle == face.handle && edge.edge_id == edge_id)
                     .map(|(name, _)| name).collect();
@@ -1221,18 +1488,14 @@ pub(super) fn seam_between(scene: &SceneMap, faces: [&str; 2]) -> Result<Result<
                 let tolerance = seam.tolerance();
                 // The same edge seen from both faces: same ends and middle (two
                 // half circles share their ends, not their middles).
-                let same = |(_, a, b, m): &(String, Vec3, Vec3, Vec3)| m.sub(middle).length() < tolerance
+                let same = |(_, a, b, m, _): &(String, Vec3, Vec3, Vec3, Seam)| m.sub(middle).length() < tolerance
                     && ((a.sub(start).length() < tolerance && b.sub(end).length() < tolerance)
                         || (a.sub(end).length() < tolerance && b.sub(start).length() < tolerance));
                 if !found.iter().any(same) {
-                    found.push(((*name).clone(), start, end, middle));
+                    found.push(((*name).clone(), start, end, middle, seam));
                 }
             }
         }
     }
-    Ok(match found.as_slice() {
-        [(name, _, _, _)] => Ok(name.clone()),
-        [] => Err(format!("faces '{}' and '{}' do not meet along a straight or circular edge; select the seam edge", faces[0], faces[1])),
-        _ => Err(format!("faces '{}' and '{}' meet along several edges; select the seam edge", faces[0], faces[1])),
-    })
+    Ok(found)
 }

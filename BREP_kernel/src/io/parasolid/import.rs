@@ -46,17 +46,34 @@ pub fn import_parasolid(text: &str) -> Result<Vec<BrepSolid>, String> {
 /// [`import_parasolid`] with names, colours and the import's diagnostics.
 pub fn import_parasolid_report(text: &str) -> Result<ParasolidImportReport, String> {
     let file = parse_xt_text(text).map_err(|e| format!("parasolid_import: {e}"))?;
-    import_file(&file)
+    import_file(&file, true)
+}
+
+/// [`import_parasolid_report`] for a caller that drops the report's
+/// diagnostics (the IMPORT3D feature): under `BREP_IMPORT_LEAN` the STEP
+/// build skips its trim readings. The bodies are the same.
+pub fn import_parasolid_bodies(text: &str) -> Result<ParasolidImportReport, String> {
+    let file = parse_xt_text(text).map_err(|e| format!("parasolid_import: {e}"))?;
+    import_file(&file, false)
+}
+
+/// [`import_parasolid_bytes_report`] for a caller that drops the report's
+/// diagnostics, as [`import_parasolid_bodies`].
+pub fn import_parasolid_bytes_bodies(bytes: &[u8]) -> Result<ParasolidImportReport, String> {
+    let file = parse_xt(bytes).map_err(|e| format!("parasolid_import: {e}"))?;
+    import_file(&file, false)
 }
 
 /// [`import_parasolid_report`] from a file's bytes: text or binary (`.x_b`),
 /// a part or a partition (the form SolidWorks embeds its bodies in).
 pub fn import_parasolid_bytes_report(bytes: &[u8]) -> Result<ParasolidImportReport, String> {
     let file = parse_xt(bytes).map_err(|e| format!("parasolid_import: {e}"))?;
-    import_file(&file)
+    import_file(&file, true)
 }
 
-fn import_file(file: &XtFile) -> Result<ParasolidImportReport, String> {
+/// `readings`: whether the caller reads the report's trim-reading
+/// diagnostics; when it does not, `import_step_report_dropping_readings`.
+fn import_file(file: &XtFile, readings: bool) -> Result<ParasolidImportReport, String> {
     let bodies = bodies(file).map_err(|e| format!("parasolid_import: {e}"))?;
     let mut report = ParasolidImportReport {
         solids: Vec::new(),
@@ -101,38 +118,53 @@ fn import_file(file: &XtFile) -> Result<ParasolidImportReport, String> {
                 _ => format!("body {ordinal}"),
             };
             let translated = body_to_step(file, body, ordinal - 1).map_err(|e| format!("parasolid_import: {}: {e}", what()))?;
-            // A sheet body (body type 3) is written as open shells, which come
-            // in as sheet bodies; a solid's must close.
-            let sheet = body.int("body_type") == Some(3);
-            let step = if sheet {
-                crate::step_import::import_step_report_with_sheets(&translated.step)
+            if body.int("body_type") == Some(2) {
+                // A wire body (body type 2): its wireframe, one wire body.
+                let wires = crate::step_import::import_step_wires(&translated.step)
+                    .map_err(|e| format!("parasolid_import: {}: {e}", what()))?;
+                if wires.is_empty() {
+                    return Err(format!("parasolid_import: {}: the wire body produced no wire", what()));
+                }
+                report.fitted_curves += translated.fitted_curves;
+                report.unverified_curves += translated.unverified_curves;
+                let appearances = vec![Vec::new(); wires.len()];
+                imported.insert(body.index, Imported { solids: wires, appearances, name: translated.name, color: translated.color });
             } else {
-                crate::import_step_report(&translated.step)
+                // A sheet body (body type 3) is written as open shells, which come
+                // in as sheet bodies; a solid's must close.
+                let sheet = body.int("body_type") == Some(3);
+                let step = if !readings {
+                    crate::step_import::import_step_report_dropping_readings(&translated.step, sheet)
+                } else if sheet {
+                    crate::step_import::import_step_report_with_sheets(&translated.step)
+                } else {
+                    crate::import_step_report(&translated.step)
+                }
+                .map_err(|e| format!("parasolid_import: {}: {e}", what()))?;
+                if step.failed > 0 {
+                    return Err(format!(
+                        "parasolid_import: {}: {}",
+                        what(),
+                        step.first_error.as_deref().unwrap_or("the body did not import")
+                    ));
+                }
+                if step.sheets_skipped > 0 && !step.solids.is_empty() {
+                    // Part of the body did not come in: refuse it whole.
+                    return Err(format!(
+                        "parasolid_import: {}: {} of its shells are open sheets, which do not bound a solid",
+                        what(),
+                        step.sheets_skipped
+                    ));
+                }
+                if step.solids.is_empty() {
+                    return Err(format!("parasolid_import: {}: the body produced no solid", what()));
+                }
+                report.fitted_curves += translated.fitted_curves;
+                report.unverified_curves += translated.unverified_curves;
+                merge_diagnostics(&mut report.diagnostics, step.diagnostics);
+                let appearances = (0..step.solids.len()).map(|j| step.appearances.get(j).map(|a| a.faces.clone()).unwrap_or_default()).collect();
+                imported.insert(body.index, Imported { solids: step.solids, appearances, name: translated.name, color: translated.color });
             }
-            .map_err(|e| format!("parasolid_import: {}: {e}", what()))?;
-            if step.failed > 0 {
-                return Err(format!(
-                    "parasolid_import: {}: {}",
-                    what(),
-                    step.first_error.as_deref().unwrap_or("the body did not import")
-                ));
-            }
-            if step.sheets_skipped > 0 && !step.solids.is_empty() {
-                // Part of the body did not come in: refuse it whole.
-                return Err(format!(
-                    "parasolid_import: {}: {} of its shells are open sheets, which do not bound a solid",
-                    what(),
-                    step.sheets_skipped
-                ));
-            }
-            if step.solids.is_empty() {
-                return Err(format!("parasolid_import: {}: the body produced no solid", what()));
-            }
-            report.fitted_curves += translated.fitted_curves;
-            report.unverified_curves += translated.unverified_curves;
-            merge_diagnostics(&mut report.diagnostics, step.diagnostics);
-            let appearances = (0..step.solids.len()).map(|j| step.appearances.get(j).map(|a| a.faces.clone()).unwrap_or_default()).collect();
-            imported.insert(body.index, Imported { solids: step.solids, appearances, name: translated.name, color: translated.color });
         }
         let entry = &imported[&body.index];
         let count = entry.solids.len() * occurrences[&body.index];

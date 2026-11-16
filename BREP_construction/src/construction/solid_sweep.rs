@@ -340,7 +340,8 @@ fn apex_tip_on() -> bool {
 /// sections a turn and the cubic through every sample): a carried screw
 /// sweep's walls in few spans. Along the screw, the carry is of degree 2·`LEAN_CARRY_ORDER` + 1
 /// through that many derivatives, `LEAN_CARRY_PER_TURN` spans a turn, instead
-/// of the quintic through 48. Across it, each boundary piece is a quintic
+/// of the quintic through 48 (over a crest, 12 spans a turn of degree
+/// 2·`LEAN_CREST_CARRY_ORDER` + 1). Across it, each boundary piece is a quintic
 /// fitted to its exact envelope samples and checked against the exact envelope
 /// between them (`lean_fit_piece`), instead of the cubic through all of them.
 /// Off, a wall has some 100 by 84 spans: a reader that integrates over its
@@ -356,6 +357,25 @@ const LEAN_CARRY_ORDER: usize = 4;
 
 /// Spans of the lean carry a turn.
 const LEAN_CARRY_PER_TURN: f64 = 8.0;
+
+/// Derivatives the lean carry matches over a crest, where a thread's walls
+/// keep 12 spans a turn: degree 7, whose error there is r·(h/2)^8/8! =
+/// 5.5e-10·r. Every reading of a wall (its sections, classification, the
+/// mass check) costs about half what it does at degree 9, and the degree-9
+/// carry gains nothing over a crest: on a fine thread whose crests are sharp
+/// the cut took twice as long at degree 9, its volume and area no nearer
+/// their closed forms (within 6.5e-10 and 7.5e-10 of them, against 3.2e-10
+/// and 2e-11 at degree 7).
+const LEAN_CREST_CARRY_ORDER: usize = 3;
+
+/// Derivatives the lean carry matches on `engine`'s walls.
+fn lean_carry_order(engine: &Engine) -> usize {
+    if engine.crest_gap {
+        LEAN_CREST_CARRY_ORDER
+    } else {
+        LEAN_CARRY_ORDER
+    }
+}
 
 /// How near (of the scale) the exact envelope a lean boundary piece passes at
 /// the mid-points between its samples, where the cubic it replaces passes
@@ -2192,7 +2212,7 @@ pub fn sweep_solid_within(
 /// parameters are the loft's, so the trims stay as they are.
 fn carry_along_screw(body: &mut BrepSolid, engine: &Engine, c: f64, span: f64, segments: usize) -> Result<(), KernelRefusal> {
     if lean_walls_on() {
-        return carry_along_screw_to_order(body, engine, c, span, segments, LEAN_CARRY_ORDER);
+        return carry_along_screw_to_order(body, engine, c, span, segments, lean_carry_order(engine));
     }
     let origin = engine.clip.axis_origin;
     let ez = engine.frame.ez;
@@ -2434,9 +2454,9 @@ fn carry_along_screw_to_order(body: &mut BrepSolid, engine: &Engine, c: f64, spa
 }
 
 /// Control points a carried wall has along the screw, in `segments` spans.
-fn carried_columns(segments: usize) -> usize {
+fn carried_columns(engine: &Engine, segments: usize) -> usize {
     if lean_walls_on() {
-        (LEAN_CARRY_ORDER + 1) * (segments + 1)
+        (lean_carry_order(engine) + 1) * (segments + 1)
     } else {
         3 * segments + 3
     }
@@ -2502,7 +2522,7 @@ fn stack_screw_rows(
         Some(&below) if copy > 0 => below + stride * (copy as u64 - 1),
         _ => id + stride * copy as u64,
     };
-    let is_cap = |face: &crate::FaceRecord| face.surface.control_points[0].len() != carried_columns(segments);
+    let is_cap = |face: &crate::FaceRecord| face.surface.control_points[0].len() != carried_columns(engine, segments);
     let cap_level = |face: &crate::FaceRecord, level: f64| {
         face.loops.iter().flat_map(|l| &l.coedges).all(|coedge| {
             row.edges.iter().find(|edge| edge.id == coedge.edge_id).is_some_and(|edge| in_level(edge, level))

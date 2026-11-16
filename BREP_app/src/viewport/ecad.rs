@@ -622,6 +622,7 @@ fn sheet_words(editor: &brep_ecad_egui::Editor, key: &str) -> String {
             None => format!("label {id}"),
         },
         "junction" => "a junction".to_string(),
+        "handle" => handle_words(id),
         _ => key.to_string(),
     }
 }
@@ -668,7 +669,32 @@ fn item_words(target: Target, editors: &Editors, key: &str, history: &History) -
     if let Some(index) = key.strip_prefix("graphic:") {
         return format!("drawn item {index}");
     }
+    if let Some(handle) = key.strip_prefix("handle:") {
+        return handle_words(handle);
+    }
     key.to_string()
+}
+
+/// A grab handle of the selection (`handle:<name>`) in words.
+fn handle_words(handle: &str) -> String {
+    let place = match handle {
+        "nw" => "top-left corner",
+        "n" => "top edge",
+        "ne" => "top-right corner",
+        "e" => "right edge",
+        "se" => "bottom-right corner",
+        "s" => "bottom edge",
+        "sw" => "bottom-left corner",
+        "w" => "left edge",
+        "radius" => "radius",
+        "rounding" => "corner radius",
+        "taper" => "taper",
+        other => match other.strip_prefix("vertex:") {
+            Some(i) => return format!("the selection's corner {i} handle"),
+            None => other,
+        },
+    };
+    format!("the selection's {place} handle")
 }
 
 /// Where `target`'s editor is looking, as `(pan, zoom)`.
@@ -1333,7 +1359,7 @@ fn graphic_json(g: &brep_ecad_core::graphic::LayerGraphic) -> serde_json::Value 
     item
 }
 /// What `__brepEcad` and the `ecad_state` command say about an editor.
-pub(crate) const STATE_DOC: &str = "the eCAD editor drawn in the central tile: target (diagram|pcb|symbol|pads, null when none); inStep, true when the editor's document is exactly its block of the document (or the empty document when there is no block) — false after ANY edit that did not reach the document or any document change that did not reach the editor; the history revision; pan [x,y] in points and zoom in points per micrometre; why its block is not being edited (unreadable), and while it is not, the parts at fault by name (offender, null when the host cannot name them) and the unreadable card's one-click repair (repair, its button's words, null when there is none); for the sheet editors the view, tool, selection, components, wires (connections, by terminal name), labels, nets (the Connectivity panel's, each net's name and pins), erc (the Connectivity panel's electrical rule check: run, whether its button has been pressed; findings, each with severity, kind, message, at in micrometres, pins and the fix it offers; noConnects and powerFlags, the pins its fixes marked) and board (counts; each placement's pads with their centres on the board; each track's net, layer, width and points in micrometres as trackPaths; each copper zone as zones — its net, layer, outline, and its fill's pieces, holes, vertices, area in mm² and, once filled in this session, the spokes each relieved pad got — with zonesStale, true when copper has changed since the fill on show was made, and selectedZone, the selected zone's index or null; drawings, what is drawn on the board itself on F/B.SilkS or F/B.Fab, each reported as a Pads drawn item is (layer, kind, width, filled, points, radius/text/height), and selectedDrawing, the selected one's index or null; cutouts, the holes milled through the board inside its outline, each its corners in micrometres, and selectedCutout, the selected one's index or null; the board's selected pad by reference and number, its selected silkscreen line or drawn item by reference and index (the part's silkscreen lines first, then its drawn items), and its message, the Inspector's line from the last sync, autoroute or refused board edit, \"\" once spent); for Symbol its tool (select|line|rectangle|circle|pin|text) and pins; for Pads its tool (select|smd|through_hole|line|rectangle|circle|arc|text), pads, its silkscreen lines, its graphics (each drawn item on F/B.SilkS, F/B.Fab or F/B.CrtYd: layer, kind polyline|arc|circle|text, width in micrometres, filled, points — a polyline's points, an arc's start, through and end, a circle's centre with radius, a text's anchor with text and height) and the selection (a pad by number, a silk line or drawn item by index); popupOpen, a menu or combo box open as the frame ends (the popup clause of the editors' key rule); modalOpen, a modal up last pass; keysReachEditor, the key rule's answer (no text field focused, no popup, no modal); status, the status strip under the editor: its text, the pointer's place in the editor's micrometres and the hit key under it (both null off the canvas); and outdated, for the sheet editors the components placed from a part whose saved version changed after they were placed, each as its reference and part (what the Update parts card lists and the canvas rings; empty when none)";
+pub(crate) const STATE_DOC: &str = "the eCAD editor drawn in the central tile: target (diagram|pcb|symbol|pads, null when none); inStep, true when the editor's document is exactly its block of the document (or the empty document when there is no block) — false after ANY edit that did not reach the document or any document change that did not reach the editor; the history revision; pan [x,y] in points and zoom in points per micrometre; why its block is not being edited (unreadable), and while it is not, the parts at fault by name (offender, null when the host cannot name them) and the unreadable card's one-click repair (repair, its button's words, null when there is none); for the sheet editors the view, tool, selection, components, wires (connections, by terminal name), labels, nets (the Connectivity panel's, each net's name and pins), erc (the Connectivity panel's electrical rule check: run, whether its button has been pressed; findings, each with severity, kind, message, at in micrometres, pins and the fix it offers; noConnects and powerFlags, the pins its fixes marked) and board (counts; each placement's pads with their centres on the board; each track's net, layer, width and points in micrometres as trackPaths; each copper zone as zones — its net, layer, outline, and its fill's pieces, holes, vertices, area in mm² and, once filled in this session, the spokes each relieved pad got — with zonesStale, true when copper has changed since the fill on show was made, and selectedZone, the selected zone's index or null; drawings, what is drawn on the board itself on F/B.SilkS or F/B.Fab, each reported as a Pads drawn item is (layer, kind, width, filled, points, radius/text/height), and selectedDrawing, the selected one's index or null; cutouts, the holes milled through the board inside its outline, each its corners in micrometres, and selectedCutout, the selected one's index or null; the board's selected pad by reference and number, its selected silkscreen line or drawn item by reference and index (the part's silkscreen lines first, then its drawn items), and its message, the Inspector's line from the last sync, autoroute or refused board edit, \"\" once spent); for Symbol its tool (select|line|rectangle|circle|pin|text) and pins; for Pads its tool (select|smd|through_hole|line|rectangle|circle|arc|text), pads (each its number, at and size in micrometres, shape and layers), its silkscreen lines, its graphics (each drawn item on F/B.SilkS, F/B.Fab or F/B.CrtYd: layer, kind polyline|arc|circle|text, width in micrometres, filled, points — a polyline's points, an arc's start, through and end, a circle's centre with radius, a text's anchor with text and height) and the selection (a pad by number, a silk line or drawn item by index); popupOpen, a menu or combo box open as the frame ends (the popup clause of the editors' key rule); modalOpen, a modal up last pass; keysReachEditor, the key rule's answer (no text field focused, no popup, no modal); status, the status strip under the editor: its text, the pointer's place in the editor's micrometres and the hit key under it (both null off the canvas); and outdated, for the sheet editors the components placed from a part whose saved version changed after they were placed, each as its reference and part (what the Update parts card lists and the canvas rings; empty when none)";
 
 /// Whether the editor's document is exactly its block of `history` — the empty
 /// document when there is no block. One comparison that fails whatever the
@@ -1646,6 +1672,8 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
                     json!({
                         "number": pad.number,
                         "at": point(pad.at),
+                        // Width and height in micrometres, as the Inspector's Size.
+                        "size": point(pad.size),
                         "shape": format!("{:?}", pad.shape),
                         "cornerRadius": pad.effective_corner_radius(),
                         // A trapezoid or custom pad's corner count, or null.

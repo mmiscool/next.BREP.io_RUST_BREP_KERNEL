@@ -759,7 +759,17 @@ pub(super) fn heal_closed_transition(
         .fold(0.0f64, f64::max)
         * 3.0
         + tolerance;
-    let new_curve = if !fitted_pair {
+    // Two neighbours on one cylinder or cone (a round-bottomed groove turned
+    // into a shaft) do not re-intersect: that surface runs on across the
+    // strip, and the rim is its section midway along it (`closed_band`'s rule).
+    let one_carrier = if fitted_pair {
+        None
+    } else {
+        super::closed_band::one_ruled_carrier_midway(&surface_a, &surface_b, &strip_points, tolerance)?
+    };
+    let new_curve = if let Some(section) = &one_carrier {
+        section.clone()
+    } else if !fitted_pair {
         let curves = intersect_analytic_pair(&surface_a, &surface_b, tolerance).ok_or_else(|| {
             KernelRefusal::unsupported(
                 KernelStage::Classify,
@@ -1570,6 +1580,9 @@ pub(super) fn heal_closed_transition(
             "validation",
             format!("{op}: closed-transition heal failed validation: {issues:?}"),
         ));
+    }
+    if one_carrier.is_some() {
+        return super::closed_band::merge_one_carrier(solid, neighbour_ids, tolerance, op);
     }
     Ok(solid)
 }

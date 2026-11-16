@@ -619,6 +619,86 @@ impl EngineState {
         brep_kernel::export_iges_assembly(&assembly, &colors, document_name, "MM", "")
     }
 
+    /// Import a SolidWorks part (`.sldprt`) or assembly (`.sldasm`). A part's
+    /// body (its first configuration's Parasolid partition) goes through the
+    /// `xtBinary` lane of [`Self::import_xt_bytes_feature`]. An assembly's
+    /// parts are read from beside `path` on disk (by base name, any case) and
+    /// placed as its instances say, all in one IMPORT3D feature carrying the
+    /// placed bodies (`nativeBrep`). Where there is no folder to read (the
+    /// browser), an assembly is refused with a message that says so.
+    pub fn import_solidworks_feature(&mut self, bytes: &[u8], path: &str, assembly: bool) -> Result<String, String> {
+        if !assembly {
+            let partitions = brep_kernel::solidworks::solidworks_part_partitions(bytes).map_err(|e| format!("SolidWorks part: {e}"))?;
+            return self.import_xt_bytes_feature(&partitions[0].1);
+        }
+        let dir = std::path::Path::new(path).parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        if dir.as_os_str().is_empty() || !dir.is_dir() {
+            return Err("a SolidWorks assembly is imported from a folder on disk, where its parts are".into());
+        }
+        let mut resolve = |name: &str| -> Option<Vec<u8>> {
+            let entry = std::fs::read_dir(&dir).ok()?.flatten().find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))?;
+            std::fs::read(entry.path()).ok()
+        };
+        let report = brep_kernel::solidworks::import_solidworks_assembly_report(bytes, &mut resolve)?;
+        let id = self.next_feature_id(&crate::features::feature_short_name("IMPORT3D"));
+        let payload = brep_kernel::native_import_payload_with_appearance(&id, &report.solids, &report.appearances)?;
+        let feature = serde_json::json!({
+            "type": "IMPORT3D",
+            "inputParams": { "id": id, "nativeBrep": payload },
+            "persistentData": {},
+        });
+        self.pending_fit = true;
+        self.add_feature(&feature.to_string())
+    }
+
+    /// Export the resident solids (those named in `only`, or all) as a
+    /// Parasolid part: text (`.x_t`) or, when `binary`, neutral binary
+    /// (`.x_b`) — the kernel's [`brep_kernel::parasolid::export_parasolid_text`]
+    /// in schema V30.1 with embedded deltas. Each solid keeps its scene name
+    /// and the colour the STEP export would give it. An assembly document is
+    /// not written yet (STEP carries its structure).
+    pub fn export_parasolid_selected(&self, document_name: &str, only: Option<&[String]>, binary: bool) -> Result<Vec<u8>, String> {
+        self.plugin_export_ready()?;
+        if !self.assembly_components.is_empty() {
+            return Err("export Parasolid: an assembly document is not written as Parasolid yet; export it as STEP".into());
+        }
+        let request: HistoryRequest = serde_json::from_value(self.run_request_value())
+            .map_err(|e| format!("export Parasolid: history request: {e}"))?;
+        let mut named = self.plugin_resident_handles(&request)?;
+        if let Some(only) = only {
+            for name in only {
+                if !named.iter().any(|(n, _)| n == name) {
+                    return Err(format!("export Parasolid: `{name}` is not a solid of this model"));
+                }
+            }
+            named.retain(|(n, _)| only.contains(n));
+        }
+        if named.is_empty() {
+            return Err("nothing to export: the model has no solids".into());
+        }
+        let colors = self.step_export_colors(&named);
+        let solids: Vec<(String, brep_kernel::BrepSolid)> = named
+            .iter()
+            .map(|(name, handle)| Ok((name.clone(), brep_kernel::registered_solid_clone(*handle)?)))
+            .collect::<Result<_, String>>()?;
+        let single = solids.len() == 1;
+        let bodies: Vec<brep_kernel::parasolid::XtExportBody> = solids
+            .iter()
+            .map(|(name, solid)| brep_kernel::parasolid::XtExportBody {
+                solid,
+                // A part of one solid is named for the document, as STEP's
+                // single product is.
+                name: Some(if single { document_name } else { name.as_str() }),
+                color: colors.get(name).map(|[r, g, b]| [f64::from(r) / 255.0, f64::from(g) / 255.0, f64::from(b) / 255.0]),
+            })
+            .collect();
+        if binary {
+            brep_kernel::parasolid::export_parasolid_binary(&bodies, "BREP")
+        } else {
+            brep_kernel::parasolid::export_parasolid_text(&bodies, "BREP").map(String::into_bytes)
+        }
+    }
+
     /// The flat import of a STEP, IGES or Parasolid text, whichever it is: the
     /// lane a structureless probe, or a structure nothing built out of, falls
     /// back to.

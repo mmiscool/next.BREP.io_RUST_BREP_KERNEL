@@ -104,10 +104,9 @@ pub fn assembly_export_tree(
     root_bodies: Vec<(String, BrepSolid)>,
     root_components: &[(String, String, Mat4)],
 ) -> Result<StepAssemblyExport, String> {
-    let own: Vec<(String, BrepSolid)> = root_bodies
+    let (own, placed): (Vec<(String, BrepSolid)>, Vec<(String, BrepSolid)>) = root_bodies
         .into_iter()
-        .filter(|(name, _)| component_prefix(name).is_none())
-        .collect();
+        .partition(|(name, _)| component_prefix(name).is_none());
     let mut assembly = StepAssemblyExport {
         products: vec![StepExportProduct {
             name: document_name.to_string(),
@@ -121,7 +120,51 @@ pub fn assembly_export_tree(
         occurrences: Vec::new(),
     };
     let library = parts_library::parts_library_map();
-    place_children(&mut assembly, 0, &library, root_components, 0)?;
+    // An instance a weld prepared in context is no longer the shared part: it
+    // is written from its own as-welded bodies, a product of its own, while
+    // the part's other instances keep sharing the library's product.
+    let prepared = crate::feature_pipeline::assembly::context_prepared_components();
+    let (own_body, shared): (Vec<_>, Vec<_>) = root_components
+        .iter()
+        .cloned()
+        .partition(|(designator, _, _)| prepared.contains_key(designator));
+    place_children(&mut assembly, 0, &library, &shared, 0)?;
+    for (designator, part_name, placement) in own_body {
+        let local = crate::AffineTransform::new(placement)
+            .and_then(|pose| pose.rigid_inverse())
+            .map_err(|error| format!("export_step: {designator}: {error}"))?;
+        let prefix = format!("{designator}:");
+        let mut bodies = Vec::new();
+        for (name, solid) in &placed {
+            let Some(local_name) = name.strip_prefix(&prefix) else { continue };
+            let mut body = crate::transform_brep(solid, local, false)
+                .map_err(|error| format!("export_step: {name}: {error}"))?;
+            // Part-local names, as the shared product's bodies carry them (and
+            // as the part's PMI names its faces).
+            let strip = |name: &mut Option<String>| {
+                if let Some(local) = name.as_deref().and_then(|name| name.strip_prefix(&prefix)) {
+                    *name = Some(local.to_string());
+                }
+            };
+            for face in body.shells.iter_mut().flat_map(|shell| &mut shell.faces) { strip(&mut face.name); }
+            for edge in &mut body.edges { strip(&mut edge.name); }
+            bodies.push((local_name.to_string(), body));
+        }
+        let id = library.get(&part_name).and_then(|entry| part_number(&entry.document)
+            .or_else(|| Some(entry.source_key.clone()))).unwrap_or_default();
+        let welds = prepared.get(&designator).map(|welds| welds.join(", ")).unwrap_or_default();
+        // The part's own PMI rides along: the annotations on faces the weld
+        // did not cut name the same faces in the as-welded body.
+        let pmi = library.get(&part_name).and_then(|entry| parts_library::document_pmi(&entry.document));
+        let child = assembly.products.len();
+        assembly.products.push(StepExportProduct {
+            name: format!("{part_name} (as welded by {welds})"),
+            id,
+            bodies,
+            pmi,
+        });
+        assembly.occurrences.push(StepExportOccurrence { designator, parent: 0, child, placement, color: None });
+    }
     Ok(assembly)
 }
 
@@ -188,10 +231,14 @@ fn add_part(
     };
     // This product's OWN bodies: the snapshot solids that no nested component
     // contributed. The namespaced ones are written in the child's product.
+    // A sub-assembly whose own groove welds prepare its components in context
+    // holds those components as welded, not as the shared parts: it is
+    // written flat, every snapshot body its own, with no child products.
+    let flat = prepared_in_context(&restored.solids);
     let bodies: Vec<(String, BrepSolid)> = restored
         .solids
         .into_iter()
-        .filter(|solid| component_prefix(&solid.name).is_none())
+        .filter(|solid| flat || component_prefix(&solid.name).is_none())
         .map(|solid| (solid.name, solid.solid))
         .collect();
     let index = assembly.products.len();
@@ -217,9 +264,24 @@ fn add_part(
         bodies,
         pmi,
     });
-    let (library, instances) = document_components(&entry.document, part_name)?;
-    place_children(assembly, index, &library, &instances, depth + 1)?;
+    if !flat {
+        let (library, instances) = document_components(&entry.document, part_name)?;
+        place_children(assembly, index, &library, &instances, depth + 1)?;
+    }
     Ok(index)
+}
+
+/// Whether a snapshot holds a component member a weld prepared in context:
+/// a namespaced body carrying a face the weld's cut left, which is named under
+/// the member's component (`ACOMP2:{weld}:Prep{side}Face{n}`). Read from the
+/// geometry itself, so a groove that cut nothing (a square or flare groove)
+/// keeps the sub-assembly's structure.
+fn prepared_in_context(solids: &[crate::RestoredSolid]) -> bool {
+    solids.iter().filter(|solid| component_prefix(&solid.name).is_some()).any(|solid| {
+        solid.solid.shells.iter().flat_map(|shell| &shell.faces).any(|face| {
+            face.name.as_deref().is_some_and(|name| component_prefix(name).is_some() && name.contains(":Prep"))
+        })
+    })
 }
 
 /// A part document's own parts library and its ACOMP instances, with each pose

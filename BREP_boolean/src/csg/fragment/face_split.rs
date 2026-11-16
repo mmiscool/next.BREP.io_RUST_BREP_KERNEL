@@ -982,7 +982,7 @@ fn fragment_face_arranged(
     };
     // Vertices where two or more cut pieces of this face meet: an interior
     // junction of the section, never a boundary vertex it merely nears.
-    let junction_keys: HashSet<String> = if crate::switch!("BREP_NEAR_SEAM_CLOSED_RUN", false) {
+    let junction_keys: HashSet<String> = if crate::switch!("BREP_NEAR_SEAM_CLOSED_RUN", true) {
         let mut seen: HashMap<u64, usize> = HashMap::default();
         for piece in active_pieces.iter().filter_map(|piece_id| pieces_by_id.get(piece_id)) {
             if piece.start_vertex_id != piece.end_vertex_id {
@@ -1520,12 +1520,18 @@ fn fragment_face_arranged(
         // along this face's seam) is inside the snap band, and snapping it
         // onto the domain edge moved that vertex to the seam: the section's
         // short piece then closed into a whole ring and the face never split.
-        // With `BREP_NEAR_SEAM_CLOSED_RUN` an end snaps only when the edge's
-        // image is at least as near the piece's own vertex as its place is.
-        // The end's own vertex is the piece's vertex nearest its image (the
-        // piece's vertex order need not follow its pcurve).
+        // With `BREP_NEAR_SEAM_CLOSED_RUN` an end snaps across a closed
+        // direction (onto the seam) only when the edge's image is at least as
+        // near the piece's own vertex as its place is. The end's own vertex is
+        // the piece's vertex nearest its image (the piece's vertex order need
+        // not follow its pcurve). A snap onto an OPEN domain edge is a rim, not
+        // a seam, and always snaps: an offset's intersection vertex a few 1e-6
+        // inside a quarter cylinder's rim is that rim's vertex, and keeping it
+        // in place stranded the section's piece one-use beside the rim.
+        let closed_axes = face.surface.closed_directions().unwrap_or((false, false));
         let keeps_vertex = |snapped: Vec2, original: Vec2, _vertex_id: u64| -> bool {
-            if !crate::switch!("BREP_NEAR_SEAM_CLOSED_RUN", false) || (snapped.x == original.x && snapped.y == original.y) {
+            let onto_seam = (closed_axes.0 && snapped.x != original.x) || (closed_axes.1 && snapped.y != original.y);
+            if !crate::switch!("BREP_NEAR_SEAM_CLOSED_RUN", true) || !onto_seam {
                 return true;
             }
             let (Ok(at), Ok(moved)) = (face.surface.evaluate(original.x, original.y), face.surface.evaluate(snapped.x, snapped.y)) else {

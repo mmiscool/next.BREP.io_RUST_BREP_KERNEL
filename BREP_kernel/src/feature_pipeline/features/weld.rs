@@ -6,6 +6,8 @@ use crate::Vec3;
 
 #[path = "weld_fit.rs"]
 mod fit;
+#[path = "weld_spline.rs"]
+mod spline;
 #[path = "weld_groove.rs"]
 pub(crate) mod groove;
 #[path = "weld_lap.rs"]
@@ -174,7 +176,13 @@ pub fn tack_hidden_params(values: &serde_json::Value) -> Vec<&'static str> {
 }
 
 fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, String> {
-    let (seams, joint_faces) = selected_seam(ctx.scene, ctx.param("seam"))?;
+    // The legs a two-face pick across a root gap is fitted with (the legs
+    // are checked below).
+    let leg = common::optional_number(ctx, "legSize")?.unwrap_or(3.0);
+    let leg2 = common::optional_number(ctx, "legSize2")?.unwrap_or(0.0);
+    let leg2 = if leg2 > 0.0 { leg2 } else { leg };
+    let picked_legs = if matches!(ctx.param("swapLegs"), Some(serde_json::Value::Bool(true))) { [leg2, leg] } else { [leg, leg2] };
+    let (seams, joint_faces) = selected_seam(ctx.scene, ctx.param("seam"), &ctx.id, picked_legs)?;
     let all_around = match ctx.param("allAround") {
         None => false,
         Some(serde_json::Value::Bool(value)) => *value,
@@ -270,6 +278,7 @@ fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, St
             }
         }
     }
+    let spline_seam = shape.is_some();
     let chain = match shape {
         Some(reason) => Err(reason),
         None => fit::Chain::new(runs),
@@ -278,7 +287,33 @@ fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, St
         Ok(chain) => chain,
         Err(reason) => {
             faces_hold_seam_edge(ctx.scene, &seam, &joint_faces)?;
+            // One planar spline segment: the bead lofted on exact rails (a
+            // continuous bead on one side, flat, fitted).
+            let simple = sides == Sides::One && intermittent == Intermittent::Continuous && contour.is_none() && tacks.is_none();
+            let spline = curves.len() == 1 && spline_seam && placement != Placement::Manual && simple;
+            if generate && spline {
+                match spline::bead(ctx.scene, &ctx.id, &curves[0], &joint_faces, legs, &ctx.id)? {
+                    Ok(bead) => {
+                        for solid in bead.joints {
+                            if !result.weld_joint_solids.contains(&solid) { result.weld_joint_solids.push(solid); }
+                        }
+                        result.added.push(common::register_added(bead.body, &ctx.id));
+                        paint_bead(&ctx.id, &colour);
+                        return Ok(finish(ctx, result, seam, curves, anchor));
+                    }
+                    Err(why) if placement == Placement::Fitted => return Err(format!("fitted placement: {why}")),
+                    Err(why) => {
+                        not_built(&mut result, &seam, format!("has no weld bead: {reason}, and as a spline seam {why}; the weld and its callout stand"));
+                        return Ok(finish(ctx, result, seam, curves, anchor));
+                    }
+                }
+            }
             if generate {
+                let reason = if curves.len() == 1 && spline_seam && !simple {
+                    format!("{reason} (a spline seam takes a continuous, flat, one-sided bead)")
+                } else {
+                    reason
+                };
                 not_built(&mut result, &seam, format!("has no weld bead: {reason}; the weld and its callout stand"));
             }
             return Ok(finish(ctx, result, seam, curves, anchor));
@@ -294,8 +329,8 @@ fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, St
         for run in &chain.runs {
             carried = carried || fit::carries(ctx.scene, run, name)?;
         }
-        if !carried && chain.is_single_line() {
-            carried = fit::bridges(ctx.scene, first, name, legs)?;
+        for run in chain.runs.iter().filter(|run| run.is_line()) {
+            carried = carried || fit::bridges(ctx.scene, run, name, legs)?;
         }
         if !carried {
             faces_hold_seam_edge(ctx.scene, &seam, std::slice::from_ref(name))?;
@@ -365,6 +400,10 @@ fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, St
             } else {
                 trims
             };
+            // Mitres through the bead's root where it stands off the seam.
+            let roots: Vec<Vec3> = sections.iter().map(|[root, _, _]| *root).collect();
+            let rooted = chain.rooted(trims, &roots)?;
+            let trims = &rooted[..];
             if let Some(height) = contour.filter(|height| *height < 0.0) {
                 for [_, a, b] in sections {
                     // A concave face may not reach the root: its depth stays
@@ -454,53 +493,50 @@ fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, St
                 }
             }
         };
-        // The far side of a single-run seam: its mirror joint, its chain and cuts.
-        let far_side = |chain: &fit::Chain, near: &fit::Fit| -> Result<Result<(fit::Chain, fit::Fit, Vec<fit::Trim>), String>, String> {
-            if chain.runs.len() != 1 {
-                return Ok(Err("both sides is built on a single straight or circular seam; weld the far side's seam as its own weld".into()));
-            }
-            let (far_seam, far_fit) = match fit::other_side(ctx.scene, &chain.runs[0], near, &ctx.id, legs)? {
+        // The far side: every run's mirror joint, the far chain and its cuts.
+        let far_side = |chain: &fit::Chain, near: &[fit::Fit]| -> Result<Result<(fit::Chain, Vec<fit::Fit>, Vec<fit::Trim>), String>, String> {
+            let (far_chain, far_fits) = match chain.far_side(ctx.scene, near, &ctx.id, legs)? {
                 Ok(found) => found,
                 Err(reason) => return Ok(Err(reason)),
             };
-            let far_chain = match fit::Chain::new(vec![far_seam]) {
-                Ok(chain) => chain,
-                Err(reason) => return Ok(Err(reason)),
-            };
-            Ok(far_chain.trims(reach).map(|trims| (far_chain, far_fit, trims)))
+            Ok(far_chain.trims(reach).map(|trims| (far_chain, far_fits, trims)))
         };
         let bodies: Bodies = match &fitted {
             Some((fits, trims)) => {
                 let sections: Vec<[Vec3; 3]> = fits.iter().map(|joint| [joint.root, joint.legs[0].scale(legs[0]), joint.legs[1].scale(legs[1])]).collect();
-                let mut built = lay(&chain, &sections, trims, false)?;
-                let mut checked = Ok(());
+                // Roots that do not meet at a mitre are a fit that fails
+                // (AUTO falls back, FITTED says so), not a feature error.
+                let roots: Vec<Vec3> = sections.iter().map(|[root, _, _]| *root).collect();
+                let mut checked = chain.rooted(trims, &roots).map(|_| ());
+                let mut built = if checked.is_ok() { lay(&chain, &sections, trims, false)? } else { Vec::new() };
                 for (_, pieces, body) in &built {
-                    checked = chain.verify_pieces(ctx.scene, fits, legs, body, pieces, &ctx.id)?;
                     if checked.is_err() { break; }
+                    checked = chain.verify_pieces(ctx.scene, fits, legs, body, pieces, &ctx.id)?;
                 }
                 match checked {
                     Ok(()) => {
-                        let far_fit;
+                        let far_fits;
                         let mut joints: Vec<&fit::Fit> = fits.iter().collect();
                         // The far side: the mirror joint across the standing
                         // member, built and checked the same way. FITTED
                         // refuses without it; AUTO keeps the near side and says so.
-                        let far = if sides == Sides::Both { Some(far_side(&chain, &fits[0])?) } else { None };
+                        let far = if sides == Sides::Both { Some(far_side(&chain, fits)?) } else { None };
                         match far {
                             None => {}
-                            Some(Ok((far_chain, fit, far_trims))) => {
-                                let far_sections = [[fit.root, fit.legs[0].scale(legs[0]), fit.legs[1].scale(legs[1])]];
+                            Some(Ok((far_chain, found, far_trims))) => {
+                                let far_sections: Vec<[Vec3; 3]> = found.iter().map(|fit| [fit.root, fit.legs[0].scale(legs[0]), fit.legs[1].scale(legs[1])]).collect();
                                 first_body.set(built.len());
-                                let far = lay(&far_chain, &far_sections, &far_trims, true)?;
-                                let mut outcome = Ok(());
+                                let far_roots: Vec<Vec3> = far_sections.iter().map(|[root, _, _]| *root).collect();
+                                let mut outcome = far_chain.rooted(&far_trims, &far_roots).map(|_| ());
+                                let far = if outcome.is_ok() { lay(&far_chain, &far_sections, &far_trims, true)? } else { Vec::new() };
                                 for (_, pieces, body) in &far {
-                                    outcome = far_chain.verify_pieces(ctx.scene, std::slice::from_ref(&fit), legs, body, pieces, &ctx.id)?;
                                     if outcome.is_err() { break; }
+                                    outcome = far_chain.verify_pieces(ctx.scene, &found, legs, body, pieces, &ctx.id)?;
                                 }
                                 match outcome {
                                     Ok(()) => {
-                                        far_fit = fit;
-                                        joints.push(&far_fit);
+                                        far_fits = found;
+                                        joints.extend(far_fits.iter());
                                         built.extend(far);
                                     }
                                     Err(reason) if placement == Placement::Fitted => return Err(format!("fitted placement: far side: {reason}")),
@@ -672,7 +708,7 @@ fn outside_bodies(scene: &crate::feature_pipeline::SceneMap, centroid: Vec3, exc
 /// seam edges or sketch paths that join head to tail (the first picked names
 /// the seam). Faces are the joint faces (in selection order); parts and
 /// components constrain the seam owner and must contain every seam edge.
-fn selected_seam(scene: &crate::feature_pipeline::SceneMap, value: Option<&serde_json::Value>) -> Result<(Vec<String>, Vec<String>), String> {
+fn selected_seam(scene: &crate::feature_pipeline::SceneMap, value: Option<&serde_json::Value>, exclude: &str, legs: [f64; 2]) -> Result<(Vec<String>, Vec<String>), String> {
     let names = common::unique_reference_names(value);
     let seams: Vec<String> = names.iter().filter(|name| scene.resolve_edge(name).is_some()
         || scene.resolve_path(name).is_some()
@@ -681,7 +717,7 @@ fn selected_seam(scene: &crate::feature_pipeline::SceneMap, value: Option<&serde
     if seams.is_empty() {
         // Two joint faces alone: the seam is the straight or circular edge they meet along.
         if names.len() == 2 && names.iter().all(|name| !scene.resolve_face_group(name).is_empty()) {
-            let seam = fit::seam_between(scene, [&names[0], &names[1]])??;
+            let seam = fit::seam_between(scene, [&names[0], &names[1]], exclude, legs)??;
             return Ok((vec![seam], names.clone()));
         }
         return Err("select the seam edges or sketch, or the two joint faces, alongside the part or component references".into());
@@ -764,8 +800,10 @@ fn seam_frame(ctx: &FeatureContext, seam: &str, start: Vec3, tangent: Vec3) -> R
 
 /// Apply the seam owner's solved rigid motion without creating or discarding handles.
 /// Compute every fallible transformation before committing the replacement bodies.
-pub(crate) fn pose(result: &mut FeatureResult, delta: crate::AffineTransform) -> Result<(), String> {
-    let bodies = result.added.iter().map(|added| {
+/// `skip`: added bodies that are not posed (members a groove weld prepared in
+/// context, which move with their own components).
+pub(crate) fn pose(result: &mut FeatureResult, delta: crate::AffineTransform, skip: &[String]) -> Result<(), String> {
+    let bodies = result.added.iter().filter(|added| !skip.contains(&added.name)).map(|added| {
         crate::with_registered_solid_str(added.handle, |solid| crate::transform_brep(solid, delta, false))
             .map(|body| (added.handle, body))
     }).collect::<Result<Vec<_>, _>>()?;

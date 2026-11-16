@@ -766,6 +766,7 @@ pub fn blend_star_network_laws(
 ) -> Result<BrepSolid, KernelRefusal> {
     // A network that refuses takes back the notes its stripes recorded.
     let mark = super::blend_notes_mark();
+    let wrap_before = WRAP_OUTCOME.with(|cell| (cell.borrow().candidates, cell.borrow().wrapped));
     let second_pass = super::edge::refine_overshoot_on() && !super::edge::overshoot_reach_active();
     if second_pass {
         OVERSHOOT_REQUESTS.with(|requests| requests.borrow_mut().clear());
@@ -795,6 +796,14 @@ pub fn blend_star_network_laws(
     }
     if result.is_err() {
         super::blend_notes_truncate(mark);
+    }
+    if wrap_sharp_corners_on() {
+        let wrap_after = WRAP_OUTCOME.with(|cell| (cell.borrow().candidates, cell.borrow().wrapped));
+        let wrapped = if result.is_ok() { wrap_after.1 - wrap_before.1 } else { 0 };
+        LAST_NETWORK_WRAPPED.with(|cell| cell.set(wrapped));
+        if result.is_err() && wrap_after.0 > wrap_before.0 {
+            bump_wrap_outcome(|outcome| outcome.failed += 1);
+        }
     }
     result
 }
@@ -1082,8 +1091,21 @@ fn blend_star_network_building(
             let perpendicular_cap = plane_normal(shared).zip(plane_normal(other_a))
                 .zip(plane_normal(other_b))
                 .is_some_and(|((cap, a), b)| cap.dot(a).abs() < 1e-6 && cap.dot(b).abs() < 1e-6);
+            // With sharp-corner wrapping asked for, a CURVED shared face whose
+            // normal at the vertex stands square to both walls' normals there
+            // wraps the convex sharp edge too (closed by the curved-cap canal).
+            let curved_square_cap = !perpendicular_cap
+                && wrap_sharp_corners_on()
+                && plane_normal(shared).is_none()
+                && face_normal_near(shared, point).zip(face_normal_near(other_a, point)).zip(face_normal_near(other_b, point))
+                    .is_some_and(|((cap, a), b)| cap.dot(a).abs() < 1e-6 && cap.dot(b).abs() < 1e-6);
             if (!sharp_convex && selected_convex)
-                || (wrap_concave && !chamfer && sharp_convex && selected_concave && perpendicular_cap) {
+                || (wrap_concave && !chamfer && sharp_convex && selected_concave && (perpendicular_cap || curved_square_cap)) {
+                // Counted before any refusal below, so a corner the wrap
+                // takes up and cannot close reads as a failed wrap.
+                if curved_square_cap {
+                    bump_wrap_outcome(|outcome| outcome.candidates += 1);
+                }
                 if unequal.is_some() {
                     return Err(refuse_unequal("the horn-torus closure at a re-entrant vertex needs one ball and is not in this lane at two radii"));
                 }
@@ -3207,9 +3229,11 @@ fn blend_star_network_building(
         // A chamfer takes the same closure with the ball's CHORD for its arc
         // (a pocket rim with one wall tilted
         // 9 degrees left every corner as an uncut notch from the cutter).
+        let planar_cap = matches!(cap.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. }));
+        // A curved cap reaches here only with sharp-corner wrapping on.
         let canal_allowed = canal_corner_on()
             && (!chamfer || chamfer_canal_corner_on())
-            && matches!(cap.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. }));
+            && (planar_cap || (!chamfer && wrap_sharp_corners_on()));
         let mut canal = pole_gap > 1e-6 * (1.0 + radius) && canal_allowed;
         if pole_gap > 1e-6 * (1.0 + radius) && !canal {
             return Err(KernelRefusal::unsupported(KernelStage::Refine, "horn_torus_dihedrals", format!(
@@ -4440,9 +4464,14 @@ fn blend_star_network_building(
                         rows_above_stop: stripe.at_start(horn.vertex),
                     })
                 };
+                // A curved cap (sharp-corner wrapping): the ball family keeps
+                // tangent to that face rather than to a plane.
+                let curved_cap = solid.shells.iter().flat_map(|shell| &shell.faces)
+                    .find(|face| face.id == horn.cap_face)
+                    .filter(|face| !matches!(face.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. })));
                 Some(canal_corner_patch(
                     sharp, [canal.poles[0].2, canal.poles[1].2], center_a, center_b, cap_point_a, radius, chamfer_ends,
-                    [crease_stripe(index_a, stop_a), crease_stripe(index_b, stop_b)], solid,
+                    [crease_stripe(index_a, stop_a), crease_stripe(index_b, stop_b)], solid, curved_cap,
                 )?)
             }
             None => None,
@@ -6187,6 +6216,91 @@ fn tilted_horn_patch(
     Ok(surface)
 }
 
+thread_local! {
+    /// [`with_wrap_sharp_corners`]'s scope: on while a caller asks for it.
+    static WRAP_SHARP_CORNERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What the corners asked to wrap did inside that scope.
+    static WRAP_OUTCOME: std::cell::RefCell<WrapOutcome> = std::cell::RefCell::new(WrapOutcome::default());
+    /// The curved-cap corners the last successful network build closed.
+    static LAST_NETWORK_WRAPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What [`with_wrap_sharp_corners`] saw: the corners classified for wrapping
+/// (every network attempt counts), the curved-cap closures built, the
+/// attempts that held such a corner and refused, or whose result the caller's
+/// acceptance rejected ([`reject_wrapped_network`]), and a point on each
+/// closure built (its patch at u = v = 1/2). A closure built on a body a later
+/// stage discarded is counted too: whether the returned body carries one is
+/// read off its faces against `points`.
+#[derive(Clone, Debug, Default)]
+pub struct WrapOutcome {
+    pub candidates: usize,
+    pub wrapped: usize,
+    pub failed: usize,
+    pub points: Vec<Vec3>,
+}
+
+/// Run `action` with sharp-corner wrapping on (the fillet feature's "Wrap
+/// sharp corners" option; off unless a caller asks), returning its result and
+/// what the wrapping did. With it on, two selected concave blends that meet
+/// over an unselected CONVEX sharp edge on a CURVED shared face (a cylindrical
+/// boss standing across a block's edge) roll the ball round that edge instead
+/// of intersecting in a sharp miter seam: the corner is closed by the envelope
+/// of the ball that stays tangent to the shared face and touches the sharp
+/// edge ([`canal_corner_patch`] on a curved cap). Off, such a corner keeps its
+/// miter. Corners on a planar shared face wrap with or without it.
+pub fn with_wrap_sharp_corners<T>(action: impl FnOnce() -> T) -> (T, WrapOutcome) {
+    let previous = (WRAP_SHARP_CORNERS.with(|cell| cell.replace(true)), WRAP_OUTCOME.with(|cell| cell.replace(WrapOutcome::default())));
+    struct Restore((bool, WrapOutcome));
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WRAP_SHARP_CORNERS.with(|cell| cell.set(self.0 .0));
+            WRAP_OUTCOME.with(|cell| *cell.borrow_mut() = std::mem::take(&mut self.0 .1));
+        }
+    }
+    let restore = Restore(previous);
+    let result = action();
+    let outcome = WRAP_OUTCOME.with(|cell| cell.borrow().clone());
+    drop(restore);
+    (result, outcome)
+}
+
+fn bump_wrap_outcome(change: impl FnOnce(&mut WrapOutcome)) {
+    WRAP_OUTCOME.with(|cell| change(&mut cell.borrow_mut()));
+}
+
+/// Whether `body` carries a closure [`with_wrap_sharp_corners`] built: a
+/// face whose carrier passes within `tolerance` of one of `outcome.points`.
+pub fn body_carries_wrapped_corner(body: &BrepSolid, outcome: &WrapOutcome, tolerance: f64) -> bool {
+    outcome.points.iter().any(|point| {
+        body.shells.iter().flat_map(|shell| &shell.faces).any(|face| {
+            crate::project_point_to_surface(&face.surface, *point)
+                .ok()
+                .and_then(|uv| face.surface.evaluate(uv.u, uv.v).ok())
+                .is_some_and(|foot| foot.sub(*point).length() <= tolerance)
+        })
+    })
+}
+
+/// A caller's acceptance rejected the last network body: when that body
+/// closed a wrapped corner, the wrapping counts as failed.
+pub fn reject_wrapped_network() {
+    if wrap_sharp_corners_on() && LAST_NETWORK_WRAPPED.with(|cell| cell.get()) > 0 {
+        bump_wrap_outcome(|outcome| outcome.failed += 1);
+    }
+}
+
+/// Whether [`with_wrap_sharp_corners`] is on for the running build.
+pub fn wrap_sharp_corners_on() -> bool {
+    WRAP_SHARP_CORNERS.with(|cell| cell.get())
+}
+
+/// The unit normal of `face`'s carrier at its point nearest `point`.
+fn face_normal_near(face: &FaceRecord, point: Vec3) -> Option<Vec3> {
+    let uv = crate::project_point_to_surface(&face.surface, point).ok()?;
+    raw_normal(&face.surface, uv.u, uv.v).ok()?.normalized().ok()
+}
+
 /// Whether a re-entrant corner the exact horn torus cannot close is closed by
 /// the ball's envelope: on unless `BREP_BLEND_CANAL_CORNER=0`/`off`.
 pub(in crate::blend) fn canal_corner_on() -> bool {
@@ -6362,14 +6476,26 @@ fn canal_corner_patch(
     chamfer_ends: Option<[(Vec3, Vec3); 2]>,
     stripes: [Option<CreaseStripe<'_>>; 2],
     solid: &BrepSolid,
+    curved_cap: Option<&FaceRecord>,
 ) -> Result<CanalPatch, KernelRefusal> {
     let chamfer = chamfer_ends.is_some();
     let crease = !chamfer && stripes.iter().any(Option::is_some);
     let unsolved = |what: &'static str| KernelRefusal::unsupported(KernelStage::Refine, what, format!("blend network: the corner's ball envelope does not solve ({what})"));
     let cap_up = cap_point_a.sub(center_a).normalized().or_refuse(KernelStage::Refine, "canal_cap_normal")?;
-    if center_b.sub(center_a).dot(cap_up).abs() > 1e-6 * (1.0 + radius) {
+    if curved_cap.is_some() && chamfer {
+        return Err(unsolved("canal_curved_cap_chamfer"));
+    }
+    if curved_cap.is_none() && center_b.sub(center_a).dot(cap_up).abs() > 1e-6 * (1.0 + radius) {
         return Err(unsolved("canal_centres_off_plane"));
     }
+    // A curved cap: the ball's contact with it, the foot of the centre's
+    // normal onto the cap's carrier, and that foot's distance from the centre.
+    let cap_foot = |centre: Vec3| -> Option<(Vec3, f64)> {
+        let surface = &curved_cap?.surface;
+        let uv = crate::project_point_to_surface(surface, centre).ok()?;
+        let foot = surface.evaluate(uv.u, uv.v).ok()?;
+        Some((foot, foot.sub(centre).length()))
+    };
     let evaluate = |t: f64| -> Result<(Vec3, Vec3), KernelRefusal> {
         let row = sharp.curve.derivatives(t, 1).or_refuse(KernelStage::Refine, "derivatives")?;
         Ok((row[0], row[1]))
@@ -6388,8 +6514,62 @@ fn canal_corner_patch(
     let side = cap_up.cross(start);
     let total = finish.dot(side).atan2(finish.dot(start));
     let [t0, t1] = sharp.curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+    // A curved cap: the ball touches the edge at `p(t)` with its centre r
+    // out in the edge's normal plane at pivot angle `angle` about the edge,
+    // measured from stop a's radial; the edge parameter is the root of the
+    // centre's distance from the cap less r. Stop b's radial sets the sweep.
+    let normal_frame = |t: f64| -> Result<(Vec3, Vec3, Vec3), KernelRefusal> {
+        let (p, tangent) = evaluate(t)?;
+        let tangent = tangent.normalized().or_refuse(KernelStage::Refine, "canal_edge_tangent")?;
+        let radial_a = center_a.sub(evaluate(poles[0])?.0);
+        let e1 = radial_a.sub(tangent.scale(radial_a.dot(tangent))).normalized().or_refuse(KernelStage::Refine, "canal_radial")?;
+        Ok((p, e1, tangent.cross(e1)))
+    };
+    let curved_total = match curved_cap {
+        Some(_) => {
+            let (p, e1, e2) = normal_frame(poles[1])?;
+            let finish = center_b.sub(p);
+            finish.dot(e2).atan2(finish.dot(e1))
+        }
+        None => 0.0,
+    };
+    let curved_station = |u: f64, guess: f64| -> Result<(f64, Vec3, Vec3), KernelRefusal> {
+        let angle = curved_total * u;
+        let centre_of = |t: f64| -> Result<(Vec3, Vec3), KernelRefusal> {
+            let (p, e1, e2) = normal_frame(t)?;
+            Ok((p, p.add(e1.scale(radius * angle.cos())).add(e2.scale(radius * angle.sin()))))
+        };
+        let residual = |t: f64| -> Result<f64, KernelRefusal> {
+            let (_, centre) = centre_of(t)?;
+            let (_, distance) = cap_foot(centre).ok_or_else(|| unsolved("canal_cap_projection"))?;
+            Ok(distance - radius)
+        };
+        let span = (poles[1] - poles[0]).abs().max(1e-9 * (t1 - t0));
+        let step = 1e-6 * span;
+        let mut t = guess;
+        for _ in 0..48 {
+            let value = residual(t)?;
+            if value.abs() <= 1e-13 * (1.0 + radius) {
+                let (p, centre) = centre_of(t)?;
+                return Ok((t, p, centre));
+            }
+            let slope = (residual(t + step)? - value) / step;
+            if slope == 0.0 || !slope.is_finite() {
+                return Err(unsolved("canal_flat_residual"));
+            }
+            t = (t - value / slope).clamp(t0, t1);
+        }
+        let (p, centre) = centre_of(t)?;
+        if residual(t)?.abs() <= 1e-10 * (1.0 + radius) {
+            return Ok((t, p, centre));
+        }
+        Err(unsolved("canal_no_convergence"))
+    };
     // The nearest-point condition along the edge for one pivot angle.
     let station = |u: f64, guess: f64| -> Result<(f64, Vec3, Vec3), KernelRefusal> {
+        if curved_cap.is_some() {
+            return curved_station(u, guess);
+        }
         let angle = total * u;
         let dir = start.scale(angle.cos()).add(side.scale(angle.sin()));
         let residual = |t: f64| -> Result<Option<f64>, KernelRefusal> {
@@ -6436,7 +6616,10 @@ fn canal_corner_patch(
     };
     let highest = std::cell::Cell::new(0.0_f64);
     let arc_controls = |u: f64, p: Vec3, centre: Vec3| -> Result<[crate::Vec4; 3], KernelRefusal> {
-        let cap = centre.add(cap_up.scale(radius));
+        let cap = match curved_cap {
+            Some(_) => cap_foot(centre).ok_or_else(|| unsolved("canal_cap_projection"))?.0,
+            None => centre.add(cap_up.scale(radius)),
+        };
         let (from, to) = (p.sub(centre), cap.sub(centre));
         let cosine = (from.dot(to) / (radius * radius)).clamp(-1.0, 1.0);
         let half = 0.5 * cosine.acos();
@@ -6452,7 +6635,9 @@ fn canal_corner_patch(
         // the bound (checked once the creases are known). Without the crease,
         // the folded patch is admitted only up to this bound. A chamfer's row is the CHORD, which has no
         // stretch running backwards past the pivot: it is not bounded.
-        let height = p.sub(center_a).dot(cap_up).abs();
+        // On a curved cap the centres leave any one plane by design; the
+        // fold is read by the crease probe alone.
+        let height = if curved_cap.is_some() { 0.0 } else { p.sub(center_a).dot(cap_up).abs() };
         highest.set(highest.get().max(height));
         if !chamfer && !crease && height > CANAL_MAX_FOOT_HEIGHT * radius {
             return Err(unsolved("canal_foot_height"));
@@ -6524,6 +6709,13 @@ fn canal_corner_patch(
             // the corner keeps its existing closure (a flat cap, say).
             if !chamfer && creases.is_empty() && highest.get() > CANAL_MAX_FOOT_HEIGHT * radius {
                 return Err(unsolved("canal_foot_height"));
+            }
+            if curved_cap.is_some() {
+                let point = surface.evaluate(0.5, 0.5).or_refuse(KernelStage::Refine, "evaluate")?;
+                bump_wrap_outcome(|outcome| {
+                    outcome.wrapped += 1;
+                    outcome.points.push(point);
+                });
             }
             return Ok(CanalPatch { surface, cap_curve: fitted[2].clone(), creases });
         }

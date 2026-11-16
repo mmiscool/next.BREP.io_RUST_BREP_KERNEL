@@ -61,6 +61,8 @@ pub enum Glyph {
     Bevel,
     U,
     J,
+    FlareV,
+    FlareBevel,
     Plug,
     Spot,
     Seam,
@@ -215,10 +217,16 @@ impl WeldSymbol {
                     "BEVEL" => Glyph::Bevel,
                     "U" => Glyph::U,
                     "J" => Glyph::J,
+                    "FLARE_V" => Glyph::FlareV,
+                    "FLARE_BEVEL" => Glyph::FlareBevel,
                     _ => Glyph::V,
                 };
-                let angle = match weld.get("grooveAngle") { None => 60.0, value => number("weld groove angle", value, evaluate)? };
-                (shape, if shape == Glyph::Square { String::new() } else { format!("{}°", fmt(angle)) })
+                if matches!(shape, Glyph::Square | Glyph::FlareV | Glyph::FlareBevel) {
+                    (shape, String::new())
+                } else {
+                    let angle = match weld.get("grooveAngle") { None => 60.0, value => number("weld groove angle", value, evaluate)? };
+                    (shape, format!("{}°", fmt(angle)))
+                }
             }
             "WELD.SPOT" => {
                 pitch = match weld.get("pitch") { None => 25.0, value => number("weld pitch", value, evaluate)? };
@@ -449,6 +457,18 @@ pub fn present(symbol: &WeldSymbol, anchor: [f64; 3], elbow: [f64; 3], frame: &F
                 let mut line = arc(0.2, 0.55, 0.35, -std::f64::consts::FRAC_PI_2, 0.0);
                 line.push(pt(0.9, 1.0));
                 drawn.polylines.push(line);
+            }
+            // Flare-V: two arcs back to back, ")(", each bulging toward the
+            // middle; flare-bevel: the perpendicular leg and one arc, "|(".
+            Glyph::FlareV => {
+                let reach = (0.5_f64 / 0.6).asin();
+                drawn.polylines.push(arc(-0.15, 0.5, 0.6, -reach, reach));
+                drawn.polylines.push(arc(1.15, 0.5, 0.6, std::f64::consts::PI - reach, std::f64::consts::PI + reach));
+            }
+            Glyph::FlareBevel => {
+                let reach = (0.5_f64 / 0.6).asin();
+                drawn.polylines.push(vec![pt(0.2, 0.0), pt(0.2, 1.0)]);
+                drawn.polylines.push(arc(1.15, 0.5, 0.6, std::f64::consts::PI - reach, std::f64::consts::PI + reach));
             }
             Glyph::Plug => drawn.polylines.push(vec![pt(0.0, 0.0), pt(0.0, 0.6), pt(1.0, 0.6), pt(1.0, 0.0)]),
             Glyph::Spot => drawn.polylines.push(arc(0.5, 0.4, 0.4, 0.0, std::f64::consts::TAU)),

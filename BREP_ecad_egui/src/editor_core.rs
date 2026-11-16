@@ -19,6 +19,12 @@ impl<Doc: PartialEq, Selection, Drag> EditorCore<Doc, Selection, Drag> {
             selected: None, drag: None, pan: Vec2::ZERO, zoom,
         }
     }
+    /// Scale the view by `factor` holding still the point `anchor` points from
+    /// the canvas centre: the pointer's offset for the wheel, zero (the centre)
+    /// for the Zoom buttons.
+    pub fn zoom_about(&mut self, factor: f32, anchor: Vec2) {
+        crate::zoom_at(&mut self.zoom, &mut self.pan, factor, anchor);
+    }
     pub fn record(&mut self, before: Doc, after: &Doc, coalesce: Option<&str>) {
         if before != *after {
             self.history.record(before, after);

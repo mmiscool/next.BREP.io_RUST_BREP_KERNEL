@@ -1,4 +1,5 @@
 //! PCB layout view: footprint placement, manual routing, autorouting, and checks.
+use crate::grips::{self, Handle};
 use super::*;
 use crate::actions::{Action, ActionGroup, key, sheet_action};
 use brep_ecad_core::autoroute::RouteJob;
@@ -348,11 +349,11 @@ pub(crate) static BOARD_ACTIONS: &[Action<Editor>] = &[
         "board.rotate",
         "Rotate 90°",
         ActionGroup::Selection,
-        Editor::rotate_part,
+        Editor::rotate_selection,
     )
     .keys(&[key(Key::R)])
     .offered_when(board)
-    .enabled_when(|e| part_of(e.board_view.selected).is_some()),
+    .enabled_when(|e| part_of(e.board_view.selected).is_some() || e.turnable_drawing_or_cutout()),
     sheet_action(
         "board.delete",
         "Delete selection",
@@ -463,6 +464,9 @@ enum Subject {
     Zone(Uuid, ZoneGrip),
     Drawing(Uuid),
     Cutout(Uuid),
+    /// One grab handle of a selected drawing or cutout: a resize.
+    DrawingHandle(Uuid, Handle),
+    CutoutHandle(Uuid, Handle),
 }
 
 /// What a press on a zone takes hold of: one corner, the middle of one edge (a
@@ -1888,6 +1892,64 @@ impl Editor {
             self.edit_part(id, |p| p.rotation = (p.rotation + 1) % 4);
         }
     }
+    /// Whether the selection is a cutout, or a drawing that looks different
+    /// turned (not text, which has no angle, nor a circle).
+    fn turnable_drawing_or_cutout(&self) -> bool {
+        let board = &self.document.board;
+        match self.board_view.selected {
+            Some(BoardSelection::Cutout(id)) => board.cutouts.iter().any(|c| c.id == id),
+            Some(BoardSelection::Drawing(id)) => board.graphics.iter().any(|g| {
+                g.id == id && matches!(g.graphic.shape, GraphicShape::Polyline { .. } | GraphicShape::Arc { .. })
+            }),
+            _ => false,
+        }
+    }
+    /// R: a part turns as it always has; a drawing or a cutout turns a quarter
+    /// turn in place, about [`grips::pivot`] (its middle). A
+    /// cutout that would leave the board or meet another is not turned, and
+    /// says so, as a moved one is put back.
+    fn rotate_selection(&mut self) {
+        let board = &self.document.board;
+        match self.board_view.selected {
+            Some(BoardSelection::Drawing(id)) => {
+                let Some(k) = board.graphics.iter().position(|g| g.id == id) else { return };
+                let mut graphic = board.graphics[k].graphic.clone();
+                let Some(about) = grips::pivot(&grips::graphic_points(&graphic.shape)) else { return };
+                if !grips::turn_graphic(&mut graphic.shape, about) {
+                    return;
+                }
+                if let Some(problem) = graphic.problem() {
+                    self.board_view.message =
+                        format!("Not turned: that {} {problem}.", graphic_kind(&graphic).to_lowercase());
+                    return;
+                }
+                self.transaction(|d| d.board.graphics[k].graphic = graphic);
+            }
+            Some(BoardSelection::Cutout(id)) => {
+                let Some(k) = board.cutouts.iter().position(|c| c.id == id) else { return };
+                let mut points = board.cutouts[k].points.clone();
+                let Some(about) = grips::pivot(&points) else { return };
+                if !grips::turn_points(&mut points, about) {
+                    self.board_view.message = format!("Not turned: cutout {} would leave the drawing area.", k + 1);
+                    return;
+                }
+                if let Some(why) = board.cutout_problem(&points, Some(k)) {
+                    self.board_view.message = format!("Not turned: cutout {} {why}.", k + 1);
+                    return;
+                }
+                let before = self.document.clone();
+                self.document.board.cutouts[k].points = points;
+                // Copper keeps clear of the cutout where it now is, inside the
+                // same undo step, as after a move.
+                if !self.document.board.zones.is_empty() {
+                    self.document.fill_zones();
+                    self.note_filled();
+                }
+                self.commit(before, None);
+            }
+            _ => self.rotate_part(),
+        }
+    }
     fn flip_part(&mut self) {
         if let Some(id) = part_of(self.board_view.selected) {
             if self.document.board.layer_count < 2 {
@@ -2206,7 +2268,7 @@ impl Editor {
         ui.horizontal_wrapped(|ui| {
             match self.board_view.tool {
                 BoardTool::Select => {
-                    ui.label("Drag parts and vias to place them, and a track by a corner or a segment to reshape it — its ends stay on the pads and vias they meet, and a free end dropped on a pad of its net snaps to the pad's centre. Select a pad and press X to route from it. R rotates, right-drag pans.");
+                    ui.label("Drag parts and vias to place them, and a track by a corner or a segment to reshape it — its ends stay on the pads and vias they meet, and a free end dropped on a pad of its net snaps to the pad's centre. Select a pad and press X to route from it. A selected drawing or cutout is sized by its handles (Shift keeps proportions). R rotates, right-drag pans.");
                 }
                 BoardTool::Route => {
                     ui.label(if self.board_view.draft.is_some() {
@@ -4217,6 +4279,10 @@ impl Editor {
                 out.push((format!("cutout:{i}"), Rect::from_center_size(at, Vec2::splat(8.))));
             }
         }
+        // The selected drawing's or cutout's grab handles, `handle:<name>`.
+        for (h, at) in self.board_handles() {
+            out.push((format!("handle:{}", h.name()), grips::handle_rect(h, view.screen(at))));
+        }
         out.extend(view.menu.iter().cloned());
         out.extend(view.inspector.shown(view.canvas_pass));
         out.extend(view.toolbar_hits.shown(view.canvas_pass));
@@ -4243,6 +4309,51 @@ impl Editor {
             self.board_view.tolerance(),
         )
     }
+    /// The grab handles the selected board drawing or cutout wears, in board
+    /// micrometres ([`grips`]); none for anything else.
+    fn board_handles(&self) -> Vec<(Handle, Point)> {
+        let board = &self.document.board;
+        match self.board_view.selected {
+            Some(BoardSelection::Drawing(id)) => board
+                .graphics
+                .iter()
+                .find(|g| g.id == id)
+                .map(|g| grips::graphic_handles(&g.graphic.shape))
+                .unwrap_or_default(),
+            Some(BoardSelection::Cutout(id)) => {
+                board.cutouts.iter().find(|c| c.id == id).map(|c| grips::ring_handles(&c.points)).unwrap_or_default()
+            }
+            _ => vec![],
+        }
+    }
+    /// The selected drawing's or cutout's handle under `p`, if any.
+    fn board_handle_at(&self, p: Pos2) -> Option<Handle> {
+        let view = &self.board_view;
+        grips::handle_at(&self.board_handles(), |q| view.screen(q), p)
+    }
+    /// What a held handle has made of the selected drawing or cutout, for the
+    /// words beside the pointer.
+    fn board_grip_readout(&self, handle: Handle) -> Option<String> {
+        let mm = grips::mm;
+        let at = self.board_handles().into_iter().find(|(h, _)| *h == handle)?.1;
+        let board = &self.document.board;
+        let shape = match self.board_view.selected? {
+            BoardSelection::Drawing(id) => Some(board.graphics.iter().find(|g| g.id == id)?.graphic.shape.clone()),
+            _ => None,
+        };
+        Some(match (shape, handle) {
+            (Some(GraphicShape::Circle { radius, .. }), _) => format!("r {} mm", mm(radius)),
+            (_, Handle::Box(..)) => {
+                let handles = self.board_handles();
+                let xs = handles.iter().map(|(_, p)| p.x);
+                let ys = handles.iter().map(|(_, p)| p.y);
+                let w = xs.clone().max()? - xs.min()?;
+                let h = ys.clone().max()? - ys.min()?;
+                format!("{} × {} mm", mm(w), mm(h))
+            }
+            _ => format!("{}, {} mm", mm(at.x), mm(at.y)),
+        })
+    }
     fn hit_board(&self, p: Pos2) -> Option<BoardSelection> {
         let view = &self.board_view;
         let board = &self.document.board;
@@ -4262,6 +4373,12 @@ impl Editor {
             && let Some(Grip::Vertex(_)) = grip(board, track, q, tolerance)
         {
             return Some(BoardSelection::Track(id));
+        }
+        // The SELECTED drawing's or cutout's grab handles, for the same reason.
+        if let Some(selected @ (BoardSelection::Drawing(_) | BoardSelection::Cutout(_))) = view.selected
+            && self.board_handle_at(p).is_some()
+        {
+            return Some(selected);
         }
         // The SELECTED zone's corners and edge middles too, for the same reason:
         // a corner put down on a pad would otherwise be the pad's.
@@ -4505,13 +4622,17 @@ impl Editor {
         }
         // The wheel zooms about the pointer and needs it on the board; the keys do
         // not (`keys_reach_editor`).
-        if response.hovered() && !ui.ctx().egui_wants_keyboard_input() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.
-                && let Some(p) = pointer
-            {
-                self.board_view.zoom_about((scroll * 0.002).exp(), p);
-            }
+        if response.hovered()
+            && !ui.ctx().egui_wants_keyboard_input()
+            && let Some((factor, p)) = crate::pointer_zoom(ui)
+        {
+            self.board_view.zoom_about(factor, p);
+        }
+        let pinch = crate::pinching(ui);
+        if pinch && let Some((before, ..)) = self.board_view.drag.take() {
+            self.document = before;
+            self.board_view.placing = None;
+            self.board_view.landing = None;
         }
         if crate::keys_reach_editor(ui.ctx()) {
             self.run_shortcuts(ui.ctx());
@@ -4570,7 +4691,7 @@ impl Editor {
                     let rotate = ui.button("Rotate 90°");
                     self.board_view.menu.push(("menuitem:rotate".into(), rotate.rect));
                     if rotate.clicked() {
-                        self.rotate_part();
+                        self.rotate_selection();
                         ui.close();
                     }
                     let flip = ui.button("Flip side");
@@ -4612,18 +4733,24 @@ impl Editor {
         match self.board_view.tool {
             BoardTool::Select => {
                 // Say what a press would take hold of before it is pressed.
-                if self.board_view.drag.is_some() {
+                if let Some((.., Subject::DrawingHandle(_, h) | Subject::CutoutHandle(_, h))) = self.board_view.drag {
+                    ui.ctx().set_cursor_icon(h.cursor());
+                } else if self.board_view.drag.is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                } else if let Some(h) = pointer.and_then(|p| self.board_handle_at(p)) {
+                    ui.ctx().set_cursor_icon(h.cursor());
                 } else if let Some(p) = pointer
                     && self.grabbable(p)
                 {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
                 }
-                if response.drag_started_by(PointerButton::Primary)
+                if !pinch
+                    && response.drag_started_by(PointerButton::Primary)
                     && let Some(p) = ui.input(|i| i.pointer.press_origin())
                 {
                     let previous = self.board_view.selected;
                     self.board_view.selected = self.hit_board(p);
+                    let handle = (previous == self.board_view.selected).then(|| self.board_handle_at(p)).flatten();
                     // An edge's middle puts a corner in only on a zone already
                     // selected, whose middles are drawn; on any other it drags it.
                     let zone_grip = match self.board_view.selected {
@@ -4659,8 +4786,16 @@ impl Editor {
                             .and_then(|t| grip(board, t, q, self.board_view.tolerance()))
                             .map(|g| (Subject::Track(id, g), q)),
                         Some(BoardSelection::Zone(id)) => zone_grip.map(|g| (Subject::Zone(id, g), q)),
-                        Some(BoardSelection::Drawing(id)) => Some((Subject::Drawing(id), q)),
-                        Some(BoardSelection::Cutout(id)) => Some((Subject::Cutout(id), q)),
+                        // A handle of the drawing or cutout ALREADY selected
+                        // sizes it; anywhere else on it moves it.
+                        Some(BoardSelection::Drawing(id)) => match handle {
+                            Some(h) => Some((Subject::DrawingHandle(id, h), q)),
+                            None => Some((Subject::Drawing(id), q)),
+                        },
+                        Some(BoardSelection::Cutout(id)) => match handle {
+                            Some(h) => Some((Subject::CutoutHandle(id, h), q)),
+                            None => Some((Subject::Cutout(id), q)),
+                        },
                         None => None,
                     };
                     if let Some((what, at)) = grabbed {
@@ -4698,6 +4833,7 @@ impl Editor {
                     }
                     self.board_view.landing = landing;
                     let (target, what) = (at.offset(delta), *what);
+                    let keep = ui.input(|i| i.modifiers.shift);
                     self.document = before.clone();
                     let board = &mut self.document.board;
                     match what {
@@ -4730,6 +4866,30 @@ impl Editor {
                                 for p in &mut c.points {
                                     *p = Point::new(p.x + delta.x, p.y + delta.y);
                                 }
+                            }
+                        }
+                        // A handle goes to the pointer's grid point; Shift keeps
+                        // a box's proportions.
+                        Subject::DrawingHandle(id, h) => {
+                            let to = snap(q, PLACE_GRID);
+                            if let (Some(g), Some(was)) = (
+                                board.graphics.iter_mut().find(|g| g.id == id),
+                                before.board.graphics.iter().find(|g| g.id == id),
+                            ) {
+                                grips::drag_graphic(&mut g.graphic.shape, &was.graphic.shape, h, to, keep);
+                                // A shape no drawing may have is not taken.
+                                if g.graphic.problem().is_some() {
+                                    g.graphic.shape = was.graphic.shape.clone();
+                                }
+                            }
+                        }
+                        Subject::CutoutHandle(id, h) => {
+                            let to = snap(q, PLACE_GRID);
+                            if let (Some(c), Some(was)) = (
+                                board.cutouts.iter_mut().find(|c| c.id == id),
+                                before.board.cutouts.iter().find(|c| c.id == id),
+                            ) {
+                                grips::drag_ring(&mut c.points, &was.points, h, to, keep);
                             }
                         }
                     }
@@ -5405,6 +5565,25 @@ impl Editor {
                         egui::StrokeKind::Outside,
                     );
                 }
+            }
+        }
+        // The selected drawing's or cutout's grab handles, on top; the one held
+        // or under the pointer filled, and what a held one sets beside the
+        // pointer.
+        let handles = self.board_handles();
+        if !handles.is_empty() {
+            let held = match view.drag {
+                Some((.., Subject::DrawingHandle(_, h) | Subject::CutoutHandle(_, h))) => Some(h),
+                _ => None,
+            };
+            let hot = held.or_else(|| {
+                view.drag.is_none().then(|| pointer.and_then(|p| grips::handle_at(&handles, |q| view.screen(q), p))).flatten()
+            });
+            grips::paint_handles(painter, &handles, |q| view.screen(q), hot, ACCENT);
+            if let (Some(h), Some(p)) = (held, pointer)
+                && let Some(text) = self.board_grip_readout(h)
+            {
+                grips::paint_readout(painter, p, text);
             }
         }
         if board.placements.is_empty() {

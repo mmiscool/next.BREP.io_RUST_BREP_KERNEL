@@ -686,6 +686,12 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     // `BREP_PROFILE_WALL` (profile-wall builds): the face loop's time split by
     // what the pcurve work under it was doing.
     let _wall = crate::wall_profile::Stage::open("step_finish_faces");
+    // The lap totals below are this loop's alone: an earlier build on this
+    // thread that failed mid-loop must not be counted here.
+    if profile {
+        super::loops::take_loop_laps();
+        crate::pcurve::take_station_fit_laps();
+    }
     for (index, pending_face) in pending.into_iter().enumerate() {
         let face_ref = pending_face.face_ref;
         let face_started = profile.then(web_time::Instant::now);
@@ -709,6 +715,12 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
         faces.push(finished.map_err(|error| format!("step_import: face #{face_ref}: {error}"))?);
     }
     lap("finish_faces", &mut lap_started, &mut laps);
+    if profile {
+        let [ask, floor, refine, readings, supplied, analytic] = super::loops::take_loop_laps();
+        profile_line!("step_import.loop_laps ask_fit={ask:.1} floor_refit={floor:.1} refine={refine:.1} readings={readings:.1} supplied={supplied:.1} analytic={analytic:.1}");
+        let [setup, probes, inserts, repair, interpolant, residual, other] = crate::pcurve::take_station_fit_laps();
+        profile_line!("step_import.station_laps setup={setup:.1} probes={probes:.1} inserts={inserts:.1} repair={repair:.1} interpolant={interpolant:.1} residual={residual:.1} tracking_probes={other:.1}");
+    }
     if let Some(prefits) = prefits.take() {
         prefits.report(shell_ref);
     }

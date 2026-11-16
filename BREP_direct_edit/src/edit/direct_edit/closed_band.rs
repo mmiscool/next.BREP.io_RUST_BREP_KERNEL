@@ -398,13 +398,21 @@ pub(super) fn heal_closed_band(
     };
     let surface_a = surface_of(&solid, neighbour_ids[0])?;
     let surface_b = surface_of(&solid, neighbour_ids[1])?;
-    let curves = wall_sections(&surface_a, &surface_b, &band_points, scale, tolerance)?.ok_or_else(|| {
-        KernelRefusal::unsupported(
-            KernelStage::Classify,
-            "analytic_pair",
-            refusal("its neighbours are not a recognized analytic pair"),
-        )
-    })?;
+    // Two neighbours on ONE surface (a groove turned into a shaft: the shaft's
+    // cylinder on both sides of it) do not re-intersect in a curve; the band's
+    // removal lets that surface run on across it. The rim is then any section
+    // of it inside the band: the one midway, where both grow to meet.
+    let one_carrier = one_ruled_carrier_midway(&surface_a, &surface_b, &band_points, tolerance)?;
+    let curves = match &one_carrier {
+        Some(section) => vec![section.clone()],
+        None => wall_sections(&surface_a, &surface_b, &band_points, scale, tolerance)?.ok_or_else(|| {
+            KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "analytic_pair",
+                refusal("its neighbours are not a recognized analytic pair"),
+            )
+        })?,
+    };
     // The healed rim is the closed branch that runs through the band: score
     // each by its WORST sample's distance to the band's rims.
     let mut centre = Vec3::default();
@@ -1051,5 +1059,87 @@ pub(super) fn heal_closed_band(
             format!("{op}: closed-band heal failed validation: {issues:?}"),
         ));
     }
+    if one_carrier.is_some() {
+        return merge_one_carrier(solid, neighbour_ids, tolerance, op);
+    }
     Ok(solid)
+}
+
+/// The two neighbours of a one-carrier heal meet in a section of the surface
+/// they share, so they are one face again, as the solid was before the band
+/// or strip was cut: merge them (`merge_faces_within`). The merge declines
+/// some pairs and hands the solid back as it was — two cylinders whose seams
+/// stand at different azimuths (`merge_cylinder_full_turn`) — and the healed
+/// solid then stands as it is, exact and valid, its two faces meeting in the
+/// healed rim; the face map says which happened.
+pub(super) fn merge_one_carrier(
+    solid: BrepSolid,
+    neighbour_ids: [u64; 2],
+    tolerance: f64,
+    op: &str,
+) -> Result<BrepSolid, KernelRefusal> {
+    let (merged, carried_by) = crate::merge_faces_within(&solid, tolerance, &neighbour_ids).map_err(|error| {
+        KernelRefusal::internal(
+            KernelStage::Sew,
+            "one_carrier_merge",
+            format!(
+                "{op}: faces {} and {} share one surface and do not merge across the healed rim ({})",
+                neighbour_ids[0], neighbour_ids[1], error.message
+            ),
+        )
+    })?;
+    let carrier = |id: u64| carried_by.iter().find(|(face, _)| *face == id).map(|(_, carrier)| *carrier);
+    if carrier(neighbour_ids[0]).is_some() && carrier(neighbour_ids[0]) == carrier(neighbour_ids[1]) {
+        Ok(merged)
+    } else {
+        Ok(solid)
+    }
+}
+
+/// Whether both (extended) neighbours are the same surface of revolution
+/// over the band: both ruled (a cylinder or a cone) and every band point on
+/// both within `tolerance`. Two coaxial circles fix a ruled carrier, so a
+/// band whose two rims lie on both carriers has them coincide. Returns the
+/// section of that surface midway along the axis between the band's two
+/// rims — a `v = const` iso-curve of the first carrier — or `None` for any
+/// other pair, which goes on to the re-intersection.
+pub(super) fn one_ruled_carrier_midway(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    band_points: &[Vec3],
+    tolerance: f64,
+) -> Result<Option<NurbsCurve>, KernelRefusal> {
+    let (Some(AnalyticSurface::RuledRevolution { frame, height, .. }), Some(AnalyticSurface::RuledRevolution { .. })) =
+        (first.analytic(), second.analytic())
+    else {
+        return Ok(None);
+    };
+    let height: f64 = *height;
+    if band_points.is_empty() || height <= tolerance {
+        return Ok(None);
+    }
+    for point in band_points {
+        for surface in [first, second] {
+            let distance = crate::project_point_to_surface(surface, *point)
+                .or_refuse(KernelStage::Classify, "project")?
+                .distance;
+            if distance > tolerance {
+                return Ok(None);
+            }
+        }
+    }
+    let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+    for point in band_points {
+        let axial = point.sub(frame.origin).dot(frame.axis);
+        low = low.min(axial);
+        high = high.max(axial);
+    }
+    if high - low <= tolerance {
+        return Ok(None);
+    }
+    let station = 0.5 * (low + high) / height;
+    if !(0.0..=1.0).contains(&station) {
+        return Ok(None);
+    }
+    Ok(Some(first.iso_curve_v(station).or_refuse(KernelStage::Classify, "iso_curve")?))
 }

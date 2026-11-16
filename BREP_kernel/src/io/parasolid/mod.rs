@@ -13,15 +13,21 @@
 //!   into solids by translating each to Part 21 for the STEP importer
 //!   (`to_step`), with names and colours.
 
+mod check;
 mod geometry;
 mod import;
 mod reader;
 mod schema;
 mod to_step;
+mod to_xt;
+mod writer;
 
 
-pub use import::{import_parasolid, import_parasolid_bytes_report, import_parasolid_report, ParasolidImportReport};
+pub use import::{import_parasolid, import_parasolid_bodies, import_parasolid_bytes_bodies, import_parasolid_bytes_report, import_parasolid_report, ParasolidImportReport};
 pub use reader::{parse_xt, parse_xt_text, Node, NodeLayout, Value, XtFile};
+pub use check::check_xt_body;
+pub use to_xt::{export_parasolid_binary, export_parasolid_report, export_parasolid_text, XtExportBody, XtExportReport};
+pub use writer::{write_xt_binary_part_data, write_xt_part_data};
 pub use schema::{Count as XtFieldCount, FieldDef as XtFieldDef, Kind as XtFieldKind};
 
 /// Whether `text` is a Parasolid text part: it starts with the transmit

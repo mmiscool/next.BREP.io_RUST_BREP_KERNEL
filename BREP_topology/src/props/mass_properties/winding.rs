@@ -431,14 +431,14 @@ fn surface_breaks_window() -> bool {
     crate::switch!("BREP_SURFACE_BREAKS_WINDOW", true)
 }
 
-/// `BREP_SURFACE_BREAKS_HULL` (default off): [`split_at_surface_breaks`]
+/// `BREP_SURFACE_BREAKS_HULL` (default on; `0` samples every span): [`split_at_surface_breaks`]
 /// skips the 32 samples of a span whose control-point hull, in the taken
 /// coordinate, holds no level image. Every sample (and every bisection
 /// point) of such a span is a convex combination of those control points, so
 /// none can equal a level or lie on either side of one; the walk would cut
 /// nothing, and the span's breaks are the same numbers unread.
 fn surface_breaks_hull() -> bool {
-    crate::switch!("BREP_SURFACE_BREAKS_HULL", false)
+    crate::switch!("BREP_SURFACE_BREAKS_HULL", true)
 }
 
 /// Whether no level image `l + n·period` (`l` in `sorted`, computed as the
@@ -613,3 +613,4 @@ fn periodic_antiderivative(
     }
     Ok(())
 }
+

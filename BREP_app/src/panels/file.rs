@@ -770,6 +770,12 @@ pub(crate) enum ImportKind {
     /// Parasolid binary (`.x_b`, `.xmt_bin`, a `.p_b` partition): straight to
     /// the Import 3D Model feature, which reads the bytes.
     ParasolidBinary,
+    /// A SolidWorks part (`.sldprt`): its body, a Parasolid partition, into
+    /// the Import 3D Model feature.
+    SolidWorksPart,
+    /// A SolidWorks assembly (`.sldasm`): its parts, read from beside it on
+    /// disk, placed in one Import 3D Model feature.
+    SolidWorksAssembly,
     /// STL: the mesh reconstruction preview.
     Stl,
     /// 3MF: the STL lane — the same preview, tolerances and accept.
@@ -792,6 +798,8 @@ pub(crate) const IMPORT_TABLE: &[(&str, ImportKind)] = &[
     ("x_b", ImportKind::ParasolidBinary),
     ("xmt_bin", ImportKind::ParasolidBinary),
     ("p_b", ImportKind::ParasolidBinary),
+    ("sldprt", ImportKind::SolidWorksPart),
+    ("sldasm", ImportKind::SolidWorksAssembly),
     ("stl", ImportKind::Stl),
     ("3mf", ImportKind::ThreeMf),
     ("obj", ImportKind::Obj),
@@ -802,7 +810,7 @@ pub(crate) const IMPORT_TABLE: &[(&str, ImportKind)] = &[
 /// The extensions of [`IMPORT_TABLE`], for the explorer's filter and the
 /// system file chooser (a test holds the two lists equal).
 const IMPORT_EXTENSIONS: &[&str] =
-    &["step", "stp", "p21", "iges", "igs", "x_t", "xmt_txt", "p_t", "x_b", "xmt_bin", "p_b", "stl", "3mf", "obj", "kicad_sym", "kicad_mod"];
+    &["step", "stp", "p21", "iges", "igs", "x_t", "xmt_txt", "p_t", "x_b", "xmt_bin", "p_b", "sldprt", "sldasm", "stl", "3mf", "obj", "kicad_sym", "kicad_mod"];
 
 /// The import kind of a file name or path, by its last extension in any case;
 /// `None` for a model document or anything the app does not import. Model
@@ -1933,6 +1941,18 @@ impl FileDialog {
                 self.hit("export:iges", &iges);
                 if iges.clicked() {
                     chosen = Some("iges");
+                }
+                // Parasolid is what SolidWorks, NX and Solid Edge open
+                // natively: the route to SolidWorks.
+                let xt = ui.button("Parasolid (.x_t)").on_hover_text("For SolidWorks, NX and Solid Edge: they open Parasolid natively");
+                self.hit("export:parasolid", &xt);
+                if xt.clicked() {
+                    chosen = Some("parasolid");
+                }
+                let xb = ui.button("Parasolid binary (.x_b)");
+                self.hit("export:parasolidbinary", &xb);
+                if xb.clicked() {
+                    chosen = Some("parasolidbinary");
                 }
                 let stl = ui.button("STL (.stl)");
                 self.hit("export:stl", &stl);
@@ -3313,6 +3333,22 @@ impl FileDialog {
                 }
             };
         }
+        if format == "parasolid" || format == "parasolidbinary" {
+            let binary = format == "parasolidbinary";
+            let ext = if binary { "x_b" } else { "x_t" };
+            return match state.export_parasolid_selected(&name, None, binary) {
+                Ok(bytes) => {
+                    let title = format!("Export Parasolid ({})", if binary { ".x_b" } else { ".x_t" });
+                    let body = if binary { SaveBody::Bytes(bytes) } else { SaveBody::Text(String::from_utf8_lossy(&bytes).into_owned()) };
+                    let request = SaveRequest { title, file_name: format!("{name}.{ext}"), body };
+                    self.deliver(docs, store, export(request)) != Delivery::Failed
+                }
+                Err(e) => {
+                    self.status = format!("export failed: {e}");
+                    false
+                }
+            };
+        }
         let (text, ext) = match format {
             "stl" => (state.export_stl_text(), "stl"),
             "obj" => (state.export_obj_text(), "obj"),
@@ -3922,6 +3958,12 @@ impl FileDialog {
                 self.import_text(state, &name, &bytes, Self::import_step)
             }
             ImportKind::ParasolidBinary => self.import_parasolid_bytes(state, &name, &bytes),
+            ImportKind::SolidWorksPart | ImportKind::SolidWorksAssembly => {
+                match state.import_solidworks_feature(&bytes, &name, kind == ImportKind::SolidWorksAssembly) {
+                    Ok(_) => self.status = format!("imported {name}"),
+                    Err(e) => self.status = format!("import failed: {e}"),
+                }
+            }
             ImportKind::Stl => self.stage_mesh_preview(MeshImportFormat::Stl, name, bytes),
             ImportKind::ThreeMf => self.stage_mesh_preview(MeshImportFormat::ThreeMf, name, bytes),
             ImportKind::Obj => self.import_obj(state, &name, &bytes),
@@ -3955,7 +3997,9 @@ impl FileDialog {
         docs.active_mut().set_label(Some(title.clone()));
         let base = file_name.rsplit(['/', '\\']).next().unwrap_or(file_name).to_string();
         self.status.clear();
-        if self.import_file(kind, docs.engine_mut(), store, base, bytes) {
+        // A SolidWorks assembly reads its parts from beside it: it keeps its path.
+        let given = if kind == ImportKind::SolidWorksAssembly { file_name.to_string() } else { base };
+        if self.import_file(kind, docs.engine_mut(), store, given, bytes) {
             self.close_after_import();
         }
         if self.status.starts_with("import failed") {
@@ -4990,7 +5034,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "file", prefix: "cancel", meaning: "close the modal", command: None },
     HitKeyDoc { panel: "file", prefix: "confirm:cancel", meaning: "keep the dirty document open", command: None },
     HitKeyDoc { panel: "file", prefix: "confirm:discard", meaning: "discard the dirty document", command: None },
-    HitKeyDoc { panel: "file", prefix: "export:", meaning: "export in a format (export:step, export:iges, export:stl, export:obj, export:glb, export:3mf, export:json, export:bomcsv, export:bomjson, the open DRAWING SHEET as export:sheetsvg, every drawing sheet as ONE multi-page PDF as export:sheetpdf, and the same drawing set with the live 3D model as export:sheetpdf3d; for a document whose PCB board has parts, its manufacturing files: the Gerber/drill/pick-and-place/BOM zip as export:fabrication, the pick-and-place CSV as export:pickplace, the electronics BOM CSV as export:ecadbom; for manufacturing instructions, the printed PDF as export:instructionspdf, every step's PNG and SVG as one zip as export:instructionsimages, and the self-contained offline player as export:instructionshtml)", command: None },
+    HitKeyDoc { panel: "file", prefix: "export:", meaning: "export in a format (export:step, export:iges, Parasolid as export:parasolid (.x_t) and export:parasolidbinary (.x_b), export:stl, export:obj, export:glb, export:3mf, export:json, export:bomcsv, export:bomjson, the open DRAWING SHEET as export:sheetsvg, every drawing sheet as ONE multi-page PDF as export:sheetpdf, and the same drawing set with the live 3D model as export:sheetpdf3d; for a document whose PCB board has parts, its manufacturing files: the Gerber/drill/pick-and-place/BOM zip as export:fabrication, the pick-and-place CSV as export:pickplace, the electronics BOM CSV as export:ecadbom; for manufacturing instructions, the printed PDF as export:instructionspdf, every step's PNG and SVG as one zip as export:instructionsimages, and the self-contained offline player as export:instructionshtml)", command: None },
     HitKeyDoc { panel: "file", prefix: "flat:", meaning: "export the flat pattern (flat:dxf, flat:svg)", command: None },
     HitKeyDoc { panel: "file", prefix: "savefile:", meaning: "the Save-file chooser a desktop export opens after its format click, for WHERE the file goes: savefile:name is the file name field, and its explorer over this machine's files publishes the explorer's key set under the `savefile` prefix (savefile:<file name> a row to overwrite, savefile:crumb:<i>, savefile:place:<label>, savefile:up, savefile:path-edit, …); `save` writes the file where the explorer is, `cancel` drops it. In the browser an export is a download and the chooser never opens", command: None },
     HitKeyDoc { panel: "file", prefix: "stepassembly:", meaning: "a STEP-with-structure import choice (assembly, bodies, flatten, cancel)", command: None },

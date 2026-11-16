@@ -103,6 +103,7 @@ pub fn assembly_session_export() -> Option<SessionTransfer> {
             .copied()
             .chain(scene.faces.values().map(|face| face.handle))
             .chain(scene.edges.values().map(|edge| edge.handle))
+            .chain(scene.weld_prepared.values().flatten().map(|link| link.prior))
             .collect();
         handles.sort_unstable();
         handles.dedup();
@@ -136,6 +137,7 @@ pub fn assembly_session_import(transfer: SessionTransfer) -> RetiredSession {
     scene.solids.values_mut().for_each(remap);
     scene.faces.values_mut().for_each(|face| remap(&mut face.handle));
     scene.edges.values_mut().for_each(|edge| remap(&mut edge.handle));
+    scene.weld_prepared.values_mut().flatten().for_each(|link| remap(&mut link.prior));
     let retired = replace_session(session);
     IMPORTED.with(|imported| *imported.borrow_mut() = owned);
     retired
@@ -167,9 +169,22 @@ pub(crate) fn publish_weld_scene(scene: &SceneMap, moved: &[(String, u32)]) {
     SESSION.with(|slot| {
         if let Some(session) = slot.borrow_mut().as_mut() {
             session.scene = scene.clone();
+            let Some(report) = session.report.as_object_mut() else { return };
+            // A member a weld prepared in context was reported moved by the
+            // solve under the prepared body, which the weld's rebuild then
+            // freed (also when the rebuild failed and the member went back to
+            // its component's body): each entry names the body its name
+            // holds now, and a name no longer in the scene is not reported.
+            if let Some(entries) = report.get_mut("movedSolids").and_then(|entries| entries.as_array_mut()) {
+                entries.retain_mut(|entry| {
+                    let Some(name) = entry.get("name").and_then(|n| n.as_str()).map(str::to_string) else { return false };
+                    let Some(&handle) = scene.solids.get(&name) else { return false };
+                    entry["handle"] = serde_json::json!(handle);
+                    !moved.iter().any(|(moved, _)| moved == &name)
+                });
+            }
             if !moved.is_empty() {
-                let entries = session.report.as_object_mut().expect("assembly report object")
-                    .entry("movedSolids").or_insert_with(|| serde_json::json!([]));
+                let entries = report.entry("movedSolids").or_insert_with(|| serde_json::json!([]));
                 if let Some(entries) = entries.as_array_mut() {
                     entries.extend(moved.iter().map(|(name, handle)| serde_json::json!({"name": name, "handle": handle})));
                 }
@@ -177,6 +192,30 @@ pub(crate) fn publish_weld_scene(scene: &SceneMap, moved: &[(String, u32)]) {
         }
     });
 }
+
+/// The components of the last run whose members a weld prepared in context
+/// (`SceneMap::weld_prepared`): root component id -> the preparing welds. Read by
+/// the structured STEP export, which writes such an instance from its
+/// as-welded bodies instead of the shared part.
+pub(crate) fn context_prepared_components() -> BTreeMap<String, Vec<String>> {
+    SESSION.with(|slot| {
+        let mut prepared: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if let Some(session) = slot.borrow().as_ref() {
+            let scene = &session.scene;
+            for member in scene.weld_prepared.keys() {
+                let (Some(entry), Some(record)) = (scene.context_member(member), scene.owning_component(member)) else { continue };
+                // A flexible occurrence (`ACOMP1:ACOMP2`) is written with the
+                // root instance that places it.
+                let root = record.id.split(':').next().unwrap_or(&record.id).to_string();
+                let welds = prepared.entry(root).or_default();
+                if !welds.contains(&entry.weld) { welds.push(entry.weld.clone()); }
+            }
+        }
+        for welds in prepared.values_mut() { welds.sort(); }
+        prepared
+    })
+}
+
 
 fn with_session<T>(f: impl FnOnce(&mut Session) -> Result<T, String>) -> Result<T, String> {
     SESSION.with(|session| {

@@ -1,5 +1,27 @@
 use super::*;
 
+thread_local! {
+    /// Profile only: `build_loop`'s coedge time by step (ask fit, floor refit,
+    /// projected-feet refine, readings, supplied, analytic precision), ms.
+    static LOOP_LAPS: std::cell::Cell<[f64; 6]> = const { std::cell::Cell::new([0.0; 6]) };
+}
+
+fn loop_lap(slot: usize, started: Option<web_time::Instant>) -> Option<web_time::Instant> {
+    let started = started?;
+    let now = web_time::Instant::now();
+    LOOP_LAPS.with(|laps| {
+        let mut all = laps.get();
+        all[slot] += (now - started).as_secs_f64() * 1e3;
+        laps.set(all);
+    });
+    Some(now)
+}
+
+/// Profile only: take and reset the [`LOOP_LAPS`] totals.
+pub(super) fn take_loop_laps() -> [f64; 6] {
+    LOOP_LAPS.with(|laps| laps.replace([0.0; 6]))
+}
+
 fn finite_point(point: Vec3) -> bool {
     point.x.is_finite() && point.y.is_finite() && point.z.is_finite()
 }
@@ -319,14 +341,17 @@ impl<'a> SolidBuilder<'a> {
             // parameter space, when the file supplies one and it verifies.
             // Falls through to the projection fit otherwise, which is what the
             // importer did for every coedge before this lane existed.
+            let lap = crate::profile::profile_enabled().then(web_time::Instant::now);
             let supplied =
                 self.supplied_loop_pcurve(surface, surface_ref, *edge_id, *forward, pcurve_tol)?;
             let edge = self.edge_record(*edge_id).clone();
+            let lap = loop_lap(4, lap);
             let precision = if supplied.is_none() && switch!("BREP_STEP_MASS_TRIM_TRACKING", true) {
                 improved_projected_analytic_trim(surface, &edge, *forward, pcurve_tol)
             } else {
                 None
             };
+            loop_lap(5, lap);
             let mut pcurve = match supplied.or(precision) {
                 Some(pcurve) => pcurve,
                 None => {
@@ -345,7 +370,9 @@ impl<'a> SolidBuilder<'a> {
                     // (`abc_00000012` face #299 edge 179, `abc_00000011` #585:
                     // 2.06e-4 at the ask, 0.250 mm at the floor, measured
                     // 2026-09-26).
+                    let lap = crate::profile::profile_enabled().then(web_time::Instant::now);
                     let mut fit = super::prefit::fit_range(surface, &edge, *forward, pcurve_tol)?;
+                    let lap = loop_lap(0, lap);
                     let mut refitted = false;
                     let deviation_trigger = fit.report.residual > trim_detector_bar(&fit.report);
                     if deviation_trigger && pcurve_tol > crate::PCURVE_REFINEMENT_TOLERANCE {
@@ -360,10 +387,12 @@ impl<'a> SolidBuilder<'a> {
                             refitted = true;
                         }
                     }
+                    let lap = loop_lap(1, lap);
                     if self.refines_projected_feet(surface, &edge.curve) {
                         fit = crate::pcurve::refine_import_projected_range(surface, &edge.curve,
                             edge.t0, edge.t1, *forward, fit);
                     }
+                    let lap = loop_lap(2, lap);
                     // What follows only READS the trim (the import report's bounded-trim
                     // diagnostics and the trim-readings capture): the pcurve is already
                     // chosen. A build whose readings nobody takes (every assembly part)
@@ -448,6 +477,7 @@ impl<'a> SolidBuilder<'a> {
                             });
                         }
                     }
+                    loop_lap(3, lap);
                     fit.curve
                 }
             };

@@ -615,6 +615,8 @@ pub use iges::{
 };
 #[path = "io/parasolid/mod.rs"]
 pub mod parasolid;
+#[path = "io/solidworks/mod.rs"]
+pub mod solidworks;
 #[path = "io/mesh_io.rs"]
 mod mesh_io;
 pub use mesh_io::{

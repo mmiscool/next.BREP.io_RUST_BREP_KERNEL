@@ -40,6 +40,46 @@ thread_local! {
     static WIDENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// Concave sides held back (the tangent connector's convention) on this thread.
+    static CONCAVE_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Whether concave sides are continued round their arc on this thread.
+    static CONCAVE_ARC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `BREP_OFFSET_CONCAVE_ARC_RETRY` (default on; `=0` restores the refusal): an
+/// outward pass that refused after holding back a CONCAVE side (one whose
+/// surface bends into the material across it) is run once more with those
+/// sides continued round their arc, the OCCT convention for a concave sharp
+/// join. The first pass keeps the tangent connector wherever it builds (a
+/// box notched by a quarter cylinder, shelled outward: its pinned closed form
+/// is that convention), so only refusals change.
+///
+/// Cause (probe): a box with a spherical dimple, or with a cylindrical groove,
+/// grown sharp, refused at every distance (a vacated rim left open; a
+/// connector edge that left its plane): the concave face's offset stopped at
+/// its source rim, short of the moved plane it must meet.
+pub(super) fn concave_arc_retry_on() -> bool {
+    crate::switch!("BREP_OFFSET_CONCAVE_ARC_RETRY", true)
+}
+
+/// The concave sides held back on this thread so far.
+pub(super) fn concave_held() -> usize {
+    CONCAVE_HELD.with(std::cell::Cell::get)
+}
+
+/// Runs `action` with concave sides continued round their arc.
+pub(super) fn with_concave_arc<T>(action: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CONCAVE_ARC.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(CONCAVE_ARC.with(|cell| cell.replace(true)));
+    action()
+}
+
 /// The number of faces widened on this thread so far.
 pub(super) fn widened_count() -> usize {
     WIDENED.with(|count| count.get())
@@ -159,7 +199,11 @@ pub(super) fn outward_sharp_side_widened_source(
         // notched by a quarter cylinder, shelled outward: its pinned closed
         // form is that convention), and continuing it round its arc refused.
         if bends_into_the_material(face, slot, *at, if slot < 2 { (va, vb) } else { (ua, ub) })? {
-            continue;
+            if !CONCAVE_ARC.with(std::cell::Cell::get) {
+                CONCAVE_HELD.with(|held| held.set(held.get() + 1));
+                continue;
+            }
+            os_debug!("outward side widening: face {} side {slot} is concave, continued round its arc (retry)", face.id);
         }
         grow[slot] = asked * 1.5;
     }

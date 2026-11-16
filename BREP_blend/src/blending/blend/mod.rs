@@ -478,6 +478,7 @@ pub use runout::{build_runout_walls, plan_runout, RunoutPlan};
 pub use fold::{is_rail_fold, is_wall_fold, wall_loop_refusal, WALL_FOLDS};
 pub use stations::is_ball_off_carrier;
 pub use network::is_ball_does_not_fit;
+pub use network::{body_carries_wrapped_corner, reject_wrapped_network, with_wrap_sharp_corners, wrap_sharp_corners_on, WrapOutcome};
 
 /// Off the switch every closed rim's two support pcurves are refitted to their
 /// rail's projected track (`edge/closed.rs::refit_closed_support_pcurve`, the

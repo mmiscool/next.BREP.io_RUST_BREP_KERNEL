@@ -7,6 +7,7 @@ use crate::symbol_editor::{InspectorHits, LIST_SHARE, grip_under, key_word, list
 use brep_ecad_core::board::{COURTYARD_MARGIN, DesignRules, Footprint, Pad, PadShape, PadVias, PasteWindows, Shape};
 use brep_ecad_core::graphic::{GraphicLayer, GraphicShape, LayerGraphic};
 use crate::board_view::graphic_color;
+use crate::grips::{self, Handle};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum DrawTool {
@@ -225,6 +226,9 @@ pub struct FootprintEditor {
     /// their grips, or `None` for the pane's share.
     items_height: Option<f32>,
     pins_height: Option<f32>,
+    /// The grab handle of the selected item a drag holds, if the drag is a
+    /// resize rather than a move.
+    grip: Option<Handle>,
 }
 impl FootprintEditor {
     pub fn new(footprint: Footprint, target: Option<Uuid>, pins: Vec<String>) -> Self {
@@ -250,6 +254,7 @@ impl FootprintEditor {
             listed: None,
             items_height: None,
             pins_height: None,
+            grip: None,
         }
     }
     pub fn blank() -> Self {
@@ -419,8 +424,119 @@ impl FootprintEditor {
             };
             Some((format!("graphic:{i}"), Rect::from_center_size(at, Vec2::splat(8.))))
         });
-        pads.chain(silk).chain(graphics).chain(self.inspector.shown(self.canvas_pass))
+        // The selected item's grab handles, `handle:<name>` (`handle:ne`,
+        // `handle:radius`, `handle:vertex:2`), where they are drawn.
+        let handles = self
+            .handles()
+            .into_iter()
+            .map(|(h, at)| (format!("handle:{}", h.name()), grips::handle_rect(h, screen(at))));
+        pads.chain(silk).chain(graphics).chain(handles).chain(self.inspector.shown(self.canvas_pass))
             .chain(self.toolbar_hits.shown(self.canvas_pass)).collect()
+    }
+    /// The grab handles the selected item wears, in footprint micrometres: a
+    /// pad's or a drawn item's ([`grips`]), a silkscreen line's corners.
+    fn handles(&self) -> Vec<(Handle, Point)> {
+        match self.core.selected {
+            Some(Item::Pad(i)) => self.footprint.pads.get(i).map(grips::pad_handles).unwrap_or_default(),
+            Some(Item::Graphic(i)) => {
+                self.footprint.graphics.get(i).map(|g| grips::graphic_handles(&g.shape)).unwrap_or_default()
+            }
+            Some(Item::Silk(i)) => self.footprint.silk.get(i).map(|line| grips::path_handles(line)).unwrap_or_default(),
+            None => vec![],
+        }
+    }
+    /// Whether R turns the selection: a pad, a silkscreen line, or a drawn
+    /// item that looks different turned (not text, which has no angle, nor a
+    /// circle).
+    fn can_rotate(&self) -> bool {
+        match self.core.selected {
+            Some(Item::Pad(i)) => i < self.footprint.pads.len(),
+            Some(Item::Silk(i)) => i < self.footprint.silk.len(),
+            Some(Item::Graphic(i)) => self
+                .footprint
+                .graphics
+                .get(i)
+                .is_some_and(|g| matches!(g.shape, GraphicShape::Polyline { .. } | GraphicShape::Arc { .. })),
+            None => false,
+        }
+    }
+    /// Turn the selection a quarter turn in place, one undo step: a pad about
+    /// its position, a line or drawn item about [`grips::pivot`] (its middle,
+    /// so four turns put it back). A turn past the drawing area is not made.
+    fn rotate_selected(&mut self) {
+        if !self.can_rotate() {
+            return;
+        }
+        let before = self.footprint.clone();
+        let turned = match self.core.selected {
+            Some(Item::Pad(i)) => {
+                turn_pad(&mut self.footprint.pads[i]);
+                true
+            }
+            Some(Item::Silk(i)) => grips::pivot(&self.footprint.silk[i])
+                .is_some_and(|about| grips::turn_points(&mut self.footprint.silk[i], about)),
+            Some(Item::Graphic(i)) => {
+                let g = &mut self.footprint.graphics[i];
+                grips::pivot(&grips::graphic_points(&g.shape)).is_some_and(|about| grips::turn_graphic(&mut g.shape, about))
+                    && g.problem().is_none()
+            }
+            None => false,
+        };
+        if !turned {
+            self.footprint = before;
+            return;
+        }
+        self.record(before);
+    }
+    /// What a handle drag has made of the selected item, in the words drawn
+    /// beside the pointer while it is held: the size, radius or corner it sets.
+    fn grip_readout(&self, handle: Handle) -> Option<String> {
+        let mm = grips::mm;
+        match self.core.selected? {
+            Item::Pad(i) => {
+                let pad = self.footprint.pads.get(i)?;
+                Some(match handle {
+                    Handle::Box(..) => format!("{} × {} mm", mm(pad.size.x.abs()), mm(pad.size.y.abs())),
+                    Handle::Radius => format!("Ø {} mm", mm(pad.size.x.abs().min(pad.size.y.abs()))),
+                    Handle::Rounding => format!("corner radius {} mm", mm(pad.effective_corner_radius())),
+                    Handle::Taper => {
+                        let d = pad.trapezoid_delta;
+                        format!("taper {} mm", mm(if d.x != 0 { d.x } else { d.y }))
+                    }
+                    Handle::Vertex(k) => {
+                        let p = pad.at.offset(*pad.polygon.get(k)?);
+                        format!("{}, {} mm", mm(p.x), mm(p.y))
+                    }
+                })
+            }
+            Item::Graphic(i) => {
+                let g = self.footprint.graphics.get(i)?;
+                Some(match (&g.shape, handle) {
+                    (GraphicShape::Polyline { points }, Handle::Box(..)) => {
+                        let (min, max) = grips::upright_rectangle(points)?;
+                        format!("{} × {} mm", mm(max.x - min.x), mm(max.y - min.y))
+                    }
+                    (GraphicShape::Circle { radius, .. }, _) => format!("r {} mm", mm(*radius)),
+                    _ => {
+                        let (_, at) = grips::graphic_handles(&g.shape).into_iter().find(|(h, _)| *h == handle)?;
+                        format!("{}, {} mm", mm(at.x), mm(at.y))
+                    }
+                })
+            }
+            Item::Silk(i) => {
+                let line = self.footprint.silk.get(i)?;
+                Some(match handle {
+                    Handle::Box(..) => {
+                        let (min, max) = grips::upright_rectangle(line)?;
+                        format!("{} × {} mm", mm(max.x - min.x), mm(max.y - min.y))
+                    }
+                    _ => {
+                        let (_, p) = grips::path_handles(line).into_iter().find(|(h, _)| *h == handle)?;
+                        format!("{}, {} mm", mm(p.x), mm(p.y))
+                    }
+                })
+            }
+        }
     }
     /// The index of the selected silkscreen line, or `None` when the selection
     /// is a pad or empty — [`Self::selected_pad`]'s twin for silk, which has
@@ -651,7 +767,7 @@ impl FootprintEditor {
                 "Click to place the pad for pin {pin}; it is on that pin from the moment it exists. Select puts the tool down."
             ),
             (None, DrawTool::Select) => {
-                "Select or drag an item. Right-drag pans. Scroll zooms. Pads are viewed from the top.".to_owned()
+                "Select or drag an item; drag a selected item's handles to size it (Shift keeps proportions). Right-drag pans. Scroll or pinch zooms about the pointer. Pads are viewed from the top.".to_owned()
             }
             (None, DrawTool::Pad | DrawTool::ThroughHole) => {
                 "Click to place a pad, or drag to draw its outline. A new pad takes the lowest free number; Item properties puts it on a pin.".to_owned()
@@ -1425,25 +1541,7 @@ impl FootprintEditor {
         let rotate = ui.button("Rotate pad 90°");
         hits.mark("rotate", &rotate);
         if rotate.clicked() {
-            pad.size = Point::new(pad.size.y, pad.size.x);
-            // A quarter turn, (x, y) to (-y, x): a trapezoid's taper and a
-            // custom pad's corners turn with it.
-            pad.trapezoid_delta = Point::new(pad.trapezoid_delta.y, -pad.trapezoid_delta.x);
-            for p in &mut pad.polygon {
-                *p = Point::new(-p.y, p.x);
-            }
-            // A windowpane's columns run where its rows did, and a via grid's.
-            if let Some(windows) = pad.layers.paste_windows.as_mut() {
-                (windows.columns, windows.rows) = (windows.rows, windows.columns);
-            }
-            if let Some(grid) = pad.vias.as_mut() {
-                (grid.columns, grid.rows) = (grid.rows, grid.columns);
-                grid.pitch = Point::new(grid.pitch.y, grid.pitch.x);
-            }
-            // A slot turns with its pad.
-            if let (Some(width), Some(height)) = (pad.drill, pad.drill_height) {
-                (pad.drill, pad.drill_height) = (Some(height), Some(width));
-            }
+            turn_pad(pad);
         }
         ui.separator();
         ui.label("Repeat pad");
@@ -1566,9 +1664,20 @@ impl FootprintEditor {
         {
             self.core.pan += ui.input(|i| i.pointer.delta());
         }
-        if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            self.core.zoom = crate::scaled_zoom(self.core.zoom, (scroll * 0.002).exp());
+        // The wheel and a pinch zoom about the pointer: the point under it stays
+        // where it is on screen.
+        if response.hovered()
+            && let Some((factor, p)) = crate::pointer_zoom(ui)
+        {
+            self.core.zoom_about(factor, p - rect.center());
+        }
+        let pinch = crate::pinching(ui);
+        if pinch {
+            if let Some((before, _)) = self.core.drag.take() {
+                self.footprint = before;
+            }
+            self.start = None;
+            self.grip = None;
         }
         let zoom = self.core.zoom;
         let center = rect.center() + self.core.pan;
@@ -1580,11 +1689,17 @@ impl FootprintEditor {
             )
         };
         let pointer = response.interact_pointer_pos();
-        if response.drag_started_by(PointerButton::Primary)
+        if !pinch
+            && response.drag_started_by(PointerButton::Primary)
             && let Some(p) = ui.input(|i| i.pointer.press_origin())
         {
             if self.tool == DrawTool::Select {
-                self.core.selected = self.hit(p, screen, raw(p));
+                // A handle of the item ALREADY selected comes first: it sits on
+                // the item's own edge, where a press would otherwise move it.
+                self.grip = grips::handle_at(&self.handles(), screen, p);
+                if self.grip.is_none() {
+                    self.core.selected = self.hit(p, screen, raw(p));
+                }
                 self.core.drag = self.core.selected.map(|_| (self.footprint.clone(), raw(p)));
             } else {
                 self.start = Some(self.snap(raw(p)));
@@ -1595,21 +1710,49 @@ impl FootprintEditor {
             // Snap the offset so items that sit off the grid keep their position relative to it.
             let delta = self.snap(Point::new(q.x - start.x, q.y - start.y));
             self.footprint = before.clone();
-            match self.core.selected {
-                Some(Item::Pad(i)) => {
+            // A handle: the side, corner or radius it holds goes to the
+            // pointer's grid point; Shift keeps a box's proportions.
+            let held = self.grip.map(|h| (h, self.snap(q), ui.input(|i| i.modifiers.shift)));
+            match (self.core.selected, held) {
+                (Some(Item::Pad(i)), Some((h, q, keep))) => {
                     let pad = &mut self.footprint.pads[i];
-                    pad.at = pad.at.offset(delta);
-                }
-                Some(Item::Silk(i)) => {
-                    for p in &mut self.footprint.silk[i] {
-                        *p = p.offset(delta);
+                    grips::drag_pad(pad, &before.pads[i], h, q, keep);
+                    // Copper no pad may have (a custom pad's corners crossing)
+                    // is not taken: it stays as it was.
+                    if pad.outline_problem().is_some() && before.pads[i].outline_problem().is_none() {
+                        *pad = before.pads[i].clone();
                     }
                 }
-                Some(Item::Graphic(i)) => move_graphic(&mut self.footprint.graphics[i], delta),
-                None => {}
+                (Some(Item::Graphic(i)), Some((h, q, keep))) => {
+                    let g = &mut self.footprint.graphics[i];
+                    grips::drag_graphic(&mut g.shape, &before.graphics[i].shape, h, q, keep);
+                    // A shape no drawing may have (an arc bent through three
+                    // points in a line) is not taken: it stays as it was.
+                    if g.problem().is_some() {
+                        g.shape = before.graphics[i].shape.clone();
+                    }
+                }
+                (Some(Item::Silk(i)), Some((h, q, keep))) => {
+                    grips::drag_path(&mut self.footprint.silk[i], &before.silk[i], h, q, keep);
+                }
+                (_, Some(_)) => {}
+                (selected, None) => match selected {
+                    Some(Item::Pad(i)) => {
+                        let pad = &mut self.footprint.pads[i];
+                        pad.at = pad.at.offset(delta);
+                    }
+                    Some(Item::Silk(i)) => {
+                        for p in &mut self.footprint.silk[i] {
+                            *p = p.offset(delta);
+                        }
+                    }
+                    Some(Item::Graphic(i)) => move_graphic(&mut self.footprint.graphics[i], delta),
+                    None => {}
+                },
             }
         }
         if response.drag_stopped_by(PointerButton::Primary) {
+            self.grip = None;
             if let Some((before, _)) = self.core.drag.take() {
                 self.record(before);
             }
@@ -1835,11 +1978,31 @@ impl FootprintEditor {
                 painter.add(egui::Shape::line(line.iter().map(|p| screen(*p)).collect(), Stroke::new(width, color)));
             }
         }
+        // The selected item's grab handles, over everything else; the one held
+        // or under the pointer is filled and sets the pointer's shape. While
+        // one is held, what it sets is written beside the pointer.
+        let hover = ui.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p));
+        let handles = self.handles();
+        let hot = self.grip.or_else(|| {
+            (self.core.drag.is_none() && self.start.is_none() && self.tool == DrawTool::Select)
+                .then(|| hover.and_then(|p| grips::handle_at(&handles, screen, p)))
+                .flatten()
+        });
+        grips::paint_handles(&painter, &handles, screen, hot, ACCENT);
+        if let Some(h) = hot {
+            ui.ctx().set_cursor_icon(h.cursor());
+        }
+        if let (Some(h), Some(p)) = (self.grip, hover)
+            && let Some(text) = self.grip_readout(h)
+        {
+            grips::paint_readout(&painter, p, text);
+        }
         // Hovering names the item under the pointer and says what it is on. The
         // canvas is where a user looks first, and a number drawn on a pad does not
         // say whether the symbol has a pin of that number.
         if self.core.drag.is_none()
             && self.start.is_none()
+            && hot.is_none()
             && let Some(p) = ui
                 .input(|i| i.pointer.hover_pos())
                 .filter(|p| rect.contains(*p))
@@ -2212,10 +2375,10 @@ static PAD_ACTIONS: &[Action<FootprintEditor>] = &[
     .enabled_when(|e| e.can_step_history(HistoryKey::Redo)),
     pad_action("pads.fit", "Fit", ActionGroup::Zoom, |e| e.fit = true).keys(&[key(Key::F)]),
     pad_action("pads.zoom_in", "Zoom +", ActionGroup::Zoom, |e| {
-        e.core.zoom = crate::scaled_zoom(e.core.zoom, 1.25)
+        e.core.zoom_about(1.25, Vec2::ZERO)
     }),
     pad_action("pads.zoom_out", "Zoom −", ActionGroup::Zoom, |e| {
-        e.core.zoom = crate::scaled_zoom(e.core.zoom, 1.0 / 1.25)
+        e.core.zoom_about(1.0 / 1.25, Vec2::ZERO)
     }),
     grid_action!("pads.grid.10", "Grid 0.01 mm", 10),
     grid_action!("pads.grid.50", "Grid 0.05 mm", 50),
@@ -2232,7 +2395,33 @@ static PAD_ACTIONS: &[Action<FootprintEditor>] = &[
     })
     .keys(&[key(Key::Delete), key(Key::Backspace)])
     .enabled_when(|e| e.core.selected.is_some()),
+    pad_action("pads.rotate", "Rotate 90°", ActionGroup::Selection, FootprintEditor::rotate_selected)
+        .keys(&[key(Key::R)])
+        .enabled_when(FootprintEditor::can_rotate),
 ];
+
+/// A pad turned a quarter turn in place, as Rotate pad 90° and R turn it.
+fn turn_pad(pad: &mut Pad) {
+    pad.size = Point::new(pad.size.y, pad.size.x);
+    // A quarter turn, (x, y) to (-y, x): a trapezoid's taper and a
+    // custom pad's corners turn with it.
+    pad.trapezoid_delta = Point::new(pad.trapezoid_delta.y, -pad.trapezoid_delta.x);
+    for p in &mut pad.polygon {
+        *p = Point::new(-p.y, p.x);
+    }
+    // A windowpane's columns run where its rows did, and a via grid's.
+    if let Some(windows) = pad.layers.paste_windows.as_mut() {
+        (windows.columns, windows.rows) = (windows.rows, windows.columns);
+    }
+    if let Some(grid) = pad.vias.as_mut() {
+        (grid.columns, grid.rows) = (grid.rows, grid.columns);
+        grid.pitch = Point::new(grid.pitch.y, grid.pitch.x);
+    }
+    // A slot turns with its pad.
+    if let (Some(width), Some(height)) = (pad.drill, pad.drill_height) {
+        (pad.drill, pad.drill_height) = (Some(height), Some(width));
+    }
+}
 
 /// The pad a drawn outline would be, when the outline is one of the two shapes a
 /// pad comes in: an axis-aligned RECTANGLE (as the rectangle tool draws one) or a

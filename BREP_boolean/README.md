@@ -1,7 +1,7 @@
 # BREP_boolean
 
 `BREP_boolean` holds the booleans and healing of the BREP kernel. Its Rust library
-target is `brep_boolean`; this is version **0.22.0**.
+target is `brep_boolean`; this is version **0.23.0**.
 
 It is one of the implementation crates the kernel is built from. Applications
 should depend on [`BREP_kernel`](https://crates.io/crates/BREP_kernel), which

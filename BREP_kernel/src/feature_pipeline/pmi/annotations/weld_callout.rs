@@ -71,11 +71,12 @@ fn resolve(annotation: &PmiAnnotation, context: &PmiContext<'_>) -> Result<Resol
         "WELD.GROOVE" => {
             let shape = feature.input_params.get("shape").and_then(serde_json::Value::as_str).unwrap_or("V");
             let double = feature.input_params.get("double").and_then(serde_json::Value::as_bool).unwrap_or(false);
-            let angle = number("grooveAngle", 60.0)?;
-            let kind = format!("{}{shape} GROOVE", if double { "DOUBLE " } else { "" });
-            if shape == "SQUARE" {
+            let kind = format!("{}{} GROOVE", if double { "DOUBLE " } else { "" }, shape.replace('_', "-"));
+            // A square or flare groove has no angle (its hidden field is not read).
+            if shape == "SQUARE" || shape.starts_with("FLARE") {
                 (kind, None)
             } else {
+                let angle = number("grooveAngle", 60.0)?;
                 (format!("{kind} {}°", format_number(angle, 0)), Some(angle))
             }
         }

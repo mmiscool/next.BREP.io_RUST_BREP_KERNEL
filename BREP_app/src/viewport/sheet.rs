@@ -931,8 +931,46 @@ impl Viewport {
             let pivot = pointer.unwrap_or(rect.center());
             self.sheet.zoom_about(rect, pivot, ZOOM_STEP.powf(wheel / 50.0));
         }
+        // A pinch zooms about its own centre: two fingers on a touch screen,
+        // or a trackpad's pinch (`Event::Zoom`). Not egui's `zoom_delta`, which
+        // also carries a ctrl-wheel the raw wheel above has already taken.
+        let touch = ui.input(|i| i.multi_touch());
+        let pinch = ui.input(|i| match touch {
+            Some(touch) => (touch.zoom_delta, touch.center_pos),
+            None => {
+                let factor: f32 = i
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Zoom(f) => Some(*f),
+                        _ => None,
+                    })
+                    .product();
+                (factor, pointer.unwrap_or(rect.center()))
+            }
+        });
+        let (factor, pivot) = pinch;
+        if response.hovered() && factor.is_finite() && factor > 0.0 && factor != 1.0 {
+            self.sheet.zoom_about(rect, pivot, factor);
+        }
+        // The first finger of a touch pinch is also the primary pointer: while
+        // two are down nothing is dragged. A grab already running ends where it
+        // is (no further move), and none starts.
+        let touch_pinch = touch.is_some();
+        if touch_pinch {
+            self.sheet.panning = false;
+            if self.sheet.dragging.take().is_some() {
+                intents.push(SheetIntent::MoveEnd);
+            }
+            if self.sheet.dim_dragging.take().is_some() {
+                intents.push(SheetIntent::MoveDimensionEnd);
+            }
+            if self.sheet.ord_dragging.take().is_some() {
+                intents.push(SheetIntent::MoveOrdinateEnd);
+            }
+        }
 
-        if response.drag_started() {
+        if response.drag_started() && !touch_pinch {
             // Where the press LANDED, not where the pointer is now: egui does
             // not report a drag until it has passed its threshold, and by then
             // the pointer has left a target as small as a dimension's value
@@ -1069,3 +1107,4 @@ impl Viewport {
         }
     }
 }
+

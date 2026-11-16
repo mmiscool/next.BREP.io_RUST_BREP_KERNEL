@@ -19,6 +19,12 @@ pub struct NodeLayout {
     pub node_type: u16,
     pub name: String,
     pub fields: Vec<FieldDef>,
+    /// The layout's description as a text file writes it at the type's
+    /// first node (a field count and edit script, or `255 `), when the file
+    /// carries one: what a writer of the same schema writes again.
+    pub delta: Option<String>,
+    /// The same, as a binary file writes it.
+    pub delta_binary: Option<Vec<u8>>,
 }
 
 impl NodeLayout {
@@ -172,6 +178,10 @@ pub struct XtFile {
     /// A partition (`TRANSMIT FILE (partition)`): its root is the WORLD,
     /// whose bodies are the partition's.
     pub partition: bool,
+    /// With embedded deltas, the largest node type the schema has.
+    pub max_node_type: Option<i64>,
+    /// Integers of user data each visible node carries (§2.1).
+    pub user_field_size: usize,
     nodes: Vec<Node>,
     by_index: HashMap<u32, usize>,
 }
@@ -292,6 +302,7 @@ fn parse_data(header: Vec<(String, String)>, mut stream: Stream) -> Result<XtFil
     // `SCH_1400068_14000_13006`: the base suffix marks embedded schema deltas,
     // followed by the maximum node type (§2.1.2.2).
     let embedded = schema_name.split('_').count() >= 4;
+    let mut max_node_type = None;
     if embedded {
         let base = schema_name.rsplit('_').next().unwrap_or_default();
         if base != schema::BASE_SCHEMA {
@@ -300,7 +311,7 @@ fn parse_data(header: Vec<(String, String)>, mut stream: Stream) -> Result<XtFil
                 schema::BASE_SCHEMA
             ));
         }
-        stream.short()?;
+        max_node_type = stream.short()?;
     }
     // Without embedded deltas the layouts are the named schema's own: the
     // base's, or a stored schema's.
@@ -318,6 +329,7 @@ fn parse_data(header: Vec<(String, String)>, mut stream: Stream) -> Result<XtFil
         ));
     }
     let user_field_size = stream.long()?.unwrap_or(0).max(0) as usize;
+    let text = stream.encoding == Encoding::Text;
     let mut layouts: HashMap<u16, Rc<NodeLayout>> = HashMap::default();
     let mut nodes = Vec::new();
     let mut by_index = HashMap::default();
@@ -336,7 +348,14 @@ fn parse_data(header: Vec<(String, String)>, mut stream: Stream) -> Result<XtFil
             Some(layout) => layout.clone(),
             None => {
                 let layout = Rc::new(if embedded {
-                    read_layout(&mut stream, node_type)?
+                    let start = stream.at;
+                    let mut layout = read_layout(&mut stream, node_type)?;
+                    if text {
+                        layout.delta = Some(String::from_utf8_lossy(&stream.data[start..stream.at]).into_owned());
+                    } else {
+                        layout.delta_binary = Some(stream.data[start..stream.at].to_vec());
+                    }
+                    layout
                 } else if let Some(stored) = stored {
                     stored_layout(stored, node_type)?
                 } else {
@@ -356,18 +375,18 @@ fn parse_data(header: Vec<(String, String)>, mut stream: Stream) -> Result<XtFil
     if nodes.is_empty() {
         return Err("the file holds no nodes".into());
     }
-    Ok(XtFile { modeller_version, schema: schema_name, header, partition, nodes, by_index })
+    Ok(XtFile { modeller_version, schema: schema_name, header, partition, max_node_type, user_field_size, nodes, by_index })
 }
 
 fn base_layout(node_type: u16) -> Result<NodeLayout, String> {
     let (name, fields) = schema::base(node_type)
         .ok_or_else(|| format!("node type {node_type} is not in the base schema and the file does not describe it"))?;
-    Ok(NodeLayout { node_type, name: name.to_string(), fields })
+    Ok(NodeLayout { node_type, name: name.to_string(), fields, delta: None, delta_binary: None })
 }
 
 /// A node type's layout in a stored schema; a type no file in that schema
 /// has shown is refused by name.
-fn stored_layout(stored: &str, node_type: u16) -> Result<NodeLayout, String> {
+pub(super) fn stored_layout(stored: &str, node_type: u16) -> Result<NodeLayout, String> {
     let delta = schema::stored_delta(stored, node_type).ok_or_else(|| {
         let name = schema::base(node_type).map_or_else(|| format!("node type {node_type}"), |(n, _)| format!("node type {node_type} ({n})"));
         format!("{name} has no known layout in schema {stored} and the file does not describe it")
@@ -392,10 +411,10 @@ fn read_layout(stream: &mut Stream, node_type: u16) -> Result<NodeLayout, String
         for _ in 0..count {
             fields.push(stream.field_def()?);
         }
-        return Ok(NodeLayout { node_type, name, fields });
+        return Ok(NodeLayout { node_type, name, fields, delta: None, delta_binary: None });
     };
     if count == 255 {
-        return Ok(NodeLayout { node_type, name: name.to_string(), fields: base });
+        return Ok(NodeLayout { node_type, name: name.to_string(), fields: base, delta: None, delta_binary: None });
     }
     let mut fields = Vec::with_capacity(count.max(0) as usize);
     let mut base_fields = base.into_iter();
@@ -424,11 +443,11 @@ fn read_layout(stream: &mut Stream, node_type: u16) -> Result<NodeLayout, String
     if fields.len() as i64 != count {
         return Err(format!("{name}'s schema edit gives {} fields, its header says {count}", fields.len()));
     }
-    Ok(NodeLayout { node_type, name: name.to_string(), fields })
+    Ok(NodeLayout { node_type, name: name.to_string(), fields, delta: None, delta_binary: None })
 }
 
 /// Node types visible at the PK interface, which carry the user field (§2.1, §6.1).
-fn carries_user_field(node_type: u16) -> bool {
+pub(super) fn carries_user_field(node_type: u16) -> bool {
     matches!(
         node_type,
         10..=19 | 29..=32 | 38 | 50..=54 | 56 | 60 | 67 | 68 | 70 | 80 | 81 | 90 | 100 | 120 | 124 | 130 | 133

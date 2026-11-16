@@ -510,24 +510,28 @@ fn seam(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     let colour = colour(ctx)?;
     let mut line = line(ctx)?;
     if inset > 0.0 {
-        // A straight line moved across onto the face, to its side of the line.
-        if !line.chain.is_single_line() {
-            return Err("inset moves a single straight line; draw the seam's line on the face instead".into());
-        }
-        let run = &line.chain.runs[0];
-        let across = line.normal.cross(run.tangent).normalized()?;
+        // The line moved across onto the face, to its side of the line: each
+        // straight run shifted, each arc made the concentric arc, a mitred
+        // corner's runs meeting again. The side is the one where every
+        // moved run lies on the sheet (read inside its ends, which may sit
+        // on the sheet's edge).
         let plate = crate::registered_solid_clone(ctx.scene.solids[&line.plate])?;
         let mut moved = None;
         for side in [1.0, -1.0] {
-            let shift = across.scale(inset * side);
-            let probe = run.at(0.5).add(shift).sub(line.normal.scale(1e-4));
-            if crate::classify_point(probe, &plate, 1e-7)?.class == PointClass::In {
-                moved = Some(fit::Seam::line(run.start.add(shift), run.tangent, run.length, None));
+            let Some(chain) = line.chain.offset(line.normal, inset * side)? else { continue };
+            let mut on = true;
+            for run in &chain.runs {
+                for fraction in [0.05, 0.5, 0.95] {
+                    let probe = run.at(fraction).sub(line.normal.scale(1e-4));
+                    on = on && crate::classify_point(probe, &plate, 1e-7)?.class == PointClass::In;
+                }
+            }
+            if on {
+                moved = Some(chain);
                 break;
             }
         }
-        let moved = moved.ok_or_else(|| format!("inset {inset} lands off the sheet on both sides of the line"))?;
-        line.chain = fit::Chain::new(vec![moved])?;
+        line.chain = moved.ok_or_else(|| format!("inset {inset} lands off the sheet on both sides of the line (or moves an arc onto its centre)"))?;
     }
     let mut result = FeatureResult::empty(&ctx.id, &ctx.feature_type);
     let start = line.chain.runs[0].start;

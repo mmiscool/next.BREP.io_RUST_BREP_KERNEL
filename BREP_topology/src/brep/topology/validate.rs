@@ -348,7 +348,27 @@ impl BrepSolid {
                 }
             }
             let uses = edge_uses.get(&edge.id).map(Vec::as_slice).unwrap_or(&[]);
-            if edge.degenerate {
+            if self.kind == BodyKind::Wire {
+                // Non-manifold plan 3.3: a Wire's edges bound no face, so no
+                // face check stands behind its curve: the curve must build
+                // and evaluate at both ends, and it must not collapse.
+                if !uses.is_empty() {
+                    issues.push(ValidationIssue::error_kind(IssueKind::OverUsedEdge, format!(
+                        "wire edge {} used {} times (a wire's edges bound no face)",
+                        edge.id,
+                        uses.len()
+                    )));
+                }
+                if edge.degenerate || control_points_within(&edge.curve, start.point, tolerances.model) {
+                    // With positive weights a curve lies in the hull of its
+                    // control points: all of them at the vertex is a point.
+                    issues.push(ValidationIssue::error(format!("wire edge {} is degenerate (a point)", edge.id)));
+                }
+                let curve = NurbsCurve::new(edge.curve.degree, edge.curve.knots.clone(), edge.curve.control_points.clone());
+                if let Err(e) = curve.and_then(|c| c.evaluate(edge.t0).and(c.evaluate(edge.t1))) {
+                    issues.push(ValidationIssue::error(format!("wire edge {} has no valid curve: {e}", edge.id)));
+                }
+            } else if edge.degenerate {
                 // A synthesized VERTEX_LOOP/pole boundary is single-use, but
                 // vendor STEP may share one explicit collapsed EDGE_CURVE
                 // between the two faces meeting at that pole. The latter is a
@@ -494,6 +514,21 @@ impl BrepSolid {
         }
         if self.kind == BodyKind::Cellular {
             self.validate_cells(&edges, &mut issues);
+        }
+        if self.kind == BodyKind::Wire {
+            // Plan 3.3: edges and vertices only, and no vertex left over.
+            if !face_ids.is_empty() {
+                issues.push(ValidationIssue::error(format!("wire body has {} faces (a wire has none)", face_ids.len())));
+            }
+            if self.edges.is_empty() {
+                issues.push(ValidationIssue::error("wire body has no edges"));
+            }
+            let used: HashSet<u64> = self.edges.iter().flat_map(|e| [e.start_vertex_id, e.end_vertex_id]).collect();
+            for vertex in &self.vertices {
+                if !used.contains(&vertex.id) {
+                    issues.push(ValidationIssue::error(format!("wire vertex {} is on no edge", vertex.id)));
+                }
+            }
         }
         ValidationReport {
             issues,
@@ -1766,4 +1801,16 @@ impl BrepSolid {
     }
 }
 
+
+
+/// Every control point of `curve` (projected, so the true points of a
+/// rational curve) within `tolerance` of `center`. With positive weights the
+/// curve lies in their convex hull, so the whole curve is then within
+/// `tolerance` of `center`: a point, whatever any sampling would say.
+pub fn control_points_within(curve: &NurbsCurve, center: Vec3, tolerance: f64) -> bool {
+    !curve.control_points.is_empty()
+        && curve.control_points.iter().all(|p| {
+            p.w > 0.0 && Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w).sub(center).length() <= tolerance
+        })
+}
 

@@ -318,7 +318,7 @@ pub fn extended_point(curve: &Curve, t: f64) -> Result<Vec3, String> {
 
 /// A B-curve's range when its ends meet (to 1e-6 mm): a closed section or
 /// profile, which is searched round its period and never extended.
-fn closed_range(curve: &Curve) -> Option<[f64; 2]> {
+pub fn closed_range(curve: &Curve) -> Option<[f64; 2]> {
     let Curve::Nurbs(nurbs) = curve else { return None };
     let [a, b] = nurbs.domain().ok()?;
     (b > a && nurbs.evaluate(a).ok()?.sub(nurbs.evaluate(b).ok()?).length() <= 1e-6).then_some([a, b])
@@ -460,11 +460,47 @@ fn brent_minimum(f: &impl Fn(f64) -> f64, mut lo: f64, mut hi: f64, tolerance: f
     x
 }
 
-/// A curve's unit tangent at `t` (extended, [`extended_point`]), by central
-/// differences.
-fn curve_tangent(curve: &Curve, t: f64) -> Option<Vec3> {
-    let h = 1e-7;
-    extended_point(curve, t + h).ok()?.sub(extended_point(curve, t - h).ok()?).normalized().ok()
+/// A curve's unit tangent at `t` (extended, [`extended_point`]), from its
+/// exact derivative: a difference step either crosses a tiny parameter
+/// range whole or rounds away beside a large knot (cross review, re-review).
+pub fn curve_tangent(curve: &Curve, t: f64) -> Option<Vec3> {
+    match curve {
+        Curve::Line { direction, .. } => direction.normalized().ok(),
+        Curve::Circle { frame, .. } => frame.x.scale(-t.sin()).add(frame.y().scale(t.cos())).normalized().ok(),
+        Curve::Ellipse { frame, major, minor } => frame.x.scale(-major * t.sin()).add(frame.y().scale(minor * t.cos())).normalized().ok(),
+        Curve::Nurbs(nurbs) => {
+            let [a, b] = nurbs.domain().ok()?;
+            nurbs.point_and_unit_tangent_extended(t, a, b).ok().map(|(_, tangent)| tangent)
+        }
+    }
+}
+
+/// A lemon torus (major radius `major` < 0, `|major|` < `minor`, mm) as the
+/// surface the writer gives it: the arc of its generating circle (centre
+/// `major` along the frame's x, radius `minor`, in the x-z half-plane) where
+/// the torus's radial factor `major + minor·cos v` is positive, spun about
+/// the axis. The arc runs pole to pole, `v` from `θ0` down to `-θ0` with
+/// `cos θ0 = -major / minor`: two exact rational quadratics, each sweeping
+/// under π/2, so no weight falls under cos(π/4) however near a sphere the
+/// lemon is (re-review). Running down the axis makes the spun surface's
+/// natural normal `dP/du × dP/dv` the torus's: at v = 0 the profile's
+/// tangent is `-z` and the turn's is `+y`, so the normal is `+x`, away from
+/// the circle's centre, as `(cos v)·radial + (sin v)·axis` is (decided, not
+/// sampled: a thin lemon has no length to difference across, re-review).
+pub fn lemon(frame: Frame, major: f64, minor: f64) -> Result<Surface, String> {
+    if !(minor > -major && major < 0.0) {
+        return Err(format!("major radius {major} mm and minor radius {minor} mm are not a lemon"));
+    }
+    let centre = frame.origin.add(frame.x.scale(major));
+    let top = (-major / minor).acos();
+    let direction = |v: f64| frame.x.scale(v.cos()).add(frame.z.scale(v.sin()));
+    let on = |v: f64| centre.add(direction(v).scale(minor));
+    let half = top / 2.0;
+    let apex = |mid: f64| (centre.add(direction(mid).scale(minor / half.cos())), half.cos());
+    let points = [(on(top), 1.0), apex(top / 2.0), (on(0.0), 1.0), apex(-top / 2.0), (on(-top), 1.0)];
+    let net = points.iter().map(|&(p, w)| Vec4 { x: p.x * w, y: p.y * w, z: p.z * w, w }).collect();
+    let arc = NurbsCurve::new(2, vec![0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0], net)?;
+    Ok(Surface::Spun { profile: Curve::Nurbs(arc), axis_point: frame.origin, axis: frame.z })
 }
 
 /// Read the surface node `node`.
@@ -485,13 +521,18 @@ pub fn surface(file: &XtFile, node: &Node, depth: usize) -> Result<Surface, Stri
         "TORUS" => {
             let major = required_length(node, "major_radius")?;
             let minor = required_length(node, "minor_radius")?;
-            if major <= 0.0 {
-                return Err(format!(
-                    "TORUS {} is a lemon torus (major radius {major} mm), which has no STEP surface",
-                    node.index
-                ));
+            let frame = Frame::read(node, "centre", "axis")?;
+            if major < 0.0 && minor <= -major {
+                return Err(format!("TORUS {} has major radius {major} mm and minor {minor} mm, not a lemon", node.index));
             }
-            Surface::Torus { frame: Frame::read(node, "centre", "axis")?, major, minor }
+            // A lemon (§5.2.2.5: a < 0, |a| < b) stays a torus here: the
+            // torus formula is its XT evaluator too, the one its SP-curves,
+            // blends and offsets are parameterised by. Only the writer says
+            // it otherwise (STEP has no lemon): see [`lemon`].
+            if major == 0.0 {
+                return Err(format!("TORUS {} has major radius 0, which the format says is a sphere", node.index));
+            }
+            Surface::Torus { frame, major, minor }
         }
         "B_SURFACE" => {
             let nurbs = file

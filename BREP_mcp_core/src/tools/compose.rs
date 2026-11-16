@@ -1800,8 +1800,8 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
         ToolSpec::new(
             "document_import",
             "document",
-            "Import a STEP / IGES / Parasolid (.x_t, .x_b) / STL / OBJ / 3MF file from the host's files (the filesystem natively; the page's document store in the browser, which holds text formats only — a binary file goes through `doc_import` with its content) as an Import 3D Model feature (format by extension unless given).",
-            object_schema(json!({ "path": { "type": "string" }, "format": { "type": "string", "enum": ["step", "iges", "parasolid", "stl", "obj", "3mf"] }, "timeout_ms": { "type": "integer", "default": 120000 } }), &["path"]),
+            "Import a STEP / IGES / Parasolid (.x_t, .x_b) / SolidWorks (.sldprt, .sldasm with its parts beside it) / STL / OBJ / 3MF file from the host's files (the filesystem natively; the page's document store in the browser, which holds text formats only — a binary file goes through `doc_import` with its content) as an Import 3D Model feature (format by extension unless given).",
+            object_schema(json!({ "path": { "type": "string" }, "format": { "type": "string", "enum": ["step", "iges", "parasolid", "solidworks", "stl", "obj", "3mf"] }, "timeout_ms": { "type": "integer", "default": 120000 } }), &["path"]),
             Annotations { read_only: false, destructive: false, idempotent: false, waits: true },
             move |args| {
                 let slot = import_slot.clone();
@@ -1813,6 +1813,7 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                         "step" | "stp" => "step".into(),
                         "iges" | "igs" => "iges".into(),
                         "x_t" | "xmt_txt" | "p_t" | "x_b" | "xmt_bin" | "p_b" => "parasolid".into(),
+                        "sldprt" | "sldasm" => "solidworks".into(),
                         "stl" => "stl".into(),
                         "obj" => "obj".into(),
                         "3mf" => "3mf".into(),
@@ -1820,7 +1821,9 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
                     });
                     let bytes = session.host.platform.read_bytes(path.clone()).await?;
                     let b64 = base64_encode(&bytes);
-                    let name = file_name(&path).unwrap_or_default();
+                    // A SolidWorks assembly reads its parts from beside it,
+                    // so it is named by its path.
+                    let name = if format == "solidworks" { path.clone() } else { file_name(&path).unwrap_or_default() };
                     let mut r = session.host.call_ok("doc_import", json!({ "format": format, "name": name, "base64": b64 })).await?.result.unwrap_or(Value::Null);
                     let after = after_wait(&session, u(&args, "timeout_ms", 120_000)).await?;
                     // Mesh reconstruction has a documented submission marker, not
@@ -1856,8 +1859,8 @@ pub fn document_tools(slot: SessionSlot, describe: &Value) -> Vec<ToolSpec> {
         ToolSpec::new(
             "document_export",
             "document",
-            "Export the active document to a file (a filesystem path natively; in the browser a download under that name, where the Export dialog's goes): brep (native JSON), step, stl, obj, iges, glb (binary glTF 2.0 of the display mesh), 3mf (a 3MF package of the display mesh, one object per body with the model's colours as base materials), the sheet-metal flat pattern as dxf / svg, the open drawing sheet as sheet_svg, every drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order), or that drawing set with the live 3D model as sheet_pdf_3d (a 3D box over every placement marked `threeD`, and a last page given over to the model), or, for a document whose PCB board has parts, its manufacturing files: fabrication (a zip of Gerber X2 layers, Excellon drills, pick-and-place and parts-BOM CSVs and a README), pick_place_csv or ecad_bom_csv, or, for a document with components or harness wires, its BOM as bom_csv / bom_json (each part row with its quantity, material, densityGcm3, volumeMm3, massKg and totalMassKg, read off the PART). The reply carries the file's size and first bytes, for the sheet formats `texts`: every text string the file shows, read back from what was written, and for sheet_pdf_3d `model3d`: its 3D boxes, views, view buttons and U3D size, read back likewise, and for fabrication `files` (each file in the zip), `readBack` (copper flashes, drill hits, outline size and CSV rows, counted from the files) and `warnings`; the CSVs answer `rows`, and the BOM formats `bomRows`: every row read back from the file written.",
-            object_schema(json!({ "format": { "type": "string", "enum": ["brep", "step", "stl", "obj", "iges", "glb", "3mf", "dxf", "svg", "sheet_svg", "sheet_pdf", "sheet_pdf_3d", "fabrication", "pick_place_csv", "ecad_bom_csv", "bom_csv", "bom_json"] }, "path": { "type": "string" } }), &["format", "path"]),
+            "Export the active document to a file (a filesystem path natively; in the browser a download under that name, where the Export dialog's goes): brep (native JSON), step, stl, obj, iges, parasolid (a Parasolid .x_t part, the route to SolidWorks, NX and Solid Edge) and parasolid_binary (.x_b), glb (binary glTF 2.0 of the display mesh), 3mf (a 3MF package of the display mesh, one object per body with the model's colours as base materials), the sheet-metal flat pattern as dxf / svg, the open drawing sheet as sheet_svg, every drawing sheet as sheet_pdf (one PDF, a page per sheet in sheet order), or that drawing set with the live 3D model as sheet_pdf_3d (a 3D box over every placement marked `threeD`, and a last page given over to the model), or, for a document whose PCB board has parts, its manufacturing files: fabrication (a zip of Gerber X2 layers, Excellon drills, pick-and-place and parts-BOM CSVs and a README), pick_place_csv or ecad_bom_csv, or, for a document with components or harness wires, its BOM as bom_csv / bom_json (each part row with its quantity, material, densityGcm3, volumeMm3, massKg and totalMassKg, read off the PART). The reply carries the file's size and first bytes, for the sheet formats `texts`: every text string the file shows, read back from what was written, and for sheet_pdf_3d `model3d`: its 3D boxes, views, view buttons and U3D size, read back likewise, and for fabrication `files` (each file in the zip), `readBack` (copper flashes, drill hits, outline size and CSV rows, counted from the files) and `warnings`; the CSVs answer `rows`, and the BOM formats `bomRows`: every row read back from the file written.",
+            object_schema(json!({ "format": { "type": "string", "enum": ["brep", "step", "stl", "obj", "iges", "parasolid", "parasolid_binary", "glb", "3mf", "dxf", "svg", "sheet_svg", "sheet_pdf", "sheet_pdf_3d", "fabrication", "pick_place_csv", "ecad_bom_csv", "bom_csv", "bom_json"] }, "path": { "type": "string" } }), &["format", "path"]),
             Annotations { read_only: false, destructive: false, idempotent: true, waits: false },
             move |args| {
                 let slot = export_slot.clone();

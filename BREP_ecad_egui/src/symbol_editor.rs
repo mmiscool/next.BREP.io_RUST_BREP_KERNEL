@@ -1,4 +1,5 @@
 use super::*;
+use crate::grips::{self, Handle};
 use crate::editor_core::EditorCore;
 use crate::actions::{Action, ActionGroup, action, command, key};
 use brep_ecad_core::Pin;
@@ -173,6 +174,9 @@ enum Grab {
     /// where a sheet's wires already reach it and the body end swings, which is
     /// how a pin is moved onto another side of an outline already drawn.
     Root,
+    /// One grab handle of the selected drawn line, rectangle or circle
+    /// ([`grips`]): a resize.
+    Handle(Handle),
 }
 
 /// A primary drag in progress: the symbol as it was when the drag began — so
@@ -423,6 +427,10 @@ impl SymbolEditor {
             hits.push((format!("{key}:tip"), Rect::from_center_size(tip, size)));
             hits.push((format!("{key}:root"), Rect::from_center_size(root, size)));
         }
+        // The selected drawn item's grab handles, `handle:<name>`.
+        for (h, at) in self.graphic_handles() {
+            hits.push((format!("handle:{}", h.name()), grips::handle_rect(h, screen(at))));
+        }
         hits.extend(self.inspector.shown(self.canvas_pass));
         hits
     }
@@ -479,7 +487,7 @@ impl SymbolEditor {
         });
         ui.label(match self.tool {
             DrawTool::Select => {
-                "Select or drag an item. Drag a selected pin's ends to aim and lengthen it, press R to turn it, or [ and ] to shorten and lengthen it. Right-drag pans. Scroll zooms. Grid: 1.27 mm."
+                "Select or drag an item. Drag a selected pin's ends to aim and lengthen it, press R to turn it, or [ and ] to shorten and lengthen it. Drag a selected shape's handles to size it (Shift keeps proportions). Right-drag pans. Scroll or pinch zooms about the pointer. Grid: 1.27 mm."
             }
             DrawTool::Pin => {
                 "Drag from the electrical connection tip toward the symbol body to add a pin, or click to place one of the last length used."
@@ -956,7 +964,22 @@ impl SymbolEditor {
     /// The handle of the SELECTED pin under `p`, if the pointer is on one.
     /// Asked before the general hit test: a handle sits on top of the pin's own
     /// body, and taking hold of one is what aims the pin rather than moving it.
+    /// The grab handles of the selected drawn item, in symbol units: a
+    /// rectangle's box, a line's corners, a circle's radius; none for text.
+    fn graphic_handles(&self) -> Vec<(Handle, Point)> {
+        let Some(Item::Graphic(i)) = self.core.selected else {
+            return vec![];
+        };
+        match self.symbol.graphics.get(i) {
+            Some(Graphic::Path(points)) => grips::path_handles(points),
+            Some(Graphic::Circle { center, radius }) => vec![(Handle::Radius, Point::new(center.x + radius, center.y))],
+            _ => vec![],
+        }
+    }
     fn grab_at(&self, p: Pos2, screen: impl Fn(Point) -> Pos2) -> Option<Grab> {
+        if let Some(h) = grips::handle_at(&self.graphic_handles(), &screen, p) {
+            return Some(Grab::Handle(h));
+        }
         let Some(Item::Pin(index)) = self.core.selected else {
             return None;
         };
@@ -1040,9 +1063,19 @@ impl SymbolEditor {
         {
             self.core.pan += ui.input(|i| i.pointer.delta());
         }
-        if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            self.core.zoom = crate::scaled_zoom(self.core.zoom, (scroll * 0.002).exp());
+        // The wheel and a pinch zoom about the pointer: the point under it stays
+        // where it is on screen.
+        if response.hovered()
+            && let Some((factor, p)) = crate::pointer_zoom(ui)
+        {
+            self.core.zoom_about(factor, p - rect.center());
+        }
+        let pinch = crate::pinching(ui);
+        if pinch {
+            if let Some(drag) = self.core.drag.take() {
+                self.symbol = drag.before;
+            }
+            self.start = None;
         }
         let zoom = self.core.zoom;
         let center = rect.center() + self.core.pan;
@@ -1055,7 +1088,8 @@ impl SymbolEditor {
             .snapped()
         };
         let pointer = response.interact_pointer_pos();
-        if response.drag_started_by(PointerButton::Primary)
+        if !pinch
+            && response.drag_started_by(PointerButton::Primary)
             && let Some(p) = ui.input(|i| i.pointer.press_origin())
         {
             if self.tool == DrawTool::Select {
@@ -1098,6 +1132,16 @@ impl SymbolEditor {
                 // The end that was taken hold of follows the pointer, squared
                 // to one of the four directions and to whole grid steps; the
                 // other end does not move at all.
+                // A handle: the side, corner or radius it holds goes to the
+                // pointer's grid point; Shift keeps a rectangle's proportions.
+                (Grab::Handle(h), Some(Item::Graphic(i))) => {
+                    let keep = ui.input(|i| i.modifiers.shift);
+                    match (&mut self.symbol.graphics[i], &drag.before.graphics[i]) {
+                        (Graphic::Path(points), Graphic::Path(was)) => grips::drag_path(points, was, h, q, keep),
+                        (Graphic::Circle { center, radius }, _) => *radius = grips::radius_to(*center, q),
+                        _ => {}
+                    }
+                }
                 (Grab::Tip | Grab::Root, Some(Item::Pin(i))) => {
                     let pin = &mut self.symbol.pins[i];
                     let anchor = if grab == Grab::Tip { pin.end } else { pin.at };
@@ -1256,6 +1300,42 @@ impl SymbolEditor {
             // whichever side the pin leaves — the rule the schematic draws by.
             if let Some((anchor, align, name)) = pin_name_label(p, screen(p.at), screen(p.end)) {
                 painter.text(anchor, align, name, FontId::monospace(12.), color);
+            }
+        }
+        // The selected drawn item's grab handles, the one held or under the
+        // pointer filled; what a held one sets, beside the pointer.
+        let handles = self.graphic_handles();
+        if !handles.is_empty() {
+            let hover = ui.input(|i| i.pointer.hover_pos()).filter(|p| rect.contains(*p));
+            let held = match &self.core.drag {
+                Some(Drag { grab: Grab::Handle(h), .. }) => Some(*h),
+                _ => None,
+            };
+            let hot = held.or_else(|| {
+                (self.core.drag.is_none() && self.tool == DrawTool::Select)
+                    .then(|| hover.and_then(|p| grips::handle_at(&handles, screen, p)))
+                    .flatten()
+            });
+            grips::paint_handles(&painter, &handles, screen, hot, ACCENT);
+            if let Some(h) = hot {
+                ui.ctx().set_cursor_icon(h.cursor());
+            }
+            if let (Some(h), Some(p)) = (held, hover)
+                && let Some(Item::Graphic(i)) = self.core.selected
+            {
+                let mm = grips::mm;
+                let text = match self.symbol.graphics.get(i) {
+                    Some(Graphic::Circle { radius, .. }) => Some(format!("r {} mm", mm(*radius))),
+                    Some(Graphic::Path(points)) => match (h, grips::upright_rectangle(points)) {
+                        (Handle::Box(..), Some((lo, hi))) => Some(format!("{} × {} mm", mm(hi.x - lo.x), mm(hi.y - lo.y))),
+                        (Handle::Vertex(k), _) => points.get(k).map(|q| format!("{}, {} mm", mm(q.x), mm(q.y))),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    grips::paint_readout(&painter, p, text);
+                }
             }
         }
         if let (Some(start), Some(p)) = (self.start, pointer) {
@@ -1425,10 +1505,10 @@ static SYMBOL_ACTIONS: &[Action<SymbolEditor>] = &[
     .enabled_when(|e| e.can_step_history(HistoryKey::Redo)),
     symbol_action("symbol.fit", "Fit", ActionGroup::Zoom, |e| e.fit = true).keys(&[key(Key::F)]),
     symbol_action("symbol.zoom_in", "Zoom +", ActionGroup::Zoom, |e| {
-        e.core.zoom = crate::scaled_zoom(e.core.zoom, 1.25)
+        e.core.zoom_about(1.25, Vec2::ZERO)
     }),
     symbol_action("symbol.zoom_out", "Zoom −", ActionGroup::Zoom, |e| {
-        e.core.zoom = crate::scaled_zoom(e.core.zoom, 1.0 / 1.25)
+        e.core.zoom_about(1.0 / 1.25, Vec2::ZERO)
     }),
     symbol_action(
         "symbol.delete",

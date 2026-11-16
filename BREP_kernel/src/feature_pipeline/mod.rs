@@ -974,9 +974,65 @@ pub struct SceneMap {
     /// name itself always wins; an alias whose canonical solid is consumed
     /// (removed and not re-added by the same result) is dropped.
     pub solid_aliases: HashMap<String, String>,
+    /// Solid name -> the welds that prepared it, in order, each with the
+    /// handle the name held before that weld (`Vec` = a chain: a part body
+    /// two welds prepared one after the other). A groove weld in an assembly
+    /// cuts its joint preparation into a COMPONENT MEMBER as an assembly-level
+    /// result: the prepared body replaces the member under its name in this
+    /// scene only, while the component (its record, its cache entry, every
+    /// other instance and the part document) keeps the unprepared body, the
+    /// chain's first `prior`. Posing a member poses both bodies; a weld
+    /// withdrawn for a rebuild after the solve puts the name back on its
+    /// `prior`, so the re-cut never cuts twice. Written as each feature's
+    /// result is applied to the map.
+    #[serde(default)]
+    pub weld_prepared: HashMap<String, Vec<Preparation>>,
+}
+
+/// One weld's preparation of a solid ([`SceneMap::weld_prepared`]).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Preparation {
+    /// The weld feature whose result replaced the solid.
+    pub weld: String,
+    /// The handle the name held before this weld: for a component member's
+    /// first preparation, the component's own body (owned by its ACOMP entry).
+    pub prior: u32,
 }
 
 impl SceneMap {
+    /// The weld that prepared a component member in context and the
+    /// component's own (unprepared) handle; `None` for any other name.
+    pub fn context_member(&self, name: &str) -> Option<&Preparation> {
+        let member = self.owning_component(name).is_some_and(|record| record.solids.iter().any(|solid| solid == name));
+        if !member { return None; }
+        self.weld_prepared.get(name).and_then(|chain| chain.first())
+    }
+
+    /// Put every solid `weld` prepared (and is still the last to have
+    /// prepared) back on the body it was cut from, with the face and edge
+    /// names that body carries. The prepared handles are left to their owner
+    /// (the weld's cache entry or result) to free.
+    pub(crate) fn restore_prepared(&mut self, weld: &str) {
+        let names: Vec<String> = self.weld_prepared.iter()
+            .filter(|(_, chain)| chain.last().is_some_and(|last| last.weld == weld))
+            .map(|(name, _)| name.clone()).collect();
+        for name in names {
+            let Some(chain) = self.weld_prepared.get_mut(&name) else { continue };
+            let Some(link) = chain.pop() else { continue };
+            if chain.is_empty() { self.weld_prepared.remove(&name); }
+            if let Some(handle) = self.solids.remove(&name) {
+                self.faces.retain(|_, face| face.handle != handle);
+                self.edges.retain(|_, edge| edge.handle != handle);
+            }
+            let Ok((face_names, edge_names)) = crate::with_registered_solid_str(link.prior, |solid| {
+                Ok::<_, String>((features::common::collect_face_names(solid), features::common::collect_edge_names(solid)))
+            }) else { continue };
+            let mut restore = FeatureResult::empty("", "");
+            restore.added.push(AddedSolid { handle: link.prior, name: name.clone(), face_names, edge_names, ..AddedSolid::default() });
+            self.apply(&restore);
+        }
+    }
+
     /// Rewrite each `removed` name that spells a legacy solid alias (and no
     /// resident solid) to the canonical name it stands for, so an old
     /// document's boolean on `{target}_{featureId}` consumes the shell
@@ -1187,6 +1243,24 @@ impl SceneMap {
     /// invalidated; freeing here would kill a clean upstream feature's cached
     /// solid the moment a downstream boolean consumed it.
     fn apply(&mut self, result: &FeatureResult) {
+        // A weld that removes a solid and adds it back under the same name
+        // prepared it: remember the body it was cut from (once per weld, so a
+        // re-applied posed result keeps it). Any other consumer of the name
+        // ends its chain.
+        let weld = features::weld::is_weld_type(&result.feature_type);
+        for name in &result.removed {
+            let replaced = result.added.iter().any(|added| &added.name == name);
+            if weld && replaced {
+                if let Some(&prior) = self.solids.get(name) {
+                    let chain = self.weld_prepared.entry(name.clone()).or_default();
+                    if chain.last().is_none_or(|last| last.weld != result.id) {
+                        chain.push(Preparation { weld: result.id.clone(), prior });
+                    }
+                }
+            } else if !replaced {
+                self.weld_prepared.remove(name);
+            }
+        }
         for name in &result.removed {
             // (A removal spelling a legacy alias was canonicalized when the
             // feature ran — `canonical_removed` — so every consumer of
@@ -1204,6 +1278,7 @@ impl SceneMap {
                 let prefix = format!("{}:", record.id);
                 self.occurrences.retain(|id, _| !id.starts_with(&prefix));
                 for member in &record.solids {
+                    self.weld_prepared.remove(member);
                     if let Some(handle) = self.solids.remove(member) {
                         self.faces.retain(|_, face| face.handle != handle);
                         self.edges.retain(|_, edge| edge.handle != handle);
@@ -2559,7 +2634,9 @@ fn capture_weld_poses(request: &HistoryRequest, results: &[FeatureResult], scene
         }
         if let Some((owner, pose)) = &owner {
             for (name, _) in &result.paths { inherited.insert(name.clone(), (owner.clone(), *pose)); }
-            for added in &result.added {
+            // A member prepared in context moves with its own component, not
+            // with the seam's owner.
+            for added in result.added.iter().filter(|added| !scene.weld_prepared.contains_key(&added.name)) {
                 for (_, name) in &added.edge_names { inherited.insert(name.clone(), (owner.clone(), *pose)); }
             }
         }
@@ -2606,8 +2683,14 @@ fn withdraw_weld(results: &mut [FeatureResult], scene: &mut SceneMap, index: usi
     for (name, _) in &result.points { scene.points.remove(name); }
     for (name, _) in &result.paths { scene.paths.remove(name); }
     for (name, _) in &result.frames { scene.frames.remove(name); }
-    let mut removal = FeatureResult::empty(&result.id, &result.feature_type);
-    removal.removed = result.added.iter().map(|added| added.name.clone()).collect();
+    // A body it prepared goes back to the body it was cut from (a component
+    // member to its component's own body, which the solve posed): the
+    // rebuild cuts that, so it never cuts twice.
+    scene.restore_prepared(&result.id);
+    let mut removal = FeatureResult::empty("", "");
+    removal.removed = result.added.iter()
+        .filter(|added| scene.solids.get(&added.name) == Some(&added.handle))
+        .map(|added| added.name.clone()).collect();
     scene.apply(&removal);
     // The cache entry stays and keeps owning the weld: it no longer holds the
     // freed bead, takes the rebuilt one in `rebuild_weld`, and never replays.
@@ -2658,7 +2741,11 @@ fn pose_weld_outputs(request: &HistoryRequest, env: &Env, results: &mut [Feature
         let seam = result.weld_source_seam.as_deref()
             .is_some_and(|seam| scene.resolve_edge(seam).is_some() || scene.resolve_path(seam).is_some()
                 || !scene.resolve_face_group(seam).is_empty());
-        seam && result.weld_joint_solids.iter().all(|solid| scene.solids.contains_key(solid))
+        // A face of a member the weld prepared in context may be cut away
+        // (a groove with no root face); it is back once the member is
+        // restored for the rebuild.
+        let prepared = scene.weld_prepared.values().any(|chain| chain.iter().any(|link| link.weld == result.id));
+        (seam || prepared) && result.weld_joint_solids.iter().all(|solid| scene.solids.contains_key(solid))
     }).collect();
     // Rebuilds run after every other weld is posed and every rebuilt weld is
     // withdrawn, so a rebuilt bead is checked against the solved scene only.
@@ -2687,7 +2774,11 @@ fn pose_weld_outputs(request: &HistoryRequest, env: &Env, results: &mut [Feature
         if before.elements == after.elements { continue; }
         let delta = before.rigid_inverse().and_then(|inverse| component::compose(&after, &inverse));
         let result = &mut results[index];
-        let posed = delta.and_then(|delta| features::weld::pose(result, delta));
+        // A body it prepared stays with what it was cut from: a component
+        // member already moved with its component, any other body never moves.
+        let members: Vec<String> = scene.weld_prepared.iter()
+            .filter(|(_, chain)| chain.iter().any(|link| link.weld == result.id)).map(|(name, _)| name.clone()).collect();
+        let posed = delta.and_then(|delta| features::weld::pose(result, delta, &members));
         if let Err(error) = posed {
             result.error = Some(format!("weld placement: {error}"));
             for (name, _) in &result.points { scene.points.remove(name); }
@@ -2697,6 +2788,8 @@ fn pose_weld_outputs(request: &HistoryRequest, env: &Env, results: &mut [Feature
             result.points.clear();
             result.paths.clear();
             // Remove failed geometry from the scene, result and its owning cache.
+            // A body it prepared goes back to the body it was cut from.
+            scene.restore_prepared(&result.id);
             let mut removal = FeatureResult::empty(&result.id, &result.feature_type);
             removal.removed = result.added.iter()
                 .filter(|added| scene.solids.get(&added.name) == Some(&added.handle))
@@ -2711,6 +2804,9 @@ fn pose_weld_outputs(request: &HistoryRequest, env: &Env, results: &mut [Feature
         // A consumed bead stays consumed; its cache-owned handle is still posed.
         let mut published = result.clone();
         published.added.retain(|added| scene.solids.get(&added.name) == Some(&added.handle));
+        // Only names it still holds are re-published: a body a later weld
+        // prepared again is that weld's now, and stays in the scene.
+        published.removed.retain(|name| published.added.iter().any(|added| &added.name == name));
         scene.apply(&published);
         moved_welds.extend(published.added.iter().map(|added| (added.name.clone(), added.handle)));
         let cacheable = !parts_library::in_isolated_run() && !result.id.is_empty() && !request.features[..index].iter()

@@ -68,7 +68,7 @@ pub(super) fn pmi_state_schema() -> Value {
         "weldSymbol":reference("WeldSymbol")}),
         &["id","type","enabled","status","message","text","unit","references","labelWorld","geometry"]);
     defs["WeldSymbol"] = closed_object_required(json!({"standard":{"enum":["Aws","Iso"]},"side":{"enum":["Arrow","Other","Both"]},
-        "glyph":{"enum":["Fillet","Square","V","Bevel","U","J","Plug","Spot","Seam","Surfacing"]},"size":text,"length":text,
+        "glyph":{"enum":["Fillet","Square","V","Bevel","U","J","FlareV","FlareBevel","Plug","Spot","Seam","Surfacing"]},"size":text,"length":text,
         "allAround":boolean,"fieldWeld":boolean,"tail":text,"staggered":boolean}),
         &["standard","side","glyph","size","length","allAround","fieldWeld","tail","staggered"]);
     defs["ViewReport"] = closed_object_required(json!({"id":text,"annotations":array(reference("AnnotationReport")),

@@ -4170,6 +4170,30 @@ pub fn analytic_station_pcurve(
 }
 
 #[allow(clippy::too_many_arguments)]
+thread_local! {
+    /// Profile only: the station fitter's time by phase (setup, probes,
+    /// inserts, repair, interpolant, residual, other), ms.
+    static STATION_LAPS: std::cell::Cell<[f64; 7]> = const { std::cell::Cell::new([0.0; 7]) };
+}
+
+fn station_lap(slot: usize, lap: &mut Option<web_time::Instant>) {
+    let Some(started) = *lap else { return };
+    let now = web_time::Instant::now();
+    STATION_LAPS.with(|laps| {
+        let mut all = laps.get();
+        all[slot] += (now - started).as_secs_f64() * 1e3;
+        laps.set(all);
+    });
+    *lap = Some(now);
+}
+
+/// Profile only: take and reset the station fitter's phase totals.
+#[doc(hidden)]
+pub fn take_station_fit_laps() -> [f64; 7] {
+    STATION_LAPS.with(|laps| laps.replace([0.0; 7]))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn fit_station_pcurve(
     surface: &NurbsSurface,
     stations: &dyn Fn(f64) -> Result<Vec3, String>,
@@ -4300,6 +4324,7 @@ pub fn fit_station_pcurve_mode(
     }
     // The 3D edge point behind each raw inversion sample, kept parallel so the
     // continuity repair can re-seed a jumped station from its own footpoint.
+    let mut lap = crate::profile::profile_enabled().then(web_time::Instant::now);
     let mut edge_points = parameters
         .iter()
         .map(|fraction| evaluate_edge(*fraction))
@@ -4322,6 +4347,7 @@ pub fn fit_station_pcurve_mode(
     let (mut pcurve, mut excursion, mut distance) =
         build_interpolant_joined(surface, &raw, &parameters, &joins)?;
 
+    station_lap(0, &mut lap);
     let mut cap = parameter_cap.max(parameters.len());
     let mut rounds = refinement_rounds;
     let mut raised = false;
@@ -4429,6 +4455,7 @@ pub fn fit_station_pcurve_mode(
                     candidates.push((index, fraction, edge_point, uv, tracking, Some((foot_uv, foot_gap))));
                 }
             }
+            station_lap(if track_projection { 6 } else { 1 }, &mut lap);
             tracking_unmet = track_projection && round_max > target;
             // A round with more candidates than the cap has room for spends
             // that room on its WORST probes, kept in curve order, rather than
@@ -4459,6 +4486,7 @@ pub fn fit_station_pcurve_mode(
                 };
                 inserts.push((index + 1, fraction, edge_point, parameter, gap));
             }
+            station_lap(2, &mut lap);
             if station_fit_tracing() {
                 eprintln!(
                     "STATION-FIT round: samples={} target={target:.3e} round_max={round_max:.3e} inserts={} truncated={truncated}{}",
@@ -4503,7 +4531,9 @@ pub fn fit_station_pcurve_mode(
             // so a fold-flip introduced mid-refinement cannot poison the next
             // round's deviation interpolant.
             repair_branch_jumps(surface, &edge_points, &mut raw, tolerance)?;
+            station_lap(3, &mut lap);
             let rebuilt = build_interpolant_joined(surface, &raw, &parameters, &joins)?;
+            station_lap(4, &mut lap);
             pcurve = rebuilt.0;
             excursion = rebuilt.1;
             distance = rebuilt.2;
@@ -4512,12 +4542,14 @@ pub fn fit_station_pcurve_mode(
                 break;
             }
         }
+        station_lap(5, &mut lap);
         let residual = match converged_max {
             Some(measured) => measured,
             None => {
                 station_residual(surface, evaluate_edge, &pcurve, &parameters, tolerance, &mut off_surface)?
             }
         };
+        station_lap(5, &mut lap);
         if station_fit_tracing() {
             eprintln!(
                 "STATION-FIT pass raised={raised} exit={exit:?} samples={} residual={residual:.3e} off_surface={off_surface:.3e}",

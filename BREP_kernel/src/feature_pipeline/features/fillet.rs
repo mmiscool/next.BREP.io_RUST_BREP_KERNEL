@@ -88,7 +88,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
         .iter()
         .map(|edge_name| common::blend_face_name(&ctx.id, edge_name))
         .collect();
-    let blended = crate::with_registered_solid_typed(target.handle, |solid| match taper {
+    let build_blend = || crate::with_registered_solid_typed(target.handle, |solid| match taper {
         Some(radius_end) => crate::fillet_edges_variable(
             solid,
             &target.edge_points,
@@ -108,6 +108,31 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     })
     // The blend's refusal keeps its class through the feature's wrap.
     .map_err(|error| error.with_message(|error| format!("fillet failed: {error}")));
+    // "Wrap sharp corners": the build runs with the ball rolled round each
+    // unselected sharp edge two selected concave blends meet over on a curved
+    // shared face. It must never do worse than the option off: when a corner
+    // it took up could not be closed (a refusal, or a body the acceptance
+    // rejected, which sends the ladder on to another composition), or the
+    // build failed, the selection is built again without it and a note says so.
+    let blended = if wrap_corners(ctx) {
+        let (wrapped, outcome) = brep_blend::blend::with_wrap_sharp_corners(build_blend);
+        // A closure built on a body some later stage threw away counts in
+        // `outcome.wrapped`; the returned body must carry one itself.
+        let carries = |body: &crate::BrepSolid| {
+            brep_blend::blend::body_carries_wrapped_corner(body, &outcome, 1e-9 * (1.0 + crate::solid_scale(body)))
+        };
+        if outcome.candidates == 0 || (outcome.failed == 0 && wrapped.as_ref().is_ok_and(carries)) {
+            wrapped
+        } else {
+            result.notes.push(
+                "Wrap sharp corners: a sharp-edge corner of this selection could not be wrapped, so the fillet was built without the option"
+                    .to_string(),
+            );
+            build_blend()
+        }
+    } else {
+        build_blend()
+    };
     let blended = match blended {
         Ok(blended) => blended,
         Err(refusal) => {
@@ -130,6 +155,11 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     result.added.push(common::register_added(blended, &target.name));
     result.removed.push(target.name);
     Ok(result)
+}
+
+/// The `wrapCorners` input: only an explicit `true` turns it on.
+fn wrap_corners(ctx: &FeatureContext) -> bool {
+    ctx.param("wrapCorners").and_then(|value| value.as_bool()).unwrap_or(false)
 }
 
 /// The `followTangent` input: only an explicit `true` turns it on.
@@ -254,6 +284,12 @@ pub fn schema() -> serde_json::Value {
             "default_value": true,
             "label": "Follow tangent",
             "hint": "Grow each selected edge to its whole tangent (G1) chain: pick one edge of a rounded rectangle and the fillet runs around the whole loop. A chain stops at a sharp corner and at a vertex where more than one edge continues it tangentially. The added edges are listed on the feature. New fillets start with it on; a fillet saved before the option existed reads as off."
+        },
+        "wrapCorners": {
+            "type": "boolean",
+            "default_value": false,
+            "label": "Wrap sharp corners",
+            "hint": "Where two selected inside (concave) fillets meet over an unselected sharp outside edge on a curved face (a round boss standing across a block's edge), roll the fillet round that edge instead of meeting in a sharp seam: the corner is closed by the surface the rolling ball sweeps while it stays on the curved face and pivots on the sharp edge. Off by default, which keeps the sharp seam. When a corner cannot be wrapped the fillet is built without the option and a note says so."
         }
     }
 })

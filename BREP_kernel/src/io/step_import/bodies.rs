@@ -373,12 +373,29 @@ pub(super) fn step_body_face_count(resolver: &Resolver, body: StepBody) -> usize
 /// exactly as before. In both paths a body that fails to reconstruct is skipped
 /// (counted in `failed`) rather than aborting the whole file.
 pub(super) fn collect_step_solids(text: &str) -> Result<ImportedBodies, String> {
-    collect_step_solids_with(text, false)
+    collect_step_solids_with(text, false, true)
+}
+
+/// `BREP_IMPORT_LEAN`: an import whose caller drops the trim readings (the
+/// IMPORT3D feature: it keeps the solids, appearances and closure notes, and
+/// has no channel for diagnostics) builds without them, and the Parasolid
+/// translation solves each exact intersection station once. Nothing a body is
+/// built from changes: the readings only read the chosen trims, and a station
+/// is the same solve at k/s and 2k/2s. Default on; `=0` builds the readings
+/// and solves every station as before.
+pub(crate) fn import_lean() -> bool {
+    switch!("BREP_IMPORT_LEAN", true)
+}
+
+/// [`collect_step_solids`] for a caller that drops the trim readings.
+pub(super) fn collect_step_solids_dropping_readings(text: &str) -> Result<ImportedBodies, String> {
+    collect_step_solids_with(text, false, !import_lean())
 }
 
 /// [`collect_step_solids`], with `sheets` building each OPEN_SHELL as a sheet
-/// body instead of skipping it ([`Resolver::sheets`]).
-pub(super) fn collect_step_solids_with(text: &str, sheets: bool) -> Result<ImportedBodies, String> {
+/// body instead of skipping it ([`Resolver::sheets`]), and `readings` off for
+/// a caller that drops the trim readings ([`Resolver::trim_readings`]).
+pub(super) fn collect_step_solids_with(text: &str, sheets: bool, readings: bool) -> Result<ImportedBodies, String> {
     if !text.contains("ISO-10303-21") {
         return Err("step_import: not an ISO-10303-21 Part 21 file".into());
     }
@@ -390,7 +407,7 @@ pub(super) fn collect_step_solids_with(text: &str, sheets: bool) -> Result<Impor
     }
     let mut resolver = Resolver::new(&entities, derive_length_scale_mm(&entities));
     resolver.sheets = sheets;
-    let resolver = resolver;
+    let resolver = if readings { resolver } else { resolver.without_trim_readings() };
     // The file's presentation entities, read ONCE. An uncoloured file leaves the
     // table empty and every appearance lookup short-circuits.
     let styles = StyleTable::read(&entities);

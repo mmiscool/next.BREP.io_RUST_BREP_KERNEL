@@ -74,13 +74,17 @@ pub const V30_SCHEMA: &str = "30100";
 /// with no deltas (`SCH_2500000_25001`).
 pub const V25_SCHEMA: &str = "25001";
 
+/// The schema Parasolid V26.1 writes (`SCH_2601178_26105`, as IronCAD
+/// writes with no deltas).
+pub const V26_SCHEMA: &str = "26105";
+
 /// Parasolid V12's schema, older than the base and so never written with
 /// deltas (`SCH_1200000_12006`).
 pub const V12_SCHEMA: &str = "12006";
 
 /// The schemas whose files may carry no layout description and are still
 /// read, by the layouts stored here.
-pub const STORED_SCHEMAS: [&str; 3] = [V12_SCHEMA, V25_SCHEMA, V30_SCHEMA];
+pub const STORED_SCHEMAS: [&str; 4] = [V12_SCHEMA, V25_SCHEMA, V26_SCHEMA, V30_SCHEMA];
 
 /// A node type's layout in a stored schema, as an edit script against the
 /// base in the form embedded deltas take (§2.1.2.2), or `None` when no file
@@ -95,6 +99,9 @@ pub fn stored_delta(schema: &str, node_type: u16) -> Option<&'static str> {
             // far as the reported file showed them.
             v30_delta(node_type).filter(|d| *d == "255 " || V25_AS_V30.contains(&node_type))
         }),
+        // A type V26.1 lays out as schema 25001 does, except where the
+        // reported file showed otherwise.
+        V26_SCHEMA => find(V26_DELTAS).or_else(|| stored_delta(V25_SCHEMA, node_type)),
         V12_SCHEMA => find(V12_DELTAS),
         _ => None,
     }
@@ -111,6 +118,16 @@ const V25_DELTAS: &[(u16, &str)] = &[
     (12, "29 CCCCCCCCCCCCCDI5 owner12 0 CCCCCCCCCA16 index_map_offset0 0 1 dA9 index_map82 0 A17 node_id_index_map82 0 A20 schema_embedding_map82 0 A5 child12 0 A14 lowest_node_id0 0 1 dZ"),
     (38, "255 "),
     (41, "255 "),
+];
+
+/// Schema 26105 where it is not 25001's: the layouts the reported IronCAD
+/// file reads end to end by. BODY has 25001's fields and one more trailing
+/// field (0 on every body there), named after V30.1's last. ASSEMBLY,
+/// INSTANCE and TRANSFORM are the base's (the file nests assemblies).
+#[rustfmt::skip]
+const V26_DELTAS: &[(u16, &str)] = &[
+    (10, "255 "), (11, "255 "), (100, "255 "),
+    (12, "30 CCCCCCCCCCCCCDI5 owner12 0 CCCCCCCCCA16 index_map_offset0 0 1 dA9 index_map82 0 A17 node_id_index_map82 0 A20 schema_embedding_map82 0 A5 child12 0 A14 lowest_node_id0 0 1 dA16 mesh_offset_data206 0 Z"),
 ];
 
 /// Types V30.1 changed from the base whose V30.1 layout the reported schema

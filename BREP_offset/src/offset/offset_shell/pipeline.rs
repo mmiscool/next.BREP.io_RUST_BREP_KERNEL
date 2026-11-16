@@ -567,6 +567,32 @@ fn imprint_attempts(
     distance: f64,
     body: Body,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    // An OUTWARD pass that refused after holding back a concave side runs once
+    // more with it continued round its arc (`concave_arc_retry_on`); the
+    // first refusal stands if that fails too.
+    let held = super::outward_side_widen::concave_held();
+    let first = imprint_attempts_once(source, opening_face_ids, distance, body);
+    match first {
+        Err(error) if distance < 0.0 || body == Body::Whole => {
+            if !super::outward_side_widen::concave_arc_retry_on() || super::outward_side_widen::concave_held() == held {
+                return Err(error);
+            }
+            os_debug!("outward pass refused with concave sides held back ({error}); retrying with them continued round their arc");
+            match super::outward_side_widen::with_concave_arc(|| imprint_attempts_once(source, opening_face_ids, distance, body)) {
+                Ok(result) => Ok(result),
+                Err(_) => Err(error),
+            }
+        }
+        other => other,
+    }
+}
+
+fn imprint_attempts_once(
+    source: &BrepSolid,
+    opening_face_ids: &[u64],
+    distance: f64,
+    body: Body,
+) -> Result<OffsetShellResultRecord, KernelRefusal> {
     // First try with oblique hole-wall carriers extended past their opening
     // planes (the lane that closes tilted/conical through-holes). If that
     // extension fired but the arrangement could not assemble the harder
@@ -705,6 +731,8 @@ fn refusal_names_its_cause(error: &str) -> bool {
         "is sealed off from the opening",
         "cannot tell whether",
         "omitting the shadowed offsets of source faces",
+        "reads shadowed over its whole extent, so omitting it again",
+        "nested passes without settling",
         "no retained face keeps any offset skin",
         "is shadowed at every one of its",
         "a rim vacated by an omitted support was left open",
@@ -721,6 +749,46 @@ fn refusal_names_its_cause(error: &str) -> bool {
     .any(|name| error.contains(name))
 }
 
+/// The deepest nesting of `offset_shell_impl` passes one shell may take.
+/// Every re-run changes an input that only grows (the omitted supports, the
+/// cavity bounds, the every-seed flag), so the depth is bounded by the face
+/// count already; this bound makes a re-run that fails to grow its input a
+/// named refusal instead of a stack overflow, whatever the cause.
+pub(super) const MAXIMUM_PASS_DEPTH: usize = 24;
+
+std::thread_local! {
+    static PASS_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One nested pass, counted while it lives.
+struct PassDepth;
+
+impl PassDepth {
+    fn enter() -> Result<Self, KernelRefusal> {
+        let depth = PASS_DEPTH.with(|cell| {
+            let depth = cell.get() + 1;
+            cell.set(depth);
+            depth
+        });
+        let pass = PassDepth;
+        if depth > MAXIMUM_PASS_DEPTH {
+            return Err(KernelRefusal::unsupported(KernelStage::Select, refusals::PASS_BUDGET, format!(
+                "offset_shell: the construction re-ran {MAXIMUM_PASS_DEPTH} nested passes without settling \
+                 which offset supports to omit"
+            )));
+        }
+        Ok(pass)
+    }
+}
+
+impl Drop for PassDepth {
+    fn drop(&mut self) {
+        PASS_DEPTH.with(|cell| cell.set(cell.get().saturating_sub(1)));
+    }
+}
+
+
+
 fn offset_shell_impl(
     source: &BrepSolid,
     opening_face_ids: &[u64],
@@ -736,6 +804,7 @@ fn offset_shell_impl(
     omitted_supports: &mut HashSet<u64>,
     vacated_notes: &mut Vec<String>,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    let _pass = PassDepth::enter()?;
     profile::attempt();
     let _sharp_rims = super::carriers::SharpOpeningRims::set(if super::carriers::ruled_miter_on() {
         super::carriers::sharp_opening_rims(source, opening_face_ids)
@@ -793,6 +862,10 @@ fn offset_shell_impl(
     // The carriers that are such tubes, by index, with the opening each
     // tube's mouth lies on.
     let mut rim_tubes: HashMap<usize, u64> = HashMap::default();
+    // The tubes of SURVIVING rounds, by carrier index: such a tube rides its
+    // round's id, so reading it shadowed must drop only the tube, never the
+    // round's own offset.
+    let mut surviving_tubes = HashSet::<usize>::default();
     let mut shielded_cusps = HashSet::<u64>::default();
 
     for face_id in &retained {
@@ -1344,7 +1417,18 @@ fn offset_shell_impl(
     // carrier the way an apex cap rides its cone's.
     if distance > 0.0 && super::rim_round::collapsed_rim_tube_enabled() {
         let tolerance = 1e-7f64.max(crate::solid_scale(source) * 1e-9);
-        for collapsed_id in &collapsed_supports {
+        // A tube a previous pass read SHADOWED is omitted with its round, as
+        // every shadowed support is: building it again would read shadowed
+        // again and ask for the same re-run.
+        // A SURVIVING round (`BREP_OFFSET_SURVIVING_RIM_TUBE`) takes its tube
+        // too: its offset ends `distance` under the rim, and the quarter tube
+        // runs from there to the mouth.
+        let surviving = retained
+            .iter()
+            .filter(|id| super::rim_round::surviving_rim_tube_enabled() && !collapsed_supports.contains(id))
+            .map(|id| (*id, true));
+        let rounds = collapsed_supports.iter().map(|id| (*id, false)).chain(surviving).collect::<Vec<_>>();
+        for (collapsed_id, survives) in rounds.iter().filter(|(id, _)| !shadowed_supports.contains(id)) {
             let Some(face) = source_by_id_lookup(&source_faces, *collapsed_id) else { continue };
             for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
                 let Some((mate, mate_use)) = junction_mate(&source_faces, face, coedge.edge_id) else { continue };
@@ -1356,14 +1440,29 @@ fn offset_shell_impl(
                     continue;
                 }
                 let Some(edge) = source.edges.iter().find(|edge| edge.id == coedge.edge_id) else { continue };
-                if let Some(tube) = super::rim_round::planar_rim_tube(edge, mate, distance, tolerance)? {
+                // A circle's tube ends ON the plane (its mouth an orphan rim);
+                // a line's runs past it (cut by the wall like any skin).
+                let (tube, on_plane) = match super::rim_round::planar_rim_tube(edge, mate, distance, tolerance, *survives)? {
+                    Some(tube) => (Some(tube), true),
+                    None if super::rim_round::surviving_rim_tube_enabled() => {
+                        (super::rim_round::planar_line_rim_tube(edge, mate, distance, tolerance, *survives)?, false)
+                    }
+                    None => (None, false),
+                };
+                if let Some(tube) = tube {
                     os_debug!(
-                        "collapsed rim tube: about edge {} (collapsed face {collapsed_id}, opening {}) as carrier {}",
+                        "rim tube: about edge {} (face {collapsed_id}, {}, opening {}) as carrier {}",
                         edge.id,
+                        if *survives { "surviving" } else { "collapsed" },
                         mate.id,
                         carriers.len()
                     );
-                    rim_tubes.insert(carriers.len(), mate.id);
+                    if on_plane {
+                        rim_tubes.insert(carriers.len(), mate.id);
+                    }
+                    if *survives {
+                        surviving_tubes.insert(carriers.len());
+                    }
                     carriers.push(Carrier { solid: tube, source_face_id: *collapsed_id, kind: OffsetFaceRole::Offset });
                 }
             }
@@ -2754,8 +2853,11 @@ fn offset_shell_impl(
                         || (distance < 0.0 && class == PointClass::In);
                 }
             }
+            #[cfg(not(test))]
+            let forced_shadow = false;
+            let skinless = skinless || forced_shadow;
             if skinless && !apex_cap_sources.contains(&index) {
-                if body == Body::Shell && distance > 0.0 && cascade_omission_enabled() {
+                if body == Body::Shell && distance > 0.0 && cascade_omission_enabled() && !forced_shadow {
                     let held = fragments_holding_true_skin(
                         source_by_id[&carrier.source_face_id],
                         source,
@@ -2781,6 +2883,10 @@ fn offset_shell_impl(
                         carrier.source_face_id,
                         readings.len()
                     )));
+                }
+                if surviving_tubes.contains(&index) {
+                    os_debug!("  select[{index}] src={}: a surviving round's rim tube reads shadowed; only the tube is dropped", carrier.source_face_id);
+                    continue;
                 }
                 os_debug!(
                     "  select[{index}] src={} SHADOWED over all {} fragment(s): {:?}",
@@ -3404,6 +3510,21 @@ fn offset_shell_impl(
                 fragment.test_point.z,
             );
         }
+    }
+    // A re-run must omit something this pass did not, or it replays this pass
+    // exactly and recurses until the stack overflows: only supports not
+    // already omitted count. A carrier riding an omitted support's id (a
+    // synthetic carrier the omission did not remove) reading shadowed is
+    // refused by name instead.
+    let already_omitted = newly_shadowed.iter().filter(|id| shadowed_supports.contains(id)).copied().collect::<Vec<_>>();
+    newly_shadowed.retain(|id| !shadowed_supports.contains(id));
+    if newly_shadowed.is_empty() && !already_omitted.is_empty() {
+        let mut faces = already_omitted;
+        faces.sort_unstable();
+        return Err(KernelRefusal::unsupported(KernelStage::Select, refusals::SHADOW_RETRY_STALLED, format!(
+            "offset_shell: a carrier built for the already omitted source face(s) {faces:?} reads shadowed \
+             over its whole extent, so omitting it again cannot change the construction"
+        )));
     }
     if !newly_shadowed.is_empty() {
         let mut omitted = shadowed_supports.clone();

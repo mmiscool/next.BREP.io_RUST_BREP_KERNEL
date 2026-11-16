@@ -1,7 +1,7 @@
 # BREP_direct_edit
 
 `BREP_direct_edit` holds the direct editing of B-rep faces for the BREP kernel. Its Rust library
-target is `brep_direct_edit`; this is version **0.22.0**.
+target is `brep_direct_edit`; this is version **0.23.0**.
 
 It is one of the implementation crates the kernel is built from. Applications
 should depend on [`BREP_kernel`](https://crates.io/crates/BREP_kernel), which

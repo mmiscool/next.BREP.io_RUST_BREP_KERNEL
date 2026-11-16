@@ -1,12 +1,16 @@
 //! Groove (butt) welds: the bead fills the joint two butting parts' faces
 //! make, with an optional cap on the face the groove opens to and a root bead
-//! on the other. In a part, the joint preparation (bevel, J or U) can be cut
-//! into the parts by the weld; an assembly weld never changes its components.
+//! on the other. The joint preparation (bevel, J or U) can be cut into the
+//! parts by the weld. In an assembly it is cut in context: the prepared body
+//! replaces the instance in the assembly only, and the part document, the
+//! component and its other instances keep the unprepared body.
 use super::common;
 use super::fit::{self, Seam, Side, Trim};
 
 #[path = "weld_edge.rs"]
 pub(crate) mod edge;
+#[path = "weld_flare.rs"]
+mod flare;
 use crate::feature_pipeline::{FeatureContext, FeatureResult, ScenePoint, SelectionProbe};
 use crate::Vec3;
 
@@ -23,9 +27,14 @@ enum Shape {
     U,
     /// One face J-shaped by the groove angle, the other square.
     J,
+    /// Two round faces (bars or bends): the flare between them.
+    FlareV,
+    /// A round face against a flat one.
+    FlareBevel,
 }
 
-const SHAPES: [(&str, Shape); 5] = [("SQUARE", Shape::Square), ("V", Shape::V), ("BEVEL", Shape::Bevel), ("U", Shape::U), ("J", Shape::J)];
+const SHAPES: [(&str, Shape); 7] = [("SQUARE", Shape::Square), ("V", Shape::V), ("BEVEL", Shape::Bevel), ("U", Shape::U), ("J", Shape::J),
+    ("FLARE_V", Shape::FlareV), ("FLARE_BEVEL", Shape::FlareBevel)];
 
 /// How one face of the joint is prepared.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,8 +50,14 @@ enum Edge {
 pub fn hidden_params(values: &serde_json::Value) -> Vec<&'static str> {
     let shape = values.get("shape").and_then(serde_json::Value::as_str).unwrap_or("V");
     let mut hidden = Vec::new();
+    if shape.starts_with("FLARE") {
+        hidden.extend(["grooveAngle", "rootFace", "rootRadius", "bevelFace", "rootReinforcement", "capOverlap", "prepare", "transition", "transitionSlope"]);
+        return hidden;
+    }
+    hidden.push("flareDepth");
     if shape == "SQUARE" {
-        hidden.extend(["grooveAngle", "rootFace", "prepare"]);
+        // Prepare joint stays: it also lets a TAPER cut a thicker part.
+        hidden.extend(["grooveAngle", "rootFace"]);
     }
     if !matches!(shape, "U" | "J") {
         hidden.push("rootRadius");
@@ -68,14 +83,16 @@ pub fn schema() -> serde_json::Value {
             "id": {"type": "string", "default_value": null},
             "seam": {"type": "reference_selection", "label": "Weld references", "selectionFilter": ["FACE", "EDGE"], "multiple": true, "default_value": null,
                 "hint": "Select the two butting faces, in order (the first is the first joint face). Add an edge of either face to set the seam's direction and the side the groove opens to; without one the seam runs along the faces' longer side and the groove opens upwards (+Z, else +Y, else +X)."},
-            "shape": {"type": "options", "label": "Groove", "options": ["SQUARE", "V", "BEVEL", "U", "J"], "default_value": "V",
-                "hint": "SQUARE: both faces square, the root opening filled. V and U: both faces prepared. BEVEL and J: one face prepared (Bevelled face), the other square."},
+            "shape": {"type": "options", "label": "Groove", "options": ["SQUARE", "V", "BEVEL", "U", "J", "FLARE_V", "FLARE_BEVEL"], "default_value": "V",
+                "hint": "SQUARE: both faces square, the root opening filled. V and U: both faces prepared. BEVEL and J: one face prepared (Bevelled face), the other square. FLARE_V: between two round faces (bars or bent edges). FLARE_BEVEL: between a round face and a flat one."},
             "double": {"type": "boolean", "label": "Double", "default_value": false,
                 "hint": "Prepare and weld from both sides: the groove is mirrored about the middle of the thickness, a cap on each side."},
             "grooveAngle": {"type": "number", "label": "Groove angle", "default_value": 60,
                 "hint": "The groove's included angle in degrees: split between the two faces for V and U, all on the bevelled face for BEVEL and J."},
             "rootFace": {"type": "number", "label": "Root face", "default_value": 0,
                 "hint": "The unprepared land at the root, in model units (for a double groove, in the middle). The groove depth is the thickness less the root face."},
+            "flareDepth": {"type": "number", "label": "Groove depth", "default_value": 0,
+                "hint": "How deep a flare groove is filled from its top (the smaller round's tangent level), in model units. 0 = down to the root."},
             "rootRadius": {"type": "number", "label": "Root radius", "default_value": 3,
                 "hint": "The radius at the bottom of a U or J groove, in model units."},
             "bevelFace": {"type": "options", "label": "Bevelled face", "options": ["FIRST", "SECOND"], "default_value": "FIRST",
@@ -86,8 +103,12 @@ pub fn schema() -> serde_json::Value {
                 "hint": "Height of the root bead below the other face, in model units. 0 = none."},
             "capOverlap": {"type": "number", "label": "Cap overlap", "default_value": 1,
                 "hint": "How far a cap or root bead runs onto each part's face past the groove's edge, in model units."},
+            "transition": {"type": "options", "label": "Thickness transition", "options": ["TAPER", "WELD_SLOPE"], "default_value": "TAPER",
+                "hint": "For parts of unequal thickness: TAPER cuts the thicker part down to the thinner at the slope below (Prepare joint on; in an assembly the cut is the assembly's, never the part's); WELD_SLOPE cuts no taper and builds the slope out of weld metal from the thicker part's edge down onto the thinner part (a step that must stay). Parts of equal thickness ignore it."},
+            "transitionSlope": {"type": "number", "label": "Transition slope (1 in)", "default_value": 2.5,
+                "hint": "The transition's run per unit of height difference: 2.5 is the 1:2.5 slope AWS D1.1 allows at most; ISO practice often uses 4."},
             "prepare": {"type": "boolean", "label": "Prepare joint", "default_value": true,
-                "hint": "Cut the groove's bevel, J or U into the parts (a part weld). Off: the parts must already be prepared; an assembly weld never changes its components."},
+                "hint": "Cut the groove's bevel, J or U (and a TAPER into a thicker part) into the parts. In an assembly the cut belongs to the assembly: that instance shows it, while the part document and the part's other instances stay as they are. Off: the parts must already be prepared."},
             "generateSolid": {"type": "boolean", "label": "Generate weld solid", "default_value": true,
                 "hint": "On by default: build the filled groove as a separate solid. Off keeps the weld, its preparation and its callout."},
             "weldColor": {"type": "color", "label": "Weld colour", "default_value": "#d9822b",
@@ -116,6 +137,9 @@ struct Joint {
     /// Whether each part ends at the seam's start and at its end (and so the
     /// preparation may run out past it there).
     ends: [[bool; 2]; 2],
+    /// How far each part runs past the joint's thickness (the thinner
+    /// part's) at the back face and at the face the groove opens to.
+    steps: [[f64; 2]; 2],
 }
 
 struct JointFace {
@@ -143,10 +167,23 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     let shape = match ctx.param("shape") {
         None => Shape::V,
         Some(serde_json::Value::String(value)) => SHAPES.iter().find(|(name, _)| *name == value.as_str()).map(|(_, shape)| *shape)
-            .ok_or_else(|| format!("unknown groove '{value}' (SQUARE, V, BEVEL, U or J)"))?,
-        Some(_) => return Err("groove must be SQUARE, V, BEVEL, U or J".into()),
+            .ok_or_else(|| format!("unknown groove '{value}' (SQUARE, V, BEVEL, U, J, FLARE_V or FLARE_BEVEL)"))?,
+        Some(_) => return Err("groove must be SQUARE, V, BEVEL, U, J, FLARE_V or FLARE_BEVEL".into()),
     };
     let double = boolean(ctx, "double", false, "Double")?;
+    if matches!(shape, Shape::FlareV | Shape::FlareBevel) {
+        return flare::build(ctx, flare::Settings {
+            flare: if shape == Shape::FlareV { flare::Flare::V } else { flare::Flare::Bevel },
+            double,
+            cap: number(ctx, "reinforcement", 1.0, "reinforcement", false)?,
+            generate: boolean(ctx, "generateSolid", true, "Generate weld solid")?,
+            colour: match ctx.param("weldColor") {
+                None => super::WELD_COLOUR.to_string(),
+                Some(serde_json::Value::String(hex)) if super::is_hex_colour(hex) => hex.to_ascii_lowercase(),
+                Some(_) => return Err("weld colour must be `#rrggbb`".into()),
+            },
+        });
+    }
     let angle = number(ctx, "grooveAngle", 60.0, "groove angle", true)?;
     // Each prepared face leans at most 80 degrees from square, so every part
     // corner along the groove keeps at least 10 degrees of metal.
@@ -166,7 +203,15 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     let cap = number(ctx, "reinforcement", 1.0, "reinforcement", false)?;
     let root_bead = if double { 0.0 } else { number(ctx, "rootReinforcement", 0.0, "root reinforcement", false)? };
     let overlap = number(ctx, "capOverlap", 1.0, "cap overlap", false)?;
-    let prepare = shape != Shape::Square && boolean(ctx, "prepare", true, "Prepare joint")?;
+    let may_cut = boolean(ctx, "prepare", true, "Prepare joint")?;
+    let prepare = shape != Shape::Square && may_cut;
+    let taper = match ctx.param("transition") {
+        None => true,
+        Some(serde_json::Value::String(value)) if value == "TAPER" => true,
+        Some(serde_json::Value::String(value)) if value == "WELD_SLOPE" => false,
+        Some(_) => return Err("thickness transition must be TAPER or WELD_SLOPE".into()),
+    };
+    let slope = number(ctx, "transitionSlope", 2.5, "transition slope", true)?;
     let generate = boolean(ctx, "generateSolid", true, "Generate weld solid")?;
     let colour = match ctx.param("weldColor") {
         None => super::WELD_COLOUR.to_string(),
@@ -176,6 +221,12 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     let joint = joint(ctx)?;
     let t = joint.thickness;
     let tolerance = 1e-6_f64.max(joint.length.max(t) * 1e-12);
+    let stepped = joint.steps.iter().flatten().any(|rise| *rise > 0.0);
+    if stepped && taper {
+        if !may_cut {
+            return Err("the parts are of unequal thickness, and a TAPER transition cuts the thicker one: turn Prepare joint on, or choose the WELD_SLOPE transition".into());
+        }
+    }
     if matches!(shape, Shape::U | Shape::J) && root_face <= tolerance {
         return Err("a U or J groove needs a root face: its radius would run out along the back face to a feather edge".into());
     }
@@ -185,13 +236,13 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     // How each face is prepared (the first face is x ≤ 0, the second x ≥ gap).
     let prepared = |bevelled: bool, share: f64| -> Edge {
         match (shape, bevelled) {
-            (Shape::Square, _) | (_, false) => Edge::Square,
+            (Shape::Square | Shape::FlareV | Shape::FlareBevel, _) | (_, false) => Edge::Square,
             (Shape::V | Shape::Bevel, true) => Edge::Bevel(angle * share),
             (Shape::U | Shape::J, true) => Edge::J(radius, angle * share),
         }
     };
     let edges = match shape {
-        Shape::Square => [Edge::Square, Edge::Square],
+        Shape::Square | Shape::FlareV | Shape::FlareBevel => [Edge::Square, Edge::Square],
         Shape::V | Shape::U => [prepared(true, 0.5), prepared(true, 0.5)],
         Shape::Bevel | Shape::J => [prepared(first_bevelled, 1.0), prepared(!first_bevelled, 1.0)],
     };
@@ -208,37 +259,87 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         parts.push((face.solid.clone(), crate::registered_solid_clone(handle)?));
     }
     let mut cut = [false; 2];
-    if prepare {
-        if !ctx.scene.components.is_empty() {
-            return Err("Prepare joint cuts the parts, and an assembly weld never changes its components: prepare the parts in their own documents and turn Prepare joint off".into());
-        }
+    // A component member is prepared in context: the cut body replaces the
+    // member in this assembly only (the part document, the component and its
+    // other instances keep the unprepared body; see `SceneMap::weld_prepared`).
+    let member = |name: &str| ctx.scene.owning_component(name).is_some_and(|record| record.solids.iter().any(|solid| solid == name));
+    if prepare || (stepped && taper) {
         // A cutter for each prepared face, past the faces it opens to and
         // past the seam's ends, reaching just across the face's plane (into
         // the root opening, never into the other part, which is not cut).
         let margin = t.max(joint.length) * 0.05 + 1.0;
         for (side, (name, body)) in parts.iter_mut().enumerate() {
-            if section.edges[side] == Edge::Square { continue; }
+            let mut tapers: Vec<(bool, f64)> = if taper {
+                [(false, joint.steps[side][0]), (true, joint.steps[side][1])].into_iter().filter(|(_, rise)| *rise > 0.0).collect()
+            } else {
+                Vec::new()
+            };
+            if (!prepare || section.edges[side] == Edge::Square) && tapers.is_empty() { continue; }
+            if let Some(other) = ctx.scene.context_member(name.as_str()).filter(|other| other.weld != ctx.id) {
+                return Err(format!("{name} is already prepared in this assembly by {}: an instance takes one joint preparation in an assembly (prepare the part in its own document for more)", other.weld));
+            }
+            let shells = body.shells.len();
             // Along the seam the cut runs out past an end only where the part
             // ends there too; a part that runs on keeps its square face past
             // the joint.
             let [before, after] = joint.ends[side].map(|ends| if ends { margin } else { 0.0 });
             let cut_seam = Seam::line(joint.origin.sub(joint.d.scale(before)), joint.d, joint.length + before + after, None);
             let back = |x: f64, y: f64| at(x, y).sub(joint.d.scale(before));
-            let outline: Vec<Side> = section.cutter(side, margin)?.into_iter().map(|side| side.place(&back)).collect();
-            let mut cutter = fit::sweep_outline(&cut_seam, &outline, &Trim::default())?;
-            // The faces the cut leaves on the part are named for the weld
-            // and the side, so the two prepared parts never share a name.
-            for (i, face) in cutter.shells.iter_mut().flat_map(|shell| &mut shell.faces).enumerate() {
-                face.name = Some(format!("{}:Prep{}Face{}", ctx.id, side + 1, i + 1));
+            let mut outlines: Vec<(&str, Vec<Flat>)> = Vec::new();
+            if prepare && section.edges[side] != Edge::Square {
+                // Carried past the face by at least the part's step, so a
+                // thicker part's flank runs on to its own face; where the
+                // part is tapered there, the cut runs on along the taper
+                // (a flank flatter than the taper would cut under it).
+                let rise = joint.steps[side][0].max(joint.steps[side][1]);
+                let away = if side == 0 { -1.0 } else { 1.0 };
+                let mut run_on = [None; 2];
+                tapers.retain(|(top, _)| {
+                    // The groove opens to the top, and to the back too when double.
+                    let grooved = *top || double;
+                    if grooved {
+                        run_on[usize::from(*top)] = Some([away * slope, if *top { 1.0 } else { -1.0 }]);
+                    }
+                    !grooved
+                });
+                outlines.push(("Face", section.cutter(side, margin + rise, run_on)?));
             }
-            *body = common::subtract_solid(body.clone(), cutter)
-                .map_err(|refusal| format!("could not prepare {name}: {refusal}"))?;
+            for (top, rise) in tapers {
+                outlines.push(("Taper", section.taper(side, top, rise, slope, margin)?));
+            }
+            for (kind, flats) in outlines {
+                let outline: Vec<Side> = flats.into_iter().map(|side| side.place(&back)).collect();
+                let mut cutter = fit::sweep_outline(&cut_seam, &outline, &Trim::default())?;
+                // The faces the cut leaves on the part are named for the weld
+                // and the side, so the two prepared parts never share a name.
+                for (i, face) in cutter.shells.iter_mut().flat_map(|shell| &mut shell.faces).enumerate() {
+                    face.name = Some(format!("{}:Prep{}{kind}{}", ctx.id, side + 1, i + 1));
+                }
+                *body = common::subtract_solid(body.clone(), cutter)
+                    .map_err(|refusal| format!("could not prepare {name}: {refusal}"))?;
+            }
+            // An instance prepared in context stays one body.
+            if member(name) && body.shells.len() != shells {
+                return Err(format!("preparing {name} would split it into {} bodies", body.shells.len()));
+            }
             cut[side] = true;
         }
     }
     let mut beads: Vec<(String, crate::BrepSolid)> = Vec::new();
     if generate {
-        let regions = section.regions(cap, root_bead, overlap)?;
+        // How each face of the joint is finished: a cap (or flush), and where
+        // a thicker part runs past the joint there, its transition.
+        let finish = |face: usize, height: f64, welded: bool| -> Finish {
+            let step = (0..2).find(|side| joint.steps[*side][face] > 0.0).map(|side| Step {
+                side,
+                rise: joint.steps[side][face],
+                // A taper is cut into the part; a weld slope is built only
+                // on a face the weld finishes.
+                slope: if taper || !welded { None } else { Some(slope) },
+            });
+            Finish { height, overlap, step }
+        };
+        let regions = section.regions(finish(1, cap, true), finish(0, if double { cap } else { root_bead }, double || root_bead > 0.0))?;
         if regions.is_empty() {
             return Err("a square groove with no root opening and no reinforcement has nothing to fill".into());
         }
@@ -281,7 +382,11 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     // The prepared parts replace the parts they were cut from.
     for ((name, body), cut) in parts.into_iter().zip(cut) {
         if cut {
-            result.added.push(common::register_added(body, &name));
+            result.added.push(if member(&name) {
+                crate::feature_pipeline::component::register_context_member(body, &name)
+            } else {
+                common::register_added(body, &name)
+            });
             result.removed.push(name);
         }
     }
@@ -437,11 +542,16 @@ fn joint(ctx: &FeatureContext) -> Result<Joint, String> {
         (Some(a), Some(b)) => (a, b),
         _ => return Err(format!("faces '{first}' and '{second}' do not run between two flat faces of their parts across the joint")),
     };
-    if (pa0 - pb0).abs() > tolerance * 1e3 || (pa1 - pb1).abs() > tolerance * 1e3 {
-        return Err(format!("the parts of '{first}' ({}) and '{second}' ({}) are not the same thickness across the joint; a groove weld between unequal parts is not built",
-            pa1 - pa0, pb1 - pb0));
+    // The joint's thickness is where both parts are; a thicker part runs
+    // past it at one face or both (a step the weld's transition meets).
+    let (aw0, aw1) = (pa0.max(pb0), pa1.min(pb1));
+    // Read against the parts' thickness, not the faces' run along the seam.
+    let across = 1e-9 * (pa1 - pa0).max(pb1 - pb0).max(1.0);
+    if aw1 - aw0 <= across {
+        return Err(format!("the parts of '{first}' and '{second}' do not overlap through their thickness across the joint"));
     }
-    let (aw0, aw1) = (pa0, pa1);
+    let step = |run: f64| if run > across * 1e3 { run } else { 0.0 };
+    let steps = [[step(aw0 - pa0), step(pa1 - aw1)], [step(aw0 - pb0), step(pb1 - aw1)]];
     let (ad0, ad1) = extent(d, &corners_a);
     let (bd0, bd1) = extent(d, &corners_b);
     let (d0, d1) = (ad0.max(bd0), ad1.min(bd1));
@@ -453,6 +563,7 @@ fn joint(ctx: &FeatureContext) -> Result<Joint, String> {
         origin: on_a.add(d.scale(d0)).add(w.scale(aw0)),
         u, w, d, gap, thickness: aw1 - aw0, length: d1 - d0,
         ends: [[ad0 >= d0 - tolerance * 1e3, ad1 <= d1 + tolerance * 1e3], [bd0 >= d0 - tolerance * 1e3, bd1 <= d1 + tolerance * 1e3]],
+        steps,
     })
 }
 
@@ -491,6 +602,27 @@ impl Flat {
 struct Region {
     outline: Vec<Flat>,
     contacts: Vec<(usize, Flat)>,
+}
+
+/// How the weld finishes one face of the joint.
+#[derive(Clone, Copy)]
+struct Finish {
+    /// The cap's height (0: flush).
+    height: f64,
+    /// How far the cap runs onto each part past the groove's edge.
+    overlap: f64,
+    /// A part that runs past the joint's thickness at this face.
+    step: Option<Step>,
+}
+
+/// A thicker part's step past the joint at one face.
+#[derive(Clone, Copy)]
+struct Step {
+    side: usize,
+    rise: f64,
+    /// The weld slope's run per unit rise; `None` where the part is tapered
+    /// (or the face is not welded), leaving no toe on the thicker part.
+    slope: Option<f64>,
 }
 
 /// The groove's cross-section.
@@ -567,11 +699,11 @@ impl Section {
 
     /// The bead's bodies: the filled groove with its caps when the root
     /// opening joins them into one, else each groove and cap on its own.
-    fn regions(&self, cap: f64, root_bead: f64, overlap: f64) -> Result<Vec<Region>, String> {
+    /// `top` finishes the face the groove opens to, `back` the other.
+    fn regions(&self, top: Finish, back: Finish) -> Result<Vec<Region>, String> {
         let t = self.thickness;
         let left = self.boundary(0)?;
         let right = self.boundary(1)?;
-        let bottom_cap = if self.double { cap } else { root_bead };
         let mut regions = Vec::new();
         if self.gap > self.tolerance {
             // One region: up the second face's boundary, across the top,
@@ -579,19 +711,21 @@ impl Section {
             let (l1, r1) = (end(&left), end(&right));
             let (l0, r0) = (start(&left), start(&right));
             let mut outline: Vec<Flat> = right.clone();
-            outline.extend(cap_sides(r1, l1, t, cap, overlap, 1.0));
-            outline.extend(left.iter().rev().map(Flat::reversed));
-            outline.extend(cap_sides(l0, r0, 0.0, bottom_cap, overlap, -1.0));
             let mut contacts: Vec<(usize, Flat)> = left.iter().map(|flat| (0, *flat)).chain(right.iter().map(|flat| (1, *flat))).collect();
-            contacts.extend(toes(l1, r1, cap, overlap));
-            contacts.extend(toes(l0, r0, bottom_cap, overlap));
+            let (sides, laid) = self.finish([(r1, 1), (l1, 0)], 1.0, &top)?;
+            outline.extend(sides);
+            contacts.extend(laid);
+            outline.extend(left.iter().rev().map(Flat::reversed));
+            let (sides, laid) = self.finish([(l0, 0), (r0, 1)], -1.0, &back)?;
+            outline.extend(sides);
+            contacts.extend(laid);
             regions.push(Region { outline, contacts });
             return Ok(regions);
         }
         // No root opening: the faces meet at the root. Each groove opening to
         // a face is a region of its own (with that face's cap); a face with
-        // no groove there has only its cap.
-        for (opening, height, sign) in [(t, cap, 1.0), (0.0, bottom_cap, -1.0)] {
+        // no groove there has only its cap (or its transition).
+        for (opening, finish, sign) in [(t, top, 1.0), (0.0, back, -1.0)] {
             // This face's groove sides on each part, from the root out to the face.
             let groove = |sides: &[Flat]| -> Vec<Flat> {
                 let picked: Vec<Flat> = sides.iter().copied().filter(|flat| {
@@ -604,11 +738,11 @@ impl Section {
             };
             let (l, r) = (groove(&left), groove(&right));
             if l.is_empty() && r.is_empty() {
-                // Square at this face (or the back of a single groove): a cap alone.
-                if height > 0.0 && overlap > 0.0 {
-                    let (a, b) = ([overlap, opening], [-overlap, opening]);
-                    let outline = vec![arc_flat(a, b, height * sign), Flat::Line(b, a)];
-                    let contacts = vec![(0, Flat::Line(b, [0.0, opening])), (1, Flat::Line([0.0, opening], a))];
+                // Square at this face (or the back of a single groove): a cap
+                // (or a transition) alone.
+                let point = [0.0, opening];
+                let (outline, contacts) = self.finish([(point, 1), (point, 0)], sign, &finish)?;
+                if !outline.is_empty() {
                     regions.push(Region { outline, contacts });
                 }
                 continue;
@@ -621,19 +755,111 @@ impl Section {
             let r = if r.is_empty() { square } else { r };
             let (l1, r1) = (end(&l), end(&r));
             let mut outline: Vec<Flat> = r.clone();
-            outline.extend(cap_sides(r1, l1, opening, height, overlap, sign));
+            let (sides, laid) = self.finish([(r1, 1), (l1, 0)], sign, &finish)?;
+            outline.extend(sides);
             outline.extend(l.iter().rev().map(Flat::reversed));
             let mut contacts: Vec<(usize, Flat)> = l.iter().map(|flat| (0, *flat)).chain(r.iter().map(|flat| (1, *flat))).collect();
-            contacts.extend(toes(l1, r1, height, overlap));
+            contacts.extend(laid);
             regions.push(Region { outline, contacts });
         }
         Ok(regions)
     }
 
+    /// The sides across one face of the joint from `ends[0]` to `ends[1]`
+    /// (each a groove edge on that face, with its part's side), bulging to
+    /// `sign`, and the strips of them that lie on the parts.
+    fn finish(&self, ends: [([f64; 2], usize); 2], sign: f64, finish: &Finish) -> Result<(Vec<Flat>, Vec<(usize, Flat)>), String> {
+        let [(from, from_side), (to, _)] = ends;
+        let mut overlaps = [finish.overlap; 2];
+        if let Some(step) = finish.step {
+            match step.slope {
+                // A taper is cut down to the groove's edge: no toe runs onto it.
+                None => overlaps[step.side] = 0.0,
+                Some(slope) => return self.weld_slope(ends, sign, finish.overlap, step, slope),
+            }
+        }
+        let from_high = from[0] > to[0] || (from[0] == to[0] && from_side == 1);
+        let sides = cap_sides(from, to, from_high, from[1], finish.height, overlaps, sign);
+        Ok((sides, toes(from, to, finish.height, overlaps)))
+    }
+
+    /// A weld slope at one face: from the thicker part's edge up its face
+    /// (its last flank carried on, a square face straight up) to its corner
+    /// past the joint, then down at the slope onto the thinner part, at
+    /// least the overlap past its groove edge.
+    fn weld_slope(&self, ends: [([f64; 2], usize); 2], sign: f64, overlap: f64, step: Step, slope: f64) -> Result<(Vec<Flat>, Vec<(usize, Flat)>), String> {
+        let [(from, from_side), (to, _)] = ends;
+        let thick = step.side;
+        let (edge, near) = if from_side == thick { (from, to) } else { (to, from) };
+        let dir = self.flank_direction(thick, sign > 0.0)?;
+        let corner = [edge[0] + dir[0] * step.rise / dir[1].abs(), edge[1] + sign * step.rise];
+        let toward = if thick == 0 { 1.0 } else { -1.0 };
+        let landing = corner[0] + toward * slope * step.rise;
+        let reach = near[0] + toward * overlap;
+        let toe = [if toward > 0.0 { landing.max(reach) } else { landing.min(reach) }, near[1]];
+        let up = Flat::Line(edge, corner);
+        let mut sides = vec![up, Flat::Line(corner, toe)];
+        let mut contacts = vec![(thick, up)];
+        if (toe[0] - near[0]).abs() > 1e-12 {
+            sides.push(Flat::Line(toe, near));
+            contacts.push((1 - thick, Flat::Line(toe, near)));
+        }
+        if from_side != thick {
+            sides = sides.iter().rev().map(Flat::reversed).collect();
+        }
+        Ok((sides, contacts))
+    }
+
+    /// The direction face `side`'s part runs on past the face the groove
+    /// opens to (`top`) or past the back: its last flank, outward.
+    fn flank_direction(&self, side: usize, top: bool) -> Result<[f64; 2], String> {
+        // A single groove leaves the back square: the part's face runs
+        // straight on past it.
+        if !top && !self.double {
+            return Ok([0.0, -1.0]);
+        }
+        let boundary = self.boundary(side)?;
+        let (a, b) = match (top, boundary.last(), boundary.first()) {
+            (true, Some(Flat::Line(a, b)), _) => (*a, *b),
+            (false, _, Some(Flat::Line(a, b))) => (*b, *a),
+            _ => return Err("the groove's edge at a stepped face is not straight".into()),
+        };
+        let dir = [b[0] - a[0], b[1] - a[1]];
+        if dir[1].abs() <= 1e-12 {
+            return Err("the groove's edge runs along a stepped face".into());
+        }
+        Ok(dir)
+    }
+
+    /// The cutter that tapers face `side`'s part where it runs `rise` past
+    /// the face the groove opens to (`top`) or past the back: everything
+    /// past that face on the joint's side of the line from the groove's
+    /// edge rising `1 : slope` away from the joint, carried `margin` past
+    /// the part's face and a hair across the joint plane.
+    fn taper(&self, side: usize, top: bool, rise: f64, slope: f64, margin: f64) -> Result<Vec<Flat>, String> {
+        let boundary = self.boundary(side)?;
+        let edge = if top { end(&boundary) } else { start(&boundary) };
+        let away = if side == 0 { -1.0 } else { 1.0 };
+        let out = if top { 1.0 } else { -1.0 };
+        let plane = if side == 0 { 0.0 } else { self.gap };
+        let across = plane - away * (self.gap * 0.5).min(slab_depth()).max(slab_depth() * 0.5);
+        let high = edge[1] + out * (rise + margin);
+        let far = [edge[0] + away * slope * (rise + margin), high];
+        Ok(vec![
+            Flat::Line(edge, far),
+            Flat::Line(far, [across, high]),
+            Flat::Line([across, high], [across, edge[1]]),
+            Flat::Line([across, edge[1]], edge),
+        ])
+    }
+
     /// The cutter that prepares face `side`'s part: the groove on that side
     /// of the joint plane, carried `margin` past each face it opens to and a
     /// hair across the plane into the root opening (the other part is not cut).
-    fn cutter(&self, side: usize, margin: f64) -> Result<Vec<Flat>, String> {
+    /// Past a face where `run_on[face]` (0 the back, 1 the face the groove
+    /// opens to) gives a direction, the cut runs on that way (a taper's)
+    /// instead of along the groove's last flank.
+    fn cutter(&self, side: usize, margin: f64, run_on: [Option<[f64; 2]>; 2]) -> Result<Vec<Flat>, String> {
         let t = self.thickness;
         let sign = if side == 0 { 1.0 } else { -1.0 };
         let plane = if side == 0 { 0.0 } else { self.gap };
@@ -658,7 +884,7 @@ impl Section {
             let root = start(&sides);
             let face = sides.last().expect("sides").end();
             let last_from = match sides.last().expect("sides") { Flat::Line(a, _) => *a, Flat::Arc { .. } => root };
-            let dir = [face[0] - last_from[0], face[1] - last_from[1]];
+            let dir = run_on[usize::from(upper)].unwrap_or([face[0] - last_from[0], face[1] - last_from[1]]);
             let rise = dir[1].abs().max(1e-300);
             let beyond = [face[0] + dir[0] / rise * margin, face[1] + dir[1].signum() * margin];
             let mut outline = vec![Flat::Line([across, root[1]], root)];
@@ -730,22 +956,26 @@ fn arc_flat(a: [f64; 2], b: [f64; 2], height: f64) -> Flat {
 
 /// The sides across one face of the joint from `from` to `to` (on level
 /// `level`): straight, or a cap `height` high (out of the part, to `sign`)
-/// running `overlap` onto each part past the groove's edges.
-fn cap_sides(from: [f64; 2], to: [f64; 2], level: f64, height: f64, overlap: f64, sign: f64) -> Vec<Flat> {
+/// running onto each part past the groove's edges by that part's overlap
+/// (`overlaps[0]` past the lower edge in x, the first part's, `[1]` past the
+/// higher). `from_high` says `from` is the higher edge.
+fn cap_sides(from: [f64; 2], to: [f64; 2], from_high: bool, level: f64, height: f64, overlaps: [f64; 2], sign: f64) -> Vec<Flat> {
     let mut sides = Vec::new();
+    let straight = |sides: &mut Vec<Flat>| if (from[0] - to[0]).abs() > 1e-12 { sides.push(Flat::Line(from, to)); };
     if height <= 0.0 {
-        if (from[0] - to[0]).abs() > 1e-12 {
-            sides.push(Flat::Line(from, to));
-        }
+        straight(&mut sides);
         return sides;
     }
-    // The cap's toes lie `overlap` beyond `from` and `to`.
-    let outward = if to[0] < from[0] { 1.0 } else { -1.0 };
-    let a = [from[0] + outward * overlap, level];
-    let b = [to[0] - outward * overlap, level];
-    if overlap > 0.0 { sides.push(Flat::Line(from, a)); }
-    sides.push(arc_flat(a, b, height * sign));
-    if overlap > 0.0 { sides.push(Flat::Line(b, to)); }
+    let (low, high) = if from_high { (to, from) } else { (from, to) };
+    let (toe_low, toe_high) = ([low[0] - overlaps[0], level], [high[0] + overlaps[1], level]);
+    if toe_high[0] - toe_low[0] <= 1e-12 {
+        straight(&mut sides);
+        return sides;
+    }
+    let (first, last) = if from_high { (toe_high, toe_low) } else { (toe_low, toe_high) };
+    if (first[0] - from[0]).abs() > 1e-12 { sides.push(Flat::Line(from, first)); }
+    sides.push(arc_flat(first, last, height * sign));
+    if (last[0] - to[0]).abs() > 1e-12 { sides.push(Flat::Line(last, to)); }
     sides
 }
 
@@ -753,17 +983,17 @@ fn end(sides: &[Flat]) -> [f64; 2] {
     sides.last().expect("a side").end()
 }
 
-/// The strips a cap lays on each part's face past the groove's edges (`left`
-/// and `right` are the groove's edges on that face).
-fn toes(left: [f64; 2], right: [f64; 2], height: f64, overlap: f64) -> Vec<(usize, Flat)> {
-    if height <= 0.0 || overlap <= 0.0 {
+/// The strips a cap lays on each part's face past the groove's edges (`a`
+/// and `b` are the groove's edges on that face), each part's overlap long.
+fn toes(a: [f64; 2], b: [f64; 2], height: f64, overlaps: [f64; 2]) -> Vec<(usize, Flat)> {
+    if height <= 0.0 {
         return Vec::new();
     }
-    let (low, high) = if left[0] <= right[0] { (left, right) } else { (right, left) };
-    vec![
-        (0, Flat::Line([low[0] - overlap, low[1]], low)),
-        (1, Flat::Line(high, [high[0] + overlap, high[1]])),
-    ]
+    let (low, high) = if a[0] <= b[0] { (a, b) } else { (b, a) };
+    let mut strips = Vec::new();
+    if overlaps[0] > 0.0 { strips.push((0, Flat::Line([low[0] - overlaps[0], low[1]], low))); }
+    if overlaps[1] > 0.0 { strips.push((1, Flat::Line(high, [high[0] + overlaps[1], high[1]]))); }
+    strips
 }
 
 /// The thin slab just inside a part under a side the bead lies against: the

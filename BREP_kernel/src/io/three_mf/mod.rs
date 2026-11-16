@@ -83,7 +83,7 @@
 //! read: [`zip`] parses the central directory, [`inflate`] implements RFC 1951,
 //! [`xml`] is a bounded pull parser. Every one of them refuses rather than grows.
 
-mod inflate;
+pub(crate) mod inflate;
 mod model;
 mod mesh_write;
 pub use mesh_write::write_3mf_meshes;

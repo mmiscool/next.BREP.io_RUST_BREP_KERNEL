@@ -26,6 +26,7 @@ pub(crate) fn count(n: usize, one: &str, many: &str) -> String {
 mod board_view;
 mod erc_panel;
 mod footprint_editor;
+mod grips;
 mod symbol_editor;
 pub use actions::{Action, ActionGroup, actions};
 pub use board_view::{BoardSelection, BoardTool, View};
@@ -58,6 +59,28 @@ fn zoom_at(zoom: &mut f32, pan: &mut Vec2, factor: f32, anchor: Vec2) {
         *zoom = next;
         *pan = next_pan;
     }
+}
+
+/// The zoom the wheel and a pinch ask of a 2D canvas this frame, with the
+/// screen point to hold still while it is applied: the pointer, or a touch
+/// pinch's centre. The plain wheel, a ctrl-wheel (which egui turns into
+/// `zoom_delta` and takes OUT of the scroll delta, so the two never add up) and
+/// a trackpad or touch pinch all zoom the same way, about the same point.
+/// `None` when nothing asks for a zoom.
+pub(crate) fn pointer_zoom(ui: &egui::Ui) -> Option<(f32, Pos2)> {
+    ui.input(|i| {
+        let factor = (i.smooth_scroll_delta.y * 0.002).exp() * i.zoom_delta();
+        let at = i.multi_touch().map(|t| t.center_pos).or(i.pointer.hover_pos())?;
+        (factor.is_finite() && factor > 0. && factor != 1.).then_some((factor, at))
+    })
+}
+
+/// Whether two or more fingers are on a touch screen: a pinch. The first
+/// finger of a pinch is also the primary pointer, so while one is on, an
+/// editor drags nothing: a drag already running is taken back and none starts,
+/// so zooming never moves what the first finger landed on.
+pub(crate) fn pinching(ui: &egui::Ui) -> bool {
+    ui.input(|i| i.multi_touch().is_some())
 }
 
 /// Coarsen the displayed grid by whole multiples of its snapping grid. Iteration
@@ -2079,12 +2102,20 @@ impl Editor {
         }
         // The wheel zooms about the pointer, so it needs the pointer here. The keys
         // do not: see [`keys_reach_editor`].
-        if response.hovered() && !ui.ctx().egui_wants_keyboard_input() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.
-                && let Some(p) = pointer
-            {
-                zoom_at(&mut self.zoom, &mut self.pan, (scroll * 0.002).exp(), p - rect.center());
+        if response.hovered()
+            && !ui.ctx().egui_wants_keyboard_input()
+            && let Some((factor, p)) = pointer_zoom(ui)
+        {
+            zoom_at(&mut self.zoom, &mut self.pan, factor, p - rect.center());
+        }
+        let pinch = pinching(ui);
+        if pinch {
+            self.terminal_drag = None;
+            if let Some((before, ..)) = self.path_drag.take() {
+                self.document = before;
+            }
+            if let Some((before, ..)) = self.drag.take() {
+                self.document = before;
             }
         }
         if keys_reach_editor(ui.ctx()) {
@@ -2149,6 +2180,7 @@ impl Editor {
             }
         });
         if matches!(self.tool, Tool::Select | Tool::Wire)
+            && !pinch
             && response.drag_started_by(PointerButton::Primary)
             && let Some(p) = ui.input(|i| i.pointer.press_origin())
         {

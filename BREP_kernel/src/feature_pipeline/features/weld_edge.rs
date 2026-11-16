@@ -356,6 +356,83 @@ fn corner(ctx: &FeatureContext) -> Result<FeatureResult, String> {
 
 // -------------------------------------------------------- surfacing weld
 
+/// A surfacing layer on a cylindrical face: the face's band or patch of its
+/// cylinder thickened `thickness` away from the part (outward on a shaft or
+/// a bend's outside, inward in a bore), revolved exactly about the axis over
+/// the face's angle; with the support slab the same depth inside the part
+/// and the callout's point. `None` when the face is not cylindrical.
+fn round_layer(ctx: &FeatureContext, name: &str, thickness: f64) -> Result<Option<(BrepSolid, BrepSolid, Vec3)>, String> {
+    use super::flare::{face, on_face, Shape};
+    let Ok(picked) = face(ctx, name) else { return Ok(None) };
+    let Shape::Round { centre, axis, radius, convex } = picked.shape.clone() else { return Ok(None) };
+    let (inner, outer) = if convex { (radius, radius + thickness) } else { (radius - thickness, radius) };
+    let size = picked.boundary.iter().map(|p| p.sub(centre).length()).fold(radius.max(1.0), f64::max);
+    let tolerance = 1e-9 * size;
+    if inner <= tolerance {
+        return Err(format!("a {thickness} thick layer fills the {radius} radius bore of '{name}'"));
+    }
+    // The face's run along the axis and round it, from its boundary.
+    let first = picked.boundary.iter().map(|p| { let off = p.sub(centre); off.sub(axis.scale(off.dot(axis))) })
+        .find(|radial| radial.length() > tolerance).ok_or_else(|| format!("face '{name}' has no boundary off its axis"))?;
+    let x = first.normalized()?;
+    let y = axis.cross(x);
+    let (mut z0, mut z1) = (f64::INFINITY, f64::NEG_INFINITY);
+    for p in &picked.boundary {
+        let z = p.sub(centre).dot(axis);
+        (z0, z1) = (z0.min(z), z1.max(z));
+    }
+    let tau = std::f64::consts::TAU;
+    let angle_of = |p: Vec3| -> Option<f64> {
+        let off = p.sub(centre);
+        let radial = off.sub(axis.scale(off.dot(axis)));
+        (radial.length() > tolerance).then(|| radial.dot(y).atan2(radial.dot(x)).rem_euclid(tau))
+    };
+    let at = |angle: f64, z: f64, r: f64| centre.add(axis.scale(z)).add(x.scale(angle.cos() * r)).add(y.scale(angle.sin() * r));
+    let on = 1e-6_f64.max(size * 1e-9);
+    let middle = (z0 + z1) * 0.5;
+    // A patch ends at its straight edges along the axis (a full band has
+    // none, or only its seam line): their angles.
+    let mut ends: Vec<f64> = Vec::new();
+    for (a, b) in &picked.lines {
+        let Ok(along) = b.sub(*a).normalized() else { continue };
+        if along.cross(axis).length() > 1e-9 { continue; }
+        let Some(angle) = angle_of(*a) else { continue };
+        let same = |known: &f64| { let d = (known - angle).rem_euclid(tau); d.min(tau - d) <= 1e-9 };
+        if !ends.iter().any(same) { ends.push(angle); }
+    }
+    let (start, sweep) = match ends.as_slice() {
+        [] | [_] => (ends.first().copied().unwrap_or(0.0), tau),
+        [a, b] => {
+            // The patch is the arc between them its middle lies on.
+            let forward = (b - a).rem_euclid(tau);
+            if on_face(&picked, at(a + forward * 0.5, middle, radius), on)? {
+                (*a, forward)
+            } else {
+                (*b, tau - forward)
+            }
+        }
+        _ => return Err(format!("face '{name}' is not a whole band or a rectangular patch of its cylinder (it has more than two straight edges along its axis); a curved surfacing weld covers those")),
+    };
+    // The face fills that band or patch (no hole, no slanted end).
+    for i in 0..=4 {
+        for j in 0..=4 {
+            let (angle, z) = (start + sweep * (0.05 + 0.9 * i as f64 / 4.0), z0 + (z1 - z0) * (0.05 + 0.9 * j as f64 / 4.0));
+            if !on_face(&picked, at(angle, z, radius), on)? {
+                return Err(format!("face '{name}' is not a whole band or a rectangular patch of its cylinder (a hole, or ends not square to the axis); a curved surfacing weld covers those"));
+            }
+        }
+    }
+    let shell = |from: f64, to: f64| -> Result<BrepSolid, String> {
+        let corners = [at(start, z0, from), at(start, z0, to), at(start, z1, to), at(start, z1, from)];
+        let profile = (0..4).map(|k| crate::make_line(corners[k], corners[(k + 1) % 4])).collect::<Result<Vec<_>, _>>()?;
+        crate::revolve_profile_brep(&profile, centre, axis, sweep)
+    };
+    let layer = shell(inner, outer)?;
+    let slab = if convex { shell(radius - slab_depth(), radius)? } else { shell(radius, radius + slab_depth())? };
+    let callout = at(start + sweep * 0.5, middle, if convex { outer } else { inner });
+    Ok(Some((layer, slab, callout)))
+}
+
 pub fn surfacing_schema() -> serde_json::Value {
     let mut schema = serde_json::json!({
         "type": "WELD.SURF", "shortName": "SURF", "longName": "Surfacing weld",
@@ -363,7 +440,7 @@ pub fn surfacing_schema() -> serde_json::Value {
         "inputParamsSchema": {
             "id": {"type": "string", "default_value": null},
             "seam": {"type": "reference_selection", "label": "Weld references", "selectionFilter": ["FACE"], "multiple": true, "default_value": null,
-                "hint": "Select the flat faces to build up with weld metal (hardfacing, build-up). Holes in a face stay open."},
+                "hint": "Select the faces to build up with weld metal (hardfacing, build-up): flat faces (holes stay open), or cylindrical ones (a shaft's or a bend's outside, a bore's inside: a whole band or a rectangular patch)."},
             "thickness": {"type": "number", "label": "Thickness", "default_value": 2, "hint": "Thickness of the surfacing layer, in model units."}
         }
     });
@@ -389,7 +466,34 @@ fn surfacing(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         let [face] = group.as_slice() else { return Err(format!("face '{name}' stands for several faces; select one")) };
         let solid = body_of(ctx.scene, face.handle).ok_or_else(|| format!("face '{name}' belongs to no resident part"))?;
         if !result.weld_joint_solids.contains(&solid) { result.weld_joint_solids.push(solid.clone()); }
-        let flat = flat_face(ctx, name)?;
+        if let Some((layer, slab, callout)) = round_layer(ctx, name, thickness)? {
+            if n == 0 {
+                result.points.push((format!("{}:Callout", ctx.id), ScenePoint::model(callout)));
+                result.weld_source_seam = Some(name.clone());
+            }
+            if !build { continue; }
+            if let Err(reason) = fit::clear_of(ctx.scene, &layer, &ctx.id, &[], 1e-6)? {
+                return Err(format!("face '{name}': {reason}"));
+            }
+            for (k, earlier) in bodies.iter().enumerate() {
+                let shared = fit::common_volume(&layer, earlier)?;
+                if shared > 1e-9 {
+                    return Err(format!("the layers on '{name}' and '{}' overlap by {shared}; surface them as separate welds", names[k]));
+                }
+            }
+            let left = outside(&slab, &[crate::registered_solid_clone(face.handle)?])?;
+            if left > 1e-9 {
+                return Err(format!("face '{name}': {left} of the support slab lies outside {solid}"));
+            }
+            bodies.push(layer);
+            continue;
+        }
+        // A face that is neither (the round ones were taken above).
+        let flat = flat_face(ctx, name).map_err(|error| if error.ends_with("is not flat") {
+            format!("face '{name}' is neither flat nor cylindrical")
+        } else {
+            error
+        })?;
         // The face's loops, each as its curves head to tail.
         let loops: Vec<Vec<crate::NurbsCurve>> = crate::with_registered_solid_str(face.handle, |body| {
             let record = body.shells.iter().flat_map(|shell| &shell.faces).find(|f| f.id == face.face_id)

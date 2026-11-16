@@ -64,6 +64,11 @@ impl StepColors {
         Self::default()
     }
 
+    /// The colour recorded for `name`.
+    pub fn get(&self, name: &str) -> Option<[u8; 3]> {
+        self.by_name.get(name).copied()
+    }
+
     /// Record one entity's colour. An empty name is ignored (no phantom entry).
     pub fn set(&mut self, name: &str, rgb: [u8; 3]) {
         if name.is_empty() {

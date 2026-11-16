@@ -114,7 +114,9 @@ pub(in crate::step_import) mod planar_split;
 mod rims;
 pub(in crate::step_import) mod loops;
 mod solids;
+mod wires;
 pub(in crate::step_import) mod prefit;
 
 pub(super) use solids::*;
+pub(super) use wires::build_wire;
 pub(in crate::step_import) use closure::ClosureNote;

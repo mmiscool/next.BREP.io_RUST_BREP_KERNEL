@@ -145,7 +145,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
 
     // 1c. Fresh Parasolid text (baked into `xtText` by the toolbar Import lane).
     if let Some(xt_text) = ctx.param("xtText").and_then(|v| v.as_str()) {
-        let report = crate::parasolid::import_parasolid_report(xt_text)
+        let report = crate::parasolid::import_parasolid_bodies(xt_text)
             .map_err(|error| format!("import3d: Parasolid import failed: {error}"))?;
         if report.solids.is_empty() {
             return Err("import3d: Parasolid file contained no importable solids".into());
@@ -159,7 +159,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
         let encoded = encoded.as_str().ok_or("import3d: param `xtBinary` must be a base64 string")?;
         let bytes = crate::snapshot::base64_decode(encoded)
             .map_err(|error| format!("import3d: param `xtBinary` is not base64: {}", error.trim_start_matches("snapshot: ")))?;
-        let report = crate::parasolid::import_parasolid_bytes_report(&bytes)
+        let report = crate::parasolid::import_parasolid_bytes_bodies(&bytes)
             .map_err(|error| format!("import3d: Parasolid import failed: {error}"))?;
         if report.solids.is_empty() {
             return Err("import3d: Parasolid file contained no importable solids".into());
