@@ -149,9 +149,13 @@ pub use brep_boolean::spherical_union::reconstruct_spherical_mesh_union;
 pub use brep_construction::solid_sweep::{
     sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
 };
-pub use brep_construction::solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, sweep_solid_tumbled, FrameCurve, RisingTurn, TwoTurns, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
+pub use brep_construction::gears;
+pub use brep_construction::gears::{helical_solid, Hand, HelicalGear, rack_section, rack_solid, ring_section, ring_solid, sprocket_section, sprocket_solid, spur_section, spur_solid, GearData, GearSection, Rack, RingGear, Sprocket, SprocketForm, SpurGear};
+pub use brep_construction::mill_program::{flat_mill_region_prisms, MillMove, MILL_REGION_REFUSAL};
+pub use brep_construction::solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, sweep_solid_tumbled, sweep_tube_slid_across, FrameCurve, RisingTurn, TwoTurns, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
 pub use brep_construction::closed_curves::{make_ellipse, make_ellipse_arc, make_ellipsoid_brep, make_periodic_bspline};
-pub use brep_construction::surface_faces::{face_from_surface, face_from_surface_trimmed, solid_from_sheets, SURFACE_FACE_REFUSAL};
+pub use brep_construction::planar_region::{cut_planar_sweep_from_prism, region_cut_on, swept_region_holds, target_outline_holds};
+pub use brep_construction::surface_faces::{face_from_surface, face_from_surface_trimmed, sheet_from_sheets, solid_from_sheets, SURFACE_FACE_REFUSAL};
 pub use brep_construction::polygon_solids::{make_pyramid_on_polygon, solid_from_polygons};
 pub use brep_construction::loft_guide_chain::loft_profile_brep_guided_chain;
 pub use brep_construction::loft_guides::{loft_profile_brep_on_guide_chains, loft_profile_brep_on_guides, loft_profile_brep_on_loose_guide_chains, GuideLoftWall, LOFT_ON_GUIDES_REFUSAL};
@@ -207,10 +211,12 @@ pub use brep_direct_edit::direct_edit::{
     offset_revolution_face, offset_revolution_face_unchecked, offset_ruled_face, offset_ruled_face_unchecked, offset_sphere_face,
     offset_sphere_face_unchecked, offset_torus_face, offset_torus_face_unchecked,
     rebuild_displaced_blends, with_blend_rebuild_decline,
-    recut_moved_planes, recut_moved_planes_rigid, recut_moved_planes_unchecked, reblend_lost_fillets, resolve_face_by_point, rotate_faces, rotate_faces_unchecked,
+    recut_moved_planes, recut_moved_planes_rigid, recut_moved_planes_unchecked, redrill_moved_bore, recut_convex_body, reblend_lost_fillets, resolve_face_by_point, rotate_faces, rotate_faces_unchecked,
     route_reading, RouteReading,
 };
 pub use brep_direct_edit::direct_edit::{face_refusal_slugs, face_transform_reason, FaceTransformReason};
+pub use brep_direct_edit::direct_edit::{deform_shell, ShellDeformPick, ShellDeformReport, ShellDeformSpec};
+pub use brep_direct_edit::direct_edit::{deform_face, face_deform_default_anchor, FaceDeformPick, FaceDeformReport, FaceDeformSpec};
 pub use brep_direct_edit::direct_edit::{
     refit_faces_as_one, refit_refusal_phrases, RefitCarrier, RefitReport, RefitSurfaceKind,
 };
@@ -259,14 +265,21 @@ pub use brep_geometry::image_curve::{affine_image_curve, image_curve, image_curv
 pub use brep_geometry::surface::{
     carrier_preview_patch, make_cone_surface, make_cylinder_surface, make_extrusion, make_plane,
     make_revolution, make_sphere_surface, make_sphere_surface_framed, make_torus_surface,
-    ExtendRefusal, NurbsSurface, SurfaceSide, WeightSite, MAXIMUM_FOLD_ANGLE,
-    MAXIMUM_GROWTH_RATIO,
+    ExtendRefusal, KnotDirection, KnotRefinementRefusal, NurbsSurface, SurfaceSide, WeightSite,
+    MAXIMUM_FOLD_ANGLE, MAXIMUM_GROWTH_RATIO,
+};
+pub use brep_geometry::deform::{
+    deform_surface, deform_surface_where, deform_surfaces_tied, DeformPick, PoleSupport, SurfaceTie, TieContinuity,
+    TiedResult, TiedSurface, DeformRefusal, DeformResult, DeformSide, DeformSpec,
+    EdgeHold,
 };
 pub use brep_geometry::coons::{
     coons_bilinear, coons_bilinear_reported, coons_with_ribbons, CompatWork, CoonsRefusal,
     CoonsReport, RibbonReport,
 };
 pub use brep_geometry::gordon::{gordon_surface, gordon_surface_reported, GordonRefusal, GordonReport};
+pub use brep_geometry::n_sided::{n_sided_fill, reentrant_corners as n_sided_reentrant_corners, NSidedRefusal, NSidedReport};
+pub use brep_geometry::regularity::{certify_regular, Irregularity, RegularityReport};
 pub use brep_geometry::analytic_surface::{
     circle_angle_to_parameter, intersect_analytic_pair, plane_ruled_section_arc,
     revolution_structure, AnalyticSurface, RevolutionFrame, RevolutionStructure,
@@ -412,11 +425,11 @@ pub use draft_roof::{extrude_profile_brep_draft_roof, DRAFT_ROOF_REFUSAL};
 #[path = "feature_pipeline/mod.rs"]
 pub mod feature_pipeline;
 pub use feature_pipeline::execute_history_json;
-pub use feature_pipeline::{first_reference_name, imported_solid_names, is_weld_type, reference_names};
+pub use feature_pipeline::{first_reference_name, imported_solid_names, is_gear_type, is_weld_type, reference_names};
 // Transform Face's default pivot (the selection's boundary centre) over the
 // results of a replayed prefix, so the gizmo and the stored `pivot` agree with
 // the feature by construction.
-pub use feature_pipeline::face_transform_pivot;
+pub use feature_pipeline::{face_transform_pivot, face_transform_reference_point};
 // Typed, in-process pipeline surface for native consumers (brep-render): run a
 // whole history and read the results without a JSON round trip.
 pub use feature_pipeline::{
@@ -610,7 +623,7 @@ pub fn io_step_decode_text_for_tests(value: &str) -> String {
 #[path = "io/iges/mod.rs"]
 mod iges;
 pub use iges::{
-    export_iges, export_iges_assembly, export_iges_bodies, import_iges, import_iges_report,
+    export_iges, export_iges_assembly, export_iges_bodies, import_iges, import_iges_bodies, import_iges_report,
     read_iges_assembly, IgesBody, IgesImportReport,
 };
 #[path = "io/parasolid/mod.rs"]

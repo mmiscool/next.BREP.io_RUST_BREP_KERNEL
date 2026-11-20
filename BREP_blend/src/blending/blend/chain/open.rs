@@ -1207,5 +1207,6 @@ fn open_chain_surgery(
     result
         .vertices
         .retain(|candidate| used.contains(&candidate.id));
+    let result = crate::blend::chart_fitted_for_gate(solid, result);
     crossings.gate(result)
 }

@@ -95,7 +95,7 @@ impl Manifest {
             .map_err(|_| "update manifest signature does not verify".to_string())
     }
 
-    /// "2026-11-04 05:00 UTC (commit 3c17b728d)", for the notice.
+    /// "2026-11-04 05:00 UTC (commit 1234abc)", for the notice.
     pub fn describe(&self) -> String {
         let when = self.built_at.get(..16).unwrap_or(&self.built_at).replace('T', " ");
         let commit = self.commit.get(..9).unwrap_or(&self.commit);

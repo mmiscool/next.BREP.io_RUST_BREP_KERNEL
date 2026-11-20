@@ -441,11 +441,14 @@ pub fn seam_straddle_wall_polygons(
                     });
                 }
             }
-            for vertex in &arcs[arc_index] {
-                column.push(FaceVertex {
-                    uv: mk(p_seam, q_of(vertex)),
-                    position: vertex.position,
-                });
+            // The arc keeps its own p (only its two seam crossings sit on the
+            // seam): pinning it collapsed a hole edge that runs along q into
+            // coincident stations and filled the hole (the torus straddle band
+            // had the same defect).
+            let last = arcs[arc_index].len() - 1;
+            for (k, vertex) in arcs[arc_index].iter().enumerate() {
+                let p = if k == 0 || k == last { p_seam } else { p_of(vertex) };
+                column.push(FaceVertex { uv: mk(p, q_of(vertex)), position: vertex.position });
             }
             cursor = range_hi;
         }
@@ -825,3 +828,4 @@ pub fn close_periodic_recut_wall(
     }
     Ok(Some((polygon, holes)))
 }
+

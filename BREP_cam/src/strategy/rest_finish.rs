@@ -35,8 +35,8 @@ fn selected(operation:&Operation,mesh:&MeshSnapshot,t:&crate::mesh::Triangle)->b
 }
 // Budgets, measured on the C19 thin-wall job (145 x 100 x 70, 832 triangles,
 // job grid 388 x 270 = 104 760 columns, 0.1 left everywhere against a 0.05
-// minimum rest, so the whole part is rest region; C16 record 2026-10-20,
-// brep-vm): 807 013 raster tests in 0.004 s, 8 281 508 classification calls
+// minimum rest, so the whole part is rest region; measured 2026-10-20 on a
+// 6-core machine): 807 013 raster tests in 0.004 s, 8 281 508 classification calls
 // (1 596 231 leaves, 3 557 148 distinct gap drops) in about 31 s serial, the
 // operation 40 s serial and 15 s with feature `parallel` on 6 cores (143 s
 // before the per-triangle drop memo and the drive-polygon index).

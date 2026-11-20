@@ -23,4 +23,4 @@ mod writer;
 
 
 pub use export::{export_iges, export_iges_assembly, export_iges_bodies, IgesBody};
-pub use import::{import_iges, import_iges_report, read_iges_assembly, IgesImportReport};
+pub use import::{import_iges, import_iges_bodies, import_iges_report, read_iges_assembly, IgesImportReport};

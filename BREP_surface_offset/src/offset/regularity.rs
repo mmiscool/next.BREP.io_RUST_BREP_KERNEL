@@ -581,6 +581,57 @@ pub fn region_grid(
     }
 }
 
+/// How short one parameter direction's iso-line may get, against what it is
+/// elsewhere on the same surface, before the curvature read there is the noise
+/// of a collapsed row rather than the surface's.
+///
+/// A pole is a row of control points collapsed to one point; a fitted surface
+/// collapses it only to its fit noise, so `Su × Sv` there is small but not
+/// zero, and [`NurbsSurface::principal_curvatures`]' absolute degeneracy test
+/// (`|Su × Sv| ≤ 1e-12`) passes it. The curvature formula then divides that
+/// noise by the vanishing first fundamental form. Measured on a fitted corner
+/// blend whose pole row is collapsed to 1.6e-8 (a fillet of radius 1.5, so the
+/// true reading is κ = −0.667 across it): with the iso-line through the sample
+/// at a ratio r of its length across the middle of the surface, the reading is
+/// off by about 7e-4 at r = 2e-4, 7e-3 at 2e-5, 7e-2 at 2e-6, and is
+/// noise below that (κ = −5412 on the pole row itself, a "fold" a shell of 1.0
+/// reported over 16 of the face's samples and then could not divide the trim
+/// at). Above the bar the reading is good to about 1e-2.
+///
+/// The comparison is with the SAME direction elsewhere, not with the other
+/// direction: a regular strip a million times longer than it is wide is thin
+/// everywhere and reads its curvature correctly, where a pole is thin only at
+/// its own row.
+const POLE_METRIC_BAR: f64 = 1e-5;
+
+/// Whether the sample sits where one parameter direction has collapsed — the
+/// neighbourhood of a pole — so that its curvature cannot be trusted.
+///
+/// Cheap first: a sample whose two iso-lines (at its own speed, over the full
+/// domain) are within [`POLE_METRIC_BAR`] of each other is regular, and that
+/// is every sample but those near a pole or on a strip of extreme aspect. Only
+/// those read the short direction's speed again across the middle of the
+/// other parameter's domain — where a pole row, which sits on a domain end, is
+/// not.
+fn near_pole(surface: &NurbsSurface, u: f64, v: f64, su: crate::Vec3, sv: crate::Vec3) -> bool {
+    let (Ok([u0, u1]), Ok([v0, v1])) = (surface.domain_u(), surface.domain_v()) else {
+        return false;
+    };
+    let along_u = su.length() * (u1 - u0);
+    let along_v = sv.length() * (v1 - v0);
+    let longer = along_u.max(along_v);
+    if !(longer > 0.0 && along_u.min(along_v) < POLE_METRIC_BAR * longer) {
+        return false;
+    }
+    // The short direction's partial across the middle of the other parameter.
+    let (short_here, short_there) = if along_v < along_u {
+        (sv.length(), surface.derivatives(0.5 * (u0 + u1), v, 1).map(|d| d[0][1].length()))
+    } else {
+        (su.length(), surface.derivatives(u, 0.5 * (v0 + v1), 1).map(|d| d[1][0].length()))
+    };
+    short_there.is_ok_and(|there| short_here < POLE_METRIC_BAR * there)
+}
+
 /// Worst `1 − δ·κ` at one parameter, over every requested displacement and both
 /// principal directions — the scalar FIELD whose zero set is the fold locus.
 ///
@@ -592,14 +643,18 @@ pub fn region_grid(
 /// transversal and the trace in `offset/fold_locus.rs` can march it.
 ///
 /// `None` where the curvature cannot be read at all (a pole, a seam, a
-/// degenerate parametrization) — not zero, which would be a fold.
+/// degenerate parametrization) — not zero, which would be a fold. That includes
+/// the neighbourhood of a pole, not only the pole itself: see [`POLE_METRIC_BAR`].
 pub fn fold_sample_at(
     surface: &NurbsSurface,
     u: f64,
     v: f64,
     displacements: &[f64],
 ) -> Option<FoldSample> {
-    let (kappa_min, kappa_max) = surface.principal_curvatures(u, v).ok()?;
+    let (kappa_min, kappa_max, su, sv) = surface.principal_curvatures_and_tangents(u, v).ok()?;
+    if near_pole(surface, u, v, su, sv) {
+        return None;
+    }
     let mut worst: Option<FoldSample> = None;
     for &displacement in displacements {
         if displacement == 0.0 {
@@ -757,12 +812,10 @@ pub fn scan_offset_regularity(
 /// the refinement around the worst node when the budget asks for it, and the
 /// between-node refinement. `bound` says how far that reading can be trusted
 /// (see [`LeastFoldFactor::bound`]).
-// Built for the outward-shell guard (`outward_fold_the_carve_missed`), which
-// sweeps the same field on a grid of its own; it moves onto this entry point as
-// a separate change, and until then only the tests call it. The callers that
-// already hold a scan read the same certainty off it directly
-// ([`RegularityScan::certify`]) rather than scanning the face twice.
-#[cfg_attr(not(test), allow(dead_code))]
+// The outward-shell guard (`outward_fold_the_carve_missed`) reads its fold
+// hunt through this. The callers that already hold a scan read the same
+// certainty off it directly ([`RegularityScan::certify`]) rather than scanning
+// the face twice.
 #[derive(Clone, Copy, Debug)]
 pub struct LeastFoldFactor {
     /// The least factor found and where, or `None` when nothing was readable.
@@ -785,7 +838,6 @@ pub struct LeastFoldFactor {
 /// [`LeastFoldFactor`] over `face`'s own trim, with `displacements` along the
 /// parametrization normal `Su × Sv` (this module's one convention) and `level`
 /// the fold factor at which a sample counts as collapsed.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn least_fold_factor(
     face: &FaceRecord,
     displacements: &[f64],

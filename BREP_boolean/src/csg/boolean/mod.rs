@@ -123,6 +123,14 @@ pub struct BooleanOptions {
     /// them names; `None` (the caller cannot tell) never re-seats.
     #[serde(default)]
     pub seam_reseat_later_references: Option<Vec<String>>,
+    /// The references later features hold, as for
+    /// [`Self::seam_reseat_later_references`]: `Some` admits the seam rejoin
+    /// (`BREP_FACE_MERGE_RESEAM`), which joins two pieces of one cylinder or
+    /// frustum split only along the carrier's seam, unless a reference that
+    /// names something on the body as merged would name something else, or
+    /// nothing, on the joined one; `None` never rejoins.
+    #[serde(default)]
+    pub seam_rejoin_later_references: Option<Vec<String>>,
 }
 
 /// [`BooleanOptions::touched_assembly`] under its environment override.
@@ -185,6 +193,7 @@ impl Default for BooleanOptions {
             sheet_trim: true,
             keep_cells: false,
             seam_reseat_later_references: None,
+            seam_rejoin_later_references: None,
         }
     }
 }
@@ -198,7 +207,8 @@ mod operand_state;
 mod rim;
 mod coincident;
 mod touch;
-mod reseat;
+pub(crate) mod reseat;
+mod rejoin;
 
 pub use rim::*;
 use select::*;
@@ -1714,6 +1724,7 @@ fn build_nary_imprint(
     }
 
     Ok(ImprintResultRecord {
+        faces_in_unproved_pairs: None,
         vertices,
         pieces,
         tangent_nodes: Vec::new(),
@@ -1805,7 +1816,7 @@ pub fn boolean_operation_nary_with_options(
         crate::heal::heal_operands(operand, &policy)?;
         // Then refit any inherited trim off the pcurve construction contract
         // whose edge lies on every carrier (a no-op without one).
-        crate::heal::refit_inherited_trims(operand, &policy)?;
+        crate::heal::refit_inherited_trims_reused(operand, &policy)?;
         // Same operand normalization as the binary path: seam edges for
         // seamless full-period band faces.
         normalize_operand_band_seams(operand)?;
@@ -1844,7 +1855,8 @@ pub fn boolean_operation_nary_with_options(
             tolerance,
             &options.keep_unmerged_name_substrs,
         )?;
-        merge_curve_continuation_edges(&merged, tolerance).map_err(|refusal| KernelRefusal { stage: KernelStage::Validate, ..refusal })?
+        let merged = merge_curve_continuation_edges(&merged, tolerance).map_err(|refusal| KernelRefusal { stage: KernelStage::Validate, ..refusal })?;
+        rejoin::rejoin_unless_referenced(merged, options, tolerance)
     } else {
         solid
     };
@@ -2370,12 +2382,14 @@ fn prepared_operands(
     // pcurve construction contract whose edge lies on every incident carrier
     // (`heal::refit_inherited_trims`; a byte-identical no-op without one).
     let refit_started = Instant::now();
-    crate::heal::refit_inherited_trims(&mut first_owned, policy)?;
-    crate::heal::refit_inherited_trims(&mut second_owned, policy)?;
+    crate::heal::refit_inherited_trims_reused(&mut first_owned, policy)?;
+    crate::heal::refit_inherited_trims_reused(&mut second_owned, policy)?;
     profile_stage("heal.refit_ms", refit_started.elapsed().as_secs_f64() * 1_000.0);
     if crate::profile::profile_enabled() {
         let (hits, misses) = crate::reading_memo::counts();
         profile_line!("boolean.reading_memo hits={hits} misses={misses}");
+        let (served, stored) = crate::heal::refit_memo_counts_served_stored();
+        profile_line!("boolean.refit_memo served={served} stored={stored}");
     }
     profile_stage("heal_ms", stage_started.elapsed().as_secs_f64() * 1_000.0);
     // Seamless full-period band faces (STEP import) break the seam-aware
@@ -2476,15 +2490,33 @@ fn plain_hull_solid(solid: &BrepSolid) -> bool {
         })
 }
 
+/// `BREP_SCOPE_PROVED_APART` (default on since the 2026-11-19 promotion;
+/// `=0` scans every face whose box reaches the other operand): see
+/// [`soundness_candidates`].
+fn scope_proved_apart_on() -> bool {
+    switch!(live "BREP_SCOPE_PROVED_APART", true)
+}
+
 /// The result faces the soundness scan reads under pass-through: the
 /// examined faces (touched and their neighbours) and every other face whose
 /// control-net box reaches the OTHER operand's bounds within `band`. A face
 /// outside both is an operand's own, clear of everything the operation added.
+///
+/// PROVED APART (`BREP_SCOPE_PROVED_APART`): with `unproved` (the imprint's
+/// [`crate::ImprintResultRecord::faces_in_unproved_pairs`]) and both operands
+/// plain hull solids, a face whose box reaches the other operand is still
+/// left out when the imprint PROVED it clear of every face of the other
+/// operand (its box met none, or each pair it met was classified `Disjoint`
+/// or proved apart by span hulls). A pair the imprint skipped, marched to
+/// nothing, or could not prove keeps the face in. A whole-body scan of a body
+/// nested inside the other operand's box (a closed hollow: the source less
+/// its inward offset, untouched) read every face of both for that alone.
 fn soundness_candidates(
     solid: &BrepSolid,
     scope: &AssemblyScope,
     bounds: [crate::Aabb; 2],
     band: f64,
+    unproved: Option<&HashSet<crate::imprint::FaceKey>>,
 ) -> HashSet<u64> {
     let mut candidates = HashSet::default();
     for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
@@ -2500,12 +2532,18 @@ fn soundness_candidates(
         match crate::Aabb::from_surface_controls(&face.surface) {
             Ok(face_bounds) if !face_bounds.intersects(other, band) => {}
             _ => {
-                candidates.insert(face.id);
+                let proved_clear = unproved.is_some_and(|unproved| {
+                    scope.source_of.get(&face.id).is_some_and(|key| !unproved.contains(key))
+                });
+                if !proved_clear {
+                    candidates.insert(face.id);
+                }
             }
         }
     }
     candidates
 }
+
 
 /// The empty solid a legitimately empty boolean returns.
 fn empty_solid() -> BrepSolid {
@@ -3046,7 +3084,8 @@ fn boolean_pipeline(
         // segments incident to the same pair of faces. Run continuation
         // cleanup again, matching the post-merge normalization performed by
         // the former assembly pipeline.
-        merge_curve_continuation_edges(&merged, tolerance).map_err(|refusal| KernelRefusal { stage: KernelStage::Validate, ..refusal })?
+        let merged = merge_curve_continuation_edges(&merged, tolerance).map_err(|refusal| KernelRefusal { stage: KernelStage::Validate, ..refusal })?;
+        rejoin::rejoin_unless_referenced(merged, options, tolerance)
     } else {
         solid
     };
@@ -3133,11 +3172,16 @@ fn boolean_pipeline(
         }
     }
     let candidates = scope.as_ref().map(|scope| {
+        let unproved = (scope_proved_apart_on() && plain_hull_solid(first) && plain_hull_solid(second))
+            .then(|| imprint.faces_in_unproved_pairs.as_ref())
+            .flatten()
+            .map(|faces| faces.iter().copied().collect::<HashSet<_>>());
         let candidates = soundness_candidates(
             &solid,
             scope,
             [operand_bounds(first), operand_bounds(second)],
             policy.sew_search,
+            unproved.as_ref(),
         );
         diagnostics.count_n("passthrough.soundness_candidates", candidates.len() as u64);
         crate::soundness::census::profile_operation(&solid, &[first, second], Some(&scope.touched), "boolean");

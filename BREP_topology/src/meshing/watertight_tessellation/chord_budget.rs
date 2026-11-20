@@ -1,7 +1,7 @@
 use super::*;
 use crate::Vec4;
 
-const HARD_SPANS: usize = 65_536;
+pub(super) const HARD_SPANS: usize = 65_536;
 
 /// Failure to certify an edge's requested chord tolerance.
 #[derive(Clone, Debug, PartialEq)]
@@ -217,6 +217,27 @@ pub fn refine(
     seeds: &[f64],
     cap: usize,
 ) -> Result<Vec<(f64, Vec3)>, EdgeChordError> {
+    refine_banded(edge, start, end, tolerance, seeds, cap, 0.0).map(|(chain, _)| chain)
+}
+
+/// [`refine`] that admits a curve end missing its vertex by more than the
+/// chord but within `endpoint_band` (the body's vertex-match band, inside
+/// which `validate` reads them as one point). Such an edge is certified
+/// against the curve's OWN ends, then its first and last stations are put
+/// back on the shared vertices, so neighbouring faces still weld; the end
+/// chords then stand off the curve by at most the miss plus the chord.
+/// Returns the chain and that standoff
+/// (zero when the ends met within the chord), for the edge's reported sag. An edge whose ends
+/// meet within the chord takes exactly the [`refine`] path.
+pub(super) fn refine_banded(
+    edge: &EdgeRecord,
+    start: Vec3,
+    end: Vec3,
+    tolerance: f64,
+    seeds: &[f64],
+    cap: usize,
+    endpoint_band: f64,
+) -> Result<(Vec<(f64, Vec3)>, f64), EdgeChordError> {
     let fail = |reason| EdgeChordError { edge_id: edge.id, requested: tolerance, reason };
     if !tolerance.is_finite() || tolerance <= 0.0 {
         return Err(fail(EdgeChordFailure::InvalidTolerance));
@@ -228,7 +249,7 @@ pub fn refine(
         return Err(fail(EdgeChordFailure::SafetyCap));
     }
     if full_line_certified(edge, start, end, tolerance, seeds) {
-        return Ok(vec![(0., start), (1., end)]);
+        return Ok((vec![(0., start), (1., end)], 0.0));
     }
     let spans = certificate_spans(&edge.curve)
         .ok_or_else(|| fail(EdgeChordFailure::UnsupportedCurve))?;
@@ -275,9 +296,18 @@ pub fn refine(
         pole.map_or_else(|| edge.curve.evaluate(t), |p| p.point())
             .map_err(|e| fail(EdgeChordFailure::Evaluation(e)))
     };
-    if endpoint(edge.t0)?.sub(start).length() > tolerance || endpoint(edge.t1)?.sub(end).length() > tolerance {
+    let (vertex_start, vertex_end) = (start, end);
+    let (curve_start, curve_end) = (endpoint(edge.t0)?, endpoint(edge.t1)?);
+    let miss = curve_start.sub(start).length().max(curve_end.sub(end).length());
+    let rebased = miss > tolerance;
+    // The miss itself is held to the band `validate` reads as one point.
+    // Putting an end station back on its vertex moves that end chord off the
+    // curve by up to the miss on top of the certified chord; that standoff
+    // (at most band + chord) is returned so the edge reports it as its sag.
+    if rebased && !(miss <= endpoint_band) {
         return Err(fail(EdgeChordFailure::EndpointMismatch));
     }
+    let (start, end) = if rebased { (curve_start, curve_end) } else { (start, end) };
     let mut output = vec![(0.0, start)];
     let mut pending = Vec::new();
     let mut b = end;
@@ -326,7 +356,11 @@ pub fn refine(
         pending.push((middle, f1, m, b));
         pending.push((f0, middle, a, m));
     }
-    Ok(output)
+    if rebased {
+        output[0].1 = vertex_start;
+        output.last_mut().expect("a chain has its end").1 = vertex_end;
+    }
+    Ok((output, if rebased { miss + tolerance } else { 0.0 }))
 }
 
 pub fn refine_shared(edge: &EdgeRecord, start: Vec3, end: Vec3, tolerance: f64, seeds: &[f64])

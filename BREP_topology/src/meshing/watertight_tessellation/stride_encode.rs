@@ -169,8 +169,10 @@ pub(super) fn tessellate_faces_stride_keyed(
         *keys = face_keys.clone().unwrap_or_default();
     }
     let scan_mesh = super::scan_mesh::active();
+    let spline_force = super::scan_mesh::spline_force();
     let mesh_one = |index: usize, face_id: u32, face: &FaceRecord| -> Result<Mesh, String> {
         let _scan_mesh = super::scan_mesh::ScanMeshScope::set(scan_mesh);
+        let _spline_force = super::scan_mesh::SplineForceScope::set(spline_force);
         // The content memo (`face_memo.rs`): a face meshed before under the
         // same carrier, trims, shared samples and chord is served its stored
         // fragment, restamped. A miss meshes as before and stores the result.

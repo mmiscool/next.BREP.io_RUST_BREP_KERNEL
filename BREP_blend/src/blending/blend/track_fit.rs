@@ -1691,7 +1691,7 @@ fn stencil_verdict_cached(
 /// midpoint checks alone is not trusted with that: on the 20-degree crossing's
 /// mirrored single closed exit edge the top rung read 9.898e-8 at its
 /// midpoints while the curve stood 1.497e-7 off the rail's track between them
-/// (fraction 0.7189; c1a4e971c + the section-fit fix), and nothing read it
+/// (fraction 0.7189, before the section-fit fix), and nothing read it
 /// until the shipped curve was. Such a fit, and every fit off the floor, takes
 /// LOCAL REPAIR: every fit this path returns is judged on
 /// `stencil_verdict` — the maximum over 15 points of every final interval,
@@ -2083,19 +2083,34 @@ fn side_feet(surface: &NurbsSurface, track: &Track, index: usize) -> Result<[[f6
 /// The curve's one-sided derivatives d C / d fraction at `fraction`, by
 /// second-order ONE-SIDED differences: a curve break may be a genuine corner,
 /// where a central difference would average two tangents neither side has.
+///
+/// Each side's stencil stays inside the curve's `[0, 1]`: a break a few 1e-6
+/// from an end (a knot line of the carrier crossing the curve just short of
+/// its end vertex) left the fixed 1e-5 stencil reading the curve past its end,
+/// where the evaluation clamps, so the prescribed tangent was wrong and the
+/// sliver piece beyond the break missed by 1.8e-7 on every rung.
 fn one_sided_derivatives(at: &dyn Fn(f64) -> Result<Vec3, String>, fraction: f64) -> Result<(Vec3, Vec3), KernelRefusal> {
-    let step = 1e-5;
+    const STEP: f64 = 1e-5;
     let here = at(fraction).or_refuse(KernelStage::Refine, "at")?;
-    let left = here
-        .scale(3.0)
-        .sub(at(fraction - step).or_refuse(KernelStage::Refine, "at")?.scale(4.0))
-        .add(at(fraction - 2.0 * step).or_refuse(KernelStage::Refine, "at")?)
-        .scale(1.0 / (2.0 * step));
-    let right = at(fraction + step).or_refuse(KernelStage::Refine, "at")?
-        .scale(4.0)
-        .sub(here.scale(3.0))
-        .sub(at(fraction + 2.0 * step).or_refuse(KernelStage::Refine, "at")?)
-        .scale(1.0 / (2.0 * step));
+    let left_step = STEP.min(0.5 * fraction);
+    let right_step = STEP.min(0.5 * (1.0 - fraction));
+    let left_side = |step: f64| -> Result<Vec3, KernelRefusal> {
+        Ok(here
+            .scale(3.0)
+            .sub(at(fraction - step).or_refuse(KernelStage::Refine, "at")?.scale(4.0))
+            .add(at(fraction - 2.0 * step).or_refuse(KernelStage::Refine, "at")?)
+            .scale(1.0 / (2.0 * step)))
+    };
+    let right_side = |step: f64| -> Result<Vec3, KernelRefusal> {
+        Ok(at(fraction + step).or_refuse(KernelStage::Refine, "at")?
+            .scale(4.0)
+            .sub(here.scale(3.0))
+            .sub(at(fraction + 2.0 * step).or_refuse(KernelStage::Refine, "at")?)
+            .scale(1.0 / (2.0 * step)))
+    };
+    // At an end itself only the inner side exists; it stands for both.
+    let left = if left_step > 0.0 { left_side(left_step)? } else { right_side(right_step)? };
+    let right = if right_step > 0.0 { right_side(right_step)? } else { left };
     Ok((left, right))
 }
 

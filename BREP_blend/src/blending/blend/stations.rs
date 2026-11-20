@@ -2172,7 +2172,7 @@ fn march_stations_impl(
                 // rails can stand on their carriers while the wall stands off
                 // the ball (the 20-degree crossing's single closed exit edge
                 // shipped a wall 4.98e-6 off the exact sweep against the 2e-6
-                // bar on c5ea8fb80, read input-only). An interval whose
+                // bar, read input-only). An interval whose
                 // declared reading is over the bar, or unreadable, refines
                 // like a rail interval; one that passes adds no station, so a
                 // wall already inside the bar builds exactly as it did.
@@ -2553,16 +2553,66 @@ fn parallel_normal_curvature(surface: &NurbsSurface, uv: [f64; 2], contact: Vec3
 }
 
 /// Preserve the exact rotational geometry of a coaxial analytic blend. The
-/// general closed-row interpolator is intentionally approximate in the
-/// marching direction; when every station is a rigid rotation of one exact
-/// section, rebuilding that section as a revolution preserves exact circular
-/// support rims. Spheres are symmetric about every axis through their centre;
-/// other revolution carriers must expose the same axis line. The axis (origin,
+/// general closed-row interpolator is intentionally approximate in the marching
+/// direction; when every station is a rigid rotation of one exact section,
+/// rebuilding that section as a revolution preserves exact circular support
+/// rims. Spheres are symmetric about every axis through their centre; other
+/// revolution carriers must expose the same axis line. The axis (origin,
 /// direction) a closed edge's blend revolves about when both mates are
 /// rotationally symmetric about one line: two spheres, or a framed carrier and
 /// a coaxial mate. Decided from the mates alone, before any station is solved.
-/// `None` when the pair is not one.
+/// `None` when the pair is not one. `BREP_BLEND_REVOLUTION_SPHERE_PLANE` (on by
+/// default; `=0` reads a sphere with a plane by the plane's frame, as before):
+/// see `closed_revolution_axis`.
+pub(crate) fn revolution_sphere_plane_on() -> bool {
+    switch!(live "BREP_BLEND_REVOLUTION_SPHERE_PLANE", true)
+}
+
+thread_local! {
+    /// Whether the closed rim being built has one section all round (a
+    /// constant radius, or a setback law): only then does a sphere with a
+    /// plane read as a revolution, since the lanes that follow (the seed
+    /// stations, the exact rows) turn ONE section. Set by
+    /// [`admit_sphere_plane`] for the rim's build.
+    static SPHERE_PLANE_ADMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while a closed rim whose section varies round it is built (see
+    /// [`admit_sphere_plane`]).
+    static SECTION_VARIES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `BREP_BLEND_REVOLUTION_CONSTANT_SECTION` (on by default since 2026-11-19;
+/// `=0` restores the first section turned): a closed rim
+/// between two carriers revolved about one axis (a cylinder's or cone's cap,
+/// two coaxial carriers, two spheres) is one section turned only when the
+/// section does not vary round it. A varying fillet or chamfer there took the
+/// exact revolution lane, which turned the FIRST station's section: the body
+/// was the constant blend of the first radius (a cylinder's cap rim at 0.5 ->
+/// 1 -> 0.5 built bit-identical to a constant 0.5, 2.7e-3 off its
+/// sliced-section volume). With the switch the axis reader declines every pair
+/// for such a rim, and the march fits it.
+pub(crate) fn revolution_constant_section_on() -> bool {
+    switch!(live "BREP_BLEND_REVOLUTION_CONSTANT_SECTION", true)
+}
+
+/// Admit (or not) the sphere-plane revolution for the closed rim built while
+/// the returned guard lives; the previous setting comes back when it drops.
+pub(in crate::blend) fn admit_sphere_plane(constant_section: bool) -> impl Drop {
+    struct Restore(bool, bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SPHERE_PLANE_ADMITTED.with(|admitted| admitted.set(self.0));
+            SECTION_VARIES.with(|varies| varies.set(self.1));
+        }
+    }
+    let previous = SPHERE_PLANE_ADMITTED.with(|admitted| admitted.replace(constant_section));
+    let varies = SECTION_VARIES.with(|varies| varies.replace(!constant_section));
+    Restore(previous, varies)
+}
+
 pub(in crate::blend) fn closed_revolution_axis(first: &BlendMate, second: &BlendMate) -> Option<(Vec3, Vec3)> {
+    if revolution_constant_section_on() && SECTION_VARIES.with(|varies| varies.get()) {
+        return None;
+    }
     let analytic1 = first.face.surface.analytic()?;
     let analytic2 = second.face.surface.analytic()?;
     let (axis_origin, base_axis) = match (analytic1, analytic2) {
@@ -2574,6 +2624,16 @@ pub(in crate::blend) fn closed_revolution_axis(first: &BlendMate, second: &Blend
             // distinct sphere centres define the actual blend symmetry axis.
             let axis = frame2.origin.sub(frame1.origin).normalized().ok()?;
             (frame1.origin, axis)
+        }
+        // `BREP_BLEND_REVOLUTION_SPHERE_PLANE`: a sphere and a plane are both
+        // symmetric about the plane's normal through the sphere's centre,
+        // wherever the plane's frame sits (a box face's corner, after a
+        // boolean), and the rim between them is a circle about it.
+        (crate::AnalyticSurface::Sphere { frame, .. }, crate::AnalyticSurface::Plane { u_dir, v_dir, .. })
+        | (crate::AnalyticSurface::Plane { u_dir, v_dir, .. }, crate::AnalyticSurface::Sphere { frame, .. })
+            if revolution_sphere_plane_on() && SPHERE_PLANE_ADMITTED.with(|admitted| admitted.get()) =>
+        {
+            (frame.origin, u_dir.cross(*v_dir).normalized().ok()?)
         }
         _ => {
             let is_plane = |surface: &crate::AnalyticSurface| matches!(surface, crate::AnalyticSurface::Plane { .. });

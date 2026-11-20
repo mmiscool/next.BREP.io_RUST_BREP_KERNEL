@@ -2,10 +2,12 @@
 //! It owns only transient browsing state; callers decide what activating a file
 //! means (open a document, choose a Save-As name, or insert an ACOMP part).
 //!
-//! Interaction model (matches a conventional file dialog): a single click on a
-//! FILE row selects it (highlight + selection preview); a double-click, the
-//! Enter key, or the footer confirm button *activates* it. Directories are pure
-//! navigation — a single click walks into them. A left sidebar offers quick
+//! Interaction model (matches a conventional file dialog): a single click
+//! anywhere on a row (name, type, size, date or blank space) selects it — the
+//! whole row highlights on hover and when selected; a double-click, the Enter
+//! key, or the footer confirm button *activates* it. Activating a FILE hands it
+//! to the caller; activating a FOLDER walks into it, so a single click on a
+//! folder only selects it. A left sidebar offers quick
 //! places + pinned folders, and the top bar is a clickable breadcrumb with an
 //! editable path and back / forward history — all driven through the
 //! [`ModelStore`] seam so web and native share one UI.
@@ -73,7 +75,7 @@ impl<'a> FileExplorerOptions<'a> {
 /// `session_start`'s `document` or `document_open`, both of which bypass the
 /// interface entirely.
 pub static HIT_KEYS: &[HitKeyDoc] = &[
-    HitKeyDoc { panel: "file", prefix: "open:", meaning: "the Open modal's explorer: open:<file name> (a row), open:confirm, open:filter, open:back / forward / up, open:path-edit, open:path-edit-toggle, open:crumb:<i>, open:place:<label>, open:pin:<label>, open:unpin:<label>, open:pin-current, open:new-folder, open:new-folder-name, open:hidden-toggle, open:sort:<column>", command: Some("doc_load") },
+    HitKeyDoc { panel: "file", prefix: "open:", meaning: "the Open modal's explorer: open:<file or folder name> (a row's name cell; one click selects, a double click opens the file or enters the folder), open:cell:<column>:<name> (the type, size or date cell of the same row, which selects it the same way), open:confirm, open:filter, open:back / forward / up, open:path-edit, open:path-edit-toggle, open:crumb:<i>, open:place:<label>, open:pin:<label>, open:unpin:<label>, open:pin-current, open:new-folder, open:new-folder-name, open:hidden-toggle, open:sort:<column>", command: Some("doc_load") },
     HitKeyDoc { panel: "file", prefix: "import:", meaning: "the Import modal's explorer, same key set under the `import` prefix, plus import:upload", command: Some("doc_import") },
     HitKeyDoc { panel: "file", prefix: "saveas:", meaning: "the Save As modal's destination explorer (saveas:file:<key>) and saveas:upload", command: Some("doc_json") },
     HitKeyDoc { panel: "file", prefix: "insert:", meaning: "the Insert-component modal: insert:lib:<name> for a parts-library entry, insert:model:<key> for the store explorer, insert:upload", command: None },
@@ -119,11 +121,20 @@ pub struct FileExplorer {
     query: String,
     new_folder: String,
     error: String,
-    /// The highlighted FILE identity (directories are navigated, never selected).
-    /// Persists across frames so the footer confirm button and keyboard Enter
-    /// have a stable target; cleared when the browser location changes so a
-    /// stale highlight never leaks into a different directory.
+    /// The highlighted FILE identity. Persists across frames so the footer
+    /// confirm button and keyboard Enter have a stable target; cleared when the
+    /// browser location changes so a stale highlight never leaks into a
+    /// different directory. At most one of `selected` / `selected_dir` is set.
     selected: Option<String>,
+    /// The highlighted FOLDER identity: one click on a folder row selects it,
+    /// and only a double click, Enter or the footer confirm walks into it. Kept
+    /// apart from `selected` so no caller ever receives a folder as a file
+    /// choice (`selected()`, `picked`, `activated` are files only).
+    selected_dir: Option<String>,
+    /// A folder activated THIS frame. Entered at the end of
+    /// [`Self::show_store`], after every widget has drawn from this frame's
+    /// listing, so the footer and the table never disagree about the location.
+    enter_dir: Option<String>,
     /// The location `selected` belongs to — a mismatch means we walked into
     /// another directory and must drop the highlight.
     selected_at: String,
@@ -134,9 +145,9 @@ pub struct FileExplorer {
     editing_path: Option<String>,
     /// Grab focus for the path field on the frame it appears.
     path_focus: bool,
-    /// The visible FILE identities in display order — the keyboard-nav target
-    /// set, refreshed every frame by [`Self::show_list`].
-    nav_files: Vec<String>,
+    /// The visible rows (identity, is-folder) in display order — the
+    /// keyboard-nav target set, refreshed every frame by [`Self::show_list`].
+    nav_rows: Vec<(String, bool)>,
     /// Which column the file table sorts by, and its direction (`false` = asc).
     sort_key: SortKey,
     sort_desc: bool,
@@ -164,6 +175,36 @@ impl FileExplorer {
     /// Insert component's footer choice, and Insert sent it to the parts library.
     pub fn clear_selection(&mut self) {
         self.selected = None;
+        self.selected_dir = None;
+    }
+
+    /// The folder identity currently highlighted (for the verifier), `None`
+    /// when a file or nothing holds the highlight.
+    pub fn selected_folder(&self) -> Option<&str> {
+        self.selected_dir.as_deref()
+    }
+
+    /// Highlight a row: a file becomes the file selection, a folder the folder
+    /// selection, and either one drops the other.
+    fn select(&mut self, identity: &str, is_dir: bool) {
+        if is_dir {
+            self.selected = None;
+            self.selected_dir = Some(identity.to_string());
+        } else {
+            self.selected_dir = None;
+            self.selected = Some(identity.to_string());
+        }
+    }
+
+    /// Activate a row: a file is confirmed to the caller, a folder is entered
+    /// at the end of the frame.
+    fn activate(&mut self, identity: &str, is_dir: bool, out: &mut FileExplorerOutput) {
+        self.select(identity, is_dir);
+        if is_dir {
+            self.enter_dir = Some(identity.to_string());
+        } else {
+            out.activated = Some(identity.to_string());
+        }
     }
 
     /// Browse the model entries exposed by a platform [`ModelStore`].
@@ -177,13 +218,14 @@ impl FileExplorer {
         let location = store.browser_location();
         if location != self.selected_at {
             self.selected = None;
+            self.selected_dir = None;
             self.selected_at = location.clone();
         }
         let places = store.browser_places();
         let pins = Self::read_pins(store);
         let mut out = FileExplorerOutput::default();
 
-        let selected_before = self.selected.clone();
+        let selected_before = (self.selected.clone(), self.selected_dir.clone());
         let compact = crate::viewport::touch::compact(ui.ctx());
         if compact {
             ui.horizontal_wrapped(|ui| {
@@ -223,7 +265,7 @@ impl FileExplorer {
             self.show_footer(ui, options, &mut out)
         });
         if compact {
-            self.show_list(ui, store, &entries, options, &mut out);
+            self.show_list(ui, &entries, options, &mut out);
         } else { ui.horizontal_top(|ui| {
             if !places.is_empty() {
                 ui.vertical(|ui| {
@@ -232,17 +274,23 @@ impl FileExplorer {
                 ui.separator();
             }
             ui.vertical(|ui| {
-                self.show_list(ui, store, &entries, options, &mut out);
+                self.show_list(ui, &entries, options, &mut out);
             });
         }); }
 
         self.handle_keys(ui, options, &mut out);
+        // A folder activated this frame (double click, Enter, footer confirm)
+        // is entered only now, after the listing drew from the old location.
+        if let Some(dir) = self.enter_dir.take() {
+            self.nav(store, || store.browser_enter(&dir));
+            ui.ctx().request_repaint();
+        }
         out.selected = self.selected.clone();
         // The footer (and any host footer: a name field, a confirm button) was
         // drawn BEFORE the row that just changed the highlight, so it is showing
         // last frame's selection. Ask for one more frame rather than leaving a
         // confirm button greyed out until the pointer happens to move again.
-        if out.picked.is_some() || self.selected != selected_before {
+        if out.picked.is_some() || (self.selected.clone(), self.selected_dir.clone()) != selected_before {
             ui.ctx().request_repaint();
         }
         out
@@ -264,6 +312,7 @@ impl FileExplorer {
                 }
                 self.error.clear();
                 self.selected = None;
+                self.selected_dir = None;
             }
             Err(error) => self.error = error,
         }
@@ -277,6 +326,7 @@ impl FileExplorer {
             if store.browser_navigate(&prev).is_ok() {
                 self.forward.push(current);
                 self.selected = None;
+                self.selected_dir = None;
                 self.error.clear();
             } else {
                 self.history.push(prev);
@@ -290,6 +340,7 @@ impl FileExplorer {
             if store.browser_navigate(&next).is_ok() {
                 self.history.push(current);
                 self.selected = None;
+                self.selected_dir = None;
                 self.error.clear();
             } else {
                 self.forward.push(next);
@@ -528,7 +579,6 @@ impl FileExplorer {
     fn show_list(
         &mut self,
         ui: &mut egui::Ui,
-        store: &dyn ModelStore,
         entries: &[BrowserEntry],
         options: FileExplorerOptions<'_>,
         out: &mut FileExplorerOutput,
@@ -577,10 +627,9 @@ impl FileExplorer {
             })
         });
         let visible: Vec<&BrowserEntry> = named.into_iter().map(|(_, entry)| entry).collect();
-        self.nav_files = visible
+        self.nav_rows = visible
             .iter()
-            .filter(|entry| !entry.is_dir)
-            .map(|entry| entry.identity.clone())
+            .map(|entry| (entry.identity.clone(), entry.is_dir))
             .collect();
 
         if visible.is_empty() {
@@ -605,18 +654,13 @@ impl FileExplorer {
                 for entry in visible {
                     ui.horizontal(|ui| {
                         let icon = if entry.is_dir { "\u{1F5C0}" } else { options.row_icon };
-                        let highlight = self.selected.as_deref().or(options.current) == Some(entry.identity.as_str());
+                        let highlight = self.row_highlight(entry, options.current);
                         let deletable = options.allow_delete && !entry.is_dir;
                         let width = (ui.available_width() - if deletable { 44.0 + ui.spacing().item_spacing.x } else { 0.0 }).max(44.0);
                         let text = format!("{icon} {}", entry.name);
                         let r = ui.add_sized([width, row_h], crate::icon_text::icon_button(ui, &text).selected(highlight).truncate());
                         out.hits.push((format!("{}:{}", options.hit_prefix, entry.name), r.rect));
-                        if r.double_clicked() && !entry.is_dir {
-                            self.selected = Some(entry.identity.clone()); out.activated = Some(entry.identity.clone());
-                        } else if r.clicked() {
-                            if entry.is_dir { self.nav(store, || store.browser_enter(&entry.identity)); }
-                            else { self.selected = Some(entry.identity.clone()); out.picked = Some(entry.identity.clone()); }
-                        }
+                        self.row_clicked(&r, entry, out);
                         if deletable {
                             let delete = ui.add(crate::icon_text::icon_button(ui, "\u{2715}").small()
                                 .min_size(crate::viewport::touch::target_size(ui.ctx(), egui::Vec2::ZERO)));
@@ -634,9 +678,17 @@ impl FileExplorer {
         // the sort.
         let row_h = egui::TextStyle::Body.resolve(ui.style()).size + 6.0;
         let mut clicked_sort: Option<SortKey> = None;
+        // The WHOLE ROW is the click target: every cell senses clicks and the
+        // row's union response selects / activates. Only the delete button is
+        // interactive on top of it, so it keeps its own click. Labels must not
+        // be text-selectable here, or a selectable label would take the click
+        // (egui's default `selectable_labels` senses click-and-drag).
+        ui.scope(|ui| {
+        ui.style_mut().interaction.selectable_labels = false;
         TableBuilder::new(ui)
             .id_salt(format!("{}-table", options.hit_prefix))
             .striped(true)
+            .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::remainder().at_least(150.0).clip(true)) // Name
             .column(Column::auto().at_least(72.0)) // Type
@@ -681,45 +733,29 @@ impl FileExplorer {
                     } else {
                         options.row_icon
                     };
-                    // An explicit selection wins; before the user picks a row, the
-                    // caller's `current` document shows highlighted.
-                    let highlight = match &self.selected {
-                        Some(sel) => !entry.is_dir && sel == &entry.identity,
-                        None => options.current == Some(entry.identity.as_str()),
-                    };
-                    row.col(|ui| {
-                        let r = crate::icon_text::selectable_icon_label(
-                            ui,
-                            highlight,
-                            &format!("{icon} {}", entry.name),
-                        );
-                        out.hits
-                            .push((format!("{}:{}", options.hit_prefix, entry.name), r.rect));
-                        if r.double_clicked() {
-                            if entry.is_dir {
-                                self.nav(store, || store.browser_enter(&entry.identity));
-                            } else {
-                                self.selected = Some(entry.identity.clone());
-                                out.activated = Some(entry.identity.clone());
-                            }
-                        } else if r.clicked() {
-                            if entry.is_dir {
-                                self.nav(store, || store.browser_enter(&entry.identity));
-                            } else {
-                                self.selected = Some(entry.identity.clone());
-                                out.picked = Some(entry.identity.clone());
-                            }
-                        }
+                    row.set_selected(self.row_highlight(entry, options.current));
+                    let prefix = options.hit_prefix;
+                    let (name_rect, _) = row.col(|ui| {
+                        crate::icon_text::IconText::new(format!("{icon} {}", entry.name))
+                            .selectable(false)
+                            .truncate()
+                            .show(ui);
                     });
-                    row.col(|ui| {
-                        ui.weak(entry_kind(entry));
-                    });
-                    row.col(|ui| {
-                        ui.weak(fmt_size(entry.size));
-                    });
-                    row.col(|ui| {
-                        ui.weak(fmt_date(entry.modified));
-                    });
+                    out.hits.push((format!("{prefix}:{}", entry.name), name_rect));
+                    let cells = [
+                        ("type", entry_kind(entry)),
+                        ("size", fmt_size(entry.size)),
+                        ("date", fmt_date(entry.modified)),
+                    ];
+                    for (slug, text) in cells {
+                        let (rect, _) = row.col(|ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(text).weak()).selectable(false));
+                        });
+                        out.hits.push((format!("{prefix}:cell:{slug}:{}", entry.name), rect));
+                    }
+                    // The row's click is read BEFORE the delete cell joins the
+                    // union: a click on the delete button is the button's alone.
+                    let clicked_row = row.response();
                     row.col(|ui| {
                         if options.allow_delete && !entry.is_dir {
                             let del = {
@@ -732,8 +768,10 @@ impl FileExplorer {
                             }
                         }
                     });
+                    self.row_clicked(&clicked_row, entry, out);
                 });
             });
+        });
         if let Some(col) = clicked_sort {
             if self.sort_key == col {
                 self.sort_desc = !self.sort_desc;
@@ -744,9 +782,42 @@ impl FileExplorer {
         }
     }
 
-    /// Keyboard navigation over the visible FILES: ↑/↓ move the selection, Enter
-    /// confirms it. Only active when the caller offers a confirm action and no
-    /// text field (filter / name / path) holds focus, so typing is never hijacked.
+    /// Whether `entry`'s row shows highlighted: the selected file or folder;
+    /// before the user picks a row, the caller's `current` document.
+    fn row_highlight(&self, entry: &BrowserEntry, current: Option<&str>) -> bool {
+        let id = entry.identity.as_str();
+        if entry.is_dir {
+            self.selected_dir.as_deref() == Some(id)
+        } else {
+            match &self.selected {
+                Some(sel) => sel == id,
+                None => self.selected_dir.is_none() && current == Some(id),
+            }
+        }
+    }
+
+    /// A row's click: a double click activates (opens a file, enters a
+    /// folder), a single click only selects. The double-click test comes
+    /// first because its second press also reports `clicked()`.
+    fn row_clicked(&mut self, response: &egui::Response, entry: &BrowserEntry, out: &mut FileExplorerOutput) {
+        if response.double_clicked() {
+            self.activate(&entry.identity, entry.is_dir, out);
+        } else if response.clicked() {
+            self.select(&entry.identity, entry.is_dir);
+            if !entry.is_dir {
+                out.picked = Some(entry.identity.clone());
+            }
+        }
+    }
+
+    /// Keyboard navigation over the visible rows: ↑/↓ move the selection
+    /// (folders and files alike), Enter activates it (opens the file, enters
+    /// the folder). Active only when the caller offers a confirm action and no
+    /// text field (filter / name / path) holds focus, so typing is never
+    /// hijacked. Not in hosts without one (Save As, step-parts): their name
+    /// field submits on Enter as it loses focus, the same frame this would see
+    /// the key, and an explorer Enter there would overwrite the typed name or
+    /// walk into a folder before the save.
     fn handle_keys(
         &mut self,
         ui: &egui::Ui,
@@ -756,7 +827,7 @@ impl FileExplorer {
         if options.confirm_label.is_none() || ui.ctx().egui_wants_keyboard_input() {
             return;
         }
-        if self.nav_files.is_empty() {
+        if self.nav_rows.is_empty() {
             return;
         }
         let (down, up, enter) = ui.input(|i| {
@@ -767,26 +838,29 @@ impl FileExplorer {
             )
         });
         if down || up {
-            let current = self
-                .selected
-                .as_deref()
-                .and_then(|s| self.nav_files.iter().position(|f| f == s));
+            let held = self.selected.as_deref().or(self.selected_dir.as_deref());
+            let current = held.and_then(|s| self.nav_rows.iter().position(|(id, _)| id == s));
             let next = match current {
-                Some(i) if down => (i + 1).min(self.nav_files.len() - 1),
+                Some(i) if down => (i + 1).min(self.nav_rows.len() - 1),
                 Some(i) => i.saturating_sub(1),
                 None => 0,
             };
-            self.selected = Some(self.nav_files[next].clone());
-        }
-        if enter {
-            if let Some(sel) = &self.selected {
+            let (id, is_dir) = self.nav_rows[next].clone();
+            self.select(&id, is_dir);
+            if !is_dir {
+                out.picked = Some(id);
+            }
+        } else if enter {
+            if let Some(dir) = self.selected_dir.clone() {
+                self.enter_dir = Some(dir);
+            } else if let Some(sel) = &self.selected {
                 out.activated = Some(sel.clone());
             }
         }
     }
 
     fn show_footer(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
         options: FileExplorerOptions<'_>,
         out: &mut FileExplorerOutput,
@@ -794,12 +868,17 @@ impl FileExplorer {
         ui.separator();
         ui.horizontal(|ui| {
             if let Some(label) = options.confirm_label {
-                let confirm =
-                    ui.add_enabled(self.selected.is_some(), egui::Button::new(label));
+                let any = self.selected.is_some() || self.selected_dir.is_some();
+                let confirm = ui.add_enabled(any, egui::Button::new(label));
                 out.hits
                     .push((format!("{}:confirm", options.hit_prefix), confirm.rect));
                 if confirm.clicked() {
-                    out.activated = self.selected.clone();
+                    // With a folder selected the confirm button walks into it.
+                    if let Some(dir) = self.selected_dir.clone() {
+                        self.enter_dir = Some(dir);
+                    } else {
+                        out.activated = self.selected.clone();
+                    }
                 }
             }
             if options.allow_import {
@@ -818,7 +897,7 @@ impl FileExplorer {
             }
             // Selection preview (bare file name), right-aligned.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(sel) = &self.selected {
+                if let Some(sel) = self.selected.as_ref().or(self.selected_dir.as_ref()) {
                     let name = sel.rsplit(['/', '\\']).next().unwrap_or(sel);
                     // Truncated: the preview is the LAST thing on the footer row,
                     // so a long file name laid out at its natural width runs left

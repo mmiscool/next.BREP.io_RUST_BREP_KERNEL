@@ -236,6 +236,89 @@ pub fn face_transform_pivot(prefix: &[FeatureResult], names: &[String]) -> Optio
     Some([centre.x, centre.y, centre.z])
 }
 
+/// The point a PICKED entity puts the pivot on — what the dialog's pivot pick
+/// stores, resolved against the scene the feature runs against (`prefix`, the
+/// results before it), so the stored number is the entity as the user saw it:
+///
+/// - a vertex (`{solid}@x,y,z`, world coordinates) → that vertex, exactly;
+/// - a straight edge → its midpoint, a point ON the line a rotation about that
+///   edge needs; a circular edge → its centre; any other edge → the point at
+///   the middle of its parameter range;
+/// - a sphere face → its centre; an axis-bearing face (cylinder, cone, torus,
+///   revolution) → the point of its axis level with the face's `selection_centre`;
+///   any other face → that centre, the value a face SELECTION defaults to;
+/// - a datum frame → its origin.
+///
+/// `Err` names what failed: an empty name, a name not in that scene, or an
+/// entity whose geometry does not evaluate. Nothing is guessed.
+pub fn reference_point(prefix: &[FeatureResult], name: &str) -> Result<[f64; 3], String> {
+    use crate::feature_pipeline::pmi::resolve::resolve_reference;
+    use crate::{resolve_edge_selection, resolve_face_selection, SelectionGeometry};
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("nothing was picked".into());
+    }
+    let mut scene = SceneMap::default();
+    for result in prefix {
+        scene.apply(result);
+    }
+    let point = if let Some(face) = scene.resolve_face(name) {
+        crate::with_registered_solid_str(face.handle, |solid| {
+            let centre = selection_centre(solid, &[face.face_id])
+                .ok_or_else(|| format!("face '{name}' has no geometry to place a point on"))?;
+            Ok(match resolve_face_selection(solid, face.face_id) {
+                Ok(SelectionGeometry::Sphere { center, .. }) => center,
+                Ok(SelectionGeometry::Axis { origin, direction, .. }) => {
+                    origin.add(direction.scale(centre.sub(origin).dot(direction)))
+                }
+                _ => centre,
+            })
+        })?
+    } else if let Some(edge) = scene.resolve_edge(name) {
+        crate::with_registered_solid_str(edge.handle, |solid| {
+            let record = solid
+                .edges
+                .iter()
+                .find(|record| record.id == edge.edge_id)
+                .ok_or_else(|| format!("edge '{name}' has no record"))?;
+            let at = |t: f64| record.curve.evaluate(t).map_err(|error| format!("edge '{name}': {error}"));
+            let (start, middle, end) = (at(record.t0)?, at(0.5 * (record.t0 + record.t1))?, at(record.t1)?);
+            // The analytic classifier's tolerances grow with the distance from
+            // the world origin; the point it names is taken only when the
+            // edge's own middle agrees with it to a fraction of the edge's own
+            // size, and otherwise the middle of the edge is the answer.
+            let size = start.sub(middle).length().max(end.sub(middle).length());
+            let reach = [start, middle, end].iter().map(|p| p.x.abs().max(p.y.abs()).max(p.z.abs())).fold(0.0, f64::max);
+            let agrees = |distance: f64| distance <= 1e-9 * size + 64.0 * f64::EPSILON * reach;
+            Ok(match resolve_edge_selection(solid, edge.edge_id) {
+                Ok(SelectionGeometry::Line { origin, .. })
+                    if agrees(middle.sub(start.add(end).scale(0.5)).length()) =>
+                {
+                    origin
+                }
+                Ok(SelectionGeometry::Circle { center, radius, .. })
+                    if [start, middle, end].iter().all(|p| agrees((p.sub(center).length() - radius).abs())) =>
+                {
+                    center
+                }
+                _ => middle,
+            })
+        })?
+    } else {
+        match resolve_reference(&scene, name)? {
+            SelectionGeometry::Point { position } => position,
+            SelectionGeometry::Plane { origin, .. } => origin,
+            SelectionGeometry::Sphere { center, .. } | SelectionGeometry::Circle { center, .. } => center,
+            SelectionGeometry::Line { origin, .. } | SelectionGeometry::Axis { origin, .. } => origin,
+        }
+    };
+    let point = [point.x, point.y, point.z];
+    if point.iter().any(|c| !c.is_finite()) {
+        return Err(format!("'{name}' did not evaluate to a finite point"));
+    }
+    Ok(point)
+}
+
 /// The rotation part of the motion as the axis and angle `rotate_faces` takes:
 /// `R` is built by the shared compose (so the Euler convention is single-sourced)
 /// and converted through its quaternion, choosing the numerically largest
@@ -426,8 +509,47 @@ fn solve_motion(
 ) -> Result<(BrepSolid, Vec<String>), (KernelRefusal, Option<&'static str>)> {
     let mut notes = Vec::new();
     let moved = match turn {
-        None => move_faces_unchecked(solid, face_ids, translation)
-            .map_err(|error| (error, Some(REFUSED_STEP_TRANSLATION)))?,
+        None => match move_faces_unchecked(solid, face_ids, translation) {
+            Ok(moved) => moved,
+            // A straight edge the translation inverts or collapses on a face
+            // with an ISLAND is that face carried past the far end of the
+            // island's wall — a pocket floor pushed past the bottom of a hole
+            // through it — whose answer has that wall STOP EXISTING. No re-solve has such a body, so the
+            // re-cut is offered it, as it is offered an acceptance refusal
+            // below; the re-solve's refusal stays the primary one if it
+            // declines too.
+            Err(error) if is_straight_edge_inversion(&error) && has_island(solid, face_ids) => {
+                match recut_past_a_refusal(solid, face_ids, None, translation) {
+                    Ok((body, lost)) => {
+                        notes.push(format!(
+                            "transformFace: the moved carriers could not be re-solved ({error}), \
+                             so the selection was RE-CUT from the original body instead — the \
+                             result is the boolean this motion defines, and a face whose carrier \
+                             left the body is no longer on it"
+                        ));
+                        notes.extend(lost);
+                        return Ok((body, notes));
+                    }
+                    Err(reason) => {
+                        let error = error.with_message(|error| {
+                            format!("{error}. The re-cut road was offered it too and declined: {reason}")
+                        });
+                        return Err((error, Some(REFUSED_STEP_TRANSLATION)));
+                    }
+                }
+            }
+            Err(error) if is_no_route_refusal(&error) => match by_regions(solid, face_ids, None, translation) {
+                Ok((body, note)) => {
+                    notes.push(format!("transformFace: the moved carriers could not be re-solved ({error}), {note}"));
+                    body
+                }
+                Err(reason) => {
+                    let error = error.with_message(|error| format!("{error}. {reason}"));
+                    return Err((error, Some(REFUSED_STEP_TRANSLATION)));
+                }
+            },
+            Err(error) => return Err((error, Some(REFUSED_STEP_TRANSLATION))),
+        },
         Some((pivot, axis, angle)) => {
             let solved = if !translates {
                 rotate_faces_unchecked(solid, face_ids, pivot, axis, angle)
@@ -471,6 +593,26 @@ fn solve_motion(
                         }
                     }
                 }
+                // A turned face whose neighbour has no route on this road — a
+                // plane's section of a cylinder or cone it cannot mint (a whole
+                // frustum's top turned past the generatrices), a slanted cap on a
+                // coaxial wall, a sphere, torus or quadric neighbour — still
+                // has an answer where the body is the intersection of its faces'
+                // own regions, or where the selection is a through bore
+                // (`by_regions`). The rotation road's refusal stays the primary
+                // one if both decline.
+                Err(error) if is_no_route_refusal(&error) => match by_regions(solid, face_ids, turn, translation) {
+                    Ok((body, note)) => {
+                        notes.push(format!(
+                            "transformFace: the turned face could not be re-solved ({error}), {note}"
+                        ));
+                        body
+                    }
+                    Err(reason) => {
+                        let error = error.with_message(|error| format!("{error}. {reason}"));
+                        return Err((error, Some(REFUSED_STEP_ROTATION)));
+                    }
+                },
                 Err(error) => return Err((error, Some(REFUSED_STEP_ROTATION))),
             }
         }
@@ -507,19 +649,37 @@ fn solve_motion(
                     notes.extend(lost);
                     body
                 }
-                // The acceptance's refusal stays the primary one — its class
-                // is what the boundary reports — and the re-cut's decline is
-                // appended as context.
-                Err(reason) => {
-                    return Err((
-                        refusal.with_message(|refusal| {
-                            format!(
-                                "{refusal}. The re-cut road was offered it too and declined: {reason}"
-                            )
-                        }),
-                        None,
-                    ))
-                }
+                // A through bore's wall: the RE-DRILL road — the body with
+                // the bore healed shut, less the moved carrier run the body's
+                // whole way through (`edit/direct_edit/face_move_redrill.rs`).
+                // It answers a mouth straddling a corner, whose two crossing
+                // pairs the acceptance's repair does not take. The re-cut
+                // declines every curved carrier, so this is the only road
+                // left for a bore wall.
+                Err(reason) => match redrill_past_a_refusal(solid, face_ids, turn, translation) {
+                    Ok(body) => {
+                        notes.push(format!(
+                            "transformFace: the moved bore could not be re-trimmed onto the body \
+                             ({refusal}), so the bore was RE-DRILLED instead — the body with the \
+                             hole filled, less the moved carrier run the body's whole way through"
+                        ));
+                        body
+                    }
+                    // The acceptance's refusal stays the primary one — its
+                    // class is what the boundary reports — and the other
+                    // roads' declines are appended as context.
+                    Err(redrill) => {
+                        return Err((
+                            refusal.with_message(|refusal| {
+                                format!(
+                                    "{refusal}. The re-cut road was offered it too and declined: \
+                                     {reason}. The re-drill road declined: {redrill}"
+                                )
+                            }),
+                            None,
+                        ))
+                    }
+                },
             }
         }
     };
@@ -546,9 +706,99 @@ fn recut_past_a_refusal(
     Ok(crate::reblend_lost_fillets(solid, face_ids, body))
 }
 
+/// The re-drill offered after the acceptance and the re-cut refused: checked
+/// by the same acceptance, as the re-cut's body is.
+fn redrill_past_a_refusal(
+    solid: &BrepSolid,
+    face_ids: &[u64],
+    turn: Option<(Vec3, Vec3, f64)>,
+    translation: Vec3,
+) -> Result<BrepSolid, KernelRefusal> {
+    let body = crate::redrill_moved_bore(solid, face_ids, turn, translation)?;
+    crate::accept_sound(body, "transformFace").map_err(|reason| {
+        reason.with_message(|reason| format!("the re-drill built a body the acceptance refused — {reason}"))
+    })
+}
+
+/// The translation primitive's refusal for a straight edge it inverts or
+/// collapses (`face_move.rs`).
+fn is_straight_edge_inversion(error: &KernelRefusal) -> bool {
+    matches!(&error.class, crate::RefusalClass::UnsupportedGeometry { what }
+        if what == crate::face_refusal_slugs::EDGE_INVERSION || what == "edge_collapse")
+}
+
+/// Whether a selected face has an inner loop (an island: a hole through it or
+/// a boss standing on it).
+fn has_island(solid: &BrepSolid, face_ids: &[u64]) -> bool {
+    solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .any(|face| face_ids.contains(&face.id) && face.loops.len() > 1)
+}
+
 /// The rotation primitive's refusal for a face tangent to a ruled neighbour.
 fn is_ruling_refusal(error: &KernelRefusal) -> bool {
     matches!(&error.class, crate::RefusalClass::UnsupportedGeometry { what } if what == "ruling_edge")
+}
+
+/// A refusal of either primitive that says the neighbour or section has NO
+/// ROUTE on that road — not that the motion inverts, collapses or tears
+/// something, which stay refusals: a carrier kind it does not re-intersect, a
+/// curved edge it cannot rebuild, a plane's section of a ruled wall it cannot
+/// mint, a slanted chord off its wall, a sphere rim it does not model.
+fn is_no_route_refusal(error: &KernelRefusal) -> bool {
+    const NO_ROUTE: &[&str] = &[
+        "carrier_kind",
+        "curved_edge_rebuild",
+        "curved_fixed_edge_pair",
+        "ruled_section",
+        "chord_off_carrier",
+        "both_nappes",
+        "asymptotic_ruling",
+        "section_through_apex",
+        "cap_through_apex",
+        "sphere_oblique_rim",
+        "sphere_mixed_neighbours",
+        "sphere_open_rim",
+        "sphere_group",
+    ];
+    matches!(&error.class, crate::RefusalClass::UnsupportedGeometry { what } if NO_ROUTE.contains(&what.as_str()))
+}
+
+/// The two roads that answer a motion from the body's own regions rather than
+/// by re-solving: the region re-cut for planar faces
+/// ([`crate::recut_convex_body`]: the body is the intersection of its faces'
+/// regions), the re-drill for a through bore ([`crate::redrill_moved_bore`]).
+/// `Ok` carries the body and the note naming the road; `Err` the declines.
+fn by_regions(
+    solid: &BrepSolid,
+    face_ids: &[u64],
+    turn: Option<(Vec3, Vec3, f64)>,
+    translation: Vec3,
+) -> Result<(BrepSolid, String), String> {
+    let recut = match crate::recut_convex_body(solid, face_ids, turn, translation) {
+        Ok(body) => {
+            return Ok((
+                body,
+                "so the body was RE-CUT as the intersection of its faces' own regions with the moved \
+                 planes' — the body this motion defines"
+                    .to_string(),
+            ))
+        }
+        Err(reason) => reason,
+    };
+    match crate::redrill_moved_bore(solid, face_ids, turn, translation) {
+        Ok(body) => Ok((
+            body,
+            "so the bore was RE-DRILLED — the body with the hole filled, less the moved carrier run \
+             the body's whole way through"
+                .to_string(),
+        )),
+        Err(redrill) => Err(format!(
+            "The region re-cut was offered it too and declined: {recut}. The re-drill road declined: {redrill}"
+        )),
+    }
 }
 
 /// Context-bar applicability ([`crate::feature_pipeline::context_offer`]):
@@ -585,7 +835,8 @@ pub fn schema() -> serde_json::Value {
             "type": "vec3",
             "label": "Pivot",
             "default_value": null,
-            "hint": "The point the rotation turns about, in world millimetres; set to the centre of the selection when the faces are picked"
+            "selectionFilter": ["VERTEX", "EDGE", "FACE"],
+            "hint": "The point the rotation turns about, in world millimetres; set to the centre of the selection when the faces are picked, or picked from a vertex, edge or face"
         },
         "transform": {
             "type": "transform",

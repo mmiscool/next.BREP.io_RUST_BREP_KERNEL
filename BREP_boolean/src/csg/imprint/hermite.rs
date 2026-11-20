@@ -109,6 +109,25 @@ fn end_weld_enabled() -> bool {
     switch!("BREP_HERMITE_END_WELD", true)
 }
 
+/// `BREP_HERMITE_TANGENCY_CHORD` (default on since 2026-11-20; `=0` declines
+/// such a run to the fitted section as before): a [`hermite_section_3d`]
+/// station where the two carriers' normals are parallel (the section passes
+/// through a tangency point) takes the run's chord as its tangent instead of
+/// declining the run to the fitted section.
+fn tangency_chord_enabled() -> bool {
+    switch!("BREP_HERMITE_TANGENCY_CHORD", true)
+}
+
+/// `BREP_HERMITE_THIN_STATIONS` (default on since 2026-11-20; `=0` emits every
+/// march station): [`hermite_section_3d`] keeps
+/// only the march stations its spans need, each kept span held to the budget
+/// with the stations it drops lying within the budget of its cubic, so a
+/// densely marched section (a tangency's tiny steps) is emitted with as few
+/// knots as the budget allows.
+fn thin_stations_enabled() -> bool {
+    switch!("BREP_HERMITE_THIN_STATIONS", true)
+}
+
 fn decline_3d(site: usize) {
     if std::env::var("BREP_DEBUG_HERMITE_3D").is_ok() {
         eprintln!("hermite 3-D decline at site {site}");
@@ -164,12 +183,24 @@ pub(super) fn hermite_section_3d(
     let in_b = |uv: [f64; 2]| [into_domain(uv[0], closed_b.0, ub), into_domain(uv[1], closed_b.1, vb)];
     let near_a = |uv: [f64; 2], near: [f64; 2]| [unwrap(uv[0], near[0], closed_a.0, ua), unwrap(uv[1], near[1], closed_a.1, va)];
     let near_b = |uv: [f64; 2], near: [f64; 2]| [unwrap(uv[0], near[0], closed_b.0, ub), unwrap(uv[1], near[1], closed_b.1, vb)];
-    let frame = |point: Vec3, along: Vec3| -> Result<Option<Station3>, String> {
+    let frame = |point: Vec3, along: Vec3, chord: Option<Vec3>| -> Result<Option<Station3>, String> {
         let (Ok(on_a), Ok(on_b)) = (project_point_to_surface(first, point), project_point_to_surface(second, point)) else {
             return Ok(None);
         };
         let cross = first.normal(on_a.u, on_a.v)?.cross(second.normal(on_b.u, on_b.v)?);
         if cross.length() <= 1e-9 {
+            // The carriers touch here (parallel normals: a tangency point the
+            // section passes through), so their normals name no direction.
+            // `BREP_HERMITE_TANGENCY_CHORD`: take the run's own chord through
+            // the station, when the run goes straight through it (`chord`,
+            // see the caller); the span checks below then hold every span to
+            // the budget or decline, as for any station.
+            if let Some(chord) = chord.filter(|_| tangency_chord_enabled()) {
+                let length = chord.length();
+                if length.is_finite() && length > 0.0 {
+                    return Ok(Some((point, chord.scale(1.0 / length), [on_a.u, on_a.v], [on_b.u, on_b.v])));
+                }
+            }
             return Ok(None);
         }
         let mut tangent = cross.normalized()?;
@@ -205,10 +236,27 @@ pub(super) fn hermite_section_3d(
             stations.pop();
         }
         let along = run[(k + 1).min(run.len() - 1)].sub(run[k.saturating_sub(1)]);
+        // The chord a tangency station may take: at an interior station only
+        // when the run goes straight through it, the chords behind and ahead
+        // within about 25 degrees. A tangency can be a BRANCH point where two
+        // section branches cross, and a run that turns there onto the other
+        // branch has no tangent to take (it declines as before). At an end,
+        // the one chord the run has.
+        let chord = {
+            let behind = (k > 0).then(|| point.sub(run[k - 1]));
+            let ahead = (k + 1 < run.len()).then(|| run[k + 1].sub(*point));
+            match (behind, ahead) {
+                (Some(behind), Some(ahead)) => {
+                    let (lb, la) = (behind.length(), ahead.length());
+                    (lb > 0.0 && la > 0.0 && behind.dot(ahead) >= 0.9 * lb * la).then_some(along)
+                }
+                (one, other) => one.or(other),
+            }
+        };
         let marched = by_point.get(&key(*point)).and_then(|&i| Some((tangents?.get(i).copied()?, branch.params_a[i], branch.params_b[i])));
         match marched {
             Some((tangent, uv_a, uv_b)) if tangent.length() > 0.5 => stations.push((*point, tangent.normalized()?, uv_a, uv_b)),
-            _ => match frame(*point, along)? {
+            _ => match frame(*point, along, chord)? {
                 Some(station) => stations.push(station),
                 None => { decline_3d(2); return Ok(None); }
             },
@@ -336,6 +384,78 @@ pub(super) fn hermite_section_3d(
             s = if secant > s0 && secant < s1 { secant } else { 0.5 * (s0 + s1) };
         }
         Ok(None)
+    };
+    // `BREP_HERMITE_THIN_STATIONS`: keep only the stations a span needs. A
+    // span from station i reaches as far ahead as it holds the budget: the
+    // five-point check below passes, no crease is crossed, and every march
+    // station it drops (a true intersection point) lies within the budget of
+    // its cubic. The loop below then holds every kept span to the budget
+    // again, bisecting onto the section where one misses, as for any span.
+    let stations = if thin_stations_enabled() && stations.len() > 2 {
+        let holds = |i: usize, j: usize| -> Result<bool, String> {
+            if j == i + 1 {
+                return Ok(true);
+            }
+            let (a, b) = (&stations[i], &stations[j]);
+            if crossed(a, b).is_some() || !(span_miss(a, b)? <= budget) {
+                return Ok(false);
+            }
+            // Each dropped station near the cubic point at its chord fraction.
+            let lengths: Vec<f64> = (i..j).map(|k| stations[k + 1].0.sub(stations[k].0).length()).collect();
+            let total: f64 = lengths.iter().sum();
+            if !(total > 0.0) {
+                return Ok(false);
+            }
+            let mut run_length = 0.0;
+            for k in i + 1..j {
+                run_length += lengths[k - i - 1];
+                let s0 = run_length / total;
+                let near = (0..=20)
+                    .map(|n| (s0 - 0.1 + 0.01 * n as f64).clamp(0.0, 1.0))
+                    .map(|s| cubic(a, b, s).sub(stations[k].0).length())
+                    .fold(f64::INFINITY, f64::min);
+                if !(near <= budget) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        let last = stations.len() - 1;
+        let mut kept = vec![stations[0]];
+        let mut i = 0usize;
+        while i < last {
+            // Grow by doubling, then bisect between the last span that held
+            // and the first that did not.
+            let (mut good, mut step) = (i + 1, 1usize);
+            let mut bad = None;
+            loop {
+                let next = (i + 2 * step).min(last);
+                if next <= good {
+                    break;
+                }
+                if holds(i, next)? {
+                    good = next;
+                    if next == last {
+                        break;
+                    }
+                    step *= 2;
+                } else {
+                    bad = Some(next);
+                    break;
+                }
+            }
+            if let Some(mut bad) = bad {
+                while bad > good + 1 {
+                    let middle = (good + bad) / 2;
+                    if holds(i, middle)? { good = middle } else { bad = middle }
+                }
+            }
+            kept.push(stations[good]);
+            i = good;
+        }
+        kept
+    } else {
+        stations
     };
     let mut pending: Vec<(Station3, Station3, usize)> = stations.windows(2).rev().map(|pair| (pair[0], pair[1], 0usize)).collect();
     let mut out: Vec<Station3> = vec![stations[0]];

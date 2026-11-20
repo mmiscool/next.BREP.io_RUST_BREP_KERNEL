@@ -45,6 +45,10 @@ pub struct TransformArm {
     /// the selection's centroid; a drag moves (and turns) every selected
     /// point. See `cage_edit.rs`.
     pub(super) cage: Option<super::cage_edit::CageArm>,
+    /// When the armed subject is ONE PICK of a Deform Face: the pick and the
+    /// drag's grab snapshot. A drag moves the pick along its normal. See
+    /// `deform_edit.rs`.
+    pub(super) deform: Option<super::deform_edit::DeformArm>,
 }
 
 /// A grab snapshot for an in-flight transform-gizmo drag: the grabbed handle,
@@ -135,6 +139,7 @@ impl EngineState {
             "anchor": self.transform_gizmo.anchor,
             "portPoint": self.transform_gizmo.port,
             "cage": self.transform_gizmo.cage.as_ref().map(|cage| cage.selected.clone()),
+            "deformPick": self.transform_gizmo.deform.as_ref().map(|arm| arm.pick),
             "origin": self.widgets.transform_origin(),
             // A Transform Face turns about its stored `pivot`, and the gizmo
             // sits at `pivot + position` — so the two coincide only while the
@@ -319,6 +324,7 @@ impl EngineState {
         self.transform_gizmo.anchor = None;
         self.transform_gizmo.port = None;
         self.transform_gizmo.cage = None;
+        self.transform_gizmo.deform = None;
         self.clear_feature_dimension_overlay();
         self.sync_transform_gizmo();
     }
@@ -334,6 +340,7 @@ impl EngineState {
         self.transform_gizmo.anchor = None;
         self.transform_gizmo.port = None;
         self.transform_gizmo.cage = None;
+        self.transform_gizmo.deform = None;
         let _ = self.widgets.set_transform_json("null");
         self.clear_feature_dimension_overlay();
         self.dirty = true;
@@ -398,6 +405,11 @@ impl EngineState {
             // A control cage: the selection's centroid, or the live drag pose
             // (see `cage_edit.rs`).
             return self.cage_pose();
+        }
+        if self.transform_gizmo.deform.is_some() {
+            // A Deform Face pick: its target, or the live drag pose (see
+            // `deform_edit.rs`).
+            return self.deform_pose();
         }
         if let Some(anchor) = self.transform_gizmo.anchor {
             // A spline anchor: its position + the intrinsic-XYZ Euler of its
@@ -588,7 +600,7 @@ impl EngineState {
         };
         // A cage with ONE point selected has nothing to turn about: its
         // gizmo draws no rotation rings.
-        let show_rings = self.cage_shows_rings().unwrap_or(true);
+        let show_rings = self.transform_gizmo.deform.is_none() && self.cage_shows_rings().unwrap_or(true);
         let _ = self
             .widgets
             .set_transform_json(&transform_frame_json_with(&pose, show_rings));
@@ -733,6 +745,7 @@ impl EngineState {
         });
         // A cage drag re-derives every selected point from the grab.
         self.cage_grab_begin();
+        self.deform_grab_begin();
         self.dirty = true;
         true
     }
@@ -789,6 +802,7 @@ impl EngineState {
             // keep the one before it" work.
             self.history.break_coalescing();
             self.cage_grab_end();
+            self.deform_grab_end();
             self.sync_transform_gizmo();
         }
     }
@@ -867,6 +881,10 @@ impl EngineState {
         };
         if self.transform_gizmo.cage.is_some() {
             self.write_cage_pose(pose);
+            return;
+        }
+        if self.transform_gizmo.deform.is_some() {
+            self.write_deform_pose(pose);
             return;
         }
         if let Some(anchor) = self.transform_gizmo.anchor {
@@ -1192,6 +1210,7 @@ impl EngineState {
         self.transform_gizmo.feature_id = None;
         self.transform_gizmo.anchor = None;
         self.transform_gizmo.cage = None;
+        self.transform_gizmo.deform = None;
         self.transform_gizmo.port = Some(address.to_string());
         self.transform_gizmo.mode = GizmoMode::Transform;
         self.transform_gizmo.drag = None;

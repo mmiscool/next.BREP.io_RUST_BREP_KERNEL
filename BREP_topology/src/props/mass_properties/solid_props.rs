@@ -290,6 +290,160 @@ pub fn solid_signed_volume_for_sign_with_bound(solid: &BrepSolid, bar: f64, enab
     solid_signed_volume(solid)
 }
 
+/// The quadtree depth of [`solid_sign_coarse_certificate`]: boundary cells
+/// split this often, against four times for the exact reading.
+pub const COARSE_SIGN_DEPTH: usize = 1;
+
+/// [`solid_sign_coarse_certificate`]'s reading and the half-width of the
+/// interval it certifies.
+#[derive(Clone, Copy, Debug)]
+pub struct CoarseSign {
+    /// The faces' contributions with every boundary cell left at the coarse
+    /// depth skipped.
+    pub reading: f64,
+    /// The skipped regions' bound plus the rounding slack: the volume lies
+    /// in `reading ± bound`.
+    pub bound: f64,
+    /// The skipped parameter-plane measure, summed over the faces (a census
+    /// figure).
+    pub skipped: f64,
+}
+
+/// A CERTIFICATE for the sign of [`solid_signed_volume`] read with a coarse
+/// quadtree: `Some(CoarseSign)` whose `reading ± bound` holds the volume, or
+/// `None` when no bound can be stated (the caller then reads the sign
+/// exactly).
+///
+/// Every face is integrated by its exact route, at the exact route's
+/// stations, except that a trimmed face's boundary cells refine only to
+/// `depth` and the partial cells left there are NOT integrated
+/// ([`super::trimmed::with_coarse_quadtree`]). The full cells, the chord
+/// corrections and every other route are term for term the exact reading's.
+///
+/// The bound, per face. The volume flux is
+/// `(1/3) ∫∫_R (S − ref)·(S_u × S_v) du dv` over the trimmed region `R`.
+/// A skipped region `K` (the trim fragments clipped to the skipped cells)
+/// therefore contributes at most `(1/3) |K| · sup|S − ref| · sup|S_u × S_v|`
+/// in magnitude. Here:
+/// - `|K|` is the sum of the fragments' absolute shoelace areas. That is
+///   exactly their measure for simple trim loops: a simple loop's winding
+///   number is 0 or ±1, and the clip keeps it.
+/// - `|S − ref| ≤ |S − local| + |local − ref| ≤ r + |local − ref|`.
+/// - `|S_u × S_v| ≤ n`.
+/// - `(n, r)` are the control-net bounds about `local` of the knot span
+///   holding `K` ([`surface_flux_bounds_on_span`]: by local support only that
+///   span's `(p+1)(q+1)` controls weigh there). A cell that is not inside one
+///   span, or that lies past the domain, takes the whole net's
+///   ([`surface_flux_bounds`], valid over the domain and its periodic wraps).
+///   A skipped region past an OPEN end of the carrier declines, because no
+///   net bound holds on the extension.
+///
+/// So the true integral of the skipped regions lies within `Σ` of those
+/// bounds of zero. The reading is what the exact reading would give with
+/// those regions removed. A sign is decided only when `|reading ∓ bar|`
+/// exceeds the bound.
+///
+/// What this certifies: the sign of any integration that agrees with the
+/// exact reading on the cells and corrections both share, and reads the
+/// skipped regions within their true bound. The exact reading's own
+/// quadrature of those regions (finer cells and triangle cubature) is not
+/// itself bounded here.
+///
+/// Declined (`None`):
+/// - a face on the hopped unwrap route, which chooses its region by an area
+///   read over cells the coarse pass skips;
+/// - a carrier with no net bound (a non-positive weight), or a call whose
+///   kinds carry no volume reference;
+/// - any non-finite value.
+///
+/// Rounding: the reading re-associates no station within a face. A skipped
+/// cell only removes addends, so `1e-9` of the faces' scale covers the
+/// difference in summation order, as in [`sliver_bound_certificate`].
+/// Nothing is memoised.
+pub fn solid_sign_coarse_certificate(solid: &BrepSolid, depth: usize) -> Option<CoarseSign> {
+    let (mut reading, mut bound, mut scale, mut skipped) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    // Early out: a sign is settled only when |reading| exceeds the bound, and
+    // a body's volume is at most that of a box holding its carriers' controls
+    // (their convex hulls hold the faces). Once the bound passes that box,
+    // nothing is left to settle. Stopping only falls through to the exact
+    // path, so this never weakens the certificate.
+    let reach = control_box_volume(solid);
+    // The faces in falling order of what their skipped cells could add to the
+    // bound (the whole net's `n · r` over the carrier's domain, read from
+    // controls alone), so that a body the certificate cannot settle reaches
+    // the early out after a few faces rather than most of them. On the
+    // bench's spiroid, a few cone walls (integrand zero about their apex,
+    // net bound large) carry most of the bound. The order changes only the
+    // summation order, which the slack covers.
+    let mut faces = Vec::new();
+    for shell in &solid.shells {
+        let reference = shell_volume_reference(shell).ok()?;
+        for face in &shell.faces {
+            let local = face_volume_reference(face).unwrap_or(reference);
+            faces.push((face, local, reference, bound_potential(&face.surface, local)));
+        }
+    }
+    faces.sort_by(|a, b| b.3.total_cmp(&a.3));
+    {
+        for &(face, local, reference, _) in &faces {
+            let (terms, measure) =
+                super::trimmed::with_coarse_quadtree(depth, || face_volume_terms_about(face, local));
+            let terms = terms.ok()?;
+            if measure.declined || !terms.iter().all(|v| v.is_finite()) {
+                return None;
+            }
+            let offset = local.sub(reference);
+            let area = Vec3::new(terms[1], terms[2], terms[3]);
+            let contribution = terms[0] + offset.dot(area);
+            let face_bound = (measure.flux + measure.normal * offset.length()) / 3.0;
+            reading += contribution;
+            bound += face_bound;
+            skipped += measure.skipped;
+            scale += terms[0].abs() + offset.length() * area.length() + face_bound;
+            if !(bound <= reach) {
+                return None;
+            }
+        }
+    }
+    let bound = bound + 1e-9 * scale;
+    [reading, bound, skipped].iter().all(|v| v.is_finite()).then_some(CoarseSign { reading, bound, skipped })
+}
+
+/// The whole net's `n · r` about `center` times the carrier's parameter
+/// domain area: an ordering key for [`solid_sign_coarse_certificate`], not a
+/// bound it relies on. Infinite where no net bound holds, so such a face
+/// (which declines) comes first.
+fn bound_potential(surface: &crate::NurbsSurface, center: Vec3) -> f64 {
+    let span = |knots: &[f64], degree: usize| -> f64 {
+        match (knots.get(degree), knots.len().checked_sub(degree + 1).and_then(|i| knots.get(i))) {
+            (Some(low), Some(high)) => (high - low).abs(),
+            _ => f64::INFINITY,
+        }
+    };
+    let area = span(&surface.knots_u, surface.degree_u) * span(&surface.knots_v, surface.degree_v);
+    match surface_flux_bounds(surface, center) {
+        Some((n, r)) if (n * r * area).is_finite() => n * r * area,
+        _ => f64::INFINITY,
+    }
+}
+
+/// The volume of the axis-aligned box holding every face carrier's control
+/// points; infinite when there are none or any is not finite.
+fn control_box_volume(solid: &BrepSolid) -> f64 {
+    let (mut low, mut high) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+        for control in face.surface.control_points.iter().flatten() {
+            let Ok(point) = control.point() else { return f64::INFINITY };
+            for (axis, value) in [point.x, point.y, point.z].into_iter().enumerate() {
+                low[axis] = low[axis].min(value);
+                high[axis] = high[axis].max(value);
+            }
+        }
+    }
+    let volume = (0..3).map(|axis| high[axis] - low[axis]).product::<f64>();
+    if volume.is_finite() { volume } else { f64::INFINITY }
+}
+
 /// `BREP_SIGN_SLIVER_BOUND` (on by default since 2026-11-03,
 /// tier-P promotion; `0`/`off` restores the reading alone): before the sign
 /// reading, try a certificate that integrates every face's cells exactly as
@@ -569,7 +723,34 @@ pub fn surface_flux_bounds(surface: &crate::NurbsSurface, center: Vec3) -> Optio
     let net = &surface.control_points;
     let rows = net.len();
     let columns = net.first()?.len();
-    if rows == 0 || columns == 0 || net.iter().any(|row| row.len() != columns) {
+    surface_flux_bounds_over(surface, center, 0..rows, 0..columns)
+}
+
+/// [`surface_flux_bounds`] over one knot span `[u_i, u_{i+1}) × [v_j,
+/// v_{j+1})`: there only the controls `i-p..=i` × `j-q..=j` carry basis
+/// weight (local support), so the same argument over that sub-net bounds
+/// `|S_u × S_v|` and `|S - center|` on the span. `None` for an index
+/// outside the net (the caller then takes the whole-net bound).
+pub fn surface_flux_bounds_on_span(surface: &crate::NurbsSurface, center: Vec3, span_u: usize, span_v: usize) -> Option<(f64, f64)> {
+    let (p, q) = (surface.degree_u, surface.degree_v);
+    if span_u < p || span_v < q {
+        return None;
+    }
+    surface_flux_bounds_over(surface, center, span_u - p..span_u + 1, span_v - q..span_v + 1)
+}
+
+fn surface_flux_bounds_over(
+    surface: &crate::NurbsSurface,
+    center: Vec3,
+    row_range: std::ops::Range<usize>,
+    column_range: std::ops::Range<usize>,
+) -> Option<(f64, f64)> {
+    let net = &surface.control_points;
+    let rows = net.len();
+    let columns = net.first()?.len();
+    if rows == 0 || columns == 0 || net.iter().any(|row| row.len() != columns)
+        || row_range.is_empty() || column_range.is_empty() || row_range.end > rows || column_range.end > columns
+    {
         return None;
     }
     let relative = |i: usize, j: usize| -> Option<[f64; 4]> {
@@ -579,8 +760,8 @@ pub fn surface_flux_bounds(surface: &crate::NurbsSurface, center: Vec3) -> Optio
     };
     let mut w_min = f64::INFINITY;
     let mut r = 0.0f64;
-    for i in 0..rows {
-        for j in 0..columns {
+    for i in row_range.clone() {
+        for j in column_range.clone() {
             let q = relative(i, j)?;
             w_min = w_min.min(q[3]);
             r = r.max((q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt() / q[3]);
@@ -588,10 +769,10 @@ pub fn surface_flux_bounds(surface: &crate::NurbsSurface, center: Vec3) -> Optio
     }
     // (largest |X_d|, largest |w_d|) in one parameter direction.
     let derivative = |along_u: bool| -> Option<(f64, f64)> {
-        let (degree, knots, count) = if along_u {
-            (surface.degree_u, &surface.knots_u, rows)
+        let (degree, knots, count, range) = if along_u {
+            (surface.degree_u, &surface.knots_u, rows, row_range.clone())
         } else {
-            (surface.degree_v, &surface.knots_v, columns)
+            (surface.degree_v, &surface.knots_v, columns, column_range.clone())
         };
         if knots.len() < count + degree + 1 {
             return None;
@@ -600,14 +781,16 @@ pub fn surface_flux_bounds(surface: &crate::NurbsSurface, center: Vec3) -> Optio
         if degree == 0 {
             return Some((0.0, 0.0));
         }
-        for k in 0..count.saturating_sub(1) {
+        // The derivative's controls over the range: consecutive differences
+        // of the controls in it (all of them for the whole net).
+        for k in range.start..range.end.saturating_sub(1) {
             let span = knots[k + degree + 1] - knots[k + 1];
             if !(span > 0.0) {
                 continue;
             }
             let factor = degree as f64 / span;
-            let others = if along_u { columns } else { rows };
-            for other in 0..others {
+            let others = if along_u { column_range.clone() } else { row_range.clone() };
+            for other in others {
                 let (a, b) = if along_u {
                     (relative(k, other)?, relative(k + 1, other)?)
                 } else {
@@ -1022,6 +1205,31 @@ pub fn solid_mass_properties_full(solid: &BrepSolid) -> Result<FullMassPropertie
     result
 }
 
+/// `BREP_MASS_MOMENT_BAND_ROUTE` (default on; `=0` restores the old route): the moment
+/// integrals take the bi-periodic band route first, as the area and volume
+/// read in [`solid_mass_properties_inner`] and [`face_moment`] already do.
+/// Without it a trimmed torus band (two rim loops round the carrier) goes
+/// straight to the trimmed cell walk, whose raw polygons collapse to a sliver
+/// on such a band: the face's moments read about zero while its volume reads
+/// in full, so the centroid is off and moves by a multiple of any
+/// translation (a 107-face part with three such bands: 2.4e-3 of the offset
+/// along x and z, and hundreds of millimetres along the torus axis at 1000).
+pub fn moment_band_route_on() -> bool {
+    crate::switch!("BREP_MASS_MOMENT_BAND_ROUTE", true)
+}
+
+/// `BREP_MASS_MOMENT_LOCAL_FRAME` (default on; `=0` reads about the world origin): the
+/// first and second moments are read about a point of the body instead of
+/// the world origin. In the world frame a moment integrand grows with the
+/// square of the distance, so a shell whose faces do not close exactly (an
+/// imported tolerant body: net vector area 1.4e-4 mm² on a 78-face part)
+/// moves its centroid by `t²/2 · Σn / V` under a translation `t` (0.11 mm at
+/// 1000 on that part), and the inertia's parallel-axis step cancels digits.
+/// About a point that moves with the body, both are translation invariant.
+pub fn moment_local_frame_on() -> bool {
+    crate::switch!("BREP_MASS_MOMENT_LOCAL_FRAME", true)
+}
+
 fn solid_mass_properties_full_moments(
     solid: &BrepSolid,
     base: MassProperties,
@@ -1037,19 +1245,49 @@ fn solid_mass_properties_full_moments(
         Integrand::ProductXZ,
         Integrand::ProductYZ,
     ];
+    // `BREP_MASS_MOMENT_LOCAL_FRAME`: every moment about one point of the
+    // body (the first non-empty shell's volume reference, the point the
+    // volume is read about), and the centroid that point plus the local one.
+    let origin = if moment_local_frame_on() {
+        solid.shells.iter().find(|shell| !shell.faces.is_empty()).map(shell_volume_reference).transpose()?
+    } else {
+        None
+    };
+    let local_kinds = origin.map(|r| {
+        [
+            Integrand::MomentAbout(0, r),
+            Integrand::MomentAbout(1, r),
+            Integrand::MomentAbout(2, r),
+            Integrand::SecondAbout(0, r),
+            Integrand::SecondAbout(1, r),
+            Integrand::SecondAbout(2, r),
+            Integrand::ProductAbout(0, r),
+            Integrand::ProductAbout(1, r),
+            Integrand::ProductAbout(2, r),
+        ]
+    });
+    let kinds: &[Integrand; 9] = local_kinds.as_ref().unwrap_or(&MOMENT_KINDS);
     let mut moments = [0.0f64; 3];
     let mut seconds = [0.0f64; 3];
     let mut products = [0.0f64; 3];
     for shell in &solid.shells {
         for face in &shell.faces {
             mass_profile(|p| p.faces += 1);
-            let results = if !is_affine(&face.surface)? && !is_untrimmed(face)? {
+            let band = if moment_band_route_on() {
+                biperiodic_band_integral(face, kinds)?
+            } else {
+                None
+            };
+            let results = if let Some(values) = band {
+                mass_profile(|p| p.route_biperiodic += 1);
+                values
+            } else if !is_affine(&face.surface)? && !is_untrimmed(face)? {
                 mass_profile(|p| p.trimmed_faces += 1);
                 // One cell decomposition, all nine moment integrands per
                 // station, instead of nine full passes per face.
-                integrate_trimmed_multi(face, &MOMENT_KINDS)?
+                integrate_trimmed_multi(face, kinds)?
             } else {
-                MOMENT_KINDS
+                kinds
                     .iter()
                     .map(|kind| face_moment(face, *kind))
                     .collect::<Result<Vec<_>, _>>()?
@@ -1069,12 +1307,14 @@ fn solid_mass_properties_full_moments(
     if volume.abs() <= 1e-30 {
         return Err("solid_mass_properties_full: non-positive volume".into());
     }
+    // The centroid in the frame the moments were read in (the world, or
+    // about `origin`).
     let centroid = Vec3::new(
         moments[0] / volume,
         moments[1] / volume,
         moments[2] / volume,
     );
-    // Inertia about the origin, then parallel-axis down to the centroid.
+    // Inertia about the frame's origin, then parallel-axis down to the centroid.
     let ixx =
         seconds[1] + seconds[2] - volume * (centroid.y * centroid.y + centroid.z * centroid.z);
     let iyy =
@@ -1086,6 +1326,7 @@ fn solid_mass_properties_full_moments(
     let iyz = -(products[2] - volume * centroid.y * centroid.z);
     let inertia = [[ixx, ixy, ixz], [ixy, iyy, iyz], [ixz, iyz, izz]];
     let (principal_moments, principal_axes) = principal_frame(inertia);
+    let centroid = origin.map_or(centroid, |r| r.add(centroid));
     Ok(FullMassProperties {
         surface_area: base.surface_area,
         volume,

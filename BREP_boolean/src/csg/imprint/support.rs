@@ -288,7 +288,7 @@ thread_local! {
     /// [`restricted_carrier`]'s window per face content (`hash_face`: carrier,
     /// sense, every loop's coedge senses and pcurves) and the two hatches it
     /// reads. The fillet's cutter composition hands the same body, less a few
-    /// faces, to boolean after boolean: on the sprocket report (1d179b4a) F9's
+    /// faces, to boolean after boolean: on the sprocket report F9's
     /// 35 imprints rebuilt ~280 unchanged windows each, 1.65 s of its 4.84 s.
     static WINDOW_MEMO: std::cell::RefCell<HashMap<[u64; 2], Option<MarchWindow>>> = std::cell::RefCell::new(HashMap::default());
     static WINDOW_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1023,7 +1023,8 @@ pub fn tangent_hit_endpoint(
     }
     let (along_low, along_high) = (along_low.min(along_high), along_low.max(along_high));
     let (other_low, other_high) = (other_low.min(other_high), other_low.max(other_high));
-    along.evaluate(hit_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let hit_point = along.evaluate(hit_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let reach_bound = hug_reach_bound_enabled();
     // The endpoint's foot on the partner's LIVE trim, or None.
     let foot = |end_parameter: f64| -> Result<Option<(f64, Vec3)>, KernelRefusal> {
         let end_point = along.evaluate(end_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
@@ -1056,6 +1057,9 @@ pub fn tangent_hit_endpoint(
         if !(hit_parameter > along_low && hit_parameter < along_high) {
             break;
         }
+        if reach_bound && !hug_could_reach(along, hit_point, end_parameter, limit)? {
+            continue;
+        }
         let Some((u, _)) = foot(end_parameter)? else {
             continue;
         };
@@ -1073,6 +1077,32 @@ pub fn tangent_hit_endpoint(
         [one] => Some(*one),
         _ => None,
     })
+}
+
+/// Whether the hug certificate could possibly close the window from the hit
+/// (at `hit_point`) to the endpoint of `along` at `end_parameter`.
+///
+/// [`span_hull_within`] accepts a window only as a cover of contiguous pieces,
+/// at most [`HUG_PIECE_CAP`] of them, each with every control point within
+/// `limit` of one foot point; a piece's curve lies in its control hull, so each
+/// piece spans at most `2 * limit`, and the cover joins the hit to the endpoint.
+/// An endpoint farther than `2 * limit * HUG_PIECE_CAP` from the hit therefore
+/// cannot be certified, whatever the curves, and the certificate (which would
+/// bisect until its budget ran out, projecting and splitting at every piece)
+/// is skipped with the same answer. The bound is doubled again for rounding.
+fn hug_could_reach(along: &NurbsCurve, hit_point: Vec3, end_parameter: f64, limit: f64) -> Result<bool, KernelRefusal> {
+    let end_point = along.evaluate(end_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let distance = end_point.sub(hit_point).length();
+    // A non-finite distance is left to the certificate, which refuses it itself.
+    Ok(!(distance > 4.0 * limit * HUG_PIECE_CAP as f64))
+}
+
+/// `BREP_HUG_REACH_BOUND` (default on since 2026-11-19; `=0` restores the
+/// certificate at every endpoint): [`tangent_hit_endpoint`] skips the hug
+/// certificate for an endpoint too far from the hit for it ever to close
+/// ([`hug_could_reach`]); the answer is the same, without the bisection.
+fn hug_reach_bound_enabled() -> bool {
+    crate::switch!("BREP_HUG_REACH_BOUND", true)
 }
 
 /// The spans of an operand edge's `curve` that lie on the other operand's

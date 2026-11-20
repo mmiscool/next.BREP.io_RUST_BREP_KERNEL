@@ -97,6 +97,12 @@ of them, across every target and including dev-dependencies).
   `license-file = "LICENSE.md"`, which is this repository's own non-standard
   licence. Automated scanners will report them as unknown rather than permissive.
 
+SpaceMouse / Spaceball input (2026-11-17, feature `spacemouse`, native only)
+added `hidapi` (MIT), `nix` (MIT) and `basic-udev` (MIT OR Apache-2.0): no
+`AND` expression and nothing in the wasm bundle. The WebHID shim
+(`web/spacemouse.js`) is project code; it was written from the HID report
+layout, not copied from any example.
+
 To regenerate the inventory after a dependency change:
 
 ```sh

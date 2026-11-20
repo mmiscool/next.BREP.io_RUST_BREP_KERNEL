@@ -212,7 +212,19 @@ fn cap_face(
 /// and the ruled skins retain both boundaries' rational weights. Multi-section
 /// interpolation requires matching degrees, knots and weights.
 pub fn loft_profile_brep(input_sections: &[Vec<NurbsCurve>]) -> Result<BrepSolid, KernelRefusal> {
-    loft_profile_brep_core(input_sections, None)
+    loft_profile_brep_core(input_sections, None, &[])
+}
+
+/// [`loft_profile_brep`] with every column BROKEN at the section indices
+/// `breaks` ([`super::broken::interpolate_column_broken`]): each run between
+/// breaks is interpolated on its own and the runs meet C0 at a full-multiplicity
+/// knot, one face per section curve as before. The sweep passes the stations
+/// where its path's curvature jumps. Empty `breaks` is [`loft_profile_brep`].
+pub fn loft_profile_brep_broken(
+    input_sections: &[Vec<NurbsCurve>],
+    breaks: &[usize],
+) -> Result<BrepSolid, KernelRefusal> {
+    loft_profile_brep_core(input_sections, None, breaks)
 }
 
 /// §5.8 loft with END TANGENCY: the skin leaves the first section along
@@ -240,12 +252,13 @@ pub fn loft_profile_brep_tangent(
             "loftSolid: end tangent must be a nonzero direction",
         )
     })?;
-    loft_profile_brep_core(input_sections, Some((start, end)))
+    loft_profile_brep_core(input_sections, Some((start, end)), &[])
 }
 
 fn loft_profile_brep_core(
     input_sections: &[Vec<NurbsCurve>],
     end_tangents: Option<(Vec3, Vec3)>,
+    breaks: &[usize],
 ) -> Result<BrepSolid, KernelRefusal> {
     let mut profile = super::ConstructionProfile::new("loft");
     let tolerance = 1e-6;
@@ -261,6 +274,13 @@ fn loft_profile_brep_core(
     // A two-section loft is a ruled rational patch: unlike the interpolated
     // multi-station/tangent paths it can retain different boundary weights.
     let ruled = section_count == 2 && end_tangents.is_none();
+    if !breaks.is_empty() && (end_tangents.is_some() || breaks.iter().any(|&b| b == 0 || b >= section_count - 1)) {
+        return Err(KernelRefusal::internal(
+            KernelStage::Collect,
+            "loft_breaks",
+            format!("loftSolid: column breaks {breaks:?} must be interior to {section_count} sections and need no end tangents"),
+        ));
+    }
     let curve_count = if ruled {
         super::validation::validate_section_loops(&sections, tolerance, "loftSolid")?
     } else {
@@ -470,7 +490,7 @@ fn loft_profile_brep_core(
     }
     // Tangent lofts always interpolate cubically — the end-derivative rows
     // need the two extra control points even for a 2-section Hermite loft.
-    let degree_v = if end_tangents.is_some() {
+    let degree_v = if end_tangents.is_some() || !breaks.is_empty() {
         3
     } else {
         3usize.min(section_count - 1)
@@ -509,6 +529,8 @@ fn loft_profile_brep_core(
                 .collect::<Result<Vec<_>, String>>()
                 .or_refuse(KernelStage::Refine, "control_point")?;
             let interpolated = match end_tangents {
+                None if !breaks.is_empty() => super::broken::interpolate_column_broken(&points, &parameters, breaks)
+                    .or_refuse(KernelStage::Refine, "interpolate_broken")?,
                 None => interpolate_curve(&points, degree_v, &parameters)
                     .or_refuse(KernelStage::Refine, "interpolate")?,
                 Some((start_direction, end_direction)) => {

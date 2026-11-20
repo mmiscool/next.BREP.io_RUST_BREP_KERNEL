@@ -167,7 +167,7 @@ thread_local! {
     /// vertices renumbered by first appearance (which pairs share a vertex,
     /// never the ids) and its subcurve's content. The fillet's cutter
     /// composition hands the same faces, under new ids, to imprint after
-    /// imprint (0.77 s of F9 on the sprocket report 1d179b4a).
+    /// imprint (0.77 s of F9 on the sprocket report).
     static TOUCH_MEMO: std::cell::RefCell<HashMap<[u64; 2], Vec<(usize, f64)>>> = std::cell::RefCell::new(HashMap::default());
     static TOUCH_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// [`closest_approach`]'s reading per edge pair, keyed by the two

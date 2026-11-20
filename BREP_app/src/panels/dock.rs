@@ -1404,7 +1404,7 @@ fn default_tree() -> Tree<PaneKind> {
     Tree::new("brep-dock", root, tiles)
 }
 
-/// The side panes that existed at 874912fbf (2026-09-10), when a workbench
+/// The side panes that existed on 2026-09-10, when a workbench
 /// stopped DELETING the panes it did not claim and began hiding them. Every
 /// layout written since holds all of these; a layout from the scheme before it
 /// lacks the ones its workbench did not claim.

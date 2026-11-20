@@ -139,6 +139,8 @@ impl Viewport {
             if self.show_sheet(ui, rect, &response, state) {
                 return;
             }
+            // A SpaceMouse moves the 3D view only while it is drawn here.
+            crate::spacemouse::drive(ui.ctx(), state);
 
             // Feed input BEFORE rendering so a change is reflected this frame.
             self.handle_viewport_input(ui, rect, &response, state);
@@ -297,6 +299,8 @@ impl Viewport {
             crate::automation::registry::publish("__brepGizmoHit", "armed gizmo handle rects in screen points (anchor)", &gizmo_anchor_hits_json(self.last_rect, state));
             // The open NURBS Solid's control-cage dots — `cage/point:<i>`, a
             // VIEWPORT-hosted widget panel in SCREEN points.
+            // The open Deform Face's pick handles — `deform/pick:<i>`.
+            crate::automation::registry::publish("__brepDeformHit", "Deform Face pick-handle rects in screen points (pick:<index>) while its form is open", &deform_pick_hits_json(self.last_rect, state));
             crate::automation::registry::publish("__brepCageHit", "control-cage dot rects in screen points (point:<index>) while a NURBS Solid's form is open", &cage_point_hits_json(self.last_rect, state));
             // The DRAGGABLE constraint handles' grab points — `constraint/<id>`,
             // the other VIEWPORT-hosted widget panel, in SCREEN points.
@@ -1070,6 +1074,10 @@ impl Viewport {
                     // selection's centroid. The click stops here: the body
                     // under the dot is not selected. Ahead of the Ctrl branch
                     // because the modifier is the cage's additive select too.
+                } else if state.deform_edit_feature().is_some() && state.deform_pick_at(lx, ly).is_some() {
+                    // A pick handle of the Deform Face whose form is open: the
+                    // transform gizmo arms on it (a drag moves the pick along
+                    // its normal) and the click stops here.
                 } else if mods.command || mods.ctrl {
                     // Ctrl/Cmd+click ADDS/TOGGLES the top pick directly, no list
                     // (the classic additive shortcut, both multi-select modes).
@@ -1867,3 +1875,28 @@ fn candidate_label(candidate: &PickCandidate) -> String {
     }
 }
 
+
+/// The open Deform Face's PICK HANDLES as zero-size rects in SCREEN points —
+/// the `__brepDeformHit` blob (`deform/pick:<index>`, the index into the
+/// feature's resolved picks). A click on one is what
+/// `EngineState::deform_pick_at` answers with that pick, so `click_widget` on
+/// the key arms the gizmo there. Empty while no Deform Face form is open.
+pub(super) fn deform_pick_hits_json(view: Option<egui::Rect>, state: &EngineState) -> String {
+    let Some(view) = view else {
+        return "{}".to_string();
+    };
+    let hits: Vec<(String, egui::Rect)> = state
+        .deform_pick_screen_points()
+        .into_iter()
+        .map(|(index, (x, y))| {
+            (
+                format!("pick:{index}"),
+                egui::Rect::from_min_size(egui::pos2(view.min.x + x as f32, view.min.y + y as f32), egui::Vec2::ZERO),
+            )
+        })
+        .collect();
+    if hits.is_empty() {
+        return "{}".to_string();
+    }
+    crate::automation::hit_rects::hits_json(hits.iter().map(|(key, rect)| (key, rect)))
+}

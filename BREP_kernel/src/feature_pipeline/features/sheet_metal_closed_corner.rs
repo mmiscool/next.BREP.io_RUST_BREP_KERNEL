@@ -10,7 +10,7 @@ use std::f64::consts::{PI, TAU};
 const EPS: f64 = 1e-7;
 
 pub fn context_applicable(probe: &SelectionProbe) -> bool {
-    probe.all_sheet_metal && probe.faces == 2 && probe.edges == 0
+    probe.all_sheet_metal && probe.faces >= 2 && probe.edges == 0
 }
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
@@ -31,8 +31,11 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     } else {
         bend_picks
     };
-    if picks.len() != 2 {
-        return Err("select the two bend faces that meet at the corner".into());
+    // Two bends make one corner; more ("selecting
+    // multiple bends is allowed ... figure out and apply the closed corner to
+    // all of the corners") close every corner where two selected bends meet.
+    if picks.len() < 2 {
+        return Err("select the bend faces that meet at the corners (two or more)".into());
     }
     let mut handle = None;
     let mut names = Vec::new();
@@ -66,9 +69,61 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         match bend_child(&tree.root, name) {
             Some(child) => ids.push(child),
             None if legacy && tree.root.find_by_id(name).is_some() => ids.push(name.clone()),
-            None => return Err("select the two bend faces that meet at the corner, not the flat faces".into()),
+            None => return Err("select the bend faces that meet at the corners, not the flat faces".into()),
         }
     }
+    let corners: Vec<[usize; 2]> = if ids.len() == 2 {
+        // Two picks: the corner they name, refused as before when it cannot close.
+        vec![[0, 1]]
+    } else {
+        // Many picks: both faces of one bend name the same wall; the first pick
+        // keeps its place in the selection order.
+        let mut seen = std::collections::HashSet::new();
+        let keep: Vec<usize> = (0..ids.len()).filter(|&k| seen.insert(ids[k].clone())).collect();
+        // Every pair of selected bends that meets at a corner, in selection order
+        // (the earlier pick is "first" for overlap and V angles at that corner).
+        let mut found = Vec::new();
+        let mut skipped = Vec::new();
+        for (n, &i) in keep.iter().enumerate() {
+            for &j in &keep[n + 1..] {
+                match pair(&tree.root, [&ids[i], &ids[j]]) {
+                    Some((parent, a, b)) if adjacent(parent, a, b) => {
+                        if corner_hinges(parent, a, b).is_ok() {
+                            found.push([i, j]);
+                        } else {
+                            skipped.push(format!("{} / {}", names[i], names[j]));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if found.is_empty() {
+            return Err(if keep.len() < 2 {
+                "select bends of at least two different flanges".into()
+            } else {
+                "no two of the selected bends meet at a convex perpendicular corner".into()
+            });
+        }
+        if !skipped.is_empty() {
+            result.notes.push(format!(
+                "corners left open (only convex perpendicular corners close): {}",
+                skipped.join(", ")
+            ));
+        }
+        let lone: Vec<&str> = keep
+            .iter()
+            .filter(|k| !found.iter().any(|c| c.contains(k)))
+            .map(|&k| names[k].as_str())
+            .collect();
+        if !lone.is_empty() {
+            result.notes.push(format!(
+                "selected bends that meet no other selected bend at a corner: {}",
+                lone.join(", ")
+            ));
+        }
+        found
+    };
     let body = ctx
         .scene
         .solids
@@ -90,14 +145,17 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         _ => return Err("unknown relief origin".into()),
     };
     let overlap = ctx.param("overlap").and_then(|v| v.as_str()).unwrap_or("First over second");
-    if !matches!(overlap, "First over second" | "Second over first" | "Mitre (weld gap)") {
-        return Err("unknown overlap option".into());
-    }
+    let joint = match overlap {
+        "First over second" | "Second over first" => Joint::Overlap,
+        "Mitre (weld gap)" => Joint::Mitre,
+        CORNER_TO_CORNER => Joint::CornerToCorner,
+        _ => return Err("unknown overlap option".into()),
+    };
     let options = Options {
         treatment: treatment.to_string(),
         centres,
         reverse: overlap == "Second over first",
-        mitre: overlap == "Mitre (weld gap)",
+        joint,
         gap: number(ctx, "gap", 0.1)?,
         size: if treatment == "Closed" || (treatment == "V Cutout" && !centres) {
             0.0
@@ -120,7 +178,9 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             [0.0; 2]
         },
     };
-    apply(&mut tree, [&ids[0], &ids[1]], &options)?;
+    for [i, j] in corners {
+        apply(&mut tree, [&ids[i], &ids[j]], &options)?;
+    }
     result
         .added
         .push(sheet_metal::register_folded(tree, &body)?);
@@ -140,11 +200,26 @@ fn number(ctx: &FeatureContext, name: &str, default: f64) -> Result<f64, String>
     Ok(value)
 }
 
-struct Options {
-    treatment: String,
+/// The overlap option that leaves an open outside corner for a fillet weld.
+const CORNER_TO_CORNER: &str = "Corner to corner (outside weld)";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Joint {
+    /// One wall runs across the other's end (selection order picks which).
+    Overlap,
     /// Neither wall overlaps: both are cut on the mitre (bisector) plane, each
     /// `gap / 2` short of it, leaving an even weld gap between the two faces.
-    mitre: bool,
+    Mitre,
+    /// Neither wall overlaps and neither is mitred: each end is cut square to
+    /// its own wall, at the line where the two inside faces meet, held back so
+    /// the two inside edges are `gap` apart. The outside corner stays open as
+    /// a V for an outside fillet weld.
+    CornerToCorner,
+}
+
+struct Options {
+    treatment: String,
+    joint: Joint,
     /// NX "Bend Centers": U/V reliefs centred where the bend centrelines
     /// cross, cutting the base plate, both bend zones and both walls.
     centres: bool,
@@ -190,21 +265,16 @@ fn pair<'a>(flat: &'a Flat, ids: [&str; 2]) -> Option<(&'a Flat, usize, usize)> 
     None
 }
 
-fn apply(tree: &mut SheetTree, ids: [&str; 2], options: &Options) -> Result<(), String> {
-    if ids[0] == ids[1] {
-        return Err("select two different flanges".into());
-    }
-    if !matches!(
-        options.treatment.as_str(),
-        "Closed" | "Circular Cutout" | "U Cutout" | "V Cutout"
-    ) {
-        return Err("unknown corner treatment".into());
-    }
-    if !options.gap.is_finite() || options.gap < 0.0 {
-        return Err("gap must be finite and nonnegative".into());
-    }
-    let (parent, a, b) =
-        pair(&tree.root, ids).ok_or("flanges must share a parent flat and a corner")?;
+/// Whether hinges `a` and `b` of `parent` are consecutive (share a corner).
+fn adjacent(parent: &Flat, a: usize, b: usize) -> bool {
+    let n = parent.outline.len();
+    (a + 1) % n == b || (b + 1) % n == a
+}
+
+/// The corner's hinges in outline order (`p` ends at the corner, `q` starts
+/// there) when they meet at a convex perpendicular corner and fold the same
+/// way by less than 180 degrees: the corners a closed corner can close.
+fn corner_hinges(parent: &Flat, a: usize, b: usize) -> Result<(usize, usize), String> {
     let n = parent.outline.len();
     let (p, q) = if (a + 1) % n == b {
         (a, b)
@@ -227,19 +297,52 @@ fn apply(tree: &mut SheetTree, ids: [&str; 2], options: &Options) -> Result<(), 
     {
         return Err("only convex perpendicular corners are supported".into());
     }
-    let bp = parent.edges[p].bend.as_ref().unwrap();
-    let bq = parent.edges[q].bend.as_ref().unwrap();
+    let bp = parent.edges[p].bend.as_ref().ok_or("corner hinge has no bend")?;
+    let bq = parent.edges[q].bend.as_ref().ok_or("corner hinge has no bend")?;
     if bp.angle_deg * bq.angle_deg <= 0.0
         || bp.angle_deg.abs() >= 180.0 - EPS
         || bq.angle_deg.abs() >= 180.0 - EPS
     {
         return Err("both bends must fold the same way, by less than 180 degrees".into());
     }
+    Ok((p, q))
+}
+
+fn apply(tree: &mut SheetTree, ids: [&str; 2], options: &Options) -> Result<(), String> {
+    if ids[0] == ids[1] {
+        return Err("select two different flanges".into());
+    }
+    if !matches!(
+        options.treatment.as_str(),
+        "Closed" | "Circular Cutout" | "U Cutout" | "V Cutout"
+    ) {
+        return Err("unknown corner treatment".into());
+    }
+    if !options.gap.is_finite() || options.gap < 0.0 {
+        return Err("gap must be finite and nonnegative".into());
+    }
+    if options.joint == Joint::CornerToCorner && options.gap <= EPS {
+        // At gap 0 the two walls touch along their inside edges only.
+        return Err("a corner-to-corner joint needs a positive gap".into());
+    }
+    let (parent, a, b) =
+        pair(&tree.root, ids).ok_or("flanges must share a parent flat and a corner")?;
+    let (p, q) = corner_hinges(parent, a, b)?;
+    let n = parent.outline.len();
+    let point = |i: usize| parent.outline[i % n];
+    let d = |i: usize| {
+        let (a, b) = (point(i), point(i + 1));
+        [b[0] - a[0], b[1] - a[1]]
+    };
+    let (dp, dq) = (d(p), d(q));
+    let (lp, lq) = (dp[0].hypot(dp[1]), dq[0].hypot(dq[1]));
+    let bp = parent.edges[p].bend.as_ref().unwrap();
+    let bq = parent.edges[q].bend.as_ref().unwrap();
     // Square 90/90 overlap corners keep their original construction (saved
     // documents rebuild unchanged); any other angle, and the mitre, trim each
     // wall by a plane through the other wall's geometry.
     let square = (bp.angle_deg.abs() - 90.0).abs() <= EPS && (bp.angle_deg - bq.angle_deg).abs() <= EPS;
-    let general = options.mitre || !square || FORCE_PLANE_CUTS.with(|force| force.get());
+    let general = options.joint != Joint::Overlap || !square || FORCE_PLANE_CUTS.with(|force| force.get());
     let through = if options.reverse { ids[1] } else { ids[0] };
     let corner = Corner {
         parent: parent.id.clone(),
@@ -419,7 +522,9 @@ thread_local! {
 /// own frame, from the folded placements. Overlap: the through wall stops on
 /// the other wall's far face, the butting wall `gap` short of the through
 /// wall's near face. Mitre: both stop `gap / 2` short of the plane that bisects
-/// the two walls.
+/// the two walls. Corner to corner: each is cut square to itself through the
+/// line where the inside faces meet, held back so the inside edges are `gap`
+/// apart.
 fn corner_planes(tree: &SheetTree, walls: [&str; 2], through: &str, options: &Options) -> Result<[PlaneCut; 2], String> {
     use crate::Vec3;
     let placements = sheet_metal::evaluate::folded_flat_placements(tree)?;
@@ -443,7 +548,32 @@ fn corner_planes(tree: &SheetTree, walls: [&str; 2], through: &str, options: &Op
     let (ap, aq) = (toward(wp, cq), toward(wq, cp));
     let half = 0.5 * tree.thickness;
     let g = options.gap;
-    let world: [(Vec3, Vec3); 2] = if options.mitre {
+    let world: [(Vec3, Vec3); 2] = if options.joint == Joint::CornerToCorner {
+        // The inside faces: x·aP = oP·aP + t/2 and x·aQ = oQ·aQ + t/2.
+        let c = ap.dot(aq);
+        let det = 1.0 - c * c;
+        if det <= 1e-12 {
+            return Err("the two walls are parallel".into());
+        }
+        let x0 = wp.origin;
+        let (rp, rq) = (half + wp.origin.sub(x0).dot(ap), half + wq.origin.sub(x0).dot(aq));
+        let alpha = (rp - c * rq) / det;
+        let beta = (rq - c * rp) / det;
+        let inside = x0.add(ap.scale(alpha)).add(aq.scale(beta));
+        // Each wall's in-plane direction away from the corner.
+        let along = |a: Vec3, other: Vec3| {
+            let d = other.sub(a.scale(other.dot(a)));
+            d.scale(1.0 / d.length())
+        };
+        let (up, uq) = (along(ap, aq), along(aq, ap));
+        // Inside edges `back` along each wall sit `2 back sin(θ/2)` apart.
+        let half_angle_sin = (0.5 * (1.0 - up.dot(uq))).max(0.0).sqrt();
+        if half_angle_sin <= 1e-9 {
+            return Err("the two walls are parallel".into());
+        }
+        let back = 0.5 * g / half_angle_sin;
+        [(inside.add(up.scale(back)), up.scale(-1.0)), (inside.add(uq.scale(back)), uq.scale(-1.0))]
+    } else if options.joint == Joint::Mitre {
         // f(x) = (x - oQ)·aQ - (x - oP)·aP: positive in P, negative in Q.
         let grad = aq.sub(ap);
         let m = grad.length();
@@ -534,7 +664,17 @@ fn centre_reliefs(tree: &mut SheetTree, k: &Corner, options: &Options) -> Result
                 relief::hull(o, r, e_q, e_p)?
             }
         }
-        _ => return Err("Bend centers reliefs are U or V cutouts".into()),
+        "Circular Cutout" => {
+            // A round notch through the bend junction (the SolidWorks-style
+            // bend relief at a closed corner): a slot as long as it is wide.
+            if r <= EPS {
+                return Err("a circular relief needs a positive diameter".into());
+            }
+            let d = [out_p[0] + out_q[0], out_p[1] + out_q[1]];
+            let norm = d[0].hypot(d[1]);
+            relief::slot(o, [d[0] / norm, d[1] / norm], r, options.size)
+        }
+        _ => return Err("Bend centers reliefs are U, V or circular cutouts".into()),
     };
     let overlaps = |loop_: &[relief::Seg], lo: [f64; 2], hi: [f64; 2]| {
         let mut kept = loop_.to_vec();
@@ -592,13 +732,13 @@ pub fn schema() -> serde_json::Value {
         "inputParamsSchema": {
             "id":{"type":"string","default_value":null},
             "bends":{"label":"Bends","type":"reference_selection","selectionFilter":["FACE"],"multiple":true,"default_value":null,
-                "hint":"Select the rounded bend faces of two adjacent flanges folded the same way (any angles below 180°). Selection order controls overlap and V angles."},
+                "hint":"Select the rounded bend faces of adjacent flanges folded the same way (any angles below 180°). Two bends close their corner; more close every corner where two selected bends meet. Selection order controls overlap and V angles: at each corner the earlier pick is first."},
             "faces":{"type":"reference_selection","selectionFilter":["FACE"],"multiple":true,"default_value":null,
                 "hint":"Flange faces picked by documents saved before bend selection; kept so they still open."},
-            "treatment":{"label":"Corner treatment","type":"options","options":["U Cutout","V Cutout"],"default_value":"U Cutout"},
+            "treatment":{"label":"Corner treatment","type":"options","options":["U Cutout","V Cutout","Circular Cutout"],"default_value":"U Cutout","hint":"Relief shape. Circular Cutout with Relief origin Bend centers is a round notch through the junction of the two bends."},
             "reliefOrigin":{"label":"Relief origin","type":"options","options":["Bend tangent","Bend centers"],"default_value":"Bend tangent","hint":"Bend tangent: relief cut into each wall end. Bend centers (NX): one relief centred where the bend centrelines cross, cutting the plate, both bends and both walls."},
-            "overlap":{"type":"options","options":["First over second","Second over first","Mitre (weld gap)"],"default_value":"First over second","hint":"Which flange extends across the other's end, or Mitre: neither overlaps, both are cut on the bisector plane with the gap between them for a weld."},
-            "gap":{"type":"number","default_value":0.1,"min":0,"hint":"Overlap: clearance between the butting end and the overlapping flange. Mitre: the weld gap between the two mitred faces."},
+            "overlap":{"type":"options","options":["First over second","Second over first","Mitre (weld gap)",CORNER_TO_CORNER],"default_value":"First over second","hint":"Which flange extends across the other's end; Mitre: neither overlaps, both are cut on the bisector plane with the gap between them for a weld; Corner to corner: both ends stay square, meeting at the inside corner and leaving the outside corner open for a fillet weld."},
+            "gap":{"type":"number","default_value":0.1,"min":0,"hint":"Overlap: clearance between the butting end and the overlapping flange. Mitre: the weld gap between the two mitred faces. Corner to corner: the opening between the two walls' inside edges (must be positive)."},
             "cutoutSize":{"label":"Cutout diameter / width","type":"number","default_value":2,"min":0,"hint":"Circular diameter, or U width at the bend tangent."},
             "cutoutDepth":{"label":"Cutout depth","type":"number","default_value":2,"min":0,"hint":"U/V reach along the flange from the bend tangent."},
             "vAngleFirst":{"label":"V angle on first flange","type":"number","default_value":45,"min":0,"max":90,"hint":"Angle in degrees between the first selected flange's V edge and the direction away from its bend; strictly between 0 and 90."},
@@ -610,13 +750,13 @@ pub fn schema() -> serde_json::Value {
 }
 
 /// The schema form displays only the dimensions used by the active treatment.
-/// Saved documents may still carry the legacy flange `faces` and the Closed or
-/// Circular treatments; the dialog never shows the former and offers U and V.
+/// Saved documents may still carry the legacy flange `faces` and the Closed
+/// treatment; the dialog never shows them and offers U, V and Circular.
 pub fn hidden_params(values: &serde_json::Value) -> Vec<&'static str> {
     let centres = values.get("reliefOrigin").and_then(|v| v.as_str()) == Some("Bend centers");
     let mut hidden = match values.get("treatment").and_then(|v| v.as_str()).unwrap_or("U Cutout") {
         "Closed" => vec!["cutoutSize", "cutoutDepth", "vAngleFirst", "vAngleSecond", "reliefOrigin"],
-        "Circular Cutout" => vec!["cutoutDepth", "vAngleFirst", "vAngleSecond", "reliefOrigin"],
+        "Circular Cutout" => vec!["cutoutDepth", "vAngleFirst", "vAngleSecond"],
         "U Cutout" => vec!["vAngleFirst", "vAngleSecond"],
         // At the bend centres a V has a rounded apex (diameter) and a length per flank.
         "V Cutout" if centres => vec!["cutoutDepth"],

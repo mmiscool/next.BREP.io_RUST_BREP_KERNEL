@@ -482,21 +482,22 @@ impl Field<'_> {
 /// Returns `Err` when the bracket is a JUMP rather than a crossing: the segment
 /// shrinks to machine width with `|g|` still large on both sides, which is what
 /// a knot line carrying a curvature discontinuity does to a sign test.
-fn bisect(field: &Field, mut lo: [f64; 2], mut hi: [f64; 2]) -> Result<[f64; 2], KernelRefusal> {
+fn bisect(field: &Field, mut lo: [f64; 2], mut hi: [f64; 2]) -> Result<[f64; 2], (KernelRefusal, [f64; 2])> {
     let (Some(mut value_lo), Some(mut value_hi)) = (field.at(lo), field.at(hi)) else {
-        return Err(KernelRefusal::internal(KernelStage::Refine, "fold_factor_unreadable", format!(
+        let unreadable = if field.at(lo).is_none() { lo } else { hi };
+        return Err((KernelRefusal::internal(KernelStage::Refine, "fold_factor_unreadable", format!(
             "fold locus: the fold factor is unreadable between {} and {}",
             field.report(lo),
             field.report(hi)
-        )));
+        )), unreadable));
     };
     for _ in 0..80 {
         let mid = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
         let Some(value_mid) = field.at(mid) else {
-            return Err(KernelRefusal::internal(KernelStage::Refine, "fold_factor_unreadable", format!(
+            return Err((KernelRefusal::internal(KernelStage::Refine, "fold_factor_unreadable", format!(
                 "fold locus: the fold factor is unreadable at {}",
                 field.report(mid)
-            )));
+            )), mid));
         };
         if value_mid.abs() <= CORRECTOR_TOLERANCE {
             return Ok(mid);
@@ -515,14 +516,14 @@ fn bisect(field: &Field, mut lo: [f64; 2], mut hi: [f64; 2]) -> Result<[f64; 2],
     }
     let residual = value_lo.abs().min(value_hi.abs());
     if residual > CORRECTOR_STALL_CEILING {
-        return Err(KernelRefusal::unsupported(KernelStage::Refine, "fold_factor_jump", format!(
+        return Err((KernelRefusal::unsupported(KernelStage::Refine, "fold_factor_jump", format!(
             "fold locus: the fold factor JUMPS across {} (from {:+.6e} to {:+.6e} over a \
              machine-width interval) — that sign change is a curvature discontinuity, a knot \
              line the surface is only C⁰ across, not a crossing of 1 − δ·κ = 0",
             field.report(lo),
             value_lo,
             value_hi
-        )));
+        )), lo));
     }
     Ok(if value_lo.abs() <= value_hi.abs() { lo } else { hi })
 }
@@ -630,8 +631,26 @@ pub fn trace_fold_locus(
     let cell_v = 1.0 / (nodes[0].len() - 1) as f64;
     let step = (cell_u.min(cell_v) * 0.5).clamp(1e-5, 0.05);
 
+    // The trace runs over the trim's parameter BOX, and the carrier outside
+    // the trim can be anything: a wrapped corner's fitted patch doubles back
+    // on itself past the trim curve that cuts it off (its partials turn
+    // anti-parallel and the normal reverses there), and the fold factor beside
+    // that is a pole, not a level set. A branch that never meets the trim is
+    // dropped by the carve anyway, so a seed whose bisection fails at a point
+    // outside it is skipped (the point the bisection failed at, not the
+    // bracket's ends: a trim with holes can leave both ends outside while the
+    // failure lies inside), and a march that fails at a point outside it ends
+    // there; the same failures inside the trim still refuse.
+    let outside = |point: [f64; 2]| {
+        let uv = field.to_uv(point);
+        !region.contains(uv[0], uv[1])
+    };
     for (lo, hi) in seeds {
-        let seed = bisect(&field, lo, hi)?;
+        let seed = match bisect(&field, lo, hi) {
+            Ok(seed) => seed,
+            Err((_, failed_at)) if outside(failed_at) => continue,
+            Err((refusal, _)) => return Err(refusal),
+        };
         if locus
             .curves
             .iter()
@@ -639,7 +658,7 @@ pub fn trace_fold_locus(
         {
             continue;
         }
-        locus.curves.push(march(&field, seed, step)?);
+        locus.curves.push(march(&field, &outside, seed, step)?);
     }
     Ok(locus)
 }
@@ -675,15 +694,20 @@ impl FoldCurve {
 }
 
 /// Follow the branch through `seed`, forward then backward.
-fn march(field: &Field, seed: [f64; 2], step: f64) -> Result<FoldCurve, KernelRefusal> {
-    let (forward, closed) = follow(field, seed, step, 1.0)?;
+fn march(
+    field: &Field,
+    outside: &dyn Fn([f64; 2]) -> bool,
+    seed: [f64; 2],
+    step: f64,
+) -> Result<FoldCurve, KernelRefusal> {
+    let (forward, closed) = follow(field, outside, seed, step, 1.0)?;
     if closed {
         return Ok(FoldCurve {
             points: forward.iter().map(|point| field.to_uv(*point)).collect(),
             closed: true,
         });
     }
-    let (backward, _) = follow(field, seed, step, -1.0)?;
+    let (backward, _) = follow(field, outside, seed, step, -1.0)?;
     // backward[0] is the seed, shared with forward[0]; drop it once.
     let mut points = backward;
     points.reverse();
@@ -696,9 +720,11 @@ fn march(field: &Field, seed: [f64; 2], step: f64) -> Result<FoldCurve, KernelRe
 }
 
 /// One direction of the march. Returns the points from `seed` onward and
-/// whether the branch closed back on its seed.
+/// whether the branch closed back on its seed. A failure at a point
+/// `outside` the trim ends the branch there instead (see the trace).
 fn follow(
     field: &Field,
+    outside: &dyn Fn([f64; 2]) -> bool,
     seed: [f64; 2],
     step: f64,
     direction: f64,
@@ -707,6 +733,9 @@ fn follow(
     let mut previous_tangent: Option<[f64; 2]> = None;
     for _ in 0..MAX_MARCH_STEPS {
         let current = *points.last().unwrap();
+        if field.gradient(current).is_none() && outside(current) {
+            return Ok((points, false));
+        }
         let gradient = field.gradient(current).ok_or_else(|| {
             format!(
                 "fold locus: the fold factor is unreadable at {}",
@@ -714,6 +743,9 @@ fn follow(
             )
         }).or_refuse(KernelStage::Refine, "fold_factor_unreadable")?;
         let length = gradient[0].hypot(gradient[1]);
+        if length <= GRADIENT_FLOOR && outside(current) {
+            return Ok((points, false));
+        }
         if length <= GRADIENT_FLOOR {
             return Err(KernelRefusal::unsupported(KernelStage::Refine, "fold_stationary", format!(
                 "fold locus: the fold factor is STATIONARY at {} (|∇(1 − δ·κ)| = {length:.3e} \
@@ -780,6 +812,9 @@ fn follow(
             attempt *= 0.5;
         }
         let Some(next) = advanced else {
+            if outside(current) {
+                return Ok((points, false));
+            }
             return Err(KernelRefusal::non_convergence(KernelStage::Refine, "fold_corrector", format!(
                 "fold locus: the corrector did not return to 1 − δ·κ = {:.3e} beyond {} after {} \
                  halvings of a {:.3e} step",

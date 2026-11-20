@@ -5,6 +5,22 @@ impl BrepSolid {
         self.validate_with_tolerances(&KernelTolerances::for_solid(self, 1e-7))
     }
 
+    /// The band within which [`validate`](Self::validate) takes an edge's
+    /// curve end and its vertex for the same point (vendor export precision,
+    /// size-coupled for large parts). The watertight mesher reads the same
+    /// band, so a body that validates also tessellates.
+    pub fn vertex_match_band(&self) -> f64 {
+        let tolerances = KernelTolerances::for_solid(self, 1e-7);
+        let mut lo = crate::Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        let mut hi = crate::Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for vertex in &self.vertices {
+            lo = crate::Vec3::new(lo.x.min(vertex.point.x), lo.y.min(vertex.point.y), lo.z.min(vertex.point.z));
+            hi = crate::Vec3::new(hi.x.max(vertex.point.x), hi.y.max(vertex.point.y), hi.z.max(vertex.point.z));
+        }
+        let diagonal = if self.vertices.is_empty() { 0.0 } else { hi.sub(lo).length() };
+        vertex_match_band(&tolerances, diagonal)
+    }
+
     /// [`validate`](Self::validate) with its CLEAN verdicts memoised by the
     /// body's content (lane R1 row 3, lane B's B3). A rim built by the
     /// closed-rim lane is validated by the surgery's repaired-branch check, by
@@ -95,6 +111,8 @@ impl BrepSolid {
             bbox_hi.sub(bbox_lo).length()
         };
         let pcurve_limit = tolerances.pcurve_acceptance(model_diagonal);
+        let census = pcurve_census_enabled();
+        let (mut census_coedges, mut census_worst) = (0usize, 0.0f64);
         // Vendor STEP files commit a vertex point and its incident edges' 3D-curve
         // endpoints as INDEPENDENT approximations that disagree by a small, roughly
         // ABSOLUTE amount (ABC 00000084/109/218 fail ONLY here: every gap clusters
@@ -122,9 +140,7 @@ impl BrepSolid {
         // 5e-3 mm (= 5 um) accepts vendor precision for metre- and
         // mm-authored files alike. Validation acceptance only — no merge
         // radius derives from this.
-        let vertex_match = tolerances
-            .heal_band(model_diagonal, 2e-5)
-            .max(crate::VERTEX_MATCH_FLOOR);
+        let vertex_match = vertex_match_band(tolerances, model_diagonal);
         let vertices: HashMap<u64, &VertexRecord> = self
             .vertices
             .iter()
@@ -260,6 +276,52 @@ impl BrepSolid {
                         ) {
                             Ok(error) => {
                                 max_pcurve_error = max_pcurve_error.max(error);
+                                if census {
+                                    census_coedges += 1;
+                                    census_worst = census_worst.max(error);
+                                    if error > 1e-6 {
+                                        // The same coedge read as POINT SETS: each lifted pcurve
+                                        // point's distance to the edge's curve, so a parameter-speed
+                                        // mismatch (same curve, other parameterization) reads apart
+                                        // from a real departure.
+                                        let (mut geometric, mut unmeasured) = (0.0f64, 0usize);
+                                        match pcurve.domain() {
+                                            Ok([q0, q1]) => {
+                                                for k in 0..=32 {
+                                                    let q = q0 + (q1 - q0) * k as f64 / 32.0;
+                                                    let distance = pcurve
+                                                        .evaluate(q)
+                                                        .ok()
+                                                        .and_then(|uv| surface.evaluate_extended(uv.x, uv.y).ok())
+                                                        .and_then(|point| census_distance_to_range(&curve, current_edge.t0, current_edge.t1, point));
+                                                    match distance {
+                                                        Some(distance) => geometric = geometric.max(distance),
+                                                        None => unmeasured += 1,
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => unmeasured = 33,
+                                        }
+                                        eprintln!(
+                                            "PCGAP coedge test={} face={} name={} kind={} edge={} curve_degree={} curve_controls={} pcurve={}/{}/{} gap={:.3e} geometric={:.3e} unmeasured={} diagonal={:.6e} limit={:.3e}",
+                                            census_thread(),
+                                            face.id,
+                                            face.name.as_deref().unwrap_or("-").replace(' ', "_"),
+                                            surface.analytic().map(|a| a.kind_label()).unwrap_or("freeform").replace(' ', "_"),
+                                            current_edge.id,
+                                            curve.degree,
+                                            curve.control_points.len(),
+                                            pcurve.degree,
+                                            pcurve.control_points.len(),
+                                            if pcurve.control_points.iter().all(|c| (c.w - 1.0).abs() < 1e-12) { "poly" } else { "rational" },
+                                            error,
+                                            geometric,
+                                            unmeasured,
+                                            model_diagonal,
+                                            pcurve_limit,
+                                        );
+                                    }
+                                }
                                 if error > pcurve_limit {
                                     issues.push(ValidationIssue::error(format!(
                                         "coedge {} of face {} pcurve is inconsistent with edge {} \
@@ -529,6 +591,17 @@ impl BrepSolid {
                     issues.push(ValidationIssue::error(format!("wire vertex {} is on no edge", vertex.id)));
                 }
             }
+        }
+        if census {
+            eprintln!(
+                "PCGAP solid test={} faces={} coedges={} worst={:.3e} diagonal={:.6e} limit={:.3e}",
+                census_thread(),
+                self.shells.iter().map(|shell| shell.faces.len()).sum::<usize>(),
+                census_coedges,
+                census_worst,
+                model_diagonal,
+                pcurve_limit,
+            );
         }
         ValidationReport {
             issues,
@@ -1814,3 +1887,66 @@ pub fn control_points_within(curve: &NurbsCurve, center: Vec3, tolerance: f64) -
         })
 }
 
+
+/// The curve-end-vs-vertex identity band for a body of `model_diagonal`
+/// (see the long note in `validate_detailed_scoped`).
+pub(crate) fn vertex_match_band(tolerances: &KernelTolerances, model_diagonal: f64) -> f64 {
+    tolerances.heal_band(model_diagonal, 2e-5).max(crate::VERTEX_MATCH_FLOOR)
+}
+
+/// CENSUS ONLY (`BREP_PCURVE_CENSUS=1`, observation, no behaviour change):
+/// every [`BrepSolid::validate`] prints one `PCGAP solid` line (coedges read,
+/// worst edge/pcurve gap, model diagonal, the acceptance limit) and a
+/// `PCGAP coedge` line for each coedge whose gap passes 1e-6 (face, name,
+/// carrier kind, edge, gap). It measures the gaps the kernel's own builds
+/// leave against the size-coupled acceptance limit.
+fn pcurve_census_enabled() -> bool {
+    debug_flag!("BREP_PCURVE_CENSUS")
+}
+
+/// The running thread's name: the test's name under the test harness.
+fn census_thread() -> String {
+    std::thread::current().name().unwrap_or("unnamed").replace(' ', "_")
+}
+
+/// CENSUS ONLY: `point`'s distance to `curve` on `[t0, t1]` (the trimmed edge,
+/// not the whole carrier): uniform stations plus the knots and each knot
+/// span's quarter points, then a ternary refinement around the nearest one.
+/// `None` when the curve cannot be evaluated there.
+fn census_distance_to_range(curve: &NurbsCurve, t0: f64, t1: f64, point: Vec3) -> Option<f64> {
+    let (lo, hi) = (t0.min(t1), t0.max(t1));
+    let at = |t: f64| curve.evaluate(t).ok().map(|q| q.sub(point).length());
+    // Candidates: 256 uniform stations plus every knot inside the range and
+    // each knot span's quarter points, so a span narrower than the uniform
+    // step (a sharp excursion) is still visited.
+    let mut candidates: Vec<f64> = (0..=256).map(|k| lo + (hi - lo) * k as f64 / 256.0).collect();
+    let mut knots: Vec<f64> = curve.knots.iter().copied().filter(|k| *k > lo && *k < hi).collect();
+    knots.push(lo);
+    knots.push(hi);
+    knots.sort_by(|a, b| a.total_cmp(b));
+    knots.dedup();
+    for pair in knots.windows(2) {
+        for quarter in 0..4 {
+            candidates.push(pair[0] + (pair[1] - pair[0]) * quarter as f64 / 4.0);
+        }
+    }
+    candidates.sort_by(|a, b| a.total_cmp(b));
+    candidates.dedup();
+    let mut best = (0usize, f64::INFINITY);
+    for (index, t) in candidates.iter().enumerate() {
+        let d = at(*t)?;
+        if d < best.1 {
+            best = (index, d);
+        }
+    }
+    let (mut a, mut b) = (candidates[best.0.saturating_sub(1)], candidates[(best.0 + 1).min(candidates.len() - 1)]);
+    for _ in 0..60 {
+        let (m1, m2) = (a + (b - a) / 3.0, b - (b - a) / 3.0);
+        if at(m1)? <= at(m2)? {
+            b = m2;
+        } else {
+            a = m1;
+        }
+    }
+    Some(best.1.min(at(0.5 * (a + b))?))
+}

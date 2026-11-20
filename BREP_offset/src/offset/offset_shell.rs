@@ -113,6 +113,16 @@ mod bore_dimples;
 pub mod revolved_parallel;
 #[path = "offset_shell/pipe_parallel.rs"]
 pub mod pipe_parallel;
+#[path = "offset_shell/prism_parallel.rs"]
+pub mod prism_parallel;
+#[path = "offset_shell/prism_erosion.rs"]
+pub mod prism_erosion;
+#[path = "offset_shell/revolved_erosion.rs"]
+pub mod revolved_erosion;
+#[path = "offset_shell/prism_growth.rs"]
+pub mod prism_growth;
+#[path = "offset_shell/full_turn.rs"]
+mod full_turn;
 #[path = "offset_shell/rim_witness.rs"]
 mod rim_witness;
 #[path = "offset_shell/tangent_rim_cuts.rs"]
@@ -121,6 +131,10 @@ mod tangent_rim_cuts;
 mod opening_surface_cut;
 #[path = "offset_shell/outward_side_widen.rs"]
 mod outward_side_widen;
+#[path = "offset_shell/box_cavity.rs"]
+pub mod box_cavity;
+#[path = "offset_shell/revolved_shell.rs"]
+pub mod revolved_shell;
 
 pub use carrier_rebuild::*;
 pub use carriers::*;

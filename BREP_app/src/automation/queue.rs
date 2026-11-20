@@ -29,7 +29,8 @@ use std::sync::{Arc, Mutex};
 pub struct Pending {
     pub envelope: Envelope,
     pub reply: Sender<Reply>,
-    deadline: Option<std::time::Instant>,
+    /// `web_time`: `std::time::Instant::now` panics on wasm32 (same type natively).
+    deadline: Option<web_time::Instant>,
     /// Who sent it ([`AutomationQueue::submit_for`]): the queue keeps each
     /// client's commands in order, not every client's in one order.
     client: Option<u64>,
@@ -37,7 +38,7 @@ pub struct Pending {
 
 impl Pending {
     fn expired(&self, frame: u64) -> bool {
-        if self.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        if self.deadline.is_some_and(|d| web_time::Instant::now() >= d) {
             let _ = self.reply.send(Reply::err(self.envelope.id, frame,
                 "host_deadline_expired: command expired before dispatch; no effects", vec![]));
             true
@@ -243,7 +244,8 @@ const SESSION_PENDING_LIMIT: std::time::Duration = std::time::Duration::from_sec
 /// command bound to no document context (the active tab): a bound one is
 /// answered with the refusal, since its binding is checked once, at dispatch.
 fn retry_while_session_pending(handler: crate::automation::command::AppHandler, args: serde_json::Value) -> Outcome {
-    let start = std::time::Instant::now();
+    // web_time: the std clock panics in the browser, where this retry also runs.
+    let start = web_time::Instant::now();
     Outcome::Poll(Box::new(move |ctx| {
         let before = refused_counts(&ctx.app.docs);
         let result = handler(ctx, args.clone());
@@ -290,7 +292,7 @@ impl AutomationQueue {
     }
 
     /// A deadline applies before dispatch, never to work already accepted by a handler.
-    pub fn submit_before(&self, envelope: Envelope, deadline: Option<std::time::Instant>) -> Receiver<Reply> {
+    pub fn submit_before(&self, envelope: Envelope, deadline: Option<web_time::Instant>) -> Receiver<Reply> {
         self.submit_for(envelope, deadline, None)
     }
 
@@ -299,7 +301,7 @@ impl AutomationQueue {
     /// command may be dispatched ahead of commands that are queued only by
     /// OTHER clients, so one client's command waiting for a pass does not
     /// hold up another's. `None` orders it against every command, as before.
-    pub fn submit_for(&self, envelope: Envelope, deadline: Option<std::time::Instant>, client: Option<u64>) -> Receiver<Reply> {
+    pub fn submit_for(&self, envelope: Envelope, deadline: Option<web_time::Instant>, client: Option<u64>) -> Receiver<Reply> {
         let (tx, rx) = channel();
         let mut inner = self.inner.lock().unwrap();
         if let Some(why) = &inner.poisoned {

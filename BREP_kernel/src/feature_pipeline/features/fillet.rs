@@ -138,7 +138,20 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
             brep_blend::blend::body_carries_wrapped_corner(body, &outcome, 1e-9 * (1.0 + crate::solid_scale(body)))
         };
         if outcome.candidates == 0 || (outcome.failed == 0 && wrapped.as_ref().is_ok_and(carries)) {
-            wrapped
+            // A document that a later feature built on this selection's sharp
+            // seam (a second fillet picking the miter between two of these
+            // blends, saved while that corner could not be wrapped) keeps the
+            // seam: wrapping would remove the edge the later feature names.
+            let kept = wrapped.as_ref().map(|body| seams_named_later(ctx, &target.edge_names, body)).unwrap_or_default();
+            if kept.is_empty() {
+                wrapped
+            } else {
+                result.notes.push(format!(
+                    "Wrap sharp corners: a later feature references {}, the sharp seam wrapping would remove, so the fillet was built without the option; remove that reference to wrap the corner",
+                    kept.join(", ")
+                ));
+                build_blend()
+            }
         } else {
             result.notes.push(
                 "Wrap sharp corners: a sharp-edge corner of this selection could not be wrapped, so the fillet was built without the option"
@@ -176,6 +189,47 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
 /// The `wrapCorners` input: only an explicit `true` turns it on.
 fn wrap_corners(ctx: &FeatureContext) -> bool {
     ctx.param("wrapCorners").and_then(|value| value.as_bool()).unwrap_or(false)
+}
+
+/// A fillet descriptor with "Wrap sharp corners" on: the history walk hands
+/// it the later references to its own blend faces and edges.
+pub(crate) fn wraps_corners(descriptor: &crate::feature_pipeline::FeatureDescriptor) -> bool {
+    matches!(descriptor.feature_type.as_str(), "F" | "FILLET")
+        && descriptor.input_params.get("wrapCorners").and_then(|value| value.as_bool()).unwrap_or(false)
+}
+
+/// The later references (`ctx.later_inputs`) that name the seam between two
+/// of this selection's blends where `wrapped` carries the corner patch that
+/// replaced it: `{base}:CORNER:{a}+{b}` stands where the miter edge
+/// `{base}:{a}|{base}:{b}[k]` (either order) would be.
+fn seams_named_later(ctx: &FeatureContext, edge_names: &[String], wrapped: &crate::BrepSolid) -> Vec<String> {
+    let Some(later) = ctx.later_inputs.filter(|later| !later.is_empty()) else { return Vec::new() };
+    let base = common::blend_face_base(&ctx.id);
+    let faces: std::collections::HashSet<&str> =
+        wrapped.shells.iter().flat_map(|shell| &shell.faces).filter_map(|face| face.name.as_deref()).collect();
+    let mut kept = Vec::new();
+    for (i, a) in edge_names.iter().enumerate() {
+        for b in &edge_names[i + 1..] {
+            if !faces.contains(format!("{base}:CORNER:{a}+{b}").as_str()) && !faces.contains(format!("{base}:CORNER:{b}+{a}").as_str()) {
+                continue;
+            }
+            let (fa, fb) = (common::blend_face_name(&ctx.id, a), common::blend_face_name(&ctx.id, b));
+            let seams = [format!("{fa}|{fb}["), format!("{fb}|{fa}[")];
+            // Exactly the edge's name, `…[k]` with nothing after it, as a
+            // reference spells it.
+            let is_seam = |name: &str| {
+                seams.iter().any(|seam| {
+                    name.strip_prefix(seam.as_str()).and_then(|rest| rest.strip_suffix(']')).is_some_and(|index| {
+                        !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                })
+            };
+            kept.extend(later.iter().filter(|name| is_seam(name)).cloned());
+        }
+    }
+    kept.sort();
+    kept.dedup();
+    kept
 }
 
 /// The `followTangent` input: only an explicit `true` turns it on.

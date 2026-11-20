@@ -13,6 +13,7 @@ pub mod assembly_component;
 // Solid-producing primitives.
 pub mod cone;
 pub mod cylinder;
+pub mod gear;
 pub mod nurbs_solid;
 pub mod pyramid;
 pub mod torus;
@@ -31,6 +32,7 @@ pub mod sketch3d;
 
 // Add-material.
 pub mod extrude;
+pub mod fill;
 pub mod loft;
 pub mod path_sweep;
 pub mod revolve;
@@ -50,6 +52,8 @@ pub mod transform;
 pub mod chamfer;
 pub mod delete_face;
 pub mod refit_faces;
+pub mod deform_face;
+pub mod sew_to_solid;
 pub mod fillet;
 pub mod hole;
 pub mod offset_face;

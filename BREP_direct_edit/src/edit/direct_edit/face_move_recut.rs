@@ -35,8 +35,11 @@
 //! the constraint, and the material that changes hands is the SLAB the carrier
 //! sweeps, bounded sideways by the faces that bound the moved face today. So:
 //!
-//! 1. Each moved face must carry a PLANE, and its trim must be one loop of
-//!    straight edges (`trim_polygon`). `delta` is how far the face moves
+//! 1. Each moved face must carry a PLANE, and its trim must be loops of
+//!    straight edges (`trim_polygon`): the outer trim, and on a translation
+//!    any number of ISLANDS — holes through the face or bosses standing on
+//!    it, whose walls stay put and decide what the tool does inside them
+//!    (the island block of `recut_moved_planes_rigid`). `delta` is how far the face moves
 //!    along its own outward normal `n̂` — `translation · n̂` for a
 //!    translation; a face whose `delta` is zero only slides inside its own
 //!    carrier, moves no material at all, and contributes no tool.
@@ -146,9 +149,9 @@ const OP: &str = "move_faces(re-cut)";
 
 /// A closed half-space `n̂·x ≤ offset`, with `n̂` a unit vector.
 #[derive(Clone, Copy, Debug)]
-struct HalfSpace {
-    normal: Vec3,
-    offset: f64,
+pub(super) struct HalfSpace {
+    pub(super) normal: Vec3,
+    pub(super) offset: f64,
 }
 
 
@@ -325,9 +328,46 @@ pub fn recut_moved_planes_rigid(
     let edge_band = (scale * 1e-7).max(1e-9);
     let mut removing: Vec<BrepSolid> = Vec::new();
     let mut adding: Vec<BrepSolid> = Vec::new();
+    let unite = |mut tools: Vec<BrepSolid>| -> Result<Option<BrepSolid>, KernelRefusal> {
+        if tools.is_empty() {
+            return Ok(None);
+        }
+        let mut tool = tools.remove(0);
+        for next in tools {
+            // The boolean's own class rides through: a degeneracy inside the
+            // union is still a degeneracy at this road's boundary.
+            tool = boolean_operation(&tool, &next, BooleanOperation::Union, &BooleanOptions::default())
+                .map_err(|error| {
+                    error.with_message(|message| {
+                        format!("{OP}: the tools could not be unioned into one — {message}")
+                    })
+                })?;
+        }
+        Ok(Some(tool))
+    };
+    // A direction's tool less the islands it must leave alone.
+    let less_islands = |tool: Option<BrepSolid>, keep: Vec<BrepSolid>| -> Result<Option<BrepSolid>, KernelRefusal> {
+        match (tool, unite(keep)?) {
+            (Some(tool), Some(keep)) => {
+                boolean_operation(&tool, &keep, BooleanOperation::Subtract, &BooleanOptions::default())
+                    .map(Some)
+                    .map_err(|error| {
+                        error.with_message(|message| {
+                            format!("{OP}: the islands could not be taken out of the tool — {message}")
+                        })
+                    })
+            }
+            (tool, _) => Ok(tool),
+        }
+    };
 
     for &(id, normal, offset) in &carriers {
         let face = face_by_id(solid, id)?;
+        // This face's own tools start here; its islands are taken out of
+        // THEM alone, so one face's island never cancels another face's tool.
+        let (removing_from, adding_from) = (removing.len(), adding.len());
+        let mut keep_removing: Vec<BrepSolid> = Vec::new();
+        let mut keep_adding: Vec<BrepSolid> = Vec::new();
         let (moved_normal, moved_offset) = motion.plane(normal, offset);
         let facing = moved_normal.dot(normal);
         if motion.rotation.is_some() && facing <= 1e-6 {
@@ -357,6 +397,19 @@ pub fn recut_moved_planes_rigid(
         // A turned face's TANGENT curved neighbours (see `tangent_surround`).
         let mut tangent_bands: HashSet<u64> = HashSet::default();
         let polygon = trim_polygon(solid, face, normal, edge_band)?;
+        if !polygon.islands.is_empty() && motion.rotation.is_some() && !turned_islands_enabled() {
+            return Err(KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "island_trim",
+                format!(
+                    "{OP}: face {id}{} has {} loops and the motion turns it, so its island's walls \
+                     would have to be cut along the hinge as well; this road carries an island only \
+                     on a translation, refusing rather than filling the island",
+                    named(face),
+                    face.loops.len()
+                ),
+            ));
+        }
         for source in &polygon.sources {
             let &EdgeSource::Neighbour(neighbour) = source else { continue };
             if neighbour_planes.contains_key(&neighbour) || tangent_bands.contains(&neighbour) {
@@ -602,6 +655,278 @@ pub fn recut_moved_planes_rigid(
                 removing.push(tool);
             }
         }
+
+        // ISLANDS. The cells above cover the
+        // outer trim WHOLE, the islands' feet included, and what that does
+        // inside an island is decided by the island's own walls, which carry
+        // on to meet the moved face exactly as they met it at home:
+        //   * a HOLE (the walls' material outside the island): material
+        //     taken away under it is empty already, or is the bottom of a
+        //     blind hole the face's new position passes, which goes with the
+        //     floor; material ADDED over it must leave the hole open;
+        //   * a BOSS (the walls' material inside): material added under its
+        //     foot is the boss already; material taken away there must stay,
+        //     since the boss's walls run on down to the moved face.
+        // So an island is KEPT out of the tool exactly when its inside is
+        // material and the tool removes, or empty and the tool adds: a prism
+        // over each convex cell of the island, the slab bounded by the
+        // island's walls, which is subtracted from that direction's tool.
+        //
+        // A TURN (`BREP_RECUT_TURNED_ISLANDS`): the island is cut along the
+        // same hinge as the trim, so each of its cells lies on one side of it
+        // and moves one way, read at the cell's own seat exactly as the trim's
+        // cells are; the cell kept out is the WEDGE between the old and the new
+        // carrier on that side, bounded by the island's walls and, where the
+        // hinge split it, by the plane through the hinge. The walls stay where
+        // they are and run on to meet the turned face, so the same rule
+        // decides: kept out exactly when the inside is material and the cell
+        // removes, or empty and the cell adds.
+        for island in &polygon.islands {
+            // Hole or boss, read once off the island's OWN boundary (the
+            // cells below also carry the carriers their convex split ran
+            // along, which are not walls): the polygon is wound
+            // counter-clockwise about the face's outward normal, so the
+            // island's inside is to the LEFT of each edge, and a wall whose
+            // outward normal points that way has its material outside — a
+            // hole.
+            let mut inside_is_material: Option<bool> = None;
+            let corners = island.points.len();
+            for (edge, source) in island.sources.iter().enumerate() {
+                let &EdgeSource::Neighbour(wall) = source else { continue };
+                let other = face_by_id(solid, wall)?;
+                if moved_set.contains(&wall) {
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "island_trim",
+                        format!(
+                            "{OP}: face {id}{} has an island whose wall, face {wall}{}, moves with it; \
+                             this road carries an island only past walls that stay, refusing",
+                            named(face),
+                            named(other)
+                        ),
+                    ));
+                }
+                let plane = plane_of_surface(&other.surface, tolerance.max(1e-9) * 10.0, OP).map_err(|error| {
+                    KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "curved_neighbour",
+                        format!(
+                            "{error} — face {id}{} has an island walled by face {wall}{}, and this road \
+                             needs every bounding carrier as a half-space",
+                            named(face),
+                            named(other)
+                        ),
+                    )
+                })?;
+                let outward = if other.same_sense { plane.normal } else { plane.normal.scale(-1.0) };
+                if outward.dot(normal).abs() > 1e-9 {
+                    return Err(KernelRefusal::unsupported(
+                        KernelStage::Classify,
+                        "island_trim",
+                        format!(
+                            "{OP}: an island wall of face {id}{}, face {wall}{}, leans against the face's \
+                             normal, so the island's section moves sideways as the face moves and this \
+                             road's straight prism does not follow it; refusing",
+                            named(face),
+                            named(other)
+                        ),
+                    ));
+                }
+                let along = polygon
+                    .frame
+                    .lift(island.points[(edge + 1) % corners])
+                    .sub(polygon.frame.lift(island.points[edge]));
+                let left = normal.cross(along);
+                let lean = outward.dot(left) / left.length().max(1e-300);
+                if lean.abs() <= 1e-9 {
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "island_trim",
+                        format!(
+                            "{OP}: an island wall of face {id}{}, face {wall}{}, lies in the face's own \
+                             plane, so which side of it the island is on is not decided; refusing",
+                            named(face),
+                            named(other)
+                        ),
+                    ));
+                }
+                let material = lean < 0.0;
+                if inside_is_material.is_some_and(|known| known != material) {
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "island_trim",
+                        format!(
+                            "{OP}: an island of face {id}{} is walled partly by material and partly \
+                             by empty space, so whether the moved face carries it as a hole or as a \
+                             boss is not decided by the geometry; refusing",
+                            named(face)
+                        ),
+                    ));
+                }
+                inside_is_material = Some(material);
+            }
+            let Some(material) = inside_is_material else { continue };
+            if motion.rotation.is_none() && material == (translation_delta > 0.0) {
+                // Inside is what the tool makes it anyway.
+                continue;
+            }
+            let cells = convex_cells(island, hinge, edge_band, scale).map_err(|error| {
+                KernelRefusal::internal(
+                    KernelStage::Classify,
+                    "cell_split",
+                    format!("{OP}: an island of face {id}{} could not be cut into convex cells — {error}", named(face)),
+                )
+            })?;
+            if motion.rotation.is_some() && hinge.is_some() && !cells.is_empty() {
+                // The hinge split drops a piece thinner than the band, which
+                // would leave that sliver of the island to the other side's
+                // tool: refuse rather than fill a corner of a hole (or cut a
+                // corner off a post).
+                let unsplit = convex_cells(island, None, edge_band, scale).map_err(|error| {
+                    KernelRefusal::internal(
+                        KernelStage::Classify,
+                        "cell_split",
+                        format!("{OP}: an island of face {id}{} could not be cut into convex cells — {error}", named(face)),
+                    )
+                })?;
+                let area = |cells: &[Cell]| cells.iter().map(|cell| cell.signed_area().abs()).sum::<f64>();
+                let (whole, kept) = (area(&unsplit), area(&cells));
+                // Relative: a dropped piece and the island both scale with the
+                // model, and the sums agree to roundoff (~1e-15 of the area).
+                if (whole - kept).abs() > 1e-12 * whole {
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "island_trim",
+                        format!(
+                            "{OP}: the hinge of the turn of face {id}{} cuts a piece off one of its islands \
+                             thinner than this road's band ({:.3e} of {:.3e}), so that piece would move \
+                             with the wrong side; refusing rather than dropping it",
+                            named(face),
+                            whole - kept,
+                            whole
+                        ),
+                    ));
+                }
+            }
+            if cells.is_empty() {
+                return Err(KernelRefusal::ill_posed(
+                    KernelStage::Classify,
+                    "island_trim",
+                    format!(
+                        "{OP}: an island of face {id}{} is thinner than this road's band, so it has no \
+                         cell to keep out of the tool and would vanish; refusing rather than \
+                         dropping it",
+                        named(face)
+                    ),
+                ));
+            }
+            for cell in &cells {
+                let seat = polygon.frame.lift(cell.centroid());
+                let delta = if motion.rotation.is_none() {
+                    translation_delta
+                } else {
+                    (moved_offset - moved_normal.dot(seat)) / facing
+                };
+                if delta.abs() <= motion_floor {
+                    return Err(KernelRefusal::ill_posed(
+                        KernelStage::Classify,
+                        "turned_through_trim",
+                        format!(
+                            "{OP}: the motion turns face {id}{} about a line through one of its islands, \
+                             and a cell of that island still sits on the line after the hinge split, so \
+                             which way it moves is not decided by the geometry; refusing rather than \
+                             choosing",
+                            named(face)
+                        ),
+                    ));
+                }
+                let adds = delta > 0.0;
+                if material == adds {
+                    // Inside is what this side's tool makes it anyway.
+                    continue;
+                }
+                let mut spaces = clip.clone();
+                if motion.rotation.is_none() {
+                    spaces.push(HalfSpace { normal, offset: offset.max(offset + delta) });
+                    spaces.push(HalfSpace { normal: normal.scale(-1.0), offset: -offset.min(offset + delta) });
+                } else {
+                    // The wedge on this cell's side of the hinge: inside the
+                    // old carrier and outside the new one where the cell moves
+                    // in, the other way round where it moves out.
+                    let (inner, outer) = if adds {
+                        ((moved_normal, moved_offset), (normal, offset))
+                    } else {
+                        ((normal, offset), (moved_normal, moved_offset))
+                    };
+                    spaces.push(HalfSpace { normal: inner.0, offset: inner.1 });
+                    spaces.push(HalfSpace { normal: outer.0.scale(-1.0), offset: -outer.1 });
+                }
+                // Every carrier the cell's edges lie on — the island's walls,
+                // the ones its convex split ran along and, on a turn, the plane
+                // through the hinge — read from the seat, which a convex cell
+                // has on one side of each.
+                for (edge, source) in cell.sources.iter().enumerate() {
+                    let wall = match *source {
+                        EdgeSource::Neighbour(wall) => wall,
+                        EdgeSource::Hinge => {
+                            let plane = polygon.frame.edge_plane(cell, edge);
+                            let sign = if plane.0.dot(seat) - plane.1 > 0.0 { -1.0 } else { 1.0 };
+                            push_unique(
+                                &mut spaces,
+                                HalfSpace { normal: plane.0.scale(sign), offset: plane.1 * sign },
+                                tolerance,
+                            );
+                            continue;
+                        }
+                    };
+                    let other = face_by_id(solid, wall)?;
+                    let plane = plane_of_surface(&other.surface, tolerance.max(1e-9) * 10.0, OP)
+                        .map_err(|error| {
+                            KernelRefusal::unsupported(KernelStage::Classify, "curved_neighbour", error)
+                        })?;
+                    let outward = if other.same_sense { plane.normal } else { plane.normal.scale(-1.0) };
+                    let reach = outward.dot(seat) - outward.dot(plane.origin);
+                    if reach.abs() <= tolerance {
+                        return Err(KernelRefusal::ill_posed(
+                            KernelStage::Classify,
+                            "probe_on_carrier",
+                            format!(
+                                "{OP}: a cell of an island of face {id} has its seat ON the carrier of \
+                                 its wall {wall} ({reach:.3e} from it); refusing rather than choosing"
+                            ),
+                        ));
+                    }
+                    let sign = if reach > 0.0 { -1.0 } else { 1.0 };
+                    push_unique(
+                        &mut spaces,
+                        HalfSpace { normal: outward.scale(sign), offset: outward.dot(plane.origin) * sign },
+                        tolerance,
+                    );
+                }
+                let probe = seat.add(normal.scale(delta * 0.5));
+                let prism = convex_solid(&spaces, probe, tolerance).map_err(|error| {
+                    KernelRefusal::internal(
+                        KernelStage::Fragment,
+                        "tool_polytope",
+                        format!("{OP}: the island tool for face {id} could not be built — {error}"),
+                    )
+                })?;
+                if adds {
+                    keep_adding.push(prism);
+                } else {
+                    keep_removing.push(prism);
+                }
+            }
+        }
+        // This face's tools, less its own islands.
+        if !keep_removing.is_empty() {
+            let own = removing.split_off(removing_from);
+            removing.extend(less_islands(unite(own)?, keep_removing)?);
+        }
+        if !keep_adding.is_empty() {
+            let own = adding.split_off(adding_from);
+            adding.extend(less_islands(unite(own)?, keep_adding)?);
+        }
     }
     if removing.is_empty() && adding.is_empty() {
         return Err(KernelRefusal::input(
@@ -622,23 +947,6 @@ pub fn recut_moved_planes_rigid(
     // lies inside the body's old bounds and what it adds lies outside them —
     // so the order of the two cuts is not a choice of answer; the subtract
     // runs first so the added material meets a body already at its new bounds.
-    let unite = |mut tools: Vec<BrepSolid>| -> Result<Option<BrepSolid>, KernelRefusal> {
-        if tools.is_empty() {
-            return Ok(None);
-        }
-        let mut tool = tools.remove(0);
-        for next in tools {
-            // The boolean's own class rides through: a degeneracy inside the
-            // union is still a degeneracy at this road's boundary.
-            tool = boolean_operation(&tool, &next, BooleanOperation::Union, &BooleanOptions::default())
-                .map_err(|error| {
-                    error.with_message(|message| {
-                        format!("{OP}: the tools could not be unioned into one — {message}")
-                    })
-                })?;
-        }
-        Ok(Some(tool))
-    };
     let mut cut = solid.clone();
     if let Some(tool) = unite(removing)? {
         cut = boolean_operation(&cut, &tool, BooleanOperation::Subtract, &BooleanOptions::default())
@@ -651,6 +959,42 @@ pub fn recut_moved_planes_rigid(
             .map_err(|error| {
                 error.with_message(|message| format!("{OP}: the re-cut's union refused — {message}"))
             })?;
+    }
+    // A boss whose floor is carried out through the far side of the body is
+    // left standing on nothing: the cut answers with a separate piece. That
+    // is not an edit of this body, so it is refused by name.
+    // Outer pieces, not shells: a cavity the cut opens up takes a shell away
+    // as a post cut loose adds one. A shell bounds material where its signed
+    // volume is positive.
+    let pieces = |body: &BrepSolid| -> Result<usize, KernelRefusal> {
+        let mut count = 0;
+        for shell in &body.shells {
+            let volume = crate::mass_properties::shell_signed_volume(shell)
+                .map_err(|error| KernelRefusal::internal(KernelStage::Validate, "shell_volume", format!("{OP}: {error}")))?;
+            if volume > 0.0 {
+                count += 1;
+            }
+        }
+        Ok(count)
+    };
+    let (before, after) = (pieces(solid)?, pieces(&cut)?);
+    if after == 0 {
+        return Err(KernelRefusal::ill_posed(
+            KernelStage::Classify,
+            "solid_vanishes",
+            format!("{OP}: the motion takes away all of the body's material; refusing rather than returning nothing"),
+        ));
+    }
+    if after > before {
+        return Err(KernelRefusal::ill_posed(
+            KernelStage::Classify,
+            "island_cut_loose",
+            format!(
+                "{OP}: the motion carries the selection past the far side of the body and leaves \
+                 {after} piece(s) where there was {before}: an island standing on the moved face is \
+                 cut loose; refusing rather than returning a body in pieces"
+            ),
+        ));
     }
     Ok(restamp(cut, solid, &moved_set, &motion, tolerance))
 }
@@ -1115,17 +1459,22 @@ impl Cell {
     }
 }
 
-/// The polygon a moved face's trim is, with its frame.
+/// The polygon a moved face's trim is, with its frame. `islands` are the
+/// face's inner loops, each read as the polygon of the REGION it encloses
+/// (wound counter-clockwise like the trim) in the same frame.
 struct TrimPolygon {
     frame: Frame,
     points: Vec<[f64; 2]>,
     sources: Vec<EdgeSource>,
+    islands: Vec<TrimPolygon>,
 }
 
-/// Read a moved face's trim as a polygon in its own frame: one loop, every
-/// edge straight, every edge shared with exactly one other face, which is the
-/// edge's source. Refuses by name what it cannot read: an island (a second
-/// loop, whose neighbours bound nothing this decomposition sees), a curved
+/// Read a moved face's trim as a polygon in its own frame: every loop of
+/// straight edges, every edge shared with exactly one other face, which is
+/// the edge's source. The loop enclosing the largest area is the outer trim
+/// and every other loop an ISLAND (a hole through the face, or the foot of a
+/// boss standing on it), whose walls bound the island's own tools
+/// (`recut_moved_planes_rigid`). Refuses by name what it cannot read: a curved
 /// edge (which a planar neighbour cannot produce) and an edge no other face
 /// holds.
 fn trim_polygon(
@@ -1134,20 +1483,42 @@ fn trim_polygon(
     normal: Vec3,
     band: f64,
 ) -> Result<TrimPolygon, KernelRefusal> {
-    let id = face.id;
-    if face.loops.len() != 1 {
+    if face.loops.is_empty() {
         return Err(KernelRefusal::unsupported(
             KernelStage::Classify,
-            "island_trim",
-            format!(
-                "{OP}: face {id}{} has {} loops, so its trim has an island whose walls bound no cell \
-                 of the outer trim, and this road cuts one convex cell at a time; refusing rather \
-                 than filling the island",
-                named(face),
-                face.loops.len()
-            ),
+            "thin_trim",
+            format!("{OP}: face {}{} has no trim loop", face.id, named(face)),
         ));
     }
+    let first = loop_polygon(solid, face, 0, normal, band, None)?;
+    let mut loops = vec![first];
+    for index in 1..face.loops.len() {
+        let frame = loops[0].frame;
+        loops.push(loop_polygon(solid, face, index, normal, band, Some(frame))?);
+    }
+    let area = |polygon: &TrimPolygon| {
+        Cell { points: polygon.points.clone(), sources: polygon.sources.clone() }.signed_area().abs()
+    };
+    let outer = (0..loops.len())
+        .max_by(|&i, &j| area(&loops[i]).total_cmp(&area(&loops[j])))
+        .expect("a face has a loop");
+    let mut polygon = loops.swap_remove(outer);
+    polygon.islands = loops;
+    Ok(polygon)
+}
+
+/// One loop of a moved face (`loop_index`) as a counter-clockwise polygon in
+/// `frame` (or a frame of its own at its first corner), with each edge's
+/// source; see [`trim_polygon`].
+fn loop_polygon(
+    solid: &BrepSolid,
+    face: &FaceRecord,
+    loop_index: usize,
+    normal: Vec3,
+    band: f64,
+    frame: Option<Frame>,
+) -> Result<TrimPolygon, KernelRefusal> {
+    let id = face.id;
     let edges: HashMap<u64, &EdgeRecord> = solid.edges.iter().map(|edge| (edge.id, edge)).collect();
     let vertices: HashMap<u64, Vec3> =
         solid.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
@@ -1163,7 +1534,7 @@ fn trim_polygon(
     }
     let mut points3: Vec<Vec3> = Vec::new();
     let mut sources: Vec<EdgeSource> = Vec::new();
-    for coedge in &face.loops[0].coedges {
+    for coedge in &face.loops[loop_index].coedges {
         let edge = edges.get(&coedge.edge_id).ok_or_else(|| {
             KernelRefusal::input(
                 KernelStage::Collect,
@@ -1234,9 +1605,12 @@ fn trim_polygon(
             format!("{OP}: face {id}{} has fewer than three corners", named(face)),
         ));
     }
-    let frame = Frame::new(points3[0], normal).map_err(|error| {
-        KernelRefusal::internal(KernelStage::Classify, "frame", format!("{OP}: {error}"))
-    })?;
+    let frame = match frame {
+        Some(frame) => frame,
+        None => Frame::new(points3[0], normal).map_err(|error| {
+            KernelRefusal::internal(KernelStage::Classify, "frame", format!("{OP}: {error}"))
+        })?,
+    };
     let mut points: Vec<[f64; 2]> = points3.iter().map(|point| frame.drop(*point)).collect();
     let probe = Cell { points: points.clone(), sources: sources.clone() };
     if probe.signed_area() < 0.0 {
@@ -1247,7 +1621,15 @@ fn trim_polygon(
         sources.rotate_left(1);
         let _ = &mut points;
     }
-    Ok(TrimPolygon { frame, points, sources })
+    Ok(TrimPolygon { frame, points, sources, islands: Vec::new() })
+}
+
+/// `BREP_RECUT_TURNED_ISLANDS` (default on; `=0` restores): the re-cut road carries a face
+/// with islands through a TURN as well as a translation, each island cut along
+/// the hinge like the trim (the island block of `recut_moved_planes_rigid`);
+/// off, a turned face with an island refuses `island_trim`.
+fn turned_islands_enabled() -> bool {
+    switch!(live "BREP_RECUT_TURNED_ISLANDS", true)
 }
 
 /// Cut a trim polygon into convex cells: first along its own reflex corners
@@ -1650,7 +2032,7 @@ fn box_half_spaces((low, high): (Vec3, Vec3), margin: f64) -> Vec<HalfSpace> {
 ///
 /// `inside` is a point the polytope must contain; it is what makes an empty or
 /// degenerate intersection a refusal rather than a body nobody asked for.
-fn convex_solid(
+pub(super) fn convex_solid(
     spaces: &[HalfSpace],
     inside: Vec3,
     tolerance: f64,
@@ -1766,7 +2148,7 @@ fn convex_solid(
 
 /// Where three half-spaces' carriers meet, or `None` when they do not meet in
 /// a point.
-fn three_plane_point(a: &HalfSpace, b: &HalfSpace, c: &HalfSpace) -> Option<Vec3> {
+pub(super) fn three_plane_point(a: &HalfSpace, b: &HalfSpace, c: &HalfSpace) -> Option<Vec3> {
     let cross = b.normal.cross(c.normal);
     let determinant = a.normal.dot(cross);
     if determinant.abs() <= 1e-9 {

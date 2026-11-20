@@ -1,6 +1,6 @@
 //! The KiCad library from a session: search the symbols and footprints on
-//! disk, then add one as a component of the open assembly. User report
-//! 20261024T213219Z-8cc7efda: an agent could only reach the library by
+//! disk, then add one as a component of the open assembly. A user
+//! report: an agent could only reach the library by
 //! clicking through the Import dialog's stages, and the "Add part to
 //! assembly" picker offers stored parts, never the library.
 //!

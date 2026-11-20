@@ -478,12 +478,25 @@ pub(super) fn collect_step_solids_with(text: &str, sheets: bool, readings: bool)
     // The appearance is resolved HERE, beside the build, because it needs the
     // built solid (to length-check the per-face pairing) and the body's STEP
     // refs (to look the colours up) in the same place.
+    // Each body at the unit of the representation that lists it: a file with
+    // no product structure can still carry representations in several units.
+    // Only a mixed file pays for the index; any other reads the global scale.
+    let units = RepresentationUnits::new(&entities);
+    let units = units.differs_from(resolver.length_scale).then_some(units);
     let build = |body: StepBody| {
+        let scaled;
+        let resolver = match &units {
+            Some(units) => {
+                scaled = resolver.with_length_scale(body_scale(units, body, &[], resolver.length_scale));
+                &scaled
+            }
+            None => &resolver,
+        };
         (
             matches!(body, StepBody::SurfaceModelShell { .. }),
-            build_step_body(&resolver, body).map(|(solid, readings)| {
-                let appearance = step_body_appearance(&resolver, &styles, body, &solid);
-                let face_refs = super::pmi::body_face_refs(&resolver, body, &solid);
+            build_step_body(resolver, body).map(|(solid, readings)| {
+                let appearance = step_body_appearance(resolver, &styles, body, &solid);
+                let face_refs = super::pmi::body_face_refs(resolver, body, &solid);
                 (solid, appearance, face_refs, readings)
             }),
         )
@@ -957,6 +970,83 @@ pub(super) fn representation_context(entity: &Entity) -> Option<usize> {
     representation_args(entity)?.get(2)?.as_ref_id().ok()
 }
 
+/// The length unit of every representation, and of every item a representation
+/// lists, read off its REPRESENTATION_CONTEXT.
+///
+/// A body's lengths are in the unit of the representation whose items name
+/// it, and a placement frame's in the unit of the representation it is an
+/// item of. A product can carry several representations (identity-related or
+/// side by side), each in its own context, so its bodies are not all in one
+/// unit, and reading them at one product scale sizes some of them wrong.
+///
+/// Built in one pass. An item listed by several representations keeps every
+/// one of them, in ascending representation id: a product reads the item at
+/// the unit of ITS representation that lists it, and only an item none of the
+/// product's representations lists takes the lowest id's that names a unit. A
+/// representation whose context resolves no length unit names none: an item a
+/// product reads through it falls back to the caller's scale (product, then
+/// file-global), never to another product's representation, so a
+/// single-context file reads every length as before.
+pub(super) struct RepresentationUnits {
+    of_representation: HashMap<usize, f64>,
+    of_item: HashMap<usize, Vec<(usize, Option<f64>)>>,
+}
+
+impl RepresentationUnits {
+    pub(super) fn new(entities: &HashMap<usize, Entity>) -> Self {
+        let mut representations: Vec<(usize, usize)> = entities
+            .iter()
+            .filter_map(|(&id, entity)| Some((id, representation_context(entity)?)))
+            .collect();
+        representations.sort_unstable();
+        let mut of_context: HashMap<usize, Option<f64>> = HashMap::default();
+        let mut of_representation: HashMap<usize, f64> = HashMap::default();
+        let mut of_item: HashMap<usize, Vec<(usize, Option<f64>)>> = HashMap::default();
+        for (id, context) in representations {
+            let scale = *of_context
+                .entry(context)
+                .or_insert_with(|| context_length_scale_mm(entities, context));
+            if let Some(scale) = scale {
+                of_representation.insert(id, scale);
+            }
+            let items = entities.get(&id).and_then(representation_items).unwrap_or(&[]);
+            for item in items.iter().filter_map(|item| item.as_ref_id().ok()) {
+                of_item.entry(item).or_default().push((id, scale));
+            }
+        }
+        Self { of_representation, of_item }
+    }
+
+    /// Millimetres per unit of one representation, when its context says.
+    pub(super) fn representation(&self, representation: usize) -> Option<f64> {
+        self.of_representation.get(&representation).copied()
+    }
+
+    /// Millimetres per unit of the representation that lists `body`, when one
+    /// does and its context says (see [`Self::item`]).
+    pub(super) fn body(&self, body: StepBody, owners: &[usize]) -> Option<f64> {
+        self.item(body.order_key().0, owners)
+    }
+
+    /// Millimetres per unit of the representation that lists `item`. One of
+    /// `owners` (the reaching product's own representations, ascending) that
+    /// lists it decides, and says nothing when its context names no unit;
+    /// only when none of them lists it does the lowest id naming a unit.
+    pub(super) fn item(&self, item: usize, owners: &[usize]) -> Option<f64> {
+        let listed = self.of_item.get(&item)?;
+        match listed.iter().find(|(representation, _)| owners.binary_search(representation).is_ok()) {
+            Some(&(_, scale)) => scale,
+            None => listed.iter().find_map(|&(_, scale)| scale),
+        }
+    }
+
+    /// Whether some representation's unit differs from `global`: only then can
+    /// a per-representation reading differ from the file-global one.
+    pub(super) fn differs_from(&self, global: f64) -> bool {
+        self.of_representation.values().any(|scale| scale.to_bits() != global.to_bits())
+    }
+}
+
 /// The root SHAPE_REPRESENTATION(s) that directly define a PRODUCT_DEFINITION's
 /// shape (via PRODUCT_DEFINITION_SHAPE → SHAPE_DEFINITION_REPRESENTATION).
 pub(super) fn pd_root_srs(structure: &StructureIndex, pd: usize) -> Vec<usize> {
@@ -1005,6 +1095,8 @@ pub(super) struct StructureIndex<'a> {
     /// NEXT_ASSEMBLY_USAGE_OCCURRENCE → the representation relationships its
     /// CONTEXT_DEPENDENT_SHAPE_REPRESENTATIONs name as its placement.
     placements_of_occurrence: HashMap<usize, Vec<usize>>,
+    /// Each representation's and each representation item's length unit.
+    pub(super) units: RepresentationUnits,
 }
 
 impl<'a> StructureIndex<'a> {
@@ -1047,8 +1139,31 @@ impl<'a> StructureIndex<'a> {
             reps_of_shape,
             identity: identity_relation_index(entities),
             placements_of_occurrence,
+            units: RepresentationUnits::new(entities),
         }
     }
+}
+
+/// Millimetres per unit of one body: the unit of the representation that lists
+/// it (one of `owners`, the reaching product's representations, when it can),
+/// else `fallback` (its product's, or the file's). Both assembly lanes and the
+/// flat lane build every body at this scale, and key their build caches by it.
+pub(super) fn body_scale(units: &RepresentationUnits, body: StepBody, owners: &[usize], fallback: f64) -> f64 {
+    if per_representation_units() {
+        units.body(body, owners).unwrap_or(fallback)
+    } else {
+        fallback
+    }
+}
+
+/// `BREP_IMPORT_REPRESENTATION_UNITS`: a body is built at the unit of the
+/// representation that lists it ([`RepresentationUnits`]), not at one scale for
+/// its whole product (or, with no product structure, for the whole file), and
+/// a NAUO's placement frames and a mapped item's origin and target at their
+/// representations' units. Default on; `=0` restores the product (or file)
+/// scale for all of them.
+pub(super) fn per_representation_units() -> bool {
+    switch!("BREP_IMPORT_REPRESENTATION_UNITS", true)
 }
 
 /// Solid-brep entity ids belonging to a PRODUCT_DEFINITION (in the part's own
@@ -1084,10 +1199,8 @@ pub(super) fn pd_step_bodies(structure: &StructureIndex, resolver: &Resolver, pd
 /// ([`resolve_assembly`]) and the structured one
 /// (`assembly::read_step_assembly`) — so they cannot disagree about a placement,
 /// about which edges survive, or about what was refused. `scale_for` gives
-/// millimetres per unit for a structure node's own representation: the flat lane
-/// passes the one file-global scale it builds all its geometry at, and the
-/// structured lane passes `ProductScales`, which resolves each node's own
-/// context (§3.6).
+/// millimetres per unit for a structure node's own representation: both lanes
+/// pass `ProductScales`, which resolves each node's own context (§3.6).
 ///
 /// A refused edge takes its whole subtree with it — nothing under a placement we
 /// cannot express is instantiated — and the walk simply never reaches it,
@@ -1109,18 +1222,31 @@ pub(super) fn resolve_structure_edges(
         refusals: Vec::new(),
     };
     for edge in edges {
-        // The placement is expressed in the PARENT frame, so it is read at the
-        // parent's scale; a mapped item's `mapping_origin` is the one exception,
-        // being an item of the CHILD representation (`mapped.rs`).
+        // Each frame of a placement is an item of one representation and is read
+        // at that representation's scale: a NAUO's ITEM_DEFINED_TRANSFORMATION
+        // has one frame in each, and a mapped item's `mapping_origin` is an item
+        // of the CHILD representation, its target of the PARENT's (`mapped.rs`).
         let parent_scale = scale_for(edge.parent_pd);
+        let child_scale = scale_for(edge.child_pd);
         let transform = match edge.kind {
             StructureEdgeKind::Nauo => {
                 let parent = Resolver::new(structure.entities, parent_scale);
-                Ok(nauo_edge_transform(structure, &parent, edge))
+                let child = Resolver::new(structure.entities, child_scale);
+                Ok(nauo_edge_transform(structure, &parent, &child, edge))
             }
             StructureEdgeKind::Mapped => {
-                let child_scale = scale_for(edge.child_pd);
                 match &edge.mapped {
+                    // `mapping_origin` at the mapped representation's unit,
+                    // `mapping_target` at the unit of the parent's
+                    // representation that holds the mapped item.
+                    Some(item) if per_representation_units() => {
+                        let parent = Resolver::new(structure.entities, parent_scale);
+                        let owners = node_representations(structure, &parent, edge.parent_pd);
+                        let units = &structure.units;
+                        let origin = units.representation(item.mapped_rep).unwrap_or(child_scale);
+                        let target = units.item(item.item, &owners).unwrap_or(parent_scale);
+                        mapped_item_transform(structure.entities, item, origin, target)
+                    }
                     Some(item) => mapped_item_transform(structure.entities, item, child_scale, parent_scale),
                     // Unreachable: a Mapped edge is only built from a MappedItem.
                     None => Ok(mat4_identity()),
@@ -1141,11 +1267,17 @@ pub(super) fn resolve_structure_edges(
 /// Resolve a NAUO's rigid placement (child-frame → parent-frame) from its
 /// CONTEXT_DEPENDENT_SHAPE_REPRESENTATION. Returns identity when any link of the
 /// transform chain is absent — a robust graceful fallback per the spec's option
-/// that the transform entities may be partial.
-pub(crate) fn nauo_edge_transform(structure: &StructureIndex, resolver: &Resolver, edge: &AssemblyEdge) -> Mat4 {
+/// that the transform entities may be partial. `parent` and `child` read lengths
+/// at the two representations' own units.
+pub(crate) fn nauo_edge_transform(
+    structure: &StructureIndex,
+    parent: &Resolver,
+    child: &Resolver,
+    edge: &AssemblyEdge,
+) -> Mat4 {
     let child_srs = pd_root_srs(structure, edge.child_pd);
     for &rep_rel_id in structure.placements_of_occurrence.get(&edge.edge_id).into_iter().flatten() {
-        if let Some(transform) = resolve_rep_rel_transform(resolver, rep_rel_id, &child_srs) {
+        if let Some(transform) = resolve_rep_rel_transform(&structure.units, parent, child, rep_rel_id, &child_srs) {
             return transform;
         }
     }
@@ -1156,11 +1288,16 @@ pub(crate) fn nauo_edge_transform(structure: &StructureIndex, resolver: &Resolve
 /// relationship carrying a REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION. The
 /// stored transform maps rep_1 → rep_2; we orient the result to child → parent
 /// using the child's known root SR, so the graph's rep ordering does not matter.
+/// `transform_item_1` is an item of rep_1 and `transform_item_2` of rep_2, so
+/// each frame's origin is read at its own representation's length unit.
 fn resolve_rep_rel_transform(
-    resolver: &Resolver,
+    units: &RepresentationUnits,
+    parent: &Resolver,
+    child: &Resolver,
     rep_rel_id: usize,
     child_srs: &[usize],
 ) -> Option<Mat4> {
+    let resolver = parent;
     let entity = resolver.get(rep_rel_id).ok()?;
     let idt_id = entity
         .find("REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION")?
@@ -1174,11 +1311,25 @@ fn resolve_rep_rel_transform(
     let idt_args = idt.find("ITEM_DEFINED_TRANSFORMATION")?;
     let item1 = idt_args.get(2)?.as_ref_id().ok()?;
     let item2 = idt_args.get(3)?.as_ref_id().ok()?;
-    let m1 = frame_matrix(&resolver.placement(item1).ok()?);
-    let m2 = frame_matrix(&resolver.placement(item2).ok()?);
+    // rep_2 is the child only when the child's root SRs name it and not rep_1;
+    // otherwise rep_1 is (the orientation the result is returned in below).
+    let child_is_rep2 = child_srs.contains(&rep2) && !child_srs.contains(&rep1);
+    // Each frame at its own representation's unit when that context names
+    // one, else at the unit of the product on that side.
+    let (side1, side2) = if child_is_rep2 { (parent, child) } else { (child, parent) };
+    let own = |representation: usize, fallback: f64| {
+        per_representation_units()
+            .then(|| units.representation(representation))
+            .flatten()
+            .unwrap_or(fallback)
+    };
+    let reader1 = side1.with_length_scale(own(rep1, side1.length_scale));
+    let reader2 = side2.with_length_scale(own(rep2, side2.length_scale));
+    let m1 = frame_matrix(&reader1.placement(item1).ok()?);
+    let m2 = frame_matrix(&reader2.placement(item2).ok()?);
     // T maps rep_1 coordinates into rep_2 coordinates.
     let forward = mat4_mul(&m2, &mat4_affine_inverse(&m1).ok()?);
-    if child_srs.contains(&rep2) && !child_srs.contains(&rep1) {
+    if child_is_rep2 {
         // rep_2 is the child ⇒ invert so the result maps child → parent.
         mat4_affine_inverse(&forward).ok()
     } else {
@@ -1318,18 +1469,23 @@ pub(super) fn resolve_assembly(
     edges: &[AssemblyEdge],
 ) -> AssemblyResult {
     // Each edge's placement (child-frame -> parent-frame), through the shared
-    // resolution the structured lane uses. This lane builds ALL its geometry at
-    // one file-global scale, so it reads every placement at that same scale --
-    // the pre-existing single-scale limitation `mixed-unit-assembly.step` pins,
-    // and the reason a mixed-unit file is only correct through the structured
-    // lane.
-    let scale = resolver.length_scale;
+    // resolution the structured lane uses, and each product's bodies built, at
+    // that product's OWN length unit (`assembly::ProductScales`): a mixed-unit assembly
+    // assigns one per representation context, and reading the whole file at one
+    // scale sizes and places every product of the other units wrong. A product
+    // with no resolvable context falls back to the file-global scale, so a
+    // single-context file reads every length exactly as before.
+    // `BREP_IMPORT_PRODUCT_UNITS=0` reads the whole file at the global scale.
     let structure = StructureIndex::new(entities);
+    let global = resolver.length_scale;
+    let per_product = switch!("BREP_IMPORT_PRODUCT_UNITS", true);
+    let mut scales = super::assembly::ProductScales::new(&structure, global);
+    let mut scale_of = |pd: usize| if per_product { scales.get(pd) } else { global };
     let ResolvedEdges {
         edges,
         transforms,
         refusals,
-    } = resolve_structure_edges(&structure, edges, |_| scale);
+    } = resolve_structure_edges(&structure, edges, &mut scale_of);
     let edges = edges.as_slice();
 
     let mut result = AssemblyResult {
@@ -1356,14 +1512,16 @@ pub(super) fn resolve_assembly(
     }
     // Build each distinct part solid once — with its appearance, which is a
     // property of the PART, not of the placement — then re-use both for every
-    // occurrence.
+    // occurrence. A build is keyed by (body, scale bits): two products share a
+    // body only by sharing a representation, hence a context, so the scale is
+    // redundant there, but a body reached at two units gets a build for each.
     // The readings are dropped below, so the builds do not take them.
-    let part_resolver = resolver.without_trim_readings();
-    let build_part = |body: StepBody| {
-        build_step_body(&part_resolver, body)
+    let build_part = |(body, scale_key): (StepBody, u64)| {
+        let scaled = resolver.with_length_scale(f64::from_bits(scale_key));
+        build_step_body(&scaled.without_trim_readings(), body)
             .map(|(solid, _readings)| {
-                let appearance = step_body_appearance(resolver, styles, body, &solid);
-                let face_refs = super::pmi::body_face_refs(resolver, body, &solid);
+                let appearance = step_body_appearance(&scaled, styles, body, &solid);
+                let face_refs = super::pmi::body_face_refs(&scaled, body, &solid);
                 (solid, appearance, face_refs)
             })
             .map_err(|error| {
@@ -1373,22 +1531,27 @@ pub(super) fn resolve_assembly(
     // Every distinct part body the walk below will reach, in the order it
     // reaches them (a dry walk, one body list per distinct product), built up
     // front -- in parallel under the `parallel` feature.
-    let mut part_bodies: Vec<StepBody> = Vec::new();
+    let mut part_bodies: Vec<(StepBody, u64)> = Vec::new();
     {
         let mut seen_products: HashSet<usize> = HashSet::default();
-        let mut seen_bodies: HashSet<StepBody> = HashSet::default();
+        let mut seen_bodies: HashSet<(StepBody, u64)> = HashSet::default();
         walk_occurrences(resolver, edges, &transforms, |node| {
             if seen_products.insert(node.pd) {
+                let product_scale = scale_of(node.pd);
+                let owners = node_representations(&structure, resolver, node.pd);
                 for body in pd_step_bodies(&structure, resolver, node.pd) {
-                    if seen_bodies.insert(body) {
-                        part_bodies.push(body);
+                    let scale_key = body_scale(&structure.units, body, &owners, product_scale).to_bits();
+                    if seen_bodies.insert((body, scale_key)) {
+                        part_bodies.push((body, scale_key));
                     }
                 }
             }
         });
     }
-    let mut solid_cache: HashMap<StepBody, Result<(BrepSolid, BodyAppearance, Vec<usize>), StepBodyError>> =
-        build_distinct_bodies(part_bodies, |body| step_body_face_count(resolver, body), &build_part).into_iter().collect();
+    let mut solid_cache: HashMap<(StepBody, u64), Result<(BrepSolid, BodyAppearance, Vec<usize>), StepBodyError>> =
+        build_distinct_bodies(part_bodies, |(body, _)| step_body_face_count(resolver, body), &build_part)
+            .into_iter()
+            .collect();
     let debug_on = std::env::var("BREP_DEBUG_STEP_ASM").is_ok();
     // Sheet part bodies already counted as skipped: once per part, like the
     // refusal lists below, not once per placement.
@@ -1400,10 +1563,13 @@ pub(super) fn resolve_assembly(
         // assembly's choice for a sub-assembly overrides the sub-assembly's.
         // Emit this product's own solids (leaf parts carry geometry; a pure
         // assembly node carries none, so this is a no-op there).
+        let product_scale = scale_of(node.pd);
+        let owners = node_representations(&structure, resolver, node.pd);
         for body in pd_step_bodies(&structure, resolver, node.pd) {
+            let scale_key = body_scale(&structure.units, body, &owners, product_scale).to_bits();
             let items = body_style_items(resolver, body);
             let occurrence_color = node.path.iter().find_map(|&edge| styles.occurrence_item_color(edge, &items));
-            let base = solid_cache.entry(body).or_insert_with(|| build_part(body));
+            let base = solid_cache.entry((body, scale_key)).or_insert_with(|| build_part((body, scale_key)));
             let (base_solid, base_appearance, base_refs) = match base {
                 Ok((solid, appearance, refs)) => (solid.clone(), appearance.clone(), refs.clone()),
                 // An OPEN SHELL_BASED_SURFACE_MODEL sheet is not a solid body, so

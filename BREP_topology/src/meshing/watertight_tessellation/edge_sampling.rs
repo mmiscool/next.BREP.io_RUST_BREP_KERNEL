@@ -323,17 +323,34 @@ fn chart_crossing_fractions(
     Ok(crossings)
 }
 
+/// The default mesher's edge samples. Under the chord budget an edge whose
+/// curve end misses its vertex by more than the chord, but within the band
+/// `validate` accepts as one point, is certified against its own curve ends
+/// rather than failing the whole body (vendor edges that miss their vertices
+/// by a few um, meshed at a 1 um chord). `BREP_TESS_ENDPOINT_BAND=0` restores the
+/// failure. The typed [`sample_all_edges_checked`] stays strict.
 pub fn sample_all_edges(
     solid: &BrepSolid,
     chord_tolerance: f64,
 ) -> Result<HashMap<u64, EdgeSamples>, String> {
-    sample_all_edges_checked(solid, chord_tolerance, chord_budget::enabled()).map_err(|e| e.to_string())
+    let strict = chord_budget::enabled();
+    let band = if strict && crate::switch!("BREP_TESS_ENDPOINT_BAND", true) { solid.vertex_match_band() } else { 0.0 };
+    sample_all_edges_banded(solid, chord_tolerance, strict, band).map_err(|e| e.to_string())
 }
 
 pub fn sample_all_edges_checked(
     solid: &BrepSolid,
     chord_tolerance: f64,
     strict: bool,
+) -> Result<HashMap<u64, EdgeSamples>, TessellationError> {
+    sample_all_edges_banded(solid, chord_tolerance, strict, 0.0)
+}
+
+fn sample_all_edges_banded(
+    solid: &BrepSolid,
+    chord_tolerance: f64,
+    strict: bool,
+    endpoint_band: f64,
 ) -> Result<HashMap<u64, EdgeSamples>, TessellationError> {
     // id -> point index built once; the linear `vertices.iter().find(id==)`
     // below was called ~2x per edge, i.e. O(E*V) on every display refresh.
@@ -404,13 +421,20 @@ pub fn sample_all_edges_checked(
         // Discover chart crossings on the refined chain: a capped or aliased
         // seed chain can hide crossings which the adjacent sphere must share.
         let atlases = chart_atlases.get(&edge.id);
+        // An edge bounding a sphere keeps the strict endpoint check: moving its
+        // end back onto a displaced vertex could cross a cube-atlas boundary
+        // its shared samples do not carry (a T-junction with the neighbour).
+        let endpoint_band = if atlases.is_some() { 0.0 } else { endpoint_band };
         let certified = if strict {
-            let chain = chord_budget::refine_shared(edge, vertex_point(edge.start_vertex_id)?,
-                vertex_point(edge.end_vertex_id)?, chord_tolerance, &fractions)?;
+            // An edge certified against its own curve ends (an endpoint miss
+            // inside the band) reports how far its end chords stand off the
+            // curve, so the faces it bounds do not chase a finer interior.
+            let (chain, standoff) = chord_budget::refine_banded(edge, vertex_point(edge.start_vertex_id)?,
+                vertex_point(edge.end_vertex_id)?, chord_tolerance, &fractions, chord_budget::HARD_SPANS, endpoint_band)?;
             // Only chart insertion needs a separate copy of the certified
             // fractions. Otherwise consume the certified chain directly below.
             if atlases.is_some() { fractions = chain.iter().map(|p| p.0).collect(); }
-            Some(chain)
+            Some((chain, standoff))
         } else {
             None
         };
@@ -429,20 +453,20 @@ pub fn sample_all_edges_checked(
                 fractions.retain(|fraction| *fraction >= 0.0 && *fraction <= 1.0);
             }
         }
-        if let Some(chain) = certified {
+        if let Some((chain, worst_sag)) = certified {
             let chain = if atlases.is_none() || (chain.len() == fractions.len()
                 && chain.iter().zip(&fractions).all(|(p, f)| p.0 == *f)) {
                 chain
             } else {
                 // Chart insertion changes the chords; certify those actual
                 // chords too before any face consumes the shared positions.
-                chord_budget::refine_shared(edge, vertex_point(edge.start_vertex_id)?,
-                    vertex_point(edge.end_vertex_id)?, chord_tolerance, &fractions)?
+                chord_budget::refine_banded(edge, vertex_point(edge.start_vertex_id)?,
+                    vertex_point(edge.end_vertex_id)?, chord_tolerance, &fractions, chord_budget::HARD_SPANS, endpoint_band)?.0
             };
             samples.insert(edge.id, EdgeSamples {
                 fractions: chain.iter().map(|p| p.0).collect(),
                 positions: chain.into_iter().map(|p| p.1).collect(),
-                worst_sag: 0.0,
+                worst_sag,
             });
             continue;
         }

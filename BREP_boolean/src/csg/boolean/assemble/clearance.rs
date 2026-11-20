@@ -357,10 +357,16 @@ fn covering_correspondence(
         let p = old.evaluate(ar[0] + f * (ar[1] - ar[0])).ok()?;
         let t = crate::project_point_to_curve(new, p).ok()?.u;
         let g = (t - br[0]) / (br[1] - br[0]);
-        if !g.is_finite() || g < result.last()?.1 || g > 1.0 {
+        let previous = result.last()?.1;
+        let rounding = 64.0 * f64::EPSILON;
+        if !g.is_finite() || g < previous - rounding || g > 1.0 + rounding {
             return None;
         }
-        result.push((f, g));
+        // Adjacent knot and grid stations can differ by one ulp. Their
+        // projected parameters may then round in the opposite order. Choose
+        // a monotone map through that uncertainty; every resulting tile
+        // still requires the same complete positive-hull exclusion below.
+        result.push((f, g.max(previous).min(1.0)));
     }
     result.push((1.0, 1.0));
     Some(result)

@@ -328,7 +328,14 @@ pub(in crate::watertight_tessellation) fn close_biperiodic_straddle_band(
         // excluding the q_lo/q_hi corners (they come from the rims) and splicing the
         // straddle arcs into their q-ranges. `wrap_q` is true — the complement band
         // sweeps q past the domain end.
-        let build_seam = |p_seam: f64, arcs: &[Vec<FaceVertex>]| -> Result<Vec<FaceVertex>, String> {
+        // Each column runs between the levels where the rebuilt rims actually
+        // meet that seam. A notched rim crosses the seam away from its mid
+        // level (`rim_level`); starting the column there overlapped the rim.
+        let build_seam = |p_seam: f64,
+                          arcs: &[Vec<FaceVertex>],
+                          q_lo: f64,
+                          q_hi: f64|
+         -> Result<Vec<FaceVertex>, String> {
             let base = seam_meridian_samples(face, p_seam, p_is_u, q_lo, q_hi, chord_tolerance, true)?;
             let mut ranges: Vec<(f64, f64, usize)> = arcs
                 .iter()
@@ -352,11 +359,16 @@ pub(in crate::watertight_tessellation) fn close_biperiodic_straddle_band(
                         });
                     }
                 }
-                for vertex in &arcs[arc_index] {
-                    column.push(FaceVertex {
-                        uv: mk(p_seam, coord(vertex).1),
-                        position: vertex.position,
-                    });
+                // The arc keeps its own p: it is the hole's boundary, which
+                // indents the band from the seam. Pinning it onto the seam
+                // collapsed a hole edge that runs along q into coincident
+                // stations (a non-simple PSLG, so the CDT declined and the ear
+                // clip folded) and filled the hole. Only its two seam
+                // crossings sit on the seam.
+                let last = arcs[arc_index].len() - 1;
+                for (k, vertex) in arcs[arc_index].iter().enumerate() {
+                    let p = if k == 0 || k == last { p_seam } else { coord(vertex).0 };
+                    column.push(FaceVertex { uv: mk(p, coord(vertex).1), position: vertex.position });
                 }
                 cursor = range_hi;
             }
@@ -370,8 +382,16 @@ pub(in crate::watertight_tessellation) fn close_biperiodic_straddle_band(
             }
             Ok(column)
         };
-        let right_seam = build_seam(p1, &right_arcs)?;
-        let mut left_seam = build_seam(p0, &left_arcs)?;
+        // Both columns are the same 3D meridian and must carry the same
+        // stations to weld, so they share one range: from the higher of the
+        // lower rim's two seam ends to the lower of the upper rim's.
+        let seam_q = |points: &[FaceVertex], at_p1: bool| {
+            coord(if at_p1 { points.last().unwrap() } else { &points[0] }).1
+        };
+        let column_lo = seam_q(&bottom, true).max(seam_q(&bottom, false));
+        let column_hi = seam_q(&top, true).min(seam_q(&top, false));
+        let right_seam = build_seam(p1, &right_arcs, column_lo, column_hi)?;
+        let mut left_seam = build_seam(p0, &left_arcs, column_lo, column_hi)?;
         left_seam.reverse();
         top.reverse();
         let mut polygon: Vec<FaceVertex> = Vec::new();
@@ -406,3 +426,4 @@ pub(in crate::watertight_tessellation) fn close_biperiodic_straddle_band(
     }
     Ok(None)
 }
+

@@ -55,7 +55,7 @@ use crate::feature_pipeline::{
     scene_metadata, AddedSolid, FeatureContext, FeatureRefusal, FeatureResult,
 };
 use crate::{
-    import_iges_report, import_step_bodies, restore_solids, BodyAppearance, BrepSolid, ImportedColor,
+    import_step_bodies, restore_solids, BodyAppearance, BrepSolid, ImportedColor,
     StepBodyError, COLOR_METADATA_KEY,
 };
 
@@ -135,7 +135,8 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     if let Some(iges_text) = ctx.param("igesText").and_then(|v| v.as_str()) {
         // The file's colours (314 or the directory colour number) are stamped
         // as the STEP branch stamps its styled colours.
-        let report = import_iges_report(iges_text)
+        // The feature has no channel for diagnostics: the lean build.
+        let report = crate::import_iges_bodies(iges_text)
             .map_err(|error| format!("import3d: IGES import failed: {error}"))?;
         if report.solids.is_empty() {
             return Err("import3d: IGES file contained no importable solids".into());

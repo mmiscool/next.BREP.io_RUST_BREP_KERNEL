@@ -29,6 +29,10 @@ struct CurveRef {
     /// Points a quarter and half way along; `None` for a conic the probes
     /// cannot place.
     probes: Option<[Vec3; 2]>,
+    /// The part of the curve this boundary piece is, as fractions along it
+    /// (0 at its start, 1 at its end): the whole curve unless a T-junction
+    /// cut it.
+    range: (f64, f64),
 }
 
 struct SoupEdge {
@@ -36,6 +40,9 @@ struct SoupEdge {
     start: usize,
     end: usize,
     uses: Vec<(usize, bool)>,
+    /// Whether the curve runs from `start` to `end`, for a piece of a curve
+    /// (whose ends are not the curve's); `None` reads it from the curve's ends.
+    forward: Option<bool>,
 }
 
 struct SoupFace {
@@ -225,7 +232,7 @@ pub(in super::super) fn analyse_face_sets(file: &IgesFile, scale: f64, pointers:
             for (curve, reversed) in boundary {
                 let a = root(&same, welder.weld(curve.start));
                 let b = root(&same, welder.weld(curve.end));
-                let edge = match_edge(&mut edges, &mut by_ends, curve, a, b, resolution);
+                let edge = match_edge(&reader, &mut edges, &mut by_ends, curve, a, b, (face_index, reversed), resolution);
                 let along = (a == edges[edge.0].start && b == edges[edge.0].end && edge.1) != reversed;
                 edges[edge.0].uses.push((face_index, along));
                 coedges.push((edge.0, along));
@@ -234,6 +241,9 @@ pub(in super::super) fn analyse_face_sets(file: &IgesFile, scale: f64, pointers:
         }
         faces.push(SoupFace { pointer, surface, parent, loops, counter_clockwise });
     }
+    if crate::switch!("BREP_IGES_T_JUNCTIONS", true) {
+        split_at_t_junctions(&reader, &mut edges, &mut faces, &welder.points, resolution);
+    }
     let (flips, bodies) = orient(&faces, &edges)?;
     Ok(FaceSets { faces, edges, vertices: welder.points, flips, bodies, resolution })
 }
@@ -241,16 +251,24 @@ pub(in super::super) fn analyse_face_sets(file: &IgesFile, scale: f64, pointers:
 /// Find the edge this statement of a curve belongs to, or start a new one.
 /// The second value says the curve runs the way the stored edge does.
 fn match_edge(
+    reader: &Translator,
     edges: &mut Vec<SoupEdge>,
     by_ends: &mut HashMap<(usize, usize), Vec<usize>>,
     curve: CurveRef,
     a: usize,
     b: usize,
+    (face, reversed): (usize, bool),
     resolution: f64,
 ) -> (usize, bool) {
     let key = (a.min(b), a.max(b));
     let bar = (SAME_CURVE_RESOLUTIONS * resolution).max(SAME_CURVE_FRACTION * curve.start.sub(curve.end).length());
     for &index in by_ends.get(&key).map_or(&[][..], Vec::as_slice) {
+        // A face walks one edge twice only as a seam, once each way: a second
+        // statement it walks the same way between the same ends (a curve
+        // shorter than the bar, stated twice) is another edge.
+        if a != b && edges[index].uses.contains(&(face, (a == edges[index].start) != reversed)) {
+            continue;
+        }
         let other = &edges[index].curve;
         let (Some(mine), Some(theirs)) = (curve.probes, other.probes) else {
             // A conic with no probes: its ends are all there is to go on.
@@ -260,22 +278,353 @@ fn match_edge(
             if mine[1].sub(theirs[1]).length() <= bar {
                 return (index, a == edges[index].start);
             }
+            // Two statements of one curve need not share a parametrization (a
+            // rational spline's weights, its knots), so the points half way
+            // along each by parameter can stand apart on the one locus: each
+            // statement's probes lying on the other is the same curve.
+            // `BREP_IGES_LOCUS_MATCH` (default on; `=0` compares by parameter alone).
+            if crate::switch!("BREP_IGES_LOCUS_MATCH", true) && reader.same_locus(&curve, other, bar) {
+                return (index, a == edges[index].start);
+            }
         } else {
             let closed_bar = bar.max(SAME_CURVE_FRACTION * mine[1].sub(curve.start).length());
+            // As for an open edge, a face walks a closed one twice only once
+            // each way (a seam round a torus).
+            let walked_twice = |same: bool| edges[index].uses.contains(&(face, same != reversed));
             if mine[0].sub(theirs[0]).length() <= closed_bar && mine[1].sub(theirs[1]).length() <= closed_bar {
+                if walked_twice(true) {
+                    continue;
+                }
                 return (index, true);
             }
             // The other way round a closed curve: a quarter of the way along
             // one is three quarters along the other, and the half is shared.
-            if mine[1].sub(theirs[1]).length() <= closed_bar {
+            if mine[1].sub(theirs[1]).length() <= closed_bar && !walked_twice(false) {
                 return (index, false);
             }
         }
     }
     let index = edges.len();
-    edges.push(SoupEdge { curve, start: a, end: b, uses: Vec::new() });
+    edges.push(SoupEdge { curve, start: a, end: b, uses: Vec::new(), forward: None });
     by_ends.entry(key).or_default().push(index);
     (index, true)
+}
+
+/// Split each edge only one face bounds where the end of another such edge
+/// lies on it, and join the pieces that then meet. Writers often cut a
+/// boundary differently on its two sides: one face's long edge runs past the
+/// corners of two shorter edges of its neighbour (a T-junction), and matched
+/// whole, the long edge and the short ones never pair. A point within `bar`
+/// (two statements of one point) of the edge's curve, away from its ends,
+/// splits it there; the pieces are edges on the same curve between those
+/// vertices, and two pieces (or a piece and an edge) between the same
+/// vertices on one locus become one edge. Every face's loop walks the pieces
+/// in its edge's place. `BREP_IGES_T_JUNCTIONS` (default on; `=0` matches
+/// whole edges only).
+fn split_at_t_junctions(
+    reader: &Translator,
+    edges: &mut Vec<SoupEdge>,
+    faces: &mut [SoupFace],
+    vertices: &[Vec3],
+    resolution: f64,
+) {
+    // Two statements of one point first; what that leaves open, again at ten
+    // times the distance (writers whose sides stand further apart than they
+    // say: 0.012 mm under a stated 0.001).
+    for factor in [1.0, 10.0] {
+        sew_free_edges(reader, edges, faces, vertices, factor * SAME_CURVE_RESOLUTIONS * resolution);
+    }
+}
+
+/// One pass of [`split_at_t_junctions`] at `bar`.
+fn sew_free_edges(reader: &Translator, edges: &mut Vec<SoupEdge>, faces: &mut [SoupFace], vertices: &[Vec3], bar: f64) {
+    let free: Vec<usize> = (0..edges.len()).filter(|&e| edges[e].uses.len() == 1).collect();
+    if free.is_empty() {
+        return;
+    }
+    weld_free_ends(edges, faces, &free, vertices, bar);
+    let free: Vec<usize> = free.into_iter().filter(|&e| edges[e].uses.len() == 1 && edges[e].start != edges[e].end).collect();
+    if free.is_empty() {
+        return;
+    }
+    // The ends of the free edges, on a grid.
+    let mut ends: Vec<usize> = free.iter().flat_map(|&e| [edges[e].start, edges[e].end]).collect();
+    ends.sort_unstable();
+    ends.dedup();
+    let extent = |e: usize| {
+        let curve = &edges[e].curve;
+        let mut points = vec![curve.start, curve.end];
+        points.extend(curve.probes.into_iter().flatten());
+        let chord = curve.start.sub(curve.end).length();
+        (points, chord)
+    };
+    let cell = {
+        let mut chords: Vec<f64> = free.iter().map(|&e| extent(e).1).collect();
+        chords.sort_by(f64::total_cmp);
+        chords[chords.len() / 2].max(1000.0 * bar)
+    };
+    let key = |p: Vec3| [(p.x / cell).floor() as i64, (p.y / cell).floor() as i64, (p.z / cell).floor() as i64];
+    let mut grid: HashMap<[i64; 3], Vec<usize>> = HashMap::default();
+    for &v in &ends {
+        grid.entry(key(vertices[v])).or_default().push(v);
+    }
+    // Each free edge's split points: (fraction along its curve, vertex).
+    let mut pieces_of: Vec<(usize, Vec<(f64, usize)>)> = Vec::new();
+    for &e in &free {
+        // A polyline through the curve, and how far the curve strays from it,
+        // bound where a point on it can be and rule out most candidates
+        // without a search along the curve.
+        let Some((polyline, sag)) = reader.polyline(&edges[e].curve) else { continue };
+        let margin = bar + sag;
+        let corner = |p: Vec3, by: f64| key(Vec3::new(p.x + by, p.y + by, p.z + by));
+        let (mut lo, mut hi) = (corner(polyline[0], -margin), corner(polyline[0], margin));
+        for &p in &polyline {
+            let (low, high) = (corner(p, -margin), corner(p, margin));
+            for axis in 0..3 {
+                lo[axis] = lo[axis].min(low[axis]);
+                hi[axis] = hi[axis].max(high[axis]);
+            }
+        }
+        let mut candidates = Vec::new();
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    if let Some(list) = grid.get(&[x, y, z]) {
+                        candidates.extend(list.iter().copied());
+                    }
+                }
+            }
+        }
+        let (start, end) = (edges[e].start, edges[e].end);
+        let mut splits = Vec::new();
+        for v in candidates {
+            let point = vertices[v];
+            if v == start || v == end || point.sub(vertices[start]).length() <= bar || point.sub(vertices[end]).length() <= bar {
+                continue;
+            }
+            if distance_to_polyline(&polyline, point) > bar + sag {
+                continue;
+            }
+            if let Some((distance, t)) = reader.nearest_on_curve(&edges[e].curve, point) {
+                if distance <= bar && t > 0.0 && t < 1.0 {
+                    splits.push((t, v));
+                }
+            }
+        }
+        if splits.is_empty() {
+            continue;
+        }
+        let at = |v: usize| reader.nearest_on_curve(&edges[e].curve, vertices[v]).map_or(0.0, |(_, t)| t);
+        splits.push((at(start), start));
+        splits.push((at(end), end));
+        splits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        splits.dedup_by_key(|(_, v)| *v);
+        if splits.len() > 2 {
+            pieces_of.push((e, splits));
+        }
+    }
+    // Cut each edge into its pieces and walk them in its place.
+    for (e, splits) in pieces_of {
+        let Ok(entity) = reader.file.entity(edges[e].curve.pointer) else { continue };
+        let Ok(transform) = reader.placed(entity, &edges[e].curve.parent) else { continue };
+        let (low, high) = edges[e].curve.range;
+        let point = |t: f64| reader.curve_point(entity, &transform, low + (high - low) * t);
+        let mut pieces = Vec::with_capacity(splits.len() - 1);
+        for pair in splits.windows(2) {
+            let ((t0, a), (t1, b)) = (pair[0], pair[1]);
+            let (Some(from), Some(to)) = (point(t0), point(t1)) else { break };
+            let probes = point(t0 + 0.25 * (t1 - t0)).zip(point(t0 + 0.5 * (t1 - t0))).map(|(q, h)| [q, h]);
+            let (low, high) = edges[e].curve.range;
+            let range = (low + (high - low) * t0, low + (high - low) * t1);
+            let curve = CurveRef { start: from, end: to, probes, range, ..edges[e].curve.clone() };
+            pieces.push(SoupEdge { curve, start: a, end: b, uses: Vec::new(), forward: Some(true) });
+        }
+        if pieces.len() != splits.len() - 1 {
+            continue;
+        }
+        let (face, along) = edges[e].uses[0];
+        // The walk runs along the curve's parameter when it leaves from the
+        // end that is first along it.
+        let increasing = along == (splits[0].1 == edges[e].start);
+        let first = edges.len();
+        let count = pieces.len();
+        for (offset, mut piece) in pieces.into_iter().enumerate() {
+            let _ = offset;
+            piece.uses.push((face, increasing));
+            edges.push(piece);
+        }
+        let mut walk: Vec<(usize, bool)> = (first..first + count).map(|index| (index, increasing)).collect();
+        if !increasing {
+            walk.reverse();
+        }
+        for coedges in &mut faces[face].loops {
+            if let Some(position) = coedges.iter().position(|&(edge, _)| edge == e) {
+                coedges.splice(position..=position, walk.iter().copied());
+                break;
+            }
+        }
+        edges[e].uses.clear();
+    }
+    // Join what now meets: two one-use edges between the same vertices on one
+    // locus.
+    let mut by_ends: HashMap<(usize, usize), Vec<usize>> = HashMap::default();
+    for index in 0..edges.len() {
+        let edge = &edges[index];
+        if edge.uses.len() == 1 && edge.start != edge.end {
+            by_ends.entry((edge.start.min(edge.end), edge.start.max(edge.end))).or_default().push(index);
+        }
+    }
+    let mut groups: Vec<Vec<usize>> = by_ends.into_values().filter(|group| group.len() > 1).collect();
+    groups.sort_unstable();
+    for group in groups {
+        for i in 0..group.len() {
+            let keep = group[i];
+            if edges[keep].uses.len() != 1 {
+                continue;
+            }
+            for &other in &group[i + 1..] {
+                if edges[other].uses.len() != 1 {
+                    continue;
+                }
+                let (face, along) = edges[other].uses[0];
+                let same_way = edges[other].start == edges[keep].start;
+                let walked = along == same_way;
+                if edges[keep].uses[0] == (face, walked) {
+                    continue;
+                }
+                let bar = bar.max(SAME_CURVE_FRACTION * edges[keep].curve.start.sub(edges[keep].curve.end).length());
+                if !reader.same_locus(&edges[keep].curve, &edges[other].curve, bar) {
+                    continue;
+                }
+                edges[keep].uses.push((face, walked));
+                edges[other].uses.clear();
+                for coedges in &mut faces[face].loops {
+                    for coedge in coedges.iter_mut() {
+                        if *coedge == (other, along) {
+                            *coedge = (keep, walked);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// The least distance from `point` to a polyline.
+fn distance_to_polyline(polyline: &[Vec3], point: Vec3) -> f64 {
+    polyline
+        .windows(2)
+        .map(|pair| {
+            let (a, b) = (pair[0], pair[1]);
+            let along = b.sub(a);
+            let length = along.dot(along);
+            let t = if length > 0.0 { (point.sub(a).dot(along) / length).clamp(0.0, 1.0) } else { 0.0 };
+            point.sub(a.add(along.scale(t))).length()
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Weld the ends of edges only one face bounds where they stand within `bar`
+/// of each other: one corner the two sides state a little apart, further
+/// than the file's resolution, which welding by position alone left as two
+/// vertices. First, such an edge that lies wholly within `bar` (a speck one
+/// side states at a corner and the other does not) leaves its loop, and its
+/// ends are one vertex. Otherwise two ends of one edge are never welded (that
+/// would fold it onto a point).
+fn weld_free_ends(edges: &mut [SoupEdge], faces: &mut [SoupFace], free: &[usize], vertices: &[Vec3], bar: f64) {
+    let mut root: HashMap<usize, usize> = HashMap::default();
+    fn find(root: &HashMap<usize, usize>, mut v: usize) -> usize {
+        while let Some(&up) = root.get(&v) {
+            v = up;
+        }
+        v
+    }
+    let shared: Vec<(usize, usize)> = edges.iter().filter(|e| e.uses.len() > 1).map(|e| (e.start, e.end)).collect();
+    for &e in free {
+        let curve = &edges[e].curve;
+        let mut points = vec![curve.start, curve.end];
+        points.extend(curve.probes.into_iter().flatten());
+        let speck = points.iter().all(|p| points.iter().all(|q| p.sub(*q).length() <= bar))
+            && vertices[edges[e].start].sub(vertices[edges[e].end]).length() <= bar;
+        let (a, b) = (find(&root, edges[e].start), find(&root, edges[e].end));
+        // An edge two faces share between these two vertices (as they now
+        // weld) must keep its length.
+        let between = |(start, end): &(usize, usize)| {
+            let (c, d) = (find(&root, *start), find(&root, *end));
+            (c == a && d == b) || (c == b && d == a)
+        };
+        if !speck || (a != b && shared.iter().any(between)) {
+            continue;
+        }
+        let (face, along) = edges[e].uses[0];
+        let Some(coedges) = faces[face].loops.iter_mut().find(|coedges| coedges.contains(&(e, along))) else { continue };
+        if coedges.len() < 2 {
+            continue;
+        }
+        coedges.retain(|&coedge| coedge != (e, along));
+        edges[e].uses.clear();
+        if a != b {
+            root.insert(a.max(b), a.min(b));
+        }
+    }
+    let ends: Vec<usize> = {
+        let mut ends: Vec<usize> =
+            free.iter().filter(|&&e| !edges[e].uses.is_empty()).flat_map(|&e| [edges[e].start, edges[e].end]).collect();
+        ends.sort_unstable();
+        ends.dedup();
+        ends
+    };
+    let key = |p: Vec3| [(p.x / bar).floor() as i64, (p.y / bar).floor() as i64, (p.z / bar).floor() as i64];
+    let mut grid: HashMap<[i64; 3], Vec<usize>> = HashMap::default();
+    for &v in &ends {
+        grid.entry(key(vertices[v])).or_default().push(v);
+    }
+    // Vertices joined by an edge, which must stay apart, kept by the vertex
+    // each now welds to as welds are made.
+    let mut adjacent: HashMap<usize, HashSet<usize>> = HashMap::default();
+    for edge in edges.iter().filter(|e| !e.uses.is_empty()) {
+        let (a, b) = (find(&root, edge.start), find(&root, edge.end));
+        if a != b {
+            adjacent.entry(a).or_default().insert(b);
+            adjacent.entry(b).or_default().insert(a);
+        }
+    }
+    for &v in &ends {
+        let k = key(vertices[v]);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let Some(list) = grid.get(&[k[0] + dx, k[1] + dy, k[2] + dz]) else { continue };
+                    for &w in list {
+                        if w <= v || vertices[v].sub(vertices[w]).length() > bar {
+                            continue;
+                        }
+                        let (a, b) = (find(&root, v), find(&root, w));
+                        if a == b || adjacent.get(&a).is_some_and(|near| near.contains(&b)) {
+                            continue;
+                        }
+                        let (keep, drop) = (a.min(b), a.max(b));
+                        root.insert(drop, keep);
+                        for neighbour in adjacent.remove(&drop).unwrap_or_default() {
+                            if let Some(near) = adjacent.get_mut(&neighbour) {
+                                near.remove(&drop);
+                                near.insert(keep);
+                            }
+                            adjacent.entry(keep).or_default().insert(neighbour);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if root.is_empty() {
+        return;
+    }
+    for edge in edges.iter_mut() {
+        edge.start = find(&root, edge.start);
+        edge.end = find(&root, edge.end);
+    }
 }
 
 /// Propagate agreement across shared edges. Returns per-face flips and the
@@ -378,18 +727,36 @@ impl FaceSets {
         let mut out = Translator::new(file, scale, split_bridges);
         let mut vertex_ids: HashMap<usize, usize> = HashMap::default();
         let mut edge_ids: HashMap<usize, usize> = HashMap::default();
-        let shell = self.shell(&mut out, outer, flip, &mut vertex_ids, &mut edge_ids)?;
+        let shell = self.shell(&mut out, outer, flip, &mut vertex_ids, &mut edge_ids, "CLOSED_SHELL")?;
         if voids.is_empty() {
             out.add(format!("MANIFOLD_SOLID_BREP('',#{shell})"));
         } else {
             let mut cavities = Vec::with_capacity(voids.len());
             for (faces, void_flip) in voids {
-                let void_shell = self.shell(&mut out, faces, *void_flip, &mut vertex_ids, &mut edge_ids)?;
+                let void_shell = self.shell(&mut out, faces, *void_flip, &mut vertex_ids, &mut edge_ids, "CLOSED_SHELL")?;
                 cavities.push(format!("#{}", out.add(format!("ORIENTED_CLOSED_SHELL('',*,#{void_shell},.T.)"))));
             }
             out.add(format!("BREP_WITH_VOIDS('',#{shell},({}))", cavities.join(",")));
         }
         Ok(out.finish(&format!("sets{}", outer.first().copied().unwrap_or(0))))
+    }
+
+    /// A Part 21 document holding `body` as one open shell of a surface model:
+    /// a set that does not close, as a sheet. Its faces keep the senses their
+    /// agreement along shared edges gives them.
+    pub(in super::super) fn to_step_sheet(
+        &self,
+        file: &IgesFile,
+        scale: f64,
+        body: &[usize],
+        split_bridges: bool,
+    ) -> Result<String, String> {
+        let mut out = Translator::new(file, scale, split_bridges);
+        let mut vertex_ids: HashMap<usize, usize> = HashMap::default();
+        let mut edge_ids: HashMap<usize, usize> = HashMap::default();
+        let shell = self.shell(&mut out, body, false, &mut vertex_ids, &mut edge_ids, "OPEN_SHELL")?;
+        out.add(format!("SHELL_BASED_SURFACE_MODEL('',(#{shell}))"));
+        Ok(out.finish(&format!("sheet{}", body.first().copied().unwrap_or(0))))
     }
 
     fn shell(
@@ -399,6 +766,7 @@ impl FaceSets {
         flip: bool,
         vertex_ids: &mut HashMap<usize, usize>,
         edge_ids: &mut HashMap<usize, usize>,
+        kind: &str,
     ) -> Result<usize, String> {
         let mut face_ids = Vec::with_capacity(body.len());
         for &index in body {
@@ -441,7 +809,7 @@ impl FaceSets {
                 ))
             ));
         }
-        Ok(out.add(format!("CLOSED_SHELL('',({}))", face_ids.join(","))))
+        Ok(out.add(format!("{kind}('',({}))", face_ids.join(","))))
     }
 
     fn vertex_id(
@@ -478,8 +846,10 @@ impl FaceSets {
         let start = self.vertex_id(out, record.start, vertex_ids);
         let end = self.vertex_id(out, record.end, vertex_ids);
         let (from, to) = (self.vertices[record.start], self.vertices[record.end]);
-        let same_sense = curve.start.sub(from).length() + curve.end.sub(to).length()
-            <= curve.start.sub(to).length() + curve.end.sub(from).length();
+        let same_sense = record.forward.unwrap_or_else(|| {
+            curve.start.sub(from).length() + curve.end.sub(to).length()
+                <= curve.start.sub(to).length() + curve.end.sub(from).length()
+        });
         let id = out.add(format!(
             "EDGE_CURVE('',#{start},#{end},#{},{})",
             curve.id,
@@ -494,7 +864,218 @@ impl FaceSets {
     }
 }
 
+/// Where a boundary piece starts and ends, walked as the boundary walks it.
+fn walked_ends((curve, reversed): &(CurveRef, bool)) -> (Vec3, Vec3) {
+    if *reversed {
+        (curve.end, curve.start)
+    } else {
+        (curve.start, curve.end)
+    }
+}
+
+/// The widest step from one piece of a closed boundary to the next.
+fn widest_joint(boundary: &[(CurveRef, bool)]) -> f64 {
+    (0..boundary.len())
+        .map(|index| walked_ends(&boundary[index]).1.sub(walked_ends(&boundary[(index + 1) % boundary.len()]).0).length())
+        .fold(0.0, f64::max)
+}
+
+/// Turn round the pieces of a closed boundary that the file states against
+/// the walk. A composite curve (102) lists members each starting where the
+/// last ends, but some writers state a member end to start: walked as
+/// written, the boundary steps across that member's length at both of its
+/// ends. Each piece is turned to the sense whose ends meet its neighbours'
+/// (whichever way those run), and the turned boundary is kept only when every
+/// joint then closes within `bar` (two statements of one point); a boundary
+/// that already closes, or that no turning closes, stays as the file states it.
+/// `BREP_IGES_MEMBER_TURN` (default on; `=0` walks every member as stated).
+fn orient_members(boundary: &mut [(CurveRef, bool)], bar: f64) {
+    let count = boundary.len();
+    if count < 2 || widest_joint(boundary) <= bar || !crate::switch!("BREP_IGES_MEMBER_TURN", true) {
+        return;
+    }
+    let nearest = |point: Vec3, piece: &(CurveRef, bool)| {
+        point.sub(piece.0.start).length().min(point.sub(piece.0.end).length())
+    };
+    let mut turned = boundary.to_vec();
+    if count == 2 {
+        // Two pieces are each other's neighbour at both ends: the first sets
+        // the walk and the second follows it.
+        let leaves = walked_ends(&turned[0]).1;
+        let (start, end) = walked_ends(&turned[1]);
+        if leaves.sub(end).length() < leaves.sub(start).length() {
+            turned[1].1 = !turned[1].1;
+        }
+    } else {
+        for index in 0..count {
+            let (before, after) = (&boundary[(index + count - 1) % count], &boundary[(index + 1) % count]);
+            let (start, end) = walked_ends(&boundary[index]);
+            let as_walked = nearest(start, before) + nearest(end, after);
+            let against = nearest(end, before) + nearest(start, after);
+            if against < as_walked {
+                turned[index].1 = !turned[index].1;
+            }
+        }
+    }
+    if widest_joint(&turned) <= bar {
+        boundary.clone_from_slice(&turned);
+    }
+}
+
 impl Translator<'_> {
+    /// Remove the specks of spikes from a closed boundary: a piece no longer
+    /// than `bar` followed by one that walks straight back along it bounds
+    /// nothing (a sliver of no width and no length) and would be one edge
+    /// walked twice the same way round the face. A longer out-and-back pair is
+    /// a seam's two sides on a periodic surface and stays. Pieces are removed
+    /// in such pairs while more than two remain. `BREP_IGES_DROP_SPIKES`
+    /// (default on; `=0` keeps them).
+    fn drop_spikes(&self, boundary: &mut Vec<(CurveRef, bool)>, bar: f64) {
+        if !crate::switch!("BREP_IGES_DROP_SPIKES", true) {
+            return;
+        }
+        let mut index = 0;
+        while boundary.len() > 2 && index < boundary.len() {
+            let next = (index + 1) % boundary.len();
+            let (out, back) = (&boundary[index], &boundary[next]);
+            let returns = walked_ends(out).0.sub(walked_ends(back).1).length() <= bar
+                && walked_ends(out).1.sub(walked_ends(back).0).length() <= bar;
+            let speck = |piece: &CurveRef| {
+                let mut points = vec![piece.start, piece.end];
+                points.extend(piece.probes.into_iter().flatten());
+                points.iter().all(|p| points.iter().all(|q| p.sub(*q).length() <= bar))
+            };
+            if returns && speck(&out.0) && speck(&back.0) && self.same_locus(&out.0, &back.0, bar) {
+                let (first, second) = (index.max(next), index.min(next));
+                boundary.remove(first);
+                boundary.remove(second);
+                index = index.saturating_sub(1);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Whether two statements of a curve between the same ends are one locus:
+    /// points at every 32nd of each (by its own parameter) lie within `bar`
+    /// of the other, so a bulge between a few probes is not missed. (One
+    /// narrower than a 32nd of a curve's parameter range can still pass.)
+    fn same_locus(&self, first: &CurveRef, second: &CurveRef, bar: f64) -> bool {
+        const POINTS: usize = 32;
+        let on = |piece: &CurveRef, locus: &CurveRef| {
+            let Ok(entity) = self.file.entity(piece.pointer) else { return false };
+            let Ok(transform) = self.placed(entity, &piece.parent) else { return false };
+            // The locus's polyline (its samples) says which stretch of it a
+            // point is nearest; the search along the curve there answers. No
+            // point is settled on the polyline alone (its sag is sampled, not
+            // a bound).
+            let Some((polyline, _)) = self.polyline(locus) else { return false };
+            let (low, high) = piece.range;
+            (1..POINTS).all(|i| {
+                let Some(point) = self.curve_point(entity, &transform, low + (high - low) * i as f64 / POINTS as f64) else {
+                    return false;
+                };
+                self.within_near_polyline(locus, &polyline, point, bar)
+            })
+        };
+        on(first, second) && on(second, first)
+    }
+
+    /// Whether a point of the curve stands within `bar` of `point`: the search
+    /// runs by golden section over the two segments either side of the
+    /// curve's polyline vertex (from [`Self::polyline`]; its vertices are
+    /// curve points) nearest `point`, and stops at the first curve point
+    /// within `bar`, which settles it.
+    fn within_near_polyline(&self, curve: &CurveRef, polyline: &[Vec3], point: Vec3, bar: f64) -> bool {
+        let Some(segments) = polyline.len().checked_sub(1).filter(|&n| n > 0) else { return false };
+        let (seed, nearest) = polyline
+            .iter()
+            .enumerate()
+            .map(|(index, vertex)| (index, vertex.sub(point).length()))
+            .fold((0, f64::INFINITY), |best, candidate| if candidate.1 < best.1 { candidate } else { best });
+        if nearest <= bar {
+            return true;
+        }
+        let Ok(entity) = self.file.entity(curve.pointer) else { return false };
+        let Ok(transform) = self.placed(entity, &curve.parent) else { return false };
+        let (low, high) = curve.range;
+        let distance = |t: f64| self.curve_point(entity, &transform, low + (high - low) * t).map(|at| at.sub(point).length());
+        let step = 1.0 / segments as f64;
+        let (mut lo, mut hi) = (((seed as f64 - 1.0) * step).max(0.0), ((seed as f64 + 1.0) * step).min(1.0));
+        let ratio = (5f64.sqrt() - 1.0) / 2.0;
+        for _ in 0..40 {
+            let (left, right) = (hi - ratio * (hi - lo), lo + ratio * (hi - lo));
+            let (Some(dl), Some(dr)) = (distance(left), distance(right)) else { return false };
+            if dl <= bar || dr <= bar {
+                return true;
+            }
+            if dl < dr {
+                hi = right;
+            } else {
+                lo = left;
+            }
+        }
+        false
+    }
+
+    /// A boundary curve as a polyline through evenly spaced parameters, with
+    /// a bound on how far the curve strays from it: twice the widest gap
+    /// between a chord's middle and the curve's point half way across it.
+    fn polyline(&self, curve: &CurveRef) -> Option<(Vec<Vec3>, f64)> {
+        const SEGMENTS: usize = 32;
+        let entity = self.file.entity(curve.pointer).ok()?;
+        let transform = self.placed(entity, &curve.parent).ok()?;
+        let (low, high) = curve.range;
+        let at = |t: f64| self.curve_point(entity, &transform, low + (high - low) * t);
+        let points: Vec<Vec3> = (0..=SEGMENTS).map(|i| at(i as f64 / SEGMENTS as f64)).collect::<Option<_>>()?;
+        let mut sag = 0.0f64;
+        for i in 0..SEGMENTS {
+            let middle = at((i as f64 + 0.5) / SEGMENTS as f64)?;
+            sag = sag.max(middle.sub(points[i].add(points[i + 1]).scale(0.5)).length());
+        }
+        Some((points, 2.0 * sag))
+    }
+
+    /// How far `point` stands from a boundary curve as the file states it,
+    /// and the fraction along the piece (0 at its start and 1 at its end, by
+    /// the curve's parameter) where it is nearest: the nearest of an even
+    /// sampling, refined by golden section between the samples either side of
+    /// it. `None` when the curve cannot be evaluated.
+    fn nearest_on_curve(&self, curve: &CurveRef, point: Vec3) -> Option<(f64, f64)> {
+        const SAMPLES: usize = 32;
+        let entity = self.file.entity(curve.pointer).ok()?;
+        let transform = self.placed(entity, &curve.parent).ok()?;
+        let (low, high) = curve.range;
+        let distance = |t: f64| self.curve_point(entity, &transform, low + (high - low) * t).map(|at| at.sub(point).length());
+        let mut best = (0usize, f64::INFINITY);
+        for index in 0..=SAMPLES {
+            let d = distance(index as f64 / SAMPLES as f64)?;
+            if d < best.1 {
+                best = (index, d);
+            }
+        }
+        let step = 1.0 / SAMPLES as f64;
+        let (mut lo, mut hi) = (((best.0 as f64 - 1.0) * step).max(0.0), ((best.0 as f64 + 1.0) * step).min(1.0));
+        let ratio = (5f64.sqrt() - 1.0) / 2.0;
+        let mut nearest = (best.1, best.0 as f64 * step);
+        for _ in 0..40 {
+            let (left, right) = (hi - ratio * (hi - lo), lo + ratio * (hi - lo));
+            let (dl, dr) = (distance(left)?, distance(right)?);
+            if dl < nearest.0 {
+                nearest = (dl, left);
+            }
+            if dr < nearest.0 {
+                nearest = (dr, right);
+            }
+            if dl < dr {
+                hi = right;
+            } else {
+                lo = left;
+            }
+        }
+        Some(nearest)
+    }
+
     /// A 144 or 143 as (surface pointer, its boundaries). Each boundary is its
     /// curves in order, each with whether it is walked against its own direction.
     #[allow(clippy::type_complexity)]
@@ -515,6 +1096,10 @@ impl Translator<'_> {
             boundaries.push(self.curve_on_surface(outer, parent)?);
             for index in 0..inner {
                 boundaries.push(self.curve_on_surface(entity.int(4 + index)?, parent)?);
+            }
+            for boundary in &mut boundaries {
+                orient_members(boundary, SAME_CURVE_RESOLUTIONS * self.resolution);
+                self.drop_spikes(boundary, SAME_CURVE_RESOLUTIONS * self.resolution);
             }
             return Ok((surface, boundaries));
         }
@@ -543,6 +1128,8 @@ impl Translator<'_> {
                 }
                 pieces.extend(run);
             }
+            orient_members(&mut pieces, SAME_CURVE_RESOLUTIONS * self.resolution);
+            self.drop_spikes(&mut pieces, SAME_CURVE_RESOLUTIONS * self.resolution);
             boundaries.push(pieces);
         }
         Ok((surface, boundaries))
@@ -596,7 +1183,7 @@ impl Translator<'_> {
         let start = at(0.0).ok_or_else(|| format!("curve DE {pointer} (entity {}) cannot be read as a boundary", entity.de.entity_type))?;
         let end = at(1.0).ok_or_else(|| format!("curve DE {pointer} cannot be read as a boundary"))?;
         let probes = at(0.25).zip(at(0.5)).map(|(a, b)| [a, b]);
-        Ok(CurveRef { pointer, parent: *parent, start, end, probes })
+        Ok(CurveRef { pointer, parent: *parent, start, end, probes, range: (0.0, 1.0) })
     }
 
     /// The point a fraction `t` along a curve, in mm.

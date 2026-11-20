@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_deform_face" brep:unicode="E0E1">
+  <!-- A block whose top face is pushed up into a smooth bump, an arrow on the pick. -->
+  <path d="M2.5 18 9.3 22.9 9.3 18.9 2.5 14Z" fill="#f0b840" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M9.3 22.9 21 17.5 21 13.5 9.3 18.9Z" fill="#d4901f" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M2.5 14 14.2 8.5 21 13.5 9.3 18.9Z" fill="#ffd977" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M6.2 15.2C9 14.6 9.6 9.6 11.8 9.3 14 9 15 13.2 17.6 12.6" fill="#a5e8c4" stroke="#2fa469" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M11.8 7.6V1.8M9.6 4 11.8 1.8 14 4" style="fill:none" stroke="#3d86c4" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

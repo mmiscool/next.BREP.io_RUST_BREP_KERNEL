@@ -191,10 +191,26 @@ pub use image_curve::{affine_image_curve, image_curve, image_curve_pair, ImageCu
 pub mod surface;
 pub use surface::{
     carrier_preview_patch, make_cone_surface, make_cylinder_surface, make_extrusion, make_plane,
-    make_revolution, make_sphere_surface, make_sphere_surface_framed, make_torus_surface,
-    ExtendRefusal, NurbsSurface, SurfaceSide, WeightSite, MAXIMUM_FOLD_ANGLE,
-    MAXIMUM_GROWTH_RATIO,
+    make_revolution, make_revolution_one_span, make_sphere_surface, make_sphere_surface_framed, make_torus_surface,
+    ExtendRefusal, KnotDirection, KnotRefinementRefusal, NurbsSurface, SurfaceSide, WeightSite,
+    MAXIMUM_FOLD_ANGLE, MAXIMUM_GROWTH_RATIO,
 };
+#[path = "geometry/deform.rs"]
+#[doc(hidden)]
+pub mod deform;
+pub use deform::{
+    deform_surface, deform_surface_where, deform_surfaces_tied, DeformPick, PoleSupport, SurfaceTie, TieContinuity,
+    TiedResult, TiedSurface, DeformRefusal, DeformResult, DeformSide, DeformSpec,
+    EdgeHold,
+};
+#[path = "geometry/bezier_triangle.rs"]
+#[doc(hidden)]
+pub mod bezier_triangle;
+pub use bezier_triangle::{BezierTriangle, BezierTriangleRefusal, TrianglePiece, TriangleSide};
+#[path = "geometry/t_spline.rs"]
+#[doc(hidden)]
+pub mod t_spline;
+pub use t_spline::{TAnchor, TMesh, TMeshSegment, TSpline, TSplineRefusal};
 #[path = "geometry/coons.rs"]
 #[doc(hidden)]
 pub mod coons;
@@ -206,6 +222,14 @@ pub use coons::{
 #[doc(hidden)]
 pub mod gordon;
 pub use gordon::{gordon_surface, gordon_surface_reported, GordonRefusal, GordonReport};
+#[path = "geometry/n_sided.rs"]
+#[doc(hidden)]
+pub mod n_sided;
+pub use n_sided::{n_sided_fill, n_sided_fill_shortening_reach, n_sided_fill_shortening_reach_spokes_off_sides, reentrant_corners as n_sided_reentrant_corners, NSidedRefusal, NSidedReport};
+#[path = "geometry/regularity.rs"]
+#[doc(hidden)]
+pub mod regularity;
+pub use regularity::{certify_regular, Irregularity, RegularityReport};
 #[path = "geometry/analytic_surface.rs"]
 #[doc(hidden)]
 pub mod analytic_surface;
@@ -253,6 +277,9 @@ pub use curve_surface_intersection::{intersect_curve_surface, CurveSurfaceInters
 #[path = "intersect/exact_line_surface.rs"]
 #[doc(hidden)]
 pub mod exact_line_surface;
+#[path = "intersect/curve_clear.rs"]
+#[doc(hidden)]
+pub mod curve_clear;
 #[path = "intersect/curve_curve_intersection.rs"]
 #[doc(hidden)]
 pub mod curve_curve_intersection;
@@ -265,6 +292,7 @@ pub use surface_surface_intersection::{
     SurfaceIntersectionOptions,
 };
 pub use surface_surface_intersection::TRANSVERSE_SEED_CROSS;
+pub use surface_surface_intersection::{carriers_proved_apart, hull_sets_proved_apart, separation_prefilter_enabled, SpanHullSet};
 #[path = "intersect/tangent_curve.rs"]
 #[doc(hidden)]
 pub mod tangent_curve;

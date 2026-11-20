@@ -301,6 +301,87 @@ pub fn generatrix_is_meridional_half_ray(
     })
 }
 
+/// `BREP_PARTIAL_SPHERE` (default off, `1` on): a revolution of any sweep
+/// whose generatrix is an arc of a circle centred on the axis reads as its
+/// sphere ([`meridian_arc_sphere`]), not only a full pole-to-pole meridian
+/// swept all round.
+fn partial_sphere_enabled() -> bool {
+    crate::switch!(live "BREP_PARTIAL_SPHERE", false)
+}
+
+/// The sphere a revolution sweeps when its generatrix is a circular arc in
+/// the start meridian half-plane centred on the axis. The centre is the axis
+/// point equidistant from the generatrix's ends; the arc is PROVED circular
+/// span by span, exactly: the generatrix must be a rational quadratic in
+/// Bezier form (every interior knot doubled), and each span's ends lie at the
+/// radius, its middle control point on both end tangents, and its middle
+/// weight (normalized by the end weights) is the cosine of half the span's
+/// angle, which is what a circular arc's quadratic is.
+fn meridian_arc_sphere(frame: &RevolutionFrame, generatrix: &NurbsCurve) -> Option<(Vec3, f64)> {
+    if !generatrix_is_meridional_half_ray(generatrix, frame) || generatrix.degree != 2 {
+        return None;
+    }
+    let controls = &generatrix.control_points;
+    if controls.len() < 3 || controls.len() % 2 == 0 {
+        return None;
+    }
+    // Bezier form: knots 0,0,0, a,a, b,b, ..., 1,1,1.
+    let knots = &generatrix.knots;
+    if knots.len() != controls.len() + 3 {
+        return None;
+    }
+    for span in 0..(controls.len() - 1) / 2 {
+        if span > 0 && knots[2 * span + 1] != knots[2 * span + 2] {
+            return None;
+        }
+    }
+    let start = controls[0].point().ok()?;
+    let end = controls[controls.len() - 1].point().ok()?;
+    let (_, rho0, z0) = frame.cylindrical(start);
+    let (_, rho1, z1) = frame.cylindrical(end);
+    let scale = curve_scale(generatrix);
+    let tolerance = RECOGNITION_TOLERANCE * scale.max(1.0);
+    if (z1 - z0).abs() <= tolerance {
+        return None;
+    }
+    let center_z = (z1 * z1 - z0 * z0 + rho1 * rho1 - rho0 * rho0) / (2.0 * (z1 - z0));
+    let center = frame.origin.add(frame.axis.scale(center_z));
+    let radius = start.sub(center).length();
+    if !(radius > tolerance) {
+        return None;
+    }
+    for span in 0..(controls.len() - 1) / 2 {
+        let (c0, c1, c2) = (controls[2 * span], controls[2 * span + 1], controls[2 * span + 2]);
+        let (p0, p1, p2) = (c0.point().ok()?, c1.point().ok()?, c2.point().ok()?);
+        let (r0, r2) = (p0.sub(center), p2.sub(center));
+        if (r0.length() - radius).abs() > tolerance || (r2.length() - radius).abs() > tolerance {
+            return None;
+        }
+        // The middle control point on both end tangents.
+        if p1.sub(p0).dot(r0).abs() > tolerance * radius || p1.sub(p2).dot(r2).abs() > tolerance * radius {
+            return None;
+        }
+        // The middle weight is cos(half the span's angle).
+        if !(c0.w > 0.0 && c2.w > 0.0) {
+            return None;
+        }
+        // A span that turns: distinct ends.
+        if p2.sub(p0).length() <= tolerance {
+            return None;
+        }
+        let cos_angle = (r0.dot(r2) / (radius * radius)).clamp(-1.0, 1.0);
+        let cos_half = ((1.0 + cos_angle) * 0.5).sqrt();
+        // The tangents meet at r / cos(half the angle) from the centre.
+        if !(cos_half > 1e-12) || (p1.sub(center).length() - radius / cos_half).abs() > tolerance / cos_half {
+            return None;
+        }
+        if (c1.w / (c0.w * c2.w).sqrt() - cos_half).abs() > 1e-9 {
+            return None;
+        }
+    }
+    Some((center, radius))
+}
+
 impl AnalyticSurface {
     /// The centre and radius of a carrier that IS a sphere, whichever way
     /// it is parameterized.
@@ -329,12 +410,13 @@ impl AnalyticSurface {
                 generatrix,
                 ..
             } => {
+                let partial = || partial_sphere_enabled().then(|| meridian_arc_sphere(frame, generatrix)).flatten();
                 if *sweep < std::f64::consts::TAU - 1e-9 {
-                    return None;
+                    return partial();
                 }
                 let controls = &generatrix.control_points;
                 if generatrix.degree != 2 || controls.len() != 5 {
-                    return None;
+                    return partial();
                 }
                 let start = controls[0].point().ok()?;
                 let end = controls[4].point().ok()?;
@@ -471,3 +553,4 @@ pub fn curve_scale(curve: &NurbsCurve) -> f64 {
         .map(|p| (p.x.abs() / p.w).max(p.y.abs() / p.w).max(p.z.abs() / p.w))
         .fold(0.0, f64::max)
 }
+

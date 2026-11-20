@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="worm" brep:unicode="E0EF">
+  <path d="M80 300H920V700H80Z" fill="#7a4d10"/>
+  <path d="M110 330H890V670H110Z" fill="#f0b840"/>
+  <path d="M110 670L180 670L260 330L190 330Z M230 670L300 670L380 330L310 330Z M350 670L420 670L500 330L430 330Z M470 670L540 670L620 330L550 330Z M590 670L660 670L740 330L670 330Z M710 670L780 670L860 330L790 330Z" fill="#c9871a"/>
+</svg>

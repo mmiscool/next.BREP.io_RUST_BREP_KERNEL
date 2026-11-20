@@ -74,7 +74,7 @@ fn referenced(later: &[String], name: Option<&String>) -> bool {
 /// A closed periodic curve or row list rotated to start at knot `c` (an
 /// interior knot of multiplicity `degree`): `None` unless every moved knot
 /// round-trips bit for bit.
-fn rotate_closed<T: Clone>(knots: &[f64], degree: usize, items: &[T], c: f64) -> Option<(Vec<f64>, Vec<T>)> {
+pub(crate) fn rotate_closed<T: Clone>(knots: &[f64], degree: usize, items: &[T], c: f64) -> Option<(Vec<f64>, Vec<T>)> {
     let (k0, k1) = (*knots.first()?, *knots.last()?);
     if knots.len() != items.len() + degree + 1 || knots.iter().filter(|&&knot| knot == c).count() != degree {
         return None;
@@ -103,7 +103,7 @@ fn rotate_closed<T: Clone>(knots: &[f64], degree: usize, items: &[T], c: f64) ->
 }
 
 /// The interior knots of multiplicity `degree`.
-fn full_knots(knots: &[f64], degree: usize) -> Vec<(f64, usize)> {
+pub(crate) fn full_knots(knots: &[f64], degree: usize) -> Vec<(f64, usize)> {
     let mut found: Vec<(f64, usize)> = Vec::new();
     for (index, &knot) in knots.iter().enumerate().skip(degree + 1).take(knots.len().saturating_sub(2 * degree + 2)) {
         if found.last().is_some_and(|&(last, _)| last == knot) {

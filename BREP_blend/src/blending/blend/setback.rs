@@ -528,6 +528,12 @@ fn anchored_t(marcher: &Marcher, seed_t: f64, lock: f64) -> Result<f64, KernelRe
 /// when the rim's loop is seam-structured), doubled until cubic rails
 /// through them hold the solved mid-stations to `rail_bar`; the last
 /// station carries the carriers' period.
+/// `BREP_BLEND_SETBACK_EXACT_REVOLUTION` (on by default; `=0` restores the
+/// doubling march): see `march_closed`.
+pub(crate) fn setback_exact_revolution_on() -> bool {
+    switch!(live "BREP_BLEND_SETBACK_EXACT_REVOLUTION", true)
+}
+
 pub(super) fn march_closed(
     solid: &BrepSolid,
     edge: &EdgeRecord,
@@ -569,12 +575,27 @@ pub(super) fn march_closed(
     // The march's own rail bar, and no looser than 1e-9 of the model scale:
     // the rails bound the removed volume, which is read to 1e-9 of the part.
     let bar = rail_bar.min(1e-9 * scale);
+    // `BREP_BLEND_SETBACK_EXACT_REVOLUTION`: two mates rotationally symmetric
+    // about one axis with the rim a circle about it (a hemisphere's rim) make
+    // every section the first one turned, and the closed rim's rows are then
+    // built as the exact revolution of one section
+    // (`exact_closed_revolution_rows`), whatever the station count: the
+    // first round of stations is the answer, as for a fillet on that lane
+    // (its seed stations only). Without it the count doubles until cubic
+    // rails through the stations hold the circles to 1e-9 of the part (1024
+    // stations on a radius-5 rim, each solved and classified in its face).
+    let exact_revolution = setback_exact_revolution_on() && crate::blend::stations::closed_revolution_axis(first, second).is_some();
     let mut count = 32usize;
     let mut misses = Vec::new();
     loop {
         let mut stations = marcher.uniform(from, span, count)?;
         let ts: Vec<f64> = (0..=count).map(|index| from + span * index as f64 / count as f64).collect();
-        let miss = fit_miss(&marcher, &ts, &stations)?;
+        let miss = if exact_revolution {
+            crate::blend::record_count("count.setback.exact_revolution", 1);
+            0.0
+        } else {
+            fit_miss(&marcher, &ts, &stations)?
+        };
         misses.push(miss);
         if std::env::var_os("BREP_DEBUG_SETBACK").is_some() {
             eprintln!("setback march: {} stations, rail miss {miss:.3e} (bar {bar:.3e})", stations.len());

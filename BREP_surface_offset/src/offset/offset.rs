@@ -1532,11 +1532,178 @@ fn offset_surface_constructed(
             same_sense: face.same_sense,
         },
     );
-    Ok((
-        refine_offset_fit(reference, &reference_offsets, distance, fitted)?,
-        OffsetSurfaceLane::Fit,
-        extended_source,
-    ))
+    let refined = refine_offset_fit(reference, &reference_offsets, distance, fitted)?;
+    if extended_source.is_none() && fit_over_trim_on() {
+        // The cropped support is returned as the surface the carrier is the
+        // offset of, so a measurement reads it over the crop, not past it.
+        if let Some((cropped, support)) = offset_fit_over_trim(face, distance, &refined, &reference_offsets, sphere_reading)? {
+            return Ok((cropped, OffsetSurfaceLane::Fit, Some(support)));
+        }
+    }
+    Ok((refined, OffsetSurfaceLane::Fit, extended_source))
+}
+
+/// `BREP_OFFSET_FIT_OVER_TRIM` (default on since the 2026-11-18 promotion;
+/// `=0` keeps the whole-support fit): a free-form
+/// carrier whose refined fit still misses the fit contract is fitted again
+/// over the face's trim (with a margin), where that reads at least four times
+/// closer ([`offset_fit_over_trim`]).
+///
+/// [`refine_offset_fit`] reads its deviation over the whole support, and one
+/// spot it cannot improve ends its rounds for the whole surface ("stopped
+/// improving"). A support can run far past its face: a fillet's rim strip
+/// round a boss whose cylinder the boolean rejoined across its seam spans u in
+/// [0, 1] with its face on [0.165, 0.861], and the strip's offset stalled at
+/// 7e-5 to 1.1e-4 at u = 0.917, OFF the face, against a contract of 2e-6, at
+/// every seam position of that kind. The shell then refused, or built off its
+/// oracle. Over the trim the same offset fits to 5e-8.
+pub fn fit_over_trim_on() -> bool {
+    switch!("BREP_OFFSET_FIT_OVER_TRIM", true)
+}
+
+thread_local! {
+    /// Set while [`offset_fit_over_trim`] fits its cropped face: its own fit
+    /// must not crop again.
+    static FITTING_OVER_TRIM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The offset of `face`'s support restricted to its trim's parameter box
+/// cropped halfway from the trim to the nearest stalled site on each side, when `refined`
+/// misses the fit contract and the cropped fit reads at least four times
+/// closer; `None` otherwise. The restriction is exact knot insertion, so the
+/// same (u, v) names the same point and every pcurve on the face still holds.
+fn offset_fit_over_trim(
+    face: &FaceRecord,
+    distance: f64,
+    refined: &NurbsSurface,
+    evaluator: &OffsetEvaluator,
+    sphere_reading: &mut Option<f64>,
+) -> Result<Option<(NurbsSurface, NurbsSurface)>, KernelRefusal> {
+    if FITTING_OVER_TRIM.with(std::cell::Cell::get) {
+        return Ok(None);
+    }
+    let source = &face.surface;
+    let contract = offset_fit_contract(source);
+    let Ok(whole) = offset_fit_deviation(refined, evaluator, distance) else {
+        return Ok(None);
+    };
+    if whole.worst() <= contract {
+        return Ok(None);
+    }
+    let [u0, u1] = source.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+    let [v0, v1] = source.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+    // Positive-weight pcurves lie in their control hull: the box cannot crop a
+    // curved trim's extremum between stations.
+    let mut bounds = [u1, u0, v1, v0];
+    for coedge in face.loops.iter().flat_map(|lp| &lp.coedges) {
+        for control in &coedge.pcurve.control_points {
+            let uv = control.point().or_refuse(KernelStage::Refine, "point")?;
+            bounds[0] = bounds[0].min(uv.x);
+            bounds[1] = bounds[1].max(uv.x);
+            bounds[2] = bounds[2].min(uv.y);
+            bounds[3] = bounds[3].max(uv.y);
+        }
+    }
+    if !(bounds[0] < bounds[1] && bounds[2] < bounds[3]) {
+        return Ok(None);
+    }
+    // Crop only where the STALL lies off the face: every site the fit misses
+    // by a quarter of its worst or more (and past the contract) must sit
+    // outside the trim's range (lesser misses on the face are the fit's own,
+    // and the crop leaves them as they are), and each
+    // crop edge goes halfway from the trim to the nearest such site on its
+    // side (a side with none keeps the support's end). A stall on the face is
+    // the fit's own business, and no crop answers it.
+    // A site within a fiftieth of the trim's span of its edge is AT the edge:
+    // a blend whose support changes continuity where its face ends stalls
+    // there (the boss's rim strip: 6.6e-5 at u = 0.148 with its trim from
+    // 0.1489), and the crop then sits on the edge itself.
+    let crop = |sites: &[(f64, f64)], low: f64, high: f64, start: f64, end: f64| -> Option<(f64, f64)> {
+        let bar = contract.max(0.25 * whole.worst());
+        let edge = 0.02 * (high - low);
+        let bad = sites.iter().filter(|(_, miss)| *miss > bar).map(|(at, _)| *at).collect::<Vec<_>>();
+        if bad.iter().any(|&at| at > low + edge && at < high - edge) {
+            return None;
+        }
+        let below = bad.iter().copied().filter(|&at| at <= low + edge).fold(f64::NEG_INFINITY, f64::max);
+        let above = bad.iter().copied().filter(|&at| at >= high - edge).fold(f64::INFINITY, f64::min);
+        let lower = if !below.is_finite() { start } else if below >= low - edge { low } else { 0.5 * (below + low) };
+        let upper = if !above.is_finite() { end } else if above <= high + edge { high } else { 0.5 * (above + high) };
+        Some((lower.max(start), upper.min(end)))
+    };
+    let Some((crop_u0, crop_u1)) = crop(&whole.u_sites, bounds[0], bounds[1], u0, u1) else {
+        return Ok(None);
+    };
+    let Some((crop_v0, crop_v1)) = crop(&whole.v_sites, bounds[2], bounds[3], v0, v1) else {
+        return Ok(None);
+    };
+    let bounds = [crop_u0, crop_u1, crop_v0, crop_v1];
+    if bounds[1] - bounds[0] >= 0.95 * (u1 - u0) && bounds[3] - bounds[2] >= 0.95 * (v1 - v0) {
+        return Ok(None);
+    }
+    let restrict = |mut curve: NurbsCurve, low: f64, high: f64| -> Result<NurbsCurve, KernelRefusal> {
+        let [a, b] = curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        // `split` wants its parameter clear of the ends by 1e-9 absolute.
+        let band = ((b - a) * 1e-12).max(2e-9);
+        if high < b - band {
+            curve = curve.split(high.max(a)).or_refuse(KernelStage::Refine, "split")?.0;
+        }
+        if low > a + band {
+            curve = curve.split(low.min(b)).or_refuse(KernelStage::Refine, "split")?.1;
+        }
+        Ok(curve)
+    };
+    let columns = (0..source.control_points[0].len())
+        .map(|j| {
+            let curve = NurbsCurve::new(source.degree_u, source.knots_u.clone(), source.control_points.iter().map(|row| row[j]).collect())
+                .or_refuse(KernelStage::Refine, "new")?;
+            restrict(curve, bounds[0], bounds[1])
+        })
+        .collect::<Result<Vec<_>, KernelRefusal>>();
+    // A crop that cannot be cut keeps the whole-support fit: never a refusal.
+    let Ok(columns) = columns else { return Ok(None) };
+    let rows = (0..columns[0].control_points.len())
+        .map(|i| {
+            let curve = NurbsCurve::new(source.degree_v, source.knots_v.clone(), columns.iter().map(|column| column.control_points[i]).collect())
+                .or_refuse(KernelStage::Refine, "new")?;
+            restrict(curve, bounds[2], bounds[3])
+        })
+        .collect::<Result<Vec<_>, KernelRefusal>>();
+    let Ok(rows) = rows else { return Ok(None) };
+    let Ok(cropped_surface) = NurbsSurface::new(
+        source.degree_u,
+        source.degree_v,
+        columns[0].knots.clone(),
+        rows[0].knots.clone(),
+        rows.into_iter().map(|row| row.control_points).collect(),
+    ) else {
+        return Ok(None);
+    };
+    let mut cropped = face.clone();
+    cropped.surface = cropped_surface;
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            FITTING_OVER_TRIM.with(|cell| cell.set(false));
+        }
+    }
+    FITTING_OVER_TRIM.with(|cell| cell.set(true));
+    let _release = Release;
+    let (fitted, lane, extended) = match offset_surface_constructed(&cropped, distance, &CarrierExtension::uniform(0.0), sphere_reading) {
+        Ok(built) => built,
+        Err(_) => return Ok(None),
+    };
+    if !matches!(lane, OffsetSurfaceLane::Fit) || extended.is_some() {
+        return Ok(None);
+    }
+    let cropped_evaluator = OffsetEvaluator::new("offset_surface", &cropped.surface, OffsetNormal::FaceStable { same_sense: face.same_sense });
+    let Ok(trimmed) = offset_fit_deviation(&fitted, &cropped_evaluator, distance) else {
+        return Ok(None);
+    };
+    if !(4.0 * trimmed.worst() <= whole.worst()) {
+        return Ok(None);
+    }
+    Ok(Some((fitted, cropped.surface)))
 }
 
 

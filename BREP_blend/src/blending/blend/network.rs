@@ -238,6 +238,38 @@ struct MixedStar {
     axis: Vec3,
     c_a: Vec3,
     c_b: Vec3,
+    /// Present when Q's spine is TILTED against the cap (a cylindrical wall
+    /// whose axis leans in wall A's plane): the closure is then the ball's
+    /// envelope along an ellipse, not a torus sector.
+    tilt: Option<MixedTilt>,
+}
+
+/// The tilted curved-wall mixed star's spine and centre path: the corner
+/// ball's centre runs r under the cap and 2r from Q's spine `spine + t·dir`,
+/// at E(phi) = spine(t(phi)) + 2r (cos phi e1 + sin phi e2), from c_a
+/// (phi = 0, e1 = -n_a) to c_b (phi = `phi_b`). Each centre's contact with Q
+/// is the midpoint to its spine point, with the cap the centre plus r n_c.
+#[derive(Clone, Copy, Debug)]
+struct MixedTilt {
+    spine: Vec3,
+    dir: Vec3,
+    e1: Vec3,
+    e2: Vec3,
+    cap_normal: Vec3,
+    /// A point on the cap plane.
+    cap_point: Vec3,
+    phi_b: f64,
+}
+
+impl MixedTilt {
+    /// The centre at `phi` and its spine point.
+    fn centre(&self, phi: f64, radius: f64) -> (Vec3, Vec3) {
+        let around = self.e1.scale(phi.cos()).add(self.e2.scale(phi.sin())).scale(2.0 * radius);
+        let base = self.spine.add(around);
+        let t = (-radius - base.sub(self.cap_point).dot(self.cap_normal)) / self.dir.dot(self.cap_normal);
+        let q = self.spine.add(self.dir.scale(t));
+        (q.add(around), q)
+    }
 }
 
 /// `BREP_BLEND_MIXED_STAR=1` lets the network close a mixed star
@@ -301,6 +333,12 @@ fn detect_mixed_star(
     if cap_a.id != cap_b.id || wall_a.id == wall_b.id {
         return None;
     }
+    if planar_outward_normal(wall_a).is_some() && planar_outward_normal(wall_b).is_none() {
+        return detect_mixed_star_curved(*q, (*r0, wall_a), (*r1, wall_b), cap_a, point, radius);
+    }
+    if planar_outward_normal(wall_a).is_none() && planar_outward_normal(wall_b).is_some() {
+        return detect_mixed_star_curved(*q, (*r1, wall_b), (*r0, wall_a), cap_a, point, radius);
+    }
     let (na, nb, nc) = (planar_outward_normal(wall_a)?, planar_outward_normal(wall_b)?, planar_outward_normal(cap_a)?);
     // Both walls stand normal to the cap (Q's axis is the cap's normal); the
     // walls themselves meet at any concave angle.
@@ -344,8 +382,152 @@ fn detect_mixed_star(
         axis: nc.scale(-1.0),
         c_a: q_v.sub(na.scale(2.0 * r)),
         c_b: q_v.sub(nb.scale(2.0 * r)),
+        tilt: None,
     })
 }
+
+/// The tapered two-edge fillet miter: a convex miter whose stripe carries a
+/// varying law runs that law linear to the vertex, starts its seam where the
+/// two rails cross and reads a tapered sibling's own fitted wall
+/// ([`super::miter`]'s `wall_level`). On by default (promoted 2026-11-17);
+/// `BREP_BLEND_TAPERED_MITER=0` is the escape hatch.
+pub fn tapered_miter_on() -> bool {
+    switch!(live "BREP_BLEND_TAPERED_MITER", true)
+}
+
+
+/// [`detect_mixed_star`] takes a mixed star whose second wall is a
+/// CYLINDER parallel to wall A (a boss or a bore fused into a planar wall,
+/// §6.9.7's curved-wall corner, upright or leaning in A's plane). On by
+/// default (promoted 2026-11-17); `BREP_BLEND_MIXED_STAR_CURVED=0` is the
+/// escape hatch.
+pub fn mixed_star_curved_on() -> bool {
+    switch!(live "BREP_BLEND_MIXED_STAR_CURVED", true)
+}
+
+
+/// The mixed star with a PLANAR wall A and a CYLINDRICAL wall B. Wall A
+/// stands normal to the cap and parallel to the cylinder's axis, so Q's
+/// spine (the r-offset plane of A meeting the (R ± r)-offset cylinder) is a
+/// line along that axis. Along the cap's normal the closure is the exact torus
+/// sector about it; leaning in A's plane (up to [`MIXED_TILT_LIMIT`]) it is
+/// the ball's envelope along an ellipse ([`MixedTilt`], [`mixed_tilt_patch`]).
+///
+/// Q's ball at the cap's level r below it, `q_v`, is (R ± r) from the
+/// cylinder's axis; rim B's ball centre there is (R ∓ r) from it, on the
+/// same radial, so 2r from `q_v` — tangent to Q's ball, as rim A's is. Each
+/// contact with Q is the midpoint of the two centres.
+fn detect_mixed_star_curved(
+    q: usize,
+    (a, wall_a): (usize, &FaceRecord),
+    (b, wall_b): (usize, &FaceRecord),
+    cap: &FaceRecord,
+    point: Vec3,
+    radius: f64,
+) -> Option<MixedStar> {
+    if !mixed_star_curved_on() {
+        return None;
+    }
+    let (na, nc) = (planar_outward_normal(wall_a)?, planar_outward_normal(cap)?);
+    let (axis_point, axis_dir, cyl_radius) = super::corner::cylinder_wall_carrier(&wall_b.surface)?;
+    let r = radius;
+    let tol = 1e-9;
+    // Wall A stands normal to the cap and parallel to the cylinder's axis;
+    // the axis may lean against the cap normal in A's plane, not past
+    // MIXED_TILT_LIMIT (the centre path's height solve divides by d.n_c).
+    let lean = axis_dir.dot(nc).abs();
+    if na.dot(nc).abs() > tol || na.dot(axis_dir).abs() > tol || lean < MIXED_TILT_LIMIT {
+        return None;
+    }
+    for face in [wall_a, cap] {
+        let Some(crate::AnalyticSurface::Plane { origin, .. }) = face.surface.analytic() else {
+            return None;
+        };
+        if planar_outward_normal(face)?.dot(point.sub(*origin)).abs() > 1e-7 * (1.0 + r) {
+            return None;
+        }
+    }
+    let foot_of = |p: Vec3| axis_point.add(axis_dir.scale(p.sub(axis_point).dot(axis_dir)));
+    if (point.sub(foot_of(point)).length() - cyl_radius).abs() > 1e-7 * (1.0 + cyl_radius) {
+        return None;
+    }
+    // Boss (material inside: the outward normal points away from the axis)
+    // or bore.
+    let outward_b = face_normal_near(wall_b, point)?.scale(if wall_b.same_sense { 1.0 } else { -1.0 });
+    let outward_away = outward_b.dot(point.sub(foot_of(point))) > 0.0;
+    let rho_q = crate::offset_analytic_pair::offset_cylinder_radius(cyl_radius, outward_away, r).ok()?;
+    let rho_b = crate::offset_analytic_pair::offset_cylinder_radius(cyl_radius, outward_away, -r).ok()?;
+    let lines = crate::offset_analytic_pair::axial_plane_meets_offset_cylinder(point, na, r, axis_point, axis_dir, rho_q).ok()?;
+    // Q's spine: the root nearest the corner, running along the axis.
+    let spine = if lines[0].sub(point).length() <= lines[1].sub(point).length() { lines[0] } else { lines[1] };
+    let dir = if axis_dir.dot(nc) < 0.0 { axis_dir } else { axis_dir.scale(-1.0) };
+    let at_height = |base: Vec3| -> Vec3 {
+        let t = (-r - base.sub(point).dot(nc)) / dir.dot(nc);
+        base.add(dir.scale(t))
+    };
+    // Rim A's stop: its centre line runs r inside A and r under the cap; the
+    // stop centre is 2r from the spine, straight across A (c_a + 2r n_a on
+    // the spine). Solved in the plane of the edge direction and n_c.
+    let e_a = na.cross(nc).normalized().ok()?;
+    let w = point.add(na.scale(r)).sub(nc.scale(r)).sub(spine);
+    let t_a = w.dot(nc) / dir.dot(nc);
+    let s_a = t_a * dir.dot(e_a) - w.dot(e_a);
+    let c_a = point.sub(na.scale(r)).sub(nc.scale(r)).add(e_a.scale(s_a));
+    let q_va = c_a.add(na.scale(2.0 * r));
+    // Rim B's stop: on the spine's radial from the axis, (rho_b - rho_q) off
+    // it, r under the cap. The radial is the same at every spine point (the
+    // spine runs parallel to the axis).
+    let u_rad = spine.sub(foot_of(spine)).normalized().ok()?;
+    let c_b = at_height(spine.add(u_rad.scale(rho_b - rho_q)));
+    let q_vb = c_b.add(u_rad.scale(rho_q - rho_b));
+    if (c_b.sub(q_vb).length() - 2.0 * r).abs() > 1e-9 * (1.0 + r) || q_va.sub(at_height(q_va)).length() > 1e-9 * (1.0 + r) {
+        return None;
+    }
+    // The torus only where the stops share one spine point: any lean moves
+    // B's stop along the spine.
+    let tilted = q_va.sub(q_vb).length() > 1e-12 * (1.0 + r);
+    let tilt = if tilted {
+        let e1 = na.scale(-1.0);
+        let e2 = dir.cross(e1).normalized().ok()?;
+        let toward_b = c_b.sub(q_vb);
+        let geometry = MixedTilt { spine, dir, e1, e2, cap_normal: nc, cap_point: point, phi_b: toward_b.dot(e2).atan2(toward_b.dot(e1)) };
+        // Past a quarter turn (a leaning BORE) the contact curve doubles back
+        // along Q; not this closure.
+        if geometry.phi_b.abs() >= std::f64::consts::FRAC_PI_2 {
+            return None;
+        }
+        // The path must land on both stops.
+        if geometry.centre(0.0, r).0.sub(c_a).length() > 1e-9 * (1.0 + r) || geometry.centre(geometry.phi_b, r).0.sub(c_b).length() > 1e-9 * (1.0 + r) {
+            return None;
+        }
+        Some(geometry)
+    } else {
+        None
+    };
+    Some(MixedStar {
+        radius: r,
+        cap: cap.id,
+        wall_a: wall_a.id,
+        wall_b: wall_b.id,
+        q,
+        a,
+        b,
+        v_a: c_a.add(na.scale(r)),
+        v_b: q_vb.add(c_b).scale(0.5),
+        w_a: c_a.add(nc.scale(r)),
+        w_b: c_b.add(nc.scale(r)),
+        q_v: q_va,
+        q_w: q_va.add(nc.scale(r)),
+        axis: nc.scale(-1.0),
+        c_a,
+        c_b,
+        tilt,
+    })
+}
+
+/// The steepest lean of a curved mixed star's cylinder axis against the cap
+/// normal (as |cos|) the closure takes: 0.5, a 60 degree lean.
+const MIXED_TILT_LIMIT: f64 = 0.5;
 
 /// The overshoot ladder for the marches, as fractions of the edge span.  A
 /// stripe that ends at a corner needs no overshoot there (its stop station is
@@ -860,6 +1042,9 @@ fn blend_star_network_building(
     // down the miter lane.
     let mut creased_vertices: Vec<u64> = Vec::new();
     let mut vertex_radii: Vec<(u64, f64)> = Vec::new();
+    // The vertices whose convex two-edge fillet miter carries a tapered
+    // stripe under `BREP_BLEND_TAPERED_MITER`: their laws run to the vertex.
+    let mut tapered_miter_vertices: Vec<u64> = Vec::new();
     for (vertex_id, stripe_indices) in &vertex_stripes {
         if stripe_indices.len() < 2 {
             continue;
@@ -939,12 +1124,17 @@ fn blend_star_network_building(
         let mut ribbon_star = false;
         if unequal.is_some() {
             if is_star {
-                if tapered_here {
+                // Under the tapered miter switch a fillet star at unequal end
+                // radii takes the ribbon fill as a constant one does: at a
+                // star each stripe's law is held at its end radius from the
+                // corner station to the vertex, so near the corner its rows
+                // are the constant ones the ribbon fill closes.
+                if tapered_here && !(super::corner::n_sided_star_on() && !chamfer) {
                     return Err(refuse_unequal("an unequal-radius star at a varying radius is not in this lane"));
                 }
                 ribbon_star = true;
             } else {
-                if tapered_here {
+                if tapered_here && !(tapered_miter_on() && !chamfer) {
                     return Err(refuse_unequal("an unequal-radius corner at a varying radius is not in this lane"));
                 }
             }
@@ -1302,13 +1492,52 @@ fn blend_star_network_building(
                 rho_side: on_side.rho.signum() * end_radius,
             }
         };
-        let rail_rail = match (unequal, miter) {
+        // Under the tapered miter, a two-edge miter with a tapered stripe
+        // starts its seam where the two rails cross, equal end radii or not:
+        // its laws run linear to the vertex, so no ball's contact is on them.
+        let tapered_two_edge = tapered_here && tapered_miter_on() && !chamfer && miter.is_some() && outward;
+        if tapered_two_edge {
+            tapered_miter_vertices.push(*vertex_id);
+        }
+        let rail_rail = match (unequal.or(if tapered_two_edge { Some((0, 0.0, 0.0)) } else { None }), miter) {
             (Some(_), Some((shared, _))) => {
                 if !outward {
                     return Err(refuse_unequal("a concave unequal-radius corner is not in this lane"));
                 }
                 let described = [rail_rail_stripe(stripe_indices[0], shared.id), rail_rail_stripe(stripe_indices[1], shared.id)];
-                let solved = solve_rail_rail_point(shared, [&described[0], &described[1]], point, scale)?;
+                let mut solved = solve_rail_rail_point(shared, [&described[0], &described[1]], point, scale)?;
+                // A TAPERED stripe's contact with the shared face runs at the
+                // law's radius where it stands, not its end radius: re-seat
+                // each stripe at the radius of the station the point projects
+                // to, until the point stops moving (the two rails' crossing).
+                if tapered_two_edge {
+                    let mut settled = false;
+                    for _ in 0..40 {
+                        let at_station = |index: usize| -> Result<RailRailStripe<'_>, KernelRefusal> {
+                            let edge = mates[index].0;
+                            let foot = crate::project_point_to_curve(&edge.curve, solved.point).or_refuse(KernelStage::Refine, "project_point_to_curve")?;
+                            let fraction = ((foot.u - edge.t0) / (edge.t1 - edge.t0)).clamp(0.0, 1.0);
+                            let local = laws[index].at_fraction(fraction);
+                            let mut stripe = rail_rail_stripe(index, shared.id);
+                            stripe.rho_shared = stripe.rho_shared.signum() * local;
+                            stripe.rho_side = stripe.rho_side.signum() * local;
+                            Ok(stripe)
+                        };
+                        let local = [at_station(stripe_indices[0])?, at_station(stripe_indices[1])?];
+                        let next = solve_rail_rail_point(shared, [&local[0], &local[1]], point, scale)?;
+                        let moved = next.point.sub(solved.point).length();
+                        solved = next;
+                        if moved <= 1e-14 * scale {
+                            settled = true;
+                            break;
+                        }
+                    }
+                    if !settled {
+                        return Err(KernelRefusal::non_convergence(KernelStage::Classify, "tapered_rail_rail", format!(
+                            "blend network: the tapered rails at vertex {vertex_id} do not settle on one crossing"
+                        )));
+                    }
+                }
                 if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                     eprintln!(
                         "network unequal miter at vertex {vertex_id}: rail/rail point {:?} on face {} \
@@ -1457,12 +1686,52 @@ fn blend_star_network_building(
         let end_radius = [law.end(true), law.end(false)];
         // A constant law is the constant radius everywhere, whatever the
         // ends read.
+        let mut skipped_end = false;
+        // The law ends that reach their hold station with zero slope (a
+        // ribbon star's or a corner ball's, under the N-sided switch): see
+        // `eased_fraction`.
+        let mut eased = [false, false];
         let law_ends: [f64; 2] = {
             let mut law_ends = ends;
             if law.constant().is_none() {
                 for (slot, vertex) in [edge.start_vertex_id, edge.end_vertex_id].into_iter().enumerate() {
-                    if let Some((_, _, VertexKind::Star { corner } | VertexKind::Miter { corner, .. })) =
-                        corners.iter().find(|(id, _, _)| *id == vertex)
+                    // Under the tapered miter a miter's stripes keep their laws
+                    // linear to the vertex: the seam joins them wherever they
+                    // meet, no shared ball needs their end radius, and the
+                    // rail/rail point is solved on those laws.
+                    let found = corners.iter().find(|(id, _, _)| *id == vertex);
+                    if tapered_miter_vertices.contains(&vertex) {
+                        skipped_end = true;
+                        continue;
+                    }
+                    // A ribbon star (unequal end radii, no common ball) under
+                    // the switch: hold the law at its end radius out to the
+                    // section through the farther of the star's two tangency
+                    // points on this stripe's faces, so the rails pass through
+                    // both at the radius they were solved at.
+                    if let Some((_, _, VertexKind::RibbonStar { corner })) = found {
+                        if super::corner::n_sided_star_on() {
+                            let at_vertex = if slot == 0 { edge.t0 } else { edge.t1 };
+                            let mut farthest = at_vertex;
+                            for (face_id, point, _) in &corner.tangency {
+                                if *face_id != first.face.id && *face_id != second.face.id {
+                                    continue;
+                                }
+                                let station = section_parameter_through(edge, *point, law_ends[slot], scale)
+                                    .map_err(|error| format!(
+                                        "blend network: edge {}'s section through the star's tangency point at vertex {vertex}: {error}",
+                                        edge.id
+                                    )).or_refuse(KernelStage::Refine, "map_err")?;
+                                if (station - at_vertex).abs() > (farthest - at_vertex).abs() {
+                                    farthest = station;
+                                }
+                            }
+                            law_ends[slot] = farthest;
+                            eased[slot] = true;
+                        }
+                        continue;
+                    }
+                    if let Some((_, _, VertexKind::Star { corner } | VertexKind::Miter { corner, .. })) = found
                     {
                         law_ends[slot] = section_parameter_through(edge, corner.center, law_ends[slot], scale)
                             .map_err(|error| {
@@ -1472,11 +1741,27 @@ fn blend_star_network_building(
                                     edge.id
                                 )
                             }).or_refuse(KernelStage::Refine, "map_err")?;
+                        // The ball is the end radius's: under the N-sided
+                        // switch the stripe reaches it with zero slope too,
+                        // so the stripe meets the ball tangentially.
+                        // (a fillet's: a chamfer's law shapes flat bevels,
+                        // which carry no crease to ease)
+                        eased[slot] = super::corner::n_sided_star_on() && !chamfer;
                     }
                 }
             }
             law_ends
         };
+        // The tapered miter's rail/rail point read the law over the edge's
+        // own span; a stripe whose far end lays the law elsewhere (a star's
+        // ball station, a flush join's seam) is not in that lane.
+        if skipped_end && ((law_ends[0] - edge.t0).abs() > 1e-12 * (1.0 + edge.t0.abs()) || (law_ends[1] - edge.t1).abs() > 1e-12 * (1.0 + edge.t1.abs())) {
+            return Err(KernelRefusal::unsupported(KernelStage::Classify, "tapered_miter_far_end", format!(
+                "blend network: edge {} runs a tapered law into a miter at one end and a star or a flush join at the \
+                 other; the tapered miter is built for a law laid over the edge's own span",
+                edge.id
+            )));
+        }
         // A tapered stripe's rows are BROKEN at its corner stations, as a
         // flush join's are at the seam ball: the march pins a station on each
         // (`open_station_parameters`), so the law's end value — and the kink
@@ -1490,7 +1775,7 @@ fn blend_star_network_building(
         let radius_at = |t: f64| -> f64 {
             match law.constant() {
                 Some(radius) => radius,
-                None => law.at_fraction((t - law_ends[0]) / (law_ends[1] - law_ends[0])),
+                None => law.at_fraction(eased_fraction((t - law_ends[0]) / (law_ends[1] - law_ends[0]), eased)),
             }
         };
         // The constant a wall is judged against: a tapered stripe has no
@@ -1548,7 +1833,7 @@ fn blend_star_network_building(
         // A tapered stripe that stops at a flush join with its own two faces
         // (the vertex section) needs nothing past it, and past it the
         // edge's straight extension may leave the carrier it curls along: on
-        // report 5e49bb42's cap rim the relieved stripe's overshoot stations
+        // the sculpted-cap report's cap rim the relieved stripe's overshoot stations
         // stopped converging 1.8 mm past the vertex. Such an end may stop at
         // its last converged station; the rails must still reach the join
         // (`corner_rails_reach`, read as the end's settlement below).
@@ -2735,7 +3020,21 @@ fn blend_star_network_building(
                         }
                         Ok([d[0] / length * chord, d[1] / length * chord])
                     };
-                    let (t_from, t_to) = (unit(d_from)?, unit([-d_to[0], -d_to[1]])?);
+                    let (mut t_from, mut t_to) = (unit(d_from)?, unit([-d_to[0], -d_to[1]])?);
+                    // Under the N-sided star the rib keeps only the LINE of the
+                    // other stripe's rail at each end: at a steep taper the rail
+                    // toward the vertex points back into the strip, and the rib
+                    // runs along it the other way (the fill's corner condition is
+                    // the rib's own derivative, whichever way the rail runs).
+                    if super::corner::n_sided_star_on() {
+                        let across = to.0[1] - from.0[1];
+                        if t_from[1] * across < 0.0 {
+                            t_from = [-t_from[0], -t_from[1]];
+                        }
+                        if t_to[1] * across < 0.0 {
+                            t_to = [-t_to[0], -t_to[1]];
+                        }
+                    }
                     if !(t_from[1] * (to.0[1] - from.0[1]) > 0.0 && t_to[1] * (to.0[1] - from.0[1]) > 0.0) {
                         return Err(KernelRefusal::unsupported(KernelStage::Refine, "n_sided_corner", format!(
                             "blend network: edge {}'s rib would leave its rail/rail point away from its strip \
@@ -2751,28 +3050,51 @@ fn blend_star_network_building(
                             h00 * from.0[1] + h10 * t_from[1] + h01 * to.0[1] + h11 * t_to[1],
                         ]
                     };
-                    let mut marched = MarchedCurve { points: Vec::new(), uv_first: Vec::new(), uv_second: Vec::new() };
-                    for sample in 0..=RIB_SAMPLES {
-                        let fraction = sample as f64 / RIB_SAMPLES as f64;
-                        let uv = hermite(fraction);
-                        let point = if sample == 0 {
-                            from.1
-                        } else if sample == RIB_SAMPLES {
-                            to.1
-                        } else {
-                            stripe.rows.surface.evaluate_extended(uv[0], uv[1]).or_refuse(KernelStage::Refine, "evaluate_extended")?
-                        };
-                        marched.points.push(point);
-                        marched.uv_first.push(uv);
-                        marched.uv_second.push(uv);
-                    }
+                    // Sampled densely enough for the fit to stand on the
+                    // blend: the rib climbs as a miter's seam does.
+                    let march_rib = |samples: usize| -> Result<MarchedCurve, KernelRefusal> {
+                        let mut marched = MarchedCurve { points: Vec::new(), uv_first: Vec::new(), uv_second: Vec::new() };
+                        for sample in 0..=samples {
+                            let fraction = sample as f64 / samples as f64;
+                            let uv = hermite(fraction);
+                            let point = if sample == 0 {
+                                from.1
+                            } else if sample == samples {
+                                to.1
+                            } else {
+                                stripe.rows.surface.evaluate_extended(uv[0], uv[1]).or_refuse(KernelStage::Refine, "evaluate_extended")?
+                            };
+                            marched.points.push(point);
+                            marched.uv_first.push(uv);
+                            marched.uv_second.push(uv);
+                        }
+                        Ok(marched)
+                    };
                     let surface = &stripe.rows.surface;
-                    let (rib_curve, rib_pcurve, _) = fit_marched(
-                        &marched,
-                        "rib",
-                        &|point: Vec3| off_surface(surface, point),
-                        fit_tolerance,
-                    )?;
+                    let rungs: &[usize] = if super::corner::n_sided_star_on() { &[RIB_SAMPLES, 2 * RIB_SAMPLES, 4 * RIB_SAMPLES, 8 * RIB_SAMPLES] } else { &[RIB_SAMPLES] };
+                    let mut fitted = None;
+                    for (rung, &samples) in rungs.iter().enumerate() {
+                        match fit_marched(&march_rib(samples)?, "rib", &|point: Vec3| off_surface(surface, point), fit_tolerance) {
+                            Ok(fit) => {
+                                fitted = Some(fit);
+                                break;
+                            }
+                            Err(error) if super::miter::is_marched_fit_off_carriers(&error) && rung + 1 < rungs.len() => continue,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    let (mut rib_curve, mut rib_pcurve, _) = fitted.ok_or(KernelRefusal::internal(KernelStage::Refine, "rib_fit", "blend network: the rib's fit ladder is empty"))?;
+                    // The exact leaving directions on the fitted rib's ends
+                    // (`turn_end_tangents`).
+                    let exact = |uv: [f64; 2], d: [f64; 2]| -> Result<Vec3, KernelRefusal> {
+                        let derivatives = surface.derivatives(uv[0], uv[1], 1).or_refuse(KernelStage::Refine, "derivatives")?;
+                        derivatives[1][0].scale(d[0]).add(derivatives[0][1].scale(d[1])).normalized().or_refuse(KernelStage::Refine, "normalized")
+                    };
+                    let in_plane = |d: [f64; 2]| -> Result<Vec3, KernelRefusal> {
+                        Vec3::new(d[0], d[1], 0.0).normalized().or_refuse(KernelStage::Refine, "normalized")
+                    };
+                    turn_end_tangents(&mut rib_curve, exact(from.0, t_from)?, exact(to.0, t_to)?);
+                    turn_end_tangents(&mut rib_pcurve, in_plane(t_from)?, in_plane(t_to)?);
                     let domain = rib_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
                     let rib_id = take_id();
                     let record = EdgeRecord {
@@ -2841,6 +3163,7 @@ fn blend_star_network_building(
                         u_ball: station_on(stripe, shared.id, p_point)?,
                         other_face,
                         radius: stripe.end_radius[usize::from(!at_start)],
+                        tapered: tapered_miter_on() && stripe.law.constant().is_none(),
                     })
                 };
                 let mut described = [describe(ia)?, describe(ib)?];
@@ -3426,6 +3749,8 @@ fn blend_star_network_building(
         w_a: u64,
         w_b: u64,
         name: Option<String>,
+        /// A tilted star's fitted closure and its cap contact curve.
+        tilted_patch: Option<(crate::NurbsSurface, NurbsCurve)>,
     }
     let mut pending_mixed: Vec<PendingMixedStar> = Vec::new();
     reentrant_timing.stop();
@@ -3450,7 +3775,11 @@ fn blend_star_network_building(
             (mixed.q, [(mixed.wall_a, mixed.v_a, v_a), (mixed.wall_b, mixed.v_b, v_b)], mixed.q_v),
         ];
         let mut arcs: Vec<EdgeRecord> = Vec::with_capacity(3);
+        let tilted = mixed.tilt.is_some();
         for (index, contacts, center) in plans {
+            if tilted && index == mixed.q {
+                continue;
+            }
             let stripe = &stripes[index];
             let at_start = stripe.at_start(*vertex_id);
             let station_0 = station_on(stripe, contacts[0].0, contacts[0].1)?;
@@ -3474,7 +3803,14 @@ fn blend_star_network_building(
             } else {
                 (second_point, first_point, second_vertex, first_vertex)
             };
-            let arc = corner_section_arc(center, mixed.radius, from, to)?;
+            // A tilted star's sections are its closure's own boundary rows:
+            // one rational span each, whatever the angle (the arc builder
+            // splits past 90 degrees, and rim B's section is not 90 there).
+            let arc = if tilted {
+                single_span_section(center, mixed.radius, from, to)?
+            } else {
+                corner_section_arc(center, mixed.radius, from, to)?
+            };
             let arc_domain = arc.domain().or_refuse(KernelStage::Refine, "domain")?;
             let record = EdgeRecord {
                 id: take_id(),
@@ -3502,8 +3838,62 @@ fn blend_star_network_building(
             }));
             arcs.push(record);
         }
+        let mut tilted_patch = None;
+        if let Some(tilt) = mixed.tilt {
+            // Q no longer ends on one section: its rails stop where the
+            // corner ball's envelope touches it at A's and B's stops, and its
+            // end is the envelope's contact curve with it (the patch's v = 0
+            // side), closed the way a miter's seam is.
+            let bar = crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit;
+            let (surface, q_curve, cap_curve) = mixed_tilt_patch(&tilt, mixed.radius, bar)?;
+            let stripe = &stripes[mixed.q];
+            let at_start = stripe.at_start(*vertex_id);
+            let first_is_a = stripe.first.face.id == mixed.wall_a;
+            let (station_a, station_b) = (station_on(stripe, mixed.wall_a, mixed.v_a)?, station_on(stripe, mixed.wall_b, mixed.v_b)?);
+            let (cr_parameter, cs_parameter, first_vertex, second_vertex) =
+                if first_is_a { (station_a, station_b, v_a, v_b) } else { (station_b, station_a, v_b, v_a) };
+            // The loop walks the edge A -> B when it walks first -> second
+            // from A's side, or second -> first from B's.
+            let walk_from_a = stripe.walk_first_to_second(at_start) == first_is_a;
+            // Stored in Q's walk direction, as every end section is: Q uses
+            // it forward, the closure reversed.
+            let q_curve = if walk_from_a { q_curve } else { q_curve.reversed().or_refuse(KernelStage::Refine, "reversed")? };
+            let q_domain = q_curve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            let (q_start, q_end) = if walk_from_a { (v_a, v_b) } else { (v_b, v_a) };
+            let q_edge = EdgeRecord {
+                id: take_id(),
+                curve: q_curve.clone(),
+                t0: q_domain[0],
+                t1: q_domain[1],
+                start_vertex_id: q_start,
+                end_vertex_id: q_end,
+                degenerate: false,
+                name: None,
+            };
+            result.edges.push(q_edge.clone());
+            let at = |fraction: f64| q_curve.evaluate(q_domain[0] + (q_domain[1] - q_domain[0]) * fraction);
+            let breaks = super::track_fit::curve_breaks(&q_curve, q_domain[0], q_domain[1], true);
+            let floor = crate::pcurve::PCURVE_REFINEMENT_TOLERANCE;
+            let fit = super::track_fit::fit_curve_track(&stripe.rows.surface, &at, &breaks, floor, 512, 4096)?;
+            if !fit.on_floor {
+                return Err(KernelRefusal::non_convergence(KernelStage::Refine, "mixed_tilt_q_track", format!(
+                    "{} the tilted mixed star's contact curve on edge {}'s blend misses by {:.3e} at {} samples",
+                    crate::blend::PCURVE_OFF_FLOOR, stripe.edge.id, fit.miss, fit.samples
+                )));
+            }
+            end_plans[mixed.q][usize::from(!at_start)] = Some(EndPlan::Miter(MiterEnd {
+                cr_parameter,
+                cs_parameter,
+                first_vertex,
+                second_vertex,
+                edges: vec![(q_edge.id, true, fit.curve)],
+            }));
+            arcs.push(q_edge);
+            tilted_patch = Some((surface, cap_curve));
+        }
         let arcs: [EdgeRecord; 3] = arcs.try_into().map_err(|_| KernelRefusal::internal(KernelStage::Refine, "mixed_star_arcs", "blend network: a mixed star needs three arcs"))?;
         pending_mixed.push(PendingMixedStar {
+            tilted_patch,
             vertex: *vertex_id,
             mixed: *mixed,
             arcs,
@@ -3805,7 +4195,7 @@ fn blend_star_network_building(
             }
             // On a CONCAVE edge, a mate CUSPED at this vertex (lane R7's
             // class) tapers to its tip before the free end is asked: the free
-            // end can find a crossing there (report b46db89a's sliver, whose
+            // end can find a crossing there (the concave-sliver report's sliver, whose
             // contact meets the sliver's straight boundary) and ship a wall
             // that overhangs the cusp into air. A convex edge keeps R7's
             // order, the taper only where the free end refuses: asked first,
@@ -3874,7 +4264,7 @@ fn blend_star_network_building(
                 }
                 Err(free_error) => {
                     // A mate CUSPED here while the other mate's boundary runs
-                    // on along the edge (report 80c5d9d1's F10, the straight
+                    // on along the edge (the straight-sliver report's F10, the straight
                     // edge of a sliver whose far side F9's tapered round
                     // took: the sliver ends at the round's hairline end, and
                     // the box top's boundary continues past it to the tip)
@@ -4096,8 +4486,8 @@ fn blend_star_network_building(
                 // An end planned as a TAPER to a cusp (`taper_runout.rs`)
                 // stops where the width reaches 2R; a setback past it means
                 // the round has no constant run, which the group answers by
-                // building at a smaller radius (`fillet/edges.rs`, report
-                // 80c5d9d1's F10: r 1 on a sliver at most 2 wide within 0.9
+                // building at a smaller radius (`fillet/edges.rs`,
+                // the straight-sliver report's F10: r 1 on a sliver at most 2 wide within 0.9
                 // of its square corner).
                 let tapered = taper_ends.contains(&index);
                 let what = if tapered { STRIPE_PINCH_TAPER_WHAT } else { "stripe_pinch" };
@@ -4261,6 +4651,42 @@ fn blend_star_network_building(
                 pcurve: pcurve.clone(),
             })
             .collect();
+        // N ≠ 4 ribs: the N-sided fill (behind `BREP_BLEND_N_SIDED_STAR`).
+        if ribs.len() != 4 && super::corner::n_sided_star_on() {
+            let star = super::corner::build_n_sided_star(&ribs, patch.center, patch.outward, patch.name.as_deref(), &mut take_id)?;
+            super::record_count("count.n_sided_star_fills", 1);
+            result.vertices.extend(star.vertices);
+            result.edges.extend(star.edges);
+            for (rib_edge, first_half, second_half, (first_pcurve, second_pcurve)) in star.splits {
+                // The stripe's loop takes the two halves in place of the rib,
+                // in the rib's stored direction (the stripe uses it forward).
+                let mut replaced = false;
+                for face in result.shells.iter_mut().flat_map(|shell| shell.faces.iter_mut()) {
+                    for lp in &mut face.loops {
+                        if let Some(at) = lp.coedges.iter().position(|c| c.edge_id == rib_edge) {
+                            if !lp.coedges[at].forward {
+                                return Err(KernelRefusal::internal(KernelStage::Sew, "n_sided_rib_sense", "blend network: a stripe walks its rib backwards"));
+                            }
+                            let second = CoedgeRecord { id: take_id(), edge_id: second_half, forward: true, pcurve: second_pcurve.clone() };
+                            lp.coedges[at] = CoedgeRecord { id: take_id(), edge_id: first_half, forward: true, pcurve: first_pcurve.clone() };
+                            lp.coedges.insert(at + 1, second);
+                            replaced = true;
+                        }
+                    }
+                }
+                if !replaced {
+                    return Err(KernelRefusal::internal(KernelStage::Sew, "n_sided_rib_user", "blend network: no stripe loop holds the star's rib"));
+                }
+                result.edges.retain(|edge| edge.id != rib_edge);
+            }
+            let shell_index = result
+                .shells
+                .iter()
+                .position(|shell| !shell.faces.is_empty())
+                .ok_or(KernelRefusal::internal(KernelStage::Sew, "shell", "blend network: the solid has no shell to sew the N-sided fill into"))?;
+            result.shells[shell_index].faces.extend(star.faces);
+            continue;
+        }
         let (face, reading) = build_ribbon_star_patch(&ribs, patch.center, patch.outward, patch.name.as_deref(), &mut take_id)?;
         super::record_count("count.ribbon_star_fills", 1);
         if super::timing::enabled() && crate::profile::profile_enabled() {
@@ -4622,7 +5048,7 @@ fn blend_star_network_building(
         } else if horn.tilted {
             tilted_horn_patch(&generatrix, &corner_section_arc(center_b, radius, horn.pole, cap_point_b)?, center_a, center_b, radius, solid)?
         } else {
-            crate::make_revolution(horn.pole, revolve_axis, &generatrix, sweep).or_refuse(KernelStage::Refine, "make_revolution")?
+            corner_revolution(horn.pole, revolve_axis, &generatrix, sweep)?
         };
         // Sanity: the far meridian lands on the second stripe's cap point.
         let far = surface.evaluate(1.0, 1.0).or_refuse(KernelStage::Refine, "evaluate")?;
@@ -4784,7 +5210,7 @@ fn blend_star_network_building(
         }
     }
     for pending in pending_mixed {
-        sew_mixed_star(&mut result, solid, &mut take_id, &stripes, &sewn, pending.vertex, &pending.mixed, &pending.arcs, [pending.v_a, pending.v_b, pending.w_a, pending.w_b], pending.name)?;
+        sew_mixed_star(&mut result, solid, &mut take_id, &stripes, &sewn, pending.vertex, &pending.mixed, &pending.arcs, [pending.v_a, pending.v_b, pending.w_a, pending.w_b], pending.name, pending.tilted_patch)?;
     }
     for flush in pending_flush {
         for (seam_id, parameter, rim) in flush.seam_trims {
@@ -4984,8 +5410,12 @@ fn blend_star_network_building(
             let _ = std::fs::write(&path, text);
         }
     }
-    let built = crossings.gate(result)?;
+    let result = crate::blend::chart_fitted_for_gate(solid, result);
+    let mut built = crossings.gate(result)?;
     gate_timing.stop();
+    // `BREP_BLEND_SAME_PARAMETER`: the network's corner and sector trims take
+    // their edges' parameter (no-op with the switch off).
+    crate::blend::same_parameter_trims(solid, &mut built);
     // Only a network that BUILT owes its reports. Each binds to its wall on
     // the built body by exact name and exact surface (the consumer's own
     // rule); a wall a later step replaced (absorbed, rebuilt) cannot carry a
@@ -5971,6 +6401,7 @@ fn sew_mixed_star(
     arcs: &[EdgeRecord; 3],
     [v_a, v_b, w_a, w_b]: [u64; 4],
     name: Option<String>,
+    tilted_patch: Option<(crate::NurbsSurface, NurbsCurve)>,
 ) -> Result<(), KernelRefusal> {
     let r = mixed.radius;
     let cap_rail = |index: usize| -> Result<u64, KernelRefusal> {
@@ -5980,7 +6411,10 @@ fn sew_mixed_star(
             )))
     };
     let (rail_a, rail_b) = (cap_rail(mixed.a)?, cap_rail(mixed.b)?);
-    let cap_arc = corner_section_arc(mixed.q_w, 2.0 * r, mixed.w_a, mixed.w_b)?;
+    let cap_arc = match &tilted_patch {
+        Some((_, cap_curve)) => cap_curve.clone(),
+        None => corner_section_arc(mixed.q_w, 2.0 * r, mixed.w_a, mixed.w_b)?,
+    };
     let cap_domain = cap_arc.domain().or_refuse(KernelStage::Refine, "domain")?;
     let cap_arc_id = take_id();
     result.edges.push(EdgeRecord {
@@ -6026,17 +6460,28 @@ fn sew_mixed_star(
     };
     // The sector: rim A's end section run V_A -> W_A, revolved about Q's
     // axis through q_v by the angle between the two rims' ball centres.
-    let radial_a = mixed.c_a.sub(mixed.q_v).normalized().or_refuse(KernelStage::Refine, "normalized")?;
-    let radial_b = mixed.c_b.sub(mixed.q_v).normalized().or_refuse(KernelStage::Refine, "normalized")?;
-    let sweep = radial_a.dot(radial_b).clamp(-1.0, 1.0).acos();
-    if sweep < 1e-9 {
-        return Err(KernelRefusal::internal(KernelStage::Refine, "mixed_star_sweep", "blend network: degenerate mixed star sweep"));
-    }
-    let revolve_axis = if radial_a.cross(radial_b).dot(mixed.axis) > 0.0 { mixed.axis } else { mixed.axis.scale(-1.0) };
-    let generatrix = corner_section_arc(mixed.c_a, r, mixed.v_a, mixed.w_a)?;
-    let surface = crate::make_revolution(mixed.q_v, revolve_axis, &generatrix, sweep).or_refuse(KernelStage::Refine, "make_revolution")?;
+    let (surface, [g0, g1]) = match tilted_patch {
+        // The tilted star's envelope: u runs A's stop -> B's, v from Q's
+        // contact (0) to the cap's (1).
+        Some((surface, _)) => {
+            let domain = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+            (surface, domain)
+        }
+        None => {
+            let radial_a = mixed.c_a.sub(mixed.q_v).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+            let radial_b = mixed.c_b.sub(mixed.q_v).normalized().or_refuse(KernelStage::Refine, "normalized")?;
+            let sweep = radial_a.dot(radial_b).clamp(-1.0, 1.0).acos();
+            if sweep < 1e-9 {
+                return Err(KernelRefusal::internal(KernelStage::Refine, "mixed_star_sweep", "blend network: degenerate mixed star sweep"));
+            }
+            let revolve_axis = if radial_a.cross(radial_b).dot(mixed.axis) > 0.0 { mixed.axis } else { mixed.axis.scale(-1.0) };
+            let generatrix = corner_section_arc(mixed.c_a, r, mixed.v_a, mixed.w_a)?;
+            let surface = corner_revolution(mixed.q_v, revolve_axis, &generatrix, sweep)?;
+            let domain = generatrix.domain().or_refuse(KernelStage::Refine, "domain")?;
+            (surface, domain)
+        }
+    };
     let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
-    let [g0, g1] = generatrix.domain().or_refuse(KernelStage::Refine, "domain")?;
     let far = surface.evaluate(u1, g1).or_refuse(KernelStage::Refine, "evaluate")?;
     if far.sub(mixed.w_b).length() > 1e-6 * (1.0 + r) {
         return Err(KernelRefusal::internal(KernelStage::Refine, "mixed_star_closure", format!(
@@ -6111,6 +6556,42 @@ fn sew_mixed_star(
     Ok(())
 }
 
+/// The shortest probe [`sharp_edge_is_convex`] tries across a wall narrower
+/// than its usual quarter-radius step: ten times the 1e-6 band the trim
+/// classification reads `Boundary` within, so a run's first quarter point is
+/// still clear of it.
+const SHARP_SHORT_PROBE_FLOOR: f64 = 1e-5;
+
+/// Whether the run from `point` along `direction` for `step` stays in
+/// `wall`'s trim at its quarter points (each within half a step of the
+/// carrier, as the probe itself must be): none reads `Outside`. A point on
+/// the trim's band (`Boundary`, read in the carrier's parameters, so a
+/// world step of 1e-4 on a plane spanning 100 per parameter is inside it)
+/// lies beside the edge the run leaves, not across a gap.
+fn run_stays_in_face(wall: &FaceRecord, point: Vec3, direction: Vec3, step: f64) -> Result<bool, KernelRefusal> {
+    for fraction in [0.25, 0.5, 0.75] {
+        let projection = crate::project_point_to_surface(&wall.surface, point.add(direction.scale(fraction * step)))
+            .or_refuse(KernelStage::Classify, "short_probe_run")?;
+        if projection.distance > 0.5 * step {
+            return Ok(false);
+        }
+        let class = crate::parameter_point_in_face(wall, crate::Vec2 { x: projection.u, y: projection.v }, 1e-6)
+            .or_refuse(KernelStage::Classify, "short_probe_run_class")?;
+        if class == crate::PolygonClass::Outside {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `BREP_BLEND_SHARP_SHORT_PROBE` (on by default; `=0` restores the refusal):
+/// [`sharp_edge_is_convex`] retries a wall that its quarter-radius probe
+/// overshoots on both sides with quartered steps, instead of refusing the
+/// network.
+pub(crate) fn sharp_edge_short_probe_on() -> bool {
+    switch!(live "BREP_BLEND_SHARP_SHORT_PROBE", true)
+}
+
 /// Whether the SHARP edge between `wall_a` and `wall_b` is convex, by the
 /// rule `analyze_edge` uses: one wall's into-material direction dives below
 /// the other wall's plane.
@@ -6129,8 +6610,35 @@ fn sharp_edge_is_convex(
         .unit_tangent(t, sharp.t0, sharp.t1)
         .map_err(|error| format!("blend network: sharp edge {}: {error}", sharp.id)).or_refuse(KernelStage::Refine, "unit_tangent")?;
     let probe = (radius * 0.25).max(1e-4);
-    let into_a = crate::fillet::into_face_direction(wall_a, point, tangent, point, tangent, probe)?;
-    let into_b = crate::fillet::into_face_direction(wall_b, point, tangent, point, tangent, probe)?;
+    let into = |wall: &FaceRecord| -> Result<Vec3, KernelRefusal> {
+        let usual = crate::fillet::into_face_direction(wall, point, tangent, point, tangent, probe);
+        if usual.is_ok() || !sharp_edge_short_probe_on() {
+            return usual;
+        }
+        // A wall NARROWER than the probe across the sharp edge (a cylinder
+        // split by its seam half a degree from the edge leaves a sliver a
+        // fiftieth of the radius wide) puts both probe signs outside its trim
+        // and refused the whole network. Tried only after the usual step
+        // failed: steps from SHARP_SHORT_PROBE_FLOOR up, quadrupling, the
+        // SHORTEST whose probe lands inside the trim and whose run from the
+        // edge does (read at its quarter points). A longer probe can land in
+        // another part of a non-convex wall across a gap (the far arm of a C
+        // or a notch) and read the material on the wrong side; the shortest
+        // reads the wall beside the edge, so only a gap narrower than the
+        // floor could mislead it.
+        let mut step = SHARP_SHORT_PROBE_FLOOR;
+        while step < probe {
+            if let Ok(direction) = crate::fillet::into_face_direction(wall, point, tangent, point, tangent, step) {
+                if run_stays_in_face(wall, point, direction, step)? {
+                    return Ok(direction);
+                }
+            }
+            step *= 4.0;
+        }
+        usual
+    };
+    let into_a = into(wall_a)?;
+    let into_b = into(wall_b)?;
     let outward = |face: &FaceRecord| -> Result<Vec3, KernelRefusal> {
         let projection = crate::project_point_to_surface(&face.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
         let normal = raw_normal(&face.surface, projection.u, projection.v)?;
@@ -6229,15 +6737,15 @@ thread_local! {
 /// (every network attempt counts), the curved-cap closures built, the
 /// attempts that held such a corner and refused, or whose result the caller's
 /// acceptance rejected ([`reject_wrapped_network`]), and a point on each
-/// closure built (its patch at u = v = 1/2). A closure built on a body a later
-/// stage discarded is counted too: whether the returned body carries one is
-/// read off its faces against `points`.
+/// closure built with the patch parameters it was evaluated at (u = v = 1/2).
+/// A closure built on a body a later stage discarded is counted too: whether
+/// the returned body carries one is read off its faces against `points`.
 #[derive(Clone, Debug, Default)]
 pub struct WrapOutcome {
     pub candidates: usize,
     pub wrapped: usize,
     pub failed: usize,
-    pub points: Vec<Vec3>,
+    pub points: Vec<(Vec3, [f64; 2])>,
 }
 
 /// Run `action` with sharp-corner wrapping on (the fillet feature's "Wrap
@@ -6271,14 +6779,23 @@ fn bump_wrap_outcome(change: impl FnOnce(&mut WrapOutcome)) {
 
 /// Whether `body` carries a closure [`with_wrap_sharp_corners`] built: a
 /// face whose carrier passes within `tolerance` of one of `outcome.points`.
+///
+/// The closure's own patch is the face's carrier, so the carrier evaluated at
+/// the point's recorded parameters lands on it exactly; that is read first.
+/// The projection is the fallback for a carrier the body re-parametrized, and
+/// its foot is only as close as the projector converges: on a wide corner
+/// (r = 1.5 on a cylinder of radius 5) it stopped 6.3e-8 off a point the patch
+/// passes through exactly, so the projection alone rejected a good wrap.
 pub fn body_carries_wrapped_corner(body: &BrepSolid, outcome: &WrapOutcome, tolerance: f64) -> bool {
-    outcome.points.iter().any(|point| {
-        body.shells.iter().flat_map(|shell| &shell.faces).any(|face| {
-            crate::project_point_to_surface(&face.surface, *point)
-                .ok()
-                .and_then(|uv| face.surface.evaluate(uv.u, uv.v).ok())
-                .is_some_and(|foot| foot.sub(*point).length() <= tolerance)
-        })
+    let faces = || body.shells.iter().flat_map(|shell| &shell.faces);
+    outcome.points.iter().any(|(point, [u, v])| {
+        faces().any(|face| face.surface.evaluate(*u, *v).is_ok_and(|on| on.sub(*point).length() <= tolerance))
+            || faces().any(|face| {
+                crate::project_point_to_surface(&face.surface, *point)
+                    .ok()
+                    .and_then(|uv| face.surface.evaluate(uv.u, uv.v).ok())
+                    .is_some_and(|foot| foot.sub(*point).length() <= tolerance)
+            })
     })
 }
 
@@ -6714,7 +7231,7 @@ fn canal_corner_patch(
                 let point = surface.evaluate(0.5, 0.5).or_refuse(KernelStage::Refine, "evaluate")?;
                 bump_wrap_outcome(|outcome| {
                     outcome.wrapped += 1;
-                    outcome.points.push(point);
+                    outcome.points.push((point, [0.5, 0.5]));
                 });
             }
             return Ok(CanalPatch { surface, cap_curve: fitted[2].clone(), creases });
@@ -7216,6 +7733,100 @@ fn split_rail_at_cap_seam(
     Ok(Some(if crosses_at_end { second_edge } else { first_edge }))
 }
 
+/// The homogeneous controls of the circular arc about `centre` from `from` to
+/// `to` (both `radius` from it) as ONE rational quadratic span: the end
+/// controls at unit weight, the middle where the end tangents meet, weighted
+/// by the cosine of the half sweep. Below a half-turn only.
+fn single_span_controls(centre: Vec3, radius: f64, from: Vec3, to: Vec3) -> Result<[crate::Vec4; 3], KernelRefusal> {
+    let (a, b) = (from.sub(centre), to.sub(centre));
+    let half = 0.5 * (a.dot(b) / (radius * radius)).clamp(-1.0, 1.0).acos();
+    if !(half > 1e-6 && half < 1.45) {
+        return Err(KernelRefusal::internal(KernelStage::Refine, "single_span_section", "blend network: a section arc is degenerate or near a half-turn"));
+    }
+    let middle = centre.add(a.add(b).normalized().or_refuse(KernelStage::Refine, "single_span_middle")?.scale(radius / half.cos()));
+    Ok([crate::Vec4::from_point(from, 1.0), crate::Vec4::from_point(middle, half.cos()), crate::Vec4::from_point(to, 1.0)])
+}
+
+/// [`single_span_controls`] as a curve on [0, 1].
+fn single_span_section(centre: Vec3, radius: f64, from: Vec3, to: Vec3) -> Result<NurbsCurve, KernelRefusal> {
+    NurbsCurve::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], single_span_controls(centre, radius, from, to)?.to_vec())
+        .or_refuse(KernelStage::Refine, "single_span_section")
+}
+
+/// The tilted curved-wall mixed star's closure: the envelope of the corner
+/// ball along its centre path ([`MixedTilt`]), each station's section the
+/// exact arc from the ball's contact with Q to its contact with the cap, the
+/// rows fitted across the stations as [`canal_corner_patch`] does (cubic in
+/// u through the homogeneous controls, the arc's own quadratic in v) and
+/// read back against the true envelope between stations within `bar`.
+/// Returns the patch (u: A's stop -> B's, v: Q -> cap), its v = 0 side (the
+/// contact with Q) and its v = 1 side (the contact with the cap).
+fn mixed_tilt_patch(tilt: &MixedTilt, radius: f64, bar: f64) -> Result<(crate::NurbsSurface, NurbsCurve, NurbsCurve), KernelRefusal> {
+    let unsolved = |what: &'static str| KernelRefusal::unsupported(KernelStage::Refine, what, format!("blend network: the tilted mixed star's envelope does not close ({what})"));
+    let row = |u: f64| -> Result<[crate::Vec4; 3], KernelRefusal> {
+        let (centre, spine) = tilt.centre(u * tilt.phi_b, radius);
+        let (from, to) = (centre.add(spine.sub(centre).scale(0.5)), centre.add(tilt.cap_normal.scale(radius)));
+        single_span_controls(centre, radius, from, to).map_err(|_| unsolved("mixed_tilt_arc"))
+    };
+    for count in [16usize, 32, 64, 128] {
+        let parameters: Vec<f64> = (0..=count).map(|k| k as f64 / count as f64).collect();
+        let mut columns: [Vec<crate::Vec4>; 3] = std::array::from_fn(|_| Vec::with_capacity(count + 1));
+        for &u in &parameters {
+            for (column, control) in columns.iter_mut().zip(row(u)?) {
+                column.push(control);
+            }
+        }
+        let fitted: Vec<NurbsCurve> = columns
+            .iter()
+            .map(|column| crate::fit::interpolate_homogeneous(column, 3, &parameters).or_refuse(KernelStage::Refine, "mixed_tilt_fit"))
+            .collect::<Result<_, _>>()?;
+        let rows: Vec<Vec<crate::Vec4>> = (0..fitted[0].control_points.len())
+            .map(|i| fitted.iter().map(|curve| curve.control_points[i]).collect())
+            .collect();
+        let surface = crate::NurbsSurface::new(3, 2, fitted[0].knots.clone(), vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], rows)
+            .or_refuse(KernelStage::Refine, "mixed_tilt_surface")?;
+        let mut worst = 0.0_f64;
+        for k in 0..count {
+            let u = (k as f64 + 0.5) / count as f64;
+            let exact = NurbsCurve::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], row(u)?.to_vec()).or_refuse(KernelStage::Refine, "mixed_tilt_row")?;
+            for j in 0..=8 {
+                let v = j as f64 / 8.0;
+                let on_patch = surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?;
+                worst = worst.max(on_patch.sub(exact.evaluate(v).or_refuse(KernelStage::Refine, "evaluate")?).length());
+            }
+        }
+        if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+            eprintln!("tilted mixed star: {count} stations, {worst:.3e} off the envelope (bar {bar:.3e})");
+        }
+        if worst <= bar {
+            let q_side = fitted[0].clone();
+            let cap_side = fitted[2].clone();
+            // The sides as plain curves: the homogeneous columns at v = 0 and
+            // v = 1 carry unit weights (the arcs' end controls), so they are
+            // the patch's own boundary curves exactly.
+            return Ok((surface, q_side, cap_side));
+        }
+    }
+    Err(unsolved("mixed_tilt_off_envelope"))
+}
+
+/// Turn a polynomial curve's end tangents onto `start` and `end` (unit, in
+/// its direction of travel): its second control point is laid along `start`
+/// from the first, its second-to-last along `end` back from the last, each at
+/// its own distance. The ends and every other control point stay; a curve of
+/// fewer than four controls or with weights is left as it is.
+fn turn_end_tangents(curve: &mut NurbsCurve, start: Vec3, end: Vec3) {
+    let n = curve.control_points.len();
+    if n < 4 || curve.control_points.iter().any(|c| (c.w - 1.0).abs() > 1e-12) {
+        return;
+    }
+    let point = |c: &crate::Vec4| Vec3::new(c.x, c.y, c.z);
+    let (q0, q1) = (point(&curve.control_points[0]), point(&curve.control_points[1]));
+    let (qm, qn) = (point(&curve.control_points[n - 2]), point(&curve.control_points[n - 1]));
+    curve.control_points[1] = crate::Vec4::from_point(q0.add(start.scale(q1.sub(q0).length())), 1.0);
+    curve.control_points[n - 2] = crate::Vec4::from_point(qn.sub(end.scale(qn.sub(qm).length())), 1.0);
+}
+
 /// The traversal fraction of edge parameter `t` along a coedge of `edge`.
 fn fraction_of(edge: &EdgeRecord, t: f64, forward: bool) -> f64 {
     let f = (t - edge.t0) / (edge.t1 - edge.t0);
@@ -7235,7 +7846,48 @@ pub fn corner_section_arc(
     if !(sweep > 1e-9) {
         return Err(KernelRefusal::internal(KernelStage::Refine, "corner_section_arc", "blend network: the corner section arc is degenerate"));
     }
-    crate::make_arc(center, x_axis, y_axis, radius, 0.0, sweep).or_refuse(KernelStage::Refine, "make_arc")
+    let arc = crate::make_arc(center, x_axis, y_axis, radius, 0.0, sweep).or_refuse(KernelStage::Refine, "make_arc")?;
+    // `BREP_BLEND_SECTION_ARC_ONE_CONIC`: an arc `make_arc` splits (past 90
+    // degrees) is rebuilt as ONE rational quadratic, the way a stripe's own
+    // section is (middle weight cos(sweep/2)), so the stripe's end pcurve, an
+    // iso line, runs at the arc's own parameter. Split, the two
+    // parameterisations part (a 165-degree section of a sharp edge: 0.125 of
+    // the radius at a quarter of the arc, which a short stripe's coedge bar
+    // refuses). An arc `make_arc` keeps whole is returned as it was.
+    if section_arc_one_conic_on() && arc.control_points.len() > 3 && sweep < std::f64::consts::PI - 1e-6 {
+        let half = 0.5 * sweep;
+        let start = center.add(x_axis.scale(radius));
+        let end = center.add(x_axis.scale(radius * sweep.cos())).add(y_axis.scale(radius * sweep.sin()));
+        let apex = center.add(x_axis.scale(radius).add(y_axis.scale(radius * half.tan())));
+        let poles = vec![
+            crate::Vec4::from_point(start, 1.0),
+            crate::Vec4::from_point(apex, half.cos()),
+            crate::Vec4::from_point(end, 1.0),
+        ];
+        return NurbsCurve::new(2, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], poles).or_refuse(KernelStage::Refine, "one_conic_arc");
+    }
+    Ok(arc)
+}
+
+/// A corner patch revolved about a corner (the mixed star's torus sector,
+/// the horn torus): its rim circles are edges built by
+/// [`corner_section_arc`] (a stripe's end, the cap arc), each coedge an iso
+/// line mapped linearly, so the turn runs in ONE span exactly where those
+/// arcs are one conic (`BREP_BLEND_SECTION_ARC_ONE_CONIC`, a turn under 180
+/// degrees). Split in two past 90 under one-conic rims, the sector's edges
+/// parted from their pcurves by 0.077 at a 120-degree corner.
+fn corner_revolution(origin: Vec3, axis: Vec3, generatrix: &NurbsCurve, sweep: f64) -> Result<crate::NurbsSurface, KernelRefusal> {
+    if section_arc_one_conic_on() && sweep < std::f64::consts::PI - 1e-6 {
+        crate::make_revolution_one_span(origin, axis, generatrix, sweep).or_refuse(KernelStage::Refine, "make_revolution_one_span")
+    } else {
+        crate::make_revolution(origin, axis, generatrix, sweep).or_refuse(KernelStage::Refine, "make_revolution")
+    }
+}
+
+/// `BREP_BLEND_SECTION_ARC_ONE_CONIC` (on by default; `=0` restores the
+/// split arc): see `corner_section_arc`.
+pub(crate) fn section_arc_one_conic_on() -> bool {
+    switch!(live "BREP_BLEND_SECTION_ARC_ONE_CONIC", true)
 }
 
 /// Close a stripe end that runs out into a POLE (`pole_end`): the march
@@ -8811,4 +9463,28 @@ pub fn build_line_pcurve(surface: &crate::NurbsSurface, start: Vec3, finish: Vec
     };
     let (p, q) = (chart(start)?, chart(finish)?);
     crate::sweep_topology::parameter_line(p[0], p[1], q[0], q[1]).or_refuse(KernelStage::Sew, "parameter_line")
+}
+
+/// The law fraction a stripe reads at `fraction` of its law's span when the
+/// ends marked in `eased` reach their hold station with zero slope: a law held
+/// flat past a station it arrives at sloping is a slope break in the blend, a
+/// crease right across the face (up to 0.07 rad on a 2 -> 1 tapered box's
+/// star, 9.2e-2 against a corner ball) that no tangent fill or ball against
+/// it can meet. Within half the span of an eased end the law is read at
+/// `g(f) = f² (2w − f) / w²` of the distance from it (w = ½): zero slope at
+/// the end, the law's own value and slope at w, and the law untouched past
+/// it. A reparameterisation, so it reads the law as a function: stops added
+/// along a straight law change nothing. Without an eased end the fraction is
+/// returned as it is.
+pub fn eased_fraction(fraction: f64, eased: [bool; 2]) -> f64 {
+    const WINDOW: f64 = 0.5;
+    let f = fraction.clamp(0.0, 1.0);
+    let ease = |x: f64| x * x * (2.0 * WINDOW - x) / (WINDOW * WINDOW);
+    if eased[0] && f < WINDOW {
+        ease(f)
+    } else if eased[1] && 1.0 - f < WINDOW {
+        1.0 - ease(1.0 - f)
+    } else {
+        fraction
+    }
 }

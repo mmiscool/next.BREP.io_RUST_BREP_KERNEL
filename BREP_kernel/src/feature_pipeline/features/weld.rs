@@ -358,6 +358,23 @@ fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, St
         }
         _ => None,
     };
+    // A bridged section the joint faces back along part of the seam only
+    // (a wall end not square to it, a relief cutting it): the bead runs along
+    // that stretch.
+    let trimmed_chain;
+    let (chain, fitted) = match fitted {
+        Some((mut fits, trims)) => match fits.as_slice() {
+            [only] if only.span != (0.0, 1.0) => {
+                let (from, to) = only.span;
+                trimmed_chain = fit::Chain::new(vec![chain.runs[0].part(from, to)])?;
+                fits[0].span = (0.0, 1.0);
+                let trims = trimmed_chain.trims(reach).map_err(|reason| format!("fitted placement: {reason}"))?;
+                (&trimmed_chain, Some((fits, trims)))
+            }
+            _ => (&chain, Some((fits, trims))),
+        },
+        None => (&chain, None),
+    };
     if generate {
         // The stretches a side's bead runs along its own seam (the far side's
         // is as long as the far run): the whole seam, or the intermittent
@@ -389,7 +406,8 @@ fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, St
         // one body), each the stretch's pieces swept and united, named
         // `{id}` first and `{id}:Bead{n}` after it.
         let first_body = std::cell::Cell::new(0usize);
-        let lay = |chain: &fit::Chain, sections: &[[Vec3; 3]], trims: &[fit::Trim], far: bool| -> Result<Vec<(String, Vec<fit::Piece>, crate::BrepSolid)>, String> {
+        // `bridges`: each run's [`fit::Fit::bridge`] (empty: every section at its root).
+        let lay = |chain: &fit::Chain, sections: &[[Vec3; 3]], bridges: &[[f64; 2]], trims: &[fit::Trim], far: bool| -> Result<Vec<(String, Vec<fit::Piece>, crate::BrepSolid)>, String> {
             // A convex face can stand past the legs: the mitres are cut for
             // the section's own reach then.
             let widest = fit::section_reach(sections, contour)? + 100.0 * crate::tolerance::WELD_FLOOR;
@@ -416,7 +434,10 @@ fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, St
             }
             let mut bodies = Vec::new();
             for (from, to) in spans(chain.length(), far)? {
-                let pieces = chain.pieces(sections, trims, from, to);
+                let mut pieces = chain.pieces(sections, trims, from, to);
+                for piece in &mut pieces {
+                    piece.bridge = bridges.get(piece.index).copied().unwrap_or([0.0, 0.0]);
+                }
                 let n = first_body.get() + bodies.len();
                 let name = if n == 0 { ctx.id.clone() } else { format!("{}:Bead{}", ctx.id, n + 1) };
                 let body = fit::build_bead(&name, &pieces, contour)?;
@@ -452,7 +473,7 @@ fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, St
                 Err(reason) => return Ok(Err(reason)),
             };
             // The section triangle's centroid, halfway along the first stretch.
-            let bodies = lay(&chain, &sections, &trims, false)?;
+            let bodies = lay(&chain, &sections, &[], &trims, false)?;
             let piece = &bodies[0].1[0];
             let [root, toe_u, toe_v] = piece.section;
             let centroid = piece.run.at(0.5).add(piece.run.carry(0.5, root.add(toe_u.add(toe_v).scale(1.0 / 3.0))));
@@ -508,7 +529,8 @@ fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, St
                 // (AUTO falls back, FITTED says so), not a feature error.
                 let roots: Vec<Vec3> = sections.iter().map(|[root, _, _]| *root).collect();
                 let mut checked = chain.rooted(trims, &roots).map(|_| ());
-                let mut built = if checked.is_ok() { lay(&chain, &sections, trims, false)? } else { Vec::new() };
+                let bridges: Vec<[f64; 2]> = fits.iter().map(fit::Fit::bridge).collect();
+                let mut built = if checked.is_ok() { lay(&chain, &sections, &bridges, trims, false)? } else { Vec::new() };
                 for (_, pieces, body) in &built {
                     if checked.is_err() { break; }
                     checked = chain.verify_pieces(ctx.scene, fits, legs, body, pieces, &ctx.id)?;
@@ -528,7 +550,8 @@ fn build(ctx: &FeatureContext, tacks: Option<Tacks>) -> Result<FeatureResult, St
                                 first_body.set(built.len());
                                 let far_roots: Vec<Vec3> = far_sections.iter().map(|[root, _, _]| *root).collect();
                                 let mut outcome = far_chain.rooted(&far_trims, &far_roots).map(|_| ());
-                                let far = if outcome.is_ok() { lay(&far_chain, &far_sections, &far_trims, true)? } else { Vec::new() };
+                                let far_bridges: Vec<[f64; 2]> = found.iter().map(fit::Fit::bridge).collect();
+                                let far = if outcome.is_ok() { lay(&far_chain, &far_sections, &far_bridges, &far_trims, true)? } else { Vec::new() };
                                 for (_, pieces, body) in &far {
                                     if outcome.is_err() { break; }
                                     outcome = far_chain.verify_pieces(ctx.scene, &found, legs, body, pieces, &ctx.id)?;

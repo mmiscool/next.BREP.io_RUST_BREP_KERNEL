@@ -103,6 +103,7 @@ fn split_self_touching_source(source: &BrepSolid) -> Result<Option<BrepSolid>, K
             .collect::<Vec<_>>(),
     );
     let imprint = ImprintResultRecord {
+        faces_in_unproved_pairs: None,
         edge_splits,
         ..empty_imprint()
     };
@@ -123,6 +124,65 @@ const RULED_NEIGHBOUR_CLEARANCE_BANDS: f64 = 16.0;
 /// How far past its opening plane an inward carrier is grown, as a fraction of
 /// the shell distance (see the fall-short reach in the carrier loop).
 const REACH_CLEARANCE: f64 = 0.25;
+
+/// `BREP_OFFSET_EXACT_PLANAR_PCURVES` (default on since the 2026-11-18
+/// promotion; `=0` restores the imprint's pcurves): every
+/// coedge of a planar face the offset BUILT (an offset or a wall, never a
+/// retained source face) takes the EXACT affine image
+/// of its own 3D edge as its pcurve, where that edge lies on the plane.
+///
+/// A plane's trim may still carry the pcurve of the imprint section it was cut
+/// from, and that section need not be the edge the assembly kept: on a boss
+/// under a rim fillet shelled through its bottom, with the boss's one cylinder
+/// face extended to its full domain, the opening wall's arc sat 6.7e-6 off the
+/// cylinder's offset while the edge itself sat on both, and the shell's volume
+/// read up to 3.8e-5 off its oracle depending only on where the cylinder's
+/// seam sat. The image of an edge on its plane is exact (the inverse affine map
+/// of the edge's control net), so the trim no longer depends on the section.
+fn exact_planar_pcurves_on() -> bool {
+    switch!("BREP_OFFSET_EXACT_PLANAR_PCURVES", true)
+}
+
+/// The pass behind [`exact_planar_pcurves_on`]: the number of coedges whose
+/// pcurve changed. A loop with any edge not on its plane within `tolerance`
+/// (the exact lane declines it) keeps every pcurve it has.
+fn exact_planar_pcurves(solid: &mut BrepSolid, built: &HashSet<u64>, tolerance: f64) -> Result<usize, KernelRefusal> {
+    let edges: HashMap<u64, EdgeRecord> = solid.edges.iter().map(|edge| (edge.id, edge.clone())).collect();
+    let mut replaced = 0usize;
+    for shell in &mut solid.shells {
+        for face in &mut shell.faces {
+            if !built.contains(&face.id) || !face.surface.is_affine().or_refuse(KernelStage::Sew, "is_affine")? {
+                continue;
+            }
+            // All or nothing per loop: one declined edge beside replaced ones
+            // would leave a gap in the loop's parameter space.
+            for loop_record in &mut face.loops {
+                let mut exact = Vec::with_capacity(loop_record.coedges.len());
+                for coedge in &loop_record.coedges {
+                    let Some(edge) = edges.get(&coedge.edge_id) else { break };
+                    if edge.degenerate || !(edge.t0 < edge.t1) {
+                        break;
+                    }
+                    let Ok(Some(fit)) = brep_geometry::pcurve::affine_pcurve_on_range(&face.surface, &edge.curve, edge.t0, edge.t1, coedge.forward, tolerance) else {
+                        break;
+                    };
+                    exact.push(fit.curve);
+                }
+                if exact.len() != loop_record.coedges.len() {
+                    continue;
+                }
+                for (coedge, pcurve) in loop_record.coedges.iter_mut().zip(exact) {
+                    coedge.pcurve = pcurve;
+                    replaced += 1;
+                }
+            }
+        }
+    }
+    if replaced > 0 {
+        solid.mass_properties_cache = Default::default();
+    }
+    Ok(replaced)
+}
 
 /// What the pipeline assembles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +208,13 @@ fn forced_direct_refusal() -> Option<KernelRefusal> {
 /// piece): see EVERY SKIN PIECE in the offset selection.
 fn every_skin_piece_enabled() -> bool {
     crate::switch!("BREP_OFFSET_EVERY_SKIN_PIECE", true)
+}
+
+/// `BREP_OFFSET_STAND_IN_ON_OWN_OFFSET` (default on since the 2026-11-18
+/// promotion; `=0` restores the largest piece): see ON ITS OWN OFFSET in the
+/// offset selection.
+fn stand_in_on_own_offset_on() -> bool {
+    crate::switch!("BREP_OFFSET_STAND_IN_ON_OWN_OFFSET", true)
 }
 
 /// `BREP_OFFSET_EVERY_SEEDED_SKIN_PIECE` (default on; `=0` restores): when an
@@ -183,8 +250,12 @@ pub fn offset_shell(
     };
     let mut shelled = offset_shell_lanes(source, opening_face_ids, distance, direct)?;
     if membrane_shells_on() {
-        drop_folded_shells(&mut shelled.solid, distance);
-        let membranes = membrane_shell_indices(&shelled.solid, distance);
+        // An unchanged body keeps the membrane reading taken on it (one mass
+        // pass instead of two: ~75 ms of shell/rounded-tray's 0.19 s).
+        let membranes = match drop_folded_shells_reading(&mut shelled.solid, distance) {
+            Some(unchanged) => unchanged,
+            None => membrane_shell_indices(&shelled.solid, distance),
+        };
         let paired = paired_face_ids(&shelled.solid);
         if !membranes.is_empty() || !paired.is_empty() {
             for (first, second) in &paired {
@@ -278,6 +349,14 @@ fn shell_is_bag(shell: &ShellRecord, edges: &HashMap<u64, &EdgeRecord>) -> bool 
 /// shell or a result that does not validate. A folded or bag shell qualifies
 /// only when its volume is at most 1% of |distance| × its area.
 pub fn drop_folded_shells(solid: &mut BrepSolid, distance: f64) {
+    drop_folded_shells_reading(solid, distance);
+}
+
+
+/// [`drop_folded_shells`], returning [`membrane_shell_indices`] of `solid`
+/// when it is left unchanged (the reading taken here), `None` when shells
+/// were dropped.
+pub(crate) fn drop_folded_shells_reading(solid: &mut BrepSolid, distance: f64) -> Option<Vec<usize>> {
     let edges: HashMap<u64, &EdgeRecord> = solid.edges.iter().map(|edge| (edge.id, edge)).collect();
     let empty = membrane_shell_indices(solid, distance);
     let folded: Vec<usize> = (0..solid.shells.len())
@@ -290,7 +369,7 @@ pub fn drop_folded_shells(solid: &mut BrepSolid, distance: f64) {
         })
         .collect();
     if folded.is_empty() || folded.len() == solid.shells.len() {
-        return;
+        return Some(empty);
     }
     let mut trimmed = solid.clone();
     let mut index = 0;
@@ -318,10 +397,11 @@ pub fn drop_folded_shells(solid: &mut BrepSolid, distance: f64) {
     let issues = trimmed.validate();
     if !issues.is_empty() {
         os_debug!("folded shells {folded:?} kept: without them the result does not validate: {issues:?}");
-        return;
+        return Some(empty);
     }
     os_debug!("dropped folded shells {folded:?}");
     *solid = trimmed;
+    None
 }
 
 /// Pairs of faces of one shell bounded by exactly the same non-degenerate
@@ -440,11 +520,23 @@ pub(super) fn offset_body(
     entry: &str,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
     profile::reset();
+    let full_turn = if super::full_turn::full_turn_revolutions_on() { super::full_turn::full_turn_revolution_source(source)? } else { None };
+    let source = full_turn.as_ref().unwrap_or(source);
     // Lane P3b row 3: one stderr write per operation for every profile line
     // emitted below (`crate::imprint::ProfileSink`).
     let _profile_sink = crate::imprint::ProfileSink::open();
     let started = web_time::Instant::now();
-    let result = offset_shell_any_lane(source, opening_face_ids, distance, body).and_then(|result| {
+    let result = match offset_shell_any_lane(source, opening_face_ids, distance, body) {
+        // A cylinder split along its own seam: refused with the seam where it
+        // is, retried with the two pieces joined on the full turn seamed in
+        // their gap (`full_turn.rs`). Only a refusal is retried.
+        Err(error) if super::full_turn::full_turn_revolutions_on() => match super::full_turn::seam_pieces_joined(source, opening_face_ids)? {
+            Some(joined) => offset_shell_any_lane(&joined, opening_face_ids, distance, body).map_err(|_| error),
+            None => Err(error),
+        },
+        other => other,
+    }
+    .and_then(|result| {
         let mut clock = web_time::Instant::now();
         let connected = outward_shell_is_connected(source, distance, &result);
         profile::lap(&mut clock, profile::ACCEPTANCE);
@@ -523,6 +615,18 @@ fn offset_shell_any_lane(
             }
         }
         return imprint_attempts(source, opening_face_ids, distance, body);
+    }
+    // `BREP_OFFSET_BOX_EMPTY_CAVITY` (default on; `=0` restores): an inward shell of a box
+    // whose walls' reach meets across an axis is the box itself, read exactly
+    // (`box_cavity.rs`) in place of the cavity search and its proof.
+    if let Some(unchanged) = super::box_cavity::box_empty_cavity_shell(source, opening_face_ids, distance)? {
+        return Ok(unchanged);
+    }
+    // `BREP_OFFSET_REVOLVED_SHELL` (default on; `=0` restores): an inward shell of a convex
+    // solid of revolution is its section less the cavity, revolved
+    // (`revolved_shell.rs`).
+    if let Some(shell) = super::revolved_shell::revolved_shell(source, opening_face_ids, distance) {
+        return Ok(shell);
     }
     // An outward shell of the one circular face of a partial revolve is planar
     // in the meridian half-plane, fold band and all: build it there and revolve
@@ -866,6 +970,9 @@ fn offset_shell_impl(
     // round's id, so reading it shadowed must drop only the tube, never the
     // round's own offset.
     let mut surviving_tubes = HashSet::<usize>::default();
+    // The carriers of a BAND carve's kept pieces (whole body only), by index:
+    // one wholly shadowed piece drops alone, never its source face's others.
+    let mut band_pieces = HashSet::<usize>::default();
     let mut shielded_cusps = HashSet::<u64>::default();
 
     for face_id in &retained {
@@ -1085,7 +1192,7 @@ fn offset_shell_impl(
         // inverted patch in it welds into a shell that validates and bounds the
         // wrong solid.
         profile::lap(&mut clock, profile::CARRIER_TRIM);
-        let carved = profile::detail("carve_folded_support", || carve_shell_support(source, face, distance, opening_face_ids))?;
+        let carved = profile::detail("carve_folded_support", || carve_shell_support(source, face, distance, opening_face_ids, body == Body::Whole))?;
         profile::lap(&mut clock, profile::CARRIER_REGULARITY);
         // A CUT RIM — the face's rim with a planar opening running across
         // its surface rather than along a v end — has the trim rebuilt over
@@ -1220,6 +1327,26 @@ fn offset_shell_impl(
                     // this carrier's boundary.
                     super::outward_side_widen::keep_used_edges(&mut carrier);
                 }
+            } else if distance < 0.0 && nonuniform_slid_trim_on() && super::outward_side_widen::slid_trim_falls_short(
+                source,
+                face,
+                &source_faces,
+                &carrier,
+                distance,
+                narrowest,
+            )? {
+                // The same fallback for a NON-uniform extension (a drafted
+                // neighbour pads one side more): the rectangle does not depend
+                // on the pads being equal. Measured on a block leaning out 1
+                // over its height 6, opened through an end face, with a slot
+                // through its top running out of the far end: the top's slid
+                // trim kept its notch at the slot wall while the wall's offset
+                // stood 1 past it, and the shell refused with open edges along
+                // that line; with the side vertical the extension is uniform
+                // and this fallback already built it.
+                os_debug!("carrier for src face {face_id}: slid trim falls short (non-uniform extension), full rectangle");
+                carrier = full_rectangle_face(&carrier, &carrier.shells[0].faces[0])?;
+                super::outward_side_widen::keep_used_edges(&mut carrier);
             }
         }
         // An inward reflex junction needs a construction plane extending PAST
@@ -1286,11 +1413,27 @@ fn offset_shell_impl(
                 vacated_notes.push(format!("source face {face_id}: {declined}"));
             }
         }
+        if carved.as_ref().is_some_and(|carved| !carved.other_pieces.is_empty()) {
+            band_pieces.insert(carriers.len());
+        }
         carriers.push(Carrier {
             solid: carrier,
             source_face_id: *face_id,
             kind: OffsetFaceRole::Offset,
         });
+        // A BAND carve's other kept pieces (whole body only): a carrier each,
+        // over its own carved source, the selection reading every one against
+        // the whole source.
+        for piece in carved.iter().flat_map(|carved| &carved.other_pieces) {
+            let (piece_carrier, piece_lane) = carrier_solid_sided_lane(&piece.solid, *face_id, distance, &extension)?;
+            os_debug!("carrier for src face {face_id}: band piece lane {piece_lane:?} ({:.1}% kept)", piece.kept_fraction * 100.0);
+            band_pieces.insert(carriers.len());
+            carriers.push(Carrier {
+                solid: piece_carrier,
+                source_face_id: *face_id,
+                kind: OffsetFaceRole::Offset,
+            });
+        }
     }
     profile::lap(&mut clock, profile::CARRIER_TRIM);
     // APEX-CAP carriers: a retained face whose DEGENERATE edge (an apex
@@ -1613,6 +1756,7 @@ fn offset_shell_impl(
                 // the band that decides whether the strip beyond the grown
                 // outline is wall or void, so the strip always resolves as its
                 // own fragment and is dropped as void.
+                let uniform_pad = pad;
                 let pad = if ruled_openings
                     .iter()
                     .any(|ruled| source_faces_adjacent(source_face, ruled))
@@ -1647,7 +1791,41 @@ fn offset_shell_impl(
                 // rather than assembling an open rim.
                 let mut scaled = carrier_solid(source, *face_id, 0.0, pad)?;
                 drop_wall_interior_loops(&mut scaled)?;
-                let mut wall = match profile::detail("offset_outline_wall", || offset_outline_wall(source, source_face, pad))? {
+                // Each outline edge padded for its own neighbour, plus the same
+                // clearance the uniform pad carries (`outward_wall_pads_per_edge`).
+                let per_edge = if per_edge_opening_pads_on() {
+                    Some(outward_wall_pads_per_edge(source, source_face, &source_faces, &opening_set, distance.abs())?)
+                } else {
+                    None
+                };
+                // Where the pads differ, every edge also takes the clearance a
+                // ruled or free-form neighbour's wall takes: an edge padded by
+                // exactly d beside one padded more lands its wall boundary ON
+                // the neighbour's offset section, and the imprint drops it as
+                // boundary (non-integral genus at the corner they share).
+                let clearance = match &per_edge {
+                    Some(pads) if pads.values().any(|value| (value - uniform_pad).abs() > 1e-12 * uniform_pad.max(1.0)) => {
+                        (pad - uniform_pad).max(
+                            RULED_NEIGHBOUR_CLEARANCE_BANDS * offset_skin_band(crate::solid_scale(source), distance),
+                        )
+                    }
+                    _ => pad - uniform_pad,
+                };
+                // An outline the per-edge offset declines (a tangent junction
+                // between edges padded differently) takes the uniform pad.
+                let outline_wall = || match &per_edge {
+                    Some(pads) => match offset_outline_wall_per_edge(source, source_face, &|edge_id| {
+                        pads.get(&edge_id).copied().unwrap_or(uniform_pad) + clearance
+                    })? {
+                        Ok(wall) => Ok(Ok(wall)),
+                        Err(reason) => {
+                            os_debug!("per-edge outline of opening face {face_id} declined ({reason}); uniform pad");
+                            offset_outline_wall(source, source_face, pad)
+                        }
+                    },
+                    None => offset_outline_wall(source, source_face, pad),
+                };
+                let mut wall = match profile::detail("offset_outline_wall", outline_wall)? {
                     Ok(outline) => {
                         // Where the scaled wall already trims the offset
                         // outline's own region — a rectangle filling its patch,
@@ -1780,6 +1958,16 @@ fn offset_shell_impl(
     let tolerance = 1e-7f64.max(scale * 1e-9);
     let pair_tolerance = (scale * 1e-8).max(2e-6);
     let reach = distance.abs() * 4.0 + pair_tolerance;
+    // Only after the cascade has omitted a shadowed carrier: until then that
+    // carrier still cuts both coplanar copies at the same points. A shell only:
+    // under `offset_solid` (the dumbbell's run-on body shrunk with rounded
+    // joins) it turned a refusal into a two-shell body 2.16 off its form.
+    if abut_coplanar_carriers_on() && body == Body::Shell && !shadowed_supports.is_empty() {
+        let abutted = abut_coplanar_offset_carriers(&mut carriers, tolerance.max(scale * 1e-9))?;
+        if abutted > 0 {
+            os_debug!("abutted {abutted} pair(s) of overlapping coplanar offset carriers");
+        }
+    }
     let carrier_samples = carriers
         .iter()
         .map(|carrier| carrier_extent_points(&carrier.solid))
@@ -2788,6 +2976,21 @@ fn offset_shell_impl(
                     return Err(unmeasured_skin_refusal(fragment.test_point, *face, reason));
                 }
             }
+            if mixed_fragment_report_on() {
+                let mut omitted = shadowed_supports.iter().copied().collect::<Vec<_>>();
+                omitted.sort_unstable();
+                for (fragment_index, (fragment, reading)) in fragments_by_carrier[index].iter().zip(&readings).enumerate() {
+                    let Some(mixed) = mixed_fragment_reading(fragment, source, &retained_faces_with_edges, distance, offset_skin_tolerance)? else { continue };
+                    if mixed.mixed() {
+                        eprintln!(
+                            "MIXED-FRAGMENT d={distance} omitted={omitted:?} src={} fragment={fragment_index} skin={} shadowed={} of {} shadowing={:?} test_reading={} test=({:.4},{:.4},{:.4})",
+                            carrier.source_face_id, mixed.skin, mixed.shadowed, mixed.inside, mixed.shadowing,
+                            match reading { SkinReading::On => "On", SkinReading::Shadowed { .. } => "Shadowed", SkinReading::Unmeasured { .. } => "Unmeasured" },
+                            fragment.test_point.x, fragment.test_point.y, fragment.test_point.z,
+                        );
+                    }
+                }
+            }
             // EVERY fragment measured nearer than the distance to some other
             // retained face: this support's offset is SHADOWED over its whole
             // extended carrier — the side walls of a slot narrower than 2|d|
@@ -2888,6 +3091,17 @@ fn offset_shell_impl(
                     os_debug!("  select[{index}] src={}: a surviving round's rim tube reads shadowed; only the tube is dropped", carrier.source_face_id);
                     continue;
                 }
+                // A band piece buried whole is that piece's answer, not its
+                // face's: its siblings may still bound material. Its carrier
+                // stays in the imprint, so the cuts it makes are unchanged.
+                if band_pieces.contains(&index)
+                    && carriers.iter().enumerate().any(|(other, sibling)| {
+                        other != index && sibling.source_face_id == carrier.source_face_id && band_pieces.contains(&other)
+                    })
+                {
+                    os_debug!("  select[{index}] src={}: a band piece reads shadowed; only the piece is dropped", carrier.source_face_id);
+                    continue;
+                }
                 os_debug!(
                     "  select[{index}] src={} SHADOWED over all {} fragment(s): {:?}",
                     carrier.source_face_id,
@@ -2958,12 +3172,13 @@ fn offset_shell_impl(
                         )?
                 };
                 os_debug!(
-                    "  select[{index}.{fragment_index}] class={class:?} contact={contact} on_skin={} reading={:?} adrift={} seed_in={:?} uv=({:.3},{:.3})",
+                    "  select[{index}.{fragment_index}] class={class:?} contact={contact} on_skin={} reading={:?} adrift={} seed_in={:?} uv=({:.3},{:.3}) at ({:.4},{:.4},{:.4})",
                     on_skin[fragment_index],
                     readings[fragment_index],
                     adrift[fragment_index],
                     parameter_point_in_face(&fragment_as_trim(fragment), seed, 1e-8),
                     fragment.test_uv.x, fragment.test_uv.y,
+                    fragment.test_point.x, fragment.test_point.y, fragment.test_point.z,
                 );
                 let past_opening = opening_limits.iter().any(|(origin, normal)| {
                     fragment.test_point.sub(*origin).dot(*normal) < -tolerance * 10.0
@@ -3027,7 +3242,42 @@ fn offset_shell_impl(
                         // watertight gate still refuses if it cannot.
                         None
                     } else {
-                        let mut by_area = classified
+                        // ON ITS OWN OFFSET (`BREP_OFFSET_STAND_IN_ON_OWN_OFFSET`):
+                        // the stand-in is drawn only from the pieces whose test
+                        // point lies the distance from the carrier's OWN trimmed
+                        // face, the one holding the seed first. A cylinder kept
+                        // as one face is offset on its full turn, and the part
+                        // of that turn buried in the neighbouring wall comes
+                        // out as a larger piece than the face's own image (a
+                        // boss whose axis sits inside the wall: 2.4 from the
+                        // cylinder against 0.1); chosen by area it closed the
+                        // shell around a skin inside the material.
+                        let mut pool = classified.clone();
+                        let mut seeded_own = None;
+                        if stand_in_on_own_offset_on() {
+                            let own = classified
+                                .iter()
+                                .filter(|fragment| {
+                                    own_offset_departure(fragment.test_point, carrier.source_face_id, &retained_faces_with_edges, distance)
+                                        .is_some_and(|departure| departure.abs() <= offset_skin_tolerance)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            if !own.is_empty() {
+                                let mut seeded = own
+                                    .iter()
+                                    .filter(|fragment| {
+                                        parameter_point_in_face(&fragment_as_trim(fragment), seed, 1e-8)
+                                            .is_ok_and(|class| class != PolygonClass::Outside)
+                                    })
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                seeded.sort_by(|a, b| a.test_uv.sub(seed).length().total_cmp(&b.test_uv.sub(seed).length()));
+                                seeded_own = seeded.into_iter().next();
+                                pool = own;
+                            }
+                        }
+                        let mut by_area = pool
                             .iter()
                             .cloned()
                             .map(|fragment| {
@@ -3036,7 +3286,7 @@ fn offset_shell_impl(
                             })
                             .collect::<Result<Vec<_>, KernelRefusal>>()?;
                         by_area.sort_by(|a, b| b.1.total_cmp(&a.1));
-                        by_area.into_iter().next().map(|entry| entry.0)
+                        seeded_own.or_else(|| by_area.into_iter().next().map(|entry| entry.0))
                     }
                 } else if !seeded_classified.is_empty() {
                     let mut candidates = seeded_classified;
@@ -3980,6 +4230,20 @@ fn offset_shell_impl(
         }
     };
     profile::detail("reconstruct_analytic_shell", || crate::offset_retrim::reconstruct_analytic_shell(&mut solid))?;
+    if exact_planar_pcurves_on() {
+        // Only the faces the offset BUILT: a retained source face keeps the
+        // source's own trims, so the shell and its source still agree there
+        // (a cavity read as source less shell cancels what they share).
+        let built = solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| face_images.get(face.id.saturating_sub(1) as usize).is_some_and(|image| !matches!(image.role, OffsetFaceRole::Source)))
+            .map(|face| face.id)
+            .collect::<HashSet<u64>>();
+        let replaced = exact_planar_pcurves(&mut solid, &built, (1e-7f64).max(scale * 1e-8))?;
+        os_debug!("exact planar pcurves: {replaced} coedge(s) re-derived from their edges");
+    }
     if rim_bands + pair_rims > 0 || !inward_extended_walls.is_empty() {
         // Rim welds and extended reflex walls join independently-oriented skins;
         // put the whole finalized manifold on one normal convention so the
@@ -4310,6 +4574,241 @@ pub fn wall_surplus_beyond_the_sections(
 /// distance past the boss limit (checked with
 /// `scripts/offset_cavity_volume.py`), and were dropped as shadowed. A carrier
 /// holding no skin at all may then be omitted even after an earlier omission.
+/// `BREP_OFFSET_ABUT_COPLANAR_CARRIERS` (default on; `=0` restores): see
+/// [`abut_coplanar_offset_carriers`].
+fn abut_coplanar_carriers_on() -> bool {
+    switch!("BREP_OFFSET_ABUT_COPLANAR_CARRIERS", true)
+}
+
+/// Two retained planar faces on ONE plane with the same outward sense (the
+/// matching side walls of two pockets) have offsets on one plane too, and each
+/// carrier is continued past its trim to its mitre — so across the material
+/// between them (a divider thinner than 2d) the two carriers OVERLAP. Every
+/// carrier crossing that plane then imprints two partly overlapping copies of
+/// one cut, which the arrangement cannot use: the frame's offset over two
+/// pockets lost all its cuts once the divider's own (shadowed) offsets stopped
+/// splitting them, and the shell refused.
+///
+/// Such a pair is cut back to abut at the middle of its overlap, each keeping
+/// its own side: the union of the two, the plane the cavity is bounded by, is
+/// unchanged, and each keeps its own source face. Planar degree-(1, 1)
+/// carriers whose trim is a parameter rectangle, overlapping along one
+/// direction and matching along the other; any other pair is left as it was.
+/// Run only in a pass after the cascade omitted a shadowed carrier: until then
+/// that carrier cuts both copies at the same points and the overlap is
+/// harmless (the outward divider builds exactly in its first pass, and cut
+/// back there it gained a 342-area membrane). Returns how many pairs were cut
+/// back.
+fn abut_coplanar_offset_carriers(carriers: &mut [Carrier], tolerance: f64) -> Result<usize, KernelRefusal> {
+    struct Plate {
+        index: usize,
+        origin: Vec3,
+        axes: [Vec3; 2],
+        lengths: [f64; 2],
+        normal: Vec3,
+        height: f64,
+    }
+    let plate = |index: usize, carrier: &Carrier| -> Result<Option<Plate>, KernelRefusal> {
+        if !matches!(carrier.kind, OffsetFaceRole::Offset) {
+            return Ok(None);
+        }
+        let face = &carrier.solid.shells[0].faces[0];
+        let surface = &face.surface;
+        if surface.degree_u != 1 || surface.degree_v != 1 || surface.control_points.len() != 2 || surface.control_points[0].len() != 2 {
+            return Ok(None);
+        }
+        if surface.control_points.iter().flatten().any(|point| (point.w - 1.0).abs() > 1e-12) || face.loops.len() != 1 {
+            return Ok(None);
+        }
+        let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
+        let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
+        // A rectangular trim: four straight pcurves, each running along u or
+        // along v, whose box lies inside the domain.
+        if face.loops[0].coedges.len() != 4 {
+            return Ok(None);
+        }
+        let mut uv_box = [f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY];
+        for coedge in &face.loops[0].coedges {
+            if coedge.pcurve.degree != 1 || coedge.pcurve.control_points.len() != 2 {
+                return Ok(None);
+            }
+            let (Ok(a), Ok(b)) = (coedge.pcurve.control_points[0].point(), coedge.pcurve.control_points[1].point()) else { return Ok(None) };
+            let (du, dv) = ((b.x - a.x).abs(), (b.y - a.y).abs());
+            if du.min(dv) > 1e-12 * du.max(dv) {
+                return Ok(None);
+            }
+            let [a, b] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+            for t in [a, b] {
+                let uv = coedge.pcurve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
+                uv_box = [uv_box[0].min(uv.x), uv_box[1].max(uv.x), uv_box[2].min(uv.y), uv_box[3].max(uv.y)];
+            }
+        }
+        let span = (u1 - u0).abs().max(v1 - v0).max(1.0);
+        let [bu0, bu1, bv0, bv1] = uv_box;
+        let box_area = (bu1 - bu0) * (bv1 - bv0);
+        if bu0 < u0 - 1e-9 * span || bu1 > u1 + 1e-9 * span || bv0 < v0 - 1e-9 * span || bv1 > v1 + 1e-9 * span
+            || !(box_area > 0.0)
+            || (parameter_space_area(face).or_refuse(KernelStage::Refine, "parameter_space_area")?.abs() - box_area).abs() > 1e-9 * box_area
+        {
+            return Ok(None);
+        }
+        let origin = surface.evaluate(bu0, bv0).or_refuse(KernelStage::Refine, "evaluate")?;
+        let along_u = surface.evaluate(bu1, bv0).or_refuse(KernelStage::Refine, "evaluate")?.sub(origin);
+        let along_v = surface.evaluate(bu0, bv1).or_refuse(KernelStage::Refine, "evaluate")?.sub(origin);
+        let lengths = [along_u.length(), along_v.length()];
+        if lengths[0] <= tolerance || lengths[1] <= tolerance {
+            return Ok(None);
+        }
+        let axes = [along_u.scale(1.0 / lengths[0]), along_v.scale(1.0 / lengths[1])];
+        if axes[0].dot(axes[1]).abs() > 1e-9 {
+            return Ok(None);
+        }
+        // A rectangle, not a bilinear quadrilateral: the fourth corner closes it.
+        let far = surface.evaluate(bu1, bv1).or_refuse(KernelStage::Refine, "evaluate")?;
+        if far.sub(origin.add(along_u).add(along_v)).length() > tolerance {
+            return Ok(None);
+        }
+        let sense = if face.same_sense { 1.0 } else { -1.0 };
+        let normal = axes[0].cross(axes[1]).scale(sense);
+        Ok(Some(Plate { index, origin, axes, lengths, normal, height: normal.dot(origin) }))
+    };
+    let mut abutted = 0usize;
+    'pairs: loop {
+        let plates = carriers
+            .iter()
+            .enumerate()
+            .map(|(index, carrier)| plate(index, carrier))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        for (i, first) in plates.iter().enumerate() {
+            for second in &plates[i + 1..] {
+                if first.normal.dot(second.normal) < 1.0 - 1e-12 || (first.height - second.height).abs() > tolerance {
+                    continue;
+                }
+                // ONE plane: every corner of the second on the first's plane, so a
+                // slightly tilted pair (equal near one point) is not cut back.
+                let on_plane = |point: Vec3| (first.normal.dot(point) - first.height).abs() <= tolerance;
+                let second_far = second.origin.add(second.axes[0].scale(second.lengths[0]));
+                let second_up = second.origin.add(second.axes[1].scale(second.lengths[1]));
+                if !on_plane(second.origin) || !on_plane(second_far) || !on_plane(second_up)
+                    || !on_plane(second_far.add(second.axes[1].scale(second.lengths[1])))
+                    || !on_plane(first.origin.add(first.axes[0].scale(first.lengths[0])).add(first.axes[1].scale(first.lengths[1])))
+                {
+                    continue;
+                }
+                // The second's extent in the first's frame, along each axis.
+                let corners = [
+                    second.origin,
+                    second.origin.add(second.axes[0].scale(second.lengths[0])),
+                    second.origin.add(second.axes[1].scale(second.lengths[1])),
+                    second.origin.add(second.axes[0].scale(second.lengths[0])).add(second.axes[1].scale(second.lengths[1])),
+                ];
+                let range = |axis: usize| {
+                    corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), corner| {
+                        let at = corner.sub(first.origin).dot(first.axes[axis]);
+                        (low.min(at), high.max(at))
+                    })
+                };
+                let ranges = [range(0), range(1)];
+                // The second must be a rectangle aligned with the first.
+                if second.axes.iter().any(|axis| axis.dot(first.axes[0]).abs().min(axis.dot(first.axes[1]).abs()) > 1e-9) {
+                    continue;
+                }
+                for (along, across) in [(0usize, 1usize), (1, 0)] {
+                    let (low, high) = ranges[along];
+                    let (across_low, across_high) = ranges[across];
+                    if (across_low).abs() > tolerance || (across_high - first.lengths[across]).abs() > tolerance {
+                        continue;
+                    }
+                    let overlap = (high.min(first.lengths[along]), low.max(0.0));
+                    if overlap.0 - overlap.1 <= tolerance {
+                        continue;
+                    }
+                    let first_holds = low >= -tolerance && high <= first.lengths[along] + tolerance;
+                    let second_holds = low <= tolerance && high >= first.lengths[along] - tolerance;
+                    if first_holds || second_holds {
+                        continue;
+                    }
+                    let cut = 0.5 * (overlap.0 + overlap.1);
+                    let point = first.origin.add(first.axes[along].scale(cut));
+                    let first_low_side = 0.5 * first.lengths[along] < cut;
+                    clip_plate(&mut carriers[first.index], point, first.axes[along], first_low_side)?;
+                    clip_plate(&mut carriers[second.index], point, first.axes[along], !first_low_side)?;
+                    abutted += 1;
+                    continue 'pairs;
+                }
+            }
+        }
+        break;
+    }
+    Ok(abutted)
+}
+
+/// Cut a planar degree-(1, 1) carrier back at the plane through `point`
+/// normal to `axis`, keeping the side below it (`keep_low`) or above it, and
+/// rebuild its trim as the new parameter rectangle.
+fn clip_plate(carrier: &mut Carrier, point: Vec3, axis: Vec3, keep_low: bool) -> Result<(), KernelRefusal> {
+    let face = carrier.solid.shells[0].faces[0].clone();
+    let surface = &face.surface;
+    let mut uv_box = [f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY];
+    for coedge in &face.loops[0].coedges {
+        let [a, b] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        for t in [a, b] {
+            let uv = coedge.pcurve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
+            uv_box = [uv_box[0].min(uv.x), uv_box[1].max(uv.x), uv_box[2].min(uv.y), uv_box[3].max(uv.y)];
+        }
+    }
+    let [u0, u1, v0, v1] = uv_box;
+    let origin = surface.evaluate(u0, v0).or_refuse(KernelStage::Refine, "evaluate")?;
+    let du = surface.evaluate(u1, v0).or_refuse(KernelStage::Refine, "evaluate")?.sub(origin);
+    let dv = surface.evaluate(u0, v1).or_refuse(KernelStage::Refine, "evaluate")?.sub(origin);
+    let level = point.sub(origin).dot(axis);
+    let (mut ru, mut rv) = ([u0, u1], [v0, v1]);
+    // Which parameter runs along the axis, and where it reaches the cut.
+    if du.dot(axis).abs() > dv.dot(axis).abs() {
+        let at = u0 + (u1 - u0) * level / du.dot(axis);
+        let low_end_is_u0 = du.dot(axis) > 0.0;
+        if keep_low == low_end_is_u0 { ru[1] = at } else { ru[0] = at }
+        if ru[0] > ru[1] { ru.swap(0, 1) }
+    } else {
+        let at = v0 + (v1 - v0) * level / dv.dot(axis);
+        let low_end_is_v0 = dv.dot(axis) > 0.0;
+        if keep_low == low_end_is_v0 { rv[1] = at } else { rv[0] = at }
+        if rv[0] > rv[1] { rv.swap(0, 1) }
+    }
+    let corner = |u: f64, v: f64| -> Result<crate::Vec4, KernelRefusal> {
+        Ok(crate::Vec4::from_point(surface.evaluate(u, v).or_refuse(KernelStage::Refine, "evaluate")?, 1.0))
+    };
+    let clipped = crate::NurbsSurface::new(
+        1,
+        1,
+        vec![ru[0], ru[0], ru[1], ru[1]],
+        vec![rv[0], rv[0], rv[1], rv[1]],
+        vec![vec![corner(ru[0], rv[0])?, corner(ru[0], rv[1])?], vec![corner(ru[1], rv[0])?, corner(ru[1], rv[1])?]],
+    )
+    .or_refuse(KernelStage::Refine, "new")?;
+    let mut rebuilt = face;
+    rebuilt.surface = clipped;
+    carrier.solid = full_rectangle_face(&carrier.solid, &rebuilt)?;
+    Ok(())
+}
+
+/// `BREP_OFFSET_PER_EDGE_OPENING_PADS` (default on; `=0` restores): a planar outward
+/// opening wall's outline is offset per edge, each by its own junction's pad
+/// (`outward_wall_pads_per_edge`), not all by the worst one's.
+fn per_edge_opening_pads_on() -> bool {
+    switch!("BREP_OFFSET_PER_EDGE_OPENING_PADS", true)
+}
+
+/// `BREP_OFFSET_NONUNIFORM_SLID_TRIM` (default on; `=0` restores): an outward planar
+/// carrier whose extension is NOT uniform also takes its full rectangle when
+/// its slid trim falls short of its narrowest pad.
+fn nonuniform_slid_trim_on() -> bool {
+    switch!("BREP_OFFSET_NONUNIFORM_SLID_TRIM", true)
+}
+
 fn cascade_omission_enabled() -> bool {
     switch!("BREP_OFFSET_SHELL_CASCADE_OMISSION", true)
 }
@@ -4520,7 +5019,7 @@ fn control_hull(source: &BrepSolid, faces: &[&FaceRecord]) -> Option<(Vec3, Vec3
 }
 
 /// `BREP_OFFSET_SHELL_EMPTY_CAVITY` (default on; `=0` restores): [`empty_cavity_shell`].
-fn empty_cavity_enabled() -> bool {
+pub(super) fn empty_cavity_enabled() -> bool {
     switch!("BREP_OFFSET_SHELL_EMPTY_CAVITY", true)
 }
 

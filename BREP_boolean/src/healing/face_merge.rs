@@ -244,6 +244,11 @@ pub struct MergeLanes<'a> {
     /// already kept, so the rim the two faces share meets both seams at ONE
     /// vertex and closes into one circle.
     pub seam_vertices: Option<&'a HashSet<u64>>,
+    /// The re-seam lane ([`rejoin_seam_split_pairs`]): join only two pieces
+    /// of ONE cylinder or frustum carrier whose only shared edges are the
+    /// carrier's own seam, on a carrier seamed in their union's angular gap,
+    /// and decline every other pair.
+    pub reseam: bool,
 }
 
 pub struct CylinderSupport {
@@ -1017,6 +1022,22 @@ pub fn shared_trim_certificate_enabled() -> bool {
     switch!(live "BREP_FACE_MERGE_TRIM_CERT", true)
 }
 
+/// `BREP_FACE_MERGE_RESEAM` (default on, `0` off): after a feature's boolean,
+/// two pieces of ONE cylinder or frustum carrier whose only shared edge is
+/// the carrier's own seam (their union is a partial turn that straddles the
+/// seam, so in the carrier's chart it is two regions a period apart) are
+/// joined on a revolution carrier seamed in the union's angular gap
+/// ([`rejoin_seam_split_pairs`]). The boolean keeps its body as it was when a
+/// later feature names something the join would change (see the boolean's
+/// `seam_rejoin_later_references`). A cone with an apex, a sphere and a
+/// torus are not read here. Off by default: a later offset shell of a joined
+/// wall under a rim fillet closes on fewer turns of the cylinder than it
+/// does on the split wall (the offset shell's own sensitivity to where the
+/// rim blend's carrier starts; it already fails some turns of the split one).
+pub fn seam_reseam_enabled() -> bool {
+    switch!(live "BREP_FACE_MERGE_RESEAM", true)
+}
+
 /// Prove closure of the complete boundary isocurves. Clamping makes these
 /// the first/last control rows; their common positive rational basis bounds
 /// the entire difference by the largest paired control-point displacement.
@@ -1430,7 +1451,7 @@ pub fn try_merge_pair_lanes(
     same_carrier_area_tolerance_ratio: f64,
     lanes: MergeLanes<'_>,
 ) -> Result<Option<FaceRecord>, KernelRefusal> {
-    let same_carrier = older.same_sense == newer.same_sense
+    let mut same_carrier = older.same_sense == newer.same_sense
         && same_surface(&older.surface, &newer.surface, tolerance);
     // Oppositely oriented planar patches can form a folded, zero-thickness
     // overlap along a multi-edge seam. Cancelling that seam preserves the
@@ -1449,7 +1470,7 @@ pub fn try_merge_pair_lanes(
             .or_refuse(KernelStage::Sew, "is_affine")?;
     let coplanar_planar =
         !same_carrier && coplanar_with_same_outward_normal(older, newer, tolerance)?;
-    let cosurface_cylinder = if !same_carrier && !coplanar_planar {
+    let mut cosurface_cylinder = if !same_carrier && !coplanar_planar {
         cosurface_cylinder_pair(older, newer, tolerance, lanes)?
     } else {
         None
@@ -1469,13 +1490,18 @@ pub fn try_merge_pair_lanes(
         .iter()
         .flat_map(|loop_record| &loop_record.coedges)
         .collect::<Vec<_>>();
-    let space = (same_carrier || cancel_planar_fold).then(|| SharedParameterSpace {
+    let mut space = (same_carrier || cancel_planar_fold).then(|| SharedParameterSpace {
         surface: &older.surface,
         weld: crate::tolerance::assembler_weld(tolerance),
     });
     let mut shared_older = HashSet::default();
     let mut shared_newer = HashSet::default();
     let mut shared_edges = HashSet::default();
+    // Same-carrier pairs a period apart that `periodic_shared_trim` proves
+    // are the carrier's seam (older coedge, newer coedge, edge), and whether
+    // any noncoincident pair went unproved: the re-seam route reads them.
+    let mut seam_pairs: Vec<(u64, u64, u64)> = Vec::new();
+    let mut unproved_seam = false;
     // Shared edges the merged face keeps, both ways: on ONE carrier, a pair
     // whose two images lie a period apart is the carrier's seam (the
     // dissolve_slits doctrine), and the union wraps across it. Cancelling it
@@ -1511,9 +1537,14 @@ pub fn try_merge_pair_lanes(
                         // A noncoincident pair may be retained only as a
                         // proved periodic seam. An interior partition stays
                         // between faces; retaining it here creates a slit.
-                        if shared_trim_certificate_enabled()
-                            && !periodic_shared_trim(space, first, second)
+                        let proved = periodic_shared_trim(space, first, second);
+                        if shared_trim_certificate_enabled() && !proved
                         { decline!(older, newer); }
+                        if proved {
+                            seam_pairs.push((first.id, second.id, first.edge_id));
+                        } else {
+                            unproved_seam = true;
+                        }
                         continue;
                     }
                 } else if shared_trim_certificate_enabled() {
@@ -1524,6 +1555,36 @@ pub fn try_merge_pair_lanes(
             shared_newer.insert(second.id);
             shared_edges.insert(first.edge_id);
         }
+    }
+    // The pieces touch ONLY across the carrier's seam: their union is one
+    // region of the cylinder (or cone) that this chart cuts in two. Read the
+    // pair as a cosurface cylinder pair instead, the seam uses cancelled as
+    // shared edges, so the partial-turn lane seams a new carrier in the
+    // union's angular gap. A union that wraps the whole turn finds no gap
+    // there and declines as before.
+    let mut reseamed = false;
+    if shared_older.is_empty()
+        && !seam_pairs.is_empty()
+        && !unproved_seam
+        && same_carrier
+        && !cancel_planar_fold
+        && lanes.reseam
+    {
+        let reseam_lanes = MergeLanes { cones: true, ..lanes };
+        if let Some(support) = cosurface_cylinder_pair(older, newer, tolerance, reseam_lanes)? {
+            for (first, second, edge) in &seam_pairs {
+                shared_older.insert(*first);
+                shared_newer.insert(*second);
+                shared_edges.insert(*edge);
+            }
+            same_carrier = false;
+            space = None;
+            cosurface_cylinder = Some(support);
+            reseamed = true;
+        }
+    }
+    if lanes.reseam && !reseamed {
+        decline!(older, newer);
     }
     if shared_older.is_empty() || shared_older.len() != shared_newer.len() {
         decline!(older, newer);
@@ -1651,6 +1712,26 @@ pub fn try_merge_pair_lanes(
             decline!(older, newer);
         }
         return Ok(Some(merged));
+    }
+
+    if reseamed {
+        // The re-seam route keeps the pieces' own carrier, turned whole spans
+        // to start inside their union's gap, and every trim's own pcurve
+        // shifted with it: the joined face is exactly the face a primitive
+        // whose seam lay in that gap would have given, which every later
+        // feature reads as it reads the primitive's. It reads the full-turn
+        // lane's bars, never the partial-turn lane's 5e-3 area share (one
+        // piece of a seam-split pair can be a sliver that share would lose).
+        let support = cosurface_cylinder.as_ref().expect("the re-seam route reads a cylinder support");
+        let weld = crate::tolerance::assembler_weld(tolerance);
+        let Some((surface, loops)) = turn_carrier_into_gap(&older.surface, loops, weld) else {
+            decline!(older, newer);
+        };
+        let merged = FaceRecord { id: older.id, surface, same_sense: older.same_sense, loops, name: older.name.clone() };
+        if reseam_accepts(older, newer, &merged, edges, tolerance, support)? {
+            return Ok(Some(merged));
+        }
+        decline!(older, newer);
     }
 
     if let Some(support) = &cosurface_cylinder {
@@ -2074,6 +2155,202 @@ fn angle_difference(from: f64, to: f64) -> f64 {
     } else {
         turn
     }
+}
+
+/// `carrier` (closed in u) turned whole spans to start at a full-multiplicity
+/// knot inside the widest u interval no trim of `loops` sweeps across (the
+/// knot inserted at the interval's middle when it holds none), with every
+/// trim's pcurve shifted in u to the turned chart: exact, since turning a
+/// closed net at a knot of multiplicity `degree` moves no basis function and
+/// each trim lies on one side of the new seam. `None` when the carrier is not
+/// closed in u or no such interval exists (the trims sweep the whole turn).
+fn turn_carrier_into_gap(
+    carrier: &NurbsSurface,
+    loops: Vec<LoopRecord>,
+    weld: f64,
+) -> Option<(NurbsSurface, Vec<LoopRecord>)> {
+    let degree = carrier.degree_u;
+    if degree == 0 || !closed_control_boundary(carrier, true, weld) {
+        return None;
+    }
+    let (u_domain, _) = surface_domains(carrier).ok()?;
+    // Each trim's u samples and the u intervals it sweeps between them.
+    let mut samples: Vec<f64> = Vec::new();
+    let mut swept: Vec<(f64, f64)> = Vec::new();
+    for coedge in loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let [t0, t1] = coedge.pcurve.domain().ok()?;
+        let mut previous: Option<f64> = None;
+        for index in 0..=16 {
+            let u = coedge.pcurve.evaluate(t0 + (t1 - t0) * index as f64 / 16.0).ok()?.x;
+            if !u.is_finite() {
+                return None;
+            }
+            samples.push(u);
+            if let Some(previous) = previous {
+                swept.push((previous.min(u), previous.max(u)));
+            }
+            previous = Some(u);
+        }
+    }
+    samples.sort_by(f64::total_cmp);
+    let (first, last) = (*samples.first()?, *samples.last()?);
+    if first < u_domain[0] - weld || last > u_domain[1] + weld {
+        return None;
+    }
+    // The widest interval between consecutive samples that no sweep covers
+    // (the trims meet across the old seam, so the wrap-around interval is
+    // covered by construction and never read).
+    let mut gap: Option<(f64, f64)> = None;
+    for pair in samples.windows(2) {
+        let (low, high) = (pair[0], pair[1]);
+        let middle = (low + high) / 2.0;
+        if high - low <= weld || swept.iter().any(|&(a, b)| a < middle && middle < b) {
+            continue;
+        }
+        if gap.is_none_or(|(a, b)| high - low > b - a) {
+            gap = Some((low, high));
+        }
+    }
+    let (low, high) = gap?;
+    let middle = (low + high) / 2.0;
+    let existing = crate::boolean::reseat::full_knots(&carrier.knots_u, degree)
+        .into_iter()
+        .map(|(knot, _)| knot)
+        .filter(|&knot| knot > low && knot < high)
+        .min_by(|a, b| (a - middle).abs().total_cmp(&(b - middle).abs()));
+    let (refined, seam) = match existing {
+        Some(knot) => (carrier.clone(), knot),
+        None => {
+            let present = carrier.knots_u.iter().filter(|&&knot| knot == middle).count();
+            let refined = carrier
+                .insert_knot(crate::KnotDirection::U, middle, degree.saturating_sub(present))
+                .ok()?;
+            (refined, middle)
+        }
+    };
+    let (knots_u, rows) =
+        crate::boolean::reseat::rotate_closed(&refined.knots_u, degree, &refined.control_points, seam)?;
+    let surface = NurbsSurface::new(refined.degree_u, refined.degree_v, knots_u, refined.knots_v.clone(), rows).ok()?;
+    // u at or past the seam moves down by (seam - u0); u before it moves up
+    // by (u1 - seam), the rest of the turn.
+    let mut turned = Vec::with_capacity(loops.len());
+    for mut loop_record in loops {
+        for coedge in &mut loop_record.coedges {
+            let [t0, t1] = coedge.pcurve.domain().ok()?;
+            let mid = coedge.pcurve.evaluate((t0 + t1) / 2.0).ok()?.x;
+            let shift = if mid >= seam { u_domain[0] - seam } else { u_domain[1] - seam };
+            for point in &mut coedge.pcurve.control_points {
+                point.x += shift * point.w;
+            }
+        }
+        turned.push(loop_record);
+    }
+    Some((surface, turned))
+}
+
+/// The re-seamed face built from a seam-split pair (`seam_reseam_enabled`)
+/// stands in for both pieces: every trim on its edge within the validator's
+/// own pcurve acceptance on the pair's extent, and the pieces' combined 3D
+/// area and volume term about the origin reproduced within what trims
+/// admitted `band` off their edges can move along the whole boundary (the
+/// full-turn lane's bars).
+fn reseam_accepts(
+    older: &FaceRecord,
+    newer: &FaceRecord,
+    merged: &FaceRecord,
+    edges: &HashMap<u64, &EdgeRecord>,
+    tolerance: f64,
+    support: &CylinderSupport,
+) -> Result<bool, KernelRefusal> {
+    let debug = std::env::var("BREP_DEBUG_MERGE").is_ok();
+    let mut perimeter = 0.0f64;
+    let mut bbox_lo = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut bbox_hi = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for coedge in [older, newer]
+        .iter()
+        .flat_map(|face| face.loops.iter().flat_map(|loop_record| &loop_record.coedges))
+    {
+        let edge = edges[&coedge.edge_id];
+        if edge.degenerate {
+            continue;
+        }
+        perimeter += crate::mass_properties::edge_arc_length(edge).unwrap_or(0.0);
+        let curve = trimmed_curve(&edge.curve, edge.t0, edge.t1)?;
+        let [c0, c1] = curve.domain().or_refuse(KernelStage::Sew, "domain")?;
+        for index in 0..=8 {
+            let point = curve
+                .evaluate(c0 + (c1 - c0) * index as f64 / 8.0)
+                .or_refuse(KernelStage::Sew, "evaluate")?;
+            bbox_lo = Vec3::new(bbox_lo.x.min(point.x), bbox_lo.y.min(point.y), bbox_lo.z.min(point.z));
+            bbox_hi = Vec3::new(bbox_hi.x.max(point.x), bbox_hi.y.max(point.y), bbox_hi.z.max(point.z));
+        }
+    }
+    // The bars read the pair's own size, never its distance from the world
+    // origin: far from the origin an origin-scaled band would admit a
+    // carrier a visible distance off the pieces' own.
+    let diagonal = bbox_hi.sub(bbox_lo).length();
+    let scale = 1.0f64.max(diagonal).max(support.radius);
+    let band = (tolerance * 100.0).max(1e-7 * scale);
+    // The support stands for the pieces' carrier itself: every station of
+    // that carrier lies on it within `band`. The support's detection admits
+    // a slight taper as a cylinder; a carrier rebuilt from such a support
+    // would move the wall, so the pair stays split.
+    let carrier = &older.surface;
+    let (u_domain, v_domain) = surface_domains(carrier)?;
+    let mut worst_off = 0.0f64;
+    for i in 0..=8 {
+        for j in 0..=4 {
+            let point = carrier
+                .evaluate(
+                    u_domain[0] + (u_domain[1] - u_domain[0]) * i as f64 / 8.0,
+                    v_domain[0] + (v_domain[1] - v_domain[0]) * j as f64 / 4.0,
+                )
+                .or_refuse(KernelStage::Sew, "evaluate")?;
+            let delta = point.sub(support.origin);
+            let axial = delta.dot(support.axis);
+            let radial = delta.sub(support.axis.scale(axial)).length();
+            worst_off = worst_off.max((radial - support.radius_at(axial)).abs());
+        }
+    }
+    let pcurve_limit = crate::KernelTolerances::for_scale(scale, 1e-7).pcurve_acceptance(diagonal);
+    let mut worst_trim = 0.0f64;
+    for coedge in merged.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let edge = edges[&coedge.edge_id];
+        let error = crate::topology::coedge_error_floored(
+            &merged.surface,
+            &coedge.pcurve,
+            &edge.curve,
+            edge,
+            coedge.forward,
+            pcurve_limit,
+        )
+        .unwrap_or(f64::INFINITY);
+        worst_trim = worst_trim.max(error);
+    }
+    let expected_area = face_area(older).or_refuse(KernelStage::Sew, "face_area")?
+        + face_area(newer).or_refuse(KernelStage::Sew, "face_area")?;
+    let expected_term = face_volume_contribution(older)
+        .or_refuse(KernelStage::Sew, "face_volume_contribution")?
+        + face_volume_contribution(newer).or_refuse(KernelStage::Sew, "face_volume_contribution")?;
+    let actual = face_area(merged).or_refuse(KernelStage::Sew, "face_area")?;
+    let actual_term =
+        face_volume_contribution(merged).or_refuse(KernelStage::Sew, "face_volume_contribution")?;
+    let area_bar = band * perimeter + 1e-9 * expected_area.abs();
+    let reach = bbox_lo.length().max(bbox_hi.length());
+    let term_bar = band * perimeter * reach / 3.0 + 1e-9 * expected_term.abs().max(expected_area.abs());
+    let accepted = worst_off <= band
+        && worst_trim <= pcurve_limit
+        && (actual - expected_area).abs() <= area_bar
+        && (actual_term - expected_term).abs() <= term_bar;
+    if debug {
+        eprintln!(
+            "merge {}x{}: re-seam {}: carrier off its support {worst_off:.3e} (band {band:.3e}), trim {worst_trim:.3e} (limit {pcurve_limit:.3e}), area {actual:.9} vs {expected_area:.9} (bar {area_bar:.3e}), volume term {actual_term:.9} vs {expected_term:.9} (bar {term_bar:.3e})",
+            older.id,
+            newer.id,
+            if accepted { "MERGE" } else { "declined" }
+        );
+    }
+    Ok(accepted)
 }
 
 /// Merge two cosurface cylinder patches whose union wraps the FULL turn.
@@ -2854,7 +3131,8 @@ fn translational_boundary_area(face: &FaceRecord) -> Option<f64> {
     if surface.degree_v != 1 || surface.control_points.len() < 2 || surface.knots_v.len() != 4 {
         return None;
     }
-    if surface.closed_directions().ok()? != (false, false) {
+    let closed = surface.closed_directions().ok()?;
+    if closed != (false, false) && !(boundary_area_closed_on() && loops_close_in_the_chart(face)?) {
         return None;
     }
     // One sweep vector, equal weights across each row, and along u weights
@@ -2968,6 +3246,50 @@ fn translational_boundary_area(face: &FaceRecord) -> Option<f64> {
     };
     let (coarse, fine) = (read(1)?, read(2)?);
     ((fine - coarse).abs() <= fine.abs() * BOUNDARY_AREA_SETTLED && fine.is_finite()).then_some(fine)
+}
+
+/// `BREP_MERGE_AREA_BOUNDARY_CLOSED` (default on since 2026-11-19; `=0` leaves
+/// every closed carrier to the surface integration): [`translational_boundary_area`]
+/// also reads a face on a carrier closed in u (a full cylinder) when every
+/// one of its loops closes in the carrier's own chart
+/// ([`loops_close_in_the_chart`]).
+fn boundary_area_closed_on() -> bool {
+    switch!("BREP_MERGE_AREA_BOUNDARY_CLOSED", true)
+}
+
+/// Whether every loop of `face` closes in its carrier's parameter chart:
+/// each coedge's pcurve ends within a billionth of the chart's width of
+/// where the next one starts, in both parameters.
+///
+/// On a closed carrier that is what lets Green's theorem read the face on
+/// its boundary as on an open one. A loop that winds around the closed
+/// direction (a full-turn rim, whose end lies a period from its start) or
+/// hops the carrier's implicit seam (one pcurve ends on one side of the
+/// chart, the next starts on the other) has a joint a period wide; the chord
+/// that closes a joint would cross the whole chart, and the surface
+/// integral reads such faces on routes of their own (winding bands, caps,
+/// walls, the unwrapped covering plane). Those are left to it: `Some(false)`.
+/// A loop of plain joints bounds the region it encloses in the chart, which
+/// the integral reads on its in-domain path.
+fn loops_close_in_the_chart(face: &FaceRecord) -> Option<bool> {
+    let [u0, u1] = face.surface.domain_u().ok()?;
+    let [v0, v1] = face.surface.domain_v().ok()?;
+    let (gap_u, gap_v) = ((u1 - u0) * 1e-9, (v1 - v0) * 1e-9);
+    for loop_record in &face.loops {
+        let count = loop_record.coedges.len();
+        if count == 0 {
+            return Some(false);
+        }
+        for (index, coedge) in loop_record.coedges.iter().enumerate() {
+            let next = &loop_record.coedges[(index + 1) % count].pcurve;
+            let here = coedge.pcurve.evaluate(coedge.pcurve.domain().ok()?[1]).ok()?;
+            let there = next.evaluate(next.domain().ok()?[0]).ok()?;
+            if !((here.x - there.x).abs() <= gap_u && (here.y - there.y).abs() <= gap_v) {
+                return Some(false);
+            }
+        }
+    }
+    Some(true)
 }
 
 /// `BREP_MERGE_DECLINE_MEMO` (default on, `0` off): a pair whose content was declined
@@ -3509,6 +3831,7 @@ pub fn merge_faces_within(
                         cones: true,
                         shared_seam_ring: true,
                         seam_vertices: Some(&seam_vertices),
+                        reseam: false,
                     };
                     let Some(mut merged) = try_merge_pair_lanes(
                         &shell.faces[lower],
@@ -3690,6 +4013,61 @@ fn finish_merge(
         ));
     }
     Ok(result)
+}
+
+/// Join every pair of faces the re-seam lane admits ([`MergeLanes::reseam`])
+/// and nothing else, pair by pair: `(the body, (surviving face id, absorbed
+/// face id) per join)`, or `None` when no pair joins or the joined body fails
+/// the merge's closing Euler and `validate()` checks.
+pub fn rejoin_seam_split_pairs(
+    solid: &BrepSolid,
+    tolerance: f64,
+    keep_unmerged: &[String],
+) -> Result<Option<(BrepSolid, Vec<(u64, u64)>)>, KernelRefusal> {
+    let mut result = solid.clone();
+    let edges = solid.edges.iter().map(|edge| (edge.id, edge)).collect::<HashMap<_, _>>();
+    let lanes = MergeLanes { reseam: true, ..MergeLanes::default() };
+    let mut joins = Vec::new();
+    let edge_ids = |face: &FaceRecord| {
+        face.loops
+            .iter()
+            .flat_map(|loop_record| &loop_record.coedges)
+            .filter(|coedge| !edges[&coedge.edge_id].degenerate)
+            .map(|coedge| coedge.edge_id)
+            .collect::<HashSet<u64>>()
+    };
+    for shell in &mut result.shells {
+        'restart: loop {
+            for lower in 0..shell.faces.len() {
+                let lower_edges = edge_ids(&shell.faces[lower]);
+                for higher in lower + 1..shell.faces.len() {
+                    let (older, newer) = (&shell.faces[lower], &shell.faces[higher]);
+                    if older.same_sense != newer.same_sense
+                        || face_is_pinned(older, keep_unmerged)
+                        || face_is_pinned(newer, keep_unmerged)
+                        || edge_ids(newer).is_disjoint(&lower_edges)
+                        || !same_surface(&older.surface, &newer.surface, tolerance)
+                    {
+                        continue;
+                    }
+                    if let Some(merged) = try_merge_pair_lanes(older, newer, &edges, tolerance, 1e-7, lanes)? {
+                        joins.push((older.id, newer.id));
+                        shell.faces[lower] = merged;
+                        shell.faces.remove(higher);
+                        continue 'restart;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    if joins.is_empty() {
+        return Ok(None);
+    }
+    match finish_merge(solid, result, true, None) {
+        Ok(result) => Ok(Some((result, joins))),
+        Err(_) => Ok(None),
+    }
 }
 
 pub fn merge_same_surface_faces(

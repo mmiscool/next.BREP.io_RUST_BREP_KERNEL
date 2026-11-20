@@ -83,6 +83,12 @@ fn native_ball(s: &NurbsSurface) -> Option<Ball> {
     Some(Ball { centre, radius })
 }
 
+/// The centre and radius of a native ball carrier ([`native_ball`]), for the
+/// concentric balls certificate.
+pub(super) fn native_ball_geometry(s: &NurbsSurface) -> Option<(Vec3, f64)> {
+    native_ball(s).map(|ball| (ball.centre, ball.radius))
+}
+
 /// Only the standard scale-derived scanner options are covered. Native sphere
 /// supports are injective away from their identified seam/poles. The constructor
 /// roundoff is orders below all four scale-derived resolution bands here.

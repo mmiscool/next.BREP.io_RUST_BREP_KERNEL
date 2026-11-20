@@ -1,6 +1,6 @@
 [package]
 name = "BREP_geometry"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "Geometry layer of the BREP kernel: vectors, tolerances, diagnostics, NURBS curves and surfaces, projection and intersection."
@@ -26,7 +26,7 @@ include = [
 name = "brep_geometry"
 
 [dependencies]
-BREP_RANSAC = { version = "0.2.1", path = "../BREP_RANSAC" }
+BREP_RANSAC = { version = "0.2.2", path = "../BREP_RANSAC" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 slotmap = "1"

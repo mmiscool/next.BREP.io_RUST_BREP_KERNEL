@@ -402,8 +402,11 @@ pub(super) struct Resolver<'a> {
     /// loop over assembly edges, so computing it eagerly made importing an
     /// assembly O(edges x entities) for a value the default importer never
     /// reads. `OnceLock` rather than `OnceCell` because `bodies.rs` hands a
-    /// `&Resolver` to a rayon `par_iter`, which requires `Sync`.
-    angle_scale: std::sync::OnceLock<Option<f64>>,
+    /// `&Resolver` to a rayon `par_iter`, which requires `Sync`. Shared (`Arc`)
+    /// between a resolver and the ones derived from it ([`Self::with_length_scale`],
+    /// [`Self::without_trim_readings`]): the angle unit is the file's, and a
+    /// per-body derived resolver must not sweep the file again for it.
+    angle_scale: std::sync::Arc<std::sync::OnceLock<Option<f64>>>,
     /// Whether a body built through this resolver reads its derived trims
     /// for the report (`builder::readings::BoundedTrim`). On by default; off
     /// for builds whose readings are dropped, where the reads only cost time.
@@ -422,7 +425,7 @@ impl<'a> Resolver<'a> {
         Self {
             entities,
             length_scale,
-            angle_scale: std::sync::OnceLock::new(),
+            angle_scale: std::sync::Arc::default(),
             trim_readings: true,
             sheets: false,
         }
@@ -435,6 +438,19 @@ impl<'a> Resolver<'a> {
             length_scale: self.length_scale,
             angle_scale: self.angle_scale.clone(),
             trim_readings: false,
+            sheets: self.sheets,
+        }
+    }
+
+    /// The same context read at another length unit: a product of a mixed-unit
+    /// assembly, whose representation context assigns its own. Every other
+    /// setting (sheets, trim readings, the angle unit) carries over.
+    pub(super) fn with_length_scale(&self, length_scale: f64) -> Self {
+        Self {
+            entities: self.entities,
+            length_scale,
+            angle_scale: self.angle_scale.clone(),
+            trim_readings: self.trim_readings,
             sheets: self.sheets,
         }
     }
@@ -612,10 +628,10 @@ pub(super) fn context_length_scale_mm(
 /// default 1.0 (assume the file is already in millimetres).
 ///
 /// ONE scale for the whole file: on a multi-context (mixed-unit) file the
-/// surviving context is whichever the `HashMap` iterates to first. The
-/// structured assembly lane resolves units per product instead — see
-/// [`context_length_scale_mm`] — and the flat lane keeps this behaviour so its
-/// output stays byte-identical.
+/// surviving context is whichever the `HashMap` iterates to first. It is only
+/// the fallback: every lane builds a body at the unit of the representation
+/// that lists it, and reads a placement frame at its representation's unit
+/// (`bodies::RepresentationUnits`), falling back to the product's, then to this.
 pub(super) fn derive_length_scale_mm(entities: &HashMap<usize, Entity>) -> f64 {
     for (&id, entity) in entities {
         if !entity.has("GLOBAL_UNIT_ASSIGNED_CONTEXT") {
@@ -809,6 +825,26 @@ impl<'a> Resolver<'a> {
             // Axial extents derived from the sampled vertex-loop can put an
             // exact apex a few ulps past zero. Preserve the singular endpoint
             // instead of rejecting a valid pointed cone.
+            //
+            // The padded range of a pointed cone runs PAST its apex. Clamping
+            // the radius there to zero while keeping the padded end moved the
+            // generatrix's end up the axis by the pad: a different, steeper
+            // cone whose rulings missed the file's by 5.9e-4 mm on an
+            // 11.5 × 6.9 mm cone (+1.0e-4 of its volume). The end that crosses
+            // is placed on the apex itself, where radius + c·tan = 0.
+            let (mut base, mut height) = (base, height);
+            if switch!("BREP_STEP_CONE_EXACT_APEX", true) && tan != 0.0 {
+                let c_apex = -radius / tan;
+                if radius_top < 0.0 {
+                    height = c_apex - c_start;
+                    radius_top = 0.0;
+                }
+                if radius_bottom < 0.0 {
+                    height = (c_start + height) - c_apex;
+                    base = frame.origin.add(frame.z.scale(c_apex));
+                    radius_bottom = 0.0;
+                }
+            }
             radius_bottom = radius_bottom.max(0.0);
             radius_top = radius_top.max(0.0);
             return Ok(Some(build_cone(
@@ -980,8 +1016,37 @@ impl<'a> Resolver<'a> {
                 // Only trust projections that actually land on the curve —
                 // an edge whose vertices are off-curve keeps legacy behavior.
                 let scale = 1.0 + p_start.length().max(p_end.length());
-                let on_curve =
-                    t_start.distance <= 1e-5 * scale && t_end.distance <= 1e-5 * scale;
+                // A vertex a few microns off a spline that runs on well past it
+                // (a tolerant Parasolid sheet: 1.2e-3..5.5e-3 mm off, the
+                // spline's ends 0.13-1.1 mm beyond) still names the sub-range:
+                // it is far nearer the curve than either end, and the endpoint
+                // heal then closes the few microns. Without the trim the whole
+                // spline was kept and its loop stayed open by the overrun.
+                let near_interior = |projection: &crate::CurveProjection, point: Vec3| -> Result<bool, String> {
+                    let to_end = point
+                        .sub(curve.evaluate(dom0)?)
+                        .length()
+                        .min(point.sub(curve.evaluate(dom1)?).length());
+                    Ok(projection.distance <= super::geometry::VENDOR_ENDPOINT_HEAL_CEILING
+                        && 10.0 * projection.distance <= to_end)
+                };
+                // Taken only when the whole curve cannot serve: its ends, in
+                // the edge's stated sense, are not both within the heal ceiling
+                // of the vertices (else the heal closes them, as before), and
+                // the sub-range runs in that sense (a curve that doubles back
+                // past the vertices must not yield a reversed fragment).
+                let whole_healable = {
+                    let (first, last) = if same_sense { (dom0, dom1) } else { (dom1, dom0) };
+                    p_start.sub(curve.evaluate(first)?).length() <= super::geometry::VENDOR_ENDPOINT_HEAL_CEILING
+                        && p_end.sub(curve.evaluate(last)?).length() <= super::geometry::VENDOR_ENDPOINT_HEAL_CEILING
+                };
+                let in_sense = if same_sense { t_start.u < t_end.u } else { t_start.u > t_end.u };
+                let on_curve = (t_start.distance <= 1e-5 * scale && t_end.distance <= 1e-5 * scale)
+                    || (switch!("BREP_STEP_TRIM_NEAR_VERTICES", true)
+                        && !whole_healable
+                        && in_sense
+                        && near_interior(&t_start, p_start)?
+                        && near_interior(&t_end, p_end)?);
                 if on_curve
                     && (interior(t_start.u) || interior(t_end.u))
                     && (t_start.u - t_end.u).abs() > span_tol

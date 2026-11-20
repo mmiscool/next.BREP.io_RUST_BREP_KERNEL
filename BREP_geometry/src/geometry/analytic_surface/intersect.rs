@@ -56,6 +56,103 @@ fn map_rational_curve(
     NurbsCurve::new(curve.degree, curve.knots.clone(), controls).ok()
 }
 
+/// `BREP_CONE_PLANE_OPEN_SECTION` (default off, `1` on): a plane cutting a
+/// cone or frustum in a parabola or hyperbola is answered with the section's
+/// arcs inside the carrier's axial band ([`cone_plane_open_section`]) instead
+/// of being left to the marcher.
+fn cone_plane_open_section_enabled() -> bool {
+    crate::switch!(live "BREP_CONE_PLANE_OPEN_SECTION", false)
+}
+
+/// A plane's open (parabolic or hyperbolic) section of a cone or frustum,
+/// exactly, over the carrier's axial band. The section point over the base
+/// circle's angle θ is the circle point projected from the apex onto the
+/// plane: homogeneous-linear in (cos θ, sin θ, 1), with weight
+/// `w(θ) = A + B cos θ + C sin θ` and axial coordinate `z_apex + K / w(θ)`
+/// (every base point sits at one height). The band's ends and `w = 0` (the
+/// section's points at infinity) are each `R cos(θ − φ) = c` in closed form;
+/// between consecutive roots `w` keeps its sign, so a base-circle arc there
+/// maps to an exact rational quadratic. The arcs whose middle lies in the band
+/// are returned.
+#[allow(clippy::too_many_arguments)]
+fn cone_plane_open_section(
+    frame: &RevolutionFrame,
+    height: f64,
+    apex: Vec3,
+    reference_rho: f64,
+    reference_z: f64,
+    k: f64,
+    normal: Vec3,
+    tolerance: f64,
+    project: &dyn Fn(crate::Vec4) -> crate::Vec4,
+) -> Option<Vec<NurbsCurve>> {
+    let center = frame.origin.add(frame.axis.scale(reference_z));
+    let a = center.sub(apex).dot(normal);
+    let b = reference_rho * frame.x_axis.dot(normal);
+    let c = reference_rho * frame.y_axis.dot(normal);
+    let r = (b * b + c * c).sqrt();
+    let z_apex = apex.sub(frame.origin).dot(frame.axis);
+    // `K` in z(θ) = z_apex + K / w(θ): k times the base circle's height over the apex.
+    let big_k = k * (reference_z - z_apex);
+    let (band_low, band_high) = (0.0_f64.min(height), 0.0_f64.max(height));
+    let margin = tolerance.max(1e-12);
+    let axial = |theta: f64| -> Option<f64> {
+        let w = a + b * theta.cos() + c * theta.sin();
+        (w.abs() > 1e-300).then(|| z_apex + big_k / w)
+    };
+    let mut roots: Vec<f64> = Vec::new();
+    let mut solve = |target: f64| {
+        // b cos θ + c sin θ = target − a.
+        if r <= 0.0 {
+            return;
+        }
+        let ratio = (target - a) / r;
+        if ratio.abs() > 1.0 {
+            return;
+        }
+        let phi = c.atan2(b);
+        let spread = ratio.acos();
+        for theta in [phi + spread, phi - spread] {
+            roots.push(theta.rem_euclid(std::f64::consts::TAU));
+        }
+    };
+    solve(0.0);
+    for end in [band_low, band_high] {
+        let offset = end - z_apex;
+        if offset.abs() > 1e-300 {
+            solve(big_k / offset);
+        }
+    }
+    roots.sort_by(f64::total_cmp);
+    roots.dedup();
+    if roots.is_empty() {
+        roots.push(0.0);
+    }
+    let mut arcs = Vec::new();
+    for index in 0..roots.len() {
+        let start = roots[index];
+        let mut end = if index + 1 < roots.len() { roots[index + 1] } else { roots[0] + std::f64::consts::TAU };
+        if roots.len() == 1 {
+            end = start + std::f64::consts::TAU;
+        }
+        // Only an empty interval is skipped: a thin one in angle can be a
+        // long branch (a plane close to a large cone's axis); one too thin to
+        // build an arc on refuses below and leaves the pair to the marcher.
+        if !(end > start) {
+            continue;
+        }
+        let middle = 0.5 * (start + end);
+        let Some(z) = axial(middle) else { continue };
+        if z < band_low - margin || z > band_high + margin {
+            continue;
+        }
+        let arc = make_arc(center, frame.x_axis, frame.y_axis, reference_rho, start, end).ok()?;
+        // Within the interval the weight keeps its sign: the image is exact.
+        arcs.push(map_rational_curve(&arc, project)?);
+    }
+    Some(arcs)
+}
+
 /// The full u-circle of a revolution surface at radial distance `rho` and
 /// axial height `z`, built with the same arc construction as the surface.
 fn frame_circle(frame: &RevolutionFrame, rho: f64, z: f64) -> Option<NurbsCurve> {
@@ -116,6 +213,19 @@ pub fn intersect_analytic_pair_with(
 ) -> Option<Vec<NurbsCurve>> {
     if let Some(curves) = intersect_recognized_pair(first, second, tolerance, gate) {
         return Some(curves);
+    }
+    if crate::switch!("BREP_EXTRUSION_SECTIONS", true) {
+        for (plane, swept) in [(first,second),(second,first)] {
+            if matches!(swept.analytic(),Some(AnalyticSurface::Plane { .. })) { continue; }
+            if let (Some(plane),Some(extrusion)) = (plane.analytic().and_then(plane_data),swept.linear_extrusion()) {
+                if let Some(curves) = super::plane_extrusion_section(extrusion,plane.origin,plane.normal,tolerance) { return Some(curves); }
+            }
+        }
+        if !matches!(first.analytic(),Some(AnalyticSurface::Plane { .. })) && !matches!(second.analytic(),Some(AnalyticSurface::Plane { .. })) {
+        if let (Some(a),Some(b)) = (first.linear_extrusion(),second.linear_extrusion()) {
+            if let Some(curves) = super::parallel_extrusion_sections(a,b,tolerance) { return Some(curves); }
+        }
+        }
     }
     if let Some(curves) = intersect_plane_affine_sphere(first, second, tolerance) {
         return Some(curves);
@@ -269,7 +379,15 @@ fn intersect_perpendicular_plane_revolution(
             return None;
         }
         let center = frame.origin.add(frame.axis.scale(axial));
-        curves.push(make_arc(center, frame.x_axis, frame.y_axis, radius, 0.0, structure.sweep).ok()?);
+        // The crossing turns from ITS azimuth: zero for a profile in the start
+        // meridian, not for a straight profile skew to the axis (a hyperboloid).
+        let phase = if generatrix_is_meridional_half_ray(generatrix, frame) {
+            0.0
+        } else {
+            let radial = point.sub(center);
+            radial.dot(frame.y_axis).atan2(radial.dot(frame.x_axis))
+        };
+        curves.push(make_arc(center, frame.x_axis, frame.y_axis, radius, phase, phase + structure.sweep).ok()?);
     }
     Some(curves)
 }
@@ -378,6 +496,22 @@ fn intersect_recognized_pair(
     {
         return intersect_sphere_sphere(center_a, radius_a, center_b, radius_b, tolerance);
     }
+    if let Some(curves) = intersect_sphere_coaxial_ruled(a, b, tolerance, gate)
+        .or_else(|| intersect_sphere_coaxial_ruled(b, a, tolerance, gate))
+    {
+        return Some(curves);
+    }
+    if let Some(curves) = intersect_equal_cylinders_meeting_axes(first, second, a, b, tolerance, gate) {
+        return Some(curves);
+    }
+    // The residual conic is cut from the first carrier and checked on the
+    // second; a wide partial cone first can fail where the other order
+    // reads the same section, so both orders are asked.
+    if let Some(curves) = intersect_cones_sharing_a_ruling(a, b, tolerance, gate)
+        .or_else(|| intersect_cones_sharing_a_ruling(b, a, tolerance, gate))
+    {
+        return Some(curves);
+    }
     // Plane×plane is deliberately NOT special-cased: the iso path
     // already returns axis-aligned box intersections exactly, and a
     // synthesized over-long line segment interacts poorly with the
@@ -385,6 +519,539 @@ fn intersect_recognized_pair(
     // fitted over the face crossing only, so the curve's [t0,t1]
     // subrange and the pcurve domain drift apart on long overhangs).
     None
+}
+
+/// `BREP_SPHERE_CONE_COAXIAL` (default off, `1` on): a sphere against a cone,
+/// frustum or cylinder whose axis passes through the sphere's centre
+/// ([`intersect_sphere_coaxial_ruled`]).
+fn sphere_cone_coaxial_enabled() -> bool {
+    crate::switch!(live "BREP_SPHERE_CONE_COAXIAL", false)
+}
+
+/// A sphere (any carrier [`AnalyticSurface::sphere_geometry`] reads, a partial
+/// sweep included under `BREP_PARTIAL_SPHERE`) against a ruled revolution
+/// whose axis passes through its centre: the pair is coaxial, so the section
+/// is the circles about that axis at the heights `z` where the generatrix's
+/// radius `ρ(z) = ρ₀ + m z` reaches the sphere, `(z − z_c)² + ρ(z)² = r²`, a
+/// quadratic. Roots off the generatrix's own nappe or outside its axial band
+/// are dropped; no real root is a proved-empty pair.
+fn intersect_sphere_coaxial_ruled(
+    sphere: &AnalyticSurface,
+    ruled: &AnalyticSurface,
+    tolerance: f64,
+    gate: RuledGate,
+) -> Option<Vec<NurbsCurve>> {
+    if !sphere_cone_coaxial_enabled() {
+        return None;
+    }
+    let (center, radius) = sphere.sphere_geometry()?;
+    let (frame, rho0, rho1, height) = ruled_revolution_data(ruled, tolerance, gate)?;
+    let offset = center.sub(frame.origin);
+    let center_z = offset.dot(frame.axis);
+    let off_axis = offset.sub(frame.axis.scale(center_z)).length();
+    // Bands relative to the sphere, where the section is: never to the
+    // ruled carrier's length or its distance from its frame origin.
+    // The coaxial test is relative to the sphere; the section's own bands
+    // (a circle's radius, the carrier's axial ends) are the tolerance itself.
+    if off_axis > tolerance.max(1e-12) * (1.0 + radius) {
+        return None;
+    }
+    let margin = tolerance.max(1e-12);
+    let slope = (rho1 - rho0) / height;
+    // In the centre's axial frame, z' = z − z_c, with ρ_c the generatrix's
+    // radius at the centre's height: z'² + (ρ_c + m z')² = r² (no cancellation
+    // against a far frame origin).
+    let rho_center = rho0 + slope * center_z;
+    let a = 1.0 + slope * slope;
+    let b = 2.0 * slope * rho_center;
+    let c = rho_center * rho_center - radius * radius;
+    let discriminant = b * b - 4.0 * a * c;
+    let mut heights = Vec::new();
+    if discriminant > 0.0 {
+        let root = discriminant.sqrt();
+        let q = -0.5 * (b + if b >= 0.0 { root } else { -root });
+        if q != 0.0 {
+            heights.push(center_z + q / a);
+            heights.push(center_z + c / q);
+        } else {
+            heights.push(center_z);
+        }
+    }
+    // A tangent contact (a double root, the generatrix touching the sphere
+    // along a circle) is left to the tangent-contact lanes, which place the
+    // circle's seam and its touching vertices; this lane answers transverse
+    // sections only.
+    // Roots closer than 2e-6 of the radius (√disc / a is their separation)
+    // are a tangency up to round-off, e.g. an equator contact about a
+    // rotated axis: as ill-conditioned as an exact one, so left there too.
+    let separation_bar = 2e-6 * radius * a;
+    if discriminant.abs() <= 1e-9 * (b * b + (4.0 * a * c).abs()).max(radius * radius * 1e-24)
+        || (discriminant > 0.0 && discriminant <= separation_bar * separation_bar)
+    {
+        return None;
+    }
+    let (band_low, band_high) = (0.0_f64.min(height), 0.0_f64.max(height));
+    let mut circles = Vec::new();
+    for z in heights {
+        let rho = rho0 + slope * z;
+        if rho < -margin || z < band_low - margin || z > band_high + margin || rho <= margin {
+            continue;
+        }
+        circles.push(frame_circle(&frame, rho, z)?);
+    }
+    Some(circles)
+}
+
+/// `BREP_CONE_SHARED_RULING` (default off, `1` on): two cones tangent along a
+/// shared ruling ([`intersect_cones_sharing_a_ruling`]).
+fn cone_shared_ruling_enabled() -> bool {
+    crate::switch!(live "BREP_CONE_SHARED_RULING", false)
+}
+
+/// A cone (or frustum) carrier as its double cone: apex, unit axis, and
+/// `cos²` of the half-angle, with the frame and extent it was read from.
+struct ConeData {
+    apex: Vec3,
+    axis: Vec3,
+    cos2: f64,
+    frame: RevolutionFrame,
+    height: f64,
+    /// The swept angle from the frame's x axis (`TAU` for a full revolution).
+    sweep: f64,
+    /// The carrier's own size: its axial extent and largest radius.
+    size: f64,
+}
+
+fn cone_data(quadric: &AnalyticSurface, tolerance: f64, gate: RuledGate) -> Option<ConeData> {
+    let (frame, rho0, rho1, height) = ruled_revolution_data(quadric, tolerance, gate)?;
+    let slope = (rho1 - rho0) / height;
+    if !(slope.is_finite() && slope.abs() > 1e-9) {
+        return None;
+    }
+    let apex = frame.origin.add(frame.axis.scale(-rho0 / slope));
+    let sweep = match quadric {
+        AnalyticSurface::Revolution { sweep, .. } => *sweep,
+        _ => std::f64::consts::TAU,
+    };
+    let size = height.abs().max(rho0.abs()).max(rho1.abs());
+    Some(ConeData { apex, axis: frame.axis, cos2: 1.0 / (1.0 + slope * slope), frame, height, sweep, size })
+}
+
+impl ConeData {
+    /// `((X − A)·d)² − cos²α |X − A|²`: zero on the double cone.
+    fn value(&self, point: Vec3) -> f64 {
+        let d = point.sub(self.apex);
+        let along = d.dot(self.axis);
+        along * along - self.cos2 * d.dot(d)
+    }
+
+    /// The distance from `point` to the double cone, to first order.
+    fn distance(&self, point: Vec3) -> f64 {
+        let d = point.sub(self.apex);
+        let gradient = self.axis.scale(2.0 * d.dot(self.axis)).sub(d.scale(2.0 * self.cos2));
+        let norm = gradient.length();
+        if norm > 0.0 { self.value(point).abs() / norm } else { d.length() }
+    }
+
+    /// The quadric's symmetric 4×4 matrix on homogeneous `(x, 1)`.
+    fn matrix(&self) -> [[f64; 4]; 4] {
+        let d = [self.axis.x, self.axis.y, self.axis.z];
+        let a = [self.apex.x, self.apex.y, self.apex.z];
+        let mut m = [[0.0; 4]; 4];
+        let mut da = [0.0; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                m[i][j] = d[i] * d[j] - if i == j { self.cos2 } else { 0.0 };
+            }
+        }
+        for i in 0..3 {
+            da[i] = (0..3).map(|j| m[i][j] * a[j]).sum();
+        }
+        for i in 0..3 {
+            m[i][3] = -da[i];
+            m[3][i] = -da[i];
+        }
+        m[3][3] = (0..3).map(|i| a[i] * da[i]).sum();
+        m
+    }
+
+    /// Whether `point`'s azimuth about the axis lies in the swept range (with
+    /// `slack` radians either side); a point on the axis is in every one.
+    fn within_sweep(&self, point: Vec3, slack: f64) -> bool {
+        if self.sweep >= std::f64::consts::TAU - 1e-12 {
+            return true;
+        }
+        match self.frame.cylindrical(point).0 {
+            None => true,
+            Some(theta) => theta <= self.sweep + slack || theta >= std::f64::consts::TAU - slack,
+        }
+    }
+
+    /// Whether `point` lies within the carrier's axial extent (so on its own
+    /// nappe of the double cone), with `slack` either side.
+    fn within_extent(&self, point: Vec3, slack: f64) -> bool {
+        let axial = point.sub(self.frame.origin).dot(self.frame.axis);
+        axial >= 0.0_f64.min(self.height) - slack && axial <= 0.0_f64.max(self.height) + slack
+    }
+
+    /// The parameter range along the line `origin + s·direction` over which
+    /// it lies within this carrier's axial extent.
+    fn extent_along(&self, origin: Vec3, direction: Vec3) -> Option<[f64; 2]> {
+        let rate = direction.dot(self.frame.axis);
+        if rate.abs() <= 1e-12 {
+            return None;
+        }
+        let at = origin.sub(self.frame.origin).dot(self.frame.axis);
+        let (low, high) = (0.0_f64.min(self.height), 0.0_f64.max(self.height));
+        let (s0, s1) = ((low - at) / rate, (high - at) / rate);
+        Some([s0.min(s1), s0.max(s1)])
+    }
+}
+
+/// The pieces of `curve` (rational, degree at most 2) within `cone`'s axial
+/// extent, cut EXACTLY where it crosses either end of the band: within each
+/// knot span the axial coordinate times the homogeneous weight is a
+/// polynomial of degree at most 2 in the parameter, read from three
+/// homogeneous evaluations, so every crossing is a root of a quadratic and no
+/// arc that enters and leaves the band between samples is missed. `None` for a
+/// curve of higher degree or a cut that cannot be made.
+fn pieces_within_extent(curve: &NurbsCurve, cone: &ConeData, slack: f64) -> Option<Vec<NurbsCurve>> {
+    if curve.degree > 2 {
+        return None;
+    }
+    let (low, high) = (0.0_f64.min(cone.height) - slack, 0.0_f64.max(cone.height) + slack);
+    let axial_times_weight = |t: f64, bound: f64| -> Option<f64> {
+        let h = curve.evaluate_homogeneous(t).ok()?;
+        let along = Vec3::new(h.x, h.y, h.z).sub(cone.frame.origin.scale(h.w)).dot(cone.frame.axis);
+        Some(along - bound * h.w)
+    };
+    let mut breaks: Vec<f64> = curve.knots.iter().copied().collect();
+    breaks.sort_by(f64::total_cmp);
+    breaks.dedup();
+    let mut cuts = Vec::new();
+    for pair in breaks.windows(2) {
+        let (t0, t1) = (pair[0], pair[1]);
+        if !(t1 > t0) {
+            continue;
+        }
+        for bound in [low, high] {
+            // f(t) = a s² + b s + c on s ∈ [0, 1] from f(0), f(½), f(1).
+            let (f0, fm, f1) = (axial_times_weight(t0, bound)?, axial_times_weight(0.5 * (t0 + t1), bound)?, axial_times_weight(t1, bound)?);
+            let a = 2.0 * f1 - 4.0 * fm + 2.0 * f0;
+            let b = 4.0 * fm - f1 - 3.0 * f0;
+            let c = f0;
+            let mut roots = Vec::new();
+            if a.abs() <= 1e-14 * (b.abs() + c.abs()).max(1e-300) {
+                if b != 0.0 {
+                    roots.push(-c / b);
+                }
+            } else {
+                let discriminant = b * b - 4.0 * a * c;
+                if discriminant >= 0.0 {
+                    let root = discriminant.sqrt();
+                    let q = -0.5 * (b + b.signum() * root);
+                    if q != 0.0 {
+                        roots.push(q / a);
+                        roots.push(c / q);
+                    }
+                }
+            }
+            // A crossing at a span's end (an internal knot) is a cut too;
+            // the curve's own ends are dropped below.
+            for s in roots {
+                if s >= -1e-12 && s <= 1.0 + 1e-12 {
+                    cuts.push(t0 + s.clamp(0.0, 1.0) * (t1 - t0));
+                }
+            }
+        }
+    }
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup();
+    let inside = |point: Vec3| cone.within_extent(point, slack);
+    let mut pieces = Vec::new();
+    let mut rest = curve.clone();
+    for cut in cuts {
+        let [r0, r1] = rest.domain().ok()?;
+        if cut <= r0 + 1e-12 * (r1 - r0).abs().max(1.0) || cut >= r1 - 1e-12 * (r1 - r0).abs().max(1.0) {
+            continue;
+        }
+        let (left, right) = rest.split(cut).ok()?;
+        pieces.push(left);
+        rest = right;
+    }
+    pieces.push(rest);
+    let mut kept = Vec::new();
+    for piece in pieces {
+        let [p0, p1] = piece.domain().ok()?;
+        if inside(piece.evaluate(0.5 * (p0 + p1)).ok()?) {
+            kept.push(piece);
+        }
+    }
+    Some(kept)
+}
+
+/// Two cones TANGENT ALONG A SHARED RULING. A ruling of each passes through
+/// its apex, so a shared one is the line through both apexes; it lies on
+/// each double cone when it makes that cone's half-angle with the axis, and
+/// a cone's tangent plane is constant along a ruling, so the cones are
+/// tangent along the whole line when their tangent planes there agree. The
+/// quartic intersection is then the ruling twice and a residual conic: in
+/// the pencil `Q₁ − λQ₂` the member vanishing on the common tangent plane `T`
+/// (λ read at one point of `T` off the ruling, where each cone restricts to
+/// the doubled ruling) is the plane pair `T ∪ π`, and the conic is either cone
+/// cut by `π`. The ruling is returned over both carriers' axial extents and
+/// the conic as the first carrier's plane section, checked on the second.
+/// A pair whose residual section cannot be read is left to the marcher.
+///
+/// A cone filled out to its sphere and the revolves of its half-sections
+/// about a line through the apex plane (brep-bench cone-spun): the cones the
+/// half-section's generators sweep are tangent to the turned cone along the
+/// generators, and the marcher could not settle the tangent pair, so one
+/// union order refused.
+fn intersect_cones_sharing_a_ruling(
+    a: &AnalyticSurface,
+    b: &AnalyticSurface,
+    tolerance: f64,
+    gate: RuledGate,
+) -> Option<Vec<NurbsCurve>> {
+    if !cone_shared_ruling_enabled() {
+        return None;
+    }
+    let (first, second) = (cone_data(a, tolerance, gate)?, cone_data(b, tolerance, gate)?);
+    let between = second.apex.sub(first.apex);
+    let length = between.length();
+    // Bands relative to the carriers' own size, not to where they sit.
+    let scale = 1.0 + first.size.max(second.size);
+    if !(length > 1e-9 * scale) {
+        return None;
+    }
+    let line = between.scale(1.0 / length);
+    // The apex line lies on both double cones.
+    for cone in [&first, &second] {
+        let along = line.dot(cone.axis);
+        if (along * along - cone.cos2).abs() > 1e-9 {
+            return None;
+        }
+    }
+    // Their tangent planes along it agree.
+    let normal_first = first.axis.cross(line).cross(line).normalized().ok()?;
+    let normal_second = second.axis.cross(line).cross(line).normalized().ok()?;
+    if normal_first.cross(normal_second).length() > 1e-9 {
+        return None;
+    }
+    // λ at a point of T off the ruling.
+    let off = first.apex.add(normal_first.cross(line).scale(length.max(1.0)));
+    let (value_first, value_second) = (first.value(off), second.value(off));
+    if !(value_second.abs() > 1e-12 * (1.0 + value_first.abs())) {
+        return None;
+    }
+    let lambda = value_first / value_second;
+    let (m_first, m_second) = (first.matrix(), second.matrix());
+    let mut pencil = [[0.0; 4]; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            pencil[i][j] = m_first[i][j] - lambda * m_second[i][j];
+        }
+    }
+    let t = [normal_first.x, normal_first.y, normal_first.z, -normal_first.dot(first.apex)];
+    let homogeneous = |point: Vec3| [point.x, point.y, point.z, 1.0];
+    let apply = |m: &[[f64; 4]; 4], x: [f64; 4]| -> [f64; 4] {
+        let mut out = [0.0; 4];
+        for i in 0..4 {
+            out[i] = (0..4).map(|j| m[i][j] * x[j]).sum();
+        }
+        out
+    };
+    let dot4 = |p: [f64; 4], q: [f64; 4]| p[0] * q[0] + p[1] * q[1] + p[2] * q[2] + p[3] * q[3];
+    // π from one point y off T: P y = ½(t (π·y) + π (t·y)).
+    let y = homogeneous(first.apex.add(normal_first.scale(length.max(1.0))));
+    let s = dot4(t, y);
+    if !(s.abs() > 1e-12) {
+        return None;
+    }
+    let py = apply(&pencil, y);
+    let pi_y = dot4(y, py) / s;
+    let mut pi = [0.0; 4];
+    for i in 0..4 {
+        pi[i] = (2.0 * py[i] - t[i] * pi_y) / s;
+    }
+    // The member is that plane pair: its value at a few points is (t·x)(π·x).
+    for probe in [second.apex.add(Vec3::new(0.37, -0.21, 0.53).scale(length)), first.apex.add(Vec3::new(-0.44, 0.61, 0.17).scale(length)), off.add(line.scale(0.3 * length))] {
+        let x = homogeneous(probe);
+        let member = dot4(x, apply(&pencil, x));
+        let pair = dot4(t, x) * dot4(pi, x);
+        if (member - pair).abs() > 1e-8 * (1.0 + member.abs().max(pair.abs())) {
+            return None;
+        }
+    }
+    let mut curves = Vec::new();
+    // The ruling over both carriers' axial extents.
+    if let (Some([a0, a1]), Some([b0, b1])) = (first.extent_along(first.apex, line), second.extent_along(first.apex, line)) {
+        let (s0, s1) = (a0.max(b0), a1.min(b1));
+        let (start, end) = (first.apex.add(line.scale(s0)), first.apex.add(line.scale(s1)));
+        let middle = start.add(end).scale(0.5);
+        if std::env::var_os("BREP_DEBUG_CONE_RULING").is_some() {
+            eprintln!(
+                "cone ruling: s [{s0:.6}, {s1:.6}] from {start:?} to {end:?}; middle theta first {:?} (sweep {:.6}) second {:?} (sweep {:.6})",
+                first.frame.cylindrical(middle).0, first.sweep, second.frame.cylindrical(middle).0, second.sweep
+            );
+        }
+        // A ruling outside a partial revolution's sweep is not on that face.
+        // Any ruling longer than the tolerance itself is a section.
+        if s1 - s0 > tolerance.max(1e-12) && first.within_sweep(middle, 1e-9) && second.within_sweep(middle, 1e-9) {
+            curves.push(crate::make_line(start, end).ok()?);
+        }
+    }
+    // The residual conic on π, when π is a real plane other than T.
+    let pi_normal = Vec3::new(pi[0], pi[1], pi[2]);
+    let pi_length = pi_normal.length();
+    if pi_length > 1e-12 * (1.0 + pi[3].abs()) {
+        let unit = pi_normal.scale(1.0 / pi_length);
+        let origin = pi_normal.scale(-pi[3] / (pi_length * pi_length));
+        let same_as_t = unit.cross(normal_first).length() <= 1e-9 && (unit.dot(first.apex) + pi[3] / pi_length).abs() <= tolerance;
+        if !same_as_t {
+            let plane = PlaneData { origin, normal: unit };
+            let conics = intersect_plane_quadric(&plane, a, tolerance, gate)?;
+            for conic in conics {
+                let [c0, c1] = conic.domain().ok()?;
+                let (mut inside, mut outside) = (0, 0);
+                for k in 0..=32 {
+                    let point = conic.evaluate(c0 + (c1 - c0) * k as f64 / 32.0).ok()?;
+                    if second.distance(point) > 1e3 * tolerance.max(1e-12) * scale {
+                        return None;
+                    }
+                    if first.within_sweep(point, 1e-9) && second.within_sweep(point, 1e-9) {
+                        inside += 1;
+                    } else {
+                        outside += 1;
+                    }
+                }
+                if std::env::var_os("BREP_DEBUG_CONE_RULING").is_some() {
+                    let ends = (conic.evaluate(c0).ok(), conic.evaluate(c1).ok());
+                    eprintln!("cone ruling conic: inside {inside} outside {outside}; ends {ends:?}; sweeps {:.6} {:.6}", first.sweep, second.sweep);
+                }
+                // The sweep counts above are read for the debug line only:
+                // nothing declines on them. The section is of the first
+                // carrier, whose plane section is returned whole once its
+                // band admits it (an ellipse is not cut to the first
+                // carrier's extent); on the second it must also lie on that
+                // carrier's own nappe and axial extent, so the pieces past it
+                // are cut off. A conic past a partial sweep's end continues on
+                // the revolution's own extension; the imprint clips it to the
+                // faces' trims.
+                let slack = tolerance.max(1e-12) * scale;
+                curves.extend(pieces_within_extent(&conic, &second, slack)?);
+            }
+        }
+    }
+    Some(curves)
+}
+
+/// `BREP_EQUAL_CYLINDER_SECTIONS` (default on, `0` off): two cylinders of one
+/// radius whose axes meet ([`intersect_equal_cylinders_meeting_axes`]).
+fn equal_cylinder_sections_enabled() -> bool {
+    crate::switch!(live "BREP_EQUAL_CYLINDER_SECTIONS", true)
+}
+
+/// Two cylinders of ONE radius whose axes meet at a point `C` (not parallel):
+/// a point at distance `r` from both axes lies on one of the two planes
+/// through `C` that bisect the axes (normals `a - b` and `a + b`), so the
+/// intersection is exactly the two plane sections of either cylinder, two
+/// ellipses that cross where the two surfaces are tangent (the points of
+/// the circle of radius `r` about `C` along `a x b`). This is the joint of
+/// two straight slides of one ball-ended tool, whose envelope cylinders
+/// share the joint ball: their crease is the section square to the mean
+/// axis, and at a shallow angle a march seeded at the tangent points reads
+/// the pair as touching only (2026-11-18, the ball-end raster). The sections
+/// are of the first carrier; every station is checked on the second.
+fn intersect_equal_cylinders_meeting_axes(
+    surface_a: &NurbsSurface,
+    surface_b: &NurbsSurface,
+    a: &AnalyticSurface,
+    b: &AnalyticSurface,
+    tolerance: f64,
+    gate: RuledGate,
+) -> Option<Vec<NurbsCurve>> {
+    if !equal_cylinder_sections_enabled() {
+        return None;
+    }
+    let (frame_a, rho0_a, rho1_a, _) = ruled_revolution_data(a, tolerance, gate)?;
+    let (frame_b, rho0_b, rho1_b, _) = ruled_revolution_data(b, tolerance, gate)?;
+    // An absolute band at the caller's tolerance: one radius means one radius
+    // to the tolerance whatever the size (floored at what the radius itself
+    // can represent), never a share of the size or of the distance from the
+    // world origin.
+    let band = tolerance.max(4.0 * f64::EPSILON * 1.0f64.max(rho0_a.abs()).max(rho0_b.abs()));
+    // ONE radius means one radius to round-off, not to the tolerance: two
+    // radii a tolerance apart meet in two branches that pass each other near
+    // the tangent points (a gap of order sqrt(r dr)), not in two crossing
+    // ellipses, and such a pair is the march's.
+    let same_radius = 16.0 * f64::EPSILON * 1.0f64.max(rho0_a.abs()).max(rho0_b.abs());
+    if (rho0_a - rho1_a).abs() > band || (rho0_b - rho1_b).abs() > band || (rho0_a - rho0_b).abs() > same_radius || rho0_a <= band {
+        return None;
+    }
+    let (radius, radius_b) = (rho0_a, rho0_b);
+    let (da, mut db) = (frame_a.axis.normalized().ok()?, frame_b.axis.normalized().ok()?);
+    if da.dot(db) < 0.0 {
+        db = db.scale(-1.0);
+    }
+    let cross = da.cross(db);
+    let sine = cross.length();
+    // Parallel axes are the coaxial / parallel lanes' business; below this
+    // angle the meeting point is not determined to `band`.
+    if sine <= 1e-6 {
+        return None;
+    }
+    // The axes must MEET, to round-off as the radii must agree: axes a
+    // tolerance apart (skew) give two branches that pass each other near the
+    // tangent points (a gap of order sqrt(r d)), not crossing ellipses.
+    let offset = frame_b.origin.sub(frame_a.origin);
+    let skew = offset.dot(cross.scale(1.0 / sine)).abs();
+    let meet = 16.0 * f64::EPSILON * 1.0f64.max(rho0_a.abs()).max(frame_a.origin.length()).max(frame_b.origin.length());
+    if std::env::var_os("BREP_DEBUG_EQUAL_CYLINDERS").is_some() {
+        eprintln!("equal cylinders: skew {skew:.3e} (round-off bar {meet:.3e}), radii {rho0_a} / {rho0_b}");
+    }
+    if skew > meet {
+        return None;
+    }
+    // C = A0 + s da with (A0 + s da - B0) x db = 0: s = ((B0 - A0) x db)·(da x db) / |da x db|^2.
+    let s = offset.cross(db).dot(cross) / (sine * sine);
+    let centre = frame_a.origin.add(da.scale(s));
+    let off_axis = |point: Vec3, origin: Vec3, axis: Vec3, rho: f64| {
+        let delta = point.sub(origin);
+        (delta.sub(axis.scale(delta.dot(axis))).length() - rho).abs()
+    };
+    // Each CARRIER is the cylinder its recognition names: a straight
+    // generatrix with equal end radii also describes a hyperboloid (a line
+    // skew to the axis), which is not this closed form.
+    for (surface, origin, axis, rho) in [(surface_a, frame_a.origin, da, radius), (surface_b, frame_b.origin, db, radius_b)] {
+        let ([u0, u1], [v0, v1]) = (surface.domain_u().ok()?, surface.domain_v().ok()?);
+        for i in 0..=6 {
+            for j in 0..=6 {
+                let point = surface.evaluate(u0 + (u1 - u0) * i as f64 / 6.0, v0 + (v1 - v0) * j as f64 / 6.0).ok()?;
+                if off_axis(point, origin, axis, rho) > band {
+                    return None;
+                }
+            }
+        }
+    }
+    let on_b = |point: Vec3| off_axis(point, frame_b.origin, db, radius_b);
+    let mut curves = Vec::new();
+    for normal in [da.sub(db), da.add(db)] {
+        let normal = normal.normalized().ok()?;
+        let plane = PlaneData { origin: centre, normal };
+        for curve in intersect_plane_quadric(&plane, a, tolerance, gate)? {
+            let [t0, t1] = curve.domain().ok()?;
+            for index in 0..=16 {
+                let point = curve.evaluate(t0 + (t1 - t0) * index as f64 / 16.0).ok()?;
+                if on_b(point) > band * 10.0 {
+                    return None;
+                }
+            }
+            curves.push(curve);
+        }
+    }
+    Some(curves)
 }
 
 /// Frame/meridian data for any revolution with a straight-line generatrix:
@@ -408,6 +1075,11 @@ fn ruled_revolution_data(
         AnalyticSurface::Revolution {
             frame, generatrix, ..
         } => {
+            // A straight profile skew to the axis sweeps a hyperboloid, not a
+            // cone: only a profile in the start meridian reads as one.
+            if !generatrix_is_meridional_half_ray(generatrix, frame) {
+                return None;
+            }
             let (start, end) = match gate {
                 RuledGate::Count => {
                     let controls = &generatrix.control_points;
@@ -537,9 +1209,12 @@ fn degenerate_apex_frustum(rho0: f64, rho1: f64, height: f64) -> bool {
 ///   to a rational-quadratic arc on the SAME knot vector.
 /// - **Cone/frustum**: the section is the PROJECTIVE image from the apex,
 ///   `X ↦ apex + (k/((X−apex)·n))·(X−apex)`, again linear in the homogeneous
-///   control point. Weight signs flip for a parabolic/hyperbolic section (the
-///   arc crosses the apex plane), and those are refused by name rather than
-///   silently mis-built.
+///   control point. A parabolic or hyperbolic section is built like an
+///   elliptic one while the ARC stays clear of the generatrices parallel to the
+///   plane: every point of it is then a finite image on one nappe and the
+///   weights keep one sign. An arc that reaches such a generatrix (a closed rim
+///   always does) has weights that change sign, and is refused by name rather
+///   than silently mis-built — that generatrix never meets the plane.
 ///
 /// `sweep` must be positive and at most a full turn; a reversed rim is built
 /// forward and reversed by the caller, which is what keeps the knot vector the
@@ -750,7 +1425,7 @@ fn intersect_plane_quadric(
                 return None;
             }
             let normal = plane.normal;
-            let conic = map_rational_curve(&circle, |p| {
+            let project = |p: crate::Vec4| {
                 let relative =
                     Vec3::new(p.x - p.w * apex.x, p.y - p.w * apex.y, p.z - p.w * apex.z);
                 let w_new = relative.dot(normal);
@@ -761,7 +1436,14 @@ fn intersect_plane_quadric(
                     z: apex.z * w_new + scaled.z,
                     w: w_new,
                 }
-            })?;
+            };
+            let Some(conic) = map_rational_curve(&circle, project) else {
+                // A parabola or hyperbola: its arcs inside the band.
+                if cone_plane_open_section_enabled() {
+                    return cone_plane_open_section(frame, *height, apex, reference_rho, reference_z, k, normal, tolerance, &project);
+                }
+                return None;
+            };
             if !section_within_band(&conic, frame, *height, tolerance) {
                 return Some(Vec::new());
             }
@@ -959,3 +1641,7 @@ fn intersect_sphere_sphere(
     )
     .ok()?])
 }
+
+
+
+

@@ -26,6 +26,57 @@ pub fn parameter_space_area(face: &FaceRecord) -> Result<f64, String> {
     Ok(area)
 }
 
+/// One pcurve's share of [`parameter_space_area`]: each quadrature station's term, in the
+/// order the sum adds them.
+fn pcurve_area_terms(pcurve: &NurbsCurve) -> Result<Vec<f64>, String> {
+    let mut terms = Vec::new();
+    for pair in curve_breaks(pcurve)?.windows(2) {
+        for panel in rule::curve_panels(pcurve, pair[0], pair[1])? {
+            for (parameter, weight) in panel.stations() {
+                let (point, tangent) = pcurve.deriv1(parameter)?;
+                terms.push(weight * 0.5 * (point.x * tangent.y - point.y * tangent.x));
+            }
+        }
+    }
+    Ok(terms)
+}
+
+/// Station terms of the pcurves read so far, keyed by each pcurve's content, for a caller
+/// that reads [`parameter_space_area`] again and again on faces that change a few pcurves
+/// at a time ([`parameter_space_area_with`]). Hold one for one task; it is not bounded.
+#[derive(Default)]
+pub struct AreaTerms {
+    terms: rustc_hash::FxHashMap<[u64; 2], std::rc::Rc<[f64]>>,
+}
+
+impl AreaTerms {
+    fn of(&mut self, pcurve: &NurbsCurve) -> Result<std::rc::Rc<[f64]>, String> {
+        let mut key = crate::identity_hash::TwoLane::new();
+        crate::identity_hash::hash_curve(&mut key, pcurve);
+        let key = key.finish();
+        if let Some(terms) = self.terms.get(&key) {
+            return Ok(terms.clone());
+        }
+        let terms: std::rc::Rc<[f64]> = pcurve_area_terms(pcurve)?.into();
+        self.terms.insert(key, terms.clone());
+        Ok(terms)
+    }
+}
+
+/// [`parameter_space_area`], bit for bit: the same terms added in the same order, each
+/// pcurve's terms computed once per content and read from `memo` after that.
+pub fn parameter_space_area_with(face: &FaceRecord, memo: &mut AreaTerms) -> Result<f64, String> {
+    let mut area = 0.0;
+    for loop_record in &face.loops {
+        for coedge in &loop_record.coedges {
+            for term in memo.of(&coedge.pcurve)?.iter() {
+                area += *term;
+            }
+        }
+    }
+    Ok(area)
+}
+
 /// The escape hatch for [`closed_parameter_space_area`]: `BREP_OPEN_PLANAR_LOOPS=1`
 /// reads every planar face's trim loops open again, as they were read before
 /// the closing chords, so the two readings are two cells of one binary.
@@ -181,6 +232,33 @@ pub fn integrand_value(kind: Integrand, point: Vec3, weighted_normal: Vec3) -> f
         Integrand::ProductXY => 0.5 * x * x * y * weighted_normal.x,
         Integrand::ProductXZ => 0.5 * x * x * z * weighted_normal.x,
         Integrand::ProductYZ => 0.5 * y * y * z * weighted_normal.y,
+        Integrand::MomentAbout(axis, reference) => {
+            let d = point.sub(reference);
+            let (c, n) = component(d, weighted_normal, axis);
+            0.5 * c * c * n
+        }
+        Integrand::SecondAbout(axis, reference) => {
+            let d = point.sub(reference);
+            let (c, n) = component(d, weighted_normal, axis);
+            c * c * c / 3.0 * n
+        }
+        Integrand::ProductAbout(pair, reference) => {
+            let d = point.sub(reference);
+            match pair {
+                0 => 0.5 * d.x * d.x * d.y * weighted_normal.x,
+                1 => 0.5 * d.x * d.x * d.z * weighted_normal.x,
+                _ => 0.5 * d.y * d.y * d.z * weighted_normal.y,
+            }
+        }
+    }
+}
+
+/// The `axis` components (0 = x, 1 = y, otherwise z) of `d` and `n`.
+fn component(d: Vec3, n: Vec3, axis: usize) -> (f64, f64) {
+    match axis {
+        0 => (d.x, n.x),
+        1 => (d.y, n.y),
+        _ => (d.z, n.z),
     }
 }
 
@@ -240,10 +318,164 @@ pub fn integrate_cell_scaled(
         // rule reads it exactly, polynomial carrier or not, so the cell's
         // AREA alone is re-read adaptively and every other integrand keeps
         // the reading above bit for bit.
-        let coarse = (totals[slot] - before) / scale;
-        totals[slot] = before + scale * adaptive_cell_area(face, cell, coarse, rules, AREA_ADAPTIVE_DEPTH, &mut stations)?;
+        let area = match rules.take_local_area_face(face) {
+            // `BREP_MASS_AREA_LOCAL_FRAME`: the same cell of the carrier
+            // translated to its own poles, read afresh there (the station
+            // memo is keyed by the untranslated carrier, so it is not asked).
+            Some(local) => {
+                let coarse = cell_area_reading(&local, cell, rules, None, &mut stations)?;
+                let area = adaptive_cell_area(&local, cell, coarse, rules, None, AREA_ADAPTIVE_DEPTH, &mut stations)?;
+                rules.restore_local_area_face(local);
+                area
+            }
+            None => {
+                let coarse = (totals[slot] - before) / scale;
+                let identity = rules.station_identity;
+                adaptive_cell_area(face, cell, coarse, rules, identity, AREA_ADAPTIVE_DEPTH, &mut stations)?
+            }
+        };
+        totals[slot] = before + scale * area;
     }
     Ok(stations)
+}
+
+/// `BREP_MASS_AREA_LOCAL_FRAME` (default on; `=0` restores the global-frame
+/// reading): the adaptive AREA re-read evaluates the carrier translated by
+/// [`local_frame_reference`] (the centre of its poles, where they stand away
+/// from the origin).
+///
+/// `|S_u × S_v|` does not depend on where the surface stands, but its
+/// reading does: the partials are sums of basis-weighted poles, and poles at
+/// a distance `D` from the origin leave about `D · ε` of rounding in a
+/// partial of the patch's own size. A unit fill patch at `x = 1e6` read its
+/// partials ~1e-10 off, ten times the refinement's 1e-11 agreement bar, so
+/// every knot cell was quartered to the depth cap (4^6 sub-cells): 16-18 s
+/// per three-patch fill face against ~4 ms at the origin, the same at
+/// `x = 1e5` (30 s a fill) and already 10x at `x = 1e4`. Translated, the
+/// rounding is that of the patch's own size and the bar is met where it is
+/// met at the origin. The bar itself is unchanged. Only the area is read
+/// there: every other integrand (volume, moments) depends on the frame and
+/// keeps its reading bit for bit.
+pub fn area_local_frame_on() -> bool {
+    switch!("BREP_MASS_AREA_LOCAL_FRAME", true)
+}
+
+/// `a - b` when it is exact in floating point (the TwoSum error term is
+/// zero), else `None`.
+fn exact_difference(a: f64, b: f64) -> Option<f64> {
+    let sum = a - b;
+    let virtual_b = sum - a;
+    let error = (a - (sum - virtual_b)) + (-b - virtual_b);
+    (sum.is_finite() && error == 0.0).then_some(sum)
+}
+
+/// `w · r` when the product is exact (its FMA residual is zero).
+fn exact_product(w: f64, r: f64) -> Option<f64> {
+    let product = w * r;
+    (product.is_finite() && w.mul_add(r, -product) == 0.0).then_some(product)
+}
+
+/// Where the area re-read stands the carrier of `face`: per coordinate, the
+/// centre of the poles rounded to a multiple of the power of two at or above
+/// their extent (a flat coordinate, extent 0, takes the centre itself), when
+/// the poles stand farther from the origin than they spread
+/// (`|centre| > extent`) AND every pole's homogeneous shift `x - w·r` is
+/// EXACT (the product by its FMA residual, the difference by TwoSum). So the
+/// translated carrier is the same surface moved by `r`, never a rounded
+/// copy: a carrier reaching from near the origin out to far coordinates
+/// keeps its frame (its small spans would not survive the move), and so does
+/// a weighted carrier whose `w·r` rounds (a generic weight times a far
+/// reference does), which is read in the global frame as before, correct and
+/// as slow as before. A unit-weight pole's shift is exact whenever it stands
+/// within a factor of two of `r` (Sterbenz). `None` when no coordinate moves,
+/// which leaves the reading as it was, bit for bit.
+pub(super) fn local_frame_reference(face: &FaceRecord) -> Option<Vec3> {
+    let poles = || face.surface.control_points.iter().flatten();
+    let mut low = [f64::INFINITY; 3];
+    let mut high = [f64::NEG_INFINITY; 3];
+    for pole in poles() {
+        if !(pole.w > 0.0) {
+            return None;
+        }
+        for (axis, value) in [pole.x, pole.y, pole.z].into_iter().enumerate() {
+            let value = value / pole.w;
+            low[axis] = low[axis].min(value);
+            high[axis] = high[axis].max(value);
+        }
+    }
+    let mut reference = [0.0f64; 3];
+    for axis in 0..3 {
+        let (centre, extent) = (0.5 * (low[axis] + high[axis]), high[axis] - low[axis]);
+        if !(centre.is_finite() && extent.is_finite()) || centre.abs() <= extent {
+            continue;
+        }
+        let candidate = if extent == 0.0 {
+            centre
+        } else {
+            let quantum = 2.0f64.powi(extent.log2().ceil() as i32);
+            (centre / quantum).round() * quantum
+        };
+        let exact = poles().all(|pole| {
+            exact_product(pole.w, candidate)
+                .and_then(|shift| exact_difference([pole.x, pole.y, pole.z][axis], shift))
+                .is_some()
+        });
+        if exact {
+            reference[axis] = candidate;
+        }
+    }
+    (reference != [0.0; 3]).then(|| Vec3::new(reference[0], reference[1], reference[2]))
+}
+
+/// `face` with its carrier translated by `-reference`: every homogeneous
+/// pole `(x - w·r, y - w·r, z - w·r, w)`, weights, knots, orientation and
+/// trims unchanged. `None` when the carrier refuses to rebuild.
+pub(super) fn translated_face(face: &FaceRecord, reference: Vec3) -> Option<FaceRecord> {
+    let surface = &face.surface;
+    let poles = surface
+        .control_points
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|pole| crate::Vec4 {
+                    x: pole.x - pole.w * reference.x,
+                    y: pole.y - pole.w * reference.y,
+                    z: pole.z - pole.w * reference.z,
+                    w: pole.w,
+                })
+                .collect()
+        })
+        .collect();
+    let surface = crate::NurbsSurface::new(
+        surface.degree_u,
+        surface.degree_v,
+        surface.knots_u.clone(),
+        surface.knots_v.clone(),
+        poles,
+    )
+    .ok()?;
+    let mut local = face.clone();
+    local.surface = surface;
+    Some(local)
+}
+
+/// The area over `cell` (unscaled) on the cell's own panels.
+fn cell_area_reading(
+    face: &FaceRecord,
+    cell: [f64; 4],
+    rules: &mut rule::SurfaceRules,
+    station_identity: Option<[u64; 2]>,
+    stations: &mut usize,
+) -> Result<f64, String> {
+    let (u_panels, v_panels) = rules.panels(&face.surface, cell)?;
+    let mut area = [0.0f64];
+    for u_panel in &u_panels {
+        for v_panel in &v_panels {
+            integrate_block(face, *u_panel, *v_panel, 1.0, &[Integrand::Area], &mut area, station_identity)?;
+            *stations += u_panel.order * v_panel.order;
+        }
+    }
+    Ok(area[0])
 }
 
 /// `BREP_MASS_AREA_ADAPTIVE` (default on) re-reads each cell's AREA by quadrant
@@ -276,6 +508,7 @@ fn adaptive_cell_area(
     cell: [f64; 4],
     coarse: f64,
     rules: &mut rule::SurfaceRules,
+    station_identity: Option<[u64; 2]>,
     depth: usize,
     stations: &mut usize,
 ) -> Result<f64, String> {
@@ -292,15 +525,7 @@ fn adaptive_cell_area(
     ];
     let mut readings = [0.0f64; 4];
     for (index, quadrant) in quadrants.iter().enumerate() {
-        let (u_panels, v_panels) = rules.panels(&face.surface, *quadrant)?;
-        let mut area = [0.0f64];
-        for u_panel in &u_panels {
-            for v_panel in &v_panels {
-                integrate_block(face, *u_panel, *v_panel, 1.0, &[Integrand::Area], &mut area, rules.station_identity)?;
-                *stations += u_panel.order * v_panel.order;
-            }
-        }
-        readings[index] = area[0];
+        readings[index] = cell_area_reading(face, *quadrant, rules, station_identity, stations)?;
     }
     let fine: f64 = readings.iter().sum();
     if (fine - coarse).abs() <= AREA_ADAPTIVE_TOLERANCE * fine.abs() {
@@ -308,7 +533,7 @@ fn adaptive_cell_area(
     }
     let mut total = 0.0;
     for (index, quadrant) in quadrants.iter().enumerate() {
-        total += adaptive_cell_area(face, *quadrant, readings[index], rules, depth - 1, stations)?;
+        total += adaptive_cell_area(face, *quadrant, readings[index], rules, station_identity, depth - 1, stations)?;
     }
     Ok(total)
 }
@@ -680,6 +905,83 @@ pub fn biperiodic_band_range(face: &FaceRecord) -> Result<Option<BiBand>, String
     Ok(None)
 }
 
+/// A bi-periodic band (two full-wrap rims) pierced by holes: a caster tread's
+/// slots, a signet ring's bore. [`biperiodic_band_range`] reads only a face of
+/// exactly two rims, so such a face fell to the trimmed path, where both rims
+/// are zero-area iso lines and only the holes were integrated (a caster's
+/// band read 680.8 for a numeric 1155.3). Read the band from its two rims as
+/// for a plain band, then take each hole away, integrated over its own
+/// polygon; a hole that straddles a seam is reconnected across it
+/// ([`crate::topology::loop_seam_offsets`]) and integrated through the
+/// domain-wrapping evaluator. None (the previous path) unless exactly two
+/// loops wind and every other loop is closed in parameter space.
+fn band_with_holes_integral(face: &FaceRecord, kinds: &[Integrand]) -> Result<Option<Vec<f64>>, String> {
+    let (closed_u, closed_v) = face.surface.closed_directions()?;
+    if !(closed_u && closed_v) {
+        return Ok(None);
+    }
+    let [u0, u1] = face.surface.domain_u()?;
+    let [v0, v1] = face.surface.domain_v()?;
+    let (u_span, v_span) = (u1 - u0, v1 - v0);
+    let mut rims = Vec::new();
+    let mut holes = Vec::new();
+    for (loop_index, loop_record) in face.loops.iter().enumerate() {
+        let (mut travel_u, mut travel_v) = (0.0, 0.0);
+        for coedge in &loop_record.coedges {
+            let [t0, t1] = coedge.pcurve.domain()?;
+            let (start, end) = (coedge.pcurve.evaluate(t0)?, coedge.pcurve.evaluate(t1)?);
+            travel_u += end.x - start.x;
+            travel_v += end.y - start.y;
+        }
+        let turns = |travel: f64, span: f64| {
+            let turns = (travel / span).round();
+            ((travel - turns * span).abs() <= 1e-3 * span.abs()).then_some(turns)
+        };
+        match (turns(travel_u, u_span), turns(travel_v, v_span)) {
+            (Some(tu), Some(tv)) if tu == 0.0 && tv == 0.0 => holes.push(loop_index),
+            (Some(tu), Some(tv)) if (tu == 0.0) != (tv == 0.0) => rims.push(loop_index),
+            _ => return Ok(None),
+        }
+    }
+    if rims.len() != 2 || holes.is_empty() {
+        return Ok(None);
+    }
+    let mut rim_face = face.clone();
+    rim_face.loops = rims.iter().map(|&index| face.loops[index].clone()).collect();
+    if biperiodic_band_range(&rim_face)?.is_none() {
+        return Ok(None);
+    }
+    let Some(band) = biperiodic_band_integral(&rim_face, kinds)? else {
+        return Ok(None);
+    };
+    let domain = [u0, u1, v0, v1];
+    let mut polygons = Vec::with_capacity(holes.len());
+    for &loop_index in &holes {
+        let coedges = &face.loops[loop_index].coedges;
+        let offsets = crate::topology::loop_seam_offsets(coedges, closed_u, closed_v, u_span, v_span)?;
+        let mut polygon = TrimPolygon::new(domain);
+        for (coedge_index, coedge) in coedges.iter().enumerate() {
+            polygon.push_coedge(loop_index, coedge_index, coedge, offsets[coedge_index])?;
+        }
+        polygon.finish();
+        // All holes one way round, so the integrator's orientation read
+        // (the sign of the summed area) holds for every one of them.
+        if polygon_signed_area(&polygon.points) < 0.0 {
+            polygon.reverse();
+        }
+        polygons.push(polygon);
+    }
+    // Past the domain by more than rounding, relative to each span: an
+    // absolute band would read a whole straddling hole on a tiny domain as
+    // in-domain and clip half of it away.
+    let (du, dv) = (1e-9 * u_span.abs(), 1e-9 * v_span.abs());
+    let extended = polygons.iter().flat_map(|polygon| polygon.points.iter()).any(|point| {
+        point[0] < u0 - du || point[0] > u1 + du || point[1] < v0 - dv || point[1] > v1 + dv
+    });
+    let removed = integrate_trimmed_polys(face, kinds, &polygons, extended, domain)?;
+    Ok(Some(band.iter().zip(removed).map(|(band, hole)| band - hole).collect()))
+}
+
 /// Gauss–Legendre integral of `kind` over the axis-aligned parameter rectangle
 /// \[u_lo,u_hi\]×\[v_lo,v_hi\], subdividing at knot spans clipped to the rectangle.
 pub fn integrate_rectangle(
@@ -741,6 +1043,11 @@ pub(super) fn biperiodic_band_integral(
     face: &FaceRecord,
     kinds: &[Integrand],
 ) -> Result<Option<Vec<f64>>, String> {
+    if face.loops.len() > 2 && switch!("BREP_MASS_BAND_HOLES", true) {
+        if let Some(values) = band_with_holes_integral(face, kinds)? {
+            return Ok(Some(values));
+        }
+    }
     let Some(band) = biperiodic_band_range(face)? else {
         if switch!("BREP_MASS_TORUS_LIFT", true) {
             return super::torus::lifted_band_integral(face, kinds);

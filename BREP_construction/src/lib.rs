@@ -59,12 +59,26 @@ pub mod solid_sweep;
 pub use solid_sweep::{
     sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
 };
+pub use planar_region::{cut_planar_sweep_from_prism, region_cut_on, swept_region_holds, target_outline_holds};
+#[path = "construction/turn_window.rs"]
+mod turn_window;
+#[path = "construction/slide_prism.rs"]
+mod slide_prism;
 #[path = "construction/solid_sweep_bar.rs"]
 mod solid_sweep_bar;
 #[path = "construction/solid_sweep_caps.rs"]
 #[doc(hidden)]
 pub mod solid_sweep_caps;
-pub use solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, sweep_solid_tumbled, FrameCurve, RisingTurn, TwoTurns, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
+#[path = "construction/solid_sweep_trim.rs"]
+#[doc(hidden)]
+pub mod solid_sweep_trim;
+#[path = "construction/planar_region.rs"]
+#[doc(hidden)]
+pub mod planar_region;
+pub use solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, sweep_solid_tumbled, sweep_tube_slid_across, FrameCurve, RisingTurn, TwoTurns, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
+#[path = "construction/mill_program.rs"]
+pub mod mill_program;
+pub use mill_program::{flat_mill_region_prisms, MillMove, MILL_REGION_REFUSAL};
 #[path = "geometry/closed_curves.rs"]
 #[doc(hidden)]
 pub mod closed_curves;
@@ -72,7 +86,7 @@ pub use closed_curves::{make_ellipse, make_ellipse_arc, make_ellipsoid_brep, mak
 #[path = "construction/surface_faces.rs"]
 #[doc(hidden)]
 pub mod surface_faces;
-pub use surface_faces::{face_from_surface, face_from_surface_trimmed, solid_from_sheets, SURFACE_FACE_REFUSAL};
+pub use surface_faces::{face_from_surface, face_from_surface_trimmed, sheet_from_sheets, solid_from_sheets, SURFACE_FACE_REFUSAL};
 #[path = "construction/polygon_solids.rs"]
 #[doc(hidden)]
 pub mod polygon_solids;
@@ -119,6 +133,9 @@ pub use sweep_topology::{
     StationBudget, SweepStationReport, SweptChain, SWEEP_DEFAULT_TOLERANCE, SWEEP_MAX_STATIONS,
     SWEEP_REFINEMENT_ROUNDS,
 };
+#[path = "construction/gears.rs"]
+pub mod gears;
+pub use gears::{cycloidal_gear_section, cycloidal_gear_solid, CycloidalGear, cycloidal_disc_section, cycloidal_disc_solid, cycloidal_pin_ring, CycloidalDisc, worm_section, worm_solid, Worm, geneva_section, geneva_sizes, geneva_solid, GenevaWheel, ratchet_section, ratchet_solid, Ratchet, timing_pulley_section, timing_pulley_solid, TimingPulley, hub_from_section, straight_spline_hub, straight_spline_section, straight_spline_shaft, StraightSpline, helical_solid, helical_transverse, twisted_prism, Hand, HelicalGear, Twist, rack_section, rack_solid, ring_section, ring_solid, ring_solid_helical, sprocket_section, sprocket_solid, spur_section, spur_solid, GearData, GearSection, Rack, RingGear, SectionCurve, Sprocket, SprocketForm, SpurGear, GEAR_FIT_TOLERANCE};
 #[path = "construction/revolve_topology.rs"]
 #[doc(hidden)]
 pub mod revolve_topology;

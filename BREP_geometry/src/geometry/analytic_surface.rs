@@ -152,6 +152,10 @@ mod revolution;
 pub use intersect::{intersect_analytic_pair, plane_ruled_section_arc};
 pub use intersect::{intersect_analytic_pair_with, ruled_gate, ruled_gate_census, RuledGate};
 pub use recognition::recognize;
+#[path = "analytic_surface/extrusion.rs"]
+mod extrusion;
+pub use extrusion::{extrusion_structure, plane_extrusion_section, parallel_extrusion_sections, ExtrusionStructure};
+pub(crate) use extrusion::ReducedProfile;
 pub use revolution::{revolution_structure, RevolutionStructure};
 pub use revolution::circumcenter;
 pub use recognition::generatrix_is_meridional_half_ray;

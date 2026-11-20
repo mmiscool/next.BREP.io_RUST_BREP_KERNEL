@@ -522,6 +522,22 @@ pub fn exact_line_line(first: &NurbsCurve, second: &NurbsCurve, tolerance: f64) 
     }])
 }
 
+/// Closed-form seeds only, with no sampled fallback. Used by reductions
+/// that must decline the entire surface pair when a profile pair is not
+/// covered. Every seed must survive refinement (possibly as a duplicate).
+pub(crate) fn intersect_curves_exact_only(first: &NurbsCurve, second: &NurbsCurve, tolerance: f64) -> Option<Vec<CurveCurveIntersection>> {
+    if let Some(hits) = exact_line_line(first,second,tolerance) { return Some(hits); }
+    let seeds = exact_line_conic_pairs(first,second,tolerance)
+        .or_else(|| exact_conic_conic_pairs(first,second,tolerance))?;
+    let hits = intersect_curves_from_seeds(first,second,tolerance,seeds.clone()).ok()?;
+    for [s,t] in seeds {
+        let a = first.evaluate(s).ok()?;
+        let b = second.evaluate(t).ok()?;
+        if !hits.iter().any(|hit| hit.point.sub(a).length() <= 4.0*tolerance && hit.point.sub(b).length() <= 4.0*tolerance) { return None; }
+    }
+    Some(hits)
+}
+
 pub fn intersect_curves(
     first: &NurbsCurve,
     second: &NurbsCurve,

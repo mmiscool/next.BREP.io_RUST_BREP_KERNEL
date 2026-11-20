@@ -266,7 +266,7 @@ fn corner(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             params["legSize"] = size.into();
             params["placement"] = "FITTED".into();
             let fillet = FeatureContext { id: ctx.id.clone(), feature_type: ctx.feature_type.clone(), params: &params,
-                persistent: ctx.persistent, env: ctx.env, scene: ctx.scene, later_inputs: ctx.later_inputs };
+                persistent: ctx.persistent, env: ctx.env, scene: ctx.scene, later_inputs: ctx.later_inputs, rejoin_references: ctx.rejoin_references };
             let mut result = super::super::build(&fillet, None)?;
             result.feature_type = ctx.feature_type.clone();
             return Ok(result);

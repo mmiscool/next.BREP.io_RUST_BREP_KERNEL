@@ -299,6 +299,27 @@ pub struct CarvedSupport {
     pub fold_boundary: usize,
     /// A finite cusp admitted only because retained planes bury its image.
     pub(super) shielded_cusp: bool,
+    /// The OTHER kept pieces of a band carve (`whole_body_fold_band_on`), each
+    /// a carved source of its own; empty for a one-piece carve.
+    pub(super) other_pieces: Vec<CarvedSupport>,
+}
+
+/// `BREP_OFFSET_WHOLE_BODY_FOLD_BAND` (default on since the 2026-11-18
+/// promotion; `=0` restores the band refusal): a whole-body
+/// offset of a face whose offset folds in a BAND keeps every regular piece,
+/// one carrier each, where every fold boundary's image is buried under the
+/// source's own offset.
+///
+/// The shell refuses a band because it keeps the source SKIN whole and over
+/// the band that skin has nothing to close against (below). A whole body has
+/// no skin: its boundary is the erosion's, the kept pieces' offsets trimmed
+/// against each other. Where every point of a fold boundary's image lies
+/// nearer than the distance to the source, that image is inside the erosion's
+/// complement, the pieces' offsets cross before reaching it, and the selection
+/// (which reads every fragment against the whole source, its own face
+/// included) drops the part past the crossing.
+pub(super) fn whole_body_fold_band_on() -> bool {
+    switch!("BREP_OFFSET_WHOLE_BODY_FOLD_BAND", true)
 }
 
 /// Lane O row 35a's switch, default on since batch 17 (`0`/`off` restores the scan): the carve certifies a
@@ -323,8 +344,103 @@ pub(super) fn carve_shell_support(
     face: &FaceRecord,
     distance: f64,
     openings: &[u64],
+    whole_body: bool,
 ) -> Result<Option<CarvedSupport>, KernelRefusal> {
+    if whole_body && whole_body_fold_band_on() {
+        if let Some(pieces) = whole_body_band_pieces(source, face, distance)? {
+            return Ok(Some(pieces));
+        }
+    }
     carve_folded_support_impl(source, face, distance, Some(openings))
+}
+
+/// The band carve of a WHOLE-BODY offset (`whole_body_fold_band_on`): `None`
+/// where the face does not fold in a band, so the one-piece carve decides.
+fn whole_body_band_pieces(source: &BrepSolid, face: &FaceRecord, distance: f64) -> Result<Option<CarvedSupport>, KernelRefusal> {
+    if distance == 0.0 || face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
+        return Ok(None);
+    }
+    let loops = face
+        .loops
+        .iter()
+        .map(|loop_record| loop_record.coedges.iter().map(|coedge| coedge.pcurve.clone()).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let displacement = shell_displacement(face, distance);
+    let Ok(mut outcome) = carve_folded_trim_scanned(&face.surface, &loops, &[displacement], COLLAPSE_FACTOR, ScanBudget::SHELL_FACE) else {
+        return Ok(None);
+    };
+    let Some(carved) = outcome.carved.take() else {
+        return Ok(None);
+    };
+    if carved.kept.len() < 2 {
+        return Ok(None);
+    }
+    // The COVER: every fold boundary's image buried under the source's own
+    // offset, by a margin, read against the whole uncarved source.
+    let retained = source
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .map(|other| {
+            let edges = source
+                .edges
+                .iter()
+                .filter(|edge| other.loops.iter().flat_map(|lp| &lp.coedges).any(|coedge| coedge.edge_id == edge.id))
+                .collect::<Vec<_>>();
+            (other, edges)
+        })
+        .collect::<Vec<_>>();
+    let margin = 1e-3 * distance.abs();
+    const SAMPLES: usize = 16;
+    for piece in &carved.kept {
+        for carved_loop in piece {
+            for (pcurve, origin) in carved_loop.pcurves.iter().zip(&carved_loop.origin) {
+                if origin.is_some() {
+                    continue;
+                }
+                let [t0, t1] = pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+                for index in 0..=SAMPLES {
+                    let uv = pcurve.evaluate(t0 + (t1 - t0) * index as f64 / SAMPLES as f64).or_refuse(KernelStage::Refine, "evaluate")?;
+                    let point = face
+                        .surface
+                        .evaluate(uv.x, uv.y)
+                        .or_refuse(KernelStage::Refine, "evaluate")?
+                        .add(face.surface.normal(uv.x, uv.y).or_refuse(KernelStage::Refine, "normal")?.scale(displacement));
+                    match offset_skin_reading(point, &retained, distance, margin) {
+                        SkinReading::Shadowed { .. } => {}
+                        reading => {
+                            os_debug!("band carve of source face {}: fold boundary image at {point:?} is not covered ({reading:?})", face.id);
+                            return Err(super::refusals::fold_band_uncovered(face.id, distance, carved.kept.len()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let total = carved.kept.len();
+    let mut supports = carved
+        .kept
+        .iter()
+        .map(|piece| {
+            let mut support = support_from_piece(source, face, piece, carved.kept_fraction, false)?;
+            // Each piece's support is restricted to its own trim: two carriers
+            // over the SAME surface read as coincident to the imprint, which
+            // then never finds where the pieces' offsets cross.
+            support.face.surface = support_over_trim(&support.face)?;
+            for shell in &mut support.solid.shells {
+                for existing in &mut shell.faces {
+                    if existing.id == face.id {
+                        existing.surface = support.face.surface.clone();
+                    }
+                }
+            }
+            Ok(support)
+        })
+        .collect::<Result<Vec<_>, KernelRefusal>>()?;
+    os_debug!("band carve of source face {}: {total} kept piece(s), every fold boundary covered", face.id);
+    let mut first = supports.remove(0);
+    first.other_pieces = supports;
+    Ok(Some(first))
 }
 
 fn carve_folded_support_impl(
@@ -396,26 +512,6 @@ fn carve_folded_support_impl(
         };
     };
 
-    let mut solid = source.clone();
-    let mut next_id = solid
-        .vertices
-        .iter()
-        .map(|vertex| vertex.id)
-        .chain(solid.edges.iter().map(|edge| edge.id))
-        .chain(
-            solid
-                .shells
-                .iter()
-                .flat_map(|shell| &shell.faces)
-                .flat_map(|face| &face.loops)
-                .flat_map(|loop_record| {
-                    std::iter::once(loop_record.id)
-                        .chain(loop_record.coedges.iter().map(|coedge| coedge.id))
-                }),
-        )
-        .max()
-        .unwrap_or(0)
-        + 1;
 
     // The sweep rule `thicken` applies does NOT apply here, and the difference
     // is worth stating because the obvious reading is wrong.
@@ -495,7 +591,7 @@ fn carve_folded_support_impl(
     let (fold_image_extent, fold_image_bar) = fold_image_extent(source, face, &carved.kept[0], distance)?;
     let shielded = if fold_image_extent > fold_image_bar && distance > 0.0 {
         match openings {
-            Some(openings) => fold_image_shielded(source, face, &carved.kept[0], distance, openings)?,
+            Some(openings) => fold_image_shielded(source, face, &carved.kept[0], &carved.dropped, distance, openings)?,
             None => false,
         }
     } else {
@@ -524,9 +620,42 @@ fn carve_folded_support_impl(
         carved
     };
 
+    Ok(Some(support_from_piece(source, face, &carved.kept[0], carved.kept_fraction, shielded)?))
+}
+
+/// The carved source over ONE kept piece of a carve: the face's trim replaced
+/// by the piece's loops, every new edge and vertex added to a clone of the
+/// source.
+fn support_from_piece(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    piece: &[crate::offset_carve::CarvedLoop],
+    kept_fraction: f64,
+    shielded: bool,
+) -> Result<CarvedSupport, KernelRefusal> {
+    let mut solid = source.clone();
+    let mut next_id = solid
+        .vertices
+        .iter()
+        .map(|vertex| vertex.id)
+        .chain(solid.edges.iter().map(|edge| edge.id))
+        .chain(
+            solid
+                .shells
+                .iter()
+                .flat_map(|shell| &shell.faces)
+                .flat_map(|face| &face.loops)
+                .flat_map(|loop_record| {
+                    std::iter::once(loop_record.id)
+                        .chain(loop_record.coedges.iter().map(|coedge| coedge.id))
+                }),
+        )
+        .max()
+        .unwrap_or(0)
+        + 1;
     let mut fold_boundary = 0usize;
-    let mut new_loops = Vec::with_capacity(carved.kept[0].len());
-    for carved_loop in &carved.kept[0] {
+    let mut new_loops = Vec::with_capacity(piece.len());
+    for carved_loop in piece {
         let count = carved_loop.pcurves.len();
         if count == 0 {
             return Err(KernelRefusal::internal(KernelStage::Refine, "offset_shell_carve_empty_loop", "offset_shell: the carve produced an empty loop"));
@@ -605,13 +734,14 @@ fn carve_folded_support_impl(
             }
         }
     }
-    Ok(Some(CarvedSupport {
+    Ok(CarvedSupport {
         solid,
         face: carved_face,
-        kept_fraction: carved.kept_fraction,
+        kept_fraction: kept_fraction,
         fold_boundary,
         shielded_cusp: shielded,
-    }))
+        other_pieces: Vec::new(),
+    })
 }
 
 /// `BREP_OFFSET_PINCH_AT_COLLAPSE` (default on; `=0` restores): a pinch's
@@ -708,30 +838,58 @@ fn support_over_trim(face: &FaceRecord) -> Result<NurbsSurface, KernelRefusal> {
         .or_refuse(KernelStage::Refine, "new")
 }
 
-/// A convex cusp is not a cavity boundary when retained planar neighbors cover its
+/// A convex cusp is not a cavity boundary when retained neighbors cover its
 /// entire image. Their offset carriers cut the regular sheet before the cusp;
 /// the ordinary imprint and skin selection must still close and validate it.
 /// Read the same miter metric as that selection, including the planes' trims.
 /// A tangent endpoint may lie on an offset plane, but the interior must also
 /// contain a measurably covered sample. An exposed cusp still refuses.
+///
+/// A CURVED retained neighbor covers too, read as the distance to its own
+/// trimmed face where the nearest point of its carrier falls inside that trim
+/// (there the miter and Euclidean readings agree; a foot outside the trim
+/// leaves that neighbor out, which can only refuse). The case is a fillet
+/// wrapped round a sharp block edge, shelled inward by more than the radius the
+/// wrap closes to at its pivot: the corner patch folds over two thirds of its
+/// trim, and the cusp is covered by the two adjacent fillets it is tangent to,
+/// not by a plane (0.84 at the nearest fold sample against the 1.0 wall).
+///
+/// A SADDLE fold is admitted on the same reading: its other principal direction
+/// curves away from the material, so an inward offset only widens it there and
+/// the fold is the convex direction's alone. The 2026-10-25 construction
+/// admitted convex tapers only because only planar cover had been qualified;
+/// the corner patch above is concave across its tube (radius 1.5) and builds,
+/// validates and puts every cavity mesh node at the wall distance. A saddle
+/// fold whose DROPPED piece borders an opening is not admitted: past an open
+/// rim nothing closes the cavity round the dropped corner (the bump block
+/// opened through a side as well as its bottom assembled with one-use edges
+/// along that side), so it keeps the refusal by name.
 fn fold_image_shielded(
     source: &BrepSolid,
     face: &FaceRecord,
     kept: &[crate::offset_carve::CarvedLoop],
+    dropped: &[Vec<crate::offset_carve::CarvedLoop>],
     distance: f64,
     openings: &[u64],
 ) -> Result<bool, KernelRefusal> {
-    let planes = source.shells.iter().flat_map(|shell| &shell.faces)
+    let retained = source.shells.iter().flat_map(|shell| &shell.faces)
         .filter(|other| other.id != face.id && !openings.contains(&other.id))
+        .collect::<Vec<_>>();
+    let planes = retained.iter().copied()
         .filter(|other| other.surface.is_affine().unwrap_or(false))
         .map(|other| {
             let edges = source.edges.iter().filter(|edge| other.loops.iter()
                 .flat_map(|lp| &lp.coedges).any(|coedge| coedge.edge_id == edge.id)).collect::<Vec<_>>();
             (other, edges)
         }).collect::<Vec<_>>();
+    let curved = retained.iter().copied()
+        .filter(|other| !other.surface.is_affine().unwrap_or(true))
+        .map(|other| Ok((other, TrimRegion::from_face(other)?)))
+        .collect::<Result<Vec<_>, KernelRefusal>>()?;
     let tolerance = KernelTolerances::for_solid(source, 1e-7).model;
     let displacement = shell_displacement(face, distance);
     let mut covered = false;
+    let mut saddle = false;
     for lp in kept {
         for (curve, origin) in lp.pcurves.iter().zip(&lp.origin) {
             if origin.is_some() { continue; }
@@ -739,15 +897,14 @@ fn fold_image_shielded(
             for index in 0..=64 {
                 let uv = curve.evaluate(a + (b-a) * index as f64 / 64.0)
                     .or_refuse(KernelStage::Refine, "evaluate")?;
-                // This path handles a convex taper. Keep saddle folds on the
-                // existing refusal path; their other sheet needs its own
-                // intersection construction and qualification.
+                // An unreadable curvature on the fold boundary is no reading.
                 let (low, high) = face.surface.principal_curvatures(uv.x, uv.y)
                     .or_refuse(KernelStage::Refine, "principal_curvatures")?;
-                let outward_max = if face.same_sense { high } else { -low };
-                if !outward_max.is_finite() || distance * outward_max > COLLAPSE_FACTOR {
+                if !low.is_finite() || !high.is_finite() {
                     return Ok(false);
                 }
+                let outward_max = if face.same_sense { high } else { -low };
+                saddle |= distance * outward_max > COLLAPSE_FACTOR;
                 let point = face.surface.evaluate(uv.x, uv.y)
                     .or_refuse(KernelStage::Refine, "evaluate")?
                     .add(face.surface.normal(uv.x, uv.y)
@@ -758,10 +915,28 @@ fn fold_image_shielded(
                         nearest = nearest.min(separation);
                     }
                 }
+                for (other, region) in &curved {
+                    let Ok(foot) = crate::project_point_to_surface(&other.surface, point) else { continue };
+                    if region.contains(foot.u, foot.v) {
+                        nearest = nearest.min(foot.distance);
+                    }
+                }
                 os_debug!("fold shielding face {} sample {index}: {nearest:.12} / {distance:.12}", face.id);
                 if nearest > distance + tolerance { return Ok(false); }
                 covered |= nearest < distance - tolerance;
             }
+        }
+    }
+    if covered && saddle {
+        let opening_edges = source.shells.iter().flat_map(|shell| &shell.faces)
+            .filter(|other| openings.contains(&other.id))
+            .flat_map(|other| other.loops.iter().flat_map(|lp| &lp.coedges).map(|coedge| coedge.edge_id))
+            .collect::<HashSet<_>>();
+        let borders_opening = dropped.iter().flatten().flat_map(|lp| &lp.origin).flatten()
+            .filter_map(|&(lp, coedge)| face.loops.get(lp).and_then(|lp| lp.coedges.get(coedge)))
+            .any(|coedge| opening_edges.contains(&coedge.edge_id));
+        if borders_opening {
+            return Ok(false);
         }
     }
     Ok(covered)
@@ -1086,6 +1261,7 @@ pub(super) fn merge_pair_imprint(
 
 pub(super) fn empty_imprint() -> ImprintResultRecord {
     ImprintResultRecord {
+        faces_in_unproved_pairs: None,
         vertices: Vec::new(),
         pieces: Vec::new(),
         by_face: Vec::new(),
@@ -1473,6 +1649,13 @@ pub(super) fn miter_curved_neighbour_on() -> bool {
 /// `face` that uses `edge` (along its outward normal at the point's foot), or
 /// `None` when that neighbour is planar, there is none, or the height cannot
 /// be read.
+/// `BREP_OFFSET_MITER_REFLEX_CURVED_NEIGHBOUR` (default on since the
+/// 2026-11-18 promotion; `=0` keeps max(height, past) there): see REFLEX edge
+/// with a CURVED neighbour in [`miter_distance_with_neighbours`].
+fn miter_reflex_curved_neighbour_on() -> bool {
+    switch!("BREP_OFFSET_MITER_REFLEX_CURVED_NEIGHBOUR", true)
+}
+
 fn curved_neighbour_height(
     face: &FaceRecord,
     edge: &EdgeRecord,
@@ -1633,6 +1816,18 @@ fn miter_distance_with_neighbours(
                         }
                     } else if !square && across.dot(beyond) > 0.0 {
                         reading = height.max(point.sub(at).dot(across));
+                    } else if !planar && across.dot(beyond) <= 0.0 && miter_reflex_curved_neighbour_on() {
+                        // A REFLEX edge with a CURVED neighbour
+                        // (`BREP_OFFSET_MITER_REFLEX_CURVED_NEIGHBOUR`): past it the material is
+                        // the INTERSECTION of the two faces' slabs (their offsets meet in the
+                        // miter), so the point is inside this face's only as deep as it is
+                        // also under the neighbour's own surface. A point of the neighbour's
+                        // offset reads the distance there and is skin (a cylinder sliver
+                        // beside a box face: max(h, past) read 0.078 against 0.1 and dropped
+                        // the sliver's skin between the miter and its seam).
+                        if let Some(over) = curved_height(edge)? {
+                            reading = reading.max(over.abs());
+                        }
                     }
                 }
             } else if at_vertex && past > 0.0 && miter_vertex_gauge_on() {
@@ -1819,6 +2014,92 @@ pub(super) fn fragments_holding_true_skin(
     }
     os_debug!("  true skin votes for source face {}: {:?}", face.id, votes);
     Ok(fragments.iter().zip(&votes).filter(|(_, (on, off))| *on > *off).map(|(fragment, _)| fragment.clone()).collect())
+}
+
+/// `BREP_OFFSET_MIXED_FRAGMENT_REPORT` (default off, reporting only): print the
+/// planar offset fragments that hold both skin and shadow — the mixed fragments
+/// of the shadow cascade, which no per-fragment reading can decide. Changes
+/// nothing the shell builds.
+pub(super) fn mixed_fragment_report_on() -> bool {
+    switch!("BREP_OFFSET_MIXED_FRAGMENT_REPORT", false)
+}
+
+/// What [`mixed_fragment_reading`] counts over one fragment.
+#[derive(Clone, Debug, Default)]
+pub(super) struct MixedReading {
+    /// Grid points inside the fragment's trim that read On, on the source's
+    /// material side.
+    pub skin: usize,
+    /// Grid points that read shadowed, and by which retained faces.
+    pub shadowed: usize,
+    pub shadowing: Vec<u64>,
+    /// Grid points inside the trim at all.
+    pub inside: usize,
+}
+
+impl MixedReading {
+    pub fn mixed(&self) -> bool {
+        self.skin > 0 && self.shadowed > 0
+    }
+}
+
+/// The design note's mixed test on a PLANAR fragment: a 9 × 9 grid over its uv
+/// box, inside its own trim, read through the selection's own
+/// [`offset_skin_reading`] (the mitered metric on planar faces). `None` for a
+/// curved fragment, whose predicate does not agree with the selection.
+pub(super) fn mixed_fragment_reading(
+    fragment: &FaceFragmentRecord,
+    source: &BrepSolid,
+    retained_faces: &[(&FaceRecord, Vec<&EdgeRecord>)],
+    distance: f64,
+    tolerance: f64,
+) -> Result<Option<MixedReading>, KernelRefusal> {
+    const GRID: usize = 9;
+    if !fragment.surface.is_affine().or_refuse(KernelStage::Select, "is_affine")? {
+        return Ok(None);
+    }
+    let trim = fragment_as_trim(fragment);
+    let mut box_uv = [f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY];
+    for coedge in fragment.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let [a, b] = coedge.pcurve.domain().or_refuse(KernelStage::Select, "domain")?;
+        for step in 0..=16 {
+            let uv = coedge.pcurve.evaluate(a + (b - a) * step as f64 / 16.0).or_refuse(KernelStage::Select, "evaluate")?;
+            box_uv = [box_uv[0].min(uv.x), box_uv[1].max(uv.x), box_uv[2].min(uv.y), box_uv[3].max(uv.y)];
+        }
+    }
+    let classify_tolerance = 1e-8 * crate::solid_scale(source).max(1.0);
+    let mut reading = MixedReading::default();
+    for i in 0..GRID {
+        for j in 0..GRID {
+            let uv = Vec2 {
+                x: box_uv[0] + (box_uv[1] - box_uv[0]) * (i as f64 + 0.5) / GRID as f64,
+                y: box_uv[2] + (box_uv[3] - box_uv[2]) * (j as f64 + 0.5) / GRID as f64,
+            };
+            if parameter_point_in_face(&trim, uv, 1e-9).or_refuse(KernelStage::Select, "parameter_point_in_face")? != PolygonClass::Inside {
+                continue;
+            }
+            reading.inside += 1;
+            let point = fragment.surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Select, "evaluate")?;
+            match offset_skin_reading(point, retained_faces, distance, tolerance) {
+                SkinReading::Shadowed { face, .. } => {
+                    reading.shadowed += 1;
+                    if !reading.shadowing.contains(&face) {
+                        reading.shadowing.push(face);
+                    }
+                }
+                SkinReading::On => {
+                    let class = classify_point(point, source, classify_tolerance).or_refuse(KernelStage::Select, "classify_point")?.class;
+                    let material = if distance > 0.0 { class == PointClass::In } else { class == PointClass::Out };
+                    if material {
+                        reading.skin += 1;
+                    }
+                }
+                SkinReading::Unmeasured { .. } => {}
+            }
+        }
+    }
+    reading.shadowing.sort_unstable();
+    Ok(Some(reading))
 }
 
 /// Whether a point's projection onto the face's surface lands inside its trim.

@@ -140,12 +140,22 @@ pub mod face_move;
 mod face_move_carrier;
 #[path = "direct_edit/face_move_recut.rs"]
 mod face_move_recut;
+#[path = "direct_edit/face_move_redrill.rs"]
+mod face_move_redrill;
+#[path = "direct_edit/face_move_convex.rs"]
+mod face_move_convex;
 #[path = "direct_edit/blend_rebuild.rs"]
 mod blend_rebuild;
 #[path = "direct_edit/face_rotate.rs"]
 mod face_rotate;
 #[path = "direct_edit/face_draft.rs"]
 mod face_draft;
+#[path = "direct_edit/face_deform.rs"]
+pub mod face_deform;
+pub use face_deform::{deform_face, face_deform_default_anchor, FaceDeformPick, FaceDeformReport, FaceDeformSpec};
+#[path = "direct_edit/face_deform_shell.rs"]
+pub mod face_deform_shell;
+pub use face_deform_shell::{deform_shell, ShellDeformPick, ShellDeformReport, ShellDeformSpec};
 pub use face_draft::{draft_faces, draft_faces_parted, draft_faces_unchecked};
 #[path = "direct_edit/face_offset.rs"]
 pub mod face_offset;
@@ -282,6 +292,8 @@ pub use face_rotate::rotate_faces_rigid;
 pub use face_move_carrier::{route_reading, RouteReading};
 // The RE-CUT road: the same edit performed from the original body and the
 // motion, for a translation whose answer needs the topology to change.
+pub use face_move_redrill::redrill_moved_bore;
+pub use face_move_convex::recut_convex_body;
 pub use face_move_recut::{recut_moved_planes, recut_moved_planes_rigid, recut_moved_planes_unchecked, reblend_lost_fillets};
 // A face edit beside a variable-radius fillet: the fillet is set aside, the
 // edit runs on the sharp body, and the fillet is re-made under its radius law.

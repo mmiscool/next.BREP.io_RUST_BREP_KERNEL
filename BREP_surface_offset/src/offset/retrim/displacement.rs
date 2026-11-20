@@ -41,23 +41,82 @@ fn polyline(c: NurbsCurve, flatness: f64, depth: usize, out: &mut Vec<Vec3>) -> 
     polyline(left, flatness, depth + 1, out)?;
     polyline(right, flatness, depth + 1, out)
 }
+/// A polyline with a box around each run of [`RUN`] segments, so the
+/// segment nearest a point is found without reading every segment.
+struct Target<'a> {
+    points: &'a [Vec3],
+    /// First segment, one past the last, and the box of their points.
+    runs: Vec<(usize, usize, Vec3, Vec3)>,
+    /// The largest coordinate magnitude of any point.
+    magnitude: f64,
+}
+
+const RUN: usize = 32;
+
+impl<'a> Target<'a> {
+    fn new(points: &'a [Vec3]) -> Self {
+        let segments = points.len().saturating_sub(1);
+        let mut runs = Vec::with_capacity(segments.div_ceil(RUN));
+        let mut start = 0;
+        while start < segments {
+            let end = (start + RUN).min(segments);
+            let (mut lo, mut hi) = (points[start], points[start]);
+            for p in &points[start..=end] {
+                lo = Vec3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+                hi = Vec3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+            }
+            runs.push((start, end, lo, hi));
+            start = end;
+        }
+        let magnitude = points.iter().fold(0.0f64, |m, p| m.max(p.x.abs()).max(p.y.abs()).max(p.z.abs()));
+        Self { points, runs, magnitude }
+    }
+
+    /// The first segment at the least `distance` from `p`: the one
+    /// `windows(2).min_by(distance)` picks. A run is skipped only when its
+    /// box is farther than the best so far by more than the rounding of
+    /// either reading (1e-12 of the coordinates' size, far above it), so no
+    /// segment that could tie or win is skipped; within the scan order a
+    /// segment replaces the best only when strictly nearer, as `min_by`
+    /// keeps the first of equal ones.
+    fn nearest(&self, p: Vec3) -> Option<(Vec3, Vec3)> {
+        let pad = 1e-12 * (self.magnitude + p.x.abs().max(p.y.abs()).max(p.z.abs()));
+        let mut best: Option<(usize, f64)> = None;
+        for &(start, end, lo, hi) in &self.runs {
+            if let Some((_, nearest)) = best {
+                let gap = |v: f64, l: f64, h: f64| (l - v).max(v - h).max(0.0);
+                let (dx, dy, dz) = (gap(p.x, lo.x, hi.x), gap(p.y, lo.y, hi.y), gap(p.z, lo.z, hi.z));
+                if (dx * dx + dy * dy + dz * dz).sqrt() > nearest + pad + 1e-12 * nearest {
+                    continue;
+                }
+            }
+            for index in start..end {
+                let reading = distance(p, self.points[index], self.points[index + 1]);
+                if best.is_none_or(|(_, nearest)| reading.total_cmp(&nearest).is_lt()) {
+                    best = Some((index, reading));
+                }
+            }
+        }
+        best.map(|(index, _)| (self.points[index], self.points[index + 1]))
+    }
+}
+
 fn directed(
     a: Vec3,
     b: Vec3,
-    target: &[Vec3],
+    target: &Target,
     bar: f64,
     depth: usize,
     work: &mut usize,
 ) -> Result<(), String> {
-    *work += target.len().saturating_sub(1);
+    // The budget counts the segments a full scan would read, as before.
+    *work += target.points.len().saturating_sub(1);
     if *work > 32_000_000 {
         return Err("analytic displacement certificate exhausted comparison budget".into());
     }
     let mid = a.add(b).scale(0.5);
-    let segment = target
-        .windows(2)
-        .min_by(|p, q| distance(mid, p[0], p[1]).total_cmp(&distance(mid, q[0], q[1])))
-        .ok_or("empty displacement polyline")?;
+    let segment = target.nearest(mid).ok_or("empty displacement polyline")?;
+    let segment = [segment.0, segment.1];
     if distance(a, segment[0], segment[1]).max(distance(b, segment[0], segment[1])) <= bar {
         return Ok(());
     }
@@ -92,7 +151,8 @@ pub(super) fn certify(
     // onto the chord bounds chord->curve.
     let bar = movement - 2.0 * flatness;
     let mut work = 0;
-    for (source, target) in [(&before, &after), (&after, &before)] {
+    let (to_after, to_before) = (Target::new(&after), Target::new(&before));
+    for (source, target) in [(&before, &to_after), (&after, &to_before)] {
         for pair in source.windows(2) {
             directed(pair[0], pair[1], target, bar, 0, &mut work)?;
         }

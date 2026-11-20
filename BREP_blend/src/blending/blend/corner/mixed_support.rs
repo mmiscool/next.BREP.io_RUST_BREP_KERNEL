@@ -6,7 +6,7 @@ use super::*;
 /// radii, and a partial [`AnalyticSurface::Revolution`] whose generatrix
 /// keeps a CONSTANT radial distance from the axis (the extruded-arc wall of
 /// the §6.9.7 curved-wall fixtures is recognized as the latter).
-pub(super) fn cylinder_wall_carrier(surface: &crate::NurbsSurface) -> Option<(Vec3, Vec3, f64)> {
+pub(in crate::blend) fn cylinder_wall_carrier(surface: &crate::NurbsSurface) -> Option<(Vec3, Vec3, f64)> {
     match surface.analytic()? {
         crate::AnalyticSurface::RuledRevolution {
             frame, rho0, rho1, ..

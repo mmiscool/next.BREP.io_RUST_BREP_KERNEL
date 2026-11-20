@@ -320,12 +320,23 @@ pub fn field_input_with(
             // button is the primary thing to do in its section (Edit Sketch IS the
             // sketch form), and a content-width button floating at the left of a
             // full-width form reads as a minor control rather than the main one.
+            //
+            // A vec3 field's PICK button (`pivot#pick`) is the one button a
+            // pick can run in: while it does, the button is drawn focused and
+            // says what to click, and pressing it again ends the pick (Done,
+            // with nothing picked: the field keeps its value).
+            let focused = picking.is_some_and(|pick| pick.path == path.as_slice());
+            let caption = if focused { "Picking: click a vertex, edge or face (press to stop)" } else { label.as_str() };
             let r = ui.add_sized(
                 [ui.available_width(), ui.spacing().interact_size.y],
-                egui::Button::new(label.as_str()),
+                egui::Button::new(caption).selected(focused),
             );
             if r.clicked() {
-                actions.clicked = Some(field.key().to_string());
+                if focused {
+                    actions.pick_done = true;
+                } else {
+                    actions.clicked = Some(field.key().to_string());
+                }
             }
             (false, r.rect)
         }

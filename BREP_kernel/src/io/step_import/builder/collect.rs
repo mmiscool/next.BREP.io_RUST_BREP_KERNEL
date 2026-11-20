@@ -140,6 +140,62 @@ impl<'a> SolidBuilder<'a> {
         Ok(id)
     }
 
+    /// Seat a vertex on its curves where the curves agree and only the vertex
+    /// is off them. [`heal_imported_edge_endpoints`] moves a curve's end onto
+    /// its vertex, but never an exact conic's (a rational quadratic would
+    /// deform); a vertex that every incident conic misses by the same few
+    /// microns (a tolerant vertex of a Parasolid sheet: two circles meeting
+    /// within 1e-4 mm of each other, 0.011 mm from the vertex written between
+    /// them) is moved to their common end instead. Taken only when at least
+    /// one incident curve is such a conic, every incident end agrees with
+    /// the others within [`crate::VERTEX_MATCH_FLOOR`], and the vertex moves
+    /// no further than [`VENDOR_ENDPOINT_HEAL_CEILING`].
+    pub(super) fn seat_vertices_on_conic_ends(&mut self) -> Result<(), String> {
+        if !switch!("BREP_STEP_SEAT_VERTICES_ON_CONICS", true) {
+            return Ok(());
+        }
+        let mut ends: HashMap<u64, (Vec<Vec3>, bool)> = HashMap::default();
+        for edge in &self.edges {
+            if edge.degenerate {
+                continue;
+            }
+            let conic = edge.curve.degree == 2
+                && edge.curve.control_points.iter().any(|control| (control.w - 1.0).abs() > 1e-12);
+            for (vertex, t) in [(edge.start_vertex_id, edge.t0), (edge.end_vertex_id, edge.t1)] {
+                let entry = ends.entry(vertex).or_insert_with(|| (Vec::new(), false));
+                entry.0.push(edge.curve.evaluate(t)?);
+                entry.1 |= conic;
+            }
+        }
+        let mut moves = Vec::new();
+        for vertex in &self.vertices {
+            let Some((points, any_conic)) = ends.get(&vertex.id) else { continue };
+            if !*any_conic || points.is_empty() {
+                continue;
+            }
+            let mean = points
+                .iter()
+                .fold(Vec3::new(0.0, 0.0, 0.0), |sum, point| sum.add(*point))
+                .scale(1.0 / points.len() as f64);
+            let agree = points.iter().all(|point| point.sub(mean).length() <= crate::VERTEX_MATCH_FLOOR);
+            let miss = mean.sub(vertex.point).length();
+            if agree && miss > crate::VERTEX_MATCH_FLOOR && miss <= VENDOR_ENDPOINT_HEAL_CEILING {
+                moves.push((vertex.id, mean, miss));
+            }
+        }
+        for (id, point, miss) in moves {
+            if let Some(vertex) = self.vertices.iter_mut().find(|vertex| vertex.id == id) {
+                vertex.point = point;
+            }
+            if self.readings.is_some() {
+                for edge_id in self.edges.iter().filter(|e| e.start_vertex_id == id || e.end_vertex_id == id).map(|e| e.id).collect::<Vec<_>>() {
+                    self.capture_stage(edge_id, || format!("its vertex seated on the conic ends ({miss:.3e})"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn edge_record(&self, edge_id: u64) -> &EdgeRecord {
         let index = *self.edge_index.get(&edge_id).expect("edge id must exist");
         &self.edges[index]
@@ -582,10 +638,12 @@ impl<'a> SolidBuilder<'a> {
         self.stitch_seam_circle_loops(&surface, &mut bounds)?;
 
         let mut loops = Vec::with_capacity(bounds.len());
+        let outer: Vec<bool> = bounds.iter().map(|(_, is_outer)| *is_outer).collect();
         for (specs, _) in bounds {
             let loop_record = self.build_loop(&surface, face_ref, surface_ref, &specs)?;
             loops.push(loop_record);
         }
+        self.seat_fold_lens_loops(face_ref, &surface, same_sense, &outer, &mut loops)?;
 
         let id = self.fresh();
         self.capture_face(id, face_ref, surface_ref);

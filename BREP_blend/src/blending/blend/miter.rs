@@ -49,6 +49,10 @@ pub(super) struct MiterStripe<'a> {
     /// so an unequal miter reads each canal at its own radius; at an equal
     /// miter both are the corner's one radius.
     pub(super) radius: f64,
+    /// The stripe's radius varies along it (a tapered law): its wall is no
+    /// constant-radius canal about its centre row, so a sibling reads it by
+    /// [`wall_level`], not by the canal distance.
+    pub(super) tapered: bool,
 }
 
 /// Row parameters this close are one station ([`MiterStripe::u_limit`]).
@@ -101,7 +105,7 @@ impl MiterStripe<'_> {
     /// only the row end that lies beyond it differs.
     ///
     /// A ball AT the vertex station (a radius equal to the round the corner
-    /// already carries: report 37e16630 at r 1.0, where both read 0.885720)
+    /// already carries: the rounded-outline report at r 1.0, where both read 0.885720)
     /// heads for the vertex's own row end; the bare comparison flipped on
     /// the last bit there and sent the seam back along the whole stripe.
     fn u_limit(&self) -> f64 {
@@ -287,6 +291,24 @@ pub(super) fn off_surface(surface: &crate::NurbsSurface, point: Vec3) -> Result<
     Ok(point.sub(foot.point).dot(normal).abs())
 }
 
+/// Signed distance from `point` to a TAPERED `stripe`'s wall, positive on
+/// the side away from its centre row (the canal level's sense).
+///
+/// A tapered fillet's wall is no constant-radius canal about its centre row,
+/// and the row leans against its own sections by the law's slope, so the
+/// canal level read at any one radius is off the wall (by about r r'^2 at the
+/// nearest point of the row). The fitted wall itself is read: the distance to
+/// its foot, signed by the side of the wall the point is on as seen from the
+/// section's centre at the foot station. Like [`bevel_level`] it reaches only
+/// as far as the rows, whose overshoot covers a miter's seam.
+fn wall_level(stripe: &MiterStripe<'_>, point: Vec3) -> Result<f64, KernelRefusal> {
+    let projection = crate::project_point_to_surface(&stripe.rows.surface, point).or_refuse(KernelStage::Refine, "project_point_to_surface")?;
+    let foot = stripe.rows.surface.evaluate(projection.u, projection.v).or_refuse(KernelStage::Refine, "evaluate")?;
+    let center = stripe.center()?.evaluate(projection.u).or_refuse(KernelStage::Refine, "evaluate")?;
+    let off = point.sub(foot);
+    Ok(if off.dot(foot.sub(center)) >= 0.0 { off.length() } else { -off.length() })
+}
+
 /// Signed distance from `point` to `stripe`'s ruled BEVEL, positive on the
 /// side AWAY from the rolling ball's centre.
 ///
@@ -454,6 +476,21 @@ pub(super) fn solve_miter(
                     super::record_count("count.miter.curved_crossings", 1);
                     Ok(closure)
                 }
+                // The re-march followed the seam to the sibling's far rail
+                // and found it FOLDS there in this stripe's sections (two
+                // concave pads over a sharp edge on a curved shared face: the
+                // far-rail crossing the first march took for the exit is the
+                // other branch, a hair before the fold). That is the corner's
+                // true reading, and the caller marches such a seam on the
+                // other stripe, so it is the refusal reported (reported
+                // 2026-11-16: the first refusal kept the corner from that
+                // swap and the chain did not build).
+                Err(second) if is_miter_seam_fold(&second) => {
+                    if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
+                        eprintln!("miter: {refusal}; the two-crossing re-march reads a fold: {second}");
+                    }
+                    Err(second)
+                }
                 Err(second) => {
                     if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                         eprintln!("miter: the two-crossing re-march refused too: {second}");
@@ -520,6 +557,9 @@ fn solve_miter_ordered(
     let sibling_level = |point: Vec3| -> Result<f64, KernelRefusal> {
         if chamfer {
             return bevel_level(second, point, scale);
+        }
+        if second.tapered {
+            return wall_level(second, point);
         }
         Ok(canal_distance(center_second, point)? - second.radius)
     };
@@ -1006,29 +1046,40 @@ fn march_connector(
         let g_prev = g(previous_u)?;
         let reach = (u_end - previous_u).abs().max(1e-9);
         let mut found = None;
-        for direction in [(u_end - previous_u).signum(), -(u_end - previous_u).signum()] {
+        // A face that holds one whole section of the follower (a plane
+        // through the axis its sections turn about: a pad round a cylinder
+        // closed by the plane wall of the pad it meets) puts every connector
+        // sample at the SAME station. The level there is rounding noise of
+        // either sign, so there is no crossing to bracket near it, and
+        // widening one way first used to run eight doublings out over the
+        // extrapolated rows and bisect a sign change far off the model
+        // (reported 2026-11-16: a connector 30 units long on a
+        // 10 unit part). The previous station is kept while it is on the
+        // face, and a bracket is the NEAREST sign change, either way.
+        let on_face = g_prev.abs() <= 1e-12 * (1.0 + scale);
+        if !on_face {
+            let toward = (u_end - previous_u).signum();
             let mut width = reach * 0.05;
-            for _ in 0..8 {
-                let candidate = previous_u + direction * width;
-                let g_candidate = g(candidate)?;
-                if (g_candidate > 0.0) != (g_prev > 0.0) {
-                    let (low, high, f_low) = if candidate > previous_u {
-                        (previous_u, candidate, g_prev)
-                    } else {
-                        (candidate, previous_u, g_candidate)
-                    };
-                    found = Some(bisect(low, high, f_low, &mut g, bar)?);
-                    break;
+            'widen: for _ in 0..8 {
+                for direction in [toward, -toward] {
+                    let candidate = previous_u + direction * width;
+                    let g_candidate = g(candidate)?;
+                    if (g_candidate > 0.0) != (g_prev > 0.0) {
+                        let (low, high, f_low) = if candidate > previous_u {
+                            (previous_u, candidate, g_prev)
+                        } else {
+                            (candidate, previous_u, g_candidate)
+                        };
+                        found = Some(bisect(low, high, f_low, &mut g, bar)?);
+                        break 'widen;
+                    }
                 }
                 width *= 2.0;
-            }
-            if found.is_some() {
-                break;
             }
         }
         let u = match found {
             Some(u) => u,
-            None if g_prev.abs() <= 1e-9 * (1.0 + scale) => previous_u,
+            None if on_face || g_prev.abs() <= 1e-9 * (1.0 + scale) => previous_u,
             None => {
                 return Err(KernelRefusal::internal(KernelStage::Refine, "miter_connector_face", "miter: the connector left the face without crossing it"))
             }
@@ -1178,7 +1229,7 @@ pub fn is_marched_fit_off_carriers(refusal: &KernelRefusal) -> bool {
 /// carriers than `tolerance` is refused by name with the number
 /// ([`MARCHED_FIT_OFF_CARRIERS`]); `what` names the curve.
 ///
-/// Measured on the 2026-09-15 notched-cap report at `2dd14cdef`: an asymmetric
+/// Measured on the 2026-09-15 notched-cap report: an asymmetric
 /// miter's connector had no section left to cross and marched one chord of
 /// 1.444e-5 and then 23 of 1.19e-12, so 24 of its 25 chord-length parameters
 /// sat within 1.9e-6 of 1.  The interpolant passed through every sample to

@@ -80,6 +80,14 @@ pub enum OutlinePiece {
     /// The arc about `centre` of `radius`, from angle `start` to angle `end`
     /// (radians; `end < start` runs clockwise). A full circle is `0 → 2π`.
     Arc { centre: [f64; 2], radius: f64, start: f64, end: f64 },
+    /// The elliptic arc about `centre` with semi-axis `semi[0]` along the
+    /// direction at angle `rotation` (radians from the first coordinate) and
+    /// `semi[1]` square to it, from eccentric angle `start` to `end` (radians;
+    /// `end < start` runs clockwise): the points `centre + R(rotation)·(semi[0]
+    /// cos θ, semi[1] sin θ)`. A whole ellipse is `0 → 2π`. Taken by the region
+    /// engine of [`sweep_solid_within`] (a solid of revolution's meridian, a
+    /// prism's outline); refused by the whole sweep.
+    Ellipse { centre: [f64; 2], semi: [f64; 2], rotation: f64, start: f64, end: f64 },
 }
 
 impl OutlinePiece {
@@ -92,11 +100,14 @@ impl OutlinePiece {
                 let angle = start + (end - start) * s;
                 [centre[0] + radius * angle.cos(), centre[1] + radius * angle.sin()]
             }
+            OutlinePiece::Ellipse { centre, semi, rotation, start, end } => {
+                ellipse_point(centre, semi, rotation, start + (end - start) * s)
+            }
         }
     }
 
     fn is_full_circle(&self) -> bool {
-        matches!(*self, OutlinePiece::Arc { start, end, .. } if ((end - start).abs() - TAU).abs() < 1e-12)
+        matches!(*self, OutlinePiece::Arc { start, end, .. } | OutlinePiece::Ellipse { start, end, .. } if ((end - start).abs() - TAU).abs() < 1e-12)
     }
 
     /// Unsigned distance from `p` to the piece.
@@ -123,6 +134,23 @@ impl OutlinePiece {
                     let b = self.point(1.0);
                     (a[0] - p[0]).hypot(a[1] - p[1]).min((b[0] - p[0]).hypot(b[1] - p[1]))
                 }
+            }
+            OutlinePiece::Ellipse { centre, semi, rotation, start, end } => {
+                // Every point of the ellipse where the distance is critical,
+                // kept where it lies on the arc, and the arc's ends.
+                let (c, s) = (rotation.cos(), rotation.sin());
+                let local = [c * (p[0] - centre[0]) + s * (p[1] - centre[1]), -s * (p[0] - centre[0]) + c * (p[1] - centre[1])];
+                let mut best = [self.point(0.0), self.point(1.0)]
+                    .iter()
+                    .map(|q| (q[0] - p[0]).hypot(q[1] - p[1]))
+                    .fold(f64::INFINITY, f64::min);
+                for theta in ellipse_critical_angles(semi, local) {
+                    if self.is_full_circle() || angle_within(theta, start, end) {
+                        let q = ellipse_point(centre, semi, rotation, theta);
+                        best = best.min((q[0] - p[0]).hypot(q[1] - p[1]));
+                    }
+                }
+                best
             }
         }
     }
@@ -160,8 +188,159 @@ impl OutlinePiece {
                 }
                 count
             }
+            OutlinePiece::Ellipse { centre, semi, rotation, start, end } => {
+                // The segments' rule, half-open in y: count each change of
+                // "above p" (y > p.y) along the arc, where it happens, if
+                // that place lies to the right of p. y(θ) = cy + A cos θ +
+                // B sin θ with A = a sin φ, B = b cos φ; it meets p.y at the
+                // roots θ = atan2(B, A) ± acos((p.y − cy)/r).
+                let (a, b) = (semi[0] * rotation.sin(), semi[1] * rotation.cos());
+                let r = a.hypot(b);
+                let target = p[1] - centre[1];
+                let span = end - start;
+                let at = |fraction: f64| ellipse_point(centre, semi, rotation, start + span * fraction);
+                let above = |q: [f64; 2]| q[1] > p[1];
+                // An end within rounding of p's height is on it, as the
+                // segment beside it reads its exact vertex (not above).
+                let snap = 1e-12 * (1.0 + semi[0].max(semi[1]) + centre[0].abs().max(centre[1].abs()));
+                let above_end = |q: [f64; 2]| q[1] > p[1] + snap;
+                // Roots as fractions of the arc, in order.
+                let mut cuts: Vec<f64> = Vec::new();
+                if target.abs() < r {
+                    let base = b.atan2(a);
+                    let spread = (target / r).acos();
+                    for theta in [base + spread, base - spread] {
+                        let fraction = ((theta - start) * span.signum()).rem_euclid(TAU) / span.abs();
+                        // a root at an end is that end's
+                        let full = self.is_full_circle();
+                        if (full && fraction < 1.0) || (fraction > 1e-12 && fraction < 1.0 - 1e-12) {
+                            cuts.push(fraction);
+                        }
+                    }
+                }
+                cuts.sort_by(|x, y| x.total_cmp(y));
+                let full = self.is_full_circle();
+                // Breakpoints: the arc's ends (not for a whole ellipse) and its roots.
+                let mut marks: Vec<f64> = Vec::with_capacity(cuts.len() + 2);
+                if !full {
+                    marks.push(0.0);
+                }
+                marks.extend(&cuts);
+                if !full {
+                    marks.push(1.0);
+                }
+                if marks.is_empty() {
+                    return 0;
+                }
+                let state_at = |k: usize| -> bool {
+                    // the state just after mark k (between it and the next)
+                    let next = if k + 1 < marks.len() { marks[k + 1] } else if full { marks[0] + 1.0 } else { 1.0 };
+                    above(at(0.5 * (marks[k] + next)))
+                };
+                let mut count = 0;
+                for k in 0..marks.len() {
+                    let before = if k > 0 {
+                        state_at(k - 1)
+                    } else if full {
+                        state_at(marks.len() - 1)
+                    } else {
+                        above_end(at(0.0))
+                    };
+                    let after = if !full && k + 1 == marks.len() { above_end(at(1.0)) } else { state_at(k) };
+                    if before != after && at(marks[k])[0] > p[0] {
+                        count += 1;
+                    }
+                }
+                count
+            }
         }
     }
+}
+
+/// The eccentric angles of every point of the ellipse of semi-axes `semi`
+/// (centred, unrotated) where the distance to `q` is critical. The foot of the
+/// normal through `q` is `(a²x/(a²+t), b²y/(b²+t))` at each root of
+/// `F(t) = (a x/(a²+t))² + (b y/(b²+t))² = 1`: one past the nearer pole (the
+/// nearest point), none or two between the poles, one before the farther
+/// pole (the farthest). A coordinate of `q` on an axis loses its term: the
+/// vertices and the feet at that pole are added as candidates always.
+fn ellipse_critical_angles(semi: [f64; 2], q: [f64; 2]) -> Vec<f64> {
+    let [a, b] = semi;
+    let (x, y) = (q[0], q[1]);
+    let big = |t: f64| (a * x / (a * a + t)).powi(2) + (b * y / (b * b + t)).powi(2) - 1.0;
+    let angle = |t: f64| {
+        let (u, v) = (a * x / (a * a + t), b * y / (b * b + t));
+        v.atan2(u)
+    };
+    let mut out = vec![0.0, std::f64::consts::FRAC_PI_2, PI, -std::f64::consts::FRAC_PI_2];
+    // At a pole whose term vanishes (q on that axis) the feet are the limits
+    // there: x/(a² − b²)·a = cos θ at t = −b², y/(b² − a²)·b = sin θ at t = −a².
+    // Every candidate is a point of the ellipse, so an extra one never reads
+    // a distance short.
+    if (a - b).abs() > 0.0 {
+        let cos = a * x / (a * a - b * b);
+        if cos.abs() <= 1.0 {
+            out.push(cos.acos());
+            out.push(-cos.acos());
+        }
+        let sin = b * y / (b * b - a * a);
+        if sin.abs() <= 1.0 {
+            out.push(sin.asin());
+            out.push(PI - sin.asin());
+        }
+    }
+    let bisect = |mut lo: f64, mut hi: f64| -> f64 {
+        // `big` changes sign between lo and hi
+        let up = big(lo) < 0.0;
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if mid <= lo || mid >= hi {
+                break;
+            }
+            if (big(mid) < 0.0) == up {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    };
+    let (p_far, p_near) = { let (s, t) = (-(a * a), -(b * b)); if s < t { (s, t) } else { (t, s) } };
+    let scale = a.max(b) * (a.max(b) + x.hypot(y));
+    // Past the nearer pole F falls from +∞ (or its finite value) to −1.
+    {
+        let mut hi = p_near + scale.max(1.0);
+        while big(hi) > 0.0 {
+            hi = p_near + 2.0 * (hi - p_near);
+        }
+        let lo = p_near + 1e-300f64.max(1e-15 * scale);
+        if big(lo) > 0.0 {
+            out.push(angle(bisect(lo, hi)));
+        }
+    }
+    // Between the poles F is convex: at its least, two roots where it dips below 1.
+    if p_near - p_far > 0.0 {
+        let (mut lo, mut hi) = (p_far, p_near);
+        for _ in 0..200 {
+            let m1 = lo + (hi - lo) / 3.0;
+            let m2 = hi - (hi - lo) / 3.0;
+            if big(m1) < big(m2) { hi = m2 } else { lo = m1 }
+        }
+        let least = 0.5 * (lo + hi);
+        if big(least) < 0.0 {
+            let pad = 1e-15 * scale.max(1.0);
+            out.push(angle(bisect(least, p_near - pad)));
+            out.push(angle(bisect(p_far + pad, least)));
+        }
+    }
+    out
+}
+
+/// The point of an ellipse at eccentric angle `theta` (see [`OutlinePiece::Ellipse`]).
+pub(crate) fn ellipse_point(centre: [f64; 2], semi: [f64; 2], rotation: f64, theta: f64) -> [f64; 2] {
+    let (x, y) = (semi[0] * theta.cos(), semi[1] * theta.sin());
+    let (c, s) = (rotation.cos(), rotation.sin());
+    [centre[0] + c * x - s * y, centre[1] + s * x + c * y]
 }
 
 /// Is `angle` on the arc that runs from `start` to `end` (either sense)?
@@ -206,6 +385,18 @@ fn validate_outline(outline: &[OutlinePiece], what: &str) -> Result<(), KernelRe
         .flat_map(|piece| [piece.point(0.0), piece.point(1.0)])
         .map(|p| p[0].abs().max(p[1].abs()))
         .fold(1.0f64, f64::max);
+    for piece in outline {
+        if let OutlinePiece::Ellipse { semi, rotation, start, end, centre } = *piece {
+            let finite = semi.iter().chain(&centre).chain([&rotation, &start, &end]).all(|x| x.is_finite());
+            if !(finite && semi[0] > 0.0 && semi[1] > 0.0 && start != end) {
+                return Err(KernelRefusal::input(
+                    KernelStage::Collect,
+                    "outline_ellipse",
+                    format!("sweepSolidWithin: an ellipse of the {what} outline needs positive semi-axes and a span"),
+                ));
+            }
+        }
+    }
     for (index, piece) in outline.iter().enumerate() {
         let next = &outline[(index + 1) % outline.len()];
         let a = piece.point(1.0);
@@ -309,8 +500,23 @@ const TURNS_PER_ROW: f64 = 2.0;
 /// `BREP_SWEEP_THREAD_ROWS` (default on; `=0` one body-long face per wall and the
 /// boolean for the clip): a thread is built a few turns at a time, since readings
 /// over a face cost the square of its length.
+/// Faster level reading (default on; `BREP_SWEEP_FAST_LEVELS=0` restores the plain reading): an edge source's samples are reduced
+/// once, not at every level (their levels do not depend on the level read),
+/// and a face's extremum Newton stops once its residual is settled far inside
+/// the acceptance (the differenced Jacobian is noise past that).
+fn fast_levels_on() -> bool {
+    crate::switch!("BREP_SWEEP_FAST_LEVELS", true)
+}
+
 fn thread_rows_on() -> bool {
     crate::switch!("BREP_SWEEP_THREAD_ROWS", true)
+}
+
+/// `BREP_SWEEP_WHOLE_TURN` (default on; `=0` restores the refusal): a turn
+/// through a whole revolution or more about the clip's axis is built even where
+/// its ends lie in the clip; its sweep is the tool's (ρ, z) shadow turned round.
+fn whole_turn_on() -> bool {
+    crate::switch!("BREP_SWEEP_WHOLE_TURN", true)
 }
 
 /// `BREP_SWEEP_WHOLE_LEVEL` (default on; `=0` restores the refusal): a screw's
@@ -334,6 +540,18 @@ fn screw_carry_on() -> bool {
 /// contour (3.5e-7 short of a cone point's tip) instead of at the point itself.
 fn apex_tip_on() -> bool {
     crate::switch!("BREP_SWEEP_APEX_TIP", true)
+}
+
+/// `BREP_SWEEP_SEED_BANDS` (default on; `=0` seeds from every tip at every
+/// level): a face's tip seeds the extremum Newton only at levels whose contour
+/// about it could miss every grid node, those within the grid's levels about
+/// it. Beyond them the contour reaches a node and the grid's own crossings
+/// seed it. A face whose level does not change along the motion (a prism's
+/// side turned about its own axis) has a ridge of near-ties that reads as
+/// hundreds of tips, and seeding each at every level was nearly all of a
+/// clipped sweep's time.
+fn seed_bands_on() -> bool {
+    crate::switch!("BREP_SWEEP_SEED_BANDS", true)
 }
 
 /// `BREP_SWEEP_LEAN_WALLS` (default on; `=0` restores the quintic through 48
@@ -480,6 +698,11 @@ struct Engine<'a> {
     /// Per face source: the parameters of its critical points (tips), which
     /// seed the extremum Newton where the level's contour is smaller than a cell.
     critical_params: Vec<Vec<(f64, f64)>>,
+    /// Per face source, beside each of `critical_params`: the levels a contour
+    /// about that tip can hold without reaching a grid node (the range of the
+    /// grid's levels about it, and the tip's own), or `None` for a fold or
+    /// kink, which seeds at every level.
+    critical_bands: Vec<Vec<Option<[f64; 2]>>>,
     /// Angular `o` (wraps at 2π) or not.
     angular: bool,
     /// Prism height (along its normal) the planar sources are evaluated at.
@@ -492,6 +715,9 @@ struct Engine<'a> {
     /// wheel, one and a half of the tool), so there are no end positions; piece
     /// `k` at the end continues as piece `wrap[k]` at the start.
     wrap: Option<Vec<usize>>,
+    /// Per edge source (under `fast_levels_on`): its samples' parameters and
+    /// levels, which do not depend on the level read.
+    edge_samples: std::cell::RefCell<std::collections::HashMap<usize, std::rc::Rc<Vec<(f64, f64)>>>>,
     /// Debug counters: (levels evaluated, oracle calls, oracle steps, seconds in
     /// candidates, seconds in the oracle).
     counters: std::cell::Cell<(usize, usize, usize, f64, f64)>,
@@ -707,7 +933,14 @@ impl<'a> Engine<'a> {
             [l - level, (ou * lv - ov * lu) / norm]
         };
         let mut f = residual(u, v);
+        // Under `fast_levels_on`, stop once the residual is far inside what
+        // is accepted below (1e-10 of the scale, 1e-6): past that the
+        // differenced Jacobian is noise, and the line search only fails.
+        let settled = |f: [f64; 2]| fast_levels_on() && f[0].abs() <= 1e-13 * self.scale && f[1].abs() <= 1e-10;
         for _ in 0..60 {
+            if settled(f) {
+                break;
+            }
             let (du_step, dv_step) = (hu * 10.0, hv * 10.0);
             let fu1 = residual(u + du_step, v);
             let fu0 = residual(u - du_step, v);
@@ -806,6 +1039,7 @@ impl<'a> Engine<'a> {
 
     /// Candidates of one source at a level: (o, source index).
     fn source_candidates(&self, index: usize, level: f64, out: &mut Vec<(f64, usize)>) {
+        let gated = seed_bands_on();
         let source = self.sources[index];
         if Self::is_face(source) {
             let grid = self.grids[index].as_ref().expect("face grid");
@@ -856,7 +1090,16 @@ impl<'a> Engine<'a> {
             // tip itself, pushed off it in four directions.
             if let Some(params) = self.critical_params.get(index) {
                 let (ur, vr, _) = self.domain(source);
-                for &(u, v) in params {
+                let bands = self.critical_bands.get(index);
+                let pad = 1e-9 * self.scale;
+                for (k, &(u, v)) in params.iter().enumerate() {
+                    if gated {
+                        if let Some(Some([low, high])) = bands.and_then(|bands| bands.get(k)) {
+                            if level < low - pad || level > high + pad {
+                                continue;
+                            }
+                        }
+                    }
                     for (du, dv) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
                         let (su, sv) = (u + du * 1e-3 * (ur[1] - ur[0]), v + dv * 1e-3 * (vr[1] - vr[0]));
                         push(&mut found, self.face_extremum(source, level, su, sv));
@@ -924,15 +1167,33 @@ impl<'a> Engine<'a> {
             // The uniform samples, with the curve's own level extrema merged in:
             // near a tip the two roots of `ℓ = ℓ₀` fall either side of the extremum,
             // closer than any fixed step, and would be missed together.
-            let mut samples: Vec<f64> = (0..=n).map(|k| range[0] + (range[1] - range[0]) * k as f64 / n as f64).collect();
-            if let Some(extra) = self.critical_params.get(index) {
-                samples.extend(extra.iter().map(|p| p.0).filter(|t| *t > range[0] && *t < range[1]));
-                samples.sort_by(|a, b| a.total_cmp(b));
-            }
-            let mut previous = self.source_reduced(source, samples[0], 0.0).0 - level;
+            let table = || -> Vec<(f64, f64)> {
+                let mut samples: Vec<f64> = (0..=n).map(|k| range[0] + (range[1] - range[0]) * k as f64 / n as f64).collect();
+                if let Some(extra) = self.critical_params.get(index) {
+                    samples.extend(extra.iter().map(|p| p.0).filter(|t| *t > range[0] && *t < range[1]));
+                    samples.sort_by(|a, b| a.total_cmp(b));
+                }
+                samples.into_iter().map(|p| (p, self.source_reduced(source, p, 0.0).0)).collect()
+            };
+            // The samples' levels do not depend on the level read: once, where on.
+            let table = if fast_levels_on() {
+                let cached = self.edge_samples.borrow().get(&index).cloned();
+                match cached {
+                    Some(t) => t,
+                    None => {
+                        let t = std::rc::Rc::new(table());
+                        self.edge_samples.borrow_mut().insert(index, t.clone());
+                        t
+                    }
+                }
+            } else {
+                std::rc::Rc::new(table())
+            };
+            let samples: Vec<f64> = table.iter().map(|x| x.0).collect();
+            let mut previous = table[0].1 - level;
             for k in 1..samples.len() {
                 let p = samples[k];
-                let value = self.source_reduced(source, p, 0.0).0 - level;
+                let value = table[k].1 - level;
                 if previous == 0.0 {
                     // A root exactly on the sample (a band's end level on the
                     // curve's own end): bisecting from a zero walks to the far
@@ -1366,10 +1627,11 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn source_critical(&self, index: usize) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+    fn source_critical(&self, index: usize) -> (Vec<(f64, f64)>, Vec<(f64, f64)>, Vec<Option<[f64; 2]>>) {
         let source = self.sources[index];
         let mut out = Vec::new();
         let mut params = Vec::new();
+        let mut bands = Vec::new();
         if Self::is_face(source) {
             let grid = self.grids[index].as_ref().expect("face grid");
             let (ur, vr, periodic) = self.domain(source);
@@ -1440,12 +1702,35 @@ impl<'a> Engine<'a> {
                         v = vr[0] + (v - vr[0]).rem_euclid(vr[1] - vr[0]);
                     }
                     if u >= ur[0] && u <= ur[1] && (periodic || (v >= vr[0] && v <= vr[1])) {
-                        out.push(self.source_reduced(source, u, v));
+                        let tip = self.source_reduced(source, u, v);
+                        // The grid's levels about the node the search began at
+                        // and about the node nearest where it ended, with the tip's.
+                        let nearest = {
+                            let fi = ((u - ur[0]) / (ur[1] - ur[0]) * (grid.nu - 1) as f64).round();
+                            let span = if periodic { grid.nv } else { grid.nv - 1 };
+                            let fj = ((v - vr[0]) / (vr[1] - vr[0]) * span as f64).round();
+                            ((fi.max(0.0) as usize).min(grid.nu - 1), (fj.max(0.0) as usize).min(grid.nv - 1))
+                        };
+                        let (mut low, mut high) = (tip.0, tip.0);
+                        for (ci, cj) in [(i, j), nearest] {
+                            for di in [-1i64, 0, 1] {
+                                for dj in [-1i64, 0, 1] {
+                                    let i2 = if u_periodic { (ci as i64 + di).rem_euclid(rows as i64) } else { (ci as i64 + di).clamp(0, grid.nu as i64 - 1) } as usize;
+                                    let j2 = if periodic { (cj as i64 + dj).rem_euclid(grid.nv as i64) } else { (cj as i64 + dj).clamp(0, grid.nv as i64 - 1) } as usize;
+                                    let level = at(i2, j2);
+                                    low = low.min(level);
+                                    high = high.max(level);
+                                }
+                            }
+                        }
+                        out.push(tip);
                         params.push((u, v));
+                        bands.push(Some([low, high]));
                     }
                 }
             }
             self.folds_and_kinks(source, grid, &mut out, &mut params);
+            bands.resize(params.len(), None);
         } else {
             let (range, _, _) = self.domain(source);
             let n = 2048;
@@ -1471,7 +1756,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        (out, params)
+        (out, params, bands)
     }
 }
 
@@ -1585,6 +1870,28 @@ pub fn sweep_solid_within(
             }
         }
     }
+    // A straight-sided prism turned about axes along it: its exact planar
+    // region, extruded (default off).
+    if crate::planar_region::planar_region_on() {
+        if let Some(bodies) = crate::planar_region::sweep_prism_planar_region(tool, motion, clip)? {
+            return Ok(bodies);
+        }
+    }
+    // A prism standing along the clip's axis, turned partway about it, one end of the turn clear
+    // of the clip's angle window: the band it passes over and its pose at the other end, exactly
+    // (`turn_window`, `BREP_SWEEP_TURN_WINDOW`, default on); None leaves it to the engine below.
+    if crate::turn_window::turn_window_on() {
+        if let Some(parts) = crate::turn_window::turn_window(tool, motion, clip)? {
+            return Ok(parts);
+        }
+    }
+    // A convex prism with arcs in its outline slid in its own plane: its whole sweep, exactly
+    // (`slide_prism`, `BREP_SWEEP_SLIDE_PRISM`, on unless =0); None leaves it to the engine below.
+    if crate::slide_prism::slide_prism_on() {
+        if let Some(parts) = crate::slide_prism::slide_prism(tool, motion, clip)? {
+            return Ok(parts);
+        }
+    }
     let narrowed: SweepClip;
     // --- Frame and classification.
     let ez = clip
@@ -1687,6 +1994,9 @@ pub fn sweep_solid_within(
                             // an arc run clockwise is one run the other way about the mirrored axis
                             OutlinePiece::Arc { centre, radius, start, end } if end >= start => make_arc(at(centre), xa, ya, radius, start, end),
                             OutlinePiece::Arc { centre, radius, start, end } => make_arc(at(centre), xa, ya.scale(-1.0), radius, -start, -end),
+                            OutlinePiece::Ellipse { .. } => {
+                                return Err(refuse("prism_outline", "a prism across the screw's axis takes lines and circular arcs only".into()))
+                            }
                         }
                         .or_refuse(KernelStage::Collect, "prism_outline")?);
                     }
@@ -1754,10 +2064,12 @@ pub fn sweep_solid_within(
                 grids: Vec::new(),
                 critical: Vec::new(),
                 critical_params: Vec::new(),
+                critical_bands: Vec::new(),
                 angular: true,
                 prism_height,
                 scale: 1.0,
                 cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+                        edge_samples: std::cell::RefCell::new(std::collections::HashMap::new()),
                 wrap: None,
                 counters: std::cell::Cell::new((0, 0, 0, 0.0, 0.0)),
             };
@@ -1849,10 +2161,12 @@ pub fn sweep_solid_within(
         grids: Vec::new(),
         critical: Vec::new(),
         critical_params: Vec::new(),
+        critical_bands: Vec::new(),
         angular: class != Class::Turn,
         prism_height,
         scale,
         cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+        edge_samples: std::cell::RefCell::new(std::collections::HashMap::new()),
         wrap,
         counters: std::cell::Cell::new((0, 0, 0, 0.0, 0.0)),
     };
@@ -1863,6 +2177,7 @@ pub fn sweep_solid_within(
         .collect();
     let critical: Vec<_> = (0..engine.sources.len()).map(|k| engine.source_critical(k)).collect();
     engine.critical_params = critical.iter().map(|c| c.1.clone()).collect();
+    engine.critical_bands = critical.iter().map(|c| c.2.clone()).collect();
     engine.critical = critical.into_iter().map(|c| c.0).collect();
     if let (SweptTool::Revolved { axis_origin, axis_direction, meridian, .. }, true) = (tool, apex_tip_on()) {
         let axis = axis_direction.normalized_or(*axis_direction);
@@ -1883,7 +2198,13 @@ pub fn sweep_solid_within(
     }
 
     // --- Ends: a screw or turn must not reach the clip at either end.
-    if matches!(class, Class::Screw(_) | Class::Turn) {
+    //     A turn through a whole revolution or more is the exception: it
+    //     carries the tool round onto itself, so its sweep is invariant
+    //     under the turn wherever its ends lie.
+    let whole_turn = class == Class::Turn
+        && whole_turn_on()
+        && (motion.steps[0].turn * (motion.to - motion.from)).abs() >= TAU * (1.0 - 1e-12);
+    if matches!(class, Class::Screw(_) | Class::Turn) && !whole_turn {
         check_ends_clear(&engine)?;
     }
 
@@ -1896,6 +2217,52 @@ pub fn sweep_solid_within(
             narrowed = SweepClip { radius: [0.0, level], ..clip.clone() };
             engine.clip = &narrowed;
             engine.crest_gap = true;
+        }
+    }
+
+    // --- A straight-sided prism along a screw's axis: its reduced section
+    //     exactly (default off), built as the levels' pieces would be.
+    if let (Class::Screw(c), None, None, true, SweptTool::Prism { origin, normal, x_axis, outline, from, to }) =
+        (class, crest, engine.bar.as_ref(), crate::planar_region::screw_section_on(), tool)
+    {
+        let n = normal.normalized_or(*normal);
+        let xa = x_axis.sub(n.scale(x_axis.dot(n))).normalized_or(*x_axis);
+        let ya = n.cross(xa);
+        let lines = outline.iter().all(|p| matches!(p, OutlinePiece::Line { .. }));
+        if lines && clip.angle.is_none() {
+            let corners: Vec<[f64; 2]> = outline
+                .iter()
+                .map(|p| {
+                    let OutlinePiece::Line { from: q, .. } = p else { unreachable!() };
+                    let l = engine.frame.local(origin.add(xa.scale(q[0])).add(ya.scale(q[1])));
+                    [l[0], l[1]]
+                })
+                .collect();
+            let (za, zb) = (engine.frame.local(origin.add(n.scale(*from)))[2], engine.frame.local(origin.add(n.scale(*to)))[2]);
+            if let Some(loops) = crate::planar_region::screw_section_loops(corners, [za.min(zb), za.max(zb)], c, clip.radius)? {
+                let mut bodies = Vec::with_capacity(loops.len());
+                for arcs in loops {
+                    let pieces: Vec<Piece> = arcs
+                        .into_iter()
+                        .map(|(points, level)| {
+                            // (level, o): the reduced plane's polar coordinates, o unwrapped along the piece.
+                            let mut out: Vec<(f64, f64)> = Vec::with_capacity(points.len());
+                            for q in points {
+                                let raw = q[1].atan2(q[0]);
+                                let o = match out.last() {
+                                    Some(&(_, previous)) => previous + wrap_pi(raw - previous),
+                                    None => raw,
+                                };
+                                out.push((q[0].hypot(q[1]), o));
+                            }
+                            let m = out.len();
+                            Piece { points: out, sigma: (0..m).map(|k| k as f64 / (m - 1) as f64).collect(), level_segment: level }
+                        })
+                        .collect();
+                    bodies.push(build_body(&engine, &pieces)?);
+                }
+                return Ok(bodies);
+            }
         }
     }
 

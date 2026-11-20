@@ -178,3 +178,19 @@ pub fn is_offset_shell_open_curved_rim(refusal: &KernelRefusal) -> bool {
         _ => false,
     }
 }
+
+/// A whole-body band carve (`BREP_OFFSET_WHOLE_BODY_FOLD_BAND`) whose fold
+/// boundary's image is not buried under the source's own offset: the kept
+/// pieces' offsets would end on a cusp edge of the erosion boundary.
+pub(super) fn fold_band_uncovered(face_id: u64, distance: f64, pieces: usize) -> KernelRefusal {
+    KernelRefusal::unsupported(
+        KernelStage::Refine,
+        "offset_shell_fold_band",
+        format!(
+            "offset_shell: the offset of source face {face_id} by {distance:.6} folds in a BAND across its \
+             trim, dividing it into {pieces} regular piece(s), and a fold boundary's image is not nearer than \
+             the distance to the source: the pieces' offsets would end on a cusp of the body's boundary \
+             instead of crossing before it, and nothing here re-solves that cusp"
+        ),
+    )
+}

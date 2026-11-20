@@ -192,7 +192,30 @@ fn ray_face_intersections(
         }
         classify_profile(|p| p.ray_fallback_faces += 1);
     }
+    // A ray proved clear of the face: the sampled search's answer is known to be empty (the check
+    // mode runs the search anyway and stops on a disagreement).
+    let check = crate::curve_clear::check_mode();
+    if check || ray_clear_enabled() {
+        let clear = crate::curve_clear::curve_clear_of_surface(sub_ray, surface, tolerance);
+        if check {
+            let hits = intersect_curve_surface(sub_ray, surface, tolerance)?;
+            if clear && !hits.is_empty() {
+                crate::curve_clear::disagreement("classifier ray", hits.len());
+            }
+            return Ok(hits);
+        }
+        if clear {
+            return Ok(Vec::new());
+        }
+    }
     intersect_curve_surface(sub_ray, surface, tolerance)
+}
+
+/// `BREP_CLASSIFY_RAY_CLEAR` (default on since its promotion; `=0` restores the search alone): a ray the sampled search would take against a freeform
+/// face is first proved clear of it by hull boxes (`crate::curve_clear`); most such searches find
+/// nothing, each after many Newton starts that open with a global projection.
+fn ray_clear_enabled() -> bool {
+    switch!("BREP_CLASSIFY_RAY_CLEAR", true)
 }
 
 /// Point-in-solid classification with per-solid precomputation: face
@@ -273,6 +296,81 @@ impl<'a> SolidClassifier<'a> {
             tolerance,
             coincident_caps: Vec::new(),
         })
+    }
+
+    /// The orientation a chord through `through` along `direction` reads, or
+    /// `None` when the chord cannot tell (`BREP_BOOLEAN_SIGN_CHORDS`).
+    ///
+    /// The chord runs from outside the faces' box to outside it, so a closed,
+    /// consistently oriented boundary is entered and left in turn: its hits,
+    /// ordered along the chord, alternate between outward normals against
+    /// the chord and along it, and their number is even. `Some(true)` when
+    /// they do and the first is an entry (material lies behind the normals,
+    /// as on a solid of positive volume), `Some(false)` when they do and the
+    /// first is an exit (inside out). `None` when any hit is tangential,
+    /// grazes (`|n · d|` under 1e-2), falls in a trim's boundary band, sits
+    /// within the On band of another hit, when the hits do not alternate or
+    /// are odd in number (a root the finder lost, or a face reversed against
+    /// its neighbours), or when no hit lies within the On band of `through`
+    /// (the aimed face itself was missed).
+    pub fn chord_orientation(&self, through: Vec3, direction: Vec3) -> Result<Option<bool>, String> {
+        let on_tolerance = self.tolerance * 10.0;
+        let direction = direction.normalized()?;
+        let middle = self.bounds.minimum.add(self.bounds.maximum).scale(0.5);
+        let reach = self.bounds.diagonal() + through.sub(middle).length() + 1.0;
+        let start = through.sub(direction.scale(reach));
+        let length = 2.0 * reach;
+        let end = start.add(direction.scale(length));
+        let mut candidates = Vec::new();
+        self.bvh.intersecting_segment(start, end, on_tolerance, &mut candidates);
+        candidates.sort_unstable();
+        // (distance along the chord, the outward normal along it).
+        let mut hits: Vec<(f64, bool)> = Vec::new();
+        let mut aimed = false;
+        for &index in &candidates {
+            let face = self.faces[index];
+            let margin = on_tolerance.max(self.face_boxes[index].diagonal() * 1e-3);
+            let Some([span_start, span_end]) =
+                clip_segment_to_aabb(start, direction, length, &self.face_boxes[index].expanded(margin))
+            else {
+                continue;
+            };
+            let span_start = (span_start - margin).max(0.0);
+            let span_end = (span_end + margin).min(length);
+            if span_end - span_start <= 1e-12 {
+                continue;
+            }
+            let sub_ray = make_line(start.add(direction.scale(span_start)), start.add(direction.scale(span_end)))?;
+            for intersection in ray_face_intersections(&sub_ray, &face.surface, self.tolerance)? {
+                if intersection.tangential {
+                    return Ok(None);
+                }
+                let uv = Vec2 { x: intersection.u, y: intersection.v };
+                match parameter_point_in_face(face, uv, face_uv_tolerance(face, uv.x, uv.y, on_tolerance))? {
+                    PolygonClass::Outside => continue,
+                    PolygonClass::Boundary => return Ok(None),
+                    PolygonClass::Inside => {}
+                }
+                let along = face_normal(face, uv.x, uv.y)?.dot(direction);
+                if along.abs() < 1e-2 {
+                    return Ok(None);
+                }
+                if intersection.point.sub(through).length() <= on_tolerance {
+                    aimed = true;
+                }
+                hits.push((intersection.point.sub(start).dot(direction), along > 0.0));
+            }
+        }
+        if !aimed || hits.is_empty() || hits.len() % 2 == 1 {
+            return Ok(None);
+        }
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for pair in hits.windows(2) {
+            if pair[1].0 - pair[0].0 <= on_tolerance || pair[1].1 == pair[0].1 {
+                return Ok(None);
+            }
+        }
+        Ok(Some(!hits[0].1))
     }
 
     /// Cheap On-band probe: is the point within the classifier's On
@@ -654,3 +752,4 @@ pub fn classify_point(
     classify_profile_report("classify_point");
     result
 }
+

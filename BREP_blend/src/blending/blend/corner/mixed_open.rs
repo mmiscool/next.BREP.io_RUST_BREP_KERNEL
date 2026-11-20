@@ -2,7 +2,7 @@
 //! (wall A ∩ cap), the SELECTED concave vertical Q (wall A ∩ wall B) and the
 //! UNSELECTED convex rim B (wall B ∩ cap) at one vertex, orthogonal planar
 //! walls, one radius — the keyway floor corners of the 2026-10-13 sprocket
-//! report `20261013T020933Z-e80a36db` (`37|43` + `37|38` over `38|43`, and
+//! report (`37|43` + `37|38` over `38|43`, and
 //! the mirror `39|43` + `38|39`).
 //!
 //! What the cutter composition leaves there: Q's pad was cut first and ends

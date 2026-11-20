@@ -148,6 +148,21 @@ pub fn feature_icon(kind: &str) -> Option<char> {
         "WELD.EDGE" => 0xE0DD,
         "WELD.CORNER" => 0xE0DE,
         "WELD.SURF" => 0xE0DF,
+        "GEAR.SPUR" => 0xE0E4,
+        "GEAR.RACK" => 0xE0E5,
+        "GEAR.RING" => 0xE0E6,
+        "GEAR.SPROCKET" => 0xE0E7,
+        "GEAR.HELICAL" => 0xE0E8,
+        "GEAR.HERRINGBONE" => 0xE0E9,
+        "GEAR.SPLINE_STRAIGHT" => 0xE0EA,
+        "GEAR.SPLINE_INV" => 0xE0EB,
+        "GEAR.TIMING_PULLEY" => 0xE0EC,
+        "GEAR.RATCHET" => 0xE0ED,
+        "GEAR.GENEVA" => 0xE0EE,
+        "GEAR.WORM" => 0xE0EF,
+        "GEAR.CYCLO_DISC" => 0xE0F0,
+        "GEAR.CYCLO_RING" => 0xE0F1,
+        "GEAR.CYCLOIDAL" => 0xE0F2,
         "HX" | "HELIX" => 0xE03C,
         "E" | "EXTRUDE" => 0xE03D,
         "B" | "BOOLEAN" => 0xE03E,
@@ -182,6 +197,9 @@ pub fn feature_icon(kind: &str) -> Option<char> {
         "SM.UNFOLD" => 0xE059,
         "TF" | "TRANSFORM FACE" | "TRANSFORMFACE" => 0xE05D,
         "RFS" | "REFIT FACES" | "REFITFACES" => 0xE05E,
+        "DFF" | "DEFORM FACE" | "DEFORMFACE" => 0xE0E1,
+        "SEW" | "SEW TO SOLID" | "SEWTOSOLID" => 0xE0E2,
+        "FILL" | "FILL SURFACE" | "FILLSURFACE" => 0xE0E0,
         _ => return None,
     };
     char::from_u32(cp)
@@ -220,6 +238,23 @@ pub fn feature_form_fields(feature_type: &str) -> Vec<FormField> {
         return Vec::new();
     };
     form_fields_from_schema(&schema)
+}
+
+/// The POINT PICK a feature form's button `key` (`pivot#pick`) runs: the vec3
+/// field's own path, its label (the picker's prompt) and the entity kinds its
+/// schema `selectionFilter` admits. `None` for any other key.
+pub fn point_pick_field(feature_type: &str, key: &str) -> Option<(Vec<String>, String, Vec<String>)> {
+    let name = key.strip_suffix(crate::engine_state::POINT_PICK_SUFFIX)?;
+    let schema = feature_schema(feature_type)?;
+    let spec = schema["inputParamsSchema"].get(name)?;
+    if spec["type"] != "vec3" {
+        return None;
+    }
+    let filter: Vec<String> = crate::json_support::string_values(spec.get("selectionFilter")).map(String::from).collect();
+    if filter.is_empty() {
+        return None;
+    }
+    Some((vec![name.to_string()], field_label(spec, name), filter))
 }
 
 /// Plugin numeric bounds are enforced when the user commits a scalar edit.
@@ -281,12 +316,26 @@ pub fn form_fields_from_schema(schema: &Value) -> Vec<FormField> {
                 // rotation and no scale. The kernel reads it with the same
                 // `common::vec3_from_value` the transform components use, so a
                 // component may be a number or an expression either way.
+                let label = field_label(spec, name);
                 fields.push(FormField {
                     path: vec![name.clone()],
-                    label: field_label(spec, name),
+                    label: label.clone(),
                     group: "Parameters".into(),
                     kind: FieldKind::Vec3 { step: 0.5 },
                 });
+                // A vec3 that declares a `selectionFilter` may ALSO be filled
+                // by picking an entity of those kinds in the view: a button
+                // under the row, bound to no value, keyed `<name>#pick`; the
+                // host runs the pick (`EngineState::begin_point_pick`) and the
+                // pick writes the point into this same row.
+                if crate::json_support::string_values(spec.get("selectionFilter")).next().is_some() {
+                    fields.push(FormField {
+                        path: vec![format!("{name}{}", crate::engine_state::POINT_PICK_SUFFIX)],
+                        label: format!("Pick {}", label.to_lowercase()),
+                        group: "Parameters".into(),
+                        kind: FieldKind::Button { label: format!("Pick {} from a vertex, edge or face", label.to_lowercase()) },
+                    });
+                }
             }
             "transform" => {
                 // TWO transform param shapes share the `transform` schema type,

@@ -374,6 +374,7 @@ impl HistoryPanel {
                 // NURBS Solid form: no control cage either.
                 state.refresh_spline_edit_overlay(None, None);
                 state.refresh_cage_edit_overlay(None);
+                state.refresh_deform_edit_overlay(None);
                 self.show_tree(ui, state, &report);
             }
             PanelMode::Form { feature_id } => self.show_form(ui, state, &report, &feature_id),
@@ -572,7 +573,7 @@ impl HistoryPanel {
         // field's — it keeps the top-right card and never matches here.)
         let picking = state
             .ref_select_field()
-            .filter(|f| f.target == RefSelectTarget::Feature && f.subject == id);
+            .filter(|f| matches!(f.target, RefSelectTarget::Feature | RefSelectTarget::PointPick) && f.subject == id);
         let spec = FormViewSpec {
             title: &title,
             subtitle: None,
@@ -624,6 +625,9 @@ impl HistoryPanel {
         } else {
             state.refresh_cage_edit_overlay(None);
         }
+        // A Deform Face form shows its pick handles in the viewport (the
+        // engine ignores any other feature type).
+        state.refresh_deform_edit_overlay(Some(id));
 
         // WHICH feature the form is showing, as a presence-only zero-size rect
         // beside the header's real rect (`form:feature`) — the same convention
@@ -705,7 +709,10 @@ impl HistoryPanel {
             // to the tip below: finishing restores the pick's own roll (this
             // feature's step), so it has to come first or the tip would be
             // rolled back from under the user.
-            if state.ref_select_field().is_some_and(|f| f.target == RefSelectTarget::Feature) {
+            if state
+                .ref_select_field()
+                .is_some_and(|f| matches!(f.target, RefSelectTarget::Feature | RefSelectTarget::PointPick))
+            {
                 state.finish_ref_select();
             }
             self.mode = PanelMode::Tree;
@@ -715,7 +722,7 @@ impl HistoryPanel {
         // field off the screen.
         if state
             .ref_select_field()
-            .is_some_and(|f| f.target == RefSelectTarget::Feature && f.subject == id)
+            .is_some_and(|f| matches!(f.target, RefSelectTarget::Feature | RefSelectTarget::PointPick) && f.subject == id)
         {
             state.ref_select_claim();
         }
@@ -1155,6 +1162,21 @@ impl HistoryPanel {
                 Ok(_) => self.mode = PanelMode::Tree,
                 Err(error) => state.push_notice(format!("Edit 3D Sketch: {error}")),
             },
+            // A vec3 field's pick button (`pivot#pick`): a one-entity pick
+            // whose Finish writes the picked point into the field.
+            key if key.ends_with(brep_render::engine_state::POINT_PICK_SUFFIX) => {
+                let feature_type = state.history.index_of(feature_id).and_then(|index| state.history.feature_type(index));
+                if let Some((_, label, filter)) =
+                    feature_type.and_then(|ty| brep_render::features::point_pick_field(&ty, key))
+                {
+                    state.begin_point_pick(feature_id, vec![key.to_string()], label, filter);
+                    // Staged buttons run AFTER the form drew and claimed this
+                    // frame's pick, so the new pick claims itself here: its
+                    // form is on screen, and an unclaimed pick is finished by
+                    // the shell at the end of the frame it began in.
+                    state.ref_select_claim();
+                }
+            }
             _ => {}
         }
     }

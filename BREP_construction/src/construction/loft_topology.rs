@@ -12,11 +12,15 @@ mod guided;
 #[path = "loft_topology/closed.rs"]
 mod closed;
 
-pub use basic::{loft_profile_brep, loft_profile_brep_tangent};
+pub use basic::{loft_profile_brep, loft_profile_brep_broken, loft_profile_brep_tangent};
+#[path = "loft_topology/broken.rs"]
+mod broken;
+pub use broken::interpolate_column_broken;
 use basic::closed_points;
 
 pub use closed::loft_profile_brep_closed;
 pub use closed::loft_profile_brep_closed_shifted;
+pub use closed::loft_profile_brep_closed_broken;
 
 pub use guided::{loft_profile_brep_guided, loft_profile_brep_guided_frame};
 

@@ -171,6 +171,12 @@ pub struct SolidDisplay {
     /// handles never recycle, and the display-reuse fast path clones this struct
     /// forward only while the handle is unchanged.
     pub is_sheet_metal: bool,
+    /// The colour this display's edges take when the metadata store names none
+    /// for them (`None`: the theme's edge colour). Set on a synthesized display
+    /// whose edges ARE the message — a refused Sew to Solid's open edges — so
+    /// [`RenderScene::apply_metadata_edge_looks`] keeps them highlighted.
+    #[serde(default)]
+    pub edge_color_base: Option<[f32; 3]>,
 }
 
 /// Source of monotonic [`SolidDisplay::revision`] values.
@@ -381,11 +387,12 @@ impl RenderScene {
         let mut any = false;
         for solid in &mut self.solids {
             let mut changed = false;
+            let base = solid.edge_color_base;
             for edge in &mut solid.edges {
                 let (want_color, want_opacity) = if edge.name.is_empty() || edge.aux {
-                    (None, None)
+                    (base, None)
                 } else {
-                    (color(&edge.name), opacity(&edge.name).map(|o| o.clamp(0.0, 1.0)).filter(|o| *o < 1.0))
+                    (color(&edge.name).or(base), opacity(&edge.name).map(|o| o.clamp(0.0, 1.0)).filter(|o| *o < 1.0))
                 };
                 if edge.color_override != want_color || edge.opacity != want_opacity {
                     edge.color_override = want_color;
@@ -976,6 +983,7 @@ pub fn solid_display_from_payload(
         visibility: crate::visibility::EntityVisibility::default(),
         bbox,
         is_sketch: false, // set by the sketch-sheet synthesizer for a committed sketch
+        edge_color_base: None,
         is_sheet_metal: false, // stamped by the pipeline from the resident handle's SheetTree
     }
 }

@@ -192,7 +192,7 @@ pub fn symbol_libraries(dir: &Path) -> Result<Vec<String>, String> {
 /// into place only when whole, and cloned again when it is not there, so
 /// git's fsync of the pack buys it nothing. What it costs is a wait on the
 /// disk's journal behind every other writer: on a host with the root disk at
-/// 100% utilisation (cad-bot, 2026-10-26) the default clone of a three-file
+/// 100% utilisation (measured 2026-10-26) the default clone of a three-file
 /// repository made 3 fsync calls and took 129 s, the same clone without them
 /// 5.5 s. The option precedes the subcommand so git hands it to index-pack and
 /// the other helpers it spawns. The trade: an unclean shutdown inside the

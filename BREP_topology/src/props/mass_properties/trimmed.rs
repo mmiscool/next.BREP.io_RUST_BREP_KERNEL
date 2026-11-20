@@ -23,6 +23,60 @@ pub fn with_straight_corrections_skipped<T>(f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// What [`with_coarse_quadtree`] reads in place of the boundary cells it
+/// does not refine: `skipped` is the sum, over every boundary cell left at
+/// `depth`, of the absolute signed areas of the trim fragments clipped to it
+/// (the parameter-plane measure of the region those cells would have
+/// integrated, for simple trim loops); `declined` marks a face whose route
+/// reads an AREA to choose its region (the hopped unwrap), which a skipped
+/// region could flip.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct CoarseMeasure {
+    pub depth: usize,
+    pub skipped: f64,
+    /// `Σ |K| · n_K · r_K` over the skipped regions `K`, with `(n_K, r_K)` the
+    /// control-net bounds of `|S_u × S_v|` and `|S - reference|` on the knot
+    /// span holding `K` (the whole net's past the domain), about the
+    /// `VolumeAbout` reference of the call's kinds.
+    pub flux: f64,
+    /// `Σ |K| · n_K`: what an offset of the reference adds per unit length.
+    pub normal: f64,
+    pub declined: bool,
+}
+
+thread_local! {
+    /// Set only inside [`with_coarse_quadtree`]: the deepest a trimmed face's
+    /// boundary cells refine (the exact reading refines to `MAX_DEPTH`), and
+    /// the measure of the boundary region left unintegrated.
+    static COARSE_QUADTREE: Cell<Option<CoarseMeasure>> = const { Cell::new(None) };
+}
+
+/// Run `f` with every trimmed face's boundary cells refined only to `depth`
+/// and the partial cells left at that depth NOT integrated: their region's
+/// parameter-plane measure is added to the returned [`CoarseMeasure`]
+/// instead, so the caller can bound what they would contribute
+/// ([`super::solid_props::solid_sign_coarse_certificate`]). Every other cell,
+/// the chord corrections and every other route integrate as the exact
+/// reading does. Nothing read under it is memoised (the station memo holds
+/// surface evaluations only, the same at every depth). The previous state is
+/// restored afterwards.
+pub fn with_coarse_quadtree<T>(depth: usize, f: impl FnOnce() -> T) -> (T, CoarseMeasure) {
+    let start = CoarseMeasure { depth, ..CoarseMeasure::default() };
+    let previous = COARSE_QUADTREE.with(|cell| cell.replace(Some(start)));
+    let result = f();
+    let measure = COARSE_QUADTREE.with(|cell| cell.replace(previous)).unwrap_or(start);
+    (result, measure)
+}
+
+fn note_coarse(update: impl FnOnce(&mut CoarseMeasure)) {
+    COARSE_QUADTREE.with(|cell| {
+        if let Some(mut measure) = cell.get() {
+            update(&mut measure);
+            cell.set(Some(measure));
+        }
+    });
+}
+
 /// What the sliver bound (`BREP_SIGN_SLIVER_BOUND`, `solid_props`) reads in
 /// place of the chord corrections: `measure` is the sum, over every station
 /// [`curved_boundary_correction`] would have evaluated, of the station's
@@ -87,6 +141,46 @@ pub fn integrate_trimmed_multi(
 /// `integrate_trimmed_multi` with the winding boundary integral switchable
 /// off, so a test can read the chord-polygon paths on the same face.
 pub fn integrate_trimmed_multi_with(
+    face: &FaceRecord,
+    kinds: &[Integrand],
+    allow_winding: bool,
+) -> Result<Vec<f64>, String> {
+    // `BREP_MASS_SPHERE_CAPS` (default off): a sphere face trimmed only by
+    // circles is read in closed form (`sphere_caps`). Not while a coarse or
+    // sliver-bound measure runs: those read the trimmed route's own cells.
+    let caps_mode = super::sphere_caps::sphere_caps_mode();
+    if caps_mode != crate::env_read::Mode::Off
+        && COARSE_QUADTREE.with(|cell| cell.get().is_none())
+        && !sliver_measure_active()
+    {
+        if let Some(closed) = super::sphere_caps::sphere_caps_integral(face, kinds)? {
+            if caps_mode == crate::env_read::Mode::On {
+                return Ok(closed);
+            }
+            let trimmed = integrate_trimmed_route(face, kinds, allow_winding)?;
+            let scale = trimmed.iter().chain(&closed).map(|v| v.abs()).fold(0.0, f64::max).max(1e-300);
+            let worst = trimmed.iter().zip(&closed).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            let area = kinds.iter().position(|k| matches!(k, Integrand::Area));
+            eprintln!(
+                "MASS-SPHERE-CAPS face={} kinds={} worst_abs={worst:.3e} worst_rel={:.3e} area={:?}",
+                face.id,
+                kinds.len(),
+                worst / scale,
+                area.map(|i| (trimmed[i], closed[i])),
+            );
+            return Ok(trimmed);
+        } else if caps_mode == crate::env_read::Mode::Check {
+            if let Ok(Err(reason)) = super::sphere_caps::sphere_face_caps(face) {
+                if reason != "not a sphere" {
+                    eprintln!("MASS-SPHERE-CAPS face={} declined={reason}", face.id);
+                }
+            }
+        }
+    }
+    integrate_trimmed_route(face, kinds, allow_winding)
+}
+
+fn integrate_trimmed_route(
     face: &FaceRecord,
     kinds: &[Integrand],
     allow_winding: bool,
@@ -191,6 +285,12 @@ pub fn integrate_trimmed_multi_with(
             trim_polygons_unwrapped(face, closed_u, closed_v, u1 - u0, v1 - v0)?;
         mass_profile(|p| p.polygons_ms += super::profile::elapsed_ms(polygons_started));
         if hopped {
+            if COARSE_QUADTREE.with(|cell| cell.get().is_some()) {
+                // The route picks raw or unwrapped by an area read over the
+                // cells; a skipped boundary region could flip that pick.
+                note_coarse(|m| m.declined = true);
+                return Ok(vec![0.0; kinds.len()]);
+            }
             if sliver_measure_active() {
                 // The route picks raw or unwrapped by an area read WITH its
                 // corrections; the bound cannot stand in for it.
@@ -415,6 +515,26 @@ pub fn integrate_trimmed_polys(
     // children clip the parent's fragments — re-clipping the full trim
     // polygon at every leaf was the dominant cost, not the quadrature.
     const MAX_DEPTH: usize = 4;
+    let coarse = COARSE_QUADTREE.with(|cell| cell.get()).is_some();
+    // The skipped regions' integrand bound is read about the call's own
+    // volume reference; per knot span, memoised for this call only.
+    let coarse_reference = kinds.iter().find_map(|kind| match kind {
+        Integrand::VolumeAbout(reference) => Some(*reference),
+        _ => None,
+    });
+    let mut coarse_spans: rustc_hash::FxHashMap<(usize, usize), Option<(f64, f64)>> = Default::default();
+    let mut coarse_whole: Option<Option<(f64, f64)>> = None;
+    // A skipped region past the domain in an OPEN direction lies on the
+    // carrier's extension, where no control-net bound holds: decline there.
+    let (coarse_open_u, coarse_open_v) = if coarse && extended {
+        match face.surface.closed_directions() {
+            Ok((closed_u, closed_v)) => (!closed_u, !closed_v),
+            Err(_) => (true, true),
+        }
+    } else {
+        (false, false)
+    };
+    let max_depth = COARSE_QUADTREE.with(|cell| cell.get()).map_or(MAX_DEPTH, |m| m.depth);
     mass_profile(|p| p.polygon_chords += polygons.iter().map(|poly| poly.points.len() as u64).sum::<u64>());
     let base_clip_started = super::profile::profile_started();
     let mut stack: Vec<([f64; 4], usize, Vec<Vec<[f64; 2]>>)> = Vec::new();
@@ -558,7 +678,7 @@ pub fn integrate_trimmed_polys(
             mass_profile(|p| p.full_ms += super::profile::elapsed_ms(full_started));
             continue;
         }
-        if depth < MAX_DEPTH {
+        if depth < max_depth {
             let child_started = super::profile::profile_started();
             let middle_u = (cell[0] + cell[1]) * 0.5;
             let middle_v = (cell[2] + cell[3]) * 0.5;
@@ -583,6 +703,47 @@ pub fn integrate_trimmed_polys(
                 stack.push((child, depth + 1, child_clipped));
             }
             mass_profile(|p| p.child_clip_ms += super::profile::elapsed_ms(child_started));
+            continue;
+        }
+        if coarse {
+            // Left unintegrated: its fragments' measure, for the caller's bound.
+            let (eps_u, eps_v) = (1e-12 * (u1 - u0).abs(), 1e-12 * (v1 - v0).abs());
+            let past_open = (coarse_open_u && (cell[0] < u0 - eps_u || cell[1] > u1 + eps_u))
+                || (coarse_open_v && (cell[2] < v0 - eps_v || cell[3] > v1 + eps_v));
+            let measure: f64 = clipped.iter().map(|polygon| polygon_signed_area(polygon).abs()).sum();
+            let bounds = coarse_reference.and_then(|reference| {
+                let inside = cell[0] >= u0 && cell[1] <= u1 && cell[2] >= v0 && cell[3] <= v1;
+                let span = inside.then(|| {
+                    let surface = &face.surface;
+                    let rows = surface.control_points.len();
+                    let columns = surface.control_points.first().map_or(0, |row| row.len());
+                    let i = knot_span_of(&surface.knots_u, surface.degree_u, rows, 0.5 * (cell[0] + cell[1]))?;
+                    let j = knot_span_of(&surface.knots_v, surface.degree_v, columns, 0.5 * (cell[2] + cell[3]))?;
+                    // The sub-net bound holds on the span only: a cell that
+                    // reaches past it takes the whole net's.
+                    let within = cell[0] >= surface.knots_u[i] && cell[1] <= surface.knots_u[i + 1]
+                        && cell[2] >= surface.knots_v[j] && cell[3] <= surface.knots_v[j + 1];
+                    within.then_some((i, j))
+                }).flatten();
+                match span {
+                    Some(span) => *coarse_spans.entry(span).or_insert_with(|| {
+                        super::solid_props::surface_flux_bounds_on_span(&face.surface, reference, span.0, span.1)
+                            .or_else(|| super::solid_props::surface_flux_bounds(&face.surface, reference))
+                    }),
+                    None => *coarse_whole.get_or_insert_with(|| super::solid_props::surface_flux_bounds(&face.surface, reference)),
+                }
+            });
+            note_coarse(|m| {
+                m.skipped += measure;
+                match bounds {
+                    Some((n, r)) => {
+                        m.flux += measure * n * r;
+                        m.normal += measure * n;
+                    }
+                    None => m.declined = true,
+                }
+                m.declined |= past_open || !measure.is_finite();
+            });
             continue;
         }
         mass_profile(|p| p.leaf_cells += 1);
@@ -650,6 +811,23 @@ pub fn integrate_trimmed_polys(
         }
     }
     Ok(totals)
+}
+
+/// The knot span `i` (`knots[i] <= x < knots[i + 1]`, nonempty) holding
+/// `x`, clamped to the net's last span at the domain's end; `None` outside
+/// the knot vector or for a net of the wrong size.
+fn knot_span_of(knots: &[f64], degree: usize, count: usize, x: f64) -> Option<usize> {
+    if count <= degree || knots.len() < count + degree + 1 || !x.is_finite() {
+        return None;
+    }
+    if !(x >= knots[degree] && x <= knots[count]) {
+        return None;
+    }
+    let mut span = degree;
+    while span + 1 < count && knots[span + 1] <= x {
+        span += 1;
+    }
+    (knots[span] < knots[span + 1]).then_some(span)
 }
 
 /// Three-point Gauss–Legendre on [0, 1], across the sliver.

@@ -296,6 +296,30 @@ impl EngineState {
         self.sync_ref_select_emphasis();
     }
 
+    /// Enter a POINT pick for the vec3 field of feature `feature_id` whose pick
+    /// button is `button_path` (the field's path with
+    /// [`super::POINT_PICK_SUFFIX`] on its last key): the same roll and the
+    /// same type-constrained pick as [`Self::begin_ref_select`], single-valued
+    /// and unseeded, committed by [`Self::finish_ref_select`] as a point (see
+    /// [`RefSelectTarget::PointPick`]).
+    pub fn begin_point_pick(&mut self, feature_id: &str, button_path: Vec<String>, label: String, filter: Vec<String>) {
+        self.begin_ref_select(feature_id, button_path, label, filter, false, Vec::new());
+        if let Some(state) = self.ref_select.as_mut() {
+            state.target = RefSelectTarget::PointPick;
+        }
+    }
+
+    /// The point a picked `name` puts a vec3 field of the feature at `index`
+    /// on, resolved against the scene BEFORE that feature — the prefix the
+    /// pick was made on, replayed like the default pivot's (warm).
+    fn point_pick_value(&self, index: usize, name: &str) -> Result<[f64; 3], String> {
+        let request = self.history.request_before(index).ok_or("the feature has no history before it")?;
+        let request: HistoryRequest = serde_json::from_value(request).map_err(|error| error.to_string())?;
+        let _trace = crate::run_trace::span("point_pick_value");
+        let result = self.execute_plugin_history(&request);
+        brep_kernel::face_transform_reference_point(&result.results, name)
+    }
+
     /// The running list of picked names (empty when not active) — the modal UI
     /// reads this back to draw its one-per-line list.
     pub fn ref_select_names(&self) -> Vec<String> {
@@ -476,6 +500,9 @@ impl EngineState {
                     RefSelectTarget::PortPoint { .. } => {
                         super::pmi_ops::world_vertex_ref(&hit.solid, hit.position)
                     }
+                    // A point pick resolves against the modeling scene before
+                    // the feature, whose solids are in world coordinates.
+                    RefSelectTarget::PointPick => super::pmi_ops::world_vertex_ref(&hit.solid, hit.position),
                     _ => return,
                 }
             }
@@ -657,6 +684,30 @@ impl EngineState {
             self.dirty = true;
             return;
         }
+        // A vec3 field's POINT pick: the one pick becomes three numbers at the
+        // field's own path (the button's path without its suffix). A pick that
+        // does not resolve says why and leaves the stored value as it was.
+        if state.target == RefSelectTarget::PointPick {
+            let mut field_path = state.path.clone();
+            if let Some(last) = field_path.last_mut() {
+                if let Some(stem) = last.strip_suffix(super::POINT_PICK_SUFFIX) {
+                    *last = stem.to_string();
+                }
+            }
+            if let (Some(index), Some(name)) = (self.history.index_of(&state.feature_id), state.names.first()) {
+                match self.point_pick_value(index, name) {
+                    Ok(point) => {
+                        let mut params = self.history.feature_params(index).unwrap_or_else(|| serde_json::json!({}));
+                        set_json_at(&mut params, &field_path, serde_json::json!(point));
+                        self.stamp_face_transform_pivot(index, &mut params);
+                        self.history.set_feature_params(index, params);
+                    }
+                    Err(error) => self.push_notice(format!("{}: {error}", state.label)),
+                }
+            }
+            self.end_ref_select(state.restore_index);
+            return;
+        }
         if state.target == RefSelectTarget::Simulation {
             let _ = self.emphasis.apply_json("{}");
             self.selection_filter = SelectionFilter::default();
@@ -744,6 +795,7 @@ impl EngineState {
                     | RefSelectTarget::Instructions { .. }
                     | RefSelectTarget::Simulation
                     | RefSelectTarget::ReplaceRepair
+                    | RefSelectTarget::PointPick
             )
         })
     }

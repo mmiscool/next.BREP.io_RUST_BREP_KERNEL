@@ -405,6 +405,11 @@ fn blend_closed_edge_impl(
     crate::blend::stations::CLOSED_MODEL_UNMET.with(|slot| slot.set(None));
     crate::blend::stations::CLOSED_REQUEST_RAILS.with(|slot| slot.set(None));
     prepare_timing.stop();
+    // One section turned is the whole blend only when the section does not
+    // vary: `BREP_BLEND_REVOLUTION_SPHERE_PLANE` reads a sphere with a plane
+    // as a revolution only for a constant radius or a setback law (one law
+    // all round), for the whole of this rim's build.
+    let _sphere_plane = crate::blend::stations::admit_sphere_plane(constant.is_some() || crate::blend::setback::active().is_some());
     let exact_revolution = crate::blend::stations::closed_revolution_axis(&first_mate, &second_mate).is_some();
     let depth_budget = if exact_revolution { 0 } else { MAX_REFINEMENT_DEPTH };
     if exact_revolution {
@@ -725,7 +730,7 @@ fn blend_closed_edge_impl(
             // 2.6e-5 to 3.8e-5 (fat carrier) off the rails they trim, while the
             // rails stood on their carriers to 1e-6 — the whole of a 5e-6 to
             // 1.1e-5 shell vector-area residual and of a seam-placement-
-            // dependent volume (dumps of c5ea8fb80 and 635ef7630, read
+            // dependent volume (two builds' dumps, read
             // input-free). Each is refitted to its rail's own projected track
             // at the pcurve floor, by the closed chain's support-piece fitter.
             let fit_timing = crate::blend::BlendTimer::start("timing.closed.rows.fit_ms");

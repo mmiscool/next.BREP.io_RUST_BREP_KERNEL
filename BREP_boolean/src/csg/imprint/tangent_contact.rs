@@ -190,6 +190,7 @@ struct ContactParameters {
     vb: f64,
 }
 
+#[derive(Clone, Copy)]
 struct SurfaceDomain {
     u0: f64,
     u1: f64,
@@ -276,6 +277,26 @@ fn refine_contact(
     seed: Vec3,
     tolerance: f64,
 ) -> Result<Option<(ContactParameters, f64)>, KernelRefusal> {
+    Ok(refine_contact_reading(first, second, seed)?
+        .and_then(|reading| (reading.residual <= tolerance).then_some((reading.parameters, reading.tangency))))
+}
+
+/// Where the refinement ended: its best iterate, that iterate's worst residual
+/// (gap or normal disagreement) and normal disagreement, and whether a
+/// parameter of it is held on an OPEN edge of its surface's domain (not a
+/// closed seam, where the contact would continue on the other side).
+struct RefinedReading {
+    parameters: ContactParameters,
+    residual: f64,
+    tangency: f64,
+    pinned: bool,
+}
+
+fn refine_contact_reading(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    seed: Vec3,
+) -> Result<Option<RefinedReading>, KernelRefusal> {
     let seed_a = project_point_to_surface(first, seed)
         .or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
     let seed_b = project_point_to_surface(second, seed)
@@ -311,6 +332,16 @@ fn refine_contact(
         clamp(moved)
     };
     let mut best = current;
+    // The descent direction −Jᵀ F at `best`: a parameter on a bound whose
+    // descent points OUT through it is held there by the domain, not by the
+    // contact (the constrained minimum's KKT sign).
+    let mut best_descent: Option<[f64; 4]> = None;
+    // Per parameter and side (low, high): a step overshot that bound by a real
+    // amount and was clamped there. It names the edge only where the BEST
+    // iterate also sits on that bound (an excursion the refinement came back
+    // from proves nothing).
+    let mut overshot = [[false; 2]; 4];
+    let mut current_is_best;
     let mut best_residual = f64::INFINITY;
     let mut best_tangency = f64::INFINITY;
     let mut without_progress = 0usize;
@@ -333,6 +364,10 @@ fn refine_contact(
             best_residual = worst;
             best_tangency = tangency;
             best = current;
+            best_descent = None;
+            current_is_best = true;
+        } else {
+            current_is_best = false;
         }
         // Converged as far as this system allows. Along an EXTENDED contact the
         // solution set is a curve, so the iterate keeps drifting ALONG it at
@@ -378,6 +413,9 @@ fn refine_contact(
             }
             rhs[row] = -(0..5).map(|k| jacobian[k][row] * residual[k]).sum::<f64>();
         }
+        if current_is_best {
+            best_descent = Some(rhs);
+        }
         let diagonal = (0..4).fold(0.0f64, |largest, index| largest.max(matrix[index][index]));
         if diagonal <= 0.0 {
             return Ok(None);
@@ -398,12 +436,19 @@ fn refine_contact(
                 scale = scale.min(limit / changes[index].abs());
             }
         }
-        let next = clamp(ContactParameters {
+        let unclamped = ContactParameters {
             ua: current.ua + changes[0] * scale,
             va: current.va + changes[1] * scale,
             ub: current.ub + changes[2] * scale,
             vb: current.vb + changes[3] * scale,
-        });
+        };
+        let next = clamp(unclamped);
+        let overshoot = [unclamped.ua - next.ua, unclamped.va - next.va, unclamped.ub - next.ub, unclamped.vb - next.vb];
+        for index in 0..4 {
+            if overshoot[index].abs() > CLAMP_OVERSHOOT * spans[index] {
+                overshot[index][usize::from(overshoot[index] > 0.0)] = true;
+            }
+        }
         let moved = (0..4)
             .map(|index| {
                 let (a, b) = match index {
@@ -420,12 +465,96 @@ fn refine_contact(
             break;
         }
     }
+    let values = [best.ua, best.va, best.ub, best.vb];
+    let bounds = [
+        (first_domain.u0, first_domain.u1),
+        (first_domain.v0, first_domain.v1),
+        (second_domain.u0, second_domain.u1),
+        (second_domain.v0, second_domain.v1),
+    ];
+    let descent_out = best_descent.map_or([false; 4], |descent| {
+        let norm = descent.iter().map(|d| d * d).sum::<f64>().sqrt();
+        std::array::from_fn(|index| {
+            let (low, high) = bounds[index];
+            let outward = (values[index] <= low && descent[index] < 0.0) || (values[index] >= high && descent[index] > 0.0);
+            outward && descent[index].abs() >= HELD_DESCENT_SHARE * norm
+        })
+    });
+    let held = std::array::from_fn::<bool, 4, _>(|index| {
+        let (low, high) = bounds[index];
+        descent_out[index] || (values[index] <= low && overshot[index][0]) || (values[index] >= high && overshot[index][1])
+    });
+    let pinned = pinned_on_open_edge(first, best.ua, best.va, first_domain, [held[0], held[1]])?
+        || pinned_on_open_edge(second, best.ub, best.vb, second_domain, [held[2], held[3]])?;
     if std::env::var("BREP_DEBUG_PAIRS").is_ok() {
         eprintln!(
-            "  refine_contact: best gap/tangency {best_residual:.3e} tangency {best_tangency:.3e}"
+            "  refine_contact: best gap/tangency {best_residual:.3e} tangency {best_tangency:.3e} pinned {pinned}"
         );
     }
-    Ok((best_residual <= tolerance).then_some((best, best_tangency)))
+    Ok(Some(RefinedReading { parameters: best, residual: best_residual, tangency: best_tangency, pinned }))
+}
+
+/// Share of the descent's norm a parameter's outward component needs before
+/// its bound counts as holding the refinement; a parameter the residual does
+/// not depend on (along an extended contact) reads round-off there.
+const HELD_DESCENT_SHARE: f64 = 0.1;
+
+/// Relative overshoot past a bound (in the parameter's span) a clamped step
+/// needs before it counts as the refinement running into that edge; round-off
+/// steps along a parameter the residual does not depend on stay far below.
+const CLAMP_OVERSHOOT: f64 = 1e-9;
+
+/// Is `(u, v)` held on an edge of `domain` across which `surface` does not
+/// continue? Only a parameter the refinement presses out through its bound
+/// (`held`, per u and v: a clamped step's overshoot, or the descent's sign at
+/// the best iterate) counts, and only where the surface's two opposite edges
+/// do not coincide (a closed seam).
+fn pinned_on_open_edge(surface: &NurbsSurface, u: f64, v: f64, domain: SurfaceDomain, held: [bool; 2]) -> Result<bool, KernelRefusal> {
+    let closed = |a: Vec3, b: Vec3, c: Vec3, d: Vec3| a.sub(b).length() <= 1e-12 * (1.0 + c.sub(d).length());
+    let at = |u: f64, v: f64| surface.evaluate(u, v).or_refuse(KernelStage::Intersect, "evaluate");
+    if held[0] && (u <= domain.u0 || u >= domain.u1) {
+        let (low, high) = (at(domain.u0, v)?, at(domain.u1, v)?);
+        if !closed(low, high, at(domain.u0, domain.v0)?, at(domain.u1, domain.v1)?) {
+            return Ok(true);
+        }
+    }
+    if held[1] && (v <= domain.v0 || v >= domain.v1) {
+        let (low, high) = (at(u, domain.v0)?, at(u, domain.v1)?);
+        if !closed(low, high, at(domain.u0, domain.v0)?, at(domain.u1, domain.v1)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `BREP_IMPRINT_TANGENCY_OFF_CARRIER` (default on since the 2026-11-18
+/// promotion; `=0` refuses as an unproven contact): a tangency witness whose
+/// refinement is driven onto an open edge of a carrier's domain and held there
+/// short of a contact names a contact OFF that carrier — within it the pair
+/// only nears tangency at its edge — so the pair is marched as an ordinary
+/// section instead of refused as an unproven contact.
+pub(super) fn tangency_off_carrier_on() -> bool {
+    switch!(live "BREP_IMPRINT_TANGENCY_OFF_CARRIER", true)
+}
+
+/// The witness's refinement ends held on an open edge of either carrier's
+/// domain, short of a contact (see [`tangency_off_carrier_on`]). Read in both
+/// orders: the normal disagreement is measured in the FIRST surface's tangent
+/// basis, which turns with that surface's own parameters, so the descent's
+/// sign at an edge of the first carrier can point inward while the
+/// disagreement grows that way (a quarter cylinder first against a plane
+/// tangent just before its start: the descent reads +20 into the piece); with
+/// the other surface first the same edge reads as holding.
+pub(super) fn tangency_runs_off_carrier(
+    first: &NurbsSurface,
+    second: &NurbsSurface,
+    witness: Vec3,
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    let held = |a: &NurbsSurface, b: &NurbsSurface| -> Result<bool, KernelRefusal> {
+        Ok(refine_contact_reading(a, b, witness)?.is_some_and(|reading| reading.pinned && reading.residual > tolerance))
+    };
+    Ok(held(first, second)? || held(second, first)?)
 }
 
 /// The second fundamental form of `surface` at `(u, v)`, expressed in the

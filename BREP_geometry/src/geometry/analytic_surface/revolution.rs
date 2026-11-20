@@ -108,7 +108,16 @@ pub fn revolution_structure(surface: &NurbsSurface) -> Option<RevolutionStructur
         NurbsCurve::new(surface.degree_v, surface.knots_v.clone(), rows[0].clone()).ok()?;
     let rebuilt = make_revolution(frame.origin, frame.axis, &generatrix, sweep).ok()?;
     if !nearly_equal_points(surface, &rebuilt, scale) {
-        return None;
+        // A turn of 90 to 180 degrees in ONE span, as
+        // `make_revolution_one_span` builds it (a one-conic corner's torus
+        // sector or horn; `BREP_REVOLUTION_ONE_SPAN_READ`).
+        if !(spans == 1 && sweep > std::f64::consts::FRAC_PI_2 && sweep < std::f64::consts::PI - 1e-6 && one_span_read_on()) {
+            return None;
+        }
+        let one_span = crate::surface::make_revolution_one_span(frame.origin, frame.axis, &generatrix, sweep).ok()?;
+        if !nearly_equal_points(surface, &one_span, scale) {
+            return None;
+        }
     }
     Some(RevolutionStructure {
         frame,
@@ -598,4 +607,11 @@ pub(super) fn clip_to_cylinder_height(curve: &NurbsCurve, frame: &RevolutionFram
         out.push(piece);
     }
     Some(out)
+}
+
+/// `BREP_REVOLUTION_ONE_SPAN_READ` (on by default; `=0` reads only
+/// `make_revolution`'s split turns): a turn of 90 to 180 degrees in ONE
+/// rational span is a surface of revolution too.
+fn one_span_read_on() -> bool {
+    crate::switch!(live "BREP_REVOLUTION_ONE_SPAN_READ", true)
 }

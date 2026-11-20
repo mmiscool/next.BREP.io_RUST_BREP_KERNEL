@@ -88,6 +88,17 @@ impl Plane {
     }
 }
 
+/// `BREP_OFFSET_SPHERE_CUT_CLOSED_VOLUME` (default off): the hull's and the
+/// cavity's volumes read in closed form ([`ball_cut_volume`]) when their caps
+/// are disjoint, each integral run only when the closed form does not agree,
+/// so nothing the measured check accepts declines. shell/sphere-pinhole-opening
+/// spent ~38 of ~145 ms on those two integrals (host); their closed forms sit
+/// 1e-15 from them, 1e-7 of the check's bar.
+fn closed_volume_on() -> bool {
+    switch!("BREP_OFFSET_SPHERE_CUT_CLOSED_VOLUME", false)
+}
+
+
 fn grazing_cavity_on() -> bool {
     switch!("BREP_OFFSET_SHELL_GRAZING_CAVITY", true)
 }
@@ -107,6 +118,67 @@ fn plane_of(face: &FaceRecord) -> Option<(Vec3, f64)> {
 /// offset` side), or `None` when the planes leave nothing. A plane that misses the
 /// ball on its kept side does not cut it; one that grazes it (within `linear`)
 /// is refused, since the split would leave a sliver or nothing.
+/// The volume of the ball `B(centre, radius)` less the caps beyond each plane
+/// (`normal · x > offset` cut away, `normal` unit) in closed form, when those
+/// caps are pairwise disjoint: `4/3 π R³ − Σ π k² (3R − k) / 3`, `k` each cap's
+/// height. `None` when two caps may overlap inside the ball, or a plane leaves
+/// nothing. Two caps are disjoint when the point of both half-spaces nearest
+/// the centre (the centre itself, a plane's foot, or the nearest point of the
+/// planes' common line) lies outside the ball by a margin.
+fn ball_cut_volume(centre: Vec3, radius: f64, planes: &[(Vec3, f64)]) -> Option<f64> {
+    // Each plane's distance from the centre along its normal: the cap is
+    // `normal · y >= s` in coordinates about the centre, of height R − s.
+    let caps = planes
+        .iter()
+        .map(|&(normal, offset)| (normal, offset - normal.dot(centre)))
+        .filter(|&(_, s)| s < radius)
+        .collect::<Vec<_>>();
+    if caps.iter().any(|&(_, s)| s <= -radius) {
+        return None;
+    }
+    let margin = 1e-9 * radius;
+    for (i, &(a, sa)) in caps.iter().enumerate() {
+        for &(b, sb) in &caps[i + 1..] {
+            let inside = |y: Vec3| a.dot(y) >= sa - margin && b.dot(y) >= sb - margin;
+            let mut nearest = f64::INFINITY;
+            for y in [Vec3::new(0.0, 0.0, 0.0), a.scale(sa), b.scale(sb)] {
+                if inside(y) {
+                    nearest = nearest.min(y.length());
+                }
+            }
+            // The planes' angle from the cross product, which keeps its
+            // precision as they turn parallel (1 − (a·b)² does not).
+            let sine = a.cross(b).length();
+            if sine >= 1e-3 {
+                // The nearest point of the planes' line. With det ≥ 1e-6 its
+                // rounding is ~1e-10 R; it is read low by 1e-6 R and more.
+                let g = a.dot(b);
+                let det = sine * sine;
+                let (p, q) = ((sa - g * sb) / det, (sb - g * sa) / det);
+                let allowance = 1e-6 * radius + 64.0 * f64::EPSILON * (p.abs() + q.abs());
+                nearest = nearest.min(a.scale(p).add(b.scale(q)).length() - allowance);
+            } else if a.x == -b.x && a.y == -b.y && a.z == -b.z {
+                // Exactly facing apart: disjoint exactly when their slab is empty.
+                if !(sa + sb > margin) {
+                    return None;
+                }
+            } else {
+                // Nearly parallel otherwise: left to the integral.
+                return None;
+            }
+            if !(nearest > radius + margin) {
+                return None;
+            }
+        }
+    }
+    let pi = std::f64::consts::PI;
+    let removed = caps.iter().map(|&(_, s)| {
+        let k = radius - s;
+        pi * k * k * (3.0 * radius - k) / 3.0
+    });
+    Some(4.0 / 3.0 * pi * radius * radius * radius - removed.sum::<f64>())
+}
+
 fn cut_ball(centre: Vec3, radius: f64, axis: Vec3, planes: &[(Vec3, f64)], linear: f64) -> Result<Option<BrepSolid>, String> {
     let mut body = make_sphere_brep(centre, radius, axis)?;
     for &(normal, offset) in planes {
@@ -228,7 +300,12 @@ fn build(source: &BrepSolid, opening_face_ids: &[u64], distance: f64) -> Result<
     let source_planes = planes.iter().map(|plane| (plane.normal, plane.offset)).collect::<Vec<_>>();
     let hull = cut_ball(centre, radius, axis, &source_planes, linear)?.ok_or("the planes leave nothing of the ball")?;
     let source_volume = solid_signed_volume(source)?;
-    if (solid_signed_volume(&hull)? - source_volume).abs() > MEASURE_BAR * source_volume.abs().max(1.0) {
+    let bar = MEASURE_BAR * source_volume.abs().max(1.0);
+    // `BREP_OFFSET_SPHERE_CUT_CLOSED_VOLUME`: the hull's closed-form volume
+    // first; the measured one decides, as before, whenever that does not agree.
+    let hull_agrees = closed_volume_on()
+        && ball_cut_volume(centre, radius, &source_planes).is_some_and(|exact| (exact - source_volume).abs() <= bar);
+    if !hull_agrees && (solid_signed_volume(&hull)? - source_volume).abs() > bar {
         return Err("the source is not the ball cut by its planes".into());
     }
 
@@ -237,7 +314,7 @@ fn build(source: &BrepSolid, opening_face_ids: &[u64], distance: f64) -> Result<
     // opening's cut is a latitude and the pole is cut away or far from it.
     let cavity_planes = planes.iter().map(|plane| (plane.normal, plane.cavity_offset(distance))).collect::<Vec<_>>();
     let cavity = cut_ball(centre, inner, axis, &cavity_planes, linear)?.ok_or("the moved planes leave no cavity")?;
-    let cavity_volume = solid_signed_volume(&cavity)?;
+    let closed_cavity = if closed_volume_on() { ball_cut_volume(centre, inner, &cavity_planes) } else { None };
     // A WHOLE ball sealed below every opening (the grazing case: it touches an opening plane at
     // one point) is the source with the ball as a void: the boolean reads a single point of
     // contact wrong (the ball r 5 below z 3 at wall 2 read 222.006 for 356.047).
@@ -279,8 +356,10 @@ fn build(source: &BrepSolid, opening_face_ids: &[u64], distance: f64) -> Result<
         }
     }
     let result_volume = solid_signed_volume(&result)?;
-    let owed_volume = source_volume - cavity_volume;
-    if (result_volume - owed_volume).abs() > MEASURE_BAR * source_volume.abs().max(1.0) {
+    let owed_by = |cavity_volume: f64| source_volume - cavity_volume;
+    let closed_agrees = closed_cavity.is_some_and(|exact| (result_volume - owed_by(exact)).abs() <= bar);
+    let owed_volume = if closed_agrees { owed_by(closed_cavity.unwrap_or_default()) } else { owed_by(solid_signed_volume(&cavity)?) };
+    if (result_volume - owed_volume).abs() > bar {
         return Err(format!("the difference reads {result_volume} against {owed_volume}"));
     }
     let mut owed_area = shell_area(source)?;
@@ -373,3 +452,4 @@ fn with_void(solid: &BrepSolid, void: &BrepSolid) -> Result<BrepSolid, String> {
     result.mass_properties_cache = Default::default();
     Ok(result)
 }
+

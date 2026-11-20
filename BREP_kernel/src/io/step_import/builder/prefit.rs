@@ -54,22 +54,37 @@ struct CoedgeFit {
 struct FaceFits {
     surface: NurbsSurface,
     coedges: Vec<CoedgeFit>,
+    /// `BREP_STEP_ALIAS_VERDICTS`: the face's loops whose aliasing scan read
+    /// no aliasing (`builder/alias_verdicts.rs`).
+    unaliased: Vec<super::alias_verdicts::Unaliased>,
 }
 
 struct Job {
     surface: NurbsSurface,
     tolerance: f64,
     coedges: Vec<(u64, bool, NurbsCurve, f64, f64)>,
+    /// The face's loops as the aliasing scan reads them, when the switch was
+    /// on on the loop's thread; empty otherwise.
+    loops: Vec<Vec<super::alias_verdicts::ScanCoedge>>,
 }
 
 /// The pending fits of one body; dropping it cancels the jobs not yet started.
 pub(super) struct Prefits {
     slots: crate::claim_slots::ClaimSlots<Job, FaceFits>,
     check: bool,
+    /// The helpers read their faces' aliasing verdicts.
+    verdicts: bool,
+}
+
+impl Prefits {
+    /// Whether the helpers read aliasing verdicts (`BREP_STEP_ALIAS_VERDICTS`).
+    pub(super) fn verdicts(&self) -> bool {
+        self.verdicts && !self.check
+    }
 }
 
 fn fit_job(job: Job) -> FaceFits {
-    let Job { surface, tolerance, coedges } = job;
+    let Job { surface, tolerance, coedges, loops } = job;
     let fits = coedges
         .into_iter()
         .map(|(edge_id, forward, curve, t0, t1)| {
@@ -89,7 +104,8 @@ fn fit_job(job: Job) -> FaceFits {
             CoedgeFit { edge_id, forward, curve, t0, t1, tolerance, ask, floor }
         })
         .collect();
-    FaceFits { surface, coedges: fits }
+    let unaliased = if loops.is_empty() { Vec::new() } else { super::alias_verdicts::helper_verdicts(&surface, loops) };
+    FaceFits { surface, coedges: fits, unaliased }
 }
 
 impl<'a> SolidBuilder<'a> {
@@ -109,22 +125,43 @@ impl<'a> SolidBuilder<'a> {
         if crate::pcurve::foot_memo_open() {
             return Ok(None);
         }
+        // `BREP_STEP_ALIAS_VERDICTS`, read here on the loop's thread; never
+        // under the joint pass's trace, which runs every scan live.
+        let verdicts = super::alias_verdicts::alias_verdicts_enabled() && std::env::var("BREP_DEBUG_PCURVE").is_err();
         let mut jobs = Vec::with_capacity(pending.len());
         for face in pending {
             let mut coedges = Vec::new();
+            let mut loops = Vec::new();
             for (specs, _) in &face.bounds {
                 for &(edge_id, forward) in specs {
                     let edge = self.edge_record(edge_id);
                     coedges.push((edge_id, forward, edge.curve.clone(), edge.t0, edge.t1));
                 }
+                if verdicts {
+                    loops.push(
+                        specs
+                            .iter()
+                            .map(|&(edge_id, forward)| {
+                                let edge = self.edge_record(edge_id);
+                                super::alias_verdicts::ScanCoedge {
+                                    curve: edge.curve.clone(),
+                                    t0: edge.t0,
+                                    t1: edge.t1,
+                                    forward,
+                                    degenerate: edge.degenerate,
+                                }
+                            })
+                            .collect(),
+                    );
+                }
             }
-            jobs.push(Job { surface: face.surface.clone(), tolerance: loop_pcurve_tolerance(&face.surface)?, coedges });
+            jobs.push(Job { surface: face.surface.clone(), tolerance: loop_pcurve_tolerance(&face.surface)?, coedges, loops });
         }
         let Some(slots) = crate::claim_slots::ClaimSlots::spawn(jobs, fit_job) else {
             return Ok(None);
         };
         STATS.with(|stats| stats.take());
-        Ok(Some(Prefits { slots, check: mode == crate::env_read::Mode::Check }))
+        Ok(Some(Prefits { slots, check: mode == crate::env_read::Mode::Check, verdicts }))
     }
 }
 
@@ -175,7 +212,14 @@ pub(super) struct Installed(Option<Option<(FaceFits, Vec<bool>, bool)>>);
 
 impl Installed {
     fn install(fits: Option<FaceFits>, check: bool) -> Self {
-        let offered = fits.map(|fits| {
+        let offered = fits.map(|mut fits| {
+            // A helper's verdicts join the body's memo (`check` reads every
+            // scan live instead, as it fits every coedge live).
+            for entry in std::mem::take(&mut fits.unaliased) {
+                if !check {
+                    super::alias_verdicts::record_unaliased(entry);
+                }
+            }
             let used = vec![false; fits.coedges.len()];
             (fits, used, check)
         });
@@ -202,14 +246,14 @@ fn same_point(a: &crate::Vec4, b: &crate::Vec4) -> bool {
     same_floats(&[a.x, a.y, a.z, a.w], &[b.x, b.y, b.z, b.w])
 }
 
-fn same_curve(a: &NurbsCurve, b: &NurbsCurve) -> bool {
+pub(super) fn same_curve(a: &NurbsCurve, b: &NurbsCurve) -> bool {
     a.degree == b.degree
         && same_floats(&a.knots, &b.knots)
         && a.control_points.len() == b.control_points.len()
         && a.control_points.iter().zip(&b.control_points).all(|(p, q)| same_point(p, q))
 }
 
-fn same_surface(a: &NurbsSurface, b: &NurbsSurface) -> bool {
+pub(super) fn same_surface(a: &NurbsSurface, b: &NurbsSurface) -> bool {
     a.degree_u == b.degree_u
         && a.degree_v == b.degree_v
         && same_floats(&a.knots_u, &b.knots_u)

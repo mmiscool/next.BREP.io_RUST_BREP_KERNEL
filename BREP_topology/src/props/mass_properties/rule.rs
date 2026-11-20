@@ -529,13 +529,50 @@ pub struct SurfaceRules {
     v_breaks: Vec<f64>,
     /// `None` until the cell has been read; `(u roots, v roots)` after.
     cells: Vec<Option<(Vec<Complex>, Vec<Complex>)>>,
+    /// The face translated to its poles' centre for the adaptive area
+    /// re-read (`integration::area_local_frame_on`), built at the first
+    /// cell that asks; the inner `None` when there is none to read on.
+    /// Owned (taken and restored around each read), so the rules stay `Send`.
+    local_area: Option<Option<Box<FaceRecord>>>,
 }
 
 impl SurfaceRules {
     pub fn new(surface: &NurbsSurface) -> Result<Self, String> {
         let (u_breaks, v_breaks) = super::surface_breaks(surface)?;
         let cells = vec![None; u_breaks.len().saturating_sub(1) * v_breaks.len().saturating_sub(1)];
-        Ok(Self { u_breaks, v_breaks, cells, station_identity: super::cell_memo::identity(surface) })
+        Ok(Self { u_breaks, v_breaks, cells, station_identity: super::cell_memo::identity(surface), local_area: None })
+    }
+
+    /// `face` (whose carrier these rules were made for) translated to
+    /// [`super::integration::local_frame_reference`], when
+    /// `BREP_MASS_AREA_LOCAL_FRAME` is on and the reference moves it; built
+    /// once per face and handed out by value: give it back with
+    /// [`Self::restore_local_area_face`] (a read that fails does not, and the
+    /// next cell rebuilds it). The weights and knots are the carrier's own,
+    /// so the cached roots and panels serve the translated copy unchanged.
+    pub(super) fn take_local_area_face(&mut self, face: &FaceRecord) -> Option<Box<FaceRecord>> {
+        if !super::integration::area_local_frame_on() {
+            return None;
+        }
+        match self.local_area.take() {
+            Some(Some(local)) => Some(local),
+            Some(None) => {
+                self.local_area = Some(None);
+                None
+            }
+            None => super::integration::local_frame_reference(face)
+                .and_then(|reference| super::integration::translated_face(face, reference))
+                .map(Box::new)
+                .or_else(|| {
+                    self.local_area = Some(None);
+                    None
+                }),
+        }
+    }
+
+    /// Hand back the face [`Self::take_local_area_face`] gave out.
+    pub(super) fn restore_local_area_face(&mut self, local: Box<FaceRecord>) {
+        self.local_area = Some(Some(local));
     }
 
     /// Which knot span of `breaks` holds `parameter` (the last one when it

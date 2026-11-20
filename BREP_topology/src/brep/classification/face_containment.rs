@@ -1,4 +1,5 @@
 use crate::curve::interior_knot_count;
+use crate::topology::LoopRecord;
 pub use super::*;
 
 /// How many chords the containment lanes sample ONE pcurve at:
@@ -671,29 +672,156 @@ fn loop_samples(prepared: &PreparedFace, face: &FaceRecord, loop_index: usize) -
     if let Some(Some(sampled)) = prepared.loop_samples.borrow().get(loop_index) {
         return sampled.clone();
     }
-    let sampled = (|| {
-        let mut points: Vec<Vec2> = Vec::new();
-        for coedge in &face.loops[loop_index].coedges {
-            let curve = &coedge.pcurve;
-            let [start, end] = curve.domain()?;
-            let sample_count = trim_sample_count(curve);
-            for index in 0..sample_count {
-                let parameter = trim_station(start, end, index, sample_count);
-                let evaluated = curve.evaluate(parameter)?;
-                points.push(Vec2 {
-                    x: evaluated.x,
-                    y: evaluated.y,
-                });
-            }
-        }
-        Ok(std::rc::Rc::new(points))
-    })();
+    let sampled = shared_loop_samples(&face.loops[loop_index]);
     let mut cells = prepared.loop_samples.borrow_mut();
     if cells.len() < face.loops.len() {
         cells.resize(face.loops.len(), None);
     }
     cells[loop_index] = Some(sampled.clone());
     sampled
+}
+
+/// `BREP_LOOP_SAMPLE_MEMO`: set to `"0"`, [`loop_samples`] samples every loop
+/// of a newly prepared face again instead of serving a loop this thread
+/// sampled before from [`LOOP_SAMPLE_MEMO`].
+pub const LOOP_SAMPLE_MEMO_SWITCH: &str = "BREP_LOOP_SAMPLE_MEMO";
+
+/// Loops this thread sampled most recently, keyed by everything sampling
+/// reads: per coedge, in order, the pcurve's degree, knots and control points
+/// (each value by its bits, never a NaN). The prepared-face cache is keyed by
+/// the whole face, so a face that gained one loop (a cut's new hole) was a
+/// miss that sampled every unchanged loop again: a ball cut by 62 dimples one
+/// after another re-evaluated every earlier rim at each cut, 7.8% of the run.
+/// The samples are a function of the pcurves alone, so serving them from here
+/// gives the lanes the same floats.
+struct LoopSampleMemo {
+    /// `(hash, signature, samples)`, the most recently used first.
+    entries: Vec<(u64, Vec<f64>, std::rc::Rc<Vec<Vec2>>)>,
+    /// Sum of the entries' sample counts.
+    points: usize,
+}
+
+/// Most entries [`LOOP_SAMPLE_MEMO`] keeps.
+const LOOP_SAMPLE_MEMO_ENTRIES: usize = 256;
+/// Most samples [`LOOP_SAMPLE_MEMO`] keeps over all its entries (16 bytes
+/// each), past which the least recently used entries go.
+const LOOP_SAMPLE_MEMO_POINTS: usize = 1 << 21;
+
+thread_local! {
+    static LOOP_SAMPLE_MEMO: std::cell::RefCell<LoopSampleMemo> =
+        const { std::cell::RefCell::new(LoopSampleMemo { entries: Vec::new(), points: 0 }) };
+}
+
+/// Walks what [`sample_loop`] reads of `record`, every count before the
+/// values it counts, handing each value to `visit` until it returns false.
+/// Returns whether every value was visited.
+fn walk_loop_signature<F: FnMut(f64) -> bool>(record: &LoopRecord, visit: &mut F) -> bool {
+    if !visit(record.coedges.len() as f64) {
+        return false;
+    }
+    for coedge in &record.coedges {
+        let curve = &coedge.pcurve;
+        if !(visit(curve.degree as f64) && visit(curve.knots.len() as f64)) {
+            return false;
+        }
+        if !(curve.knots.iter().all(|&knot| visit(knot)) && visit(curve.control_points.len() as f64)) {
+            return false;
+        }
+        if !curve.control_points.iter().all(|p| visit(p.x) && visit(p.y) && visit(p.z) && visit(p.w)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Every pcurve of `record` at [`trim_sample_count`] chords, [`trim_station`]
+/// `0..count`, in coedge order.
+fn sample_loop(record: &LoopRecord) -> Result<Vec<Vec2>, String> {
+    let mut points: Vec<Vec2> = Vec::new();
+    for coedge in &record.coedges {
+        let curve = &coedge.pcurve;
+        let [start, end] = curve.domain()?;
+        let sample_count = trim_sample_count(curve);
+        for index in 0..sample_count {
+            let parameter = trim_station(start, end, index, sample_count);
+            let evaluated = curve.evaluate(parameter)?;
+            points.push(Vec2 {
+                x: evaluated.x,
+                y: evaluated.y,
+            });
+        }
+    }
+    Ok(points)
+}
+
+/// [`sample_loop`] of `record`, served from [`LOOP_SAMPLE_MEMO`] when this
+/// thread sampled a loop with the same signature to the bit. An error is
+/// returned and not kept.
+fn shared_loop_samples(record: &LoopRecord) -> Result<std::rc::Rc<Vec<Vec2>>, String> {
+    if !switch!(LOOP_SAMPLE_MEMO_SWITCH, true) {
+        return sample_loop(record).map(std::rc::Rc::new);
+    }
+    use std::hash::Hasher;
+    let mut hasher = rustc_hash::FxHasher::default();
+    walk_loop_signature(record, &mut |value: f64| {
+        hasher.write_u64(value.to_bits());
+        true
+    });
+    let hash = hasher.finish();
+    let found = LOOP_SAMPLE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        let at = memo.entries.iter().position(|(entry_hash, signature, _)| {
+            if *entry_hash != hash {
+                return false;
+            }
+            let mut index = 0;
+            let walked = walk_loop_signature(record, &mut |value: f64| {
+                let same = signature
+                    .get(index)
+                    .is_some_and(|stored| stored.to_bits() == value.to_bits() && !value.is_nan());
+                index += 1;
+                same
+            });
+            walked && index == signature.len()
+        })?;
+        let entry = memo.entries.remove(at);
+        let samples = entry.2.clone();
+        memo.entries.insert(0, entry);
+        Some(samples)
+    });
+    if let Some(samples) = found {
+        // Whether sampling succeeds also depends on each pcurve instance's
+        // validation, which the key does not hold (an instance validated
+        // before its fields changed evaluates content a fresh one rejects).
+        // Sampling validates each pcurve first, in coedge order, and every
+        // evaluation of content served here succeeded, so validating in the
+        // same order returns exactly the error a fresh sampling would.
+        for coedge in &record.coedges {
+            coedge.pcurve.domain()?;
+        }
+        containment_profile(|p| p.loop_sample_hits += 1);
+        return Ok(samples);
+    }
+    let samples = std::rc::Rc::new(sample_loop(record)?);
+    containment_profile(|p| p.loop_sample_misses += 1);
+    if samples.len() > LOOP_SAMPLE_MEMO_POINTS {
+        return Ok(samples);
+    }
+    let mut signature = Vec::new();
+    walk_loop_signature(record, &mut |value: f64| {
+        signature.push(value);
+        true
+    });
+    LOOP_SAMPLE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        memo.points += samples.len();
+        memo.entries.insert(0, (hash, signature, samples.clone()));
+        while memo.entries.len() > LOOP_SAMPLE_MEMO_ENTRIES || memo.points > LOOP_SAMPLE_MEMO_POINTS {
+            let Some((_, _, dropped)) = memo.entries.pop() else { break };
+            memo.points -= dropped.len();
+        }
+    });
+    Ok(samples)
 }
 
 /// Per-thread split of what a face's FIRST query pays to prepare it, printed
@@ -726,6 +854,8 @@ struct ContainmentProfile {
     region_evaluate_ms: f64,
     region_canonical_ms: f64,
     region_segments_ms: f64,
+    loop_sample_hits: u64,
+    loop_sample_misses: u64,
 }
 
 thread_local! {
@@ -736,6 +866,7 @@ thread_local! {
             rim_strip_preps: 0, rim_strip_ms: 0.0, generic_preps: 0, generic_ms: 0.0,
             generic_chords: 0, index_builds: 0, index_ms: 0.0, region_builds: 0,
             region_evaluate_ms: 0.0, region_canonical_ms: 0.0, region_segments_ms: 0.0,
+            loop_sample_hits: 0, loop_sample_misses: 0,
         }) };
 }
 
@@ -774,11 +905,12 @@ pub fn containment_profile_report(label: &str) {
         return;
     }
     profile_line!(
-        "containment.profile {label} cache_misses={} seam_band: preps={} ms={:.2} sphere_cap: preps={} ms={:.2} horizon: preps={} ms={:.2} rim_strip: preps={} ms={:.2} generic: preps={} ms={:.2} chords={} index: builds={} ms={:.2} region: builds={} evaluate_ms={:.2} canonical_ms={:.2} segments_ms={:.2}",
+        "containment.profile {label} cache_misses={} seam_band: preps={} ms={:.2} sphere_cap: preps={} ms={:.2} horizon: preps={} ms={:.2} rim_strip: preps={} ms={:.2} generic: preps={} ms={:.2} chords={} index: builds={} ms={:.2} region: builds={} evaluate_ms={:.2} canonical_ms={:.2} segments_ms={:.2} loop_samples: memo_hits={} memo_misses={}",
         p.cache_misses, p.seam_band_preps, p.seam_band_ms, p.sphere_cap_preps, p.sphere_cap_ms,
         p.horizon_preps, p.horizon_ms, p.rim_strip_preps, p.rim_strip_ms, p.generic_preps,
         p.generic_ms, p.generic_chords, p.index_builds, p.index_ms, p.region_builds,
         p.region_evaluate_ms, p.region_canonical_ms, p.region_segments_ms,
+        p.loop_sample_hits, p.loop_sample_misses,
     );
     CONTAINMENT_PROFILE.with(|cell| cell.set(ContainmentProfile::default()));
 }
@@ -978,10 +1110,16 @@ fn cached_entry(
     })
 }
 
-/// Empties this thread's prepared-face cache, spherical regions included. For
-/// the boolean's operand-state instrument (`BREP_DEBUG_OPERAND_STATE=tls`) only.
+/// Empties this thread's prepared-face cache, spherical regions included, and
+/// its loop-sample memo. For the boolean's operand-state instrument
+/// (`BREP_DEBUG_OPERAND_STATE=tls`) only.
 pub fn forget_prepared_faces() {
     PREPARED_FACES.with(|cache| cache.borrow_mut().entries.clear());
+    LOOP_SAMPLE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        memo.entries.clear();
+        memo.points = 0;
+    });
 }
 
 

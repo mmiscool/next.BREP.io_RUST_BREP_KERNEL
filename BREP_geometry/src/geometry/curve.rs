@@ -126,11 +126,15 @@ impl Vec4 {
     }
 }
 
-/// Largest degree served by the allocation-free stack-array basis engine.
-/// Higher degrees (rare: only externally imported geometry) fall back to the
-/// heap-allocating `KnotVector` path.
+/// Public stack capacity used by prepared readers and optional algorithms.
+/// Keep this bound stable: those algorithms may use different arithmetic.
 pub const MAX_STACK_DEGREE: usize = 7;
 pub const MAX_STACK_ORDER: usize = MAX_STACK_DEGREE + 1;
+
+// The scalar surface evaluator also carries degree-nine screw walls. Its
+// larger scratch must not enable other algorithms or resize public fields.
+pub(crate) const EVALUATOR_STACK_DEGREE: usize = 9;
+pub(crate) const EVALUATOR_STACK_ORDER: usize = EVALUATOR_STACK_DEGREE + 1;
 
 /// `BREP_DEBUG_KNOTS=1` diagnostic for a rejected knot vector: dumps the whole
 /// vector (plus a backtrace) to stderr and appends it to the returned message,
@@ -268,26 +272,38 @@ pub fn knot_find_span(knots: &[f64], degree: usize, parameter: f64) -> usize {
 
 /// Cox–de Boor basis functions into a caller-provided stack array.
 /// Requires `degree <= MAX_STACK_DEGREE`; entries `0..=degree` are written.
+#[inline]
 pub fn basis_functions_into(
+    knots: &[f64], degree: usize, span: usize, parameter: f64,
+    basis: &mut [f64; MAX_STACK_ORDER],
+) {
+    debug_assert!(degree <= MAX_STACK_DEGREE);
+    basis_functions_wide(knots, degree, span, parameter, basis);
+}
+
+/// Internal surface scratch, including ninth-degree screw walls.
+pub(crate) fn basis_functions_wide<const WIDTH: usize>(
     knots: &[f64],
     degree: usize,
     span: usize,
     parameter: f64,
-    basis: &mut [f64; MAX_STACK_ORDER],
+    basis: &mut [f64; WIDTH],
 ) {
-    debug_assert!(degree <= MAX_STACK_DEGREE);
-    // The degrees every carrier the kernel builds has (1..=5) run the same
+    debug_assert!(degree <= EVALUATOR_STACK_DEGREE);
+    debug_assert!(degree < WIDTH);
+    // Common carrier degrees (1..=5, 8 and 9) run the same
     // recurrence with the degree and the scratch size fixed at compile time:
     // the same operations in the same order on the same operands, so the same
-    // bits, without the eight-wide scratch fill and runtime loop bounds that
-    // were a third of a sign reading's surface station (
-    // 2026-11-02). Higher degrees keep the eight-wide scratch.
+    // bits, without the full-width scratch fill and runtime loop bounds.
+    // Degrees 0, 6 and 7 retain the public eight-wide scratch.
     match degree {
         1 => basis_functions_scratch::<2>(knots, 1, span, parameter, basis),
         2 => basis_functions_scratch::<3>(knots, 2, span, parameter, basis),
         3 => basis_functions_scratch::<4>(knots, 3, span, parameter, basis),
         4 => basis_functions_scratch::<5>(knots, 4, span, parameter, basis),
         5 => basis_functions_scratch::<6>(knots, 5, span, parameter, basis),
+        8 => basis_functions_scratch::<9>(knots, 8, span, parameter, basis),
+        9 => basis_functions_scratch::<10>(knots, 9, span, parameter, basis),
         _ => basis_functions_scratch::<MAX_STACK_ORDER>(knots, degree, span, parameter, basis),
     }
 }
@@ -301,7 +317,7 @@ fn basis_functions_scratch<const ORDER: usize>(
     degree: usize,
     span: usize,
     parameter: f64,
-    basis: &mut [f64; MAX_STACK_ORDER],
+    basis: &mut [f64],
 ) {
     debug_assert!(degree < ORDER);
     let mut left = [0.0f64; ORDER];
@@ -314,53 +330,75 @@ fn basis_functions_scratch<const ORDER: usize>(
 /// degree keep whatever the caller initialized them to (callers zero-fill,
 /// matching the heap implementation's zero rows). Requires
 /// `degree <= MAX_STACK_DEGREE` and `out.len() > derivative_count`.
+#[inline]
 pub fn basis_derivatives_into(
+    knots: &[f64], degree: usize, span: usize, parameter: f64,
+    derivative_count: usize, out: &mut [[f64; MAX_STACK_ORDER]],
+) {
+    debug_assert!(degree <= MAX_STACK_DEGREE);
+    basis_derivatives_wide(knots, degree, span, parameter, derivative_count, out);
+}
+
+/// Internal surface scratch, with the public helper's arithmetic.
+pub(crate) fn basis_derivatives_wide<const WIDTH: usize>(
     knots: &[f64],
     degree: usize,
     span: usize,
     parameter: f64,
     derivative_count: usize,
-    out: &mut [[f64; MAX_STACK_ORDER]],
+    out: &mut [[f64; WIDTH]],
 ) {
-    debug_assert!(degree <= MAX_STACK_DEGREE);
+    debug_assert!(degree <= EVALUATOR_STACK_DEGREE);
+    debug_assert!(degree < WIDTH);
     debug_assert!(out.len() > derivative_count);
+    // A value-only request needs only the current basis column. A2.2 uses
+    // the same scalar recurrence as A2.3's zeroth row, without its square
+    // derivative scratch table or the final column copy.
+    if derivative_count == 0 {
+        basis_functions_wide(knots, degree, span, parameter, &mut out[0]);
+        return;
+    }
     // The degree is already fixed below, but A2.3's inner k loop still
     // receives a runtime derivative count. Fix the common counts too,
     // without changing the recurrence or the higher-order fallback.
     if switch!("BREP_BASIS_DERIVATIVE_COUNT_FIXED", true) {
         match derivative_count {
-            0 => return basis_derivatives_count_fixed::<0>(knots, degree, span, parameter, out),
-            1 => return basis_derivatives_count_fixed::<1>(knots, degree, span, parameter, out),
-            2 => return basis_derivatives_count_fixed::<2>(knots, degree, span, parameter, out),
+            0 => return basis_derivatives_count_fixed::<0, WIDTH>(knots, degree, span, parameter, out),
+            1 => return basis_derivatives_count_fixed::<1, WIDTH>(knots, degree, span, parameter, out),
+            2 => return basis_derivatives_count_fixed::<2, WIDTH>(knots, degree, span, parameter, out),
             _ => {}
         }
     }
-    // Degrees 1..=5 with the degree and the scratch size fixed at compile
+    // Degrees 1..=5, 8 and 9 with degree and scratch size fixed at compile
     // time (see `basis_functions_into`): the same operations in the same
     // order, so the same bits; `ndu`, `left`, `right` and `a` shrink from
-    // eight-wide to `degree + 1`-wide and the loop bounds fold.
+    // full-width to `degree + 1`-wide and the loop bounds fold.
     match degree {
-        1 => basis_derivatives_scratch::<2>(knots, 1, span, parameter, derivative_count, out),
-        2 => basis_derivatives_scratch::<3>(knots, 2, span, parameter, derivative_count, out),
-        3 => basis_derivatives_scratch::<4>(knots, 3, span, parameter, derivative_count, out),
-        4 => basis_derivatives_scratch::<5>(knots, 4, span, parameter, derivative_count, out),
-        5 => basis_derivatives_scratch::<6>(knots, 5, span, parameter, derivative_count, out),
-        _ => basis_derivatives_scratch::<MAX_STACK_ORDER>(knots, degree, span, parameter, derivative_count, out),
+        1 => basis_derivatives_scratch::<2, WIDTH>(knots, 1, span, parameter, derivative_count, out),
+        2 => basis_derivatives_scratch::<3, WIDTH>(knots, 2, span, parameter, derivative_count, out),
+        3 => basis_derivatives_scratch::<4, WIDTH>(knots, 3, span, parameter, derivative_count, out),
+        4 => basis_derivatives_scratch::<5, WIDTH>(knots, 4, span, parameter, derivative_count, out),
+        5 => basis_derivatives_scratch::<6, WIDTH>(knots, 5, span, parameter, derivative_count, out),
+        8 => basis_derivatives_scratch::<9, WIDTH>(knots, 8, span, parameter, derivative_count, out),
+        9 => basis_derivatives_scratch::<10, WIDTH>(knots, 9, span, parameter, derivative_count, out),
+        _ => basis_derivatives_scratch::<MAX_STACK_ORDER, WIDTH>(knots, degree, span, parameter, derivative_count, out),
     }
 }
 
 #[inline(always)]
-fn basis_derivatives_count_fixed<const COUNT: usize>(
+fn basis_derivatives_count_fixed<const COUNT: usize, const WIDTH: usize>(
     knots: &[f64], degree: usize, span: usize, parameter: f64,
-    out: &mut [[f64; MAX_STACK_ORDER]],
+    out: &mut [[f64; WIDTH]],
 ) {
     match degree {
-        1 => basis_derivatives_scratch::<2>(knots, 1, span, parameter, COUNT, out),
-        2 => basis_derivatives_scratch::<3>(knots, 2, span, parameter, COUNT, out),
-        3 => basis_derivatives_scratch::<4>(knots, 3, span, parameter, COUNT, out),
-        4 => basis_derivatives_scratch::<5>(knots, 4, span, parameter, COUNT, out),
-        5 => basis_derivatives_scratch::<6>(knots, 5, span, parameter, COUNT, out),
-        _ => basis_derivatives_scratch::<MAX_STACK_ORDER>(knots, degree, span, parameter, COUNT, out),
+        1 => basis_derivatives_scratch::<2, WIDTH>(knots, 1, span, parameter, COUNT, out),
+        2 => basis_derivatives_scratch::<3, WIDTH>(knots, 2, span, parameter, COUNT, out),
+        3 => basis_derivatives_scratch::<4, WIDTH>(knots, 3, span, parameter, COUNT, out),
+        4 => basis_derivatives_scratch::<5, WIDTH>(knots, 4, span, parameter, COUNT, out),
+        5 => basis_derivatives_scratch::<6, WIDTH>(knots, 5, span, parameter, COUNT, out),
+        8 => basis_derivatives_scratch::<9, WIDTH>(knots, 8, span, parameter, COUNT, out),
+        9 => basis_derivatives_scratch::<10, WIDTH>(knots, 9, span, parameter, COUNT, out),
+        _ => basis_derivatives_scratch::<MAX_STACK_ORDER, WIDTH>(knots, degree, span, parameter, COUNT, out),
     }
 }
 
@@ -370,13 +408,13 @@ fn basis_derivatives_count_fixed<const COUNT: usize>(
 /// unwritten entries are read as zero by the next order), so the width
 /// changes no value.
 #[inline(always)]
-fn basis_derivatives_scratch<const ORDER: usize>(
+fn basis_derivatives_scratch<const ORDER: usize, const WIDTH: usize>(
     knots: &[f64],
     degree: usize,
     span: usize,
     parameter: f64,
     derivative_count: usize,
-    out: &mut [[f64; MAX_STACK_ORDER]],
+    out: &mut [[f64; WIDTH]],
 ) {
         let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::BASIS);
     debug_assert!(degree < ORDER);
@@ -1192,7 +1230,7 @@ impl NurbsCurve {
         let parameter = knot_clamp(&self.knots, DEGREE, parameter);
         let span = knot_find_span(&self.knots, DEGREE, parameter);
         let mut rows = [[0.0; MAX_STACK_ORDER]; 2];
-        basis_derivatives_scratch::<ORDER>(&self.knots, DEGREE, span, parameter, 1, &mut rows);
+        basis_derivatives_scratch::<ORDER, MAX_STACK_ORDER>(&self.knots, DEGREE, span, parameter, 1, &mut rows);
         let zero = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
         let mut homogeneous = [zero; 2];
         let reader_part = crate::reader_profile::Part::open(crate::reader_profile::ACCUMULATE);
@@ -1699,7 +1737,7 @@ pub fn basis_functions_raw(knots: &[f64], degree: usize, span: usize, parameter:
     basis
 }
 
-#[inline]
+#[inline(always)]
 pub fn basis_functions_raw_into(knots: &[f64], degree: usize, span: usize, parameter: f64,
     guard: f64, basis: &mut [f64], left: &mut [f64], right: &mut [f64]) {
         let _reader_part = crate::reader_profile::Part::open(crate::reader_profile::BASIS);

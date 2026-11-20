@@ -20,12 +20,16 @@ fn settings_result_schema() -> Value {
         "showOccludedEdges", "flatShading", "wireframe", "showFaces", "showEdges",
         "showVertices", "overrideModelColors", "showWorkbenchToolbar",
         "pickDoubleSided", "assemblyAutoSolve", "showConstraintGraphics", "orthographic",
-    ] {
+        "spacemouseEnabled",
+    ]
+    .into_iter()
+    .chain(brep_render::style::SPACEMOUSE_AXES.iter().map(|(key, _)| *key))
+    {
         properties.insert(key.into(), json!({"type":"boolean"}));
     }
     for key in [
         "uiScale", "labelScale", "edgeWidthPx", "hiddenEdgeAlpha", "vertexSizePx",
-        "axisLengthPx", "viewcubeSizePx",
+        "axisLengthPx", "viewcubeSizePx", "spacemouseSensitivity",
     ] {
         properties.insert(key.into(), json!({"type":"number"}));
     }

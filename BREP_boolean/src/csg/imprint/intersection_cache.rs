@@ -110,6 +110,22 @@ pub fn solve_pierces(curve: &NurbsCurve, surface: &NurbsSurface, tolerance: f64)
             return crate::curve_surface_intersection::intersect_curve_surface_from_seeds(curve, surface, tolerance, seeds);
         }
     }
+    // An edge proved clear of the carrier: the general search's answer is known to be empty (the
+    // check mode runs the search anyway and stops on a disagreement).
+    let check = crate::curve_clear::check_mode();
+    if check || super::pierce_clear::pierce_clear_enabled() {
+        let clear = crate::curve_clear::curve_clear_of_surface(curve, surface, tolerance);
+        if check {
+            let hits = crate::intersect_curve_surface(curve, surface, tolerance)?;
+            if clear && !hits.is_empty() {
+                crate::curve_clear::disagreement("imprint pierce", hits.len());
+            }
+            return Ok(hits);
+        }
+        if clear {
+            return Ok(Vec::new());
+        }
+    }
     crate::intersect_curve_surface(curve, surface, tolerance)
 }
 

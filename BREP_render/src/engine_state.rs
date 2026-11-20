@@ -354,6 +354,11 @@ pub struct EngineState {
     /// `cage_edit.rs`.
     cage_edit_feature: Option<String>,
     cage_overlay_key: Option<(String, Vec<usize>, u64)>,
+    /// The Deform Face whose pick handles are shown (fed by the history panel)
+    /// and what that overlay was last fed for — `(feature id, armed pick,
+    /// applied run generation)`. See `deform_edit.rs`.
+    deform_edit_feature: Option<String>,
+    deform_overlay_key: Option<(String, Option<usize>, u64)>,
     /// Construction datum/plane visibility: the frame NAMES whose datum plane is
     /// HIDDEN (its Scene-tree checkbox off). Absent = visible. Mirrors
     /// [`hidden_sketches`].
@@ -728,7 +733,20 @@ pub enum RefSelectTarget {
     /// ([`EngineState::take_replace_repair_pick`]), whose repair also
     /// reaches mates inside nested assemblies; nothing rolls.
     ReplaceRepair,
+    /// A feature's VEC3 field filled from ONE picked vertex, edge or face
+    /// (Transform Face's `pivot`): `path` is the pick BUTTON's own path, the
+    /// field's key with [`POINT_PICK_SUFFIX`] appended (`["pivot#pick"]`), so
+    /// the form draws that button as the focused one. Finish resolves the pick
+    /// to a point against the scene the feature runs against
+    /// (`brep_kernel::face_transform_reference_point`) and writes it at the
+    /// field's own path as three numbers; nothing is written when nothing was
+    /// picked or the pick does not resolve.
+    PointPick,
 }
+
+/// The suffix a vec3 field's PICK button carries on its key (`pivot#pick`),
+/// the `key#id` form every published hit key with a sub-control uses.
+pub const POINT_PICK_SUFFIX: &str = "#pick";
 
 /// Which occurrence field of a step a pick fills ([`RefSelectTarget::Instructions`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -865,6 +883,8 @@ impl Default for EngineState {
             spline_anchor_picked: None,
             cage_edit_feature: None,
             cage_overlay_key: None,
+            deform_edit_feature: None,
+            deform_overlay_key: None,
             hidden_datums: std::collections::HashSet::new(),
             shown_datum_names: Vec::new(),
             runner: Box::new(crate::runner::InlineRunner::new()),
@@ -1150,6 +1170,9 @@ mod spline_edit;
 /// gizmo at its centroid, the drag write-back, loop insertion, reset and the
 /// cage overlay.
 mod cage_edit;
+/// The Deform Face PICK HANDLES: the kernel's resolved picks drawn as dots,
+/// one armed by a click, dragged along its normal through the transform gizmo.
+mod deform_edit;
 
 // Re-exports preserving the original `engine_state::*` public surface.
 pub use assembly_ops::{document_signature, nested_fixed_state, ComponentInsert};
@@ -1172,6 +1195,7 @@ pub use wire_harness_ops::ConnectionPatch;
 pub use wire_bom::{WireBomLine, WireLengthState};
 pub use spline_edit::SplineAnchorRow;
 pub use cage_edit::{CageArm, CageSelect, CageSummary, CAGE_PICK_RADIUS_PX};
+pub use deform_edit::{DeformArm, DeformPickRow, DEFORM_PICK_RADIUS_PX};
 pub use transform_gizmo::{GizmoMode, TransformArm};
 pub(crate) use transform_gizmo::rotate_euler_xyz_f64;
 

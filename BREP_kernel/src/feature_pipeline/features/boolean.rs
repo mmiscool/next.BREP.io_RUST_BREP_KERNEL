@@ -203,6 +203,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     let options = BooleanOptions {
         merge_coplanar_faces: boolean.merge_coplanar_faces,
         seam_reseat_later_references: ctx.later_inputs.map(<[String]>::to_vec),
+        seam_rejoin_later_references: ctx.rejoin_references.map(<[String]>::to_vec),
         ..BooleanOptions::default()
     };
 

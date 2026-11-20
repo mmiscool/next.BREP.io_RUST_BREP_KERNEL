@@ -134,11 +134,21 @@ impl<'a> SolidBuilder<'a> {
         // surface would corrupt geometry that a later stage may still refuse
         // honestly. The upper guard is scale-proportional: vendor 3D
         // approximations reach ~1e-3 of model size (PCURVE_S1 master
-        // semantics), anything beyond that is a wrong carrier, not drift.
+        // semantics), anything well beyond that is a wrong carrier, not drift.
+        //
+        // A tolerant edge stands a little further off: one 3D curve for two
+        // faces that meet only within the edge's tolerance. At 1e-3 of model
+        // size, edges 0.33 mm off a blend on a part of 270 mm half-diagonal
+        // were left where they stood, and the two faces' trims along them
+        // stayed 0.33 mm apart. At 2e-3 the face-to-face trim gap (summed
+        // over each body's two-face edges, a reading with no cancellation
+        // between edges) narrows on seven of a 2000-file Parasolid sample's
+        // bodies and widens on none, there or over the 1026 step-import
+        // fixture solids. At 1e-2 two fixture bodies widen.
         let upper_rel = std::env::var("BREP_RECONCILE_MAX")
             .ok()
             .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(1e-3);
+            .unwrap_or(2e-3);
         const SAMPLES: usize = 32;
         let mut replaced = 0usize;
         for face in faces {

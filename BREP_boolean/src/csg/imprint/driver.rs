@@ -86,7 +86,7 @@ pub enum SectionRefineRoute {
     /// curve stands further off the carriers BETWEEN them than the local gate
     /// ([`carrier_miss_route`]). The polyline it met is the march's chords; an
     /// interpolant through consistent stations can still ring between them.
-    /// Measured 2026-10-04 (08356963b, 94 cases): 23 of 285 fast-path sections,
+    /// Measured 2026-10-04 (94 cases): 23 of 285 fast-path sections,
     /// 13 distinct pairs, read their mid-spans up to 6.03e-6 off while every
     /// kept station read within 1e-7; fixture 28 t217 pair 118x474 read 1.59e-6
     /// between stations 1.8e-9 off.
@@ -1578,6 +1578,11 @@ fn build_imprints_with_carrier_seeds(
         .iter()
         .map(|tagged| SurfaceClassifyData::memoized(&tagged.face.surface, options.tolerance))
         .collect::<Result<Vec<_>, _>>().or_refuse(KernelStage::Intersect, "csg.imprint.driver")?;
+    // Per-face span hulls for the separation prefilter, built on first use.
+    let first_hulls: Vec<std::cell::OnceCell<Option<crate::SpanHullSet>>> =
+        (0..first_faces.len()).map(|_| std::cell::OnceCell::new()).collect();
+    let second_hulls: Vec<std::cell::OnceCell<Option<crate::SpanHullSet>>> =
+        (0..second_faces.len()).map(|_| std::cell::OnceCell::new()).collect();
     let mut face_edge_lists: HashMap<FaceKey, Vec<&EdgeRecord>> = HashMap::default();
     for tagged in first_faces.iter().chain(second_faces.iter()) {
         face_edge_lists.insert(tagged.key(), face_edges(*tagged, &builder.edges)?);
@@ -1614,6 +1619,10 @@ fn build_imprints_with_carrier_seeds(
     let mut deferred_boundary_spans = Vec::new();
     let mut work_pairs = super::work_profile::Pairs::new(first_faces.len() * second_faces.len());
     let mut paired = Vec::new();
+    // Every cross-operand pair whose face boxes met, and those of them the
+    // imprint PROVED apart (`ImprintResultRecord::faces_in_unproved_pairs`).
+    let mut visited_pairs: Vec<(usize, usize)> = Vec::new();
+    let mut proved_apart_pairs: HashSet<(usize, usize)> = HashSet::default();
     for (first_index, first) in first_faces.iter().enumerate() {
         let first = *first;
         paired.clear();
@@ -1642,6 +1651,7 @@ fn build_imprints_with_carrier_seeds(
                 }
             }
             let second = second_faces[second_index];
+            visited_pairs.push((first_index, second_index));
             profile.pairs += 1;
             let _work_pair = super::work_profile::Pair::open(&mut work_pairs, first.face, second.face);
             // Set when this pair's section passes through an isolated TANGENT
@@ -1665,7 +1675,16 @@ fn build_imprints_with_carrier_seeds(
                 PAIR_ANGULAR_TOLERANCE,
             ).or_refuse(KernelStage::Intersect, "csg.imprint.driver")?;
             profile.classify += profile.lap(&mut lap_start);
+            // A proof recorded, not acted on (the pair is imprinted as
+            // before): two exact concentric analytic carriers whose surfaces
+            // cannot meet (the walls of a closed hollow of a revolved solid).
+            if concentric_carriers_apart(&first.face.surface, &second.face.surface, options.tolerance * 10.0) {
+                proved_apart_pairs.insert((first_index, second_index));
+            }
             if pair_classification.relation == SurfacePairRelation::Disjoint {
+                // A proof: the control hulls' boxes, or two parallel planes,
+                // apart by more than the contact band.
+                proved_apart_pairs.insert((first_index, second_index));
                 if debug_pairs {
                     eprintln!(
                         "pair {}x{}: DISJOINT-cull sep={:.4e}",
@@ -2049,6 +2068,27 @@ fn build_imprints_with_carrier_seeds(
                         // nothing is proven and the pre-classification refusal
                         // stands). Neither has a section curve the imprint can
                         // represent.
+                        // The witness's refinement held on an open edge of a
+                        // carrier, short of a contact: the contact lies off
+                        // the carrier, so within both the pair only nears
+                        // tangency at that edge and its section is an ordinary
+                        // curve (`BREP_IMPRINT_TANGENCY_OFF_CARRIER`).
+                        None if super::tangent_contact::tangency_off_carrier_on()
+                            && super::tangent_contact::tangency_runs_off_carrier(
+                                &first.face.surface,
+                                &second.face.surface,
+                                tangency_witness,
+                                options.tolerance,
+                            )?
+                            && every_other_tangency_admitted(first, second, &clipped, options.tolerance)? =>
+                        {
+                            if debug_pairs {
+                                eprintln!(
+                                    "pair {}x{}: tangency witness refines off the carrier, marched as a section",
+                                    first.face.id, second.face.id
+                                );
+                            }
+                        }
                         other => {
                             let shape = match other {
                                 Some(contact) => contact.describe(),
@@ -2093,6 +2133,24 @@ fn build_imprints_with_carrier_seeds(
                 .as_ref()
                 .map(|window| &window.surface)
                 .unwrap_or(&second.face.surface);
+            // Trim-window carriers PROVED apart by their span hulls
+            // (`BREP_SSI_SEPARATION_PREFILTER`) have nothing to seed or march:
+            // every cheaper lane above has had the pair, and only the pairs
+            // that reach the march pay for the proof (each face's hulls are
+            // built once).
+            let proved_apart = crate::separation_prefilter_enabled() && {
+                let hulls_a = first_hulls[first_index].get_or_init(|| crate::SpanHullSet::of(first_march));
+                let hulls_b = second_hulls[second_index].get_or_init(|| crate::SpanHullSet::of(second_march));
+                matches!((hulls_a, hulls_b), (Some(a), Some(b)) if crate::hull_sets_proved_apart(a, b, options.tolerance * 10.0))
+            };
+            if proved_apart {
+                proved_apart_pairs.insert((first_index, second_index));
+                profile.seeds += profile.lap(&mut lap_start);
+                if debug_pairs {
+                    eprintln!("pair {}x{}: trim-window carriers proved apart, not marched", first.face.id, second.face.id);
+                }
+                continue;
+            }
             let pair_hermite_lane = hermite_lane && super::hermite::refinement_carriers_eligible(
                 &first.face.surface, &second.face.surface,
             );
@@ -3291,7 +3349,22 @@ fn build_imprints_with_carrier_seeds(
         radii: std::mem::take(&mut builder.vertex_radii),
         sources: std::mem::take(&mut builder.vertex_sources),
     };
+    // Published for the plain two-operand loop only: a self-imprint's pairs
+    // are within one solid and say nothing about the other operand.
+    let faces_in_unproved_pairs = self_pairs.is_none().then(|| {
+        let mut faces: HashSet<FaceKey> = HashSet::default();
+        for pair in &visited_pairs {
+            if !proved_apart_pairs.contains(pair) {
+                faces.insert(first_faces[pair.0].key());
+                faces.insert(second_faces[pair.1].key());
+            }
+        }
+        let mut faces = faces.into_iter().collect::<Vec<_>>();
+        faces.sort_by_key(|key| (key.operand, key.face_id));
+        faces
+    });
     let mut result = ImprintResultRecord {
+        faces_in_unproved_pairs,
         tangent_nodes,
         tangent_sections,
         vertices: builder.vertices,
@@ -4572,6 +4645,58 @@ fn split_pieces_at_tangent_ends(
     Ok(())
 }
 
+/// Past the first tangency witness of `clipped` (judged by the caller), every
+/// other stretch of the runs where the pair's normals are parallel is judged
+/// once, at its first point: an isolated node or a tangency off its carrier
+/// is admitted; anything else (an extended or an unproven contact) is not
+/// (`BREP_IMPRINT_TANGENCY_OFF_CARRIER`).
+fn every_other_tangency_admitted(
+    first: TaggedFace<'_>,
+    second: TaggedFace<'_>,
+    clipped: &[Vec<Vec3>],
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    later_parallel_stretch_starts_all(
+        clipped,
+        |point| pair_normals_parallel_at(first, second, point),
+        |point| {
+            Ok(match classify_tangent_contact(&first.face.surface, &second.face.surface, point, tolerance)? {
+                Some(contact) => contact.is_isolated_node(),
+                None => super::tangent_contact::tangency_runs_off_carrier(&first.face.surface, &second.face.surface, point, tolerance)?,
+            })
+        },
+    )
+}
+
+/// Walk `runs` and hand `admit` the first point of every stretch of
+/// consecutive `parallel` points past the first such stretch (the caller's
+/// witness), in order, as each is found; `false` at the first one `admit`
+/// rejects, before any later point is read (so a later point's failure never
+/// takes precedence over an earlier verdict). A stretch ends where a point is
+/// not parallel or its run ends.
+pub(super) fn later_parallel_stretch_starts_all(
+    runs: &[Vec<Vec3>],
+    mut parallel: impl FnMut(Vec3) -> Result<bool, KernelRefusal>,
+    mut admit: impl FnMut(Vec3) -> Result<bool, KernelRefusal>,
+) -> Result<bool, KernelRefusal> {
+    let mut first_stretch = true;
+    for run in runs {
+        let mut inside_stretch = false;
+        for &point in run {
+            let is_parallel = parallel(point)?;
+            if is_parallel && !inside_stretch {
+                if first_stretch {
+                    first_stretch = false;
+                } else if !admit(point)? {
+                    return Ok(false);
+                }
+            }
+            inside_stretch = is_parallel;
+        }
+    }
+    Ok(true)
+}
+
 fn pair_normals_parallel_at(
     first: TaggedFace<'_>,
     second: TaggedFace<'_>,
@@ -4592,3 +4717,56 @@ fn pair_normals_parallel_at(
 }
 
 
+
+/// Two exact analytic carriers on one axis (or one centre) whose surfaces are
+/// apart everywhere by more than `band`: concentric spheres of different
+/// radii; coaxial tori in one plane whose tubes are nested or clear of each
+/// other (their centre circles `|R1 - R2|` apart against the tube radii);
+/// coaxial cylinders of different radii. A PROOF, read only by the boolean's
+/// scoped acceptance (`ImprintResultRecord::faces_in_unproved_pairs`).
+fn concentric_carriers_apart(first: &NurbsSurface, second: &NurbsSurface, band: f64) -> bool {
+    use crate::AnalyticSurface as A;
+    let (Some(a), Some(b)) = (first.analytic(), second.analytic()) else {
+        return false;
+    };
+    let same_point = |p: Vec3, q: Vec3| p.sub(q).length() <= band * 1e-3;
+    // The axes are one line over the carriers' whole EXTENT: an angle moves
+    // the far end of a long carrier by the angle times its size (cross
+    // review: two 1e7-long cylinders 5e-13 rad apart cross).
+    let extent = match (crate::Aabb::from_surface_controls(first), crate::Aabb::from_surface_controls(second)) {
+        (Ok(a), Ok(b)) => a.diagonal().max(b.diagonal()),
+        _ => return false,
+    };
+    if !(extent.is_finite() && extent > 0.0) {
+        return false;
+    }
+    let same_axis = |fa: &crate::RevolutionFrame, fb: &crate::RevolutionFrame| {
+        fa.axis.cross(fb.axis).length() * extent <= band * 1e-3
+    };
+    // The second frame's origin on the first frame's axis line.
+    let on_axis = |fa: &crate::RevolutionFrame, fb: &crate::RevolutionFrame| {
+        let offset = fb.origin.sub(fa.origin);
+        offset.sub(fa.axis.scale(offset.dot(fa.axis))).length() <= band * 1e-3
+    };
+    match (a, b) {
+        (A::Sphere { frame: fa, radius: ra }, A::Sphere { frame: fb, radius: rb }) => {
+            same_point(fa.origin, fb.origin) && (ra - rb).abs() > band
+        }
+        (A::Torus { frame: fa, major_radius: big_a, minor_radius: small_a }, A::Torus { frame: fb, major_radius: big_b, minor_radius: small_b }) => {
+            if !(same_axis(fa, fb) && same_point(fa.origin, fb.origin)) {
+                return false;
+            }
+            let apart = (big_a - big_b).abs();
+            let (small, large) = (small_a.min(*small_b), small_a.max(*small_b));
+            apart + small < large - band || apart > small_a + small_b + band
+        }
+        (A::RuledRevolution { frame: fa, rho0: a0, rho1: a1, .. }, A::RuledRevolution { frame: fb, rho0: b0, rho1: b1, .. }) => {
+            (a0 - a1).abs() <= band * 1e-3
+                && (b0 - b1).abs() <= band * 1e-3
+                && same_axis(fa, fb)
+                && on_axis(fa, fb)
+                && (a0 - b0).abs() > band
+        }
+        _ => false,
+    }
+}

@@ -468,6 +468,17 @@ pub fn offset_outline_wall(
     face: &FaceRecord,
     pad: f64,
 ) -> Result<Result<BrepSolid, String>, KernelRefusal> {
+    offset_outline_wall_per_edge(source, face, &|_| pad)
+}
+
+/// [`offset_outline_wall`] with each outline edge offset by its own pad,
+/// `pad_of(edge id)`: a corner joins the two neighbouring offsets wherever
+/// they cross, whatever their two distances.
+pub fn offset_outline_wall_per_edge(
+    source: &BrepSolid,
+    face: &FaceRecord,
+    pad_of: &dyn Fn(u64) -> f64,
+) -> Result<Result<BrepSolid, String>, KernelRefusal> {
     if !face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(Err("the opening is not planar".into()));
     }
@@ -500,6 +511,7 @@ pub fn offset_outline_wall(
         return Ok(Err("the opening has no loop".into()));
     };
     let mut elements = Vec::new();
+    let mut pads = Vec::new();
     for coedge in &face.loops[outer].coedges {
         let edge = edge_by_id
             .get(&coedge.edge_id)
@@ -514,7 +526,10 @@ pub fn offset_outline_wall(
         };
         let (start, end) = (vertex_by_id[&start_id], vertex_by_id[&end_id]);
         match classify_edge(&frame, edge, coedge.forward, start, end, tolerance)? {
-            Ok(element) => elements.push(element),
+            Ok(element) => {
+                elements.push(element);
+                pads.push(pad_of(coedge.edge_id));
+            }
             Err(reason) => return Ok(Err(reason)),
         }
     }
@@ -545,7 +560,7 @@ pub fn offset_outline_wall(
     };
     // Each element's offset, as a whole line or circle.
     let mut offsets = Vec::with_capacity(count);
-    for element in &elements {
+    for (element, &pad) in elements.iter().zip(&pads) {
         match element.clone() {
             Element::Free { base, .. } => {
                 // The offset curve p + pad·n is regular only where the outline
@@ -597,7 +612,7 @@ pub fn offset_outline_wall(
         match &elements[index] {
             Element::Free { base, .. } => {
                 let (tangent, _) = base.tangent_and_curvature(fraction)?;
-                Ok(add(base.point(fraction)?, scale(outward(tangent), pad)))
+                Ok(add(base.point(fraction)?, scale(outward(tangent), pads[index])))
             }
             _ => Ok(offsets[index].sample(fraction)),
         }
@@ -614,9 +629,21 @@ pub fn offset_outline_wall(
         let vertex = current.start();
         let n_in = outward(previous.end_tangent()?);
         let n_out = outward(current.start_tangent()?);
-        let naive_in = add(vertex, scale(n_in, pad));
-        let naive_out = add(vertex, scale(n_out, pad));
+        let pad_in = pads[(index + count - 1) % count];
+        let pad_out = pads[index];
+        let pad = pad_in.max(pad_out);
+        let naive_in = add(vertex, scale(n_in, pad_in));
+        let naive_out = add(vertex, scale(n_out, pad_out));
         if length(sub(n_in, n_out)) <= 1e-9 {
+            // A TANGENT junction: the two offsets meet only if they are the
+            // same distance out; padded differently they are parallel curves
+            // that never meet, and a junction on either would leave the other
+            // element's end off its vertex.
+            if (pad_in - pad_out).abs() > tolerance {
+                return Ok(Err(format!(
+                    "outline corner {index} is tangent and its two edges are padded differently ({pad_in:.6} and {pad_out:.6})"
+                )));
+            }
             junctions.push(naive_out);
             continue;
         }
@@ -708,7 +735,7 @@ pub fn offset_outline_wall(
     for index in 0..count {
         let (from, to) = (junctions[index], junctions[(index + 1) % count]);
         match (elements[index].clone(), offsets[index].clone()) {
-            (Element::Free { base, .. }, _) => match fit_free_offset(&base, pad, free_range[index], from, to, signed_area, tolerance)? {
+            (Element::Free { base, .. }, _) => match fit_free_offset(&base, pads[index], free_range[index], from, to, signed_area, tolerance)? {
                 Ok(curve) => grown.push(Element::Fitted { curve, start: from, end: to }),
                 Err(reason) => return Ok(Err(reason)),
             },

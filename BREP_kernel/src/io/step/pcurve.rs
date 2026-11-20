@@ -142,9 +142,22 @@ pub(crate) enum EmittedSurface {
     /// emitted control net and knots ARE the stored ones, so emitted UV is
     /// stored UV and the stored pcurve transfers directly.
     Spline,
+    /// A translated spline profile. Emitted v is signed physical distance;
+    /// stored chart swaps, offset and scale are transferred to each pcurve.
+    Extrusion { profile: NurbsCurve, direction: Vec3, profile_is_u: bool, sweep_start: f64, magnitude: f64 },
 }
 
 impl EmittedSurface {
+    fn stored_uv(&self, x: f64, y: f64, w: f64) -> (f64,f64) {
+        match self {
+            Self::Extrusion { profile_is_u,sweep_start,magnitude,.. } => {
+                let (t,s)=if *profile_is_u {(x,y)} else {(y,x)};
+                (t,(s-sweep_start*w)*magnitude)
+            }
+            _ => (x,y),
+        }
+    }
+
     /// ISO 10303-42 evaluation of the emitted entity.  `stored` is consulted
     /// only for the B-spline carrier, whose emitted parameterization is the
     /// stored one; `evaluate_extended` there so a seam-riding pcurve that
@@ -182,12 +195,13 @@ impl EmittedSurface {
                 minor_radius * v.sin(),
             ),
             EmittedSurface::Spline => return stored.evaluate_extended(u, v),
+            EmittedSurface::Extrusion { profile,direction,.. } => profile.evaluate_extended(u)?.add(direction.scale(v)),
         })
     }
 
     fn frame(&self) -> Option<&EmittedFrame> {
         match self {
-            EmittedSurface::Plane { .. } | EmittedSurface::Spline => None,
+            EmittedSurface::Plane { .. } | EmittedSurface::Spline | EmittedSurface::Extrusion { .. } => None,
             EmittedSurface::Cylinder { frame, .. }
             | EmittedSurface::Cone { frame, .. }
             | EmittedSurface::Sphere { frame, .. }
@@ -233,7 +247,7 @@ impl EmittedSurface {
                     offset.dot(frame.axis).atan2(rho - major_radius),
                 ))
             }
-            EmittedSurface::Spline => None,
+            EmittedSurface::Spline | EmittedSurface::Extrusion { .. } => None,
         }
     }
 
@@ -242,7 +256,7 @@ impl EmittedSurface {
     /// height, a sphere's latitude).
     fn periods(&self) -> (Option<f64>, Option<f64>) {
         match self {
-            EmittedSurface::Plane { .. } | EmittedSurface::Spline => (None, None),
+            EmittedSurface::Plane { .. } | EmittedSurface::Spline | EmittedSurface::Extrusion { .. } => (None, None),
             EmittedSurface::Cylinder { .. }
             | EmittedSurface::Cone { .. }
             | EmittedSurface::Sphere { .. } => (Some(TAU), None),
@@ -572,7 +586,7 @@ fn sample_uv(
     pcurve: &NurbsCurve,
     parameters: &[f64],
 ) -> Result<Option<Vec<(f64, f64)>>, String> {
-    if matches!(emitted_surface, EmittedSurface::Spline) {
+    if matches!(emitted_surface, EmittedSurface::Spline | EmittedSurface::Extrusion { .. }) {
         // Emitted UV IS stored UV here, so there is nothing to invert: read the
         // stored pcurve at the fraction that matches each emitted parameter.
         // For an emitted `CIRCLE` that fraction is the tangent-half-angle
@@ -583,7 +597,8 @@ fn sample_uv(
         for &parameter in parameters {
             let fraction = emitted_curve.fraction_at(parameter)?;
             let uv = pcurve.evaluate(q0 + (q1 - q0) * fraction)?;
-            points.push((uv.x, uv.y));
+            let (u,v) = emitted_surface.stored_uv(uv.x,uv.y,1.0);
+            points.push((u,v));
         }
         return Ok(Some(points));
     }
@@ -775,7 +790,7 @@ fn stored_net_candidate(
     emitted_curve: &EmittedCurve,
     pcurve: &NurbsCurve,
 ) -> Result<Option<Pcurve2d>, String> {
-    if !matches!(emitted_surface, EmittedSurface::Spline)
+    if !matches!(emitted_surface, EmittedSurface::Spline | EmittedSurface::Extrusion { .. })
         || !emitted_curve.parameter_is_affine_in_fraction()
     {
         return Ok(None);
@@ -793,7 +808,10 @@ fn stored_net_candidate(
     Ok(Some(Pcurve2d::Spline(NurbsCurve::new(
         pcurve.degree,
         knots,
-        pcurve.control_points.clone(),
+        pcurve.control_points.iter().map(|p| {
+            let (x,y)=emitted_surface.stored_uv(p.x,p.y,p.w);
+            crate::Vec4{x,y,z:0.0,w:p.w}
+        }).collect(),
     )?)))
 }
 
@@ -845,5 +863,6 @@ fn verify(
     }
     Ok(worst)
 }
+
 
 

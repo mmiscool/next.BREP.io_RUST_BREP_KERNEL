@@ -620,6 +620,47 @@ fn refine_interior_bounded(
         lawson_flips(vertices, triangles, boundary_pairs, scale);
     }
     let mut memo = FaceMemo::default();
+    // A spline carrier's bound reads the corners' uv (`SplineBound`), plus
+    // each corner's residual `|position − S(uv)|` (a shared edge sample is
+    // not an evaluation at its uv), read once per vertex.
+    let mut residuals: Vec<Option<f64>> = Vec::new();
+    let mut bound_of = |vertices: &[FaceVertex], corners: [usize; 3]| -> Result<Option<f64>, String> {
+        use crate::watertight_tessellation::scan_mesh::FaceBound;
+        let FaceBound::Spline(spline) = bound else {
+            return Ok(triangle_bound(bound, corners.map(|index| vertices[index].position)));
+        };
+        if residuals.len() < vertices.len() {
+            residuals.resize(vertices.len(), None);
+        }
+        let mut residual = 0.0f64;
+        for &index in &corners {
+            let value = match residuals[index] {
+                Some(value) => value,
+                None => {
+                    let vertex = vertices[index];
+                    let value = match face.surface.evaluate(vertex.uv[0], vertex.uv[1]) {
+                        Ok(on) => on.sub(vertex.position).length(),
+                        Err(_) => return Ok(None),
+                    };
+                    residuals[index] = Some(value);
+                    value
+                }
+            };
+            residual = residual.max(value);
+        }
+        let Some(uv_bound) = spline.triangle(corners.map(|index| vertices[index].uv)) else {
+            return Ok(None);
+        };
+        let scale = corners
+            .iter()
+            .map(|&index| {
+                let p = vertices[index].position;
+                p.x.abs().max(p.y.abs()).max(p.z.abs())
+            })
+            .fold(1.0f64, f64::max);
+        let value = uv_bound + residual + 256.0 * f64::EPSILON * scale;
+        Ok(value.is_finite().then_some(value))
+    };
     for _ in 0..SCAN_REFINE_PASSES {
         tess_profile(|p| p.refine_passes += 1);
         let mut users: HashMap<(usize, usize), u32> = HashMap::with_capacity(triangles.len() * 2);
@@ -632,8 +673,7 @@ fn refine_interior_bounded(
         let splittable = |edge: &(usize, usize)| !boundary_pairs.contains(edge) && users.get(edge) == Some(&2);
         let mut chosen: Vec<(usize, usize)> = Vec::new();
         for triangle in triangles.iter() {
-            let corners = triangle.map(|index| vertices[index].position);
-            let Some(deviation) = triangle_bound(bound, corners) else {
+            let Some(deviation) = bound_of(vertices, *triangle)? else {
                 return Ok(false);
             };
             if deviation <= chord_tolerance {
@@ -648,7 +688,7 @@ fn refine_interior_bounded(
                 let (a, b) = (triangle[corner], triangle[(corner + 1) % 3]);
                 let edge = (a.min(b), a.max(b));
                 let (pa, pb) = (vertices[a].position, vertices[b].position);
-                let Some(edge_bound) = triangle_bound(bound, [pa, pb, pb]) else {
+                let Some(edge_bound) = bound_of(vertices, [a, b, b])? else {
                     return Ok(false);
                 };
                 if splittable(&edge) {

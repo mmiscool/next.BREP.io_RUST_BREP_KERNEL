@@ -87,6 +87,9 @@ pub mod report_followup;
 pub mod scripting;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod simulation_export;
+// SpaceMouse / Spaceball navigation: the shared core, native HID reader and
+// the exports `web/spacemouse.js` calls.
+pub mod spacemouse;
 pub mod store;
 /// A template's input marks and its spin-out (`.tbrep`).
 pub mod template;

@@ -761,6 +761,9 @@ impl BrepApp {
         // callback can wake the reactive frame loop (see `store::set_repaint_ctx`).
         #[cfg(target_arch = "wasm32")]
         crate::store::set_repaint_ctx(cc.egui_ctx.clone());
+        // A SpaceMouse report wakes an idle frame; natively this also starts
+        // the HID reader thread.
+        crate::spacemouse::install(&cc.egui_ctx);
         let saved_settings = model_store.read(SETTINGS_KEY);
 
         // --- how a document's engine is built --------------------------------
@@ -796,7 +799,7 @@ impl BrepApp {
             state
         });
 
-        // Start with the seed model on every launch (7626103c2). Reopening the
+        // Start with the seed model on every launch. Reopening the
         // previous session can immediately rerun a problematic document and
         // prevent the user from recovering by restarting the app, so which
         // documents were open is not persisted at all: saved models come back

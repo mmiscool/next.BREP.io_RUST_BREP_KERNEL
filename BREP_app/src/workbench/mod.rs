@@ -40,6 +40,7 @@ pub mod cam;
 pub mod diagram;
 pub mod drawing;
 pub mod ecad;
+pub mod gears;
 pub mod instructions;
 pub mod modeling;
 pub mod pads;
@@ -229,6 +230,8 @@ pub static WORKBENCHES: &[&Workbench] = &[
     &instructions::INSTRUCTIONS,
     // Motion studies: an assembly's mates driven over time.
     &simulation::SIMULATION,
+    // Gear generators: one feature per gear type.
+    &gears::GEARS,
 ];
 
 /// Workbenches DECLARED but not yet in the dropdown — none today. A

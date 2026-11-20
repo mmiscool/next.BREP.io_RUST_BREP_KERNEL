@@ -574,6 +574,13 @@ pub fn tessellate_rectangle_watertight(
     if !supported_carrier(face) {
         return Ok(false);
     }
+    // The soundness scan with `BREP_SCAN_MESH_SPLINE`: a polynomial spline
+    // face takes the interior triangulation with the sound spline bound
+    // (`scan_mesh::SplineBound`). The grid's long strips along a crest made
+    // the crossing sweep's candidate pairs explode.
+    if matches!(super::scan_mesh::face_bound(face), Some(super::scan_mesh::FaceBound::Spline(_))) {
+        return Ok(false);
+    }
     if face.loops.len() != 1
         || face.loops[0].coedges.len() != 4
         || face

@@ -582,21 +582,23 @@ impl<'a> SolidBuilder<'a> {
 
         // Sample each coedge in coedge sense; a degenerate (collapsed pole) edge
         // has no branch to track — that loop is not this class, keep the old path.
-        const N: usize = 64;
-        let mut samples: Vec<Vec<Vec3>> = Vec::with_capacity(m);
-        for (edge_id, forward) in specs {
-            let edge = self.edge_record(*edge_id);
-            if edge.degenerate {
-                return Ok(None);
-            }
-            let mut pts = Vec::with_capacity(N + 1);
-            for k in 0..=N {
-                let f = k as f64 / N as f64;
-                let edge_fraction = if *forward { f } else { 1.0 - f };
-                pts.push(edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * edge_fraction)?);
-            }
-            samples.push(pts);
-        }
+        const N: usize = super::alias_verdicts::SCAN_SAMPLES;
+        let coedges: Vec<super::alias_verdicts::ScanCoedge> = specs
+            .iter()
+            .map(|(edge_id, forward)| {
+                let edge = self.edge_record(*edge_id);
+                super::alias_verdicts::ScanCoedge {
+                    curve: edge.curve.clone(),
+                    t0: edge.t0,
+                    t1: edge.t1,
+                    forward: *forward,
+                    degenerate: edge.degenerate,
+                }
+            })
+            .collect();
+        let Some(samples) = super::alias_verdicts::loop_samples(&coedges)? else {
+            return Ok(None);
+        };
 
         // Aliasing signature: the SINGLE-SEED inversion of the samples (Newton
         // from the seed grid's nearest sample) branch-JUMPS where the carrier
@@ -618,22 +620,14 @@ impl<'a> SolidBuilder<'a> {
         // carriers this pass exists for it is the far end's local minimum —
         // 1.2e-1 on `abc_00000026`, whose edges lie within 7.6e-4 of those
         // carriers.
-        const JUMP: f64 = 0.2;
-        let mut aliased = false;
-        let mut global_residual = 0.0f64;
-        for pts in &samples {
-            let mut prev: Option<(f64, f64)> = None;
-            for p in pts {
-                let g = crate::projection::project_point_to_surface_from_nearest_seed(surface, *p)?;
-                global_residual = global_residual.max(g.distance);
-                if let Some(pv) = prev {
-                    if norm_step((g.u, g.v), pv) > JUMP {
-                        aliased = true;
-                    }
-                }
-                prev = Some((g.u, g.v));
-            }
+        //
+        // `BREP_STEP_ALIAS_VERDICTS` (`builder/alias_verdicts.rs`): a loop a
+        // prefit helper already scanned, with the same inputs bit for bit and
+        // no aliasing, is answered from that reading (never under the trace).
+        if !dbg && super::alias_verdicts::known_unaliased(surface, &coedges) {
+            return Ok(None);
         }
+        let (aliased, global_residual) = super::alias_verdicts::aliasing_scan(surface, &samples)?;
         if dbg {
             eprintln!(
                 "joint scan: m={m} extent={extent:.3} aliased={aliased} global_residual={global_residual:.3e}"
@@ -751,12 +745,15 @@ impl<'a> SolidBuilder<'a> {
         }
 
         // Build each coedge's pcurve by interpolating its chained footpoints —
-        // already on-surface, a single fold, in coedge-sense 0..1.
+        // already on-surface, a single fold, in coedge-sense 0..1 — then
+        // refine it where the interpolant leaves the feet BETWEEN stations.
         let parameters: Vec<f64> = (0..=N).map(|k| k as f64 / N as f64).collect();
         let mut pcurves = Vec::with_capacity(m);
-        for c in &chains {
-            let points: Vec<Vec3> = c.iter().map(|&(u, v)| Vec3::new(u, v, 0.0)).collect();
-            pcurves.push(crate::interpolate_curve(&points, 3, &parameters)?);
+        for (ci, c) in chains.iter().enumerate() {
+            let (edge_id, forward) = specs[ci];
+            pcurves.push(self.refined_chain_pcurve(
+                surface, edge_id, forward, &parameters, c, pcurve_tol, 1e-2 * extent, &norm_step,
+            )?);
         }
         if std::env::var("BREP_DEBUG_PCURVE").is_ok() {
             eprintln!(
@@ -765,4 +762,144 @@ impl<'a> SolidBuilder<'a> {
         }
         Ok(Some(pcurves))
     }
+
+    /// The pcurve through one coedge's chained feet, with stations added
+    /// where the interpolant strays from the feet between them.
+    ///
+    /// A cubic through 64 equally spaced feet is read only AT those feet. Where
+    /// the trim's parameter speed on the carrier changes quickly (a coedge
+    /// near one side of a wide bicubic, its u running half the domain in the
+    /// first seventh of the edge), the interpolant swings between stations:
+    /// measured 7.1e-2 mm off the edge between feet that sit within 1e-7 of it,
+    /// worth 0.52 mm³ of one face's volume term on a 66 000 mm³ part.
+    ///
+    /// Each span is read at its quarter points against the foot seeded at the
+    /// span's left station (the chain's own seeding, so the branch is kept).
+    /// A span whose image misses that foot by more than `pcurve_tol` takes a
+    /// new station at the worst-missed quarter point that gives a sound foot:
+    /// continuous with both neighbours (the chain's step bound), a true foot
+    /// (its miss from the edge point lies along the carrier's normal; a seeded
+    /// projection that stalled leaves a tangential miss), within the bound the
+    /// loop was adopted on (`residual_bound`) and nearer the edge than the
+    /// interpolant's image there. A stalled or wandering projection is never
+    /// forced into the trim, and an evaluation that fails rejects that station
+    /// only: the plain interpolation is the floor. Rounds stop when no span
+    /// misses or at [`JOINT_STATION_CAP`] stations. The loop's shared vertices
+    /// are the end stations and never move; a chain that reads clean is
+    /// returned exactly as the plain interpolation built it.
+    #[allow(clippy::too_many_arguments)]
+    fn refined_chain_pcurve(
+        &self,
+        surface: &NurbsSurface,
+        edge_id: u64,
+        forward: bool,
+        parameters: &[f64],
+        chain: &[(f64, f64)],
+        pcurve_tol: f64,
+        residual_bound: f64,
+        norm_step: &dyn Fn((f64, f64), (f64, f64)) -> f64,
+    ) -> Result<NurbsCurve, String> {
+        let interpolate = |fractions: &[f64], feet: &[(f64, f64)]| {
+            let points: Vec<Vec3> = feet.iter().map(|&(u, v)| Vec3::new(u, v, 0.0)).collect();
+            crate::interpolate_curve(&points, 3, fractions)
+        };
+        let plain = interpolate(parameters, chain)?;
+        if !switch!("BREP_JOINT_CHAIN_REFINE", true) {
+            return Ok(plain);
+        }
+        let debug = std::env::var("BREP_DEBUG_PCURVE").is_ok();
+        let edge = self.edge_record(edge_id);
+        let edge_point = |fraction: f64| {
+            let along = if forward { fraction } else { 1.0 - fraction };
+            edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * along)
+        };
+        // A sound station at `fraction` of span `k`: the foot seeded at the
+        // span's left station, kept only when it is a true foot, within the
+        // adoption bound, nearer the edge than the interpolant's image and
+        // continuous with both neighbours. Any evaluation that fails is no
+        // station, never a failed import.
+        let station = |curve: &NurbsCurve, feet: &[(f64, f64)], k: usize, fraction: f64| -> Option<(f64, f64)> {
+            let target = edge_point(fraction).ok()?;
+            let foot = crate::project_point_to_surface_seeded(surface, target, feet[k].0, feet[k].1).ok()?;
+            let at = (foot.u, foot.v);
+            let current = curve.evaluate(fraction).ok()?;
+            let image_miss = surface.evaluate(current.x, current.y).ok()?.sub(target).length();
+            let miss = target.sub(surface.evaluate(foot.u, foot.v).ok()?);
+            let foot_miss = miss.length();
+            let normal = surface.normal(foot.u, foot.v).ok()?;
+            let tangential = miss.sub(normal.scale(miss.dot(normal))).length();
+            let sound = foot_miss.is_finite()
+                && tangential <= 0.1 * pcurve_tol
+                && foot_miss <= residual_bound
+                && foot_miss < image_miss
+                && norm_step(at, feet[k]) < 0.15
+                && norm_step(at, feet[k + 1]) < 0.15;
+            if !sound && debug {
+                eprintln!("joint-chain refine: edge {edge_id} span {k} at {fraction:.5}: foot_miss {foot_miss:.3e} tangential {tangential:.3e} image_miss {image_miss:.3e} steps {:.3e} {:.3e}", norm_step(at, feet[k]), norm_step(at, feet[k + 1]));
+            }
+            sound.then_some(at)
+        };
+        let mut fractions = parameters.to_vec();
+        let mut feet = chain.to_vec();
+        let mut curve = plain;
+        for round in 0..JOINT_REFINE_ROUNDS {
+            let mut inserted: Vec<(usize, f64, (f64, f64))> = Vec::new();
+            for k in 0..fractions.len() - 1 {
+                let (a, b) = (fractions[k], fractions[k + 1]);
+                // The quarter points the interpolant misses its foot at, worst
+                // first; the first that gives a sound station is taken.
+                let mut missed: Vec<(f64, f64)> = Vec::new();
+                for quarter in [0.25, 0.5, 0.75] {
+                    let fraction = a + (b - a) * quarter;
+                    let reading = (|| -> Option<f64> {
+                        let uv = curve.evaluate(fraction).ok()?;
+                        let image = surface.evaluate(uv.x, uv.y).ok()?;
+                        let foot = crate::project_point_to_surface_seeded(
+                            surface,
+                            edge_point(fraction).ok()?,
+                            feet[k].0,
+                            feet[k].1,
+                        )
+                        .ok()?;
+                        Some(surface.evaluate(foot.u, foot.v).ok()?.sub(image).length())
+                    })();
+                    if let Some(miss) = reading.filter(|miss| *miss > pcurve_tol) {
+                        missed.push((fraction, miss));
+                    }
+                }
+                missed.sort_by(|x, y| y.1.total_cmp(&x.1));
+                if let Some((fraction, at)) = missed
+                    .iter()
+                    .find_map(|&(fraction, _)| station(&curve, &feet, k, fraction).map(|at| (fraction, at)))
+                {
+                    inserted.push((k + 1, fraction, at));
+                }
+            }
+            if debug {
+                eprintln!("joint-chain refine: edge {edge_id} round {round}: {} stations, inserting {}", fractions.len(), inserted.len());
+            }
+            if inserted.is_empty() || fractions.len() + inserted.len() > JOINT_STATION_CAP {
+                break;
+            }
+            for (index, fraction, at) in inserted.into_iter().rev() {
+                fractions.insert(index, fraction);
+                feet.insert(index, at);
+            }
+            // A refined net that cannot be interpolated keeps the last curve.
+            match interpolate(&fractions, &feet) {
+                Ok(refined) => curve = refined,
+                Err(_) => break,
+            }
+        }
+        Ok(curve)
+    }
 }
+
+/// Refinement rounds [`SolidBuilder::refined_chain_pcurve`] may spend; each
+/// splits every span that misses, so eight take a 1/64 span below 1/4000 of
+/// the coedge.
+const JOINT_REFINE_ROUNDS: usize = 8;
+
+/// The most stations a refined joint-chain pcurve may carry, the station
+/// fitter's own sample ceiling.
+const JOINT_STATION_CAP: usize = 513;

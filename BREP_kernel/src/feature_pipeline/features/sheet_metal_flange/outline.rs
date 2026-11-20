@@ -321,7 +321,7 @@ fn apply_corner(
     // An open corner whose setbacks hold BOTH bands back from C needs no trim:
     // the rim keeps the corner, as it does beside an earlier feature's flange,
     // and both band ends stay plain setback ends that take a bend relief
-    // (report 20261028T220522Z-f17c3ad7: the trim suppressed every relief).
+    // (a user report: the trim suppressed every relief).
     let p_clear = geometry.setback_end > GEOM_EPS
         && resolved[p].length - geometry.setback_end <= u + GEOM_EPS;
     let q_clear = geometry.setback_start > GEOM_EPS && geometry.setback_start >= s_c_q - GEOM_EPS;

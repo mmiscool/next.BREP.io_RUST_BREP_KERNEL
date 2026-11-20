@@ -356,6 +356,39 @@ fn continuation_in_place_on() -> bool {
     crate::switch!("BREP_CONTINUATION_IN_PLACE", true)
 }
 
+/// `BREP_CONTINUATION_AREA_TERMS` (default on; =0 reads every face afresh): the join's area guard reads each face's
+/// parameter-space area from station terms kept per pcurve across the whole merge
+/// ([`crate::mass_properties::parameter_space_area_with`]), bit for bit the same reading. A
+/// join changes the pcurves of one or two loops, but the guard read every pcurve of both
+/// faces before and after each join: on a ball cut by 62 dimples in one subtract, the
+/// ball's face carries a loop per dimple and its area reads were 43% of the build.
+fn continuation_area_terms_on() -> bool {
+    crate::switch!("BREP_CONTINUATION_AREA_TERMS", true)
+}
+
+/// `BREP_CONTINUATION_AREA_TERMS_CHECK=1`: read both ways and stop on any difference.
+fn continuation_area_terms_check() -> bool {
+    crate::switch!("BREP_CONTINUATION_AREA_TERMS_CHECK", false)
+}
+
+
+/// The guard's area reading of `face`, through `memo` when the terms are kept.
+fn guard_area(face: &crate::topology::FaceRecord, memo: &mut crate::mass_properties::AreaTerms) -> Result<f64, KernelRefusal> {
+    let (kept, check) = (continuation_area_terms_on(), continuation_area_terms_check());
+    if !kept && !check {
+        return parameter_space_area(face).or_refuse(KernelStage::Sew, "parameter_space_area");
+    }
+    let read = crate::mass_properties::parameter_space_area_with(face, memo);
+    if check {
+        let fresh = parameter_space_area(face);
+        let bits = |r: &Result<f64, String>| r.as_ref().map(|a| a.to_bits()).map_err(Clone::clone);
+        if bits(&read) != bits(&fresh) {
+            panic!("continuation area terms check: kept {read:?} differs from {fresh:?} on face {}", face.id);
+        }
+    }
+    read.or_refuse(KernelStage::Sew, "parameter_space_area")
+}
+
 fn merge_curve_continuation_edges_impl(
     solid: &BrepSolid,
     tolerance: f64,
@@ -363,6 +396,7 @@ fn merge_curve_continuation_edges_impl(
 ) -> Result<BrepSolid, KernelRefusal> {
     let mut result = solid.clone();
     let mut rejected = rustc_hash::FxHashSet::<(u64, u64)>::default();
+    let mut area_terms = crate::mass_properties::AreaTerms::default();
     loop {
         let edges = result
             .edges
@@ -774,8 +808,8 @@ fn merge_curve_continuation_edges_impl(
         else {
             break;
         };
-        let before_face = parameter_space_area(faces[face_index]).or_refuse(KernelStage::Sew, "parameter_space_area")?;
-        let before_mate = parameter_space_area(faces[first_mate.face]).or_refuse(KernelStage::Sew, "parameter_space_area")?;
+        let before_face = guard_area(faces[face_index], &mut area_terms)?;
+        let before_mate = guard_area(faces[first_mate.face], &mut area_terms)?;
         drop(faces);
         drop(edges);
         // IN PLACE (`BREP_CONTINUATION_IN_PLACE`, default on; `=0` restores the clone): the join edits the solid itself and
@@ -886,10 +920,10 @@ fn merge_curve_continuation_edges_impl(
         let forced = false;
         if forced || !preserves_area(
             before_face,
-            parameter_space_area(candidate_faces[face_index]).or_refuse(KernelStage::Sew, "parameter_space_area")?,
+            guard_area(candidate_faces[face_index], &mut area_terms)?,
         ) || !preserves_area(
             before_mate,
-            parameter_space_area(candidate_faces[first_mate.face]).or_refuse(KernelStage::Sew, "parameter_space_area")?,
+            guard_area(candidate_faces[first_mate.face], &mut area_terms)?,
         ) {
             // This exact pair crosses a periodic p-curve branch. Leave it
             // split and continue searching for other safe candidates.
@@ -930,4 +964,5 @@ fn merge_curve_continuation_edges_impl(
     }
     Ok(result)
 }
+
 

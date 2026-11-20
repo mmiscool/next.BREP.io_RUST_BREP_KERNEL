@@ -40,11 +40,13 @@ use general_star::round_general_star;
 use mixed_concave::round_mixed_concave_corner;
 use mixed_curved::round_mixed_concave_curved_corner;
 use mixed_support::{
-    build_mixed_sector_patch, coedge_sense_on, curved_wall_ball_candidates, cylinder_wall_carrier,
-    line_closest_points, locate_mixed_junction_arc, rebuild_mixed_corner_run,
+    build_mixed_sector_patch, coedge_sense_on, curved_wall_ball_candidates, line_closest_points,
+    locate_mixed_junction_arc, rebuild_mixed_corner_run,
 };
+pub(in crate::blend) use mixed_support::cylinder_wall_carrier;
 pub use patch::{build_chamfer_corner_facet, build_corner_patch_exact, build_general_corner_patch};
-pub(in crate::blend) use ribbon_star::{build_ribbon_star_patch, RibbonRib};
+pub(in crate::blend) use ribbon_star::{build_n_sided_star, build_ribbon_star_patch, RibbonRib};
+pub use ribbon_star::{is_n_sided_undercut_refusal, n_sided_star_on, N_SIDED_FOLD_WHAT, N_SIDED_UNDERCUT_WHAT};
 use patch::build_octant_face;
 
 /// Partition a cyclic loop from a retained anchor, preserving traversal order.

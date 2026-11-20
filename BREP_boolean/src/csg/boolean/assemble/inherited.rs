@@ -1,12 +1,12 @@
 //! The DERIVED inherited-trim challenger (D, 2026-10-05; root's authorization
-//! "derived inherited challenger", corrected per root's 4a6f508 review). A
+//! "derived inherited challenger", corrected on review). A
 //! boolean output use of an operand's own edge carries the operand's trim
 //! restricted to the piece (`csg/edge_split.rs::subcurve_by_fraction`):
 //! nothing refits it, and when the file's trim does not track its own edge,
 //! the output inherits that. On fixture 25 the operand edges 5 and 9 (shipped
 //! edges 2 and 3) stand 3.388e-4 / 8.965e-4 off their curved carriers and their
-//! four output uses track their edges only to 1.422e-4 .. 4.262e-4 (a4c84871,
-//! every-use control).
+//! four output uses track their edges only to 1.422e-4 .. 4.262e-4 (every-use
+//! control).
 //!
 //! What may change: only the OUTPUT body's coedge pcurves of an inherited
 //! edge. Raw operands, edge curves, ranges, senses, carriers, vertices and
@@ -278,7 +278,7 @@ thread_local! {
     /// (`coedge_use_identity`: carrier, pcurve, edge curve and range, sense)
     /// and the bar's bits: everything the fit reads. The fillet's cutter
     /// composition hands the same blend-on-blend uses, under new ids, to
-    /// boolean after boolean (35 on the sprocket report 1d179b4a, every fit
+    /// boolean after boolean (35 on the sprocket report, every fit
     /// declined or refused at the loop gate). The loop and body gates still
     /// run on a served read. Governed by `reading_memo::memo_on`, bounded by
     /// its capacity and cleared with it.
@@ -359,7 +359,10 @@ pub fn read_pair_gated(
     let (Some((first, first_tracking)), Some((second, second_tracking))) = (first, second) else {
         return Some(PairRead::Unread);
     };
-    if first_tracking <= bar && second_tracking <= bar {
+    // A pair is offered for refit only when a use misses its edge by more
+    // than the offer margin x the bar (`BREP_INHERITED_REFIT_MARGIN`).
+    let offer = bar * refit_offer_margin();
+    if first_tracking <= offer && second_tracking <= offer {
         return Some(PairRead::Clean);
     }
     if !proceed() {
@@ -388,6 +391,20 @@ pub fn read_pair_gated(
         (read_first(), read_second())
     };
     Some(PairRead::Candidates(vec![first.0, second.0], usize::from(first.1) + usize::from(second.1)))
+}
+
+/// `BREP_INHERITED_REFIT_MARGIN` (default on, `0` off): a pair whose uses
+/// already track their edge within TWICE the bar is not offered for refit
+/// (off: within the bar). A trim a hair over the bar gains nothing a refit can
+/// show, and the closed-shell gate that admits the batch reads the whole
+/// body twice: on a CNC raster every cut offered the same ~6-30 such pairs
+/// (tracking 1.0-1.24e-7 against 1e-7) and the gate refused them every time,
+/// after two 0.75-1.4 s readings of a 330-face body. The decision reads only
+/// the pair's own tracking, so it is the same whatever ran before. Twice the
+/// bar stays four orders inside validation's own pcurve acceptance (its floor
+/// is 4e-3, `KernelTolerances::pcurve_acceptance`).
+fn refit_offer_margin() -> f64 {
+    if crate::switch!(live "BREP_INHERITED_REFIT_MARGIN", true) { 2.0 } else { 1.0 }
 }
 
 fn candidate(face: &crate::FaceRecord, edge: &crate::topology::EdgeRecord, coedge: &crate::topology::CoedgeRecord, old: &NurbsCurve, bar: f64) -> UseRead {
@@ -634,7 +651,7 @@ pub fn challenge_inherited_trims_scoped(
         }
         eligible += 1;
         if separated.is_some_and(|far| edge_uses.iter().all(|u| far.contains(&faces[u.0].id))) {
-            if edge_uses.iter().all(|u| clean_tracking_cached(faces[u.0], edge, &faces[u.0].loops[u.1].coedges[u.2], bar)) {
+            if edge_uses.iter().all(|u| clean_tracking_cached(faces[u.0], edge, &faces[u.0].loops[u.1].coedges[u.2], bar * refit_offer_margin())) {
                 far_reused += 1;
                 continue;
             }

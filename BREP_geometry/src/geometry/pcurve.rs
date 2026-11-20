@@ -355,6 +355,96 @@ fn worst_first() -> bool {
 /// `BREP_PCURVE_C0_JOIN=0` builds one C2 interpolant through the stations as
 /// before 2026-10-03 (the C0 joins at the curve's corners off), for a
 /// same-binary A/B. Read once per process.
+/// `BREP_PCURVE_POLE_ROW_CROSSING` (default on, `0` off): on a closed-u
+/// carrier other than the analytic sphere (which has its own pole rules), a C0
+/// join of a trim on the carrier's collapsed row (a pole) where the trim comes in
+/// along one longitude and leaves along another is built as the incoming piece
+/// held at its longitude, a link along the row, and the outgoing piece held at
+/// its own. Off, both pieces share the pole station's single (arbitrary)
+/// longitude, and the piece whose meridian it is not swings sideways in its
+/// last span: a trim through a spherical cap's pole read 1.0e-3 off its edge
+/// at v = 0.9995 while every station read 1e-8 (1.2e-5 of a union's volume).
+fn pole_row_crossing() -> bool {
+    switch!(live "BREP_PCURVE_POLE_ROW_CROSSING", true)
+}
+
+/// Whether `v`'s row of `surface` is collapsed. The row is the curve whose
+/// control points are the columns' points at `v` (each column of the net read
+/// as a curve in v); with positive weights the row lies in their hull, so the
+/// row is one point exactly when they are (within 1e-12 of the net's extent).
+fn row_collapsed(surface: &NurbsSurface, v: f64) -> Result<bool, String> {
+    if surface.control_points.iter().flatten().any(|control| !(control.w > 0.0)) {
+        return Ok(false);
+    }
+    let mut row = Vec::with_capacity(surface.control_points.len());
+    for column in &surface.control_points {
+        let curve = NurbsCurve::new(surface.degree_v, surface.knots_v.clone(), column.clone())?;
+        row.push(curve.evaluate(v)?);
+    }
+    let Some(&first) = row.first() else { return Ok(false) };
+    let extent = surface
+        .control_points
+        .iter()
+        .flatten()
+        .filter_map(|control| control.point().ok())
+        .map(|point| point.sub(first).length())
+        .fold(0.0_f64, f64::max);
+    Ok(row.iter().all(|point| point.sub(first).length() <= 1e-12 * (1.0 + extent)))
+}
+
+/// The longitude a trim reaches a pole at, from the two stations nearest it
+/// on one side (`near`, then `far`): linear in the curve parameter, so a trim
+/// whose longitude varies toward the pole keeps its locus, and a meridian its
+/// constant longitude.
+fn pole_longitude(points: &[Vec3], parameters: &[f64], pole: usize, near: usize, far: usize) -> f64 {
+    let (t_pole, t_near, t_far) = (parameters[pole], parameters[near], parameters[far]);
+    if (t_near - t_far).abs() <= f64::EPSILON * t_near.abs().max(1.0) {
+        return points[near].x;
+    }
+    points[near].x + (points[near].x - points[far].x) * (t_pole - t_near) / (t_near - t_far)
+}
+
+/// The pole-row crossings among `pieces`' joins: `(join index, the incoming
+/// side's end point, the outgoing side's start point)` in (u, v). A join is a
+/// crossing when its station lies on a collapsed row ([`row_collapsed`]),
+/// where its longitude is arbitrary, and the two sides reach it at different
+/// longitudes ([`pole_longitude`]). No station other than the pole's moves.
+fn pole_row_crossings(surface: &NurbsSurface, points: &mut [Vec3], parameters: &[f64], pieces: &[usize]) -> Result<Vec<(usize, Vec3, Vec3)>, String> {
+    let ([u0, u1], _) = surface_domains(surface)?;
+    let period = (u1 - u0).abs();
+    let mut crossings = Vec::new();
+    for &join in &pieces[1..pieces.len() - 1] {
+        if join < 2 || join + 2 >= points.len() || !row_collapsed(surface, points[join].y)? {
+            continue;
+        }
+        let incoming = pole_longitude(points, parameters, join, join - 1, join - 2);
+        let outgoing = pole_longitude(points, parameters, join, join + 1, join + 2);
+        if (incoming - outgoing).abs() <= 1e-12 * period.max(1.0) {
+            continue;
+        }
+        let pole_v = points[join].y;
+        crossings.push((join, Vec3::new(incoming, pole_v, 0.0), Vec3::new(outgoing, pole_v, 0.0)));
+    }
+    Ok(crossings)
+}
+
+/// A trim station at either END on a collapsed row ([`row_collapsed`]) takes
+/// the longitude the trim reaches it at ([`pole_longitude`]); no other
+/// station moves.
+fn hold_pole_row_ends(surface: &NurbsSurface, points: &mut [Vec3], parameters: &[f64]) -> Result<(), String> {
+    if points.len() < 3 {
+        return Ok(());
+    }
+    let last = points.len() - 1;
+    if row_collapsed(surface, points[0].y)? && !row_collapsed(surface, points[1].y)? {
+        points[0].x = pole_longitude(points, parameters, 0, 1, 2);
+    }
+    if row_collapsed(surface, points[last].y)? && !row_collapsed(surface, points[last - 1].y)? {
+        points[last].x = pole_longitude(points, parameters, last, last - 1, last - 2);
+    }
+    Ok(())
+}
+
 fn c0_joins() -> bool {
     switch!("BREP_PCURVE_C0_JOIN", true)
 }
@@ -637,6 +727,16 @@ pub fn build_interpolant_joined(
         .collect();
     bounds.sort_unstable();
     bounds.dedup();
+    // A trim that ENDS on a collapsed row (a pole of a closed-u carrier)
+    // holds the longitude of its nearest regular station through the pole
+    // band, as the cone apex does (`BREP_PCURVE_POLE_ROW_CROSSING`).
+    // The analytic sphere has its own pole rules above; this reads every
+    // other closed-u carrier (a surface of revolution's pole, e.g. a cap of a
+    // cone filled out to its sphere).
+    let pole_rows = pole_row_crossing() && closed_u && !matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. }));
+    if pole_rows {
+        hold_pole_row_ends(surface, &mut points, curve_parameters)?;
+    }
     if degree < 3 || bounds.is_empty() || !c0_joins() {
         let curve = interpolate_curve(&points, degree, curve_parameters)?;
         return Ok((curve, excursion, distance));
@@ -657,19 +757,52 @@ pub fn build_interpolant_joined(
         let curve = interpolate_curve(&points, degree, curve_parameters)?;
         return Ok((curve, excursion, distance));
     }
-    let mut knots: Vec<f64> = Vec::with_capacity(curve_parameters.len() + 4);
-    let mut control: Vec<Vec4> = Vec::with_capacity(curve_parameters.len());
+    // A join on a collapsed row (a pole of a closed-u carrier) where the
+    // trim leaves along another longitude than it came in on: each side holds
+    // its own longitude up to the pole and a link runs along the row
+    // (`BREP_PCURVE_POLE_ROW_CROSSING`).
+    let mut points = points;
+    let crossings = if pole_rows { pole_row_crossings(surface, &mut points, curve_parameters, &pieces)? } else { Vec::new() };
+    let mut knots: Vec<f64> = Vec::with_capacity(curve_parameters.len() + 8);
+    let mut control: Vec<Vec4> = Vec::with_capacity(curve_parameters.len() + 4);
     let last_piece = pieces.len() - 2;
+    // The longitude the next piece starts at, when a link precedes it.
+    let mut start_override: Option<Vec3> = None;
     for piece in 0..=last_piece {
         let (from, to) = (pieces[piece], pieces[piece + 1]);
-        let fitted = interpolate_curve(&points[from..=to], 3, &curve_parameters[from..=to])?;
+        let mut piece_points = points[from..=to].to_vec();
+        let mut piece_parameters = curve_parameters[from..=to].to_vec();
+        if let Some(start) = start_override.take() {
+            piece_points[0] = start;
+        }
+        let crossing = crossings.iter().find(|crossing| crossing.0 == to).copied();
+        if let Some((_, before, _)) = crossing {
+            // The link takes a sliver of the parameter just short of the
+            // pole: the piece ends there at its own longitude.
+            let span = piece_parameters[piece_parameters.len() - 1] - piece_parameters[piece_parameters.len() - 2];
+            let sliver = (1e-9 * (curve_parameters[curve_parameters.len() - 1] - curve_parameters[0]).abs()).min(0.1 * span);
+            let last = piece_parameters.len() - 1;
+            piece_parameters[last] -= sliver;
+            piece_points[last] = before;
+        }
+        let fitted = interpolate_curve(&piece_points, 3, &piece_parameters)?;
         if piece == 0 {
             knots.extend(fitted.knots[..4].iter().copied());
         }
         knots.extend(fitted.knots[4..fitted.knots.len() - 4].iter().copied());
+        control.extend(fitted.control_points.iter().skip(usize::from(piece > 0)).copied());
+        if let Some((_, before, after)) = crossing {
+            let link_start = piece_parameters[piece_parameters.len() - 1];
+            knots.extend(std::iter::repeat(link_start).take(3));
+            for k in 1..=3 {
+                let along = k as f64 / 3.0;
+                let point = Vec3::new(before.x + (after.x - before.x) * along, before.y + (after.y - before.y) * along, 0.0);
+                control.push(Vec4::from_point(point, 1.0));
+            }
+            start_override = Some(after);
+        }
         let multiplicity = if piece == last_piece { 4 } else { 3 };
         knots.extend(std::iter::repeat(curve_parameters[to]).take(multiplicity));
-        control.extend(fitted.control_points.iter().skip(usize::from(piece > 0)).copied());
     }
     let curve = NurbsCurve::new(3, knots, control)?;
     Ok((curve, excursion, distance))
@@ -1532,25 +1665,70 @@ pub struct NativeRead {
     pub standoff: f64,
 }
 
-fn native_read(surface: &NurbsSurface, curve: &NurbsCurve, pcurve: &NurbsCurve, [t0, t1]: [f64; 2], fractions: &[f64]) -> Result<NativeRead, String> {
-    crate::work_counts::add(|c| { c.pcurve_native_passes += 1; c.pcurve_native_samples += fractions.len() as u64; });
+fn native_read(surface: &NurbsSurface, curve: &NurbsCurve, pcurve: &NurbsCurve, domain: [f64; 2], fractions: &[f64]) -> Result<NativeRead, String> {
+    native_read_memo(surface, curve, pcurve, domain, fractions, None)
+}
+
+/// One curve's [`native_read`] values per probe fraction (by its bits), for
+/// one standing or candidate pcurve inside [`standoff_tracking_rungs`].
+pub type NativeReadMemo = rustc_hash::FxHashMap<u64, NativeRead>;
+
+/// [`native_read`], with each probe's reading taken from `memo` when that
+/// fraction was read before for the SAME pcurve, and stored there after.
+///
+/// A probe's reading depends only on the surface, the edge curve, this
+/// pcurve and the fraction. The reader caches nothing but its span walk, the
+/// sample caches return the values they would compute, and the seed is the
+/// pcurve's own uv. The maximum over a set of finite values does not depend
+/// on their order. So the result is the uncached one, bit for bit, while
+/// `BREP_PCURVE_READ_MEMO` is on (default). A fraction whose reading is not
+/// finite fails as before, and failures are not stored.
+fn native_read_memo(
+    surface: &NurbsSurface,
+    curve: &NurbsCurve,
+    pcurve: &NurbsCurve,
+    [t0, t1]: [f64; 2],
+    fractions: &[f64],
+    mut memo: Option<&mut NativeReadMemo>,
+) -> Result<NativeRead, String> {
     let mut read = NativeRead { tracking: 0.0, deviation: 0.0, standoff: 0.0 };
     let mut reader = ProbeCurveReader::new(pcurve, probe_batch_enabled());
+    let mut computed = 0u64;
     for &fraction in fractions {
-        let parameter = reader.evaluate(fraction)?;
-        let image = section_surface_point(surface, parameter.x, parameter.y, true)?;
-        let on_curve = section_curve_point(curve, t0 + (t1 - t0) * fraction)?;
-        let foot = crate::projection::project_point_to_surface_from_seed(surface, on_curve, [parameter.x, parameter.y])?;
-        let tracking = image.sub(foot.point).length();
-        let deviation = image.sub(on_curve).length();
-        if !(tracking.is_finite() && deviation.is_finite() && foot.distance.is_finite()) {
-            return Err(format!("native read: non-finite reading at fraction {fraction}"));
-        }
-        read.tracking = read.tracking.max(tracking);
-        read.deviation = read.deviation.max(deviation);
-        read.standoff = read.standoff.max(foot.distance);
+        let probe = match memo.as_deref().and_then(|memo| memo.get(&fraction.to_bits())) {
+            Some(&probe) => probe,
+            None => {
+                computed += 1;
+                let parameter = reader.evaluate(fraction)?;
+                let image = section_surface_point(surface, parameter.x, parameter.y, true)?;
+                let on_curve = section_curve_point(curve, t0 + (t1 - t0) * fraction)?;
+                let foot = crate::projection::project_point_to_surface_from_seed(surface, on_curve, [parameter.x, parameter.y])?;
+                let tracking = image.sub(foot.point).length();
+                let deviation = image.sub(on_curve).length();
+                if !(tracking.is_finite() && deviation.is_finite() && foot.distance.is_finite()) {
+                    return Err(format!("native read: non-finite reading at fraction {fraction}"));
+                }
+                let probe = NativeRead { tracking, deviation, standoff: foot.distance };
+                if let Some(memo) = memo.as_deref_mut() {
+                    memo.insert(fraction.to_bits(), probe);
+                }
+                probe
+            }
+        };
+        read.tracking = read.tracking.max(probe.tracking);
+        read.deviation = read.deviation.max(probe.deviation);
+        read.standoff = read.standoff.max(probe.standoff);
     }
+    crate::work_counts::add(|c| { c.pcurve_native_passes += 1; c.pcurve_native_samples += computed; });
     Ok(read)
+}
+
+/// `BREP_PCURVE_READ_MEMO` (default on; `0` reads every probe afresh): the
+/// standoff-tracking rungs keep each pcurve's probe readings
+/// ([`native_read_memo`]), so a standing fit is not read again at fractions
+/// it was already read at.
+fn pcurve_read_memo_enabled() -> bool {
+    crate::switch!("BREP_PCURVE_READ_MEMO", true)
 }
 
 /// Whether an off-carrier tracking candidate replaces the standing fit, both
@@ -1735,7 +1913,7 @@ pub fn refine_pcurve(
         // (its INHERITED standoff), so no pcurve can bring the image within the
         // floor of the edge point. What a pcurve CAN improve is its tracking
         // error: the image's distance from the edge point's foot. Measured
-        // 2026-10-04 (a2b401d4d, 15-degree crossing, turn 295): a first pass
+        // 2026-10-04 (15-degree crossing, turn 295): a first pass
         // ended RoundBudget at 6.726e-6 over a 1.316e-7 standoff and every
         // tracking pass was skipped. No candidate refinement when the ACTUAL
         // tracking request is met: the first pass's own tracking, read on its
@@ -1744,7 +1922,7 @@ pub fn refine_pcurve(
         // under standoff + floor does not prove that: a tangential slip t over
         // a standoff g reads sqrt(g^2 + t^2) < g + t.
         // `BREP_PCURVE_STANDOFF_TRACKING=0`: diagnostic A/B hatch, not a
-        // policy. It restores the pre-lane answer (35c8610a1's parent: an
+        // policy. It restores the earlier answer (before this tracking: an
         // off-carrier first pass is returned as it stands) for a same-binary
         // attribution of a volume or census delta to this lane. Default (unset
         // or any other value) is unchanged. It does not touch the in-floor
@@ -1930,7 +2108,12 @@ fn standoff_tracking_rungs(
     call: u64,
     insert: &mut impl FnMut(f64, Vec3, Vec3) -> Result<(Option<[f64; 2]>, f64), String>,
 ) -> Result<Refinement, String> {
-    let first = native_probe_fractions(&[&*pcurve]).and_then(|probes| native_read(surface, curve, pcurve, domain, &probes));
+    // Each pcurve's probe readings, kept while it is the standing fit or the
+    // candidate (`BREP_PCURVE_READ_MEMO`).
+    let memoise = pcurve_read_memo_enabled();
+    let mut standing_memo = NativeReadMemo::default();
+    let first = native_probe_fractions(&[&*pcurve])
+        .and_then(|probes| native_read_memo(surface, curve, pcurve, domain, &probes, memoise.then_some(&mut standing_memo)));
     if trace {
         eprintln!("PCURVE-TRACK call={call} standoff-tracking first-pass native={first:?} floor={floor:e}");
     }
@@ -1948,9 +2131,13 @@ fn standoff_tracking_rungs(
         let candidate = refine_pcurve_pass(surface, curve, domain, u_domain, v_domain, floor, joins,
             &mut refined_parameters, &mut refined_raw, &mut refined_curve, best.off_surface, best.clamped,
             true, fraction, true, &mut *insert, false);
+        let mut candidate_memo = NativeReadMemo::default();
         let reads = candidate.as_ref().ok().map(|_| {
             native_probe_fractions(&[&*pcurve, &refined_curve]).and_then(|probes| {
-                Ok((native_read(surface, curve, pcurve, domain, &probes)?, native_read(surface, curve, &refined_curve, domain, &probes)?))
+                Ok((
+                    native_read_memo(surface, curve, pcurve, domain, &probes, memoise.then_some(&mut standing_memo))?,
+                    native_read_memo(surface, curve, &refined_curve, domain, &probes, memoise.then_some(&mut candidate_memo))?,
+                ))
             })
         });
         let fields_finite = matches!(&candidate, Ok(seen) if seen.residual.is_finite() && seen.off_surface.is_finite());
@@ -1976,6 +2163,8 @@ fn standoff_tracking_rungs(
         *parameters = refined_parameters;
         *raw = refined_raw;
         *pcurve = refined_curve;
+        // The candidate is the standing fit now: its readings come with it.
+        standing_memo = candidate_memo;
         best = taken;
         if read.tracking <= floor * 0.01 {
             break;
@@ -1992,7 +2181,7 @@ pub enum RungDecision {
     Accept,
     /// Not taken, but it read finite and LOWER tracking than the standing fit
     /// while over the floor: the finer fraction is still tried from the same
-    /// baseline (fixture 25 on e90c30c94: one use read 2.33e-7 at 0.1 and
+    /// baseline (fixture 25: one use read 2.33e-7 at 0.1 and
     /// stopped while its partner was taken at 9.0e-9).
     Continue,
     /// Not taken and not improving (or unreadable): the rungs end.
@@ -3839,7 +4028,7 @@ pub fn challenger_trigger(residual: f64, off_surface: f64, ask: f64, tracking: i
 }
 
 /// The END-SPAN CHALLENGER of the range lane (2026-10-05, the four original
-/// fitter rows of `abc_00000011/12` edges 7 and 243). On e90c30c94 their worst
+/// fitter rows of `abc_00000011/12` edges 7 and 243). Before this, their worst
 /// excess (4.58e-6 and 5.14e-6) sat in the installed pcurve's LAST span, at the
 /// edge's start, where the edge curve's own first knot span is only 4.5e-6
 /// (e7) and 1.2e-4 (e243) wide while the fitter's end span was 1.4e-4 wide at
@@ -3872,7 +4061,7 @@ pub fn end_span_challenger(
     legacy: PcurveFit,
 ) -> Result<PcurveFit, String> {
     // On the bar by deviation: nothing is read (the original zero-work
-    // path). The TRACKING trigger (538dd700c: an off-carrier edge on its
+    // path). The TRACKING trigger (an off-carrier edge on its
     // deviation bar challenged on its common tracking) is withdrawn from this
     // merge (Claude master's ruling, 2026-10-05): bisected as the first commit
     // that moved step_import's a_trim_off_its_bar_is_accepted_and_named, and
@@ -4105,10 +4294,14 @@ pub fn fit_pcurve_on_surface_stations(
 ) -> Result<PcurveFit, String> {
     let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::FIT);
     crate::work_counts::add(|c| c.fit_calls += 1);
-    fit_station_pcurve(
+    let fit = fit_station_pcurve(
         surface, stations, breaks, &[], tolerance.max(PCURVE_REFINEMENT_TOLERANCE),
         base_samples, refinement_rounds, parameter_cap, SPAN_FLOOR,
-    )
+    )?;
+    // Tallied on the open scope like the curve builders' fits, so a station
+    // fit's clamp reaches the operation's ledger (`pcurve.clamped`).
+    record_fit(&fit.report);
+    Ok(fit)
 }
 
 /// Precision construction for stations on recognized analytic carriers. Unlike
@@ -4425,7 +4618,7 @@ pub fn fit_station_pcurve_mode(
             // within the span floor of a station cannot be inserted: it is
             // counted, and the fit may not report its tracking as met. On e24
             // the four rows stopped on their quarter probes and read 1.144e-7 /
-            // 1.590e-7 at the common probes (a4c84871 runtime, 2026-10-05).
+            // 1.590e-7 at the common probes (2026-10-05).
             let mut verify_blocked = false;
             if track_projection && candidates.is_empty() && !truncated && !skipped_narrow {
                 for fraction in verification_fractions(&pcurve, verify)? {
@@ -4702,6 +4895,7 @@ fn station_residual(
     }
     Ok(worst)
 }
+
 
 
 

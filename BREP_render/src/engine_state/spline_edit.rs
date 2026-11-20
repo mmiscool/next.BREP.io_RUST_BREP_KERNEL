@@ -480,6 +480,7 @@ impl EngineState {
         if self.transform_gizmo.anchor == Some(anchor)
             && self.transform_gizmo.feature_id.as_deref() == Some(feature_id)
         {
+            self.transform_gizmo.deform = None;
             self.transform_gizmo.anchor = Some(target);
         }
         self.write_spline_points(feature_id, points, None);
@@ -508,6 +509,7 @@ impl EngineState {
         self.transform_gizmo.feature_id = Some(feature_id.to_string());
         self.transform_gizmo.mode = GizmoMode::Transform;
         self.transform_gizmo.drag = None;
+        self.transform_gizmo.deform = None;
         self.transform_gizmo.anchor = Some(anchor);
         self.clear_feature_dimension_overlay();
         self.sync_transform_gizmo();

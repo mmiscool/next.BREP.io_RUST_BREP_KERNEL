@@ -70,6 +70,7 @@ mod expression;
 pub(crate) mod features;
 pub use features::common::{first_reference_name, reference_names};
 pub use features::weld::is_weld_type;
+pub use features::gear::is_gear_type;
 /// The NURBS Solid's cage resolver, which the engine's cage editor reads its
 /// handles through (`resolve_cage`, `primitive_cage`, `has_persisted_cage`).
 pub use features::nurbs_solid;
@@ -77,7 +78,7 @@ pub(crate) use features::transform::bbox_center as transform_bbox_center;
 // Transform Face's default pivot over a replayed prefix: the value the app
 // stores into `pivot` when a face selection is committed, computed by the same
 // resolution and centre the feature falls back to for a null pivot.
-pub use features::transform_face::face_transform_pivot;
+pub use features::transform_face::{face_transform_pivot, reference_point as face_transform_reference_point};
 /// A Pattern Component instance id (`APAT1.ACOMP3.i4`) as `(pattern, seed, n)`.
 pub fn pattern_component_instance(id: &str) -> Option<(String, String, i64)> {
     features::assembly_pattern::parse_instance_id(id).map(|(p, s, n)| (p.to_string(), s.to_string(), n))
@@ -1469,6 +1470,15 @@ pub struct FeatureContext<'a> {
     /// feature might reference them, or a direct `execute_feature` call)
     /// never re-seats.
     pub later_inputs: Option<&'a [String]>,
+    /// `Some` when the history walk knows every reference a later feature
+    /// holds that could name what this feature builds (no later feature
+    /// carries persistent data): each later reference string that spells this
+    /// feature's id or a face name of a solid it consumes. A feature's
+    /// boolean may then join a cylinder wall split only along its seam
+    /// (`BREP_FACE_MERGE_RESEAM`) unless one of them would read the joined
+    /// body differently. `None` (a direct `execute_feature` call, an internal
+    /// sub-feature) never joins.
+    pub rejoin_references: Option<&'a [String]>,
 }
 
 impl<'a> FeatureContext<'a> {
@@ -1677,7 +1687,7 @@ pub fn execute_feature(
     env: &Env,
     scene: &SceneMap,
 ) -> FeatureResult {
-    execute_feature_with_later(descriptor, env, scene, None)
+    execute_feature_with_later(descriptor, env, scene, None, None)
 }
 
 /// [`execute_feature`] with what the history walk knows about the features
@@ -1687,6 +1697,7 @@ pub(crate) fn execute_feature_with_later(
     env: &Env,
     scene: &SceneMap,
     later_inputs: Option<&[String]>,
+    rejoin_references: Option<&[String]>,
 ) -> FeatureResult {
     let id = extract_id(&descriptor.input_params);
     let feature_type = descriptor.feature_type.clone();
@@ -1706,6 +1717,7 @@ pub(crate) fn execute_feature_with_later(
         env,
         scene,
         later_inputs,
+        rejoin_references,
     };
     // Alias resolution mirrors the caller's feature registry, which matches short name,
     // LONG name, and class name (all uppercased) — saved files and tests use
@@ -1724,6 +1736,7 @@ pub(crate) fn execute_feature_with_later(
         "E" | "EXTRUDE" => features::extrude::execute(&ctx),
         "R" | "REVOLVE" => features::revolve::execute(&ctx),
         "LOFT" => features::loft::execute(&ctx),
+        "FILL" | "FILL SURFACE" | "FILLSURFACE" => features::fill::execute(&ctx),
         "SW" | "SWEEP" => features::sweep::execute(&ctx),
         "SWP" | "PATH SWEEP" | "PATHSWEEP" => features::path_sweep::execute(&ctx),
         "RIB" => features::rib::execute(&ctx),
@@ -1743,6 +1756,8 @@ pub(crate) fn execute_feature_with_later(
         "TF" | "TRANSFORMFACE" | "TRANSFORM FACE" => features::transform_face::execute(&ctx),
         "DF" | "DELETE FACE" | "DELETEFACE" => features::delete_face::execute(&ctx),
         "RFS" | "REFIT FACES" | "REFITFACES" => features::refit_faces::execute(&ctx),
+        "DFF" | "DEFORM FACE" | "DEFORMFACE" => features::deform_face::execute(&ctx),
+        "SEW" | "SEW TO SOLID" | "SEWTOSOLID" => features::sew_to_solid::execute(&ctx),
         "THK" | "THICKEN" => features::thicken::execute(&ctx),
         "H" | "HOLE" => features::hole::execute(&ctx),
         // --- No-kernel-op / long tail ---
@@ -1775,6 +1790,21 @@ pub(crate) fn execute_feature_with_later(
         "SP" | "SPLINE" => features::spline::execute(&ctx),
         "WELD" => features::weld::execute(&ctx),
         "WELD.GROOVE" => features::weld::groove::execute(&ctx),
+        "GEAR.SPUR" => features::gear::spur::execute(&ctx),
+        "GEAR.HELICAL" => features::gear::helical::execute(&ctx),
+        "GEAR.HERRINGBONE" => features::gear::helical::execute_herringbone(&ctx),
+        "GEAR.RACK" => features::gear::rack::execute(&ctx),
+        "GEAR.RING" => features::gear::ring::execute(&ctx),
+        "GEAR.SPROCKET" => features::gear::sprocket::execute(&ctx),
+        "GEAR.TIMING_PULLEY" => features::gear::timing_pulley::execute(&ctx),
+        "GEAR.SPLINE_STRAIGHT" => features::gear::straight_spline::execute(&ctx),
+        "GEAR.SPLINE_INV" => features::gear::involute_spline::execute(&ctx),
+        "GEAR.RATCHET" => features::gear::ratchet::execute(&ctx),
+        "GEAR.GENEVA" => features::gear::geneva::execute(&ctx),
+        "GEAR.WORM" => features::gear::worm::execute(&ctx),
+        "GEAR.CYCLO_DISC" => features::gear::cycloidal::execute_disc(&ctx),
+        "GEAR.CYCLO_RING" => features::gear::cycloidal::execute_ring(&ctx),
+        "GEAR.CYCLOIDAL" => features::gear::cycloidal_gear::execute(&ctx),
         "WELD.TACK" => features::weld::execute_tack(&ctx),
         "WELD.SPOT" => features::weld::lap::execute_spot(&ctx),
         "WELD.RSEAM" => features::weld::lap::execute_seam(&ctx),
@@ -2047,7 +2077,9 @@ pub fn sketch_alias_lookup<'a, V>(map: &'a HashMap<String, V>, name: &str) -> Op
 fn has_persistent_data(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Null => false,
-        serde_json::Value::Object(map) => !map.is_empty(),
+        // A gear's `gearData` is derived output (diameters, thicknesses) and
+        // holds no reference, so it alone does not count.
+        serde_json::Value::Object(map) => map.keys().any(|key| key != "gearData"),
         serde_json::Value::Array(items) => !items.is_empty(),
         serde_json::Value::String(text) => !text.is_empty(),
         _ => true,
@@ -2084,6 +2116,74 @@ fn seam_reseat_references(
     names.sort();
     names.dedup();
     Some(names)
+}
+
+/// Every string value of a later feature's inputs that spells feature `id`,
+/// or a face or edge name of a solid it consumes (every derived edge name
+/// embeds its faces' names; an authored edge name keeps its own), trimmed,
+/// sorted and deduplicated: the references a seam rejoin
+/// (`FeatureContext::rejoin_references`) reads.
+fn rejoin_references(
+    id: &str,
+    consumed: &std::collections::BTreeSet<String>,
+    scene: &SceneMap,
+    later: &[FeatureDescriptor],
+) -> Vec<String> {
+    fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) => out.push(text.trim().to_string()),
+            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, out)),
+            serde_json::Value::Object(map) => map.values().for_each(|item| walk(item, out)),
+            _ => {}
+        }
+    }
+    let handles: Vec<u32> = consumed.iter().filter_map(|name| scene.solids.get(name).copied()).collect();
+    let mut faces: Vec<&str> = scene
+        .faces
+        .iter()
+        .filter(|(_, face)| handles.contains(&face.handle))
+        .map(|(name, _)| name.as_str())
+        // A derived edge name (`{faceA}|{faceB}[n]`) spells its faces already.
+        .chain(
+            scene
+                .edges
+                .iter()
+                .filter(|(name, edge)| !name.contains('|') && handles.contains(&edge.handle))
+                .map(|(name, _)| name.as_str()),
+        )
+        .collect();
+    if !id.is_empty() {
+        faces.push(id);
+    }
+    let mut strings = Vec::new();
+    for descriptor in later {
+        walk(&descriptor.input_params, &mut strings);
+    }
+    strings.retain(|text| !text.is_empty() && faces.iter().any(|face| text.contains(face)));
+    strings.sort();
+    strings.dedup();
+    strings
+}
+
+/// Every string a later feature's inputs spell that names a face or edge of
+/// feature `id`'s blend (`{id}:BLEND:…`), sorted and deduplicated.
+fn later_blend_references(id: &str, later: &[FeatureDescriptor]) -> Vec<String> {
+    fn walk(value: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::String(text) if text.trim().starts_with(prefix) => out.push(text.trim().to_string()),
+            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, prefix, out)),
+            serde_json::Value::Object(map) => map.values().for_each(|item| walk(item, prefix, out)),
+            _ => {}
+        }
+    }
+    let prefix = format!("{}:", features::common::blend_face_base(id));
+    let mut names = Vec::new();
+    for descriptor in later {
+        walk(&descriptor.input_params, &prefix, &mut names);
+    }
+    names.sort();
+    names.dedup();
+    names
 }
 
 fn scan_consumed(
@@ -2351,6 +2451,36 @@ pub fn execute_history_observed(
             }
             None => fingerprint,
         };
+        // A fillet that wraps sharp corners keeps a seam a later feature names
+        // (`features::fillet`), so those later names key its cache too.
+        let wrap_seam_references = features::fillet::wraps_corners(descriptor)
+            .then(|| later_blend_references(&id, &request.features[index + 1..]));
+        let fingerprint = match &wrap_seam_references {
+            Some(names) if !names.is_empty() => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                (fingerprint, "wrap-seams", names).hash(&mut hasher);
+                hasher.finish()
+            }
+            _ => fingerprint,
+        };
+        let later_inputs = reseat_references.as_deref().or(wrap_seam_references.as_deref());
+        // The references a seam rejoin reads (`FeatureContext::rejoin_references`)
+        // change what the feature builds, so they key its cache too.
+        let rejoin_references = (!persistent_after[index + 1])
+            .then(|| rejoin_references(&id, &consumed, &scene, &request.features[index + 1..]));
+        // `None` (a later feature carries persistent data: never join) keys
+        // apart from `Some` with no references (join freely), so a cached
+        // joined body is not reused once persistent data appears after it.
+        let fingerprint = match &rejoin_references {
+            Some(names) if names.is_empty() => fingerprint,
+            _ => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                (fingerprint, "seam-rejoin", &rejoin_references).hash(&mut hasher);
+                hasher.finish()
+            }
+        };
         // Merkle input hash over this feature + its consumed producers' versions.
         // Computed for EVERY feature (cacheable or not) so its produced names can
         // publish a version for downstream consumers.
@@ -2423,7 +2553,8 @@ pub fn execute_history_observed(
         let blend_operation = crate::blend::BlendOperation::enter();
         let feature_profile = crate::boolean::profile::Feature::begin();
         let feat_start = web_time::Instant::now();
-        let mut result = execute_feature_with_later(descriptor, &env, &scene, reseat_references.as_deref());
+        let mut result =
+            execute_feature_with_later(descriptor, &env, &scene, later_inputs, rejoin_references.as_deref());
         let feature_ms = feat_start.elapsed().as_secs_f64() * 1000.0;
         feature_profile.finish(&id, feature_ms);
         timings.push((id.clone(), feature_ms));

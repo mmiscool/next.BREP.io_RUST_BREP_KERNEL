@@ -924,6 +924,7 @@ pub(super) fn chain_surgery(
             result.vertices.retain(|candidate| candidate.id != vertex);
         }
     }
+    let result = crate::blend::chart_fitted_for_gate(solid, result);
     crossings.gate(result)
 }
 

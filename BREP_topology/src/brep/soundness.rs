@@ -147,6 +147,10 @@ pub mod pair_memo;
 pub mod fold_memo;
 #[path = "soundness/analytic_body.rs"]
 pub mod analytic_body;
+#[path = "soundness/torus_face.rs"]
+pub mod torus_face;
+#[path = "soundness/concentric_balls.rs"]
+pub mod concentric_balls;
 #[path = "soundness/tube_grid.rs"]
 pub mod tube_grid;
 #[path = "soundness/resolve.rs"]
@@ -844,6 +848,31 @@ pub fn solid_self_intersections(
             ..empty_intersection_report(options)
         });
     }
+    if torus_face::enabled() && torus_face::certifies(solid, options) {
+        if let Some(started) = started {
+            profile_line!("soundness.profile ms={:.2} faces=1 certificate=exact_torus_face triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0);
+        }
+        return Ok(SelfIntersectionReport {
+            certificate: Some("exact_torus_face"),
+            ..empty_intersection_report(options)
+        });
+    }
+    if concentric_balls::enabled() && concentric_balls::certifies(solid, options) {
+        if concentric_balls::check_mode() {
+            let full = solid_self_intersections_full(solid, options)?;
+            if full.is_flagged() {
+                eprintln!("soundness.concentric_balls DISAGREES: the full scan flags a body the certificate passed: {:?}", full.summary());
+            }
+            return Ok(full);
+        }
+        if let Some(started) = started {
+            profile_line!("soundness.profile ms={:.2} faces={} certificate=concentric_balls triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells[0].faces.len());
+        }
+        return Ok(SelfIntersectionReport {
+            certificate: Some("concentric_balls"),
+            ..empty_intersection_report(options)
+        });
+    }
     if sphere_certificate::enabled() && sphere_certificate::certifies(solid, options) {
         if let Some(started) = started {
             profile_line!("soundness.profile ms={:.2} faces={} certificate=native_trimmed_spheres triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells[0].faces.len());
@@ -973,6 +1002,11 @@ pub fn solid_self_intersections_with_pair_certificates(
     collect_census: bool,
     certify_pairs: bool,
 ) -> Result<SelfIntersectionReport, String> {
+    if crate::watertight_tessellation::scan_mesh::spline_check()
+        && crate::watertight_tessellation::scan_mesh::spline_force().is_none()
+    {
+        return spline_check_scan(solid, options, collect_census, certify_pairs);
+    }
     let key = if collect_census || fold_trace_enabled() || pierce_trace_enabled() {
         None
     } else {
@@ -989,6 +1023,54 @@ pub fn solid_self_intersections_with_pair_certificates(
         }
     }
     Ok(report)
+}
+
+/// `BREP_SCAN_MESH_SPLINE_CHECK`: the scan with the spline bound forced off,
+/// then on, neither served from nor stored in a memo, compared on what the
+/// acceptance reads (flagged, confirmed crossings, folds, undecided). The
+/// forced-off report is returned. The line carries both triangle counts and
+/// the bounded/fallback face counts of the forced-on run, so a census of
+/// agreeing lines cannot be all faces the bound never took. The forced runs
+/// skip the face-pair memo, so a test of that memo reads no stores under
+/// this flag.
+fn spline_check_scan(
+    solid: &BrepSolid,
+    options: SelfIntersectionOptions,
+    collect_census: bool,
+    certify_pairs: bool,
+) -> Result<SelfIntersectionReport, String> {
+    use crate::watertight_tessellation::scan_mesh::{peek_counts, SplineForceScope};
+    let off = {
+        let _force = SplineForceScope::set(Some(false));
+        solid_self_intersections_uncached(solid, options, collect_census, certify_pairs)?
+    };
+    // A delta of the global counters (approximate when other threads scan).
+    let before = peek_counts();
+    let on = {
+        let _force = SplineForceScope::set(Some(true));
+        solid_self_intersections_uncached(solid, options, collect_census, certify_pairs)
+    };
+    let after = peek_counts();
+    let (bounded, fallback) = (after.0.saturating_sub(before.0), after.1.saturating_sub(before.1));
+    let summary = |report: &SelfIntersectionReport| {
+        (report.is_flagged(), report.confirmed.len(), report.folds.len(), report.undecided, report.fold_undecided)
+    };
+    match on {
+        Ok(on) => {
+            let same = summary(&off) == summary(&on);
+            eprintln!(
+                "soundness.spline_check{} flagged={}/{} confirmed={}/{} folds={}/{} undecided={}/{} triangles={}/{} bounded_faces={bounded} fallback_faces={fallback}",
+                if same { "" } else { " DIFFER" },
+                off.is_flagged(), on.is_flagged(),
+                off.confirmed.len(), on.confirmed.len(),
+                off.folds.len(), on.folds.len(),
+                off.undecided, on.undecided,
+                off.triangles, on.triangles,
+            );
+        }
+        Err(message) => eprintln!("soundness.spline_check DIFFER on_failed={message:?}"),
+    }
+    Ok(off)
 }
 
 fn solid_self_intersections_uncached(
@@ -1088,7 +1170,10 @@ fn solid_self_intersections_uncached(
     // count the report carries is kept. Off while the census collects (its
     // tallies read every candidate) and when the mesh's face keys are not
     // the faces' (a stride other than 1 never reaches here).
-    let pair_memo = pair_memo::enabled() && !collect_census && face_keys.len() == faces.len();
+    // A check mode's forced run (`spline_check_scan`) reads every pair
+    // itself, so the two runs it compares stay independent.
+    let pair_memo = pair_memo::enabled() && !collect_census && face_keys.len() == faces.len()
+        && crate::watertight_tessellation::scan_mesh::spline_force().is_none();
     let pair_options = pair_memo::options_key(options.chord_tolerance, options.weld, options.min_crossing_length);
     // Per unordered face pair: 0 untouched, 1 swept clean so far, 2 served
     // from the memo, 3 crossed in the mesh.
@@ -2975,6 +3060,116 @@ fn sweep_chords(
     second: Option<&[Chord]>,
     mut offer: impl FnMut(usize, usize),
 ) {
+    match pairs_found_along_v(first, second) {
+        Some(pairs) => {
+            for (later_is_second, later, earlier) in pairs {
+                if later_is_second {
+                    offer(earlier, later);
+                } else {
+                    offer(later, earlier);
+                }
+            }
+        }
+        None => sweep_chords_along_u(first, second, offer),
+    }
+}
+
+/// How many pairs of the closed intervals `(low, high)` overlap, ties and
+/// all counted the cheap way: an estimate of a sweep's work, not a result.
+fn overlapping_pairs(mut intervals: Vec<(f64, f64)>) -> usize {
+    let mut highs: Vec<f64> = intervals.iter().map(|interval| interval.1).collect();
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    highs.sort_by(|a, b| a.total_cmp(b));
+    intervals
+        .iter()
+        .enumerate()
+        .map(|(started_before, interval)| {
+            started_before.saturating_sub(highs.partition_point(|high| *high < interval.0))
+        })
+        .sum()
+}
+
+/// The pairs [`sweep_chords_along_u`] offers, in ITS order, found by a sweep
+/// along v instead -- or `None` when that sweep would not be much cheaper (or
+/// a coordinate is not finite), and the u sweep runs as it is.
+///
+/// A trim that runs along v at nearly constant u (a long wall's rail in its
+/// own chart) puts every one of its chords in the u sweep's active set at
+/// once, and the u sweep then tests all of their pairs: tens of thousands of
+/// chords made a loop scan seconds long. The u sweep offers exactly the pairs
+/// whose u intervals and v intervals both overlap, ordered by the sweep rank
+/// (u order, stable) of the later chord and then of the earlier one. The v
+/// sweep finds every pair whose v intervals overlap; each is held to the u
+/// sweep's own two tests and the survivors are put in its order, so what is
+/// offered, and in what order, is the same.
+fn pairs_found_along_v(first: &[Chord], second: Option<&[Chord]>) -> Option<Vec<(bool, usize, usize)>> {
+    let all = || first.iter().chain(second.into_iter().flatten());
+    if !all().all(|chord| chord.a.x.is_finite() && chord.a.y.is_finite() && chord.b.x.is_finite() && chord.b.y.is_finite()) {
+        return None;
+    }
+    let count = first.len() + second.map_or(0, |second| second.len());
+    let along_u = overlapping_pairs(all().map(|chord| (chord.min_u(), chord.max_u())).collect());
+    let along_v = overlapping_pairs(all().map(|chord| (chord.min_v(), chord.max_v())).collect());
+    if along_u <= 4 * (along_v + count) {
+        return None;
+    }
+    // The u sweep's event order, exactly as it sorts it.
+    let mut order: Vec<(f64, bool, usize)> = first
+        .iter()
+        .enumerate()
+        .map(|(index, chord)| (chord.min_u(), false, index))
+        .collect();
+    if let Some(second) = second {
+        order.extend(second.iter().enumerate().map(|(index, chord)| (chord.min_u(), true, index)));
+    }
+    order.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut rank_first = vec![0usize; first.len()];
+    let mut rank_second = vec![0usize; second.map_or(0, |second| second.len())];
+    for (rank, (_, is_second, index)) in order.iter().enumerate() {
+        if *is_second {
+            rank_second[*index] = rank;
+        } else {
+            rank_first[*index] = rank;
+        }
+    }
+    let chord = |is_second: bool, index: usize| if is_second { second.expect("second set indexed")[index] } else { first[index] };
+    let rank = |is_second: bool, index: usize| if is_second { rank_second[index] } else { rank_first[index] };
+    let mut by_v: Vec<(f64, bool, usize)> = order.iter().map(|(_, is_second, index)| (chord(*is_second, *index).min_v(), *is_second, *index)).collect();
+    by_v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut active: Vec<(bool, usize)> = Vec::new();
+    let mut found: Vec<(usize, usize, bool, usize, usize)> = Vec::new();
+    for (sweep_v, is_second, index) in by_v {
+        active.retain(|(other_second, other)| chord(*other_second, *other).max_v() >= sweep_v);
+        for &(other_second, other) in &active {
+            if second.is_some() && other_second == is_second {
+                continue;
+            }
+            let (later, earlier) = if rank(is_second, index) > rank(other_second, other) {
+                ((is_second, index), (other_second, other))
+            } else {
+                ((other_second, other), (is_second, index))
+            };
+            let (x, y) = (chord(later.0, later.1), chord(earlier.0, earlier.1));
+            // The u sweep's own two tests: the earlier chord still active when
+            // the later one starts, and the v boxes not apart.
+            if !(y.max_u() >= x.min_u()) || x.max_v() < y.min_v() || y.max_v() < x.min_v() {
+                continue;
+            }
+            found.push((rank(later.0, later.1), rank(earlier.0, earlier.1), later.0, later.1, earlier.1));
+        }
+        active.push((is_second, index));
+    }
+    found.sort_unstable_by_key(|pair| (pair.0, pair.1));
+    Some(found.into_iter().map(|(_, _, later_is_second, later, earlier)| (later_is_second, later, earlier)).collect())
+}
+
+/// The sweep along u: chords sorted by their least u, each tested against
+/// the chords whose u interval it overlaps.
+fn sweep_chords_along_u(
+    first: &[Chord],
+    second: Option<&[Chord]>,
+    mut offer: impl FnMut(usize, usize),
+) {
     let mut order: Vec<(f64, bool, usize)> = first
         .iter()
         .enumerate()
@@ -4587,4 +4782,5 @@ pub mod network_acceptance_memo {
     }
 
 }
+
 

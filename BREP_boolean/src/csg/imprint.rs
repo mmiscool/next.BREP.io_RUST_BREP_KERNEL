@@ -484,6 +484,17 @@ pub struct ImprintResultRecord {
     /// Appended at the end of the struct (2026-10-10).
     #[serde(default)]
     pub tangent_sections: Vec<TangentSectionRecord>,
+    /// The faces of either operand that stand in at least one cross-operand
+    /// face pair the imprint did NOT positively prove apart: every pair whose
+    /// face boxes met and was neither classified `Disjoint` (control-hull or
+    /// parallel-plane separation) nor proved apart by the trim windows' span
+    /// hulls. A face absent from it was proved clear of every face of the
+    /// other operand (its box met none, or each pair it met was proved apart),
+    /// so nothing the operation added can cross it. `None` wherever the
+    /// imprint did not run its plain two-operand pair loop (a self-imprint,
+    /// a record assembled elsewhere): then no face may be read as proved.
+    #[serde(default)]
+    pub faces_in_unproved_pairs: Option<Vec<FaceKey>>,
 }
 
 /// One extended tangential contact the imprint recognised (see
@@ -569,6 +580,7 @@ pub mod sections;
 mod tangent_contact;
 #[path = "imprint/driver.rs"]
 pub mod driver;
+
 #[path = "imprint/work_profile.rs"]
 pub mod work_profile;
 #[path = "imprint/reuse_profile.rs"]
@@ -608,10 +620,13 @@ pub use support::clear_window_memo;
 pub use self_touch::clear_touch_memo;
 
 
+
 #[path = "imprint/pcurve_cache.rs"]
 mod pcurve_cache;
 use pcurve_cache::cached_build_pcurve as build_pcurve_on_surface_marched;
 
+#[path = "imprint/pierce_clear.rs"]
+mod pierce_clear;
 #[path = "imprint/intersection_cache.rs"]
 pub mod intersection_cache;
 use intersection_cache::intersect as intersect_curve_surface;

@@ -1385,14 +1385,43 @@ pub fn build_open_surgery_with_tail(
     // split off on that side.  Only equality: a stop PAST the row's end — a
     // free end's crossing the rows never reached — still fails the split and
     // refuses, rather than building a rail out to wherever the rows stop.
-    let trim_row = |row: &NurbsCurve, a: f64, b: f64| -> Result<NurbsCurve, KernelRefusal> {
-        let [low, high] = row.domain().or_refuse(KernelStage::Refine, "domain")?;
-        let tail = if a == low { row.clone() } else { row.split(a).or_refuse(KernelStage::Refine, "split")?.1 };
-        if b == high {
-            return Ok(tail);
+    //
+    // `NurbsCurve::split` cuts at a knot lying within `KNOT_IDENTITY_TOL` of
+    // the stop instead of at the stop. On a long rail that is not a small
+    // distance: a ten-metre swept bar's support rail runs ~9000 per unit of
+    // its parameter, and a march station 5e-11 from the free end's crossing
+    // put the trimmed rail's end 4.4e-7 past the cap it stops on, off its
+    // carrier, where no support pcurve can reach the 1e-7 floor. Where the
+    // cut moved the piece's end by more than a tenth of that floor, its end
+    // control point (a clamped curve's end point) is pinned back onto the row
+    // at the stop. A smaller move (rows of ordinary size read up to 1.7e-9)
+    // holds no fit off the floor and is left exactly as cut.
+    // `pinned`: `None` pins a 3D row's end where its cut moved it past that
+    // bar and reports which ends it pinned; `Some(ends)` pins exactly those
+    // ends (the row's uv trim follows its rail).
+    let pin = |piece: &mut NurbsCurve, at_end: bool, point: Vec3, force: Option<bool>| -> bool {
+        let index = if at_end { piece.control_points.len() - 1 } else { 0 };
+        let control = piece.control_points[index];
+        let cut = Vec3::new(control.x / control.w, control.y / control.w, control.z / control.w);
+        let moved = force.unwrap_or_else(|| cut.sub(point).length() > 0.1 * crate::pcurve::PCURVE_REFINEMENT_TOLERANCE);
+        if moved {
+            piece.control_points[index] = Vec4::from_point(point, control.w);
         }
-        let (middle, _) = tail.split(b).or_refuse(KernelStage::Refine, "split")?;
-        Ok(middle)
+        moved
+    };
+    let trim_row = |row: &NurbsCurve, a: f64, b: f64, pinned: Option<[bool; 2]>| -> Result<(NurbsCurve, [bool; 2]), KernelRefusal> {
+        let [low, high] = row.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let mut ends = [false; 2];
+        let mut tail = if a == low { row.clone() } else { row.split(a).or_refuse(KernelStage::Refine, "split")?.1 };
+        if a != low {
+            ends[0] = pin(&mut tail, false, row.evaluate(a).or_refuse(KernelStage::Refine, "evaluate")?, pinned.map(|ends| ends[0]));
+        }
+        if b == high {
+            return Ok((tail, ends));
+        }
+        let (mut middle, _) = tail.split(b).or_refuse(KernelStage::Refine, "split")?;
+        ends[1] = pin(&mut middle, true, row.evaluate(b).or_refuse(KernelStage::Refine, "evaluate")?, pinned.map(|ends| ends[1]));
+        Ok((middle, ends))
     };
     let kind = |plan: &EndPlan| match plan {
         EndPlan::Free(_) => "free",
@@ -1451,7 +1480,7 @@ pub fn build_open_surgery_with_tail(
     }
     // The support pcurve the rows carry interpolates the stations' (u, v) and
     // is read nowhere between them: on the 20-degree crossing's notched open
-    // exit arc it stood 2.98e-5 off the rail it trims (q1 = 9cd8c3163 + the
+    // exit arc it stood 2.98e-5 off the rail it trims (with the
     // section-fit fix, read against the exact cylinders). Inside the crossing
     // window — on the face, never on a carrier's extension — it is refitted
     // to the trimmed rail's own projected track at the pcurve floor and read
@@ -1473,8 +1502,8 @@ pub fn build_open_surgery_with_tail(
             return Ok(None);
         }
         let rows_timing = crate::blend::BlendTimer::start("timing.surgery.trim.rows_ms");
-        let rail = trim_row(row, a, b).map_err(describe_trim)?;
-        let interpolated = trim_row(pcurve, a, b)?;
+        let (rail, pinned) = trim_row(row, a, b, None).map_err(describe_trim)?;
+        let (interpolated, _) = trim_row(pcurve, a, b, Some(pinned))?;
         rows_timing.stop();
         {
             let overrun_timing = crate::blend::BlendTimer::start("timing.surgery.trim.overrun_ms");

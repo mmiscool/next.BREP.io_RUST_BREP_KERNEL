@@ -3,8 +3,13 @@
 //! into a cylinder it is unioned with, its two concave edges the block's
 //! vertical wall and top face meeting the cylinder.
 //!
-//! On a planar floor that corner is the runout composition's (`runout.rs`);
-//! on a curved floor that composition's ring does not build (the miter of the
+//! On a planar floor that corner is the runout composition's (`runout.rs`),
+//! but only where the corner analysis sees it: a closed edge in the selection
+//! (a cylinder's rim) blinds that analysis, so no composition there closes a
+//! planar-floor corner either (a block's edge dying through a cylinder's flat
+//! top cap, or the cap's rim arc dying into the block's flat wall). There the
+//! planar floor is this composition's too (`planar_floors`).
+//! On a curved floor the runout composition's ring does not build (the miter of the
 //! two concave stripes over the sharp spine edge leaves its carriers) and the
 //! cutter composition left the corner as bare edge fillets — the concave arc's
 //! wall overhanging the spine's round as a lip, or, at a smaller radius, the
@@ -20,8 +25,11 @@
 //!
 //! The composition is taken only by the shape it is built for, read before
 //! anything is built, and only where the ordinary lanes have no closure for
-//! the corner: the floor is curved, and each spine's other end is free or a
-//! convex STAR (every other selected edge there convex: a box corner). A star
+//! the corner: the floor is curved (or the corner analysis is blind), and
+//! each spine's other end is free or a convex STAR (every other selected edge
+//! there convex: a box corner). A PARTIAL star, one of whose edges is left
+//! sharp, closes in a miter of the rounds that meet there, which only a stage
+//! building them together closes: its other edges join the spines' stage. A star
 //! end splits the second stage in two (`split_rest`): the spine's round
 //! already ends at that corner, so the star's other edges reach it along the
 //! round's arc on the far face, an arc of a round of their own radius whose
@@ -60,10 +68,11 @@ fn is_planar(solid: &BrepSolid, face_id: u64) -> bool {
         .is_some_and(|face| matches!(face.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. })))
 }
 
-/// The selection's spine runouts on a curved floor, or `None` when the
-/// selection is not this composition's shape (no such spine, a spine whose
-/// other end meets another selected edge, or one dying into a planar floor).
-fn detect(solid: &BrepSolid, selected_ids: &[u64], radius: f64) -> Option<(Vec<Runout>, bool)> {
+/// The selection's spine runouts on a curved floor (or any floor, with
+/// `planar_floors`), or `None` when the selection is not this composition's
+/// shape (no such spine, a spine whose other end meets another selected edge,
+/// or, without `planar_floors`, one dying into a planar floor).
+fn detect(solid: &BrepSolid, selected_ids: &[u64], radius: f64, planar_floors: bool) -> Option<(Vec<Runout>, bool, Vec<usize>)> {
     // Closed edges (a cylinder's rim) have no corner to share: they are left
     // out of the reading and built with the rest in the second stage.
     let open: Vec<usize> = (0..selected_ids.len())
@@ -82,6 +91,11 @@ fn detect(solid: &BrepSolid, selected_ids: &[u64], radius: f64) -> Option<(Vec<R
     // Whether some spine's far end is a convex star (other selected convex
     // edges meet it there): the second stage is then split (`split_rest`).
     let mut split = false;
+    // A star with an edge left sharp (a box corner two of whose three edges
+    // are picked): the rounds meet there in a miter, which only a stage that
+    // builds them together closes, so the star's other edges join the
+    // spines' stage (their own far ends then reach the rest as a star's do).
+    let mut with_spines = Vec::new();
     for (slot, &index) in open.iter().enumerate() {
         if !convex[slot] {
             continue;
@@ -92,8 +106,10 @@ fn detect(solid: &BrepSolid, selected_ids: &[u64], radius: f64) -> Option<(Vec<R
         enum End {
             Runout(u64),
             Free,
-            /// Every other selected edge there is convex.
-            Star,
+            /// Every other selected edge there is convex: the selection
+            /// indices of those edges when an edge there is left sharp
+            /// (a partial star), empty when every edge there is selected.
+            Star(Vec<usize>),
             Other,
         }
         let mut ends = Vec::with_capacity(2);
@@ -112,7 +128,9 @@ fn detect(solid: &BrepSolid, selected_ids: &[u64], radius: f64) -> Option<(Vec<R
                 && selected_here.iter().all(|other| convex[*other])
                 && around.iter().all(|id| !selected_ids.contains(id) || open_ids.contains(id))
             {
-                ends.push((vertex, End::Star));
+                let full = around.iter().all(|id| selected_ids.contains(id));
+                let partial = if full { Vec::new() } else { selected_here.iter().map(|other| open[*other]).collect() };
+                ends.push((vertex, End::Star(partial)));
                 continue;
             }
             // Three edges at the vertex, all selected: the spine and two
@@ -133,19 +151,23 @@ fn detect(solid: &BrepSolid, selected_ids: &[u64], radius: f64) -> Option<(Vec<R
         }
         for (vertex, end) in ends {
             match end {
-                // A planar floor is the runout composition's.
-                End::Runout(floor) if is_planar(solid, floor) => return None,
+                // A planar floor is the runout composition's where the
+                // corner analysis can see it.
+                End::Runout(floor) if !planar_floors && is_planar(solid, floor) => return None,
                 End::Runout(floor) => {
                     let point = solid.vertices.iter().find(|candidate| candidate.id == vertex)?.point;
                     runouts.push(Runout { spine: index, vertex, point, floor });
                 }
                 End::Free => {}
-                End::Star => split = true,
+                End::Star(partial) => {
+                    split = true;
+                    with_spines.extend(partial);
+                }
                 End::Other => return None,
             }
         }
     }
-    (!runouts.is_empty()).then_some((runouts, split))
+    (!runouts.is_empty()).then_some((runouts, split, with_spines))
 }
 
 /// The spine's bridge: the edge of the first stage's body between the floor
@@ -181,7 +203,8 @@ fn bridge_point(input: &BrepSolid, staged: &BrepSolid, runout: &Runout) -> Optio
 
 /// Build `edge_points` spine-first when the selection has this shape: `None`
 /// when it does not, or when a stage did not build every wall (the caller's
-/// lanes then answer as before).
+/// lanes then answer as before). `planar_floors` admits spines dying into a
+/// planar floor too: only where the corner analysis is blind to the corner.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spine_first_composition(
     solid: &BrepSolid,
@@ -190,16 +213,17 @@ pub(super) fn spine_first_composition(
     edge_names: Option<&[String]>,
     radius: f64,
     name: Option<&str>,
+    planar_floors: bool,
 ) -> Option<(BrepSolid, BlendSelection)> {
     let debug = std::env::var("BREP_DEBUG_NETWORK").is_ok();
-    let (runouts, split) = detect(solid, selected_ids, radius)?;
-    let mut spines: Vec<usize> = runouts.iter().map(|runout| runout.spine).collect();
+    let (runouts, split, with_spines) = detect(solid, selected_ids, radius, planar_floors)?;
+    let mut spines: Vec<usize> = runouts.iter().map(|runout| runout.spine).chain(with_spines).collect();
     spines.sort_unstable();
     spines.dedup();
     if debug {
         for runout in &runouts {
             eprintln!(
-                "spine-first: spine #{} dies into the curved floor {} at vertex {} ({:.4}, {:.4}, {:.4})",
+                "spine-first: spine #{} dies into the floor {} at vertex {} ({:.4}, {:.4}, {:.4})",
                 runout.spine, runout.floor, runout.vertex, runout.point.x, runout.point.y, runout.point.z
             );
         }
@@ -211,9 +235,12 @@ pub(super) fn spine_first_composition(
     }
     let name_of = |index: usize| edge_names.and_then(|names| names.get(index)).cloned().unwrap_or_default();
     let pick_names = |indices: &[usize]| edge_names.map(|_| indices.iter().map(|index| name_of(*index)).collect::<Vec<_>>());
-    // Stage 1: the spines alone.
+    // Stage 1: the spines alone (with the other edges of a partial star).
     let spine_points: Vec<Vec3> = spines.iter().map(|index| edge_points[*index]).collect();
     let spine_names = pick_names(&spines);
+    if debug {
+        eprintln!("spine-first: the first stage picks {:?}", spine_names.clone().unwrap_or_default());
+    }
     let staged = match fillet_edges_reported(solid, &spine_points, spine_names.as_deref(), radius, false, name) {
         Ok((staged, selection)) if selection.is_complete() => staged,
         Ok(_) | Err(_) => {
@@ -271,11 +298,19 @@ fn build_stage(
     what: &str,
     debug: bool,
 ) -> Option<BrepSolid> {
+    if debug {
+        eprintln!("spine-first: {what} picks {:?}", names.map(|names| names.to_vec()).unwrap_or_default());
+    }
     match fillet_edges_reported(body, points, names, radius, false, name) {
         Ok((result, selection)) if selection.is_complete() => Some(result),
         Ok((_, selection)) => {
             if debug {
-                eprintln!("spine-first: {what} dropped {:?}", selection.rejected);
+                let named: Vec<String> = selection
+                    .rejected
+                    .iter()
+                    .map(|index| names.and_then(|names| names.get(*index)).cloned().unwrap_or_else(|| format!("#{index} at {:?}", points.get(*index))))
+                    .collect();
+                eprintln!("spine-first: {what} dropped {:?} ({named:?})", selection.rejected);
             }
             None
         }
@@ -349,6 +384,9 @@ fn split_rest(
     for (point, source) in smooth_runs(input, &concave_staged, &other_points) {
         other_points.push(point);
         other_names.push(format!("{}:RUN", name_of(rest[other_slots[source]])));
+        if debug {
+            eprintln!("spine-first: run {} at ({:.4}, {:.4}, {:.4})", other_names.last().unwrap(), point.x, point.y, point.z);
+        }
     }
     if debug {
         eprintln!("spine-first: the last stage takes {} edges ({} added runs)", other_points.len(), other_points.len() - other_slots.len());

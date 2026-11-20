@@ -1,6 +1,8 @@
 use crate::curve::{
-    basis_derivatives_into, basis_functions_into, knot_clamp, knot_domain, knot_find_span,
-    validate_knots, MAX_STACK_DEGREE, MAX_STACK_ORDER,
+    basis_derivatives_wide as basis_derivatives_into, basis_functions_wide as basis_functions_into,
+    knot_clamp, knot_domain, knot_find_span,
+    validate_knots, EVALUATOR_STACK_DEGREE as MAX_STACK_DEGREE,
+    EVALUATOR_STACK_ORDER as MAX_STACK_ORDER,
 };
 pub use crate::{KnotVector, NurbsCurve, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
@@ -9,6 +11,9 @@ use serde::{Deserialize, Serialize};
 mod extension;
 #[path = "surface/trim_partials.rs"]
 mod trim_partials;
+#[path = "surface/refine.rs"]
+mod refine;
+pub use refine::{KnotDirection, KnotRefinementRefusal};
 pub use trim_partials::PreparedTrimPartials;
 pub use extension::{
     ExtendRefusal, SurfaceSide, WeightSite, MAXIMUM_FOLD_ANGLE, MAXIMUM_GROWTH_RATIO,
@@ -59,6 +64,14 @@ pub struct NurbsSurface {
     /// surface, and recomputed on demand after deserialization.
     #[serde(skip, default)]
     pub analytic: std::cell::OnceCell<Option<crate::AnalyticSurface>>,
+    /// Translation structure, queried independently of the classic analytic
+    /// enum so adding this carrier does not break exhaustive API matches.
+    #[serde(skip, default)]
+    linear_extrusion: std::cell::OnceCell<Option<crate::analytic_surface::ExtrusionStructure>>,
+    /// The extrusion's profile reduced across its direction, with its seed samples
+    /// (`BREP_EXTRUSION_HELD_PROFILE`); built from `linear_extrusion` on first use.
+    #[serde(skip, default)]
+    extrusion_profile: std::cell::OnceCell<Option<crate::analytic_surface::ReducedProfile>>,
     /// Lazily recognized affine sphere (`geometry/affine_sphere.rs`), read
     /// only under `BREP_AFFINE_SPHERE` and only when no analytic carrier was
     /// recognized; an acceleration cache like `analytic`.
@@ -90,6 +103,10 @@ pub struct NurbsSurface {
     /// answer does not already settle. `None` when the net cannot be refined.
     #[serde(skip, default)]
     pub projection_cells: std::cell::OnceCell<Option<crate::projection::ProjectionCells>>,
+    /// Cached Bézier patches and their hull boxes for the curve-clear proof
+    /// (`intersect/curve_clear.rs`), built on its first query of this surface.
+    #[serde(skip, default)]
+    pub(crate) bezier_patches: std::cell::OnceCell<Option<std::sync::Arc<crate::curve_clear::SurfacePatches>>>,
 }
 
 impl NurbsSurface {
@@ -107,6 +124,8 @@ impl NurbsSurface {
             knots_v,
             control_points,
             analytic: std::cell::OnceCell::new(),
+            linear_extrusion: std::cell::OnceCell::new(),
+            extrusion_profile: std::cell::OnceCell::new(),
             affine_sphere: std::cell::OnceCell::new(),
             validated: std::cell::Cell::new(false),
             closed_directions: std::cell::OnceCell::new(),
@@ -114,6 +133,7 @@ impl NurbsSurface {
             projection_dense_grid: std::cell::OnceCell::new(),
             projection_ring_grid: std::cell::OnceCell::new(),
             projection_cells: std::cell::OnceCell::new(),
+            bezier_patches: std::cell::OnceCell::new(),
         };
         surface.ensure_valid()?;
         Ok(surface)
@@ -217,6 +237,18 @@ impl NurbsSurface {
         Ok(knot_domain(&self.knots_v, self.degree_v))
     }
 
+    /// Exact affine translation structure in this surface's own chart.
+    pub fn linear_extrusion(&self) -> Option<&crate::analytic_surface::ExtrusionStructure> {
+        self.linear_extrusion.get_or_init(|| crate::analytic_surface::extrusion_structure(self)).as_ref()
+    }
+
+    /// The held reduced profile of `extrusion` when it is this surface's own recognized
+    /// structure (`Some(None)` when it cannot be reduced); `None` for any other structure.
+    pub(crate) fn held_extrusion_profile(&self, extrusion: &crate::analytic_surface::ExtrusionStructure) -> Option<Option<&crate::analytic_surface::ReducedProfile>> {
+        let own = self.linear_extrusion.get().and_then(Option::as_ref).is_some_and(|e| std::ptr::eq(e, extrusion));
+        own.then(|| self.extrusion_profile.get_or_init(|| extrusion.reduce(true)).as_ref())
+    }
+
     /// The recognized analytic carrier, if this exact rational patch is a
     /// plane or a full revolution quadric/torus. Computed once per instance.
     pub fn analytic(&self) -> Option<&crate::AnalyticSurface> {
@@ -246,6 +278,8 @@ impl NurbsSurface {
         let mut warm = Vec::new();
         let cells = [
             ("analytic", self.analytic.get().is_some()),
+            ("linear_extrusion", self.linear_extrusion.get().is_some()),
+            ("extrusion_profile", self.extrusion_profile.get().is_some()),
             ("affine_sphere", self.affine_sphere.get().is_some()),
             ("validated", self.validated.get()),
             ("closed", self.closed_directions.get().is_some()),
@@ -253,6 +287,7 @@ impl NurbsSurface {
             ("dense", self.projection_dense_grid.get().is_some()),
             ("ring", self.projection_ring_grid.get().is_some()),
             ("cells", self.projection_cells.get().is_some()),
+            ("bezier", self.bezier_patches.get().is_some()),
         ];
         for (name, held) in cells {
             if held {
@@ -270,6 +305,11 @@ impl NurbsSurface {
         let wants = |name: &str| names.iter().any(|&n| n == name || n == "all");
         if wants("analytic") {
             self.analytic = from.map(|f| f.analytic.clone()).unwrap_or_default();
+        }
+        // the held profile is built from the structure, so it goes wherever the structure goes
+        if wants("linear_extrusion") || wants("extrusion_profile") {
+            self.linear_extrusion = from.map(|f|f.linear_extrusion.clone()).unwrap_or_default();
+            self.extrusion_profile = from.map(|f| f.extrusion_profile.clone()).unwrap_or_default();
         }
         if wants("affine_sphere") {
             self.affine_sphere = from.map(|f| f.affine_sphere.clone()).unwrap_or_default();
@@ -291,6 +331,9 @@ impl NurbsSurface {
         }
         if wants("cells") {
             self.projection_cells = from.map(|f| f.projection_cells.clone()).unwrap_or_default();
+        }
+        if wants("bezier") {
+            self.bezier_patches = from.map(|f| f.bezier_patches.clone()).unwrap_or_default();
         }
     }
 
@@ -581,7 +624,7 @@ impl NurbsSurface {
             let span_u = knot_find_span(&self.knots_u, self.degree_u, u);
             let span_v = knot_find_span(&self.knots_v, self.degree_v, v);
             // `derivative_count` reaches the degree here (blends ask for third
-            // partials), so the rows stay eight wide.
+            // partials), so the rows retain the full stack order.
             let mut basis_u = [[0.0f64; MAX_STACK_ORDER]; MAX_STACK_ORDER];
             let mut basis_v = [[0.0f64; MAX_STACK_ORDER]; MAX_STACK_ORDER];
             basis_derivatives_into(
@@ -697,6 +740,31 @@ impl NurbsSurface {
         v: f64,
         derivative_count: usize,
     ) -> Result<[[Vec3; 3]; 3], String> {
+        match derivative_count {
+            0 => self.derivatives_small_count::<0>(u, v),
+            1 => self.derivatives_small_count::<1>(u, v),
+            2 => self.derivatives_small_count::<2>(u, v),
+            _ => self.derivatives_small_degrees::<{usize::MAX}, {usize::MAX}, {usize::MAX}>(u, v, derivative_count),
+        }
+    }
+
+    fn derivatives_small_count<const COUNT: usize>(&self, u: f64, v: f64) -> Result<[[Vec3; 3]; 3], String> {
+        match (self.degree_u, self.degree_v) {
+            (3, 9) => self.derivatives_small_degrees::<3, 9, COUNT>(u, v, COUNT),
+            (5, 9) => self.derivatives_small_degrees::<5, 9, COUNT>(u, v, COUNT),
+            _ => self.derivatives_small_degrees::<{usize::MAX}, {usize::MAX}, COUNT>(u, v, COUNT),
+        }
+    }
+
+    // The same recurrence and control-point order, with partial count and common
+    // screw-wall degrees fixed so bounds and loop trips can fold. MAX retains
+    // the runtime argument for the generic path and its bitwise comparison.
+    fn derivatives_small_degrees<const U: usize, const V: usize, const COUNT: usize>(
+        &self, u: f64, v: f64, derivative_count: usize,
+    ) -> Result<[[Vec3; 3]; 3], String> {
+        let degree_u = if U == usize::MAX { self.degree_u } else { U };
+        let degree_v = if V == usize::MAX { self.degree_v } else { V };
+        let derivative_count = if COUNT == usize::MAX { derivative_count } else { COUNT };
         // Row zero of the derivative basis has the value recurrence's exact
         // arithmetic. Keep its row-major sum and reciprocal multiplication,
         // but avoid the derivative scratch grids for a point-only request.
@@ -704,7 +772,7 @@ impl NurbsSurface {
         // the original derivative path whenever that policy is enabled.
         if derivative_count == 0 && switch!("BREP_SURFACE_POINT_ONLY", false)
             && u.is_finite() && v.is_finite()
-            && self.degree_u <= MAX_STACK_DEGREE && self.degree_v <= MAX_STACK_DEGREE
+            && degree_u <= MAX_STACK_DEGREE && degree_v <= MAX_STACK_DEGREE
             && !analytic_point_on() {
             let point = self.evaluate_homogeneous(u, v)?;
             if point.w.abs() <= EPS {
@@ -716,8 +784,8 @@ impl NurbsSurface {
         }
         debug_assert!(derivative_count <= 2);
         self.ensure_valid()?;
-        let du = derivative_count.min(self.degree_u);
-        let dv = derivative_count.min(self.degree_v);
+        let du = derivative_count.min(degree_u);
+        let dv = derivative_count.min(degree_v);
         let stride = derivative_count + 1;
         let zero = Vec4 {
             x: 0.0,
@@ -726,11 +794,11 @@ impl NurbsSurface {
             w: 0.0,
         };
         let mut homogeneous = [zero; 9];
-        if self.degree_u <= MAX_STACK_DEGREE && self.degree_v <= MAX_STACK_DEGREE {
-            let u = knot_clamp(&self.knots_u, self.degree_u, u);
-            let v = knot_clamp(&self.knots_v, self.degree_v, v);
-            let span_u = knot_find_span(&self.knots_u, self.degree_u, u);
-            let span_v = knot_find_span(&self.knots_v, self.degree_v, v);
+        if degree_u <= MAX_STACK_DEGREE && degree_v <= MAX_STACK_DEGREE {
+            let u = knot_clamp(&self.knots_u, degree_u, u);
+            let v = knot_clamp(&self.knots_v, degree_v, v);
+            let span_u = knot_find_span(&self.knots_u, degree_u, u);
+            let span_v = knot_find_span(&self.knots_v, degree_v, v);
             // Rows `..=du` / `..=dv` (at most three) are the only ones written
             // or read; the eight-row fill was a measurable share of a sign
             // reading's surface station (2026-11-02).
@@ -738,7 +806,7 @@ impl NurbsSurface {
             let mut basis_v = [[0.0f64; MAX_STACK_ORDER]; 3];
             basis_derivatives_into(
                 &self.knots_u,
-                self.degree_u,
+                degree_u,
                 span_u,
                 u,
                 du,
@@ -746,7 +814,7 @@ impl NurbsSurface {
             );
             basis_derivatives_into(
                 &self.knots_v,
-                self.degree_v,
+                degree_v,
                 span_v,
                 v,
                 dv,
@@ -759,11 +827,11 @@ impl NurbsSurface {
                         continue;
                     }
                     let mut point = zero;
-                    for i in 0..=self.degree_u {
-                        let row = &self.control_points[span_u - self.degree_u + i];
-                        for j in 0..=self.degree_v {
+                    for i in 0..=degree_u {
+                        let row = &self.control_points[span_u - degree_u + i][span_v - degree_v..=span_v];
+                        for j in 0..=degree_v {
                             point = point.add(
-                                row[span_v - self.degree_v + j]
+                                row[j]
                                     .scale(basis_u[k][i] * basis_v[l][j]),
                             );
                         }
@@ -786,11 +854,11 @@ impl NurbsSurface {
                         continue;
                     }
                     let mut point = zero;
-                    for i in 0..=self.degree_u {
-                        let row = &self.control_points[span_u - self.degree_u + i];
-                        for j in 0..=self.degree_v {
+                    for i in 0..=degree_u {
+                        let row = &self.control_points[span_u - degree_u + i];
+                        for j in 0..=degree_v {
                             point = point.add(
-                                row[span_v - self.degree_v + j]
+                                row[span_v - degree_v + j]
                                     .scale(basis_u[k][i] * basis_v[l][j]),
                             );
                         }
@@ -1048,6 +1116,8 @@ impl NurbsSurface {
             (2, 1) => self.deriv1_small_fixed::<2, 1>(u, v),
             (1, 2) => self.deriv1_small_fixed::<1, 2>(u, v),
             (2, 2) => self.deriv1_small_fixed::<2, 2>(u, v),
+            (3, 9) => self.deriv1_small_fixed::<3, 9>(u, v),
+            (5, 9) => self.deriv1_small_fixed::<5, 9>(u, v),
             _ => {
                 let g = self.derivatives_small(u, v, 1)?;
                 Ok((g[0][0], g[1][0], g[0][1]))
@@ -1083,9 +1153,9 @@ impl NurbsSurface {
         let sum = |k: usize, l: usize| {
             let mut value = zero;
             for i in 0..=DEGREE_U {
-                let row = &self.control_points[span_u - DEGREE_U + i];
+                let row = &self.control_points[span_u - DEGREE_U + i][span_v - DEGREE_V..=span_v];
                 for j in 0..=DEGREE_V {
-                    value = value.add(row[span_v - DEGREE_V + j].scale(basis_u[k][i] * basis_v[l][j]));
+                    value = value.add(row[j].scale(basis_u[k][i] * basis_v[l][j]));
                 }
             }
             value
@@ -1274,7 +1344,7 @@ impl NurbsSurface {
         v: f64,
     ) -> Result<Vec3, String> {
         self.ensure_valid()?;
-        if self.degree_u > MAX_STACK_DEGREE || self.degree_v > MAX_STACK_DEGREE {
+        if self.degree_u > crate::curve::MAX_STACK_DEGREE || self.degree_v > crate::curve::MAX_STACK_DEGREE {
             return Err("NurbsSurface: partial by differences exceeds the stack degree".into());
         }
         let (pu, pv) = (self.degree_u, self.degree_v);
@@ -1358,6 +1428,14 @@ impl NurbsSurface {
     /// an offset's regularity factor 1 − d·κ vanishes exactly when an inward
     /// offset (d = −R) reaches the axis.
     pub fn principal_curvatures(&self, u: f64, v: f64) -> Result<(f64, f64), String> {
+        self.principal_curvatures_and_tangents(u, v)
+            .map(|(kappa_min, kappa_max, _, _)| (kappa_min, kappa_max))
+    }
+
+    /// [`Self::principal_curvatures`] together with the first derivatives
+    /// `Su` and `Sv` it was read from, so a caller can judge how well
+    /// conditioned the reading is without evaluating the surface twice.
+    pub fn principal_curvatures_and_tangents(&self, u: f64, v: f64) -> Result<(f64, f64, Vec3, Vec3), String> {
         let derivatives: [[Vec3; 3]; 3] = if small_derivatives_enabled() {
             self.derivatives_small(u, v, 2)?
         } else {
@@ -1387,6 +1465,8 @@ impl NurbsSurface {
         Ok((
             mean_double * 0.5 - discriminant,
             mean_double * 0.5 + discriminant,
+            su,
+            sv,
         ))
     }
 
@@ -1549,12 +1629,39 @@ pub fn make_revolution(
     generatrix: &NurbsCurve,
     theta: f64,
 ) -> Result<NurbsSurface, String> {
+    revolution_in_spans(axis_point, axis_direction, generatrix, theta, None)
+}
+
+/// [`make_revolution`] with the turn in ONE rational quadratic span (middle
+/// weight cos(theta/2)) for `theta` under 180 degrees, where
+/// `make_revolution` splits past 90. Its circles then run at the parameter of
+/// a one-conic arc of the same turn, so an edge built that way lies on an
+/// iso line of it. Up to 90 degrees the two are the same surface.
+pub fn make_revolution_one_span(
+    axis_point: Vec3,
+    axis_direction: Vec3,
+    generatrix: &NurbsCurve,
+    theta: f64,
+) -> Result<NurbsSurface, String> {
+    if !(theta < std::f64::consts::PI - 1e-6) {
+        return Err("makeRevolution: one span needs theta under PI".into());
+    }
+    revolution_in_spans(axis_point, axis_direction, generatrix, theta, Some(1))
+}
+
+fn revolution_in_spans(
+    axis_point: Vec3,
+    axis_direction: Vec3,
+    generatrix: &NurbsCurve,
+    theta: f64,
+    spans: Option<usize>,
+) -> Result<NurbsSurface, String> {
     if theta <= EPS || theta > std::f64::consts::TAU + EPS {
         return Err("makeRevolution: theta must be in (0, 2*PI]".into());
     }
     let theta = theta.min(std::f64::consts::TAU);
     let axis = axis_direction.normalized()?;
-    let arc_count = ((theta / std::f64::consts::FRAC_PI_2 - EPS).ceil() as usize).clamp(1, 4);
+    let arc_count = spans.unwrap_or_else(|| ((theta / std::f64::consts::FRAC_PI_2 - EPS).ceil() as usize).clamp(1, 4));
     let arc_angle = theta / arc_count as f64;
     let middle_weight = (arc_angle / 2.0).cos();
     let mut knots_u = vec![0.0, 0.0, 0.0];
@@ -1948,7 +2055,7 @@ fn analytic_point_on() -> bool {
 /// `normal` and `principal_curvatures` read the stack twin
 /// [`NurbsSurface::derivatives_small`] instead of the heap grid. A third of the
 /// D2 outward shell's heap allocations were `NurbsSurface::derivatives` (a
-/// sampled-backtrace allocation census, cad-bot); the values are the same bits.
+/// sampled-backtrace allocation census); the values are the same bits.
 pub fn small_derivatives_enabled() -> bool {
     switch!("BREP_SURFACE_SMALL_DERIVATIVES", true)
 }

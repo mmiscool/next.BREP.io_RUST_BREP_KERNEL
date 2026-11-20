@@ -646,7 +646,7 @@ fn rim_runs_forward(
 ///   is the WHOLE section, and the one thing that is free about it is where its
 ///   single vertex sits. That vertex is the face's own SEAM vertex, and the
 ///   section must start there, not at the carrier's `u = 0`: a face's seam EDGE
-///   need not sit at the generatrix (the push-face seam fix, `becc64a98`), and a
+///   need not sit at the generatrix (the push-face seam fix), and a
 ///   rim anchored anywhere else would relocate the seam vertex and strand the
 ///   wall's seam edge. So the arc is built from the re-solved seam vertex's own
 ///   azimuth through a full turn.

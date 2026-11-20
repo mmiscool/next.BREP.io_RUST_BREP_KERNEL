@@ -296,6 +296,15 @@ pub struct RenderSettings {
     pub pick_double_sided: bool,
     /// How a plain viewport click builds a multi-selection (see [`MultiSelectMode`]).
     pub multi_select: MultiSelectMode,
+    /// A connected SpaceMouse / Spaceball moves the 3D view (`brep-app`'s
+    /// `spacemouse` module). On by default: with no device it does nothing.
+    pub spacemouse_enabled: bool,
+    /// Speed multiplier over the device's base rates, clamped to
+    /// `[0.1, 5.0]` (the slider's domain).
+    pub spacemouse_sensitivity: f32,
+    /// Per-axis direction flips, indexed in the device's HID axis order
+    /// (`SPACEMOUSE_AXES`): pan x, zoom, pan y, tilt, roll, spin.
+    pub spacemouse_invert: [bool; 6],
     /// Tessellation LOD factor — the chord-tolerance multiplier behind the
     /// "Render Quality" dropdown (see [`RENDER_QUALITY`]: 1.0 = "Medium", 0.5 =
     /// "High"). Defaults to 0.5, the "High" level, per the 2026-10-14 display
@@ -408,6 +417,9 @@ impl Default for RenderSettings {
             viewcube_size_px: brep_gizmos::view_cube::ViewCube::DEFAULT_SIZE_PX,
             pick_double_sided: true,
             multi_select: MultiSelectMode::ClickToggles,
+            spacemouse_enabled: true,
+            spacemouse_sensitivity: 1.0,
+            spacemouse_invert: [false; 6],
             // "High" render quality (RENDER_QUALITY: 0.5 = half the "Medium"
             // chord tolerance) — the directive's dropdown value.
             lod_factor: 0.5,
@@ -600,6 +612,17 @@ impl RenderSettings {
                 _ => {}
             }
         }
+        if let Some(v) = value.get("spacemouseEnabled").and_then(|v| v.as_bool()) {
+            self.spacemouse_enabled = v;
+        }
+        if let Some(v) = value.get("spacemouseSensitivity").and_then(|v| v.as_f64()) {
+            self.spacemouse_sensitivity = (v as f32).clamp(0.1, 5.0);
+        }
+        for (slot, (key, _)) in self.spacemouse_invert.iter_mut().zip(SPACEMOUSE_AXES) {
+            if let Some(v) = value.get(key).and_then(|v| v.as_bool()) {
+                *slot = v;
+            }
+        }
         // The active UI workbench id (a plain string; the app validates it against
         // its registry). Stored verbatim — an unknown id is tolerated here —
         // except a RETIRED id, which is rewritten to its successor on read so
@@ -635,7 +658,7 @@ impl RenderSettings {
     /// This is the counterpart the settings schema serializes/persists through
     /// (there was previously no serializer, only the partial-override reader).
     pub fn to_json(&self) -> String {
-        serde_json::json!({
+        let mut json = serde_json::json!({
             "theme": match self.theme {
                 ThemeMode::Auto => "auto",
                 ThemeMode::Light => "light",
@@ -674,6 +697,8 @@ impl RenderSettings {
             "viewcubeSizePx": self.viewcube_size_px as f64,
             "pickDoubleSided": self.pick_double_sided,
             "multiSelect": self.multi_select.label(),
+            "spacemouseEnabled": self.spacemouse_enabled,
+            "spacemouseSensitivity": self.spacemouse_sensitivity as f64,
             "renderQuality": quality_from_lod(self.lod_factor),
             "sketchMovableColor": rgba_to_css_hex(self.sketch_movable_color),
             "sketchLockedColor": rgba_to_css_hex(self.sketch_locked_color),
@@ -690,8 +715,11 @@ impl RenderSettings {
             "assemblyAutoSolve": self.assembly_auto_solve,
             "showConstraintGraphics": self.show_constraint_graphics,
             "bomColumns": self.bom_columns,
-        })
-        .to_string()
+        });
+        for ((key, _), invert) in SPACEMOUSE_AXES.iter().zip(self.spacemouse_invert) {
+            json[*key] = serde_json::Value::Bool(invert);
+        }
+        json.to_string()
     }
 
     /// The live [`SketchColors`] view of the sketcher palette — the tessellation /
@@ -912,6 +940,20 @@ pub fn settings_form_fields() -> Vec<FormField> {
         .collect()
 }
 
+/// The SpaceMouse invert settings, `(json key, label)`, in the device's HID
+/// axis order: translation x, y, z then rotation x, y, z. HID's frame is x to
+/// the right, y toward the user, z down, so its y is push / pull (zoom) and
+/// its z is lift / press (pan up / down); rotation about x tilts the cap
+/// forward / back, about y rolls it sideways, about z spins it.
+pub const SPACEMOUSE_AXES: [(&str, &str); 6] = [
+    ("spacemouseInvertPanX", "Invert pan left / right"),
+    ("spacemouseInvertZoom", "Invert zoom (push / pull)"),
+    ("spacemouseInvertPanY", "Invert pan up / down"),
+    ("spacemouseInvertTilt", "Invert tilt"),
+    ("spacemouseInvertRoll", "Invert roll"),
+    ("spacemouseInvertSpin", "Invert spin"),
+];
+
 /// The Rust-owned settings schema: the ordered list of display-settings fields,
 /// grouped, analogous to the kernel feature schemas. Adding a field here (plus
 /// its `apply_json`/`to_json` handling) makes the whole UI grow a widget for it
@@ -1070,6 +1112,22 @@ pub fn settings_schema() -> Vec<SettingsField> {
         f("sketchPreviewColor", "Draw preview", "Sketch", FieldKind::Color),
         f("sketchConstraintColor", "Constraint / dimension", "Sketch", FieldKind::Color),
         f("sketchConflictColor", "Conflicting constraint", "Sketch", FieldKind::Color),
+        // --- SpaceMouse ----------------------------------------------------
+        // A 6-DoF navigation device (SpaceMouse / Spaceball). The slider's
+        // domain MATCHES the `apply_json` clamp. One flip per device axis.
+        f("spacemouseEnabled", "Use SpaceMouse / Spaceball", "SpaceMouse", FieldKind::Bool),
+        f(
+            "spacemouseSensitivity",
+            "Speed",
+            "SpaceMouse",
+            FieldKind::Range { min: 0.1, max: 5.0, step: 0.05 },
+        ),
+        f(SPACEMOUSE_AXES[0].0, SPACEMOUSE_AXES[0].1, "SpaceMouse", FieldKind::Bool),
+        f(SPACEMOUSE_AXES[2].0, SPACEMOUSE_AXES[2].1, "SpaceMouse", FieldKind::Bool),
+        f(SPACEMOUSE_AXES[1].0, SPACEMOUSE_AXES[1].1, "SpaceMouse", FieldKind::Bool),
+        f(SPACEMOUSE_AXES[3].0, SPACEMOUSE_AXES[3].1, "SpaceMouse", FieldKind::Bool),
+        f(SPACEMOUSE_AXES[5].0, SPACEMOUSE_AXES[5].1, "SpaceMouse", FieldKind::Bool),
+        f(SPACEMOUSE_AXES[4].0, SPACEMOUSE_AXES[4].1, "SpaceMouse", FieldKind::Bool),
         // --- Debug ---------------------------------------------------------
         // LAST so the "Debug" group renders at the BOTTOM of the settings tree.
         f("debugGrabHandles", "Debug grab handles", "Debug", FieldKind::Bool),

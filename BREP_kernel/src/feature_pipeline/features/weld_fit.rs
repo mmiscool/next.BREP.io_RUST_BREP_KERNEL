@@ -60,9 +60,22 @@ pub(super) struct Fit {
     /// How far along each leg from the root its face begins (the gap a leg
     /// crosses; zero for a leg that starts on its face).
     pub skip: [f64; 2],
+    /// The stretch of the run (fractions from its start) the bead runs
+    /// along: the whole run, or for a bridged section the part both faces
+    /// back ([`backed_span`]).
+    pub span: (f64, f64),
 }
 
 impl Fit {
+    /// Where both legs start off the root (each face begins a gap from it),
+    /// the distance along each leg at which the bead's section begins: the
+    /// section is the quadrilateral from one face's first point through the
+    /// toes to the other's, bridging the root opening. Zero otherwise (the
+    /// root triangle, as every other joint).
+    pub(super) fn bridge(&self) -> [f64; 2] {
+        if self.skip[0] > 0.0 && self.skip[1] > 0.0 { self.skip } else { [0.0, 0.0] }
+    }
+
     /// This fit carried `fraction` along `seam`: the section and the joint
     /// faces' normals where that fraction of the run starts.
     pub(super) fn carried(&self, seam: &Seam, fraction: f64) -> Fit {
@@ -76,6 +89,7 @@ impl Fit {
             legs: [seam.carry(fraction, self.legs[0]), seam.carry(fraction, self.legs[1])],
             root: seam.carry(fraction, self.root),
             skip: self.skip,
+            span: self.span,
         }
     }
 }
@@ -245,6 +259,24 @@ pub(super) fn sweep_section(seam: &Seam, points: &[Vec3], contour: Option<f64>, 
         match contour {
             Some(height) if i == 1 && points.len() == 3 => {
                 let (centre, _, _, apex) = contour_arc(points[0], from, to, height)?;
+                outline.push(Side::Arc { from, to, centre, through: apex });
+            }
+            _ => outline.push(Side::Line(from, to)),
+        }
+    }
+    sweep_outline(seam, &outline, trim)
+}
+
+/// [`sweep_section`] of a bridged section `[first point on face 1, toe 1,
+/// toe 2, first point on face 2]` whose legs meet at `root` (off the section):
+/// the face between the toes is the contour arc as for the root triangle.
+fn sweep_bridged(seam: &Seam, root: Vec3, points: [Vec3; 4], contour: Option<f64>, trim: &Trim) -> Result<crate::BrepSolid, String> {
+    let mut outline = Vec::with_capacity(4);
+    for i in 0..4 {
+        let (from, to) = (points[i], points[(i + 1) % 4]);
+        match contour {
+            Some(height) if i == 1 => {
+                let (centre, _, _, apex) = contour_arc(root, from, to, height)?;
                 outline.push(Side::Arc { from, to, centre, through: apex });
             }
             _ => outline.push(Side::Line(from, to)),
@@ -489,6 +521,30 @@ fn across_gap(scene: &SceneMap, seam: &Seam, name: &str, widest: f64) -> Result<
     Ok(None)
 }
 
+/// The flat faces of the bodies offering `carriers` that stand a root gap
+/// narrower than `widest` off the straight seam (see [`across_gap`]).
+fn gapped_faces(scene: &SceneMap, seam: &Seam, carriers: &[JointFace], widest: f64) -> Result<Vec<JointFace>, String> {
+    let mut handles: Vec<u32> = carriers.iter().map(|joint| joint.handle).collect();
+    handles.sort_unstable();
+    handles.dedup();
+    let mut found = Vec::new();
+    for handle in handles {
+        let names: Vec<String> = crate::with_registered_solid_str(handle, |solid| {
+            Ok(solid.shells.iter().flat_map(|shell| &shell.faces)
+                .filter(|face| !carriers.iter().any(|joint| joint.handle == handle && joint.face_id == face.id))
+                .filter_map(|face| face.name.clone()).collect())
+        })?;
+        for name in names {
+            if let Some(joint) = across_gap(scene, seam, &name, widest)? {
+                if joint.handle == handle {
+                    found.push(joint);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// Whether the named face stands a bridgeable root gap off a straight seam.
 pub(super) fn bridges(scene: &SceneMap, seam: &Seam, name: &str, legs: [f64; 2]) -> Result<bool, String> {
     Ok(across_gap(scene, seam, name, legs[0].max(legs[1]))?.is_some())
@@ -560,6 +616,196 @@ fn root_of(pair: [&JointFace; 2], tangent: Vec3) -> Result<Option<(Vec3, [f64; 2
     Ok(Some((shift, skip)))
 }
 
+/// [`root_of`], with the gapped face's leg backed from where that face
+/// begins. A face that holds the root (a flange edge standing a root gap off
+/// the other flange's face) begins there; otherwise the root is the corner
+/// of two faces that each begin a gap away from it (a corner-to-corner
+/// joint's open V, between two square wall ends whose inside edges stand a
+/// root opening apart) and that face's leg starts where the face does, so
+/// the bead bridges the opening between the two faces' first points
+/// ([`Fit::bridge`]). `None` when the face does not begin within `reach`.
+fn backed_root(pair: [&JointFace; 2], seam: &Seam, probe: f64, reach: f64) -> Result<Option<(Vec3, [f64; 2])>, String> {
+    let Some((root, mut skip)) = root_of(pair, seam.tangent)? else { return Ok(None) };
+    let Some(gapped) = pair.iter().position(|face| face.gap.is_some()) else { return Ok(Some((root, skip))) };
+    let tolerance = seam.tolerance();
+    let leg = seam.carry(0.5, leg_direction(pair[gapped], pair[1 - gapped], seam.tangent)?);
+    let middle = seam.at(0.5).add(seam.carry(0.5, root));
+    let on = |s: f64| runs_onto(pair[gapped], middle.add(leg.scale(s)), tolerance);
+    // The face holds the root (on it or its boundary): as every such joint.
+    if on(0.0)? {
+        return Ok(Some((root, skip)));
+    }
+    // The first sample on the face, then its edge by bisection. (Not from
+    // the corner probe's distance: a root opening can be narrower than it.)
+    const SAMPLES: usize = 64;
+    let mut off = 0.0;
+    for k in 1..=SAMPLES {
+        let s = reach * k as f64 / SAMPLES as f64;
+        if !on(s)? {
+            off = s;
+            continue;
+        }
+        let mut inside = s;
+        while inside - off > tolerance * 1e-2 {
+            let mid = 0.5 * (off + inside);
+            if on(mid)? { inside = mid } else { off = mid }
+        }
+        // Exactly where the face begins: its straight edge along the seam
+        // there (a bisection stops a tolerance short of it, which would leave
+        // the support slab's end a sliver off the next face). A face beginning
+        // at the root (within its tolerance), or with no straight edge there,
+        // is read as holding it, as before (the corner probe then decides).
+        let edge = edge_along(pair[gapped], middle, leg, seam.tangent, inside, tolerance)?;
+        let Some(edge) = edge.filter(|edge| *edge > 10.0 * tolerance) else {
+            return Ok(on(probe)?.then_some((root, skip)));
+        };
+        // Only a pair whose other leg is backed too: both faces begin off
+        // the root, so the root is the corner of their planes in free space.
+        if skip[1 - gapped] <= tolerance {
+            return Ok(None);
+        }
+        skip[gapped] = edge;
+        return Ok(Some((root, skip)));
+    }
+    Ok(None)
+}
+
+/// The longest stretch of a straight `seam` (fractions from its start) along
+/// which each face holds its whole leg band, from where the face begins
+/// (`skip`) to the toe (`sizes`), measured from the section's `root`; `None`
+/// when no stretch is backed. The stretch ends where a boundary edge of a face
+/// enters its band: a wall end not square to the seam, a relief's cut. Exact
+/// for straight edges; a curved edge's extreme within the band is refined on
+/// the curve. The whole seam (0, 1) when nothing enters the bands.
+fn backed_span(seam: &Seam, faces: [&JointFace; 2], legs: [Vec3; 2], root: Vec3, skip: [f64; 2], sizes: [f64; 2]) -> Result<Option<(f64, f64)>, String> {
+    let tolerance = seam.tolerance();
+    let origin = seam.start.add(root);
+    // Breaks along the seam (by length from its start).
+    let mut breaks: Vec<f64> = Vec::new();
+    for i in 0..2 {
+        let (leg, low, high) = (legs[i], skip[i] + 10.0 * tolerance, sizes[i] - 10.0 * tolerance);
+        let coords = |p: Vec3| { let d = p.sub(origin); (d.dot(seam.tangent), d.dot(leg)) };
+        let curves: Vec<NurbsCurve> = crate::with_registered_solid_str(faces[i].handle, |solid| {
+            let record = solid.shells.iter().flat_map(|shell| &shell.faces).find(|f| f.id == faces[i].face_id)
+                .ok_or_else(|| format!("face {} is no longer resident", faces[i].face_id))?;
+            let mut curves = Vec::new();
+            for coedge in record.loops.iter().flat_map(|l| &l.coedges) {
+                let Some(edge) = solid.edges.iter().find(|e| e.id == coedge.edge_id) else { continue };
+                if edge.degenerate { continue; }
+                curves.push(crate::feature_pipeline::features::common::trimmed_curve(&edge.curve, edge.t0, edge.t1)?);
+            }
+            Ok(curves)
+        })?;
+        for curve in &curves {
+            let [t0, t1] = curve.domain()?;
+            let at = |t: f64| -> Result<(f64, f64), String> { Ok(coords(curve.evaluate(t)?)) };
+            const SAMPLES: usize = 512;
+            let ts: Vec<f64> = (0..=SAMPLES).map(|k| t0 + (t1 - t0) * k as f64 / SAMPLES as f64).collect();
+            let points = ts.iter().map(|t| at(*t)).collect::<Result<Vec<_>, _>>()?;
+            let inside = |s: f64| s > low && s < high;
+            for k in 0..SAMPLES {
+                let ((f0, s0), (_, s1)) = (points[k], points[k + 1]);
+                // Where the edge crosses the band's sides, by bisection on the curve.
+                for bound in [low, high] {
+                    if (s0 - bound) * (s1 - bound) < 0.0 {
+                        let (mut a, mut b) = (ts[k], ts[k + 1]);
+                        for _ in 0..80 {
+                            let m = 0.5 * (a + b);
+                            if (at(m)?.1 - bound) * (s0 - bound) > 0.0 { a = m } else { b = m }
+                        }
+                        breaks.push(at(0.5 * (a + b))?.0);
+                    }
+                }
+                if inside(s0) {
+                    breaks.push(f0);
+                }
+            }
+            if inside(points[SAMPLES].1) {
+                breaks.push(points[SAMPLES].0);
+            }
+            // A curved edge's extreme along the seam inside the band: refine
+            // each local extreme of the samples on the curve.
+            for k in 1..SAMPLES {
+                let (prev, here, next) = (points[k - 1].0, points[k].0, points[k + 1].0);
+                let extreme = (here >= prev && here >= next) || (here <= prev && here <= next);
+                if !extreme || !inside(points[k].1) || (here - prev).abs() + (next - here).abs() <= 0.0 {
+                    continue;
+                }
+                let maximum = here >= prev;
+                let (mut a, mut b) = (ts[k - 1], ts[k + 1]);
+                for _ in 0..100 {
+                    let (m1, m2) = (a + (b - a) / 3.0, b - (b - a) / 3.0);
+                    let (g1, g2) = (at(m1)?.0, at(m2)?.0);
+                    if (g1 < g2) == maximum { a = m1 } else { b = m2 }
+                }
+                let (f, s) = at(0.5 * (a + b))?;
+                if inside(s) {
+                    breaks.push(f);
+                }
+            }
+        }
+    }
+    breaks.push(0.0);
+    breaks.push(seam.length);
+    breaks.retain(|f| *f >= 0.0 && *f <= seam.length);
+    breaks.sort_by(f64::total_cmp);
+    // A stretch is backed where both bands lie on their faces at its middle.
+    let backed = |f: f64| -> Result<bool, String> {
+        for i in 0..2 {
+            for k in 0..=16 {
+                let s = skip[i] + (sizes[i] - skip[i]) * k as f64 / 16.0;
+                if !runs_onto(faces[i], origin.add(seam.tangent.scale(f)).add(legs[i].scale(s)), tolerance)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    };
+    let mut best: Option<(f64, f64)> = None;
+    for pair in breaks.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if b - a <= 100.0 * tolerance || best.is_some_and(|(x, y)| y - x >= b - a) {
+            continue;
+        }
+        if backed(0.5 * (a + b))? {
+            best = Some((a, b));
+        }
+    }
+    let Some((a, b)) = best else { return Ok(None) };
+    // By length from the seam's start; an end within the seam's tolerance of
+    // the seam's own end is that end.
+    let near = 10.0 * tolerance;
+    Ok(Some((if a <= near { 0.0 } else { a }, if b >= seam.length - near { seam.length } else { b })))
+}
+
+/// The distance along `leg` from `from` to the straight edge of `face` that
+/// runs along `tangent` and crosses the leg's line within ten tolerances of
+/// `near`; `None` when no edge does.
+fn edge_along(face: &JointFace, from: Vec3, leg: Vec3, tangent: Vec3, near: f64, tolerance: f64) -> Result<Option<f64>, String> {
+    crate::with_registered_solid_str(face.handle, |solid| {
+        let record = solid.shells.iter().flat_map(|shell| &shell.faces).find(|f| f.id == face.face_id)
+            .ok_or_else(|| format!("face {} is no longer resident", face.face_id))?;
+        let mut best: Option<f64> = None;
+        for coedge in record.loops.iter().flat_map(|l| &l.coedges) {
+            let Some(edge) = solid.edges.iter().find(|e| e.id == coedge.edge_id) else { continue };
+            let (a, b) = (edge.curve.evaluate(edge.t0)?, edge.curve.evaluate(edge.t1)?);
+            let Ok(along) = b.sub(a).normalized() else { continue };
+            // Straight and along the seam.
+            let middle = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1))?;
+            if along.cross(tangent).length() > 1e-9 || middle.sub(a).cross(along).length() > tolerance {
+                continue;
+            }
+            let d = a.sub(from);
+            let s = d.dot(leg);
+            let off = d.sub(leg.scale(s)).sub(along.scale(d.dot(along))).length();
+            if off <= 10.0 * tolerance && (s - near).abs() <= 10.0 * tolerance && best.is_none_or(|b| (s - near).abs() < (b - near).abs()) {
+                best = Some(s);
+            }
+        }
+        Ok(best)
+    })
+}
+
 /// The leg direction along `face`, on the free side of `other`.
 fn leg_direction(face: &JointFace, other: &JointFace, tangent: Vec3) -> Result<Vec3, String> {
     let direction = face.normal.cross(tangent).normalized()?;
@@ -582,12 +828,13 @@ fn outside_solid(scene: &SceneMap, solid: &str, point: Vec3, tolerance: f64) -> 
 /// Check the pair makes a corner with free space between the legs: both short
 /// legs land on their faces and the wedge between them is outside every body
 /// that offered a joint face.
-fn corner(scene: &SceneMap, seam: &Seam, pair: [&JointFace; 2], solids: &[String], probe: f64) -> Result<Option<[Vec3; 2]>, String> {
+fn corner(scene: &SceneMap, seam: &Seam, pair: [&JointFace; 2], solids: &[String], probe: f64, sizes: [f64; 2]) -> Result<Option<[Vec3; 2]>, String> {
+    let reach = sizes[0].max(sizes[1]);
     if pair[0].normal.cross(pair[1].normal).length() < MIN_CORNER_SIN {
         return Ok(None);
     }
     let legs = [leg_direction(pair[0], pair[1], seam.tangent)?, leg_direction(pair[1], pair[0], seam.tangent)?];
-    let Some((root, skip)) = root_of(pair, seam.tangent)? else { return Ok(None) };
+    let Some((root, skip)) = backed_root(pair, seam, probe, reach)? else { return Ok(None) };
     let tolerance = seam.tolerance();
     let middle = seam.at(0.5).add(seam.carry(0.5, root));
     let carried = [seam.carry(0.5, legs[0]), seam.carry(0.5, legs[1])];
@@ -597,9 +844,21 @@ fn corner(scene: &SceneMap, seam: &Seam, pair: [&JointFace; 2], solids: &[String
         }
     }
     let wedge = middle.add(carried[0].add(carried[1]).scale(probe / 3.0));
-    for solid in solids {
-        if !outside_solid(scene, solid, wedge, tolerance * 0.1)? {
+    let mut free = vec![wedge];
+    if skip[0] > 0.0 && skip[1] > 0.0 {
+        // A bridged section: both faces begin within the shorter leg, and
+        // the opening between their first points is free space.
+        if skip[0].max(skip[1]) >= sizes[0].min(sizes[1]) - tolerance {
             return Ok(None);
+        }
+        let opening = middle.add(carried[0].scale(skip[0])).add(middle.add(carried[1].scale(skip[1]))).scale(0.5);
+        free.push(opening.add(carried[0].add(carried[1]).scale(probe / 3.0)));
+    }
+    for point in free {
+        for solid in solids {
+            if !outside_solid(scene, solid, point, tolerance * 0.1)? {
+                return Ok(None);
+            }
         }
     }
     Ok(Some(legs))
@@ -640,7 +899,7 @@ pub(super) fn fit(scene: &SceneMap, seam: &Seam, explicit: &[String], exclude: &
     let mut pairs: Vec<([JointFace; 2], [Vec3; 2])> = Vec::new();
     match chosen.as_slice() {
         [first, second] => {
-            if let Some(legs) = corner(scene, seam, [first, second], &solids, probe)? {
+            if let Some(legs) = corner(scene, seam, [first, second], &solids, probe, legs)? {
                 pairs.push(([first.clone(), second.clone()], legs));
             }
         }
@@ -652,11 +911,31 @@ pub(super) fn fit(scene: &SceneMap, seam: &Seam, explicit: &[String], exclude: &
                             continue;
                         }
                     }
-                    if corner(scene, seam, [a, b], &solids, probe)?.is_some() {
+                    if corner(scene, seam, [a, b], &solids, probe, legs)?.is_some() {
                         let [f0, f1] = order(seam, chosen.first(), [a, b]);
                         let legs = [leg_direction(&f0, &f1, seam.tangent)?, leg_direction(&f1, &f0, seam.tangent)?];
                         pairs.push(([f0, f1], legs));
                     }
+                }
+            }
+        }
+    }
+    // A seam with no corner along it: the inside edge of a square wall end at
+    // a corner-to-corner joint. The other wall's face a root opening away is
+    // found on the same body; only a pair whose legs are both backed off the
+    // root is taken (the open V outside, or the inside corner: one picked face
+    // chooses), so every other joint reads as before.
+    if pairs.is_empty() && chosen.len() <= 1 && chosen.iter().all(|only| only.gap.is_none()) && seam.is_line() {
+        let widest = legs[0].max(legs[1]);
+        for gapped in gapped_faces(scene, seam, &all, widest)? {
+            for carrier in &all {
+                let bridged = backed_root([carrier, &gapped], seam, probe, widest)?
+                    .is_some_and(|(_, skip)| skip[0] > 0.0 && skip[1] > 0.0);
+                let wanted = chosen.first().is_none_or(|only| same(only, carrier));
+                if wanted && bridged && corner(scene, seam, [carrier, &gapped], &solids, probe, legs)?.is_some() {
+                    let [f0, f1] = order(seam, chosen.first(), [carrier, &gapped]);
+                    let legs = [leg_direction(&f0, &f1, seam.tangent)?, leg_direction(&f1, &f0, seam.tangent)?];
+                    pairs.push(([f0, f1], legs));
                 }
             }
         }
@@ -681,21 +960,56 @@ pub(super) fn fit(scene: &SceneMap, seam: &Seam, explicit: &[String], exclude: &
         }
     }
     let tolerance = seam.tolerance();
-    let Some((root, skip)) = root_of([&first, &second], seam.tangent)? else {
+    let Some((root, skip)) = backed_root([&first, &second], seam, probe, legs[0].max(legs[1]))? else {
         return Ok(Err(format!("no root across the gap between faces {} and {}", first.name, second.name)));
     };
+    // A bridged section runs along the stretch both faces back: a wall end
+    // that is not square to the seam (unequal bend angles), or one a relief
+    // cuts, ends the bead short of the seam's ends.
+    let span = if skip[0] > 0.0 && skip[1] > 0.0 && seam.is_line() {
+        let refused = || format!("faces {} and {} back no stretch of the seam together", first.name, second.name);
+        let Some((a, b)) = backed_span(seam, [&first, &second], legs_dir, root, skip, legs)? else { return Ok(Err(refused())) };
+        // A trimmed end stands inside the faces by the weld's resolvable band
+        // (a hundred weld floors, the support check's depth), more where a
+        // face's edge meets it at a slant and the material under the leg runs
+        // out before the face does; so may an end of the seam itself. The
+        // first stretch whose exact support check holds: the backed stretch
+        // as found, then both ends inset by a band, two, four, ...
+        let base = 100.0 * crate::tolerance::WELD_FLOOR;
+        let mut found = None;
+        for k in 0..=8 {
+            let inset = |end: f64, own: f64| if k == 0 { if end == own { 0.0 } else { base } } else { base * f64::powi(2.0, k) };
+            let (from, to) = (a + inset(a, 0.0), b - inset(b, seam.length));
+            if to - from <= base {
+                break;
+            }
+            let span = (from / seam.length, to / seam.length);
+            let trial = Fit { faces: [first.clone(), second.clone()], legs: legs_dir, root, skip, span };
+            if supported(&seam.part(span.0, span.1), &trial, legs, &Trim { ends: [None, None] })?.is_ok() {
+                found = Some(if from == 0.0 && to == seam.length { (0.0, 1.0) } else { span });
+                break;
+            }
+        }
+        match found {
+            Some(span) => span,
+            None => return Ok(Err(refused())),
+        }
+    } else {
+        (0.0, 1.0)
+    };
+    let along = seam.part(span.0, span.1);
     for (((face, leg), size), skip) in [&first, &second].iter().zip(&legs_dir).zip(legs).zip(skip) {
         if size <= skip + tolerance {
             return Ok(Err(format!("leg {size} does not reach across the {skip} root gap onto joint face {}", face.name)));
         }
         for fraction in STATIONS {
-            let toe = seam.at(fraction).add(seam.carry(fraction, root.add(leg.scale(size))));
+            let toe = along.at(fraction).add(along.carry(fraction, root.add(leg.scale(size))));
             if !runs_onto(face, toe, tolerance)? {
                 return Ok(Err(format!("leg {size} runs off joint face {}", face.name)));
             }
         }
     }
-    Ok(Ok(Fit { faces: [first, second], legs: legs_dir, root, skip }))
+    Ok(Ok(Fit { faces: [first, second], legs: legs_dir, root, skip, span }))
 }
 
 // The far side of a fitted joint on one run: the mirror corner across the
@@ -981,6 +1295,10 @@ impl Chain {
             }
         }
         let fits: Vec<Fit> = fitted.into_iter().map(|fit| fit.expect("every run fitted")).collect();
+        // A bead trimmed to the stretch its faces back is a single run's.
+        if count > 1 && fits.iter().any(|fit| fit.span != (0.0, 1.0)) {
+            return Ok(Err("the joint faces back only part of a segment of a seam of several segments".into()));
+        }
         for (a, b, corner) in &self.corners {
             if corner.is_some() {
                 continue;
@@ -1164,6 +1482,7 @@ impl Chain {
                     if f1 == 1.0 && through_end { trims[k].ends[1] } else { None },
                 ] };
                 pieces.push(Piece {
+                    bridge: [0.0, 0.0],
                     run: run.part(f0, f1),
                     section: [run.carry(f0, root), run.carry(f0, a), run.carry(f0, b)],
                     trim,
@@ -1220,6 +1539,9 @@ pub(super) struct Piece {
     pub trim: Trim,
     pub index: usize,
     pub from: f64,
+    /// [`Fit::bridge`] of its run's fit: where along each leg the section
+    /// begins (zero: at the root).
+    pub bridge: [f64; 2],
 }
 
 /// The pieces swept and united into one body, its faces named
@@ -1227,11 +1549,18 @@ pub(super) struct Piece {
 /// `contour` height when one is given.
 pub(super) fn build_bead(id: &str, pieces: &[Piece], contour: Option<f64>) -> Result<crate::BrepSolid, String> {
     let mut bead: Option<crate::BrepSolid> = None;
-    for Piece { run, section: [root, a, b], trim, .. } in pieces {
+    for Piece { run, section: [root, a, b], trim, bridge, .. } in pieces {
         // Keep the section counter-clockwise about the seam.
-        let (a, b) = if a.cross(*b).dot(run.tangent) >= 0.0 { (*a, *b) } else { (*b, *a) };
+        let ((a, b), [skip_a, skip_b]) = if a.cross(*b).dot(run.tangent) >= 0.0 { ((*a, *b), *bridge) } else { ((*b, *a), [bridge[1], bridge[0]]) };
         let start = run.start.add(*root);
-        let piece = sweep_section(run, &[start, start.add(a), start.add(b)], contour, trim)?;
+        let piece = if skip_a > 0.0 && skip_b > 0.0 {
+            // Across a root opening: from one face's first point, through the
+            // toes, to the other's (the contour stays between the toes).
+            let first = |leg: Vec3, skip: f64| start.add(leg.scale(skip / leg.length()));
+            sweep_bridged(run, start, [first(a, skip_a), start.add(a), start.add(b), first(b, skip_b)], contour, trim)?
+        } else {
+            sweep_section(run, &[start, start.add(a), start.add(b)], contour, trim)?
+        };
         bead = Some(match bead {
             None => piece,
             Some(sum) => crate::boolean_operation(&sum, &piece, crate::BooleanOperation::Union, &crate::BooleanOptions::default())

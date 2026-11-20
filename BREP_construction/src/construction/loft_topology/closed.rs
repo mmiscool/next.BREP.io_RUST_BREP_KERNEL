@@ -47,6 +47,27 @@ pub fn loft_profile_brep_closed_shifted(
     input_sections: &[Vec<NurbsCurve>],
     shift: usize,
 ) -> Result<BrepSolid, KernelRefusal> {
+    loft_profile_brep_closed_core(input_sections, shift, None)
+}
+
+/// [`loft_profile_brep_closed`] with every column BROKEN at the section
+/// indices `breaks` ([`super::broken::interpolate_column_broken`]) and at the
+/// seam: the ring is fitted as runs from break to break, unrolled through the
+/// wrap back to section 0, each face spanning `v ∈ [0, 1]` from section 0 to
+/// itself. `breaks` are interior (`0 < b < sections`); the seam is always one.
+/// Unshifted rings only — a shifted ring's columns run several laps.
+pub fn loft_profile_brep_closed_broken(
+    input_sections: &[Vec<NurbsCurve>],
+    breaks: &[usize],
+) -> Result<BrepSolid, KernelRefusal> {
+    loft_profile_brep_closed_core(input_sections, 0, Some(breaks))
+}
+
+fn loft_profile_brep_closed_core(
+    input_sections: &[Vec<NurbsCurve>],
+    shift: usize,
+    breaks: Option<&[usize]>,
+) -> Result<BrepSolid, KernelRefusal> {
     let tolerance = 1e-6;
     let section_count = input_sections.len();
     if section_count < 4 {
@@ -147,6 +168,13 @@ pub fn loft_profile_brep_closed_shifted(
         ));
     }
 
+    if let Some(breaks) = breaks.filter(|breaks| shift != 0 || breaks.iter().any(|&b| b == 0 || b >= section_count)) {
+        return Err(KernelRefusal::internal(
+            KernelStage::Collect,
+            "loft_breaks",
+            format!("loftSolid: closed column breaks {breaks:?} must be interior to {section_count} sections on an unshifted ring"),
+        ));
+    }
     let mut skins = Vec::with_capacity(curve_count);
     if shift == 0 {
         for curve_index in 0..curve_count {
@@ -159,8 +187,16 @@ pub fn loft_profile_brep_closed_shifted(
                     .map(|section| section[curve_index].control_points[control_index].point())
                     .collect::<Result<Vec<_>, String>>()
                     .or_refuse(KernelStage::Refine, "control_point")?;
-                let interpolated = crate::interpolate_curve_closed(&points, &parameters)
-                    .or_refuse(KernelStage::Refine, "interpolate_closed")?;
+                let interpolated = if let Some(breaks) = breaks {
+                    // Unrolled: station 0 again at the wrap parameter.
+                    let mut unrolled = points.clone();
+                    unrolled.push(points[0]);
+                    super::broken::interpolate_column_broken(&unrolled, &parameters, breaks)
+                        .or_refuse(KernelStage::Refine, "interpolate_broken")?
+                } else {
+                    crate::interpolate_curve_closed(&points, &parameters)
+                        .or_refuse(KernelStage::Refine, "interpolate_closed")?
+                };
                 knots_v = interpolated.knots.clone();
                 let weight = reference.control_points[control_index].w;
                 grid.push(

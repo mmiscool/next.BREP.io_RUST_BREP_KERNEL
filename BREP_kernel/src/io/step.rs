@@ -153,6 +153,31 @@ fn write_analytic_surface(
     surface: &NurbsSurface,
 ) -> Result<Option<(usize, bool, EmittedSurface)>, String> {
     let Some(analytic) = surface.analytic() else {
+        if crate::switch!("BREP_EXTRUSION_EXPORT", true) {
+            if let Some(extrusion) = surface.linear_extrusion() {
+                let magnitude = extrusion.direction.length();
+                let axis = extrusion.direction.normalized()?;
+                // A swept entity's reader rebuilds the finite axial band from
+                // its boundary. That coordinate is unambiguous for a profile
+                // in an axis-normal plane. An advancing profile (for example
+                // a helix) can project onto itself on several turns; retain
+                // the original finite NURBS chart rather than lose its turn.
+                let anchor = extrusion.profile.control_points[0].point()?;
+                let points = extrusion.profile.control_points.iter().map(|p|p.point()).collect::<Result<Vec<_>,_>>()?;
+                let extent = points.iter().map(|p|p.sub(anchor).length()).fold(magnitude,f64::max);
+                let coordinate = points.iter().map(|p|p.length()).fold(anchor.length(),f64::max);
+                let band = 1e-11*extent + 32.0*f64::EPSILON*coordinate;
+                if points.iter().any(|p|p.sub(anchor).dot(axis).abs()>band) { return Ok(None); }
+                let profile = write_curve(writer,&extrusion.profile)?;
+                let direction = write_direction(writer,axis)?;
+                let vector = writer.add(format!("VECTOR('',#{direction},1.)"));
+                let entity = writer.add(format!("SURFACE_OF_LINEAR_EXTRUSION('',#{profile},#{vector})"));
+                return Ok(Some((entity,!extrusion.profile_is_u,EmittedSurface::Extrusion {
+                    profile:extrusion.profile.clone(), direction:axis,
+                    profile_is_u:extrusion.profile_is_u, sweep_start:extrusion.sweep_domain[0], magnitude,
+                })));
+            }
+        }
         return Ok(None);
     };
     match analytic {
@@ -1225,6 +1250,17 @@ pub(crate) fn write_product_geometry(
         let solid = *solid;
         let solid_name = solid_name.as_str();
         let band = KernelTolerances::for_solid(solid, 1e-7).export_knit;
+        // Reader trim repair couples adjacent faces through shared edges. If
+        // an extrusion boundary already misses the export band, preserve the
+        // solid's bounded extrusion charts together, not just the loose face.
+        let retain_extrusion_charts = crate::switch!("BREP_EXTRUSION_EXPORT", true)
+            && solid.shells.iter().flat_map(|s|&s.faces)
+                .filter(|face|face.surface.analytic().is_none() && face.surface.linear_extrusion().is_some())
+                .any(|face|face.loops.iter().flat_map(|l|&l.coedges).any(|coedge| {
+                    let Ok(edge) = edge_for(solid,coedge.edge_id) else { return true; };
+                    crate::measure_edge_against_pcurve_image(&face.surface,&coedge.pcurve,
+                        edge,coedge.forward,band).map_or(true,|m|m.deviation()>band)
+                }));
         let mut vertex_ids = HashMap::<u64, usize>::default();
         let mut edge_ids = HashMap::<u64, usize>::default();
         let mut surfaces = HashMap::<usize, (usize, bool, EmittedSurface)>::default();
@@ -1239,7 +1275,10 @@ pub(crate) fn write_product_geometry(
                 if surfaces.contains_key(&key) {
                     continue;
                 }
-                let entry = match write_analytic_surface(writer, &face.surface)? {
+                let analytic = if retain_extrusion_charts && face.surface.analytic().is_none() {
+                    None
+                } else { write_analytic_surface(writer, &face.surface)? };
+                let entry = match analytic {
                     Some(triple) => triple,
                     None => (
                         write_surface(writer, &face.surface)?,
@@ -1809,4 +1848,5 @@ pub fn audit_step_manifold(step: &str) -> Vec<String> {
     issues.sort();
     issues
 }
+
 

@@ -105,8 +105,10 @@ struct PendingFace {
     bounds: Vec<(Vec<(u64, bool)>, bool)>,
 }
 
+pub(in crate::step_import) mod alias_verdicts;
 mod closure;
 mod collect;
+mod fold_lens;
 pub(in crate::step_import) mod readings;
 mod supplied_fit;
 mod seams;

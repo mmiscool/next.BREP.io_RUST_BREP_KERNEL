@@ -137,6 +137,29 @@ pub fn planar_chart_overrun(
     Ok(Some(excursion))
 }
 
+/// `BREP_BLEND_CHART_BEFORE_GATE` (on unless `=0`/`off`; promoted 2026-11-19): the body a validate GATE
+/// inside an operation judges, with its planar charts fitted to its trims
+/// first. A surgery that trims past a planar carrier's chart leaves the trim
+/// clamped onto the chart's boundary and defers the widening to
+/// [`fit_planar_charts_to_trims`], which the feature runs after the operation
+/// returns. A gate that validates before that pass judges the folded trim:
+/// on a boss fillet's side walls the folded pcurves stood 0.06-0.37 off their
+/// edges (the edges themselves in the plane to 1e-12), and validate's
+/// size-coupled bar passed them. With the switch the gate reads the widened
+/// body, which is the one the operation returns. A widening the pass refuses
+/// (an edge off the plane) leaves the body as it was, so the gate and the
+/// later pass decide it as before.
+pub fn chart_fitted_for_gate(input: &BrepSolid, result: BrepSolid) -> BrepSolid {
+    if !crate::switch!(live "BREP_BLEND_CHART_BEFORE_GATE", true) {
+        return result;
+    }
+    let mut fitted = result.clone();
+    match fit_planar_charts_to_trims(input, &mut fitted) {
+        Ok(_) => fitted,
+        Err(_) => result,
+    }
+}
+
 /// Widen every planar carrier in `result` whose own trims leave its chart, and
 /// rebuild those faces' pcurves.  Returns how many carriers moved.
 ///

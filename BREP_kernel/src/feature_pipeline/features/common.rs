@@ -616,6 +616,7 @@ pub fn finalize_solids(ctx: &FeatureContext, bodies: Vec<(String, BrepSolid)>) -
     }
     let options = BooleanOptions {
         merge_coplanar_faces: boolean.merge_coplanar_faces,
+        seam_rejoin_later_references: ctx.rejoin_references.map(<[String]>::to_vec),
         ..BooleanOptions::default()
     };
     let mut bodies = bodies.into_iter();
@@ -688,6 +689,7 @@ pub fn finalize_solid_grouped(
 
     let options = BooleanOptions {
         merge_coplanar_faces: boolean.merge_coplanar_faces,
+        seam_rejoin_later_references: ctx.rejoin_references.map(<[String]>::to_vec),
         ..BooleanOptions::default()
     };
     // Fold, keeping the running result as a LOCAL owned BrepSolid: register only
@@ -971,7 +973,7 @@ pub fn resolve_blend_selection(ctx: &FeatureContext) -> Result<BlendSelection, S
 /// end where the continuation's mates are not both on the selected edge's
 /// own carriers: an end at a mere split of the same two surfaces caps
 /// cleanly and is left as selected — unless nothing else meets that vertex.
-/// There the two edges are one curve the boolean split (report 93aa19e7,
+/// There the two edges are one curve the boolean split (the cap-rim report,
 /// 2026-10-25: a sculpted cap's rim in pieces 0.27 and 22.85 long, the user
 /// picking the short one), both mates' next boundary edge is the same edge,
 /// and no cap can be built (`shared_end_boundary`); the chain is walked on.
@@ -1569,6 +1571,17 @@ pub fn resolve_path_chains(
                 segments.push(segment);
             }
         }
+    }
+    group_path_segments(segments)
+}
+
+/// `segments` grouped into the separate chains they form by touching end to
+/// end, each chain ordered head to tail ([`resolve_path_chains`]' grouping, for
+/// a caller that gathers its segments itself). The chains come in the order of
+/// their first segment.
+pub(super) fn group_path_segments(segments: Vec<PathSegment>) -> Result<Vec<Vec<PathSegment>>, String> {
+    if segments.is_empty() {
+        return Ok(Vec::new());
     }
     let ends: Vec<(Vec3, Vec3)> = segments
         .iter()

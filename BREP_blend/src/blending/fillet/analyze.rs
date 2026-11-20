@@ -1422,8 +1422,8 @@ fn support_extent_pass(
     };
     // A support that narrows to a CUSP at an end of the edge runs out under
     // the ball near that end by construction, and the network tapers the
-    // round to zero at the tip there (`blend/taper_runout.rs`; report
-    // b46db89a's sliver, cusped at both ends of a concave arc). Every overrun
+    // round to zero at the tip there (`blend/taper_runout.rs`;
+    // the concave-sliver report's sliver, cusped at both ends of a concave arc). Every overrun
     // station on such a support, on that end's half of the edge, is the
     // taper's; any other overrun still answers as below. CONCAVE edges only:
     // a convex edge's overrun has its own admission below, and its cusped

@@ -94,9 +94,37 @@ fn offset_solid_joined(
     distance: f64,
     corners: OffsetCorners,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    // A right prism over a smooth convex profile grows by its parts, the
+    // rims' tubes fitted about the profile (`BREP_OFFSET_PRISM_GROWTH`).
+    if corners == OffsetCorners::Rounded && distance > 0.0 {
+        if let Some(grown) = super::prism_growth::prism_growth(source, distance) {
+            return Ok(grown);
+        }
+    }
+    // A solid of revolution grows by its half-section's growth revolved,
+    // exact, ahead of the pipeline and the blend that rounds its rims
+    // (`BREP_OFFSET_REVOLVED_FIRST`).
+    if corners == OffsetCorners::Rounded && distance > 0.0 && revolved_first_on() {
+        if let Some(grown) = super::revolved_parallel::revolved_parallel(source, distance) {
+            return Ok(grown);
+        }
+    }
     if corners == OffsetCorners::Rounded && distance > 0.0 {
         if let Some(grown) = grown_across_reflex_edges(source, distance) {
             return Ok(grown);
+        }
+    }
+    // A right prism over a polygon whose shrink drops an edge or splits the
+    // body: the planar erosion extruded, exact and without a boolean
+    // (`BREP_OFFSET_PRISM_EROSION`); a solid of revolution over a polygon
+    // section likewise, its section eroded and revolved
+    // (`BREP_OFFSET_REVOLVED_EROSION`).
+    if corners == OffsetCorners::Rounded && distance < 0.0 {
+        if let Some(eroded) = super::prism_erosion::prism_erosion(source, distance, true) {
+            return Ok(eroded);
+        }
+        if let Some(eroded) = super::revolved_erosion::revolved_erosion(source, distance, true) {
+            return Ok(eroded);
         }
     }
     let widened_before = super::outward_side_widen::widened_count();
@@ -116,7 +144,15 @@ fn offset_solid_joined(
         Ok(sharp) => sharp,
         Err(error) => {
             if corners == OffsetCorners::Rounded {
-                if let Some(grown) = grown_by_pieces(source, distance) {
+                if let Some(eroded) = super::prism_erosion::prism_erosion(source, distance, false) {
+                    return Ok(eroded);
+                }
+                if distance < 0.0 {
+                    if let Some(eroded) = super::revolved_erosion::revolved_erosion(source, distance, false) {
+                        return Ok(eroded);
+                    }
+                }
+                if let Some(grown) = grown_by_pieces(source, distance)? {
                     return Ok(grown);
                 }
                 if let Some(grown) = super::revolved_parallel::revolved_parallel(source, distance) {
@@ -124,6 +160,14 @@ fn offset_solid_joined(
                 }
                 if let Some(grown) = super::pipe_parallel::pipe_parallel(source, distance) {
                     return Ok(grown);
+                }
+            }
+            // A right prism shrunk past its profile's curvature: the trimmed
+            // inward offset extruded between the moved caps (sharp and rounded
+            // joins agree on a convex prism's shrink).
+            if distance < 0.0 {
+                if let Some(shrunk) = super::prism_parallel::prism_parallel(source, distance)? {
+                    return Ok(shrunk);
                 }
             }
             return Err(error);
@@ -150,6 +194,13 @@ fn offset_solid_joined(
         },
     }
 }
+
+/// `BREP_OFFSET_REVOLVED_FIRST` (default on; `=0` restores): the revolved-parallel lane
+/// answers a rounded growth before the pipeline, not only after its refusal.
+fn revolved_first_on() -> bool {
+    switch!("BREP_OFFSET_REVOLVED_FIRST", true)
+}
+
 
 /// `BREP_OFFSET_GROW_BY_PIECES` (default on; `=0` restores): [`grown_by_pieces`].
 fn grow_by_pieces_enabled() -> bool {
@@ -179,15 +230,19 @@ fn grow_by_pieces_enabled() -> bool {
 /// pipeline's own refusal stands. The faces are all `Offset` images with
 /// `source_face_id` 0, as the rounded caps are: a face of the union may carry
 /// the growth of several source faces' pieces.
-fn grown_by_pieces(source: &BrepSolid, distance: f64) -> Option<OffsetShellResultRecord> {
+///
+/// A decline is `Ok(None)`; the one refusal that comes through is a shrink
+/// whose grown complement covers the whole body, which is the answer itself.
+fn grown_by_pieces(source: &BrepSolid, distance: f64) -> Result<Option<OffsetShellResultRecord>, KernelRefusal> {
     if !grow_by_pieces_enabled() {
-        return None;
+        return Ok(None);
     }
     match grown_by_pieces_impl(source, distance) {
-        Ok(result) => result,
+        Ok(result) => Ok(result),
+        Err(error) if matches!(&error.class, crate::RefusalClass::UnsupportedGeometry { what } if what == "offset_solid_shrinks_to_nothing") => Err(error),
         Err(error) => {
             os_debug!("grow by pieces declined: {error}");
-            None
+            Ok(None)
         }
     }
 }
@@ -669,11 +724,22 @@ fn shrunk_by_pieces(source: &BrepSolid, amount: f64) -> Result<Option<OffsetShel
     let options = BooleanOptions::default();
     let outside = boolean_operation(&frame, source, BooleanOperation::Subtract, &options)?;
     let mut answer = None;
+    // Each plane set's grown pieces, kept for the subtraction below: growing
+    // them is most of a set's cost (a cut, a sharp offset and a rounding per
+    // piece), and the subtraction reads exactly the pieces the union did.
+    let mut grown_sets: Vec<Result<Option<Vec<BrepSolid>>, KernelRefusal>> = Vec::with_capacity(sets.len());
     for planes in &sets {
-        let attempt = grown_union(&outside, planes, amount).and_then(|reach| match reach {
+        let grown = grown_pieces(&outside, planes, amount);
+        let attempt = match &grown {
+            Ok(Some(grown)) => union_of_grown(grown),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error.clone()),
+        }
+        .and_then(|reach| match reach {
             Some(reach) => boolean_operation(source, &reach, BooleanOperation::Subtract, &options).map(Some),
             None => Ok(None),
         });
+        grown_sets.push(grown);
         match attempt {
             Ok(Some(solid)) if solid.validate().is_empty() => {
                 answer = Some(solid);
@@ -684,8 +750,8 @@ fn shrunk_by_pieces(source: &BrepSolid, amount: f64) -> Result<Option<OffsetShel
         }
     }
     if answer.is_none() && shrink_by_subtraction_enabled() {
-        for planes in &sets {
-            match subtracted_one_by_one(source, &outside, planes, amount) {
+        for (planes, grown) in sets.iter().zip(grown_sets) {
+            match grown.and_then(|grown| subtracted_one_by_one(source, grown)) {
                 Ok(Some(solid)) => {
                     answer = Some(solid);
                     break;
@@ -698,6 +764,15 @@ fn shrunk_by_pieces(source: &BrepSolid, amount: f64) -> Result<Option<OffsetShel
     let Some(solid) = answer else {
         return Ok(None);
     };
+    // The grown complement covering the whole body is the shrink's answer
+    // "nothing", and an empty solid validates: it is refused by name, never
+    // returned as a body (the elliptic cylinder shrunk by 6 once read as a
+    // solid of no faces).
+    if solid.shells.iter().all(|shell| shell.faces.is_empty()) {
+        return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_solid_shrinks_to_nothing", format!(
+            "offset_solid: the shrink by {amount:.6} leaves nothing: the complement grown by that much covers the whole body"
+        )));
+    }
     let face_images = solid
         .shells
         .iter()
@@ -714,7 +789,12 @@ fn grown_union(solid: &BrepSolid, planes: &[(Vec3, Vec3)], amount: f64) -> Resul
     let Some(grown) = grown_pieces(solid, planes, amount)? else {
         return Ok(None);
     };
-    let union = crate::boolean_operation_nary(&grown, BooleanOperation::Union)?;
+    union_of_grown(&grown)
+}
+
+/// The union of grown pieces; `None` when it does not validate.
+fn union_of_grown(grown: &[BrepSolid]) -> Result<Option<BrepSolid>, KernelRefusal> {
+    let union = crate::boolean_operation_nary(grown, BooleanOperation::Union)?;
     Ok(union.validate().is_empty().then_some(union))
 }
 
@@ -749,8 +829,11 @@ fn shrink_by_subtraction_enabled() -> bool {
 }
 
 
-fn subtracted_one_by_one(source: &BrepSolid, outside: &BrepSolid, planes: &[(Vec3, Vec3)], amount: f64) -> Result<Option<BrepSolid>, KernelRefusal> {
-    let Some(grown) = grown_pieces(outside, planes, amount)? else {
+/// `source` less each of the grown pieces `grown` in turn (`None` when there
+/// are none, as [`grown_pieces`] gives none for a set leaving one piece, or
+/// when the result does not validate).
+fn subtracted_one_by_one(source: &BrepSolid, grown: Option<Vec<BrepSolid>>) -> Result<Option<BrepSolid>, KernelRefusal> {
+    let Some(grown) = grown else {
         return Ok(None);
     };
     let options = BooleanOptions::default();

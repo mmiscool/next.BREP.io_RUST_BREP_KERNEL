@@ -179,6 +179,73 @@ impl ArcballControls {
     }
 }
 
+/// One frame of six-degree-of-freedom navigation (a SpaceMouse / Spaceball),
+/// already integrated over the frame's time step. "Object mode": the model
+/// follows the cap, so the camera moves by the inverse.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SixDofMotion {
+    /// Screen-space pan in CSS px, y down: the scene moves by this much, as
+    /// it does under a pan drag.
+    pub pan: [f64; 2],
+    /// Frustum-scale factor about the orbit target (>1 zooms out), as
+    /// [`zoom`] takes it.
+    pub zoom: f64,
+    /// The model's rotation this frame as a camera-space rotation vector
+    /// (radians; x = screen right, y = screen up, z = toward the viewer),
+    /// about the orbit target.
+    pub rotate: [f64; 3],
+}
+
+impl SixDofMotion {
+    pub fn is_idle(&self) -> bool {
+        self.pan == [0.0, 0.0] && (self.zoom == 1.0 || self.zoom == 0.0) && self.rotate == [0.0; 3]
+    }
+}
+
+impl ArcballControls {
+    /// Apply one frame of 6-DoF motion through the same pan / zoom / orbit
+    /// primitives the pointer uses, so the orbit centre, the view cube and
+    /// every screen-constant overlay follow it. `allow_rotate` is false while
+    /// the sketch camera is locked flat to its plane (pan and zoom keep that
+    /// orientation, as two-finger touch does). Returns true when the camera
+    /// changed.
+    pub fn six_dof(&mut self, camera: &mut ViewCamera, motion: &SixDofMotion, allow_rotate: bool) -> bool {
+        if !self.enabled
+            || !motion.pan.iter().chain(&motion.rotate).all(|v| v.is_finite())
+            || !motion.zoom.is_finite()
+        {
+            return false;
+        }
+        let mut changed = false;
+        if allow_rotate {
+            let w = motion.rotate;
+            let angle = len3(w);
+            if angle > 1e-12 {
+                // Camera-space axis → world, the convention `rotate_arcball`
+                // uses: the scene turns by +angle, the camera by -angle.
+                let (right, up, forward) = camera.basis();
+                let axis = norm3(add3(
+                    add3(scale3(right, w[0]), scale3(up, w[1])),
+                    scale3(forward, -w[2]),
+                ));
+                let offset = sub3(camera.eye, camera.target);
+                camera.eye = add3(camera.target, rotate3(offset, axis, -angle));
+                camera.up = norm3(rotate3(camera.up, axis, -angle));
+                changed = true;
+            }
+        }
+        if motion.pan != [0.0, 0.0] {
+            pan(camera, motion.pan[0], motion.pan[1]);
+            changed = true;
+        }
+        if motion.zoom > 0.0 && motion.zoom != 1.0 {
+            zoom(camera, motion.zoom);
+            changed = true;
+        }
+        changed
+    }
+}
+
 /// Zoom by `factor` while keeping the world point under the cursor fixed —
 /// "zoom toward the mouse". `cx,cy` are cursor CSS px (top-left origin).
 pub fn zoom_toward(camera: &mut ViewCamera, factor: f64, cx: f64, cy: f64) {

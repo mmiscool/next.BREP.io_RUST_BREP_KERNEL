@@ -24,6 +24,8 @@ pub(in crate::boolean) struct AssemblyScope {
     pub(in crate::boolean) examined: HashSet<u64>,
     /// Result face id → the operand its fragment came from.
     pub(in crate::boolean) operand_of: HashMap<u64, u8>,
+    /// Result face id → the operand face its fragment came from.
+    pub(in crate::boolean) source_of: HashMap<u64, crate::imprint::FaceKey>,
 }
 
 impl AssemblyScope {
@@ -96,7 +98,7 @@ impl AssemblyScope {
                 changed.as_ref().map_or(-1, |changed| changed.len() as i64)
             );
         }
-        Self { touched, examined, operand_of }
+        Self { touched, examined, operand_of, source_of: HashMap::default() }
     }
 }
 
@@ -178,6 +180,8 @@ fn assemble_fragments_impl(
     let mut dbg_edge_src: HashMap<u64, Vec<String>> = HashMap::default();
     // (result face id, operand, touched) per face built, for the scope.
     let mut origins: Vec<(u64, u8, bool)> = Vec::new();
+    // (result face id, the operand face its fragment came from), for the scope.
+    let mut sources: Vec<(u64, crate::imprint::FaceKey)> = Vec::new();
     // The pieces an imprinted TANGENT section was minted as
     // (`TangentSectionRecord::piece_ids`): their coedges carry a material
     // side into the weld (`SourceEdge::tangent_side`).
@@ -186,13 +190,23 @@ fn assemble_fragments_impl(
         .iter()
         .flat_map(|section| section.piece_ids.iter().copied())
         .collect();
+    // `BREP_BOOLEAN_SIGN_CHORDS`: (result face id, an interior point of its
+    // fragment, the carrier's normal there) per face built, for the chords
+    // that read the result's orientation in place of its volume.
+    let sign_chords = sign_chords_mode();
+    let mut aims: Vec<(u64, Vec3, Option<Vec3>)> = Vec::new();
     for fragment in selected {
         let dbg_operand = fragment.operand;
         let dbg_face = fragment.source_face_id;
+        if sign_chords != crate::env_read::Mode::Off {
+            let normal = fragment.surface.normal(fragment.test_uv.x, fragment.test_uv.y).ok();
+            aims.push((assembler.next_face_id, fragment.test_point, normal));
+        }
         let mut untouched = false;
         if let Some(touch) = touch {
             let touched = touch.is_touched(fragment.operand, fragment.source_face_id);
             origins.push((assembler.next_face_id, fragment.operand, touched));
+            sources.push((assembler.next_face_id, crate::imprint::FaceKey { operand: fragment.operand, face_id: fragment.source_face_id }));
             untouched = touched_passes && !touched;
         } else if declared_kind == crate::BodyKind::Cellular {
             origins.push((assembler.next_face_id, fragment.operand, true));
@@ -395,7 +409,9 @@ fn assemble_fragments_impl(
         })
         .collect::<Vec<_>>();
     let mut scope = touch.map(|_| {
-        AssemblyScope::build(&origins, &shells, &assembler.edges, &assembler.vertex_aliases, touch.and_then(|touch| touch.operand_edges.as_ref()))
+        let mut scope = AssemblyScope::build(&origins, &shells, &assembler.edges, &assembler.vertex_aliases, touch.and_then(|touch| touch.operand_edges.as_ref()));
+        scope.source_of = sources.iter().copied().collect();
+        scope
     });
     // The geometry checks of a scoped validation read the examined faces
     // only; every structural check still reads the whole solid.
@@ -1127,6 +1143,27 @@ fn assemble_fragments_impl(
     let stage_started = Instant::now();
     let _caller = crate::mass_caller("assemble.mass_check");
     let bar = tolerance.powi(3);
+    // `BREP_BOOLEAN_SIGN_CHORDS`: where no imprint coincidence or tangent
+    // contact could leave a shell of no thickness, chords through every face
+    // built from a touched fragment read the orientation in place of the
+    // volume. A positive reading stands for the volume check under `on`;
+    // under `check` both run and a positive reading the volume refuses is
+    // reported.
+    let chords_admitted = sign_chords != crate::env_read::Mode::Off
+        && !allow_open
+        && declared_kind == crate::BodyKind::Solid
+        && imprint.cosurface_pairs.is_empty()
+        && imprint.tangent_sections.is_empty()
+        && sign_check_void_shells_enabled()
+        && (!sign_chords_analytic_only_enabled() || every_face_analytic(&solid));
+    let chords_positive = chords_admitted
+        && orientation_by_chords(&solid, &aims, scope.as_ref(), tolerance, profile || sign_chords == crate::env_read::Mode::Check);
+    if chords_positive && sign_chords == crate::env_read::Mode::On {
+        if profile {
+            profile_line!("assemble.mass_check_ms={:.2} by=chords", stage_started.elapsed().as_secs_f64() * 1_000.0);
+        }
+        return Ok((solid, scope));
+    }
     // A shell with no touched face is an operand's shell as the operand held
     // it; its sign is the operand's and it is left out of the check. With no
     // shell touched (a disjoint union) there is nothing to integrate.
@@ -1172,6 +1209,14 @@ fn assemble_fragments_impl(
             stage_started.elapsed().as_secs_f64() * 1_000.0
         );
     }
+    if chords_positive {
+        if let Some(volume) = volume.filter(|volume| *volume <= bar) {
+            eprintln!(
+                "boolean.sign_chords DISAGREE: the chords read a positive orientation, the volume reads {volume:.6e} (bar {bar:.3e}); faces {}",
+                solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>()
+            );
+        }
+    }
     if volume.is_some_and(|volume| volume <= bar) {
         return Err(KernelRefusal::new(
             RefusalClass::NonPositiveVolume,
@@ -1180,6 +1225,100 @@ fn assemble_fragments_impl(
         ));
     }
     Ok((solid, scope))
+}
+
+
+/// `BREP_BOOLEAN_SIGN_CHORDS` (default on; `0`/`off` reads the volume on every
+/// result as before; `check` runs the chords and the volume both and reports
+/// a positive reading the volume refuses): the boolean
+/// assembly's non-positive-volume check reads the result's orientation along
+/// chords where it can ([`orientation_by_chords`]).
+fn sign_chords_mode() -> crate::env_read::Mode {
+    crate::mode_switch!("BREP_BOOLEAN_SIGN_CHORDS", true)
+}
+
+/// `BREP_SIGN_CHORDS_ANALYTIC_ONLY` (default on; `0`/`off` lets chords read any
+/// result): the chords read a result only when every one of its faces has a
+/// recognised analytic carrier (`NurbsSurface::analytic`: planes, revolution
+/// quadrics and tori, and revolutions of a spline generatrix). A chord
+/// meets every face in its path, and against a freeform wall each crossing is
+/// a Newton search over the whole patch: on a screw thread's helicoidal walls
+/// the chords cost 3.2 s where the volume certificate they replace costs a
+/// fraction of that (a fine thread with sharp crests: 4.2 s off, 7.3 s on, release build).
+/// Every result that gained from the chords on the floor rows is all analytic.
+fn sign_chords_analytic_only_enabled() -> bool {
+    switch!("BREP_SIGN_CHORDS_ANALYTIC_ONLY", true)
+}
+
+fn every_face_analytic(solid: &BrepSolid) -> bool {
+    solid.shells.iter().flat_map(|shell| &shell.faces).all(|face| face.surface.analytic().is_some())
+}
+
+/// Whether chords read the assembled solid as positively oriented at every
+/// face built from a touched fragment (every face built when there is no
+/// scope).
+///
+/// The volume check refuses a result whose touched shells hold no material:
+/// inside out, or of no thickness. With no imprint coincidence and no tangent
+/// contact (the caller's gate), a closed shell has thickness, and the sign is
+/// its orientation. The solid's topology is valid here: every edge is used
+/// twice in opposite senses, so a face reversed against its neighbours shows
+/// as hits that fail to alternate. Each aimed face is crossed by a chord
+/// through its fragment's interior point
+/// ([`crate::classification::SolidClassifier::chord_orientation`]), along the carrier's
+/// normal there and, where that chord cannot tell, along the classifier's
+/// fixed directions; every aimed face must read positive, each chord
+/// checking every face it crosses. A face with no aim, a chord that cannot
+/// tell along any direction, or any inside-out reading answers `false`, and
+/// the volume is read as before.
+fn orientation_by_chords(
+    solid: &BrepSolid,
+    aims: &[(u64, Vec3, Option<Vec3>)],
+    scope: Option<&AssemblyScope>,
+    tolerance: f64,
+    profile: bool,
+) -> bool {
+    const DIRECTIONS: [Vec3; 4] = [
+        Vec3 { x: 0.577215, y: 0.618034, z: 0.532088 },
+        Vec3 { x: -0.707107, y: 0.267949, z: 0.654321 },
+        Vec3 { x: 0.316228, y: -0.741657, z: 0.585786 },
+        Vec3 { x: -0.414214, y: -0.552786, z: -0.723607 },
+    ];
+    let started = Instant::now();
+    let built: HashSet<u64> = solid.shells.iter().flat_map(|shell| &shell.faces).map(|face| face.id).collect();
+    let aimed = |id: &u64| built.contains(id) && scope.is_none_or(|scope| scope.touched.contains(id));
+    let wanted = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter(|face| aimed(&face.id))
+        .count();
+    let reading = (|| {
+        let classifier = crate::classification::SolidClassifier::new(solid, tolerance).ok()?;
+        let mut read = 0usize;
+        for (face_id, point, normal) in aims.iter().filter(|(id, _, _)| aimed(id)) {
+            let verdict = normal
+                .iter()
+                .chain(DIRECTIONS.iter())
+                .find_map(|direction| classifier.chord_orientation(*point, *direction).ok().flatten());
+            if verdict != Some(true) {
+                if profile {
+                    profile_line!("assemble.sign_chords face={face_id} verdict={verdict:?}");
+                }
+                return None;
+            }
+            read += 1;
+        }
+        Some(read)
+    })();
+    let positive = wanted > 0 && reading == Some(wanted);
+    if profile {
+        profile_line!(
+            "assemble.sign_chords positive={positive} faces={wanted} read={reading:?} ms={:.2}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+    }
+    positive
 }
 
 /// `BREP_SIGN_CHECK_VOID_SHELLS` (default on; `=0` restores reading the touched

@@ -922,9 +922,30 @@ fn stable_normal(
                     .length(),
             );
         let scale = along_u.max(along_v);
-        scale > 0.0 && along_u.min(along_v) < scale * 1e-6
+        (scale > 0.0 && along_u.min(along_v) < scale * 1e-6).then(|| {
+            // Whether the short direction is a COLLAPSED ROW — short here
+            // against what the same direction spans across the middle of the
+            // other parameter — or the surface is merely narrow everywhere.
+            let row_along_v = along_v < along_u;
+            let spread_there = |cu: f64, cv: f64| -> Result<f64, String> {
+                let there = surface.evaluate(cu, cv)?;
+                let (plus, minus) = if row_along_v {
+                    ((cu, (cv + dv).clamp(v0, v1)), (cu, (cv - dv).clamp(v0, v1)))
+                } else {
+                    (((cu + du).clamp(u0, u1), cv), ((cu - du).clamp(u0, u1), cv))
+                };
+                Ok(surface.evaluate(plus.0, plus.1)?.sub(there).length()
+                    .max(surface.evaluate(minus.0, minus.1)?.sub(there).length()))
+            };
+            let (short, there) = if row_along_v {
+                (along_v, spread_there((u0 + u1) * 0.5, v))
+            } else {
+                (along_u, spread_there(u, (v0 + v1) * 0.5))
+            };
+            (row_along_v, there.is_ok_and(|there| short < there * 1e-6))
+        })
     };
-    if singular_here {
+    if let Some((row_along_v, row_collapsed)) = singular_here {
         let v_mid = (v0 + v1) * 0.5;
         let u_mid = (u0 + u1) * 0.5;
         let mut interior = None;
@@ -932,6 +953,16 @@ fn stable_normal(
             let candidate_v = v + (v_mid - v) * fraction;
             let candidate_u = u + (u_mid - u) * fraction;
             for (cu, cv) in [(u, candidate_v), (candidate_u, v), (candidate_u, candidate_v)] {
+                // A probe that moves only ALONG a collapsed row stays on the
+                // singular point. Where the row collapsed exactly its cross
+                // product is zero and the probe reads nothing; where a fitted
+                // row collapsed only to its fit noise it reads that noise's
+                // normal, which is not the limit and must not be taken for it.
+                // A surface that is merely narrow everywhere has a regular
+                // normal along that row, and keeps that probe.
+                if row_collapsed && ((row_along_v && cu == u) || (!row_along_v && cv == v)) {
+                    continue;
+                }
                 if let Some(candidate) = normal_at(cu, cv) {
                     interior = Some(candidate);
                     break;

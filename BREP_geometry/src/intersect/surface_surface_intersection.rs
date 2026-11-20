@@ -1,7 +1,8 @@
 use crate::curve::interior_knot_count;
 use crate::fit::solve_small;
 use crate::projection::project_point_to_surface_from_seed;
-use crate::{project_point_to_surface, KnotVector, NurbsSurface, Vec3};
+use crate::{project_point_to_surface, KnotVector, NurbsSurface, Vec3, Vec4};
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 const EPSILON: f64 = crate::tolerance::FP_FLOOR;
@@ -265,6 +266,401 @@ struct SpanLeaf {
 /// The knot-span leaves of a carrier (A4): one per non-empty span pair, each
 /// boxed by the `(p+1)×(q+1)` control points that influence it. A net whose
 /// span structure cannot be read is one leaf, the whole box.
+/// `BREP_SSI_SEPARATION_PREFILTER` (default on, `0` off): the boolean imprint
+/// culls a face pair whose carriers [`hull_sets_proved_apart`] before its
+/// classification and seeding.
+pub fn separation_prefilter_enabled() -> bool {
+    crate::switch!(live "BREP_SSI_SEPARATION_PREFILTER", true)
+}
+
+/// One knot span of a carrier: its control sub-net's points (the span lies in
+/// their convex hull when every weight is positive), their box, and the
+/// sub-net's corner normal (`None` where the corners do not span a plane).
+struct SpanHull {
+    bounds: Bounds,
+    points: Vec<Vec3>,
+    normal: Option<Vec3>,
+    /// The span's parameter box, `[u0, u1, v0, v1]`.
+    range: [f64; 4],
+    /// The span's homogeneous control net, `(p + 1) x (q + 1)` row-major:
+    /// its own Bezier patch once the carrier is in Bezier form.
+    net: Vec<Vec4>,
+    degrees: (usize, usize),
+}
+
+/// The hull of one Bezier patch's homogeneous net (`(p + 1) x (q + 1)`,
+/// row-major) over the parameter box `range`.
+fn hull_of_net(net: Vec<Vec4>, (p, q): (usize, usize), range: [f64; 4]) -> Option<SpanHull> {
+    let mut points = Vec::with_capacity(net.len());
+    let mut minimum = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+    let mut maximum = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for control in &net {
+        if !(control.w > 0.0) || !control.w.is_finite() {
+            return None;
+        }
+        let point = control.point().ok()?;
+        // A non-finite point bounds nothing: the hull is unreadable, so the
+        // pair is never proved apart on it.
+        if !(point.x.is_finite() && point.y.is_finite() && point.z.is_finite()) {
+            return None;
+        }
+        minimum = Vec3::new(minimum.x.min(point.x), minimum.y.min(point.y), minimum.z.min(point.z));
+        maximum = Vec3::new(maximum.x.max(point.x), maximum.y.max(point.y), maximum.z.max(point.z));
+        points.push(point);
+    }
+    let at = |r: usize, c: usize| points[r * (q + 1) + c];
+    let du = at(p, 0).add(at(p, q)).sub(at(0, 0)).sub(at(0, q));
+    let dv = at(0, q).add(at(p, q)).sub(at(0, 0)).sub(at(p, 0));
+    let normal = du.cross(dv).normalized().ok();
+    Some(SpanHull { bounds: Bounds { minimum, maximum }, points, normal, range, net, degrees: (p, q) })
+}
+
+/// A Bezier span's four quarters, split at its parameter middle both ways by
+/// de Casteljau on the homogeneous net (exact for a rational patch): the same
+/// patches a full-multiplicity middle knot inserted into the whole carrier
+/// gives, read from this span alone.
+fn quartered(hull: &SpanHull) -> Option<[SpanHull; 4]> {
+    let (p, q) = hull.degrees;
+    // Split a row of `n + 1` homogeneous points at t = 1/2.
+    let split = |row: &[Vec4]| -> (Vec<Vec4>, Vec<Vec4>) {
+        let mut work = row.to_vec();
+        let n = work.len() - 1;
+        let mut left = Vec::with_capacity(n + 1);
+        let mut right = vec![work[n]; n + 1];
+        left.push(work[0]);
+        right[n] = work[n];
+        for level in 1..=n {
+            for k in 0..=n - level {
+                // Halved before the sum: no overflow at extreme weights.
+                work[k] = work[k].scale(0.5).add(work[k + 1].scale(0.5));
+            }
+            left.push(work[0]);
+            right[n - level] = work[n - level];
+        }
+        (left, right)
+    };
+    // In u: split every column (u runs down the rows).
+    let mut low_u = vec![Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 }; (p + 1) * (q + 1)];
+    let mut high_u = low_u.clone();
+    for c in 0..=q {
+        let column: Vec<Vec4> = (0..=p).map(|r| hull.net[r * (q + 1) + c]).collect();
+        let (left, right) = split(&column);
+        for r in 0..=p {
+            low_u[r * (q + 1) + c] = left[r];
+            high_u[r * (q + 1) + c] = right[r];
+        }
+    }
+    // In v: split every row of each half.
+    let halves_v = |net: &[Vec4]| -> (Vec<Vec4>, Vec<Vec4>) {
+        let (mut low, mut high) = (Vec::with_capacity(net.len()), Vec::with_capacity(net.len()));
+        for r in 0..=p {
+            let (left, right) = split(&net[r * (q + 1)..(r + 1) * (q + 1)]);
+            low.extend(left);
+            high.extend(right);
+        }
+        (low, high)
+    };
+    let [u0, u1, v0, v1] = hull.range;
+    let (um, vm) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
+    let (a, b) = halves_v(&low_u);
+    let (c, d) = halves_v(&high_u);
+    Some([
+        hull_of_net(a, (p, q), [u0, um, v0, vm])?,
+        hull_of_net(b, (p, q), [u0, um, vm, v1])?,
+        hull_of_net(c, (p, q), [um, u1, v0, vm])?,
+        hull_of_net(d, (p, q), [um, u1, vm, v1])?,
+    ])
+}
+
+/// `BREP_SSI_SEPARATION_LOCAL_REFINE` (default on, `0` off): the prefilter's
+/// refinement quarters only the spans of its unproved pairs (de Casteljau on
+/// each span's own Bezier net) instead of halving every span of both whole
+/// carriers at each level. Off, a pair of 22 x 11-span lofted faces that touch
+/// along an edge (never provable) paid ~140 ms building ~15 000 span hulls per
+/// carrier by the third level.
+pub fn separation_local_refine_enabled() -> bool {
+    crate::switch!(live "BREP_SSI_SEPARATION_LOCAL_REFINE", true)
+}
+
+/// Every knot span's hull of `surface`, or `None` when a weight is not
+/// positive (the convex-hull property needs positive weights).
+fn span_hulls(surface: &NurbsSurface) -> Option<Vec<SpanHull>> {
+    let (p, q) = (surface.degree_u, surface.degree_v);
+    let rows = surface.control_points.len();
+    let columns = surface.control_points.first().map_or(0, Vec::len);
+    // A rectangular net whose knot vectors fit it, or nothing is read.
+    if rows == 0
+        || columns == 0
+        || surface.control_points.iter().any(|row| row.len() != columns)
+        || surface.knots_u.len() != rows + p + 1
+        || surface.knots_v.len() != columns + q + 1
+    {
+        return None;
+    }
+    if surface.control_points.iter().flatten().any(|control| !(control.w > 0.0) || !control.w.is_finite()) {
+        return None;
+    }
+    let spans = |knots: &[f64], degree: usize, count: usize| -> Vec<usize> {
+        (degree..count).filter(|&i| i + 1 < knots.len() && knots[i] < knots[i + 1]).collect()
+    };
+    let (spans_u, spans_v) = (spans(&surface.knots_u, p, rows), spans(&surface.knots_v, q, columns));
+    let mut hulls = Vec::with_capacity(spans_u.len() * spans_v.len());
+    for &i in &spans_u {
+        for &j in &spans_v {
+            let net: Vec<Vec4> = surface.control_points[i - p..=i].iter().flat_map(|row| row[j - q..=j].iter().copied()).collect();
+            let range = [surface.knots_u[i], surface.knots_u[i + 1], surface.knots_v[j], surface.knots_v[j + 1]];
+            hulls.push(hull_of_net(net, (p, q), range)?);
+        }
+    }
+    (!hulls.is_empty()).then_some(hulls)
+}
+
+/// Whether `surface`'s net can be read span by span: rectangular, knot vectors
+/// that fit it, finite and non-decreasing, with at least one span each way.
+fn readable_net(surface: &NurbsSurface) -> bool {
+    let (p, q) = (surface.degree_u, surface.degree_v);
+    let rows = surface.control_points.len();
+    let columns = surface.control_points.first().map_or(0, Vec::len);
+    let knots_fit = |knots: &[f64], degree: usize, count: usize| {
+        knots.len() == count + degree + 1
+            && knots.iter().all(|knot| knot.is_finite())
+            && knots.windows(2).all(|pair| pair[0] <= pair[1])
+            && knots[0] < knots[knots.len() - 1]
+    };
+    rows > 0
+        && columns > 0
+        && surface.control_points.iter().all(|row| row.len() == columns)
+        && knots_fit(&surface.knots_u, p, rows)
+        && knots_fit(&surface.knots_v, q, columns)
+}
+
+/// `surface` in Bezier form: every interior knot raised to multiplicity
+/// `degree` (exact), so each span's control sub-net is that span's own
+/// Bezier net and its hull hugs the span (a B-spline span's sub-net reaches
+/// about `degree` spans either side).
+fn bezier_form(surface: &NurbsSurface) -> Option<NurbsSurface> {
+    if !readable_net(surface) {
+        return None;
+    }
+    let raise = |knots: &[f64], degree: usize| -> Vec<f64> {
+        let (first, last) = (knots[0], knots[knots.len() - 1]);
+        let mut inserted = Vec::new();
+        let mut index = 0;
+        while index < knots.len() {
+            let knot = knots[index];
+            let count = knots[index..].iter().take_while(|&&other| other == knot).count();
+            if knot > first && knot < last && count < degree {
+                inserted.extend(std::iter::repeat(knot).take(degree - count));
+            }
+            index += count;
+        }
+        inserted
+    };
+    let in_u = raise(&surface.knots_u, surface.degree_u);
+    let refined = if in_u.is_empty() { surface.clone() } else { surface.refine_knots(crate::KnotDirection::U, &in_u).ok()? };
+    let in_v = raise(&refined.knots_v, refined.degree_v);
+    if in_v.is_empty() { Some(refined) } else { refined.refine_knots(crate::KnotDirection::V, &in_v).ok() }
+}
+
+/// `surface` (in Bezier form) with a full-multiplicity knot at the middle of
+/// every span, both directions: the same surface on Bezier spans half as
+/// wide, whose hulls hug it four times closer.
+fn halved_spans(surface: &NurbsSurface) -> Option<NurbsSurface> {
+    let middles = |knots: &[f64], degree: usize| -> Vec<f64> {
+        knots
+            .windows(2)
+            .filter(|pair| pair[0] < pair[1])
+            .flat_map(|pair| std::iter::repeat(0.5 * (pair[0] + pair[1])).take(degree))
+            .collect()
+    };
+    let refined = surface.refine_knots(crate::KnotDirection::U, &middles(&surface.knots_u, surface.degree_u)).ok()?;
+    refined.refine_knots(crate::KnotDirection::V, &middles(&refined.knots_v, refined.degree_v)).ok()
+}
+
+/// Whether two carriers are PROVED apart by more than `margin`: every pair of
+/// knot spans, one of each, is separated by its control hulls' boxes or by a
+/// plane square to either span's corner normal or to the line between the
+/// hulls' centroids (a span lies in its control hull, so hulls apart by
+/// `margin` along any direction are surfaces apart). A span pair no direction
+/// separates is read again on both carriers with every span halved (exact
+/// knot insertion), its children only, up to three times while at most 64
+/// pairs remain. `false` when anything cannot be read, the span count is
+/// large, or a pair is still not proved apart: the march then runs as before.
+///
+/// Two neighbouring hob cutters (near-parallel lofted flanks a few tenths of
+/// a millimetre apart) seed and refine every overlapping leaf pair to
+/// nothing, because the boxes the seeder grows by a share of the carrier
+/// always overlap there; this test settles such a pair first.
+pub fn carriers_proved_apart(first: &NurbsSurface, second: &NurbsSurface, margin: f64) -> bool {
+    match (SpanHullSet::of(first), SpanHullSet::of(second)) {
+        (Some(a), Some(b)) => hull_sets_proved_apart(&a, &b, margin),
+        _ => false,
+    }
+}
+
+/// A carrier in Bezier form with its span hulls, built once per face so a
+/// face tested against many others ([`hull_sets_proved_apart`]) converts once.
+pub struct SpanHullSet {
+    surface: NurbsSurface,
+    hulls: Vec<SpanHull>,
+}
+
+impl SpanHullSet {
+    /// `None` when the carrier cannot be read (a weight not positive, a ragged
+    /// net): such a face is never proved apart.
+    pub fn of(surface: &NurbsSurface) -> Option<Self> {
+        let surface = bezier_form(surface)?;
+        let hulls = span_hulls(&surface)?;
+        Some(Self { surface, hulls })
+    }
+}
+
+/// [`carriers_proved_apart`] on two prepared hull sets.
+pub fn hull_sets_proved_apart(first: &SpanHullSet, second: &SpanHullSet, margin: f64) -> bool {
+    const PAIR_CAP: usize = 250_000;
+    // A pair that crosses leaves many span pairs unseparated at once: past
+    // this many the pair is given up at the first level, so a crossing pair
+    // pays a partial scan, not refinements.
+    const REFINE_CAP: usize = 64;
+    const LEVELS: usize = 3;
+    if first.hulls.len().saturating_mul(second.hulls.len()) > PAIR_CAP {
+        return false;
+    }
+    let (a, b) = (&first.hulls, &second.hulls);
+    let interval = |points: &[Vec3], normal: Vec3| {
+        points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), point| {
+            let value = point.dot(normal);
+            (low.min(value), high.max(value))
+        })
+    };
+    let centroid = |points: &[Vec3]| points.iter().fold(Vec3::new(0.0, 0.0, 0.0), |sum, p| sum.add(*p)).scale(1.0 / points.len() as f64);
+    let apart = |hull_a: &SpanHull, hull_b: &SpanHull| {
+        if !hull_a.bounds.intersects(hull_b.bounds, margin) {
+            return true;
+        }
+        // The spans' own normals, then the line between the hulls' centroids.
+        let between = centroid(&hull_b.points).sub(centroid(&hull_a.points)).normalized().ok();
+        [hull_a.normal, hull_b.normal, between].into_iter().flatten().any(|normal| {
+            let (low_a, high_a) = interval(&hull_a.points, normal);
+            let (low_b, high_b) = interval(&hull_b.points, normal);
+            low_a > high_b + margin || low_b > high_a + margin
+        })
+    };
+    let mut unproved: Vec<(usize, usize)> = Vec::new();
+    for (ia, hull_a) in a.iter().enumerate() {
+        for (ib, hull_b) in b.iter().enumerate() {
+            if !apart(hull_a, hull_b) {
+                unproved.push((ia, ib));
+                if unproved.len() > REFINE_CAP {
+                    return false;
+                }
+            }
+        }
+    }
+    if separation_local_refine_enabled() {
+        // Each level's hulls are the quarters of the previous level's unproved
+        // spans only; a pair's children are its spans' quarters.
+        let mut level_a: Vec<SpanHull> = Vec::new();
+        let mut level_b: Vec<SpanHull> = Vec::new();
+        let mut first_level = true;
+        for _ in 0..LEVELS {
+            if unproved.is_empty() {
+                break;
+            }
+            let (parents_a, parents_b): (&[SpanHull], &[SpanHull]) =
+                if first_level { (a, b) } else { (&level_a, &level_b) };
+            let mut quarters_a: HashMap<usize, usize> = HashMap::new();
+            let mut quarters_b: HashMap<usize, usize> = HashMap::new();
+            let (mut next_a, mut next_b): (Vec<SpanHull>, Vec<SpanHull>) = (Vec::new(), Vec::new());
+            let mut next: Vec<(usize, usize)> = Vec::new();
+            for &(ia, ib) in &unproved {
+                let start_a = match quarters_a.get(&ia) {
+                    Some(&start) => start,
+                    None => {
+                        let Some(children) = quartered(&parents_a[ia]) else { return false };
+                        let start = next_a.len();
+                        next_a.extend(children);
+                        quarters_a.insert(ia, start);
+                        start
+                    }
+                };
+                let start_b = match quarters_b.get(&ib) {
+                    Some(&start) => start,
+                    None => {
+                        let Some(children) = quartered(&parents_b[ib]) else { return false };
+                        let start = next_b.len();
+                        next_b.extend(children);
+                        quarters_b.insert(ib, start);
+                        start
+                    }
+                };
+                for ka in start_a..start_a + 4 {
+                    for kb in start_b..start_b + 4 {
+                        if !apart(&next_a[ka], &next_b[kb]) {
+                            next.push((ka, kb));
+                            if next.len() > REFINE_CAP {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            next.sort_unstable();
+            next.dedup();
+            unproved = next;
+            level_a = next_a;
+            level_b = next_b;
+            first_level = false;
+        }
+        if std::env::var_os("BREP_DEBUG_SEPARATION").is_some() {
+            eprintln!("separation (local): unproved after refinement {}", unproved.len());
+        }
+        return unproved.is_empty();
+    }
+    // Each refinement level owns its carriers and hulls; level 0 is the
+    // prepared sets.
+    let within = |child: &[f64; 4], parent: &[f64; 4]| child[0] >= parent[0] && child[1] <= parent[1] && child[2] >= parent[2] && child[3] <= parent[3];
+    let mut levels: Vec<(NurbsSurface, NurbsSurface, Vec<SpanHull>, Vec<SpanHull>)> = Vec::new();
+    for _ in 0..LEVELS {
+        if unproved.is_empty() {
+            break;
+        }
+        let (surface_a, surface_b, parents_a, parents_b) = match levels.last() {
+            Some((sa, sb, ha, hb)) => (sa, sb, ha.as_slice(), hb.as_slice()),
+            None => (&first.surface, &second.surface, a.as_slice(), b.as_slice()),
+        };
+        let (Some(next_a), Some(next_b)) = (halved_spans(surface_a), halved_spans(surface_b)) else { return false };
+        let (Some(hulls_a), Some(hulls_b)) = (span_hulls(&next_a), span_hulls(&next_b)) else { return false };
+        let mut next: Vec<(usize, usize)> = Vec::new();
+        for &(ia, ib) in &unproved {
+            let children_a: Vec<usize> = (0..hulls_a.len()).filter(|&k| within(&hulls_a[k].range, &parents_a[ia].range)).collect();
+            let children_b: Vec<usize> = (0..hulls_b.len()).filter(|&k| within(&hulls_b[k].range, &parents_b[ib].range)).collect();
+            for &ka in &children_a {
+                for &kb in &children_b {
+                    if !apart(&hulls_a[ka], &hulls_b[kb]) {
+                        next.push((ka, kb));
+                        if next.len() > REFINE_CAP {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        next.sort_unstable();
+        next.dedup();
+        unproved = next;
+        levels.push((next_a, next_b, hulls_a, hulls_b));
+    }
+    if std::env::var_os("BREP_DEBUG_SEPARATION").is_some() {
+        let (a, b) = match levels.last() {
+            Some((_, _, ha, hb)) => (ha.as_slice(), hb.as_slice()),
+            None => (a.as_slice(), b.as_slice()),
+        };
+        eprintln!("separation: spans {}x{} unproved after refinement {}", a.len(), b.len(), unproved.len());
+    }
+    unproved.is_empty()
+}
+
 fn span_leaves(info: SurfaceInfo<'_>) -> Result<Vec<SpanLeaf>, String> {
     let surface = info.surface;
     let (p, q) = (surface.degree_u, surface.degree_v);

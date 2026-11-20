@@ -17,9 +17,9 @@
 //! kernel's rayon parallelism (tessellation and STEP import).
 //!
 //! ```toml
-//! BREP = "0.26"                                     # kernel only
-//! BREP = { version = "0.26", features = ["render"] } # + the wgpu render engine
-//! BREP = { version = "0.26", features = ["full"] }   # the eframe app, render and gizmos
+//! BREP = "0.27"                                     # kernel only
+//! BREP = { version = "0.27", features = ["render"] } # + the wgpu render engine
+//! BREP = { version = "0.27", features = ["full"] }   # the eframe app, render and gizmos
 //! ```
 //!
 //! ```no_run

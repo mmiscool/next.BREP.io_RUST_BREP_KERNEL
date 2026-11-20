@@ -558,6 +558,12 @@ pub enum TrimRefitDecline {
     /// The carrier is closed in u or v. No period-branch rule is implemented
     /// here, so the refit declines rather than guess a branch.
     ClosedCarrier,
+    /// The use's own-carrier candidacy read already put the edge more than
+    /// `policy.model` off that carrier, so the edge's claim was not read
+    /// (`BREP_HEAL_REFIT_OWN_STANDOFF_DECLINE`; the claim would decline too,
+    /// as `EdgeOffCarrier` or an earlier extension class). A new variant of a
+    /// public enum: it ships in a minor (0.x) release.
+    OwnCarrierStandoff,
     /// The old trim's image at fraction 0 or 1 is already over the bar from the
     /// edge's end: keeping the loop endpoints would keep an error.
     OldEndWrong,
@@ -696,6 +702,10 @@ pub struct ScopeProfile {
     /// Feet rebuilt from a recorded foot (same carrier, fraction and incoming
     /// hint bits) instead of searched.
     pub replayed_feet: usize,
+    /// Feet taken from a recorded foot whose incoming hint differed, because
+    /// that foot lies within the hint-first bar of the point
+    /// ([`near_replay_foot`]).
+    pub near_replayed_feet: usize,
     /// Feet per phase whose key was already read earlier in the refit:
     /// [candidacy, old claim, final claim].
     pub repeated_feet: [usize; 3],
@@ -726,8 +736,8 @@ enum ScopePhase {
 impl ScopeProfile {
     pub fn summary(&self) -> String {
         format!(
-            "final claims reused {} read {}; replayed feet {}; repeated feet {:?}; feet candidacy {} old-claim {} final-claim {} (distinct keys {}); scope projector calls {} in {:.3}s; newton iterations {}; grid fallbacks {}; witnesses {}; hint-only sample {}: agrees {} smaller {} larger {} unreadable {}",
-            self.final_claims_reused, self.final_claims_read, self.replayed_feet, self.repeated_feet,
+            "final claims reused {} read {}; replayed feet {} near {}; repeated feet {:?}; feet candidacy {} old-claim {} final-claim {} (distinct keys {}); scope projector calls {} in {:.3}s; newton iterations {}; grid fallbacks {}; witnesses {}; hint-only sample {}: agrees {} smaller {} larger {} unreadable {}",
+            self.final_claims_reused, self.final_claims_read, self.replayed_feet, self.near_replayed_feet, self.repeated_feet,
             self.candidacy_feet, self.old_claim_feet, self.final_claim_feet, self.keys.len(),
             self.projector_calls, self.projector_seconds, self.newton_iterations, self.grid_fallbacks,
             self.witness_evaluations, self.sampled, self.hint_agrees, self.hint_smaller, self.hint_larger,
@@ -831,6 +841,242 @@ pub fn refit_inherited_trims(
         *solid = candidate;
     }
     Ok(report)
+}
+
+/// `BREP_REFIT_SOLID_MEMO` (default on; `=0` refits every operand afresh):
+/// [`refit_inherited_trims_reused`] serves an operand this thread refit before.
+fn refit_solid_memo_enabled() -> bool {
+    switch!("BREP_REFIT_SOLID_MEMO", true)
+}
+
+/// Most operands [`REFIT_SOLID_MEMO`] keeps, and most faces over all of them.
+const REFIT_SOLID_MEMO_ENTRIES: usize = 16;
+const REFIT_SOLID_MEMO_FACES: usize = 20_000;
+
+/// A refit operand: its counts and policy as a cheap first test, the full
+/// content key, and the operand the refit left.
+struct RefitMemoEntry {
+    counts: [usize; 5],
+    key: [u64; 2],
+    faces: usize,
+    refit: std::rc::Rc<BrepSolid>,
+}
+
+thread_local! {
+    /// Operands whose refit READ something (a candidate's claim or an entry),
+    /// keyed by everything the refit and its result can depend on: the whole
+    /// solid (ids, names and every geometric bit of each record), the policy,
+    /// every `BREP_*` environment variable and, in a test build, the switches
+    /// the test forces. The offset's shrink
+    /// by pieces hands the same grown pieces to the n-ary union and then to
+    /// each one-by-one subtraction: three refits of 140-460 ms each read again
+    /// on bit-identical operands (shell/dumbbell-neck-filled).
+    static REFIT_SOLID_MEMO: std::cell::RefCell<Vec<RefitMemoEntry>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn refit_memo_counts(solid: &BrepSolid) -> [usize; 5] {
+    let faces = solid.shells.iter().map(|shell| shell.faces.len()).sum();
+    let coedges = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .flat_map(|face| &face.loops)
+        .map(|loop_record| loop_record.coedges.len())
+        .sum();
+    [solid.vertices.len(), solid.edges.len(), solid.shells.len(), faces, coedges]
+}
+
+fn hash_name(lane: &mut crate::mass_properties::TwoLane, name: &Option<String>) {
+    match name {
+        None => lane.u64(u64::MAX),
+        Some(name) => {
+            lane.usize(name.len());
+            name.bytes().for_each(|byte| lane.u64(byte as u64));
+        }
+    }
+}
+
+/// The content key of `solid` under `policy` and the environment: every
+/// field of every record, in order, each float by its bits.
+fn refit_memo_key(solid: &BrepSolid, policy: &KernelTolerances) -> [u64; 2] {
+    use crate::mass_properties::{hash_curve, hash_surface, TwoLane};
+    let mut lane = TwoLane::new();
+    for value in [
+        policy.convergence, policy.model, policy.intersection_fit, policy.pcurve_consistency,
+        policy.export_knit, policy.sew_search, policy.sliver, policy.angular,
+    ] {
+        lane.f64(value);
+    }
+    // Every BREP_* variable as the environment holds it now: a switch read on
+    // every call (`live`, or any switch under BREP_ENV_READ_ONCE=0) can change
+    // between two refits of one operand, and a changed one must not be served.
+    // wasm32-unknown-unknown has no environment and `vars_os` panics there
+    // ("not supported on this platform"), so the browser hashes an empty set.
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut environment: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+        .filter(|(name, _)| name.to_str().is_some_and(|name| name.starts_with("BREP_")))
+        .collect();
+    #[cfg(target_arch = "wasm32")]
+    let mut environment: Vec<(std::ffi::OsString, std::ffi::OsString)> = Vec::new();
+    environment.sort();
+    // Whether switches are read once or on every call decides which of the
+    // environment's values they see (a test can force either).
+    lane.bool(crate::env_read::read_once_enabled());
+    // The hint-first foot's setting as the switch reads it (default or forced).
+    lane.bool(claim_hint_first());
+    lane.bool(claim_hint_boundary());
+    lane.bool(claim_replay_near());
+    lane.usize(environment.len());
+    for (name, value) in &environment {
+        for text in [name, value] {
+            let bytes = text.as_encoded_bytes();
+            lane.usize(bytes.len());
+            bytes.iter().for_each(|&byte| lane.u64(byte as u64));
+        }
+    }
+    lane.u64(solid.id);
+    lane.u64(solid.genus as u64);
+    format!("{:?}", solid.kind).bytes().for_each(|byte| lane.u64(byte as u64));
+    lane.usize(solid.vertices.len());
+    for vertex in &solid.vertices {
+        lane.u64(vertex.id);
+        lane.f64(vertex.point.x);
+        lane.f64(vertex.point.y);
+        lane.f64(vertex.point.z);
+    }
+    lane.usize(solid.edges.len());
+    for edge in &solid.edges {
+        lane.u64(edge.id);
+        hash_curve(&mut lane, &edge.curve);
+        lane.f64(edge.t0);
+        lane.f64(edge.t1);
+        lane.u64(edge.start_vertex_id);
+        lane.u64(edge.end_vertex_id);
+        lane.bool(edge.degenerate);
+        hash_name(&mut lane, &edge.name);
+    }
+    lane.usize(solid.shells.len());
+    for shell in &solid.shells {
+        lane.u64(shell.id);
+        lane.usize(shell.faces.len());
+        for face in &shell.faces {
+            lane.u64(face.id);
+            hash_surface(&mut lane, &face.surface);
+            lane.bool(face.same_sense);
+            hash_name(&mut lane, &face.name);
+            lane.usize(face.loops.len());
+            for loop_record in &face.loops {
+                lane.u64(loop_record.id);
+                lane.usize(loop_record.coedges.len());
+                for coedge in &loop_record.coedges {
+                    lane.u64(coedge.id);
+                    lane.u64(coedge.edge_id);
+                    lane.bool(coedge.forward);
+                    hash_curve(&mut lane, &coedge.pcurve);
+                }
+            }
+        }
+    }
+    lane.usize(solid.cells.len());
+    for cell in &solid.cells {
+        lane.u64(cell.id);
+        lane.bool(cell.void);
+        lane.usize(cell.faces.len());
+        for &(face, sense) in &cell.faces {
+            lane.u64(face);
+            lane.bool(sense);
+        }
+    }
+    lane.finish()
+}
+
+/// Whether every curve and surface of `solid` passes its construction checks:
+/// a served refit must not stand in for one whose first reading would have
+/// refused (the cached validation is per instance, the key is content).
+fn refit_memo_valid(solid: &BrepSolid) -> bool {
+    solid.edges.iter().all(|edge| edge.curve.domain().is_ok())
+        && solid.shells.iter().flat_map(|shell| &shell.faces).all(|face| {
+            face.surface.domain_u().is_ok()
+                && face.loops.iter().flat_map(|l| &l.coedges).all(|coedge| coedge.pcurve.domain().is_ok())
+        })
+}
+
+/// [`refit_inherited_trims`] for a caller that keeps only the refit operand
+/// (the boolean's operand preparation): an operand this thread refit before,
+/// equal in every field and under the same policy, gets that refit's result
+/// without the reading. Only refits that read something (an entry or a claim)
+/// are kept. The key costs one pass over the operand, a fraction of the
+/// detection pass the refit runs anyway (which hashes each coedge's carrier,
+/// pcurve and edge); operands of more than [`REFIT_SOLID_MEMO_FACES`] faces are
+/// not keyed. Off under any `BREP_DEBUG_TRIM_REFIT*` diagnostic, whose output
+/// is per reading.
+pub fn refit_inherited_trims_reused(solid: &mut BrepSolid, policy: &KernelTolerances) -> Result<(), KernelRefusal> {
+    let diagnostics = ["BREP_DEBUG_TRIM_REFIT", "BREP_DEBUG_TRIM_REFIT_OFF", "BREP_DEBUG_TRIM_REFIT_NO_REPLAY", "BREP_DEBUG_TRIM_REFIT_PROFILE"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+    let counts = refit_memo_counts(solid);
+    if !refit_solid_memo_enabled() || diagnostics || counts[3] > REFIT_SOLID_MEMO_FACES {
+        return refit_inherited_trims(solid, policy).map(|_| ());
+    }
+    let key = refit_memo_key(solid, policy);
+    let served = REFIT_SOLID_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        let at = memo.iter().position(|entry| entry.counts == counts && entry.key == key)?;
+        let entry = memo.remove(at);
+        let refit = entry.refit.clone();
+        memo.insert(0, entry);
+        Some(refit)
+    });
+    if let Some(refit) = served {
+        if refit_memo_valid(solid) {
+            refit_memo_note(true);
+            *solid = (*refit).clone();
+            return Ok(());
+        }
+    }
+    let report = refit_inherited_trims(solid, policy)?;
+    if report.entries.is_empty() && report.claims_read == 0 {
+        return Ok(());
+    }
+    refit_memo_note(false);
+    REFIT_SOLID_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        memo.insert(0, RefitMemoEntry { counts, key, faces: counts[3], refit: std::rc::Rc::new(solid.clone()) });
+        let mut total = 0usize;
+        let keep = memo
+            .iter()
+            .take_while(|entry| {
+                total += entry.faces;
+                total <= REFIT_SOLID_MEMO_FACES
+            })
+            .count()
+            .min(REFIT_SOLID_MEMO_ENTRIES);
+        memo.truncate(keep.max(1));
+    });
+    Ok(())
+}
+
+thread_local! {
+    /// (served, stored) since the thread started, for the profile line and tests.
+    static REFIT_MEMO_COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn refit_memo_note(served: bool) {
+    REFIT_MEMO_COUNTS.with(|counts| {
+        let (hits, stores) = counts.get();
+        counts.set(if served { (hits + 1, stores) } else { (hits, stores + 1) });
+    });
+}
+
+/// Empties this thread's operand refit memo.
+pub fn clear_refit_memo() {
+    REFIT_SOLID_MEMO.with(|memo| memo.borrow_mut().clear());
+}
+
+/// Operands [`refit_inherited_trims_reused`] served from its memo and stored
+/// in it on this thread.
+pub fn refit_memo_counts_served_stored() -> (u64, u64) {
+    REFIT_MEMO_COUNTS.with(|counts| counts.get())
 }
 
 /// `BREP_TRIM_REFIT_UNSPLIT`: read split halves through [`UnsplitView`].
@@ -1310,7 +1556,7 @@ pub fn refit_inherited_trims_gated(
                     // read (the key carries the tolerance).
                     let own = crate::reading_memo::memoized(
                         crate::reading_memo::Reading::RefitCandidacy,
-                        crate::mass_properties::identity_with_model(use_key, policy.model),
+                        salted(crate::mass_properties::identity_with_model(use_key, policy.model)),
                         || {
                             edge_standoff_read(
                                 &face.surface,
@@ -1333,6 +1579,7 @@ pub fn refit_inherited_trims_gated(
                     if miss <= floor + own {
                         continue;
                     }
+
                     // A candidate on a CLOSED carrier declines here, before its
                     // edge's claim is read, exactly as `refit_one` declines it
                     // (an unreadable closedness is Unreadable, as there). The
@@ -1352,6 +1599,18 @@ pub fn refit_inherited_trims_gated(
                             continue;
                         }
                         Ok(_) => {}
+                    }
+                    // The candidacy read already witnesses the edge farther
+                    // off this use's own carrier than the model tolerance: the
+                    // edge claim, which reads every use's carrier, would
+                    // decline the edge on that same evidence if on nothing
+                    // earlier (`BREP_HEAL_REFIT_OWN_STANDOFF_DECLINE`). It is
+                    // declined here under its own class, without the claim.
+                    if own > policy.model && own_standoff_decline_enabled() {
+                        entry.standoff = vec![(face.id, own)];
+                        entry.decision = TrimRefitDecision::Declined(TrimRefitDecline::OwnCarrierStandoff);
+                        report.entries.push(entry);
+                        continue;
                     }
                     // A candidate. Its edge's claim, read once per edge over
                     // every use's old trim.
@@ -1566,7 +1825,27 @@ fn claim_memo_key(solid: &BrepSolid, uses: &[CoedgeIndex], edge: &crate::topolog
         .iter()
         .map(|&(s, f)| uses.iter().position(|&(us, uf, _, _)| (us, uf) == (s, f)).unwrap_or(usize::MAX))
         .collect();
-    crate::mass_properties::edge_claim_identity(&keys, &ranks, model)
+    salted(crate::mass_properties::edge_claim_identity(&keys, &ranks, model))
+}
+
+/// The salt the candidacy and claim memo keys take from the hint-first
+/// settings (`BREP_HEAL_CLAIM_HINT_FIRST`, `BREP_HEAL_CLAIM_HINT_BOUNDARY`,
+/// `BREP_HEAL_CLAIM_REPLAY_NEAR`): none with all off, a hash of the bits otherwise, so a reading taken
+/// under one setting is never served under another and no tolerance can
+/// stand in for a setting.
+fn memo_salt() -> [u64; 2] {
+    let bits = u64::from(claim_hint_first()) | (u64::from(claim_hint_boundary()) << 1) | (u64::from(claim_replay_near()) << 2);
+    if bits == 0 {
+        [0, 0]
+    } else {
+        [brep_geometry::identity_hash::mix64(bits ^ 0x6865_616c_6869_6e74), brep_geometry::identity_hash::mix64(bits.wrapping_mul(0x9e37_79b9_7f4a_7c15))]
+    }
+}
+
+/// `key` salted by the hint-first settings ([`memo_salt`]).
+fn salted(key: [u64; 2]) -> [u64; 2] {
+    let salt = memo_salt();
+    [key[0] ^ salt[0], key[1] ^ salt[1]]
 }
 
 /// The claim the memo holds for `key`, counted as a hit or a miss
@@ -1690,6 +1969,16 @@ pub fn edge_claim_with(
     ((claim, decline), records)
 }
 
+/// `BREP_HEAL_REFIT_OWN_STANDOFF_DECLINE` (default on, `0` off): a refit
+/// candidate whose own-carrier candidacy read already puts its edge more than
+/// the model tolerance off that carrier declines `EdgeOffCarrier` there, without
+/// reading the edge's claim over every use's trims. Off, the claim is read and
+/// declines on the same standoff. On lofted gear teeth (pcurves of 300-500
+/// knots) that claim read was most of an operand's ~2 s refit pass.
+fn own_standoff_decline_enabled() -> bool {
+    crate::switch!(live "BREP_HEAL_REFIT_OWN_STANDOFF_DECLINE", true)
+}
+
 /// The edge claim's stations, as forward fractions of the edge: the union of
 /// the edge's knot breaks and every trim's knot breaks (a reversed use's
 /// fraction `f` is the edge's `1 − f`), at [`TRIM_REFIT_SCOPE_INTERIOR`]
@@ -1794,7 +2083,10 @@ pub fn joints_not_worse(solid: &BrepSolid, working: &BrepSolid, (s, f, l, c): Co
 /// whole ordered read (stations, and with them every incoming hint) is the old
 /// claim's, and `old` IS this claim. It is read again only when they differ,
 /// replaying from `record` (the old claim's feet) every station whose fraction
-/// and incoming hint are the old read's bit for bit ([`edge_standoff_replay`]).
+/// and incoming hint are the old read's bit for bit ([`edge_standoff_replay`]),
+/// and under `BREP_HEAL_CLAIM_REPLAY_NEAR` a station whose fraction only is
+/// the old read's when its recorded foot lies within the hint-first bar
+/// ([`near_replay_foot`]).
 /// Returns the claim and whether `old` was taken.
 pub fn final_claim(
     solid: &BrepSolid,
@@ -2569,8 +2861,12 @@ fn same_hint(a: Option<[f64; 2]>, b: Option<[f64; 2]>) -> bool {
 /// hint) ([`unclamped_foot`]), and the point is a pure function of the
 /// station's fraction; so a station whose fraction bits AND incoming hint
 /// bits equal a recorded one has that record's foot uv, and the foot is
-/// rebuilt from it ([`foot_at_uv`]) bit for bit. Nothing else is skipped: the
-/// extension test, the carrier witness and every count run as before.
+/// rebuilt from it ([`foot_at_uv`]) bit for bit. Under
+/// `BREP_HEAL_CLAIM_REPLAY_NEAR`, a station whose fraction only matches takes
+/// the recorded foot when it lies within the hint-first bar
+/// ([`near_replay_foot`]); that foot reads the verdicts, not the bits, of the
+/// station's own read. Nothing else is skipped: the extension test, the
+/// carrier witness and every count run as before.
 /// `record`, when given, receives this read's own feet.
 pub fn edge_standoff_replay(
     surface: &crate::NurbsSurface,
@@ -2627,16 +2923,20 @@ pub fn edge_standoff_read(
                 profile.repeated_feet[profile.phase as usize] += 1;
             }
         });
-        let replayed = replay
-            .and_then(|replay| replay.get(&fraction.to_bits()))
-            .filter(|(incoming, _)| same_hint(*incoming, hint))
-            .map(|&(_, uv)| uv);
+        let recorded = replay.and_then(|replay| replay.get(&fraction.to_bits()));
+        let replayed = recorded.filter(|(incoming, _)| same_hint(*incoming, hint)).map(|&(_, uv)| uv);
         let foot = match replayed {
             Some(uv) => {
                 profiling(|profile| profile.replayed_feet += 1);
                 foot_at_uv(surface, point, uv)?
             }
-            None => unclamped_foot(surface, point, hint)?,
+            None => match recorded.and_then(|&(_, uv)| near_replay_foot(surface, point, uv, hint, model)) {
+                Some(foot) => {
+                    profiling(|profile| profile.near_replayed_feet += 1);
+                    foot
+                }
+                None => scope_foot(surface, point, hint, model)?,
+            },
         };
         if let Some(record) = record.as_mut() {
             record.push((fraction.to_bits(), foot.uv));
@@ -2686,7 +2986,285 @@ pub fn edge_standoff_read(
 /// The public projectors clamp to the patch (and an analytic cylinder's
 /// closed form clamps its axial coordinate), so a point beside the patch
 /// reads its overshoot there; this one reads the extended patch.
+/// `BREP_HEAL_CLAIM_HINT_FIRST` (default on, `0` off): a scope foot with a
+/// hint (the previous station's foot) is first read by Newton from the hint
+/// alone, and that foot is taken when it lies within a thousandth of the
+/// smaller of the claim's model tolerance and the refit floor of the point and
+/// inside the carrier's domain. Its setting rides in the candidacy and claim
+/// memo keys ([`memo_salt`]) and the operand refit memo's. The global
+/// minimum is then no farther than it, and neither foot reads past the domain,
+/// so every standoff verdict and extension class reads as the full read does;
+/// anything else takes the full read (a global projection plus the hint). On
+/// a swept torus union the global projection was 28% of the boolean.
+fn claim_hint_first() -> bool {
+    crate::switch!(live "BREP_HEAL_CLAIM_HINT_FIRST", true)
+}
+
+/// `BREP_HEAL_CLAIM_HINT_BOUNDARY` (default on, `0` off): with the hint-first
+/// read on, a hint foot a rounding past a boundary edge (3D overshoot within
+/// the bar) is taken as well: half of the swept bull-nose cut's stations and a
+/// tenth of the torus union's lie on a boundary edge and fell to the full read.
+fn claim_hint_boundary() -> bool {
+    crate::switch!(live "BREP_HEAL_CLAIM_HINT_BOUNDARY", true)
+}
+
+/// `BREP_HEAL_CLAIM_HINT_CHECK` (default off): with the hint-first read on,
+/// every foot it takes is also read in full, and a full read whose reading
+/// (its distance, or past the domain its standoff through a point on the
+/// carrier, as the claim reads it) differs from the hint-first foot's
+/// reading by more than twice the bar is reported
+/// (`HEAL-CLAIM-HINT DISAGREE`) and counted ([`CLAIM_HINT_DISAGREEMENTS`]).
+/// A full foot a rounding past a boundary edge the hint-first foot sits on
+/// moves only the diagnostic outside/witnessed counts, never a verdict.
+fn claim_hint_check() -> bool {
+    crate::switch!(live "BREP_HEAL_CLAIM_HINT_CHECK", false)
+}
+
+thread_local! {
+    /// Hint-first feet the full read disagreed with (check mode only).
+    pub static CLAIM_HINT_DISAGREEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `BREP_HEAL_CLAIM_REPLAY_NEAR` (default off): with the hint-first read on,
+/// a final-claim station whose fraction the old claim read, but whose
+/// incoming hint differs from the old read's (a station the new trims
+/// inserted earlier moved it), takes the old claim's foot when that foot lies
+/// within the hint-first bar of the point ([`near_replay_foot`]). Exact replay
+/// needs the hint bits too, so one inserted station sent every later station
+/// of the edge to a search; taking the recorded foot puts the hints back in
+/// step and exact replay resumes. On the swept bull-nose cut and torus union,
+/// over nine in ten such stations had a recorded foot within the bar.
+fn claim_replay_near() -> bool {
+    crate::switch!(live "BREP_HEAL_CLAIM_REPLAY_NEAR", false)
+}
+
+/// `BREP_HEAL_CLAIM_REPLAY_CHECK` (default off): every foot
+/// [`near_replay_foot`] takes is also read as [`scope_foot`] reads it from the
+/// station's own hint; readings (as the claim reads them) more than twice the
+/// bar apart are reported (`HEAL-CLAIM-REPLAY DISAGREE`) and counted
+/// ([`CLAIM_REPLAY_DISAGREEMENTS`]). The recorded foot is kept either way.
+fn claim_replay_check() -> bool {
+    crate::switch!(live "BREP_HEAL_CLAIM_REPLAY_CHECK", false)
+}
+
+thread_local! {
+    /// Near-replayed feet the station's own read disagreed with, and the feet
+    /// compared (check mode only).
+    pub static CLAIM_REPLAY_DISAGREEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static CLAIM_REPLAY_CHECKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The recorded foot `uv` of a station whose incoming hint differs from the
+/// recorded read's, taken when it is a foot the hint-first read would take:
+/// within the bar of `point` (`1e-3 × min(model, refit floor)`) and inside the
+/// domain, or a rounding past a boundary edge under
+/// `BREP_HEAL_CLAIM_HINT_BOUNDARY`: the foot the old claim took for this same
+/// point (final claims replay their own edge on the same carrier, forward)
+/// from another hint, under the acceptance hint-first itself applies. Its
+/// distance and any witness stay within about twice the bar, far under the
+/// model tolerance, so the standoff and extension verdicts read as the
+/// station's own read does; the diagnostic outside and witnessed counts may
+/// differ (an inside foot against one a rounding past a boundary). `None` with `BREP_HEAL_CLAIM_REPLAY_NEAR`
+/// or the hint-first read off, or when the foot is not that close.
+fn near_replay_foot(surface: &crate::NurbsSurface, point: Vec3, uv: [f64; 2], hint: Option<[f64; 2]>, model: f64) -> Option<ScopeFoot> {
+    if !(claim_replay_near() && claim_hint_first() && model.is_finite() && model > 0.0) {
+        return None;
+    }
+    let bar = 1e-3 * model.min(crate::PCURVE_REFINEMENT_TOLERANCE);
+    let foot = foot_at_uv(surface, point, uv).filter(|foot| {
+        foot.distance <= bar
+            && ((foot.beyond_u == 0.0 && foot.beyond_v == 0.0)
+                || (claim_hint_boundary() && foot.beyond_u <= bar && foot.beyond_v <= bar))
+    })?;
+    if claim_replay_check() {
+        // What the claim reads from a foot: its distance inside the domain,
+        // or past it the standoff through a point on the carrier.
+        let read = |foot: &ScopeFoot| match extension_kind(surface, foot) {
+            None => Some(foot.distance),
+            Some(_) => carrier_witness(surface, foot, point),
+        };
+        let own = scope_foot(surface, point, hint, model);
+        let agrees = matches!((read(&foot), own.as_ref().and_then(read)), (Some(near), Some(own)) if (near - own).abs() <= 2.0 * bar);
+        CLAIM_REPLAY_CHECKED.with(|count| count.set(count.get() + 1));
+        if !agrees {
+            CLAIM_REPLAY_DISAGREEMENTS.with(|count| count.set(count.get() + 1));
+            eprintln!("HEAL-CLAIM-REPLAY DISAGREE point {point:?} recorded {foot:?} own {own:?}");
+        }
+    }
+    Some(foot)
+}
+
+/// Newton from `seed` alone on the extended carrier: the best `(distance,
+/// uv)` it reaches (the iteration [`unclamped_foot`] runs from each seed).
+fn hint_newton_foot(surface: &crate::NurbsSurface, point: Vec3, seed: [f64; 2]) -> Option<(f64, [f64; 2])> {
+    const ITERATIONS: usize = 50;
+    let d = surface.evaluate_extended(seed[0], seed[1]).ok()?.sub(point).length();
+    let mut best = (d.is_finite().then_some(d)?, seed);
+    newton_descent(surface, point, seed, &mut best, ITERATIONS);
+    Some(best)
+}
+
+/// `BREP_HEAL_NEWTON_IMAGE_REUSE` (default off, `1` on): the claim's foot
+/// Newton ([`newton_descent`]) reads the distance at each new station from
+/// the next step's own first partials, whose point `deriv1_extended` computes
+/// anyway, instead of evaluating the station a second time. The two points
+/// are the same bits: `deriv1_extended` is `derivatives_extended(u, v, 1)` at
+/// `[0][0]`, the point row of the same basis and the same extension
+/// arithmetic as `evaluate_extended`; a failed partials read falls back to
+/// the evaluation. Over the swept bull-nose cut's 840k hinted feet each took
+/// three steps, so this is one surface read in two.
+fn newton_image_reuse() -> bool {
+    crate::switch!(live "BREP_HEAL_NEWTON_IMAGE_REUSE", false)
+}
+
+/// `BREP_HEAL_NEWTON_IMAGE_REUSE_CHECK` (default off): run both readings,
+/// keep the evaluation's, and count and print every foot whose distance or
+/// uv bits differ ([`NEWTON_IMAGE_DISAGREEMENTS`]).
+fn newton_image_reuse_check() -> bool {
+    crate::switch!(live "BREP_HEAL_NEWTON_IMAGE_REUSE_CHECK", false)
+}
+
+thread_local! {
+    /// Feet whose image-reuse descent read other bits (check mode only).
+    pub static NEWTON_IMAGE_DISAGREEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Descents run both ways (check mode only), so a check that compared
+    /// nothing reads zero here rather than passing.
+    pub static NEWTON_IMAGE_CHECKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Newton on the squared distance from `start`, lowering `best` to every
+/// station that reads closer; returns the steps taken. Stops when a step is
+/// below round-off, after `iterations` steps, or at a singular or unreadable
+/// station.
+fn newton_descent(surface: &crate::NurbsSurface, point: Vec3, start: [f64; 2], best: &mut (f64, [f64; 2]), iterations: usize) -> usize {
+    if newton_image_reuse_check() {
+        let mut evaluated = *best;
+        let steps = newton_descent_with(surface, point, start, &mut evaluated, iterations, false);
+        let mut reused = *best;
+        newton_descent_with(surface, point, start, &mut reused, iterations, true);
+        NEWTON_IMAGE_CHECKED.with(|count| count.set(count.get() + 1));
+        let bits = |(d, [u, v]): (f64, [f64; 2])| (d.to_bits(), u.to_bits(), v.to_bits());
+        if bits(evaluated) != bits(reused) {
+            NEWTON_IMAGE_DISAGREEMENTS.with(|count| count.set(count.get() + 1));
+            eprintln!("HEAL-NEWTON-IMAGE DISAGREE point {point:?} start {start:?} evaluated {evaluated:?} reused {reused:?}");
+        }
+        *best = evaluated;
+        return steps;
+    }
+    newton_descent_with(surface, point, start, best, iterations, newton_image_reuse())
+}
+
+fn newton_descent_with(
+    surface: &crate::NurbsSurface,
+    point: Vec3,
+    start: [f64; 2],
+    best: &mut (f64, [f64; 2]),
+    iterations: usize,
+    reuse: bool,
+) -> usize {
+    let distance = |u: f64, v: f64| -> Option<f64> {
+        let d = surface.evaluate_extended(u, v).ok()?.sub(point).length();
+        d.is_finite().then_some(d)
+    };
+    let [mut u, mut v] = start;
+    let mut partials = surface.deriv1_extended(u, v);
+    let mut steps = 0_usize;
+    for _ in 0..iterations {
+        steps += 1;
+        let Ok((image, su, sv)) = partials else { break };
+        let residual = image.sub(point);
+        let (a, b, c) = (su.dot(su), su.dot(sv), sv.dot(sv));
+        let (gu, gv) = (su.dot(residual), sv.dot(residual));
+        let determinant = a * c - b * b;
+        if !(determinant.is_finite() && determinant.abs() > 0.0) {
+            break;
+        }
+        let du = -(c * gu - b * gv) / determinant;
+        let dv = -(a * gv - b * gu) / determinant;
+        if !(du.is_finite() && dv.is_finite()) {
+            break;
+        }
+        u += du;
+        v += dv;
+        partials = surface.deriv1_extended(u, v);
+        let reading = match (&partials, reuse) {
+            (Ok((image, _, _)), true) => {
+                let d = image.sub(point).length();
+                d.is_finite().then_some(d)
+            }
+            _ => distance(u, v),
+        };
+        if let Some(d) = reading {
+            if d < best.0 {
+                *best = (d, [u, v]);
+            }
+        }
+        if du.abs() <= 1e-15 * (1.0 + u.abs()) && dv.abs() <= 1e-15 * (1.0 + v.abs()) {
+            break;
+        }
+    }
+    steps
+}
+
 pub fn unclamped_foot(surface: &crate::NurbsSurface, point: Vec3, hint: Option<[f64; 2]>) -> Option<ScopeFoot> {
+    unclamped_foot_full(surface, point, hint)
+}
+
+/// The claim's foot read ([`edge_standoff_read`]) under its model tolerance:
+/// with `BREP_HEAL_CLAIM_HINT_FIRST`, the hint-first foot when it is within
+/// `model / 1000` of the point (absolute, so a stalled Newton far off is never
+/// taken wherever the part sits) and inside the domain, else
+/// [`unclamped_foot`]'s full read.
+pub fn scope_foot(surface: &crate::NurbsSurface, point: Vec3, hint: Option<[f64; 2]>, model: f64) -> Option<ScopeFoot> {
+    if let Some(seed) = hint.filter(|_| claim_hint_first() && model.is_finite() && model > 0.0) {
+        // A thousandth of the smaller of the model tolerance and the refit
+        // floor: every reading the refit compares (a standoff against the
+        // model, a trim's miss against the floor plus its own standoff) then
+        // moves by at most this much from the full read's.
+        let bar = 1e-3 * model.min(crate::PCURVE_REFINEMENT_TOLERANCE);
+        let fast = hint_newton_foot(surface, point, seed)
+            .filter(|(d, _)| *d <= bar)
+            .and_then(|(d, [u, v])| finish_foot(surface, d, u, v))
+            .filter(|foot| {
+                // A foot a rounding past a boundary edge (a station on the
+                // face's own boundary) is taken too when its 3D overshoot is
+                // within the bar (`BREP_HEAL_CLAIM_HINT_BOUNDARY`): the claim
+                // reads it through a point on the carrier as it reads the
+                // full foot there, and both readings stay within twice the bar.
+                (foot.beyond_u == 0.0 && foot.beyond_v == 0.0)
+                    || (claim_hint_boundary() && foot.beyond_u <= bar && foot.beyond_v <= bar)
+            });
+        if let Some(foot) = fast {
+            if claim_hint_check() {
+                let full = unclamped_foot_full(surface, point, hint);
+                // What the claim reads from the full foot ([`edge_standoff_replay`]):
+                // its distance inside the domain, or past it the standoff through
+                // a point on the carrier. Within the bar, both read the same
+                // verdict: no standoff and no extension over the model tolerance.
+                let read = |foot: &ScopeFoot| match extension_kind(surface, foot) {
+                    None => Some(foot.distance),
+                    Some(_) => carrier_witness(surface, foot, point),
+                };
+                let fast_reading = read(&foot);
+                let reading = full.as_ref().and_then(read);
+                // The claim compares these readings against the model and the
+                // refit floor; the two reads agree when they read within twice
+                // the bar of each other.
+                let agrees = matches!((fast_reading, reading), (Some(fast), Some(full)) if (fast - full).abs() <= 2.0 * bar);
+                if !agrees {
+                    CLAIM_HINT_DISAGREEMENTS.with(|count| count.set(count.get() + 1));
+                    eprintln!("HEAL-CLAIM-HINT DISAGREE point {point:?} hint-first {foot:?} full {full:?}");
+                }
+            }
+            return Some(foot);
+        }
+    }
+    unclamped_foot_full(surface, point, hint)
+}
+
+/// [`unclamped_foot`]'s full read: a global projection and the hint as
+/// seeds, Newton from the best of them.
+fn unclamped_foot_full(surface: &crate::NurbsSurface, point: Vec3, hint: Option<[f64; 2]>) -> Option<ScopeFoot> {
     const GRID: usize = 8;
     const SEEDS: usize = 3;
     const ITERATIONS: usize = 50;
@@ -2733,38 +3311,13 @@ pub fn unclamped_foot(surface: &crate::NurbsSurface, point: Vec3, hint: Option<[
     scored.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut best = (f64::INFINITY, [f64::NAN; 2]);
     let mut iterations = 0_usize;
-    for &(start, [mut u, mut v]) in scored.iter().take(SEEDS) {
+    for &(start, [u, v]) in scored.iter().take(SEEDS) {
         if start < best.0 {
             best = (start, [u, v]);
         }
-        for _ in 0..ITERATIONS {
-            iterations += 1;
-            // Same first partials and extension arithmetic, without allocating
-            // a Vec of Vecs at every Newton station.
-            let Ok((image, su, sv)) = surface.deriv1_extended(u, v) else { break };
-            let residual = image.sub(point);
-            let (a, b, c) = (su.dot(su), su.dot(sv), sv.dot(sv));
-            let (gu, gv) = (su.dot(residual), sv.dot(residual));
-            let determinant = a * c - b * b;
-            if !(determinant.is_finite() && determinant.abs() > 0.0) {
-                break;
-            }
-            let du = -(c * gu - b * gv) / determinant;
-            let dv = -(a * gv - b * gu) / determinant;
-            if !(du.is_finite() && dv.is_finite()) {
-                break;
-            }
-            u += du;
-            v += dv;
-            if let Some(d) = distance(u, v) {
-                if d < best.0 {
-                    best = (d, [u, v]);
-                }
-            }
-            if du.abs() <= 1e-15 * (1.0 + u.abs()) && dv.abs() <= 1e-15 * (1.0 + v.abs()) {
-                break;
-            }
-        }
+        // Same first partials and extension arithmetic, without allocating
+        // a Vec of Vecs at every Newton station.
+        iterations += newton_descent(surface, point, [u, v], &mut best, ITERATIONS);
     }
     profiling(|profile| profile.newton_iterations += iterations);
     if let Some(seed) = hint.filter(|_| profiling_on()) {

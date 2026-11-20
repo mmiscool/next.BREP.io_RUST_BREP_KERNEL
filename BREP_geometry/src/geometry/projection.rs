@@ -149,7 +149,7 @@ pub fn project_point_to_curve(curve: &NurbsCurve, point: Vec3) -> Result<CurvePr
 /// point. On the D2 outward shells every one of its 512 calls a shell call
 /// projects onto a straight two-point edge, and 209 of them repeat a call
 /// already made (the section's pierces, its ambiguity reads and the endpoint
-/// exchange re-project the same points; counted, cad-bot). A straight curve's
+/// exchange re-project the same points; counted). A straight curve's
 /// whole net and the point make a 16-word key compared exactly, so a hit
 /// returns the very answer the projector computed.
 const PROJECTION_MEMO_ENTRIES: usize = 4096;
@@ -179,7 +179,162 @@ fn projection_memo_enabled() -> bool {
 
 // Immutable slices avoid retaining Vec spare capacity: cached sample payload
 // is at most 8 MiB per thread, plus at most 4096 map entries and Rc headers.
-type CurveSeeds = std::rc::Rc<[(f64, Vec3)]>;
+type CurveSeeds = std::rc::Rc<SeedSet>;
+
+/// A curve's seed samples in their original sequence, and the boxes of consecutive blocks of them
+/// for [`blocked_seed_scan`] (`BREP_CURVE_SEED_BLOCKS`).
+#[derive(Clone)]
+pub(crate) struct SeedSet {
+    samples: Box<[(f64, Vec3)]>,
+    blocks: Box<[SeedBlock]>,
+}
+
+impl std::ops::Deref for SeedSet {
+    type Target = [(f64, Vec3)];
+    fn deref(&self) -> &Self::Target {
+        &self.samples
+    }
+}
+
+/// Samples per block of [`SeedSet::blocks`].
+const SEED_BLOCK: usize = 16;
+
+/// The box of block `b`'s samples `b * SEED_BLOCK ..` and of the sample before them, so it holds
+/// every segment that ends at one of its samples.
+#[derive(Clone, Copy)]
+struct SeedBlock {
+    low: Vec3,
+    high: Vec3,
+}
+
+impl SeedSet {
+    fn new(samples: Vec<(f64, Vec3)>) -> Self {
+        let mut blocks = Vec::with_capacity(samples.len().div_ceil(SEED_BLOCK));
+        let mut first = 0;
+        while first < samples.len() {
+            let last = (first + SEED_BLOCK).min(samples.len());
+            let from = first.saturating_sub(1);
+            let mut low = samples[from].1;
+            let mut high = low;
+            for &(_, q) in &samples[from..last] {
+                low = Vec3::new(low.x.min(q.x), low.y.min(q.y), low.z.min(q.z));
+                high = Vec3::new(high.x.max(q.x), high.y.max(q.y), high.z.max(q.z));
+            }
+            blocks.push(SeedBlock { low, high });
+            first = last;
+        }
+        Self { samples: samples.into_boxed_slice(), blocks: blocks.into_boxed_slice() }
+    }
+}
+
+/// `BREP_CURVE_SEED_BLOCKS` (default on since its promotion; `=0` scans every sample): the curve projector's seed scan reads only the blocks of
+/// samples whose box can hold the nearest sample or the nearest segment ([`blocked_seed_scan`]),
+/// for the same answer as the scan of every sample.
+fn seed_blocks_enabled() -> bool {
+    switch!("BREP_CURVE_SEED_BLOCKS", true)
+}
+
+/// `BREP_CURVE_SEED_BLOCKS_CHECK=1`: run both scans and stop on any difference.
+fn seed_blocks_check() -> bool {
+    switch!("BREP_CURVE_SEED_BLOCKS_CHECK", false)
+}
+
+/// What the seed scan reads: the nearest sample (first of equals), the nearest segment between
+/// consecutive samples (first of equals), and the first and last samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SeedScan {
+    best_u: f64,
+    best_distance_squared: f64,
+    witness_distance_squared: f64,
+    witness_low: f64,
+    witness_high: f64,
+}
+
+/// The scan of every sample in order, as the projector has always read it.
+fn linear_seed_scan(samples: &[(f64, Vec3)], point: Vec3, start: f64) -> SeedScan {
+    let mut scan = SeedScan { best_u: start, best_distance_squared: f64::INFINITY, witness_distance_squared: f64::INFINITY, witness_low: start, witness_high: start };
+    let mut previous: Option<(f64, Vec3)> = None;
+    for &(parameter, sample) in samples {
+        let distance_squared = sample.sub(point).length_squared();
+        if distance_squared < scan.best_distance_squared {
+            scan.best_distance_squared = distance_squared;
+            scan.best_u = parameter;
+        }
+        if let Some((previous_parameter, previous_sample)) = previous {
+            let segment = point_segment_distance_squared(point, previous_sample, sample);
+            if segment < scan.witness_distance_squared {
+                scan.witness_distance_squared = segment;
+                scan.witness_low = previous_parameter;
+                scan.witness_high = parameter;
+            }
+        }
+        previous = Some((parameter, sample));
+    }
+    scan
+}
+
+/// The same answer as [`linear_seed_scan`], reading only the blocks that can hold it. The linear
+/// scan keeps the FIRST sample (and segment) of least distance, so its answer is the least
+/// (distance, index) pair; a block whose box lies farther than both least distances found holds
+/// neither, and the blocks are read nearest box first until every remaining box is that far. The
+/// box bound is a true lower bound of each sample's computed distance (the same coordinate
+/// differences, rounded the same way, never larger). A segment's nearest point is computed, so its
+/// distance may read below the box: by a few ulps relative, and by an absolute rounding of the
+/// order of eps times the coordinates' size, which dominates near zero (a point an ulp off a
+/// closed curve's seam read its last chord at 3.269e-30 against a box at 3.303e-30). Each box is
+/// therefore read at its distance less a cushion of 64 eps times the size of the point and box
+/// corners, and less a relative 1e-9, and passed over only when that is farther than both.
+fn blocked_seed_scan(set: &SeedSet, point: Vec3, start: f64) -> SeedScan {
+    let gap = |low: f64, high: f64, x: f64| if x < low { low - x } else if x > high { x - high } else { 0.0 };
+    let mut order: Vec<(f64, usize)> = set
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(b, block)| {
+            let (dx, dy, dz) = (gap(block.low.x, block.high.x, point.x), gap(block.low.y, block.high.y, point.y), gap(block.low.z, block.high.z, point.z));
+            let cushion = 64.0 * f64::EPSILON * (point.length() + block.low.length() + block.high.length());
+            let reach = ((dx * dx + dy * dy + dz * dz).sqrt() * (1.0 - 1e-9) - cushion).max(0.0);
+            (reach * reach, b)
+        })
+        .collect();
+    order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let samples = &set.samples;
+    let (mut best, mut best_index) = (f64::INFINITY, usize::MAX);
+    let (mut witness, mut witness_index) = (f64::INFINITY, usize::MAX);
+    for (bound, b) in order {
+        if bound > best.max(witness) {
+            break;
+        }
+        let first = b * SEED_BLOCK;
+        let last = (first + SEED_BLOCK).min(samples.len());
+        for i in first..last {
+            let (_, sample) = samples[i];
+            let distance_squared = sample.sub(point).length_squared();
+            if distance_squared < best || (distance_squared == best && best_index != usize::MAX && i < best_index) {
+                best = distance_squared;
+                best_index = i;
+            }
+            if i > 0 {
+                let segment = point_segment_distance_squared(point, samples[i - 1].1, sample);
+                if segment < witness || (segment == witness && witness_index != usize::MAX && i < witness_index) {
+                    witness = segment;
+                    witness_index = i;
+                }
+            }
+        }
+    }
+    let mut scan = SeedScan { best_u: start, best_distance_squared: f64::INFINITY, witness_distance_squared: f64::INFINITY, witness_low: start, witness_high: start };
+    if best_index != usize::MAX {
+        scan.best_u = samples[best_index].0;
+        scan.best_distance_squared = best;
+    }
+    if witness_index != usize::MAX {
+        scan.witness_distance_squared = witness;
+        scan.witness_low = samples[witness_index - 1].0;
+        scan.witness_high = samples[witness_index].0;
+    }
+    scan
+}
 const CURVE_SEED_BUDGET: usize = 262_144;
 thread_local! {
     static CURVE_SEEDS: std::cell::RefCell<(rustc_hash::FxHashMap<[u64; 2], CurveSeeds>, usize)> = Default::default();
@@ -227,7 +382,7 @@ fn cached_curve_seeds(curve: &NurbsCurve, start: f64, end: f64) -> Result<Option
     }
     let mut seeds = Vec::new();
     visit_curve_seeds(curve, start, end, |u, point| seeds.push((u, point)))?;
-    let seeds: CurveSeeds = seeds.into();
+    let seeds: CurveSeeds = std::rc::Rc::new(SeedSet::new(seeds));
     CURVE_SEEDS.with(|memo| {
         let mut memo = memo.borrow_mut();
         if memo.0.len() >= PROJECTION_MEMO_ENTRIES || memo.1 + seeds.len() > CURVE_SEED_BUDGET {
@@ -240,6 +395,56 @@ fn cached_curve_seeds(curve: &NurbsCurve, start: f64, end: f64) -> Result<Option
 }
 
 fn project_point_to_curve_uncached(curve: &NurbsCurve, point: Vec3) -> Result<CurveProjection, String> {
+    let [start, end] = curve.domain()?;
+    let seeds = cached_curve_seeds(curve, start, end)?;
+    project_point_to_curve_seeded(curve, point, seeds.as_deref())
+}
+
+/// A curve held with its seed samples, for a caller that projects onto the same curve again and
+/// again (an extrusion's reduced profile): the projector reads the held samples instead of
+/// hashing the curve's content into the seed cache on every call. Same samples, same answer.
+#[derive(Clone)]
+pub(crate) struct HeldCurve {
+    pub(crate) curve: NurbsCurve,
+    seeds: Option<SeedSet>,
+}
+
+impl std::fmt::Debug for HeldCurve {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldCurve").field("curve", &self.curve).field("seeds", &self.seeds.as_ref().map(|s| s.samples.len())).finish()
+    }
+}
+
+impl HeldCurve {
+    pub(crate) fn new(curve: NurbsCurve) -> Self {
+        let seeds = curve.domain().ok().and_then(|[start, end]| {
+            let bound = curve.knots.len().saturating_add(1).saturating_mul(4usize.max(curve.degree + 2).saturating_add(1));
+            if bound > CURVE_SEED_BUDGET { return None; }
+            let mut samples = Vec::new();
+            visit_curve_seeds(&curve, start, end, |u, point| samples.push((u, point))).ok()?;
+            Some(SeedSet::new(samples))
+        });
+        Self { curve, seeds }
+    }
+
+    /// The curve without its samples: [`Self::project`] is then `project_point_to_curve`.
+    pub(crate) fn bare(curve: NurbsCurve) -> Self {
+        Self { curve, seeds: None }
+    }
+
+    /// `project_point_to_curve(&self.curve, point)`, bit for bit. A straight curve keeps the
+    /// projector's own memo, and a curve whose samples are not held goes the projector's way.
+    pub(crate) fn project(&self, point: Vec3) -> Result<CurveProjection, String> {
+        match &self.seeds {
+            Some(seeds) if !(projection_memo_enabled() && straight_projection_key(&self.curve, point).is_some()) => {
+                project_point_to_curve_seeded(&self.curve, point, Some(seeds))
+            }
+            _ => project_point_to_curve(&self.curve, point),
+        }
+    }
+}
+
+fn project_point_to_curve_seeded(curve: &NurbsCurve, point: Vec3, seeds: Option<&SeedSet>) -> Result<CurveProjection, String> {
     let [start, end] = curve.domain()?;
     let mut best_u = start;
     let mut best_distance_squared = f64::INFINITY;
@@ -275,10 +480,33 @@ fn project_point_to_curve_uncached(curve: &NurbsCurve, point: Vec3) -> Result<Cu
         }
         previous = Some((parameter, sample));
     };
-    if let Some(seeds) = cached_curve_seeds(curve, start, end)? {
-        for &(parameter, sample) in seeds.iter() { visit(parameter, sample); }
-    } else {
-        visit_curve_seeds(curve, start, end, visit)?;
+    match seeds.filter(|set| !set.samples.is_empty() && (seed_blocks_enabled() || seed_blocks_check())) {
+        Some(set) => {
+            let scan = if seed_blocks_check() {
+                let linear = linear_seed_scan(&set.samples, point, start);
+                let blocked = blocked_seed_scan(set, point, start);
+                let bits = |s: &SeedScan| [s.best_u, s.best_distance_squared, s.witness_distance_squared, s.witness_low, s.witness_high].map(f64::to_bits);
+                if bits(&linear) != bits(&blocked) {
+                    panic!("curve seed blocks check: blocked scan {blocked:?} differs from the linear scan {linear:?} at {point:?}");
+                }
+                linear
+            } else {
+                blocked_seed_scan(set, point, start)
+            };
+            best_u = scan.best_u;
+            best_distance_squared = scan.best_distance_squared;
+            witness_distance_squared = scan.witness_distance_squared;
+            witness_low = scan.witness_low;
+            witness_high = scan.witness_high;
+            start_point = Some(set.samples[0].1);
+            end_point = Some(set.samples[set.samples.len() - 1].1);
+        }
+        None => match seeds {
+            Some(seeds) => {
+                for &(parameter, sample) in seeds.iter() { visit(parameter, sample); }
+            }
+            None => visit_curve_seeds(curve, start, end, visit)?,
+        },
     }
     // A closed curve's domain is PERIODIC, so Newton must wrap across the seam
     // rather than stop at it. Clamping made the projector return the seam for
@@ -589,6 +817,11 @@ pub fn project_point_to_surface(
     }
     if let Some(ellipsoid) = surface.affine_sphere() {
         if let Some(projection) = ellipsoid.project(surface, point) {
+            return Ok(projection);
+        }
+    }
+    if switch!("BREP_EXTRUSION_PROJECTION", true) {
+        if let Some(projection) = surface.linear_extrusion().and_then(|e| e.project(surface,point)) {
             return Ok(projection);
         }
     }
@@ -2756,6 +2989,7 @@ pub fn curve_foot_newton(
     let (_, nearest, squared) = curve_foot_newton_state(curve, point, seed, bracket, policy)?;
     Ok((nearest, squared))
 }
+
 
 
 

@@ -710,7 +710,7 @@ const FOOT_TRAVEL: usize = 4;
 /// `j`: the probe's wall `u` and the centres' edge parameter name the same
 /// section only to first order, so the foot can sit more than the one-node
 /// window from `j` (the 15- and 20-degree rows' feet stood up to 1.5 nodes,
-/// one 3.3, from it on f4ed17782's build, every decline there a window exit).
+/// one 3.3, from it, every decline there a window exit).
 /// A solve that leaves its window moves the stencil to the node nearest
 /// where it left, at most [`FOOT_TRAVEL`] nodes from `j` and never back to a
 /// node already tried; `None` when the foot is not found that way (or a
@@ -2089,7 +2089,7 @@ pub fn project_piece_pcurve_within(
     guide: Option<&dyn Fn(f64) -> Option<[f64; 2]>>,
     refine_near: &[f64],
 ) -> Result<NurbsCurve, KernelRefusal> {
-    project_piece_pcurve_track(piece, surface, start_is_crossing, end_is_crossing, guide, refine_near, false)
+    project_piece_pcurve_track(piece, surface, start_is_crossing, end_is_crossing, guide, refine_near, false, 1)
 }
 
 /// [`project_piece_pcurve_within`], retried where it misses the floor on a
@@ -2110,17 +2110,45 @@ pub fn project_piece_pcurve_within_knot_retry(
     guide: Option<&dyn Fn(f64) -> Option<[f64; 2]>>,
     refine_near: &[f64],
 ) -> Result<NurbsCurve, KernelRefusal> {
-    match project_piece_pcurve_track(piece, surface, start_is_crossing, end_is_crossing, guide, refine_near, false) {
-        Err(uniform) if matches!(&uniform.class, crate::RefusalClass::NonConvergence { what } if what == CHAIN_PCURVE_FLOOR_WHAT) => {
-            project_piece_pcurve_track(piece, surface, start_is_crossing, end_is_crossing, guide, refine_near, true).map_err(|_| uniform)
-        }
-        other => other,
+    let floor_miss = |refusal: &KernelRefusal| matches!(&refusal.class, crate::RefusalClass::NonConvergence { what } if what == CHAIN_PCURVE_FLOOR_WHAT);
+    let fit = |knot_aware: bool, ceiling_factor: usize| {
+        project_piece_pcurve_track(piece, surface, start_is_crossing, end_is_crossing, guide, refine_near, knot_aware, ceiling_factor)
+    };
+    let uniform = match fit(false, 1) {
+        Err(uniform) if floor_miss(&uniform) => uniform,
+        other => return other,
+    };
+    match fit(true, 2) {
+        Err(doubled) if floor_miss(&doubled) => {}
+        Err(_) => return Err(uniform),
+        fitted => return fitted,
     }
+    // A rail that is only C1 where its spine's curvature jumps (a path
+    // spline's short straight leads into its Hermite spans, G1 not G2)
+    // carries a track whose fit converges only O(h²) toward each joint, and
+    // the local refinement that grades samples there runs out of room: a
+    // rail of 512 or more control points starts its uniform track AT the
+    // ceiling and is never refined at all (a 10 m swept bar rounded r = 90:
+    // 5.8e-4 off with nothing inserted), and the knot-aware track, crowded by
+    // the march's own stations, can stop just over the floor (the same bar at
+    // r = 45: 1.5e-7 at 8192 intervals) or diverge. Only then are the uniform
+    // track and the knot-aware track each refined once more, in that order,
+    // within four times the uniform ceiling. The floor is unchanged, and a
+    // miss there keeps the uniform refusal.
+    for knot_aware in [false, true] {
+        match fit(knot_aware, 4) {
+            Err(wider) if floor_miss(&wider) => {}
+            Err(_) => return Err(uniform),
+            fitted => return fitted,
+        }
+    }
+    Err(uniform)
 }
 
 /// [`project_piece_pcurve_within`]'s track and fit, the track sampled
 /// uniformly in the piece's parameter, and with `knot_aware` at the piece's
-/// interior knots too.
+/// interior knots too; its local repair stays within `ceiling_factor` times
+/// the uniform ceiling.
 #[allow(clippy::too_many_arguments)]
 fn project_piece_pcurve_track(
     piece: &NurbsCurve,
@@ -2130,6 +2158,7 @@ fn project_piece_pcurve_track(
     guide: Option<&dyn Fn(f64) -> Option<[f64; 2]>>,
     refine_near: &[f64],
     knot_aware: bool,
+    ceiling_factor: usize,
 ) -> Result<NurbsCurve, KernelRefusal> {
     let [u0, u1] = surface.domain_u().or_refuse(KernelStage::Refine, "domain_u")?;
     let [v0, v1] = surface.domain_v().or_refuse(KernelStage::Refine, "domain_v")?;
@@ -2146,7 +2175,7 @@ fn project_piece_pcurve_track(
     // samples of it was accepted 1.19e-3 off the rail it claims.
     // The knot-aware retry's track holds the piece's knots on top of the
     // uniform samples; its repair may use twice the uniform ceiling.
-    let ceiling = if knot_aware { 2 * PIECE_TRACK_CEILING } else { PIECE_TRACK_CEILING };
+    let ceiling = ceiling_factor * PIECE_TRACK_CEILING;
     let uniform = (8 * piece.control_points.len()).clamp(96, PIECE_TRACK_CEILING);
     let mut fractions: Vec<f64> = (0..=uniform).map(|section| section as f64 / uniform as f64).collect();
     if knot_aware {

@@ -88,6 +88,12 @@ pub(super) fn count(bounded: bool) {
     if bounded { &BOUNDED } else { &FALLBACKS }.fetch_add(1, Ordering::Relaxed);
 }
 
+/// `(bounded, fallbacks)` so far, without resetting them (the check mode
+/// reads a delta, leaving the counters to the profile line and tests).
+pub fn peek_counts() -> (u64, u64) {
+    (BOUNDED.load(Ordering::Relaxed), FALLBACKS.load(Ordering::Relaxed))
+}
+
 /// `(bounded, fallbacks)` since the last call (the `soundness.scan_mesh`
 /// profile line).
 pub fn take_counts() -> (u64, u64) {
@@ -101,6 +107,250 @@ pub enum FaceBound {
     Sphere { centre: Vec3, radius: f64 },
     Ruled { origin: Vec3, axis: Vec3, rho0: f64, rho1: f64, height: f64 },
     Affine { sphere: crate::affine_sphere::AffineSphere, largest_semi_axis: f64 },
+    /// A polynomial spline carrier (`BREP_SCAN_MESH_SPLINE`). The bound is
+    /// read from the triangle's uv corners and the net's second differences
+    /// ([`SplineBound::triangle`]), plus each corner's residual, in the
+    /// interior bounded refinement. The rectangle grid is skipped for it.
+    Spline(std::sync::Arc<SplineBound>),
+}
+
+/// `BREP_SCAN_MESH_SPLINE` (default off: on by default for a few hours on
+/// 2026-11-20, back off because the Utah teapot's soundness scan went from
+/// 0.54 to 0.91 s; `=1` enables): the scan meshes a polynomial
+/// spline face with a SOUND deviation bound ([`SplineBound::triangle`]) in
+/// the bounded refinement, in place of the display's sampled chord and
+/// angular checks (and its rectangle grid attempt).
+pub fn spline_enabled() -> bool {
+    spline_force().unwrap_or_else(|| crate::switch!(live "BREP_SCAN_MESH_SPLINE", false))
+}
+
+/// `BREP_SCAN_MESH_SPLINE_CHECK=1`: the scan runs twice, the spline bound
+/// forced off and then on, and prints one `soundness.spline_check` line
+/// comparing the reports. The forced-off report is returned.
+pub fn spline_check() -> bool {
+    crate::debug_flag!("BREP_SCAN_MESH_SPLINE_CHECK")
+}
+
+thread_local! {
+    static SPLINE_FORCE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// The check mode's forced reading of the switch on this thread, if any.
+pub fn spline_force() -> Option<bool> {
+    SPLINE_FORCE.with(|cell| cell.get())
+}
+
+/// Force the spline bound on this thread (`None` clears it), restoring the
+/// previous state on drop; carried onto the tessellator's workers per face.
+pub struct SplineForceScope {
+    previous: Option<bool>,
+}
+
+impl SplineForceScope {
+    pub fn set(force: Option<bool>) -> Self {
+        Self { previous: SPLINE_FORCE.with(|cell| cell.replace(force)) }
+    }
+}
+
+impl Drop for SplineForceScope {
+    fn drop(&mut self) {
+        SPLINE_FORCE.with(|cell| cell.set(self.previous));
+    }
+}
+
+/// Second-derivative bounds of a polynomial tensor spline, per knot span.
+///
+/// The surface is `S(u, v) = Σ N_i,p(u) N_j,q(v) P_ij` with all weights equal,
+/// so a polynomial in each span. Its second partials are splines of the same
+/// form, whose controls are scaled second differences of the net:
+/// - `S_uu`: `R_ij = (p-1) (Q_{i+1,j} - Q_ij) / (u_{i+p+1} - u_{i+2})`, with
+///   `Q_ij = p (P_{i+1,j} - P_ij) / (u_{i+p+1} - u_{i+1})`;
+/// - `S_vv`: the same in v;
+/// - `S_uv`: `p q (P_{i+1,j+1} - P_{i,j+1} - P_{i+1,j} + P_ij) / ((u_{i+p+1} - u_{i+1}) (v_{j+q+1} - v_{j+1}))`.
+///
+/// A control whose denominator vanishes multiplies a basis function that
+/// vanishes identically, and is skipped. On the span `[u_k, u_{k+1}] ×
+/// [v_l, v_{l+1}]` only the controls whose basis functions are nonzero there
+/// weigh. The basis is nonnegative and sums to one, so the length of each
+/// partial is at most the largest length among those controls. That is the
+/// span's entry `[M_uu, M_uv, M_vv]`.
+///
+/// A carrier with an interior knot of multiplicity at least its degree (a
+/// C0 line, where `S_u` or `S_v` jumps) gets no bound.
+#[derive(Debug)]
+pub struct SplineBound {
+    knots_u: Vec<f64>,
+    knots_v: Vec<f64>,
+    degree_u: usize,
+    degree_v: usize,
+    /// Spans `k` in `degree_u..rows`, `l` in `degree_v..columns`.
+    spans_v: usize,
+    table: Vec<[f64; 3]>,
+}
+
+impl SplineBound {
+    pub fn new(surface: &crate::NurbsSurface) -> Option<Self> {
+        let net = &surface.control_points;
+        let (p, q) = (surface.degree_u, surface.degree_v);
+        let rows = net.len();
+        let columns = net.first()?.len();
+        let (ku, kv) = (&surface.knots_u, &surface.knots_v);
+        if rows <= p || columns <= q || net.iter().any(|row| row.len() != columns)
+            || ku.len() != rows + p + 1 || kv.len() != columns + q + 1
+        {
+            return None;
+        }
+        let w0 = net[0][0].w;
+        if !(w0.is_finite() && w0 > 0.0) || net.iter().flatten().any(|c| c.w != w0) {
+            return None;
+        }
+        let points: Vec<Vec<Vec3>> = net
+            .iter()
+            .map(|row| row.iter().map(|c| c.point().ok().filter(|x| x.x.is_finite() && x.y.is_finite() && x.z.is_finite())).collect())
+            .collect::<Option<_>>()?;
+        // No interior C0 line.
+        let c0 = |knots: &[f64], degree: usize, count: usize| {
+            (degree + 1..count).any(|k| knots[k] > knots[degree] && knots[k] < knots[count] && {
+                knots.iter().filter(|&&x| x == knots[k]).count() >= degree.max(1)
+            })
+        };
+        if c0(ku, p, rows) || c0(kv, q, columns) {
+            return None;
+        }
+        let ratio = |num: f64, den: f64| if den > 0.0 { num / den } else { 0.0 };
+        // First differences along u: Qu[i][j], i < rows - 1.
+        let qu: Vec<Vec<Vec3>> = (0..rows.saturating_sub(1))
+            .map(|i| (0..columns).map(|j| points[i + 1][j].sub(points[i][j]).scale(ratio(p as f64, ku[i + p + 1] - ku[i + 1]))).collect())
+            .collect();
+        let qv: Vec<Vec<Vec3>> = (0..rows)
+            .map(|i| (0..columns.saturating_sub(1)).map(|j| points[i][j + 1].sub(points[i][j]).scale(ratio(q as f64, kv[j + q + 1] - kv[j + 1]))).collect())
+            .collect();
+        let spans_u = rows - p;
+        let spans_v = columns - q;
+        let mut table = vec![[0.0f64; 3]; spans_u * spans_v];
+        for k in p..rows {
+            for l in q..columns {
+                let mut m = [0.0f64; 3];
+                if p >= 2 {
+                    for i in k - p..=k - 2 {
+                        let den = ku[i + p + 1] - ku[i + 2];
+                        if !(den > 0.0) { continue; }
+                        for j in l - q..=l {
+                            m[0] = m[0].max(qu[i + 1][j].sub(qu[i][j]).scale((p - 1) as f64 / den).length());
+                        }
+                    }
+                }
+                if p >= 1 && q >= 1 {
+                    for i in k - p..=k - 1 {
+                        let den_u = ku[i + p + 1] - ku[i + 1];
+                        if !(den_u > 0.0) { continue; }
+                        for j in l - q..=l - 1 {
+                            let den_v = kv[j + q + 1] - kv[j + 1];
+                            if !(den_v > 0.0) { continue; }
+                            let twist = points[i + 1][j + 1].sub(points[i][j + 1]).sub(points[i + 1][j]).add(points[i][j]);
+                            m[1] = m[1].max(twist.scale((p * q) as f64 / (den_u * den_v)).length());
+                        }
+                    }
+                }
+                if q >= 2 {
+                    for j in l - q..=l - 2 {
+                        let den = kv[j + q + 1] - kv[j + 2];
+                        if !(den > 0.0) { continue; }
+                        for i in k - p..=k {
+                            m[2] = m[2].max(qv[i][j + 1].sub(qv[i][j]).scale((q - 1) as f64 / den).length());
+                        }
+                    }
+                }
+                if !m.iter().all(|x| x.is_finite()) {
+                    return None;
+                }
+                table[(k - p) * spans_v + (l - q)] = m;
+            }
+        }
+        Some(Self { knots_u: ku.clone(), knots_v: kv.clone(), degree_u: p, degree_v: q, spans_v, table })
+    }
+
+    /// The largest `[M_uu, M_uv, M_vv]` over the spans meeting `[u0, u1] ×
+    /// [v0, v1]`; `None` outside the domain.
+    fn over(&self, [u0, u1, v0, v1]: [f64; 4]) -> Option<[f64; 3]> {
+        let span = |knots: &[f64], degree: usize, x: f64| -> Option<usize> {
+            let count = knots.len() - degree - 1;
+            if !(x >= knots[degree] && x <= knots[count]) {
+                return None;
+            }
+            // The last span whose start is at or below x (the closed spans
+            // meeting x are this one and, at a knot, the one before).
+            let mut k = degree;
+            while k + 1 < count && knots[k + 1] <= x {
+                k += 1;
+            }
+            Some(k)
+        };
+        let (p, q) = (self.degree_u, self.degree_v);
+        // A corner on a knot also touches the span that ends there.
+        let low = |knots: &[f64], degree: usize, x: f64| span(knots, degree, x).map(|k| if k > degree && knots[k] == x { k - 1 } else { k });
+        let (ka, kb) = (low(&self.knots_u, p, u0)?, span(&self.knots_u, p, u1)?);
+        let (la, lb) = (low(&self.knots_v, q, v0)?, span(&self.knots_v, q, v1)?);
+        let mut m = [0.0f64; 3];
+        for k in ka..=kb {
+            for l in la..=lb {
+                let entry = self.table[(k - p) * self.spans_v + (l - q)];
+                for slot in 0..3 {
+                    m[slot] = m[slot].max(entry[slot]);
+                }
+            }
+        }
+        Some(m)
+    }
+
+    /// An upper bound on `|L(x) - S(x)|` over the uv triangle `uv`, where `L`
+    /// is the linear interpolant of `S` at its corners.
+    ///
+    /// Proof. For `x = Σ λ_i v_i`, Taylor's theorem with integral remainder
+    /// along each segment `x → v_i` gives
+    /// `Σ λ_i S(v_i) − S(x) = Σ λ_i ∫₀¹ (1−t) D²S[v_i − x]² dt`.
+    /// The linear terms cancel because `Σ λ_i (v_i − x) = 0`. This needs `S`
+    /// to be C1 with a bounded, piecewise continuous second derivative, which
+    /// holds without interior C0 lines.
+    ///
+    /// Next, `|D²S[d]²| ≤ M_uu du² + 2 M_uv |du dv| + M_vv dv² ≤ Q(d)`, with
+    /// `Q(d) = (M_uu + α M_uv) du² + (M_vv + M_uv / α) dv²` for any `α > 0`
+    /// (`2|du dv| ≤ α du² + dv² / α`). So the error is at most
+    /// `½ Σ λ_i Q(v_i − x)`. The weight is chosen per centre as
+    /// `√(Dv / Du)` from the corners' squared extents about it, which keeps
+    /// a long, thin rim strip from paying its long side's length in the cross
+    /// term. When every corner shares one u (or one v), each `d` inside has
+    /// no cross term at all.
+    ///
+    /// For the quadratic form `Q` and any centre `c`, that sum equals
+    /// `Σ λ_i Q(v_i − c) − Q(x − c) ≤ max_i Q(v_i − c)`. The bound takes the
+    /// best of the centroid and the three edge midpoints. For a right
+    /// triangle the hypotenuse midpoint gives exactly a quarter of `Q` of the
+    /// hypotenuse.
+    pub fn triangle(&self, uv: [[f64; 2]; 3]) -> Option<f64> {
+        let lo = |k: usize| uv.iter().map(|p| p[k]).fold(f64::INFINITY, f64::min);
+        let hi = |k: usize| uv.iter().map(|p| p[k]).fold(f64::NEG_INFINITY, f64::max);
+        let [muu, muv, mvv] = self.over([lo(0), hi(0), lo(1), hi(1)])?;
+        // About centre c, with the cross term split by the weight α that
+        // suits this triangle's extents (any α > 0 is valid).
+        let form = |c: [f64; 2]| {
+            let du = uv.iter().map(|p| (p[0] - c[0]).powi(2)).fold(0.0f64, f64::max);
+            let dv = uv.iter().map(|p| (p[1] - c[1]).powi(2)).fold(0.0f64, f64::max);
+            let (a, b) = if du > 0.0 && dv > 0.0 {
+                let alpha = (dv / du).sqrt();
+                (muu + alpha * muv, mvv + muv / alpha)
+            } else {
+                // Every corner on one iso line: every d along it has no cross term.
+                (muu, mvv)
+            };
+            uv.iter().map(|p| a * (p[0] - c[0]).powi(2) + b * (p[1] - c[1]).powi(2)).fold(0.0f64, f64::max)
+        };
+        let mid = |i: usize, j: usize| [(uv[i][0] + uv[j][0]) * 0.5, (uv[i][1] + uv[j][1]) * 0.5];
+        let centroid = [(uv[0][0] + uv[1][0] + uv[2][0]) / 3.0, (uv[0][1] + uv[1][1] + uv[2][1]) / 3.0];
+        let best = [form(centroid), form(mid(0, 1)), form(mid(1, 2)), form(mid(2, 0))].into_iter().fold(f64::INFINITY, f64::min);
+        let value = 0.5 * best;
+        value.is_finite().then_some(value)
+    }
 }
 
 /// The bound kind of `face`, or `None` (keep the display refinement).
@@ -125,12 +375,17 @@ pub fn face_bound(face: &FaceRecord) -> Option<FaceBound> {
         }
         _ => {}
     }
-    let affine = face.surface.affine_sphere()?;
-    let largest = affine.semi_axes()[0];
-    if !(largest.is_finite() && largest > 0.0) {
-        return None;
+    if let Some(affine) = face.surface.affine_sphere() {
+        let largest = affine.semi_axes()[0];
+        if !(largest.is_finite() && largest > 0.0) {
+            return None;
+        }
+        return Some(FaceBound::Affine { sphere: affine.clone(), largest_semi_axis: largest });
     }
-    Some(FaceBound::Affine { sphere: affine.clone(), largest_semi_axis: largest })
+    if spline_enabled() && face.surface.analytic().is_none() {
+        return SplineBound::new(&face.surface).map(|bound| FaceBound::Spline(std::sync::Arc::new(bound)));
+    }
+    None
 }
 
 /// Rounding pad for a quantity at magnitude `scale`.
@@ -210,6 +465,8 @@ pub fn triangle_bound(bound: &FaceBound, t: [Vec3; 3]) -> Option<f64> {
             }
             inside.max(0.0) + outward.max(0.0)
         }
+        // Read from the uv corners by the bounded refinement (`SplineBound`).
+        FaceBound::Spline(_) => return None,
         FaceBound::Affine { ref sphere, largest_semi_axis } => {
             // `M` is affine, so the preimage of the triangle is the triangle of
             // the preimages, and `|M x - M y| <= sigma_max |x - y|` with the

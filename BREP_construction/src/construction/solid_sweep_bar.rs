@@ -45,6 +45,20 @@ struct Piece {
     /// Bounding box of the samples, grown by the piece's sag.
     low: [f64; 2],
     high: [f64; 2],
+    /// The boxes of the chords taken BLOCK at a time (each chord lies in its
+    /// ends' box).
+    blocks: Vec<([f64; 2], [f64; 2])>,
+}
+
+/// Chords to a block of a piece's nearest-chord scan.
+const BLOCK: usize = 16;
+
+/// The squared distance from `q` to the box `low..high`, no more than any
+/// point's in it.
+fn box_squared(q: [f64; 2], low: [f64; 2], high: [f64; 2]) -> f64 {
+    let dx = (low[0] - q[0]).max(q[0] - high[0]).max(0.0);
+    let dy = (low[1] - q[1]).max(q[1] - high[1]).max(0.0);
+    dx * dx + dy * dy
 }
 
 /// The start of a piece: where it leaves the piece before it.
@@ -102,6 +116,24 @@ fn to_segment(q: [f64; 2], a: [f64; 2], b: [f64; 2]) -> (f64, f64) {
     let span = dot2(d, d);
     let w = if span > 0.0 { (dot2(sub2(q, a), d) / span).clamp(0.0, 1.0) } else { 0.0 };
     (length2(sub2([a[0] + d[0] * w, a[1] + d[1] * w], q)), w)
+}
+
+/// The squared distance from `q` to the segment `a b` (as [`to_segment`]
+/// finds its nearest point, without the root).
+fn to_segment_squared(q: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let d = sub2(b, a);
+    let span = dot2(d, d);
+    let w = if span > 0.0 { (dot2(sub2(q, a), d) / span).clamp(0.0, 1.0) } else { 0.0 };
+    let r = sub2([a[0] + d[0] * w, a[1] + d[1] * w], q);
+    dot2(r, r)
+}
+
+/// Whether a bar's nearest-chord scan takes roots only near the least
+/// squared distance, and its even-odd count passes blocks of chords wholly
+/// above or below the point (on unless BREP_SWEEP_CHORD_SQUARES=0; the same
+/// chord, distance and count bit for bit).
+fn chord_squares_on() -> bool {
+    crate::switch!("BREP_SWEEP_CHORD_SQUARES", true)
 }
 
 impl Bar {
@@ -186,7 +218,15 @@ impl Bar {
                 size = size.max(q[0].abs()).max(q[1].abs());
                 samples.push(q);
             }
-            pieces.push(Piece { curve: curve.clone(), domain, straight, samples, places, low: [0.0; 2], high: [0.0; 2] });
+            let blocks = (0..(samples.len() - 1).div_ceil(BLOCK))
+                .map(|b| {
+                    let run = &samples[b * BLOCK..=((b + 1) * BLOCK).min(samples.len() - 1)];
+                    let low = run.iter().fold([f64::INFINITY; 2], |m, p| [m[0].min(p[0]), m[1].min(p[1])]);
+                    let high = run.iter().fold([f64::NEG_INFINITY; 2], |m, p| [m[0].max(p[0]), m[1].max(p[1])]);
+                    (low, high)
+                })
+                .collect();
+            pieces.push(Piece { curve: curve.clone(), domain, straight, samples, places, low: [0.0; 2], high: [0.0; 2], blocks });
         }
         if off_plane > 1e-9 * size.max(1.0) {
             return Err(input("section_plane", "the bar's section does not lie in the plane through its origin square to its direction".into()));
@@ -396,13 +436,22 @@ impl Bar {
 
     /// Is `q` inside the polyline through the section (even-odd)?
     fn inside_chords(&self, q: [f64; 2]) -> bool {
+        let crosses = |a: [f64; 2], b: [f64; 2]| -> bool {
+            (a[1] > q[1]) != (b[1] > q[1]) && a[0] + (q[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1]) > q[0]
+        };
         let mut crossings = 0usize;
+        let blocks = chord_squares_on();
         for piece in &self.pieces {
-            for pair in piece.samples.windows(2) {
-                let (a, b) = (pair[0], pair[1]);
-                if (a[1] > q[1]) != (b[1] > q[1]) {
-                    let x = a[0] + (q[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1]);
-                    if x > q[0] {
+            let chords = piece.samples.len() - 1;
+            for block in 0..chords.div_ceil(BLOCK) {
+                // A block wholly above q, or wholly at or below it (by its
+                // samples' own heights), holds no crossing.
+                let (low, high) = piece.blocks[block];
+                if blocks && (high[1] <= q[1] || low[1] > q[1]) {
+                    continue;
+                }
+                for k in block * BLOCK..((block + 1) * BLOCK).min(chords) {
+                    if crosses(piece.samples[k], piece.samples[k + 1]) {
                         crossings += 1;
                     }
                 }
@@ -450,10 +499,47 @@ impl Bar {
                 continue;
             }
             let mut own = (f64::INFINITY, 0usize, 0.0f64);
-            for (k, pair) in piece.samples.windows(2).enumerate() {
-                let (d, w) = to_segment(q, pair[0], pair[1]);
-                if d < own.0 {
-                    own = (d, k, w);
+            if chord_squares_on() {
+                // The chord the root scan picks is within rounding of the
+                // least distance, so only chords that near (in blocks whose
+                // box is that near) need the root, taken in order. `slack`
+                // outweighs any rounding in a nearest point or its distance
+                // (a few ulps of the coordinates), however near q is.
+                let scale = q[0].abs().max(q[1].abs()).max(piece.low[0].abs()).max(piece.low[1].abs()).max(piece.high[0].abs()).max(piece.high[1].abs());
+                let slack = 1e-12 * scale + 1e-300;
+                let chords = piece.samples.len() - 1;
+                let floor = |b: usize| (box_squared(q, piece.blocks[b].0, piece.blocks[b].1).sqrt() - slack).max(0.0);
+                let mut least = f64::INFINITY;
+                for b in 0..piece.blocks.len() {
+                    if floor(b) * floor(b) > least {
+                        continue;
+                    }
+                    for k in b * BLOCK..((b + 1) * BLOCK).min(chords) {
+                        least = least.min(to_segment_squared(q, piece.samples[k], piece.samples[k + 1]));
+                    }
+                }
+                let near = least.sqrt() + slack;
+                for b in 0..piece.blocks.len() {
+                    if floor(b) > near {
+                        continue;
+                    }
+                    for k in b * BLOCK..((b + 1) * BLOCK).min(chords) {
+                        let (a, c) = (piece.samples[k], piece.samples[k + 1]);
+                        if to_segment_squared(q, a, c).sqrt() > near + slack {
+                            continue;
+                        }
+                        let (d, w) = to_segment(q, a, c);
+                        if d < own.0 {
+                            own = (d, k, w);
+                        }
+                    }
+                }
+            } else {
+                for (k, pair) in piece.samples.windows(2).enumerate() {
+                    let (d, w) = to_segment(q, pair[0], pair[1]);
+                    if d < own.0 {
+                        own = (d, k, w);
+                    }
                 }
             }
             least = least.min(own.0);

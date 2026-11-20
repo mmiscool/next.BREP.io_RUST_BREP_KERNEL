@@ -47,6 +47,16 @@ pub enum Integrand {
     ProductXY,
     ProductXZ,
     ProductYZ,
+    /// The first moments about a reference point `r`, by axis (0 = x, 1 = y,
+    /// 2 = z): `∫(x − r_x) dV = ∮ ((x − r_x)²/2)·nx dA`, etc. Read about a
+    /// point of the body, they do not grow with the body's distance from the
+    /// origin (`VolumeAbout`'s reason).
+    MomentAbout(usize, Vec3),
+    /// Second moments about `r`, by axis: `∫(x − r_x)² dV = ∮ ((x − r_x)³/3)·nx dA`.
+    SecondAbout(usize, Vec3),
+    /// Products about `r`, by pair (0 = xy, 1 = xz, 2 = yz):
+    /// `∫(x − r_x)(y − r_y) dV = ∮ ((x − r_x)²(y − r_y)/2)·nx dA`, etc.
+    ProductAbout(usize, Vec3),
 }
 
 /// A bounded, per-solid memo for exact area and volume. Geometry edits are
@@ -178,6 +188,9 @@ pub mod polygons;
 pub mod rule;
 #[path = "mass_properties/solid_props.rs"]
 pub mod solid_props;
+/// A sphere face trimmed only by circles, read in closed form.
+#[path = "mass_properties/sphere_caps.rs"]
+pub mod sphere_caps;
 #[path = "mass_properties/sphere_sign.rs"]
 pub mod sphere_sign;
 #[path = "mass_properties/trimmed.rs"]
@@ -205,6 +218,7 @@ pub use measures::{
 };
 pub use solid_props::{
     solid_mass_properties, solid_mass_properties_full, signed_volume_against, solid_signed_volume, solid_signed_volume_for_sign,
+    solid_sign_coarse_certificate, CoarseSign, COARSE_SIGN_DEPTH,
 };
 pub use solid_props::shell_signed_volume;
 pub use polygons::trim_polygons;

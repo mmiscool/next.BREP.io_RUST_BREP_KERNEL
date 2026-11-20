@@ -9,8 +9,8 @@
 //! that).
 //!
 //! The topology is the reference's for a manifold solid (§4.3, §5.3): an
-//! infinite void region and a solid region (and a void region for each
-//! cavity), a shell per region side, faces chained as back faces of their
+//! infinite void region and a solid region for each lump (and a void region
+//! for each cavity), a shell per region side, faces chained as back faces of their
 //! solid region's shell and front faces of the void region's, a loop per
 //! boundary, and two fins per edge, the positive one running with the edge
 //! and pointing at its end vertex. Geometry is exact: analytic carriers the
@@ -352,12 +352,22 @@ impl Builder {
         }
         let body = self.reserve();
         // Regions: the infinite void first (the body's region chain head),
-        // then the solid, then a void per cavity shell.
-        let outer = outer_shell(solid)?;
+        // then for each lump its solid region and a void per cavity shell.
+        let Lumps { lumps, within } = lumps(solid)?;
         let infinite = self.reserve();
-        let material = self.reserve();
-        let cavities: Vec<usize> = (0..solid.shells.len()).filter(|&s| s != outer).collect();
-        let cavity_regions: Vec<u32> = cavities.iter().map(|_| self.reserve()).collect();
+        let materials: Vec<u32> = lumps.iter().map(|_| self.reserve()).collect();
+        let cavity_regions: Vec<Vec<u32>> = lumps.iter().map(|(_, cavities)| cavities.iter().map(|_| self.reserve()).collect()).collect();
+        // Each kernel shell's lump, and its void side's region.
+        let mut material_of = vec![0u32; solid.shells.len()];
+        let mut void_of = vec![0u32; solid.shells.len()];
+        for (k, (outer, cavities)) in lumps.iter().enumerate() {
+            material_of[*outer] = materials[k];
+            void_of[*outer] = within[k].map_or(infinite, |(j, c)| cavity_regions[j][c]);
+            for (j, &c) in cavities.iter().enumerate() {
+                material_of[c] = materials[k];
+                void_of[c] = cavity_regions[k][j];
+            }
+        }
         // A shell on each side of every kernel shell: its solid side in the
         // solid region, its void side in the infinite void or its cavity.
         let mut solid_shells = Vec::new();
@@ -569,21 +579,44 @@ impl Builder {
             let faces = back.get(&s).cloned().unwrap_or_default();
             let head = faces.first().copied().unwrap_or(0);
             let id = self.id();
-            self.put(solid_shells[s], 13, vec![("node_id", int(id)), ("body", ptr(body)), ("face", ptr(head)), ("region", ptr(material))])?;
-            let void_region = if s == outer { infinite } else { cavity_regions[cavities.iter().position(|&c| c == s).unwrap()] };
+            self.put(solid_shells[s], 13, vec![("node_id", int(id)), ("body", ptr(body)), ("face", ptr(head)), ("region", ptr(material_of[s]))])?;
             let id = self.id();
-            self.put(void_shells[s], 13, vec![("node_id", int(id)), ("front_face", ptr(head)), ("region", ptr(void_region))])?;
+            self.put(void_shells[s], 13, vec![("node_id", int(id)), ("front_face", ptr(head)), ("region", ptr(void_of[s]))])?;
         }
-        // The solid region's shells: the outer first, then the cavities'.
-        let mut material_shells = vec![solid_shells[outer]];
-        material_shells.extend(cavities.iter().map(|&c| solid_shells[c]));
-        for pair in material_shells.windows(2) {
-            self.set(pair[0], "next", ptr(pair[1]))?;
+        // The infinite void's shells: the outer void side of each lump not
+        // inside another's cavity. A cavity's: its own void side, then the
+        // outer void side of each lump inside it. Each solid region's: its
+        // outer first, then its cavities'.
+        let voids_in = |place: Option<(usize, usize)>| -> Vec<u32> {
+            let mut shells: Vec<u32> = place.map(|(j, c)| void_shells[lumps[j].1[c]]).into_iter().collect();
+            shells.extend((0..lumps.len()).filter(|&k| within[k] == place).map(|k| void_shells[lumps[k].0]));
+            shells
+        };
+        let mut regions = Vec::new();
+        let mut void_region = |region: u32, place: Option<(usize, usize)>, this: &mut Self| -> Result<(), String> {
+            let shells = voids_in(place);
+            for pair in shells.windows(2) {
+                this.set(pair[0], "next", ptr(pair[1]))?;
+            }
+            regions.push((region, shells[0], b'V'));
+            Ok(())
+        };
+        void_region(infinite, None, self)?;
+        let mut material_regions = Vec::new();
+        for (k, (outer, cavities)) in lumps.iter().enumerate() {
+            let mut material_shells = vec![solid_shells[*outer]];
+            material_shells.extend(cavities.iter().map(|&c| solid_shells[c]));
+            for pair in material_shells.windows(2) {
+                self.set(pair[0], "next", ptr(pair[1]))?;
+            }
+            material_regions.push((materials[k], material_shells[0], b'S'));
+            for j in 0..cavities.len() {
+                void_region(cavity_regions[k][j], Some((k, j)), self)?;
+            }
         }
-        let mut regions = vec![(infinite, void_shells[outer], b'V'), (material, material_shells[0], b'S')];
-        for (k, &c) in cavities.iter().enumerate() {
-            regions.push((cavity_regions[k], void_shells[c], b'V'));
-        }
+        // The infinite void heads the chain, then the solid regions, then
+        // the cavities' voids.
+        let regions: Vec<(u32, u32, u8)> = regions[..1].iter().chain(&material_regions).chain(&regions[1..]).copied().collect();
         for (k, &(region, shell, kind)) in regions.iter().enumerate() {
             let id = self.id();
             let next = regions.get(k + 1).map_or(0, |r| r.0);
@@ -646,7 +679,7 @@ impl Builder {
                 ("state", int(1)),
                 ("body_type", int(1)),
                 ("nom_geom_state", int(1)),
-                ("shell", ptr(solid_shells[outer])),
+                ("shell", ptr(solid_shells[lumps[0].0])),
                 ("boundary_surface", ptr(boundary_surfaces.first().copied().unwrap_or(0))),
                 ("boundary_curve", ptr(curve_nodes.first().copied().unwrap_or(0))),
                 ("boundary_point", ptr(points.first().copied().unwrap_or(0))),
@@ -968,27 +1001,107 @@ impl Builder {
     }
 }
 
-/// The kernel shell that bounds the others: the one whose signed volume is
-/// positive (an outer shell faces out, a cavity's into the cavity), the
-/// largest if several are.
-fn outer_shell(solid: &BrepSolid) -> Result<usize, String> {
+/// A solid's lumps, largest first, each its outer shell and its cavities'
+/// shells; and for each lump the cavity (lump, cavity index) it sits inside,
+/// if any.
+struct Lumps {
+    lumps: Vec<(usize, Vec<usize>)>,
+    within: Vec<Option<(usize, usize)>>,
+}
+
+/// The solid's lumps: each shell whose signed volume is positive bounds one
+/// (an outer shell faces out), and each other shell (a cavity's, facing into
+/// the cavity) lies in the smallest of them that holds a point of it. Each
+/// lump is a solid region of its own (§4.3); a lump inside another's cavity
+/// has its outside in that cavity's void region.
+fn lumps(solid: &BrepSolid) -> Result<Lumps, String> {
     if solid.shells.is_empty() {
         return Err("the solid has no shells".into());
     }
     if solid.shells.len() == 1 {
-        return Ok(0);
+        return Ok(Lumps { lumps: vec![(0, Vec::new())], within: vec![None] });
     }
-    let volume = |s: usize| {
+    let alone = |s: usize| {
         let mut one = solid.clone();
         one.shells = vec![solid.shells[s].clone()];
         one.mass_properties_cache = Default::default();
-        crate::solid_signed_volume(&one).unwrap_or(f64::NAN)
+        one
     };
-    let volumes: Vec<f64> = (0..solid.shells.len()).map(volume).collect();
-    (0..solid.shells.len())
-        .filter(|&s| volumes[s] > 0.0)
-        .max_by(|&a, &b| volumes[a].total_cmp(&volumes[b]))
-        .ok_or_else(|| format!("no shell of the solid encloses positive volume ({volumes:?})"))
+    let volumes: Vec<f64> = (0..solid.shells.len()).map(|s| crate::solid_signed_volume(&alone(s)).unwrap_or(f64::NAN)).collect();
+    // A shell enclosing no volume (or none measurable) is neither an outer
+    // shell nor a cavity's: measured against its own size (the cube of its
+    // vertices' box diagonal), so a small cavity in a large solid counts.
+    let points: HashMap<u64, Vec3> = solid.vertices.iter().map(|v| (v.id, v.point)).collect();
+    let ends: HashMap<u64, [u64; 2]> = solid.edges.iter().map(|e| (e.id, [e.start_vertex_id, e.end_vertex_id])).collect();
+    let size = |s: usize| -> f64 {
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        let coedges = solid.shells[s].faces.iter().flat_map(|f| &f.loops).flat_map(|l| &l.coedges);
+        for p in coedges.filter_map(|c| ends.get(&c.edge_id)).flatten().filter_map(|v| points.get(v)) {
+            for (k, x) in [p.x, p.y, p.z].into_iter().enumerate() {
+                lo[k] = lo[k].min(x);
+                hi[k] = hi[k].max(x);
+            }
+        }
+        (0..3).map(|k| (hi[k] - lo[k]).max(0.0).powi(2)).sum::<f64>().sqrt()
+    };
+    if let Some(s) = (0..volumes.len()).find(|&s| !volumes[s].is_finite() || volumes[s].abs() <= 1e-12 * size(s).powi(3)) {
+        return Err(format!("shell {s} of the solid encloses no volume to tell an outer shell from a cavity by ({})", volumes[s]));
+    }
+    let mut outers: Vec<usize> = (0..solid.shells.len()).filter(|&s| volumes[s] > 0.0).collect();
+    if outers.is_empty() {
+        return Err(format!("no shell of the solid encloses positive volume ({volumes:?})"));
+    }
+    outers.sort_by(|&a, &b| volumes[b].total_cmp(&volumes[a]));
+    let mut lumps: Vec<(usize, Vec<usize>)> = outers.iter().map(|&o| (o, Vec::new())).collect();
+    if outers.len() == 1 {
+        lumps[0].1 = (0..solid.shells.len()).filter(|&s| s != outers[0]).collect();
+        return Ok(Lumps { lumps, within: vec![None] });
+    }
+    let bounded: Vec<BrepSolid> = outers.iter().map(|&o| alone(o)).collect();
+    let vertices: HashMap<u64, Vec3> = solid.vertices.iter().map(|v| (v.id, v.point)).collect();
+    let edges: HashMap<u64, u64> = solid.edges.iter().map(|e| (e.id, e.start_vertex_id)).collect();
+    let point_of = |s: usize| -> Result<Vec3, String> {
+        solid.shells[s]
+            .faces
+            .iter()
+            .flat_map(|f| &f.loops)
+            .flat_map(|l| &l.coedges)
+            .find_map(|coedge| edges.get(&coedge.edge_id).and_then(|v| vertices.get(v)))
+            .copied()
+            .ok_or_else(|| format!("shell {s} has no vertex"))
+    };
+    let inside = |p: Vec3, body: &BrepSolid| crate::classify_point(p, body, 1e-6).is_ok_and(|c| c.class == crate::PointClass::In);
+    for c in (0..solid.shells.len()).filter(|&s| volumes[s] < 0.0) {
+        let point = point_of(c)?;
+        // The smallest lump holding it: lumps are largest first.
+        let holder = (0..outers.len())
+            .rev()
+            .find(|&k| inside(point, &bounded[k]))
+            .ok_or_else(|| format!("cavity shell {c} lies in no lump of the solid"))?;
+        lumps[holder].1.push(c);
+    }
+    // A lump inside another's outer shell is in one of its cavities: the
+    // smallest cavity whose shell, with that lump's outer, leaves it out.
+    let mut within = vec![None; lumps.len()];
+    for k in 0..lumps.len() {
+        let point = point_of(lumps[k].0)?;
+        let mut best: Option<((usize, usize), f64)> = None;
+        for (j, (outer, cavities)) in lumps.iter().enumerate() {
+            if j == k || !inside(point, &bounded[j]) {
+                continue;
+            }
+            for (ci, &c) in cavities.iter().enumerate() {
+                let mut hollow = solid.clone();
+                hollow.shells = vec![solid.shells[*outer].clone(), solid.shells[c].clone()];
+                hollow.mass_properties_cache = Default::default();
+                if !inside(point, &hollow) && best.map_or(true, |(_, v)| -volumes[c] < v) {
+                    best = Some(((j, ci), -volumes[c]));
+                }
+            }
+        }
+        within[k] = best.map(|(place, _)| place);
+    }
+    Ok(Lumps { lumps, within })
 }
 
 /// Distinct knots and their multiplicities.

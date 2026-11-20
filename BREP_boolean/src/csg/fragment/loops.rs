@@ -662,7 +662,7 @@ impl LoopUse for UseView {
 /// so every coedge, pcurve and source is the clone path's to the byte.
 /// Measured on the filleted box's outward offset (D1), whose two arc regions
 /// hold ~270 uses each: the clone and the per-comparison tag parse were
-/// 0.43 of build_loop's 0.49 ms per attempt (cad-bot fast build, plain).
+/// 0.43 of build_loop's 0.49 ms per attempt (release build, serial).
 fn loop_view_enabled() -> bool {
     switch!("BREP_FRAGMENT_LOOP_VIEW", true)
 }

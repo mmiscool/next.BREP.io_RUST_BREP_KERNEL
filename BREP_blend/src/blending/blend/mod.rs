@@ -29,6 +29,8 @@ pub mod miter;
 pub mod network;
 pub use network::STRIPE_PINCH_TAPER_WHAT;
 pub mod planar_chart;
+pub mod same_parameter;
+pub use same_parameter::same_parameter_trims;
 mod restrict;
 pub mod rollover;
 pub mod rollover_surgery;
@@ -450,10 +452,11 @@ pub use chain::{blend_smooth_chain, blend_smooth_chain_if_closed};
 pub use chain::smooth_chain_members;
 pub use corner::round_concave_chain_corner;
 pub use corner::round_convex_corner;
+pub use corner::{is_n_sided_undercut_refusal, N_SIDED_FOLD_WHAT, N_SIDED_UNDERCUT_WHAT};
 pub use edge::{blend_closed_edge, blend_closed_edge_knot_aware, blend_edge_variable, blend_open_edge, is_pcurve_floor_refusal, with_pcurve_knot_retry};
 pub use collapse::is_full_width_collapse;
 pub use planar_chart::{
-    fit_planar_charts_to_trims, is_planar_chart_refusal, planar_chart_overrun,
+    chart_fitted_for_gate, fit_planar_charts_to_trims, is_planar_chart_refusal, planar_chart_overrun,
 };
 pub use track_fit::PCURVE_OFF_FLOOR;
 pub use edge::{consumed_band, is_consumed_snap, is_rail_collapse};
@@ -528,6 +531,7 @@ pub fn closed_wall_predict_on() -> bool {
 // BREP lane L: begin keyway_floor_open_mixed_corner_20261014
 pub use corner::round_mixed_concave_open_corner;
 // BREP lane L: end keyway_floor_open_mixed_corner_20261014
+
 
 
 // Lane R7 (2026-10-19): the tapered cusp runout; `BREP_BLEND_TAPER_RUNOUT`.

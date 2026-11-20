@@ -289,15 +289,8 @@ pub fn face_from_surface_trimmed(surface: &NurbsSurface, loops: &[Vec<NurbsCurve
     accept(records.sheet(surface, face_loops), "trimmed_face")
 }
 
-/// The solid `sheets` bound: their faces joined along the edges that coincide
-/// within `tolerance` (the kernel's sewing, [`crate::sew_solid`], which pairs
-/// edges by where they lie and needs no agreement between the sheets'
-/// normals), then turned outward.
-///
-/// One closed face is a solid by itself (a ball's or a ring's face from
-/// [`face_from_surface`]). Refuses sheets that leave an edge open after
-/// sewing, saying how many, and a joined body the kernel's validation rejects.
-pub fn solid_from_sheets(sheets: &[BrepSolid], tolerance: f64) -> Result<BrepSolid, KernelRefusal> {
+/// `sheets` as one body of all their faces, every id made new, unsewn.
+fn joined_sheets(sheets: &[BrepSolid], tolerance: f64) -> Result<BrepSolid, KernelRefusal> {
     if sheets.is_empty() || sheets.iter().any(|sheet| sheet.shells.iter().all(|shell| shell.faces.is_empty())) {
         return Err(input("sheets_empty", "at least one sheet, each of at least one face, is required".into()));
     }
@@ -354,6 +347,30 @@ pub fn solid_from_sheets(sheets: &[BrepSolid], tolerance: f64) -> Result<BrepSol
         kind: BodyKind::Sheet,
         cells: Default::default(),
     };
+    Ok(joined)
+}
+
+/// One sheet of all the faces of `sheets`, joined along the edges that
+/// coincide within `tolerance` (the kernel's sewing, as [`solid_from_sheets`]
+/// joins them), its boundary left open: the patches of a filled N-sided hole
+/// as one body. Refuses a joined body the kernel's validation rejects.
+pub fn sheet_from_sheets(sheets: &[BrepSolid], tolerance: f64) -> Result<BrepSolid, KernelRefusal> {
+    let joined = joined_sheets(sheets, tolerance)?;
+    let (mut sheet, _) = sew_solid(&joined, tolerance)?;
+    sheet.kind = BodyKind::Sheet;
+    accept(sheet, "joined_sheet")
+}
+
+/// The solid `sheets` bound: their faces joined along the edges that coincide
+/// within `tolerance` (the kernel's sewing, [`crate::sew_solid`], which pairs
+/// edges by where they lie and needs no agreement between the sheets'
+/// normals), then turned outward.
+///
+/// One closed face is a solid by itself (a ball's or a ring's face from
+/// [`face_from_surface`]). Refuses sheets that leave an edge open after
+/// sewing, saying how many, and a joined body the kernel's validation rejects.
+pub fn solid_from_sheets(sheets: &[BrepSolid], tolerance: f64) -> Result<BrepSolid, KernelRefusal> {
+    let joined = joined_sheets(sheets, tolerance)?;
     let (mut solid, report) = sew_solid(&joined, tolerance)?;
     // a pole's degenerate edge bounds its one face by nature; every other edge must bound two
     let mut uses = std::collections::HashMap::<u64, usize>::new();

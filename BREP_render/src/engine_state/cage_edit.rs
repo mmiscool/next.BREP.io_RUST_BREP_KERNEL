@@ -206,6 +206,7 @@ impl EngineState {
         self.transform_gizmo.drag = None;
         self.transform_gizmo.anchor = None;
         self.transform_gizmo.port = None;
+        self.transform_gizmo.deform = None;
         self.transform_gizmo.cage = Some(CageArm {
             selected,
             grab: None,

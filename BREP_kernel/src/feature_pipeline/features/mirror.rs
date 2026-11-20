@@ -56,7 +56,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     for (source_name, handle) in &resolved {
         let name = format!("{feature_id}:{source_name}:M");
         // A mirrored sheet-metal part stays sheet metal, so flanges and unfolds
-        // work on the copy (report 20261028T220228Z-cc228ef6). The copy IS its
+        // work on the copy (a user report). The copy IS its
         // reflected tree's evaluation, so later sheet-metal edits keep every
         // name on the same face (a reflected fold edge runs the other way, so
         // its bend's END caps trade names against a reflected solid).

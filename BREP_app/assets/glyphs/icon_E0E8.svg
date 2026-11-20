@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="helical_gear" brep:unicode="E0E8">
+  <path d="M120 140H880V860H120Z" fill="#7a4d10"/>
+  <path d="M155 175H845V825H155Z" fill="#f0b840"/>
+  <path d="M185 175L247 175L397 825L335 825Z M310 175L372 175L522 825L460 825Z M435 175L497 175L647 825L585 825Z M560 175L622 175L772 825L710 825Z M685 175L747 175L897 825L835 825Z" fill="#c9871a"/>
+</svg>

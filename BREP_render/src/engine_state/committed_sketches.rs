@@ -15,6 +15,13 @@ const PORT_TERMINATION_COLOR: [f32; 3] = [
     0x32 as f32 / 255.0,
     0x2d as f32 / 255.0,
 ];
+/// The open edges a refused Sew to Solid draws: orange, so the gap reads apart
+/// from sketches (cyan), ports (red) and every solid.
+const SEW_GAP_COLOR: [f32; 3] = [
+    0xff as f32 / 255.0,
+    0x9f as f32 / 255.0,
+    0x1a as f32 / 255.0,
+];
 /// A WAYPOINT port: a lighter red, so a pass-through reads apart from an end.
 const PORT_WAYPOINT_COLOR: [f32; 3] = [
     0xff as f32 / 255.0,
@@ -34,6 +41,10 @@ const PORT_WAYPOINT_COLOR: [f32; 3] = [
 ///     its address stands in for the id and it draws the same line.
 ///   * `S3D` — a 3D sketch draws one curve per model geometry, `{id}:G{gid}`,
 ///     like a planar sketch (it never has a sheet: nothing closes a region).
+///   * `SEW` — a Sew to Solid whose faces did not close draws the open edges
+///     it refused on, `{id}:GAP[n]`, so the user sees which edge to fix, as
+///     the display `{id}:GAP`. A sew that closed publishes none and draws
+///     (and lists) nothing.
 /// Anything else (a solid feature) has no sheet here. Only `S` and `S3D` are
 /// ever ENTERABLE — the sketch-mode guards check the type separately.
 fn curve_feature_segment_prefix(feature_type: &str, id: &str) -> Option<String> {
@@ -43,6 +54,7 @@ fn curve_feature_segment_prefix(feature_type: &str, id: &str) -> Option<String> 
         "SP" => Some(format!("{id}:SplineEdge")),
         brep_kernel::SKETCH3D_FEATURE_TYPE => Some(format!("{id}:G")),
         "WP" | brep_kernel::PORTS_FEATURE_TYPE => Some(format!("{id}:PortLine")),
+        "SEW" => Some(format!("{id}:GAP")),
         _ => None,
     }
 }
@@ -112,6 +124,18 @@ impl EngineState {
             if Some(id.as_str()) == editing {
                 continue;
             }
+            // A Sew to Solid is listed only while it has open edges to show,
+            // and under `{id}:GAP`, never its id: the solid it builds once the
+            // faces close is the scene solid `{id}`, which the refresh that
+            // retires this display must not remove.
+            let id = if feature_type == "SEW" {
+                if !self.sketch_paths.iter().any(|(name, _)| name.starts_with(prefix.as_str())) {
+                    continue;
+                }
+                prefix.clone()
+            } else {
+                id
+            };
             let point_prefix = curve_feature_point_prefix(&feature_type, &id);
             ids.push((id, feature_type, prefix, point_prefix));
         }
@@ -177,6 +201,7 @@ impl EngineState {
     fn curve_feature_color(&self, _id: &str, feature_type: &str) -> [f32; 3] {
         match feature_type {
             "WP" => PORT_WAYPOINT_COLOR,
+            "SEW" => SEW_GAP_COLOR,
             ty if ty == brep_kernel::PORTS_FEATURE_TYPE => PORT_TERMINATION_COLOR,
             _ => SKETCH_SHEET_COLOR,
         }
@@ -279,6 +304,14 @@ impl EngineState {
             let mut solid = crate::scene::solid_display_from_payload(&id, payload);
             solid.is_sketch = true;
             solid.color_override = Some(color);
+            // A refused Sew to Solid's open edges are the message: drawn in
+            // its colour, not the theme's edge colour.
+            if color == SEW_GAP_COLOR {
+                solid.edge_color_base = Some(color);
+                for edge in &mut solid.edges {
+                    edge.color_override = Some(color);
+                }
+            }
             self.scene.insert_solid(solid);
             fed.push(id);
         }

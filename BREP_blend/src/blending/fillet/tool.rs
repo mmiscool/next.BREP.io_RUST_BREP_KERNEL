@@ -348,6 +348,7 @@ pub(super) fn fillet_or_chamfer(
     // onto the chart's boundary by the pcurve builder, which leaves a wrong
     // region on a body `validate()` passes; widen the carrier to hold it.
     crate::blend::fit_planar_charts_to_trims(&healed, &mut result)?;
+    crate::blend::same_parameter_trims(&healed, &mut result);
     // A blend with no corner closure after it is finished here. A cutter-first
     // composition's cutter keeps its standing scaffold tagged until the group
     // has closed its corners, which read that topology (`settle_cutter_scaffold`).
@@ -489,6 +490,7 @@ fn fillet_or_chamfer_inner(
     // crossing faces and drop the fragments in the void.
     let entry = if chamfer { "chamfer" } else { "fillet" };
     general_first.stop();
+    let general = general.map(|result| crate::blend::chart_fitted_for_gate(solid, result));
     let general_error = match general {
         Ok(result) if result.validate().is_empty() => {
             let interference = crate::blend::BlendTimer::start("timing.cutter.general_first.interference_ms");
@@ -605,7 +607,9 @@ fn fillet_or_chamfer_inner(
                             chamfer,
                             &names,
                             &|_| None,
-                        ) {
+                        )
+                        .map(|result| crate::blend::chart_fitted_for_gate(solid, result))
+                        {
                             Ok(result) if result.validate().is_empty() => Ok(result),
                             Ok(_) => Err(error),
                             Err(network_error) => {

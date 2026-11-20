@@ -1738,7 +1738,7 @@ pub(super) fn snap_curve_endpoints(
 /// 9.7 and 22.2 microns short of it on opposite sides), so this leaves several
 /// times that headroom while staying orders below a genuinely disconnected
 /// edge.
-const VENDOR_ENDPOINT_HEAL_CEILING: f64 = 1e-1;
+pub(super) const VENDOR_ENDPOINT_HEAL_CEILING: f64 = 1e-1;
 
 /// Pull an imported edge's 3D curve endpoints ONTO the topological vertices the
 /// STEP file says they meet at.
@@ -1770,8 +1770,9 @@ const VENDOR_ENDPOINT_HEAL_CEILING: f64 = 1e-1;
 /// those miss their vertices like any other spline.
 ///
 /// This is deliberately not a general snap:
-/// * degree 2 is left alone — a rational conic is an exact circle/ellipse that
-///   a control-point translation would deform;
+/// * a rational degree-2 curve is left alone — it is an exact circle/ellipse
+///   that a control-point translation would deform (a polynomial quadratic is
+///   healed like any spline);
 /// * a miss beyond [`VENDOR_ENDPOINT_HEAL_CEILING`], or past the curve's own
 ///   half-chord (which would fold the end past the middle), is real broken
 ///   geometry and is refused, so the honest import error still surfaces;
@@ -1790,7 +1791,13 @@ pub(super) fn heal_imported_edge_endpoints(
     // Opt-out for A/B bisection of a STEP-import regression against this heal
     // (the same lever `BREP_NO_PCURVE_REPAIR` gives the branch-jump repair).
     let polyline = curve.degree == 1;
-    if curve.degree == 2
+    // An exact conic is a RATIONAL quadratic; a polynomial quadratic B-spline
+    // is free-form like any other spline and misses its vertices like one
+    // (four Parasolid sheets written with quadratic B-spline edges were
+    // refused 6-11 microns short of a vertex).
+    let rational = curve.control_points.iter().any(|control| (control.w - 1.0).abs() > 1e-12);
+    let exact_conic = curve.degree == 2 && (rational || !switch!("BREP_STEP_HEAL_POLYNOMIAL_QUADRATICS", true));
+    if exact_conic
         || curve.degree == 0
         || curve.control_points.len() < curve.degree + 1
         || std::env::var("BREP_STEP_NO_ENDPOINT_HEAL").is_ok()
@@ -1822,17 +1829,40 @@ pub(super) fn heal_imported_edge_endpoints(
         control.y += delta.y * control.w;
         control.z += delta.z * control.w;
     };
+    let last = control_points.len() - 1;
+    // With three control points the start's and the end's neighbours are one
+    // pole; it takes half of each delta, which adds exactly the linear blend
+    // (1 - t) start_delta + t end_delta to a single quadratic span, instead of
+    // both deltas whole (a bulge).
+    let shared = !polyline && last == 2;
+    let neighbour_share = if shared { 0.5 } else { 1.0 };
     if heal_start {
         translate(&mut control_points[0], start_delta);
         if !polyline {
-            translate(&mut control_points[1], start_delta);
+            translate(&mut control_points[1], start_delta.scale(neighbour_share));
         }
     }
     if heal_end {
-        let last = control_points.len() - 1;
         translate(&mut control_points[last], end_delta);
         if !polyline {
-            translate(&mut control_points[last - 1], end_delta);
+            translate(&mut control_points[last - 1], end_delta.scale(neighbour_share));
+        }
+    }
+    // A heal moves the end poles; it must not turn a leg of the control
+    // polygon around (a large miss on a short curve folds it back on itself).
+    // Such a curve is left as written, for validation to judge.
+    let leg = |points: &[Vec4], i: usize| -> Option<Vec3> {
+        Some(points[i + 1].point().ok()?.sub(points[i].point().ok()?))
+    };
+    for i in [0, 1, last.saturating_sub(2), last.saturating_sub(1)] {
+        if i + 1 > last {
+            continue;
+        }
+        let (Some(before), Some(after)) = (leg(&curve.control_points, i), leg(&control_points, i)) else {
+            return Ok(curve.clone());
+        };
+        if !(after.dot(before) > 0.0) {
+            return Ok(curve.clone());
         }
     }
     NurbsCurve::new(curve.degree, curve.knots.clone(), control_points)

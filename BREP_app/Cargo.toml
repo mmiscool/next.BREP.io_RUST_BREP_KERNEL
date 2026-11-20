@@ -1,6 +1,6 @@
 [package]
 name = "BREP_app"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -63,7 +63,13 @@ automation = ["dep:brep-mcp-core", "dep:schemars", "brep_instructions/schema", "
 # agent gets what a desktop one does. On by default so the plain
 # `cargo build --release` the release lane runs ships the flag.
 mcp = ["automation", "dep:brep-mcp-core", "dep:tokio"]
-default = ["mcp", "scripting"]
+default = ["mcp", "scripting", "spacemouse"]
+# Native SpaceMouse / Spaceball input (src/spacemouse.rs) through the `hidapi`
+# crate's pure-Rust backends: Linux hidraw (`linux-native-basic-udev`, no
+# libudev or C compile) and Windows HID (`windows-native`). The dependency is
+# in the non-wasm target table, so the web build never links it; there the
+# WebHID shim (web/spacemouse.js) feeds the same Rust core.
+spacemouse = ["dep:hidapi"]
 # Scripts in the CAD app (src/scripting.rs): the Boa interpreter the PLM's
 # hooks run on, from BREP_script_core, with the CAD-side host bindings.
 # Native and wasm alike. On by default so `./build.sh app` compiles Boa for
@@ -72,16 +78,16 @@ default = ["mcp", "scripting"]
 scripting = ["dep:brep-script-core"]
 
 [dependencies]
-brep-plugins = { package = "BREP_plugins", version = "0.16.0", path = "../BREP_plugins" }
+brep-plugins = { package = "BREP_plugins", version = "0.17.0", path = "../BREP_plugins" }
 # The shared CAM model (setups, tools, operations, toolpaths) the CAM
 # workbench persists in the document's `cam` block and the dialogs edit. Pure
 # Rust, no features: the kernel adapter stays on the generation side.
 # `post-runtime`: C4's posts on the Boa interpreter, for the CAM pane's Post…
 # and cam_post (contract C19-27), in every build (the MCP host builds the app
 # without `scripting`), so posting is a Boa caller on wasm too.
-brep_cam = { package = "BREP_cam", version = "0.14.0", path = "../BREP_cam", features = ["post-runtime"] }
+brep_cam = { package = "BREP_cam", version = "0.15.0", path = "../BREP_cam", features = ["post-runtime"] }
 # The windowing-agnostic viewer brain + wgpu-29 render core we are hosting.
-brep-render = { package = "BREP_render", version = "0.23.0", path = "../BREP_render" }
+brep-render = { package = "BREP_render", version = "0.24.0", path = "../BREP_render" }
 # Manufacturing instructions: the block, the wizard, step edits and the player.
 brep_instructions = { package = "BREP_instructions", version = "0.4.0", path = "../BREP_instructions" }
 # Motion studies: the simulation block the Simulation pane edits.
@@ -161,7 +167,7 @@ image = { version = "0.25", default-features = false, features = ["png", "gif"] 
 # The electronics documents (schematic, wiring diagram, board, symbol, pads) and
 # their embeddable egui editors, moved in from eCAD as sibling crates. Their
 # manifests stand alone, like every crate here; see the profile section below.
-BREP_ecad_core = { version = "0.7.0", path = "../BREP_ecad_core" }
+BREP_ecad_core = { version = "0.7.1", path = "../BREP_ecad_core" }
 BREP_ecad_egui = { version = "0.7.0", path = "../BREP_ecad_egui" }
 # The script interpreter core shared with the PLM server (feature `scripting`).
 # It turns on Boa's wasm backend itself, so nothing about Boa is spelled here.
@@ -242,7 +248,7 @@ web-sys = { version = "0.3", features = [
 # WebMCP tools over the page's own platform (src/webmcp.rs). Declared per
 # target so the wasm build never resolves rmcp or hyper; the `mcp` feature's
 # `dep:brep-mcp-core` activates whichever entry the target has.
-brep-mcp-core = { package = "BREP_mcp_core", version = "0.11.11", path = "../BREP_mcp_core", default-features = false, optional = true }
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.11.12", path = "../BREP_mcp_core", default-features = false, optional = true }
 # The host protocol's channels (`tokio::sync` is the one tokio feature set
 # that compiles for wasm32); no runtime, no timers — the page's event loop
 # runs the tasks and `setTimeout` is the pause.
@@ -251,7 +257,7 @@ tokio = { version = "1", default-features = false, features = ["sync"], optional
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # The MCP server core (feature `mcp`): the same server `brep-mcp` hosts
 # headlessly, embedded here over the app's own automation queue.
-brep-mcp-core = { package = "BREP_mcp_core", version = "0.11.11", path = "../BREP_mcp_core", optional = true }
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.11.12", path = "../BREP_mcp_core", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net", "time"], optional = true }
 # The desktop event loop (src/desktop_loop.rs) wraps eframe's winit handler so
 # application commands dispatch without waiting for a frame. The version eframe
@@ -273,6 +279,9 @@ mp4e = "1.0.5"
 # The desktop update manifest's ed25519 signature (src/update.rs). Verify only:
 # no default features, so no RNG, PEM or key exchange in the build.
 ed25519-compact = { version = "2.4", default-features = false, features = ["std"] }
+# SpaceMouse / Spaceball HID (feature `spacemouse`; MIT). Its build script
+# panics on wasm32, which is why it lives in this table.
+hidapi = { version = "2.6", default-features = false, features = ["linux-native-basic-udev", "windows-native"], optional = true }
 
 [[bin]]
 name = "brep-app"

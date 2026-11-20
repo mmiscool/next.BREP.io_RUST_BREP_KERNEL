@@ -836,8 +836,13 @@ impl SettingsPanel {
                 }
                 let base = tree::child_guides(&[], is_last);
                 let m = gfields.len();
+                // The SpaceMouse group ends with its device row, below the fields.
+                let device_row = gname == "SpaceMouse";
                 for (fi, &f) in gfields.iter().enumerate() {
-                    changed |= self.settings_leaf(ui, f, &mut settings_json, &base, fi + 1 == m);
+                    changed |= self.settings_leaf(ui, f, &mut settings_json, &base, fi + 1 == m && !device_row);
+                }
+                if device_row {
+                    self.spacemouse_device_leaf(ui, &base);
                 }
             }
         }
@@ -909,6 +914,28 @@ impl SettingsPanel {
         });
         self.hits.insert(format!("field:{}", field.key()), rect);
         changed
+    }
+
+    /// The SpaceMouse device: its status sentence, and on the web the button
+    /// that opens the browser's device chooser (WebHID grants a device only
+    /// from a click; once granted the page reopens it on every load).
+    fn spacemouse_device_leaf(&mut self, ui: &mut egui::Ui, guides: &[bool]) {
+        let status = crate::spacemouse::status_line();
+        let mut button = egui::Rect::NOTHING;
+        let row = tree::node(ui, TreeRow::leaf(guides, true, "Device"), |ui| {
+            if cfg!(target_arch = "wasm32") {
+                let response = ui.button("Connect…").on_hover_text("Choose a SpaceMouse / Spaceball for this page");
+                if response.clicked() {
+                    crate::spacemouse::request_device();
+                }
+                button = response.rect;
+            }
+            ui.add(egui::Label::new(egui::RichText::new(&status).weak()).truncate()).on_hover_text(&status);
+        });
+        self.hits.insert("field:spacemouseDevice".into(), row.row_rect);
+        if button != egui::Rect::NOTHING {
+            self.hits.insert("field:spacemouseConnect".into(), button);
+        }
     }
 
     /// The published widget hit-rects (egui points) for the headed verifier.

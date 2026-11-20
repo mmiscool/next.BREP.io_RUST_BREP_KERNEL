@@ -7,8 +7,8 @@
 //! A selected convex edge E ends at a vertex V where one of its two mates, A,
 //! has a CUSP: A's other boundary edge B at V leaves V along E's own
 //! direction (unit tangents within [`CUSP_TANGENT`]), so A's width under E
-//! goes to zero at V, and a radius-R ball stops fitting before V. Report
-//! 6df39293 (F8): the r 0.25 round on the start face's sliver outside F2's
+//! goes to zero at V, and a radius-R ball stops fitting before V.
+//! The start-face-sliver report (F8): the r 0.25 round on the start face's sliver outside F2's
 //! r 5 round; A is the sliver (y = 10), B the r 5 arc, V is (5, 10, 20).
 //!
 //! # The law (the integrator's ruling, 2026-10-19: C1, keep the hairline)
@@ -61,11 +61,11 @@
 //! the rim to H; from H the round shares B's V-side piece with B's other
 //! face, B being split at H. The bulkhead a cap would sew is the round.
 //!
-//! # Concave edges and both ends (2026-10-21, report b46db89a)
+//! # Concave edges and both ends (2026-10-21, the concave-sliver report)
 //!
 //! The class holds for a CONCAVE edge too ([`ball_at`] reads the depth on
 //! each mate's ball side, so the sign of ρ carries it), and at both ends of
-//! one stripe, each end against its own cusp line. Report b46db89a's sliver
+//! one stripe, each end against its own cusp line. The concave-sliver report's sliver
 //! is a square corner minus a quarter disk under an r 1 concave arc: the
 //! width `5/cos θ − 5` reaches 2R only within 44.4°–45.6° of the arc, so the
 //! two tapers start 0.1 apart about its midpoint and the constant stripe
@@ -272,7 +272,7 @@ pub(in crate::blend) struct TaperEnd {
 /// (edge, parameter at the near end, parameter at the far end).
 ///
 /// The width plane crosses B only while B lasts. Where A's boundary turns
-/// (report 80c5d9d1, 2026-10-24: F10's r 1 on the start face's straight
+/// (the straight-sliver report, 2026-10-24: F10's r 1 on the start face's straight
 /// edge after F9's r 0.3 tapered round, whose taper rail is B and spans only
 /// the 0.27-wide end of the sliver), the width reaches 2R on a LATER edge of
 /// A's boundary, F9's constant rail; read on B alone it ran out, the end was
@@ -347,7 +347,7 @@ fn width_at(
     };
     let start = side(first, first_near)?;
     // A plane through B's far END crosses it there, whatever the last bit of
-    // the sign reads (report b46db89a: the sliver's two cusp lines meet at the
+    // the sign reads (the concave-sliver report: the sliver's two cusp lines meet at the
     // square's corner, which the plane at the arc's midpoint passes through).
     let end_bar = 1e-9 * (1.0 + start.abs());
     for &(boundary, b_near, b_far) in chain {
@@ -1020,7 +1020,7 @@ pub(in crate::blend) fn sew_taper_ends(
         coedges.push(CoedgeRecord { id: take_id(), edge_id: pole_id, forward: true, pcurve: line((1.0, v_out), (1.0, v_in))? });
         // Orientation: outward is away from the ball centre on a convex edge
         // and towards it on a concave one, where the ball rolls in the air
-        // (report b46db89a: both tapers read inward, and the body lost 101
+        // (the concave-sliver report: both tapers read inward, and the body lost 101
         // of volume where its round adds 1.2).
         let surface_point = taper.surface.evaluate(0.5, 0.5).or_refuse(KernelStage::Refine, "evaluate")?;
         let away = surface_point.sub(taper.center.evaluate(0.5).or_refuse(KernelStage::Refine, "evaluate")?);

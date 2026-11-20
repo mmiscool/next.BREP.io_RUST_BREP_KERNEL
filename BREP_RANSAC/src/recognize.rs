@@ -2057,7 +2057,7 @@ fn classical_hypothesis(
 
 /// Relative cost of one generic hypothesis per kind, in units of a plane
 /// hypothesis, in [`TYPES`] order. The sample fit dominates a losing
-/// hypothesis, and on brep-vm2 (release, 2026-10-27, the jitter-1.0 d0.02
+/// hypothesis, and in a release build (2026-10-27, the jitter-1.0 d0.02
 /// torus and the jitter-0.3 d0.02 crossing fixtures) it measured 0.01 ms for
 /// a plane, 0.05 sphere, 0.13 cylinder, 0.27 cone and 9.2 torus. The bandit
 /// divides a kind's reward by this instead of reading the clock, so a run

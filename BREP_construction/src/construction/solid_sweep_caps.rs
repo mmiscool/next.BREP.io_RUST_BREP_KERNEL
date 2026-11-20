@@ -810,7 +810,17 @@ pub fn piece_point(piece: &OutlinePiece, s: f64) -> [f64; 2] {
             let angle = start + (end - start) * s;
             [centre[0] + radius * angle.cos(), centre[1] + radius * angle.sin()]
         }
+        OutlinePiece::Ellipse { centre, semi, rotation, start, end } => crate::solid_sweep::ellipse_point(centre, semi, rotation, start + (end - start) * s),
     }
+}
+
+/// The whole sweep takes meridians of lines and circular arcs; an elliptic
+/// piece is swept only by [`crate::sweep_solid_within`]'s region engine.
+fn refuse_elliptic(meridian: &[OutlinePiece]) -> Result<(), KernelRefusal> {
+    if meridian.iter().any(|piece| matches!(piece, OutlinePiece::Ellipse { .. })) {
+        return Err(refuse("revolved_ellipse", "a meridian with an elliptic piece is not swept whole here".into()));
+    }
+    Ok(())
 }
 
 fn split_revolved(
@@ -823,6 +833,7 @@ fn split_revolved(
     let w = axis.normalized().map_err(|_| input("axis", "the tool's axis has no direction".into()))?;
     let u1 = radial.sub(w.scale(radial.dot(w))).normalized().map_err(|_| input("radial", "the radial direction lies along the axis".into()))?;
     let u2 = w.cross(u1);
+    refuse_elliptic(meridian)?;
     if let [OutlinePiece::Arc { centre, radius, start, end }] = meridian {
         if ((end - start).abs() - TAU).abs() < 1e-12 && centre[0] > *radius {
             return split_torus(screw, origin, w, u1, u2, *centre, *radius, meridian);
@@ -855,6 +866,7 @@ fn split_revolved(
             .map(|piece| match *piece {
                 OutlinePiece::Line { from, to } => OutlinePiece::Line { from: to, to: from },
                 OutlinePiece::Arc { centre, radius, start, end } => OutlinePiece::Arc { centre, radius, start: end, end: start },
+                OutlinePiece::Ellipse { centre, semi, rotation, start, end } => OutlinePiece::Ellipse { centre, semi, rotation, start: end, end: start },
             })
             .collect();
         &reversed_meridian
@@ -927,6 +939,7 @@ fn split_revolved(
     for &i in &faces {
         let piece = &meridian[i];
         match *piece {
+            OutlinePiece::Ellipse { .. } => return Err(refuse("revolved_ellipse", "a meridian with an elliptic piece is not swept whole here".into())),
             OutlinePiece::Line { .. } => {
                 let roots = |s: f64| -> Vec<f64> {
                     let (a, b, c) = harmonic(|psi| g(piece, s, psi));
@@ -1786,6 +1799,177 @@ fn split_revolved(
     })
 }
 
+/// `BREP_SWEEP_RING_WINDING` (default off): a ring whose grazing curves wind
+/// round its tube as they go once round the ring is split along their
+/// continuous unwrapping, in six pieces, instead of refused.
+fn ring_winding_on() -> bool {
+    crate::switch!("BREP_SWEEP_RING_WINDING", false)
+}
+
+/// A ring split by grazing curves that wind round its tube: the curves' angle
+/// v on the tube, unwrapped continuously along ψ, gains a whole number of
+/// turns going once round the ring. None where it gains none (the two-halves
+/// split serves). Six pieces along ψ keep each band's stretch of v short of a
+/// whole turn while the curves turn, and leave the tumble's eight trial seams
+/// (π/4 apart) four distinct placements.
+#[allow(clippy::too_many_arguments)]
+fn split_torus_wound(
+    screw: &Screw,
+    origin: Vec3,
+    w: Vec3,
+    u1: Vec3,
+    u2: Vec3,
+    centre: [f64; 2],
+    radius: f64,
+    meridian: &[OutlinePiece],
+) -> Result<Option<Split>, KernelRefusal> {
+    const PIECES: usize = 6;
+    let (rho_c, z_c) = (centre[0], centre[1]);
+    let radial = |psi: f64| u1.scale(psi.cos()).add(u2.scale(psi.sin()));
+    let tube_centre = |psi: f64| origin.add(w.scale(z_c)).add(radial(psi).scale(rho_c));
+    let point = |psi: f64, v: f64| tube_centre(psi).add(radial(psi).scale(radius * v.cos())).add(w.scale(radius * v.sin()));
+    let g = |psi: f64, v: f64| screw.velocity(point(psi, v)).dot(radial(psi).scale(v.cos()).add(w.scale(v.sin())));
+    let n = screw.loop_samples;
+    let total = PIECES * n;
+    // (ψ, lower, upper) round the whole ring, each base angle the one nearest
+    // the last.
+    let mut round: Vec<(f64, f64, f64)> = Vec::with_capacity(total + 1);
+    let mut near = {
+        let (a, b, _) = harmonic(|v| g(0.0, v));
+        b.atan2(a)
+    };
+    for i in 0..=total {
+        let psi = TAU * i as f64 / total as f64;
+        let (a, b, c) = harmonic(|v| g(psi, v));
+        let r = a.hypot(b);
+        if !(c.abs() < r * (1.0 - 1e-9)) {
+            return Err(refuse("ring_grazing", "the ring's grazing curves do not run all the way round it".into()));
+        }
+        let base = near + (b.atan2(a) - near + PI).rem_euclid(TAU) - PI;
+        if i > 0 && (base - near).abs() > 0.5 {
+            return Err(refuse("ring_grazing", "the ring's grazing curves turn too fast".into()));
+        }
+        near = base;
+        let spread = (-c / r).acos();
+        round.push((psi, base - spread, base + spread));
+    }
+    if ((round[total].1 - round[0].1) / TAU).round() == 0.0 {
+        return Ok(None);
+    }
+    let samples: Vec<Vec<(f64, f64, f64)>> = (0..PIECES).map(|k| round[k * n..=(k + 1) * n].to_vec()).collect();
+    let seam_psi = |k: usize| TAU * k as f64 / PIECES as f64;
+    let params: Vec<f64> = (0..=n).map(|i| i as f64 / n as f64).collect();
+    let mut points: Vec<Vec3> = Vec::new();
+    let mut curves: Vec<ToolCurve> = Vec::new();
+    // Points: at each seam, on each branch (the last piece ends on seam 0,
+    // a whole number of turns round the tube on).
+    let mut corner: HashMap<(usize, usize), usize> = HashMap::new(); // (seam, branch)
+    for (seam, piece) in samples.iter().enumerate() {
+        let (psi, lower, upper) = piece[0];
+        for (branch, v) in [(0, lower), (1, upper)] {
+            points.push(point(psi, v));
+            corner.insert((seam, branch), points.len() - 1);
+        }
+    }
+    let mut branch_curve: HashMap<(usize, usize), usize> = HashMap::new(); // (piece, branch)
+    for (piece, list) in samples.iter().enumerate() {
+        for branch in 0..2 {
+            let mut xyz: Vec<Vec3> = list.iter().map(|&(psi, lo, hi)| point(psi, if branch == 0 { lo } else { hi })).collect();
+            let (start, end) = (corner[&(piece, branch)], corner[&((piece + 1) % PIECES, branch)]);
+            xyz[0] = points[start];
+            xyz[n] = points[end];
+            curves.push(ToolCurve { curve: frag(crate::interpolate_curve(&xyz, 5, &params), "ring_branch")?, start, end, degenerate: false, samples: Some(xyz.clone()) });
+            branch_curve.insert((piece, branch), curves.len() - 1);
+        }
+    }
+    let tube_arc = |psi: f64, v0: f64, v1: f64| -> Result<NurbsCurve, KernelRefusal> {
+        let start = point(psi, v0);
+        let axis = radial(psi).cross(w);
+        let surface = frag(make_revolution(tube_centre(psi), axis, &frag(make_line(start, start.add(axis)), "line")?, v1 - v0), "tube_arc")?;
+        frag(surface.iso_curve_v(0.0), "tube_arc")
+    };
+    // Seam arcs of each band: band 0 (front) from lower to upper, band 1
+    // (back) from upper to lower + 2π.
+    let mut seam_arc: HashMap<(usize, usize), usize> = HashMap::new(); // (seam, band)
+    for seam in 0..PIECES {
+        let (psi, lower, upper) = samples[seam][0];
+        let (lo_point, hi_point) = (corner[&(seam, 0)], corner[&(seam, 1)]);
+        curves.push(ToolCurve { curve: tube_arc(psi, lower, upper)?, start: lo_point, end: hi_point, degenerate: false, samples: None });
+        seam_arc.insert((seam, 0), curves.len() - 1);
+        curves.push(ToolCurve { curve: tube_arc(psi, upper, lower + TAU)?, start: hi_point, end: lo_point, degenerate: false, samples: None });
+        seam_arc.insert((seam, 1), curves.len() - 1);
+    }
+    let mut caps = Vec::new();
+    for piece in 0..PIECES {
+        let (psi_a, psi_b) = (seam_psi(piece), seam_psi(piece + 1));
+        for band in 0..2 {
+            let (lo_branch, hi_branch, hi_turn) = if band == 0 { (0usize, 1usize, 0.0) } else { (1, 0, TAU) };
+            let pick = |s: &(f64, f64, f64), b: usize| if b == 0 { s.1 } else { s.2 };
+            // As in the two-halves split: a margin each side for end trims.
+            let low = samples[piece].iter().map(|s| pick(s, lo_branch)).fold(f64::INFINITY, f64::min);
+            let high = samples[piece].iter().map(|s| pick(s, hi_branch) + hi_turn).fold(f64::NEG_INFINITY, f64::max);
+            let margin = (0.25 * (TAU - (high - low))).clamp(1e-3, 0.25);
+            let (v_low, v_high) = (low - margin, high + margin);
+            let theta_v = v_high - v_low;
+            if theta_v >= TAU {
+                return Err(refuse("ring_grazing", "a band of the ring wraps all the way round its tube".into()));
+            }
+            let generatrix = tube_arc(psi_a, v_low, v_high)?;
+            let surface = frag(make_revolution(origin, w, &generatrix, psi_b - psi_a), "ring_band")?;
+            let spans_u = (surface.knots_u.len() - 6) / 2 + 1;
+            let spans_v = (generatrix.knots.len() - 6) / 2 + 1;
+            let uv_of = |psi: f64, v: f64| {
+                Vec3::new(
+                    crate::circle_angle_to_parameter(spans_u, psi_b - psi_a, psi - psi_a),
+                    crate::circle_angle_to_parameter(spans_v, theta_v, v - v_low),
+                    0.0,
+                )
+            };
+            let angles_of = |x: Vec3| -> (f64, f64) {
+                let r = x.sub(origin);
+                let psi = r.dot(u2).atan2(r.dot(u1));
+                let psi = 0.5 * (psi_a + psi_b) + (psi - 0.5 * (psi_a + psi_b) + PI).rem_euclid(TAU) - PI;
+                let q = x.sub(tube_centre(psi));
+                let v = q.dot(w).atan2(q.dot(radial(psi)));
+                let mid = 0.5 * (v_low + v_high);
+                (psi, mid + (v - mid + PI).rem_euclid(TAU) - PI)
+            };
+            let inverse_pcurve = |curve: &NurbsCurve| -> Result<NurbsCurve, KernelRefusal> {
+                let [d0, d1] = frag(curve.domain(), "domain")?;
+                let ts: Vec<f64> = (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect();
+                let mut uv = Vec::with_capacity(ts.len());
+                for &t in &ts {
+                    let (psi, v) = angles_of(frag(curve.evaluate(t), "point")?);
+                    uv.push(uv_of(psi, v));
+                }
+                frag(crate::interpolate_curve(&uv, 5, &ts), "ring_pcurve")
+            };
+            let lower_edge = branch_curve[&(piece, lo_branch)];
+            let upper_edge = branch_curve[&(piece, hi_branch)];
+            let right = seam_arc[&((piece + 1) % PIECES, band)];
+            let left = seam_arc[&(piece, band)];
+            let coedges = vec![
+                (lower_edge, true, inverse_pcurve(&curves[lower_edge].curve)?),
+                (right, true, inverse_pcurve(&curves[right].curve)?),
+                (upper_edge, false, frag(inverse_pcurve(&curves[upper_edge].curve)?.reversed(), "reversed")?),
+                (left, false, frag(inverse_pcurve(&curves[left].curve)?.reversed(), "reversed")?),
+            ];
+            let mid = &samples[piece][n / 2];
+            let front = g(mid.0, 0.5 * (pick(mid, lo_branch) + pick(mid, hi_branch) + hi_turn)) > 0.0;
+            caps.push(Cap { surface, front, coedges, chart: Some(Chart::Revolution { origin, w, u1, u2, alpha: psi_a, theta: psi_b - psi_a, spans_u, meridian: MeridianChart::Arc { centre: [rho_c, z_c], start: v_low, sweep: theta_v, spans: spans_v } }) });
+        }
+    }
+    Ok(Some(Split {
+        points,
+        curves,
+        caps,
+        slides: Vec::new(),
+        slide_sides: Vec::new(),
+        scale: rho_c + radius,
+        shape: Shape::Revolved { origin, axis: w, meridian: meridian.to_vec() },
+    }))
+}
+
 /// A ring (torus: the circle of `radius` about `centre` in (ρ, z), off the
 /// axis), split by its two grazing curves. For each angle ψ about the ring's
 /// axis the grazing value along the tube's circle is A cos v + B sin v + C, so
@@ -1803,6 +1987,11 @@ fn split_torus(
     radius: f64,
     meridian: &[OutlinePiece],
 ) -> Result<Split, KernelRefusal> {
+    if ring_winding_on() {
+        if let Some(split) = split_torus_wound(screw, origin, w, u1, u2, centre, radius, meridian)? {
+            return Ok(split);
+        }
+    }
     let (rho_c, z_c) = (centre[0], centre[1]);
     let radial = |psi: f64| u1.scale(psi.cos()).add(u2.scale(psi.sin()));
     let tube_centre = |psi: f64| origin.add(w.scale(z_c)).add(radial(psi).scale(rho_c));
@@ -2055,12 +2244,26 @@ pub fn sweep_solid(tool: &SolidTool, motion: &SolidMotion) -> Result<BrepSolid, 
 
 fn sweep_with(screw: &Screw, tool: &SolidTool) -> Result<BrepSolid, KernelRefusal> {
     let screw = *screw;
+    if let SolidTool::Revolved { meridian, .. } = tool {
+        refuse_elliptic(meridian)?;
+    }
     if let SolidTool::Revolved { axis_origin, axis_direction, meridian, .. } = tool {
         if let Some(body) = ball_across_axis(&screw, *axis_origin, *axis_direction, meridian)? {
             return Ok(body);
         }
     }
     if let SolidTool::Revolved { axis_origin, axis_direction, radial, meridian } = tool {
+        if ring_fold::ring_fold_on() {
+            if let [OutlinePiece::Arc { centre, radius, start, end }] = meridian.as_slice() {
+                if ((end - start).abs() - TAU).abs() < 1e-12 {
+                    let w = axis_direction.normalized().map_err(|_| input("axis", "the tool's axis has no direction".into()))?;
+                    let u1 = radial.sub(w.scale(radial.dot(w))).normalized().map_err(|_| input("radial", "the radial direction lies along the axis".into()))?;
+                    if let Some(body) = ring_fold::ring_slid_past_fold(&screw, *axis_origin, w, u1, w.cross(u1), *centre, *radius)? {
+                        return Ok(body);
+                    }
+                }
+            }
+        }
         if let Some(body) = flat_ring(&screw, *axis_origin, *axis_direction, *radial, meridian)? {
             return Ok(body);
         }
@@ -3536,20 +3739,206 @@ pub fn prism_region_sweep(
             }
         }
     };
+    let count = paths.len();
+    region_from_paths(
+        count,
+        &|index: usize, t: f64| eval(paths[index], t),
+        &|index: usize| matches!(paths[index], Path::End(..)),
+        &|_: usize| closed,
+        &junctions,
+        &depth,
+        scale,
+        (base, e1, e2, up),
+        (from, to),
+    )
+}
+
+/// Everything a tube (the ball of `radius` swept along the curve
+/// `centreline(s)`, s ∈ [0, 1], its ends included) passes through as it slides
+/// by `slide`, inside the slab `slab[0] ≤ (x − slab_origin)·n ≤ slab[1]` (`n` =
+/// `slab_normal` normalised), which the tube must cross wholly: before the
+/// slab at the start, past it at the end (checked at 8001 points of the
+/// centreline, with a margin of the longest step between them). The
+/// returned prism along the slide agrees with the sweep inside the slab; the
+/// caller cuts a workpiece that lies within it.
+///
+/// The centreline must be resolved by its samples (as every path of the plane
+/// region arrangement is): smooth, its height changing between two of the
+/// 8001 checking samples by no more than the step between them, so that the
+/// samples bound it. A curve that wanders between samples is outside this
+/// contract.
+///
+/// Why a prism: a point x of the slab is in the sweep iff the line through x
+/// along the slide meets the tube. If it does, `n·` grows along the line, so
+/// its topmost point y of the starting tube lies before x, and y + slide (a
+/// point of the final tube) past it: x − y is a multiple of the slide in
+/// [0, 1). So the sweep in the slab is the slab's part of the prism over the
+/// tube's shadow along the slide: in the plane square to it the union of the
+/// discs of `radius` about the shadow γ of the centreline. That region is
+/// bounded by γ's two offset curves (each disc's grazing points, γ ± radius
+/// along its normal) and the end discs' circles, built exactly by the plane
+/// region arrangement of [`sweep_prism_along`].
+pub fn sweep_tube_slid_across(
+    centreline: &dyn Fn(f64) -> Vec3,
+    radius: f64,
+    slide: Vec3,
+    slab_origin: Vec3,
+    slab_normal: Vec3,
+    slab: [f64; 2],
+) -> Result<BrepSolid, KernelRefusal> {
+    if !(radius.is_finite() && radius > 0.0) {
+        return Err(input("tube_radius", "the tube's radius must be positive".into()));
+    }
+    let up = slide.normalized().map_err(|_| input("slide", "the slide has no length".into()))?;
+    let normal = slab_normal.normalized().map_err(|_| input("slab", "the slab's normal has no direction".into()))?;
+    if !(slab[1] > slab[0]) || up.dot(normal).abs() < 1e-9 {
+        return Err(input("slab", "the slab must have thickness and the slide must cross it".into()));
+    }
+    // Orient so the slide runs up the slab's normal.
+    let (normal, slab) = if up.dot(normal) > 0.0 { (normal, slab) } else { (normal.scale(-1.0), [-slab[1], -slab[0]]) };
+    let points: Vec<Vec3> = (0..=8000).map(|k| centreline(k as f64 / 8000.0)).collect();
+    if points.iter().any(|p| !(p.x.is_finite() && p.y.is_finite() && p.z.is_finite())) {
+        return Err(input("centreline", "the centreline has a point that is not finite".into()));
+    }
+    let step = points.windows(2).map(|w| w[1].sub(w[0]).length()).fold(0.0f64, f64::max);
+    let heights: Vec<f64> = points.iter().map(|q| q.sub(slab_origin).dot(normal)).collect();
+    let (low, high) = heights.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &h| (a.min(h), b.max(h)));
+    let rise = slide.dot(normal);
+    if !(high + radius + step < slab[0] && low - radius - step + rise > slab[1]) {
+        return Err(refuse("tube_slab", "the tube does not pass wholly through the slab (it starts or ends within reach of it)".into()));
+    }
+    let e1 = {
+        let seed = if up.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
+        seed.sub(up.scale(seed.dot(up))).normalized().map_err(|_| input("slide", "no frame".into()))?
+    };
+    let e2 = up.cross(e1);
+    // The plane's origin on the centreline itself, so that every tolerance
+    // reads the tube's own size, wherever it lies.
+    let base = points[0];
+    let flat = |p: Vec3| [p.sub(base).dot(e1), p.sub(base).dot(e2)];
+    let centre = |s: f64| -> [f64; 2] { flat(centreline(s)) };
+    let velocity = |s: f64| -> [f64; 2] {
+        let h = 1e-7;
+        let (a, b) = ((s - h).max(0.0), (s + h).min(1.0));
+        let (p, q) = (centre(a), centre(b));
+        [(q[0] - p[0]) / (b - a), (q[1] - p[1]) / (b - a)]
+    };
+    // The shadow must keep moving (a disc standing still has no grazing points).
+    for k in 0..=2000 {
+        let w = velocity(k as f64 / 2000.0);
+        if w[0].hypot(w[1]) < 1e-9 * (1.0 + radius) {
+            return Err(refuse("tube_shadow", "the tube's shadow along the slide stops (its centreline runs along the slide)".into()));
+        }
+    }
+    // Tolerances read the tube's radius (a probe beside a boundary must stay
+    // within the tube), never more than its extent; a tube longer than 1e6
+    // radii is beyond what the coordinates resolve at that size.
+    let extent = (0..=64).map(|k| { let c = centre(k as f64 / 64.0); c[0].hypot(c[1]) }).fold(radius, f64::max);
+    if extent > 1e6 * radius {
+        return Err(refuse("tube_shadow", "the tube is too long for its radius (over a million radii)".into()));
+    }
+    let scale = extent.min(1e3 * radius);
+    // Paths: the two offset curves, then the two end circles.
+    let eval = |index: usize, t: f64| -> [f64; 2] {
+        match index {
+            0 | 1 => {
+                let c = centre(t);
+                let w = velocity(t);
+                let length = w[0].hypot(w[1]);
+                let side = if index == 0 { 1.0 } else { -1.0 };
+                [c[0] - side * radius * w[1] / length, c[1] + side * radius * w[0] / length]
+            }
+            _ => {
+                let c = centre(if index == 2 { 0.0 } else { 1.0 });
+                let angle = TAU * t;
+                [c[0] + radius * angle.cos(), c[1] + radius * angle.sin()]
+            }
+        }
+    };
+    // Inside: nearer than `radius` to the shadow at some time.
+    let depth = |p: [f64; 2]| -> f64 {
+        let samples = 4000;
+        let f = |s: f64| { let c = centre(s); (p[0] - c[0]).hypot(p[1] - c[1]) - radius };
+        let values: Vec<f64> = (0..=samples).map(|k| f(k as f64 / samples as f64)).collect();
+        let mut least = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        for k in 0..=samples {
+            let left = if k == 0 { f64::INFINITY } else { values[k - 1] };
+            let right = if k == samples { f64::INFINITY } else { values[k + 1] };
+            if values[k] <= left && values[k] <= right && values[k] < least + 1e-3 * scale {
+                let (mut lo, mut hi) = (((k as f64) - 1.0).max(0.0) / samples as f64, ((k as f64) + 1.0).min(samples as f64) / samples as f64);
+                for _ in 0..80 {
+                    let (m1, m2) = (lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0);
+                    if f(m1) < f(m2) { hi = m2 } else { lo = m1 }
+                }
+                least = least.min(f(0.5 * (lo + hi)));
+            }
+        }
+        least
+    };
+    // The prism spans the slab's crossing of every line through the region:
+    // from below the starting tube to past the final one, along the slide.
+    let (a0, a1) = points.iter().map(|q| q.sub(base).dot(up)).fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), h| (a.min(h), b.max(h)));
+    let margin = radius + step + 1e-3 * scale;
+    // Each offset curve ends on its end circle, tangent to it there (both run
+    // along the velocity), which no crossing test finds: split the circles at
+    // those points (the angles of ±the normal there).
+    let mut touches: Vec<(usize, f64)> = Vec::new();
+    for (circle, s) in [(2usize, 0.0f64), (3, 1.0)] {
+        let w = velocity(s);
+        for side in [1.0f64, -1.0] {
+            let angle = (side * w[0]).atan2(-side * w[1]);
+            touches.push((circle, angle.rem_euclid(TAU) / TAU));
+        }
+    }
+    region_from_paths(
+        4,
+        &eval,
+        &|_| false,
+        &|index| index >= 2,
+        &touches,
+        &depth,
+        scale,
+        (base, e1, e2, up),
+        (a0 - margin, a1 + slide.length() + margin),
+    )
+}
+
+/// The plane region bounded by pieces of the candidate `count` paths (each
+/// `eval(index, t)`, t ∈ [0, 1]), extruded along `up` from `heights.0` to
+/// `heights.1`: the paths are split where they cross each other or
+/// themselves (and at `extra_cuts`), a piece is kept where `depth` (negative
+/// inside the region) reads one side covered and the other not, and the kept
+/// pieces chain into one outer loop and its holes. `straight_path(index)`: the
+/// path is a segment (built as a line); `closed_path(index)`: its two ends
+/// meet (neighbours for the self-crossing test).
+#[allow(clippy::too_many_arguments)]
+fn region_from_paths(
+    count: usize,
+    eval: &dyn Fn(usize, f64) -> [f64; 2],
+    straight_path: &dyn Fn(usize) -> bool,
+    closed_path: &dyn Fn(usize) -> bool,
+    extra_cuts: &[(usize, f64)],
+    depth: &dyn Fn([f64; 2]) -> f64,
+    scale: f64,
+    frame: (Vec3, Vec3, Vec3, Vec3),
+    heights: (f64, f64),
+) -> Result<BrepSolid, KernelRefusal> {
+    let (base, e1, e2, up) = frame;
+    let (from, to) = heights;
     // Split parameters: mutual crossings (polyline, then Newton), and each
     // path's ends lying on another.
     let m = 400;
-    let polylines: Vec<Vec<[f64; 2]>> = paths.iter().map(|&p| (0..=m).map(|i| eval(p, i as f64 / m as f64)).collect()).collect();
-    let mut cuts: Vec<Vec<f64>> = vec![vec![0.0, 1.0]; paths.len()];
+    let polylines: Vec<Vec<[f64; 2]>> = (0..count).map(|p| (0..=m).map(|i| eval(p, i as f64 / m as f64)).collect()).collect();
+    let mut cuts: Vec<Vec<f64>> = vec![vec![0.0, 1.0]; count];
     let tol = 1e-10 * scale;
-    for a in 0..paths.len() {
-        for b in a..paths.len() {
+    for a in 0..count {
+        for b in a..count {
             for i in 0..m {
                 for j in 0..m {
                     // A path against itself: only where it crosses over
                     // (stretches apart along it; a closed path's ends are
                     // neighbours too).
-                    if a == b && (j < i + 3 || (closed && i < 3 && j + 3 > m)) {
+                    if a == b && (j < i + 3 || (closed_path(a) && i < 3 && j + 3 > m)) {
                         continue;
                     }
                     let (p0, p1, q0, q1) = (polylines[a][i], polylines[a][i + 1], polylines[b][j], polylines[b][j + 1]);
@@ -3567,10 +3956,10 @@ pub fn prism_region_sweep(
                     // Newton on the exact paths.
                     let (mut ta, mut tb) = ((i as f64 + x) / m as f64, (j as f64 + y) / m as f64);
                     for _ in 0..50 {
-                        let (pa, pb) = (eval(paths[a], ta), eval(paths[b], tb));
+                        let (pa, pb) = (eval(a, ta), eval(b, tb));
                         let h = 1e-7;
-                        let da = { let q = eval(paths[a], (ta + h).min(1.0)); let p = eval(paths[a], (ta - h).max(0.0)); let w = (ta + h).min(1.0) - (ta - h).max(0.0); [(q[0] - p[0]) / w, (q[1] - p[1]) / w] };
-                        let db = { let q = eval(paths[b], (tb + h).min(1.0)); let p = eval(paths[b], (tb - h).max(0.0)); let w = (tb + h).min(1.0) - (tb - h).max(0.0); [(q[0] - p[0]) / w, (q[1] - p[1]) / w] };
+                        let da = { let q = eval(a, (ta + h).min(1.0)); let p = eval(a, (ta - h).max(0.0)); let w = (ta + h).min(1.0) - (ta - h).max(0.0); [(q[0] - p[0]) / w, (q[1] - p[1]) / w] };
+                        let db = { let q = eval(b, (tb + h).min(1.0)); let p = eval(b, (tb - h).max(0.0)); let w = (tb + h).min(1.0) - (tb - h).max(0.0); [(q[0] - p[0]) / w, (q[1] - p[1]) / w] };
                         let f = [pa[0] - pb[0], pa[1] - pb[1]];
                         let det = -da[0] * db[1] + da[1] * db[0];
                         if det.abs() < 1e-300 {
@@ -3584,7 +3973,7 @@ pub fn prism_region_sweep(
                             break;
                         }
                     }
-                    let (pa, pb) = (eval(paths[a], ta), eval(paths[b], tb));
+                    let (pa, pb) = (eval(a, ta), eval(b, tb));
                     if (pa[0] - pb[0]).hypot(pa[1] - pb[1]) < tol && !(a == b && (ta - tb).abs() < 1.0 / m as f64) {
                         cuts[a].push(ta);
                         cuts[b].push(tb);
@@ -3593,9 +3982,9 @@ pub fn prism_region_sweep(
             }
         }
     }
-    // A corner's path is its own time: split it where a grazing point passes it.
-    for &(corner, s) in &junctions {
-        cuts[corner].push(s);
+    // Extra splits the caller names (a corner's path where a grazing point passes it).
+    for &(path, t) in extra_cuts {
+        cuts[path].push(t);
     }
     for c in &mut cuts {
         c.sort_by(|x, y| x.total_cmp(y));
@@ -3615,12 +4004,12 @@ pub fn prism_region_sweep(
             if t1 - t0 < 1e-9 {
                 continue;
             }
-            let (pa, pb) = (eval(paths[index], t0), eval(paths[index], t1));
+            let (pa, pb) = (eval(index, t0), eval(index, t1));
             if (pa[0] - pb[0]).hypot(pa[1] - pb[1]) < 1e-9 * scale {
                 continue;
             }
             let tm = 0.5 * (t0 + t1);
-            let (p, q) = (eval(paths[index], tm), eval(paths[index], (tm + 1e-6).min(1.0)));
+            let (p, q) = (eval(index, tm), eval(index, (tm + 1e-6).min(1.0)));
             let d = [q[0] - p[0], q[1] - p[1]];
             let length = d[0].hypot(d[1]);
             if length == 0.0 {
@@ -3648,19 +4037,19 @@ pub fn prism_region_sweep(
         used[first] = true;
         loop {
             let last = &pieces[*order.last().expect("order")];
-            let end = eval(paths[last.path], last.t1);
-            let start = eval(paths[pieces[order[0]].path], pieces[order[0]].t0);
+            let end = eval(last.path, last.t1);
+            let start = eval(pieces[order[0]].path, pieces[order[0]].t0);
             if (end[0] - start[0]).hypot(end[1] - start[1]) < 1e-8 * scale {
                 break;
             }
             let next = (0..pieces.len()).filter(|&k| !used[k]).min_by(|&x, &y| {
-                let (px, py) = (eval(paths[pieces[x].path], pieces[x].t0), eval(paths[pieces[y].path], pieces[y].t0));
+                let (px, py) = (eval(pieces[x].path, pieces[x].t0), eval(pieces[y].path, pieces[y].t0));
                 (px[0] - end[0]).hypot(px[1] - end[1]).total_cmp(&(py[0] - end[0]).hypot(py[1] - end[1]))
             });
             let Some(next) = next else {
                 return Err(refuse("prism_along", "the boundary does not close".into()));
             };
-            let p = eval(paths[pieces[next].path], pieces[next].t0);
+            let p = eval(pieces[next].path, pieces[next].t0);
             if (p[0] - end[0]).hypot(p[1] - end[1]) > 1e-8 * scale {
                 return Err(refuse("prism_along", format!("the boundary does not close (gap {:e})", (p[0] - end[0]).hypot(p[1] - end[1]))));
             }
@@ -3675,7 +4064,7 @@ pub fn prism_region_sweep(
         for &k in order {
             let piece = &pieces[k];
             for i in 0..32 {
-                points.push(eval(paths[piece.path], piece.t0 + (piece.t1 - piece.t0) * i as f64 / 32.0));
+                points.push(eval(piece.path, piece.t0 + (piece.t1 - piece.t0) * i as f64 / 32.0));
             }
         }
         (0..points.len()).map(|i| { let (a, b) = (points[i], points[(i + 1) % points.len()]); a[0] * b[1] - b[0] * a[1] }).sum::<f64>() * 0.5
@@ -3693,7 +4082,7 @@ pub fn prism_region_sweep(
     let mut bottom_loops = Vec::with_capacity(loops.len());
     let mut extent: Vec<[f64; 2]> = Vec::new();
     for order in &loops {
-        let mut loop_points: Vec<[f64; 2]> = order.iter().map(|&k| eval(paths[pieces[k].path], pieces[k].t0)).collect();
+        let mut loop_points: Vec<[f64; 2]> = order.iter().map(|&k| eval(pieces[k].path, pieces[k].t0)).collect();
         loop_points.push(loop_points[0]);
         let count = order.len();
         let (bottom_v, top_v): (Vec<u64>, Vec<u64>) = (0..count).map(|k| (shell.vertex(world(loop_points[k], from)), shell.vertex(world(loop_points[k], to)))).unzip();
@@ -3702,10 +4091,10 @@ pub fn prism_region_sweep(
         let mut curves2d = Vec::with_capacity(count);
         for (slot, &k) in order.iter().enumerate() {
             let piece = &pieces[k];
-            let straight = matches!(paths[piece.path], Path::End(..));
+            let straight = straight_path(piece.path);
             let next = (slot + 1) % count;
             for i in 0..=16 {
-                extent.push(eval(paths[piece.path], piece.t0 + (piece.t1 - piece.t0) * i as f64 / 16.0));
+                extent.push(eval(piece.path, piece.t0 + (piece.t1 - piece.t0) * i as f64 / 16.0));
             }
             let curve_at = |h: f64| -> Result<NurbsCurve, KernelRefusal> {
                 if straight {
@@ -3713,7 +4102,7 @@ pub fn prism_region_sweep(
                 }
                 let samples = 192;
                 let ts: Vec<f64> = (0..=samples).map(|i| i as f64 / samples as f64).collect();
-                let mut points: Vec<Vec3> = ts.iter().map(|&t| world(eval(paths[piece.path], piece.t0 + (piece.t1 - piece.t0) * t), h)).collect();
+                let mut points: Vec<Vec3> = ts.iter().map(|&t| world(eval(piece.path, piece.t0 + (piece.t1 - piece.t0) * t), h)).collect();
                 points[0] = world(loop_points[slot], h);
                 points[samples] = world(loop_points[next], h);
                 frag(crate::interpolate_curve(&points, 5, &ts), "plane_path")
@@ -3875,6 +4264,35 @@ pub struct TwoTurns {
 /// spans each passing once, and the spans' sweeps are joined (consecutive
 /// spans meet along a grazing loop; distant ones overlap).
 pub fn sweep_solid_tumbled(tool: &SolidTool, motion: &TwoTurns) -> Result<BrepSolid, KernelRefusal> {
+    let lofted = sweep_solid_tumbled_lofted(tool, motion);
+    // A ring (a whole circle off its axis) the lofted walls refuse, by the
+    // trim engine (BREP_SWEEP_RING_TRIM); the lofted refusal stands where it
+    // refuses too. Rows the walls build are left to them.
+    let Err(refusal) = lofted else { return lofted };
+    // A wall whose double curve reaches a corner: the trim route meets that
+    // double curve's tip, which it does not yet write so a reader integrates
+    // round it, and refuses after the work; declined before it.
+    if !crate::solid_sweep_trim::ring_trim_on() || refusal.to_string().contains(DOUBLE_CURVE_CORNER) {
+        return Err(refusal);
+    }
+    let SolidTool::Revolved { axis_origin, axis_direction, meridian, .. } = tool else { return Err(refusal) };
+    let [OutlinePiece::Arc { centre, radius, start, end }] = meridian.as_slice() else { return Err(refusal) };
+    if !(((end - start).abs() - TAU).abs() < 1e-12 && centre[0] > *radius) {
+        return Err(refusal);
+    }
+    let (Ok(axis), Ok(d0), Ok(d1)) = (axis_direction.normalized(), motion.axes[0].1.normalized(), motion.axes[1].1.normalized()) else { return Err(refusal) };
+    let two = crate::solid_sweep_trim::TwoTurnMotion { points: [motion.axes[0].0, motion.axes[1].0], directions: [d0, d1], rates: motion.rates };
+    let ring_centre = axis_origin.add(axis.scale(centre[1]));
+    crate::solid_sweep_trim::sweep_ring_tumbled(ring_centre, axis, centre[0], *radius, &two, motion.from, motion.to).or(Err(refusal))
+}
+
+/// The lofted walls' refusal where a wall's double curve reaches a corner of
+/// its grazing loop (the tumbled sweep reads it to skip the ring's trim route).
+#[doc(hidden)]
+pub const DOUBLE_CURVE_CORNER: &str = "the double curve of a wall reaches a corner of its grazing loop";
+
+/// The tumbled sweep by the lofted walls (a polyhedron by the trim engine).
+fn sweep_solid_tumbled_lofted(tool: &SolidTool, motion: &TwoTurns) -> Result<BrepSolid, KernelRefusal> {
     if !(motion.from.is_finite() && motion.to.is_finite() && motion.to > motion.from) {
         return Err(input("range", "the motion's range must run forward".into()));
     }
@@ -3885,6 +4303,13 @@ pub fn sweep_solid_tumbled(tool: &SolidTool, motion: &TwoTurns) -> Result<BrepSo
         directions[k] = motion.axes[k].1.normalized().map_err(|_| input("axis", "a turn's axis has no direction".into()))?;
     }
     let turns = Turns { points, directions, rates: motion.rates };
+    // A convex polyhedron, by the trim engine (default off).
+    if let SolidTool::Polyhedron { vertices, faces } = tool {
+        if crate::solid_sweep_trim::trim_engine_on() {
+            let two = crate::solid_sweep_trim::TwoTurnMotion { points, directions, rates: motion.rates };
+            return crate::solid_sweep_trim::sweep_convex_tumbled(vertices, faces, &two, motion.from, motion.to);
+        }
+    }
     let SolidTool::Revolved { axis_origin, axis_direction, radial, meridian } = tool else {
         return Err(refuse("tumble_tool", "a tumble sweeps a solid of revolution only".into()));
     };
@@ -4294,6 +4719,66 @@ fn row_pieces(wall: &NurbsSurface, v: f64, spans: &[TrimSpan]) -> Result<Vec<Nur
 }
 
 /// The wall over u ∈ [a, b] only, in the same parameters.
+/// Can `pcurve` (in a wall's chart) meet the split segment u = tip.u, v in
+/// [v_lo, v_hi], anywhere but at the tip itself? A pcurve that ENDS at the
+/// tip (a side of the double curve) touches it there: a short stub at that end
+/// must leave the tip into one side of the line or away from the segment, and
+/// the rest is tested. Every other piece is decided on the convex hull of its
+/// control points (positive weights), halved where a hull straddles the
+/// segment; one still straddling after 24 halvings counts as meeting it.
+fn hull_meets_segment(pcurve: &NurbsCurve, tip: &[f64; 2], v_lo: f64, v_hi: f64) -> Result<bool, KernelRefusal> {
+    let uv = |p: &Vec4| [p.x / p.w, p.y / p.w];
+    let near_tip = |p: [f64; 2]| (p[0] - tip[0]).abs() <= 1e-9 && (p[1] - tip[1]).abs() <= 1e-9;
+    let (first, last) = (uv(&pcurve.control_points[0]), uv(&pcurve.control_points[pcurve.control_points.len() - 1]));
+    if !(near_tip(first) || near_tip(last)) {
+        return hull_straddles(pcurve, tip, v_lo, v_hi, 0);
+    }
+    if near_tip(first) && near_tip(last) {
+        return Ok(true);
+    }
+    let [d0, d1] = frag(pcurve.domain(), "domain")?;
+    let at = if near_tip(first) { d0 + 1e-3 * (d1 - d0) } else { d1 - 1e-3 * (d1 - d0) };
+    let (a, b) = frag(pcurve.split(at), "split")?;
+    let (stub, rest) = if near_tip(first) { (a, b) } else { (b, a) };
+    let side: Vec<f64> = stub.control_points.iter().map(|p| uv(p)[0] - tip[0]).collect();
+    let one_side = side.iter().all(|d| *d >= -1e-12) || side.iter().all(|d| *d <= 1e-12);
+    // The segment runs from the tip towards the far row: away is the other way.
+    let segment_below = v_lo < tip[1] - 1e-12;
+    let away = stub.control_points.iter().all(|p| if segment_below { uv(p)[1] >= tip[1] - 1e-9 } else { uv(p)[1] <= tip[1] + 1e-9 });
+    if !(one_side || away) {
+        return Ok(true);
+    }
+    hull_straddles(&rest, tip, v_lo, v_hi, 0)
+}
+
+fn hull_straddles(pcurve: &NurbsCurve, tip: &[f64; 2], v_lo: f64, v_hi: f64, depth: usize) -> Result<bool, KernelRefusal> {
+    let points: Vec<[f64; 2]> = pcurve.control_points.iter().map(|p| [p.x / p.w, p.y / p.w]).collect();
+    let (u_min, u_max) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p[0]), hi.max(p[0])));
+    let (w_min, w_max) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p[1]), hi.max(p[1])));
+    if u_min > tip[0] + 1e-12 || u_max < tip[0] - 1e-12 || w_min > v_hi + 1e-12 || w_max < v_lo - 1e-12 {
+        return Ok(false);
+    }
+    if depth >= 24 {
+        return Ok(true);
+    }
+    let [d0, d1] = frag(pcurve.domain(), "domain")?;
+    match pcurve.split(0.5 * (d0 + d1)) {
+        Ok((a, b)) => Ok(hull_straddles(&a, tip, v_lo, v_hi, depth + 1)? || hull_straddles(&b, tip, v_lo, v_hi, depth + 1)?),
+        // Too short to halve: count it as meeting the segment.
+        Err(_) => Ok(true),
+    }
+}
+
+/// `BREP_SWEEP_SPLIT_CROSSING` (default on; `=0` off): a lofted wall that
+/// turns over near one end is split at its swallowtail's point whenever the
+/// split segment to the far row crosses no trim curve, not only where the
+/// trimmed row keeps to its side of the tip's u; otherwise the wall stays one
+/// face carrying its double curve as a slot (one edge used twice), which
+/// meshes poorly at the slot's tip.
+fn split_crossing_on() -> bool {
+    crate::switch!("BREP_SWEEP_SPLIT_CROSSING", true)
+}
+
 fn restrict_u(surface: &NurbsSurface, a: f64, b: f64) -> Result<NurbsSurface, KernelRefusal> {
     let [u0, u1] = frag(surface.domain_u(), "domain")?;
     if a <= u0 + 1e-12 && b >= u1 - 1e-12 {
@@ -4890,7 +5375,7 @@ fn double_curve(at: &dyn Fn(f64, f64) -> Result<Vec3, KernelRefusal>, a: [f64; 2
             return Err(refuse("end_trim", format!("the double curve of a wall cannot be followed (sides {separation:e} apart)")));
         };
         if [y[0], y[2]].iter().any(|&u| u <= 1e-3 || u >= 1.0 - 1e-3) {
-            return Err(refuse("end_trim_corner", "the double curve of a wall reaches a corner of its grazing loop".into()));
+            return Err(refuse("end_trim_corner", DOUBLE_CURVE_CORNER.into()));
         }
         if y[1] > window || y[3] > window || y[1] < 0.0 || y[3] < 0.0 {
             return Err(refuse("end_trim_deep", format!("the double curve of a wall runs deep into the motion or back past its end (its sides at time fractions {:.4} and {:.4} from the end, {} points in)", y[1], y[3], a_side.len())));
@@ -4988,7 +5473,32 @@ fn assemble_lofted(
             }
             Ok(true)
         };
-        let split_here = !tips.is_empty() && trims.get(&(index, 1 - far)).map(straight).transpose()?.unwrap_or(false);
+        // Or, where the trimmed row strays across the tip's u only beyond the
+        // tip (near its own end), the split segment itself: from the tip to
+        // the far row, crossed by none of either end's trim curves. Each strip
+        // then lies on the wall over the u its own pcurves span.
+        let crossing_free = |trim_near: &EndTrim| -> Result<bool, KernelRefusal> {
+            let v_far = far as f64;
+            for tip in &tips {
+                let (v_lo, v_hi) = if v_far < tip[1] { (v_far, tip[1]) } else { (tip[1], v_far) };
+                let ends = [Some(trim_near), trims.get(&(index, far))];
+                for trim in ends.into_iter().flatten() {
+                    for span in &trim.spans {
+                        for (_, _, pcurve) in &span.chain {
+                            if hull_meets_segment(pcurve, tip, v_lo, v_hi)? {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(true)
+        };
+        let split_here = !tips.is_empty()
+            && match trims.get(&(index, 1 - far)) {
+                Some(trim) => straight(trim)? || (split_crossing_on() && crossing_free(trim)?),
+                None => false,
+            };
         if split_here {
             split_walls.insert(index);
             let v_far = far as f64;
@@ -5227,7 +5737,23 @@ fn assemble_lofted(
                 Some((edge, u, v0, v1)) => coedges.push((edge, false, uv_line([u, v1], [u, v0])?)),
                 None => coedges.push((orbits[&from], false, uv_line([0.0, 1.0], [0.0, 0.0])?)),
             }
-            let (ua, ub) = (if j == 0 { 0.0 } else { lines[j - 1].1 }, lines.get(j).map_or(1.0, |line| line.1));
+            let (mut ua, mut ub) = (if j == 0 { 0.0 } else { lines[j - 1].1 }, lines.get(j).map_or(1.0, |line| line.1));
+            // A strip whose trim strays past its split line (beyond the tip)
+            // takes the wall over that u too: the parameters are the wall's.
+            if lines.len() > 0 && split_crossing_on() {
+                // Its control points bound each pcurve (positive weights).
+                for (_, _, pcurve) in &coedges {
+                    for point in &pcurve.control_points {
+                        let u = point.x / point.w;
+                        if u < ua - 1e-9 {
+                            ua = u.max(0.0);
+                        }
+                        if u > ub + 1e-9 {
+                            ub = u.min(1.0);
+                        }
+                    }
+                }
+            }
             shell.face(restrict_u(surface, ua, ub)?, coedges);
         }
     }
@@ -5258,14 +5784,21 @@ fn assemble_lofted(
 
 /// Is the world point y inside the moving tool at some time of the motion?
 /// Steps t by the distance over a bound on the speed of any tool point near y.
-fn covered(screw: &Screw, split: &Split, y: Vec3, margin: f64) -> Result<bool, KernelRefusal> {
-    let reach = y.sub(screw.a).length() + split.scale + screw.extent;
-    let speed = (screw.omega.abs() * reach + screw.rate_bound()).max(1e-300);
+fn covered(screw: &Screw, split: &Split, reach: Option<&ToolReach>, y: Vec3, normal: Vec3, margin: f64) -> Result<bool, KernelRefusal> {
+    if reach.is_some_and(|reach| reach.never_inside(screw, y, normal, margin)) {
+        return Ok(false);
+    }
+    if let Some(found) = reach.and_then(|reach| reach.turn_about_parallel_axis(screw, y, margin)) {
+        return found;
+    }
+    let speed = preimage_speed_bound(screw, split, y);
     let floor = (screw.t1 - screw.t0) * 1e-7;
+    let glide = Glide::of(screw, y);
     let mut t = screw.t0;
     let mut steps = 0usize;
     loop {
-        let d = split.distance(screw.invert(t, y));
+        let p = screw.invert(t, y);
+        let d = split.distance(p);
         if d < -margin {
             return Ok(true);
         }
@@ -5275,8 +5808,446 @@ fn covered(screw: &Screw, split: &Split, y: Vec3, margin: f64) -> Result<bool, K
         if steps > 2_000_000 {
             return Err(refuse("probe_budget", "the one-pass check could not walk the motion past a point near the sweep".into()));
         }
-        t = (t + ((d.abs() + margin) / speed).max(floor)).min(screw.t1);
+        let first = (d.abs() + margin) / speed;
+        let second = glide.as_ref().map_or(0.0, |glide| glide.step(split, p, t, d, margin, speed, screw.t1 - t));
+        let second = if second.is_finite() { second } else { 0.0 };
+        t = (t + first.max(second).max(floor)).min(screw.t1);
         steps += 1;
+    }
+}
+
+/// The preimage of a probe under a plain screw, as an explicit curve: with
+/// `u` the probe's offset from the axis square to it and `v = e × u`,
+/// `p(t) = a + (e·(y − a) − advance(t))·e + cos(ωt)·u − sin(ωt)·v`. Its
+/// second derivative is no longer than `ω²·|u| + 2|c₂|` (`curve`).
+///
+/// The walk in time steps by the tool's distance over the preimage's speed:
+/// beside a wall the tool grazes (a thread's flank, a ball's groove) the
+/// distance stays the probe's tiny offset through the whole contact and the
+/// walk crawls, some π·√(2R/δ) steps a probe. Where the path runs along the
+/// tool rather than into it, its tangent line stays clear of the tool for
+/// far longer, and the path leaves that line by no more than `curve·h²/2`:
+/// the second-order step is the longest `h` the tool's distance from the
+/// tangent segment, less that, keeps above −margin. It is never shorter than
+/// the first-order step, and skips no time the probe is deeper than the margin.
+struct Glide {
+    e: Vec3,
+    u: Vec3,
+    v: Vec3,
+    omega: f64,
+    c: f64,
+    c2: f64,
+    curve: f64,
+    /// Under `frame_glide_on`, a frame riding a curve: the probe's preimage
+    /// `a + R(−θ(t))(y − P(t))` read through the frame (frame, y).
+    riding: Option<(Frame, Vec3)>,
+}
+
+/// The second-order step for frames riding a curve (default on; `=0` restores the first-order walk).
+fn frame_glide_on() -> bool {
+    crate::switch!("BREP_SWEEP_FRAME_GLIDE", true)
+}
+
+impl Glide {
+    fn of(screw: &Screw, y: Vec3) -> Option<Glide> {
+        if let (Some(frame), None, true) = (&screw.frame, &screw.turns, frame_glide_on()) {
+            return Glide::riding(screw, frame, y);
+        }
+        if screw.frame.is_some() || screw.turns.is_some() {
+            return None;
+        }
+        let r = y.sub(screw.a);
+        let u = r.sub(screw.e.scale(r.dot(screw.e)));
+        let curve = screw.omega * screw.omega * u.length() + 2.0 * screw.c2.abs();
+        // A bound rounded to nothing, or below the normal range, is not one:
+        // only a slide (no turn, no rise) is straight.
+        let straight = screw.omega == 0.0 && screw.c2 == 0.0;
+        if !straight && !(curve >= f64::MIN_POSITIVE && curve.is_finite()) {
+            return None;
+        }
+        Some(Glide { e: screw.e, u, v: screw.e.cross(u), omega: screw.omega, c: screw.c, c2: screw.c2, curve, riding: None })
+    }
+
+    /// A frame riding a planar cubic: the preimage `p = a + R(−θ) q`,
+    /// `q = y − P(t)`, turns about `up`, and its second derivative is
+    /// `R(−θ)(θ'² up×(up×q) − θ'' up×q + 2θ' up×P' − P'')`, so
+    /// `|p''| ≤ (θ'² + |θ''|)·|q| + 2|θ'|·|P'| + |P''|`. Over the motion's
+    /// span |P'| and |P''| are bounded by their control polygons and |P'''|
+    /// is a constant; `θ' = up·(P'×P'')/|P'|²` and θ'' are bounded through a
+    /// lower bound on |P'| (its samples less |P''| times half their spacing;
+    /// no glide where that is not positive); `|q| ≤ |y − P(t₀)| + |P'|·span`.
+    fn riding(screw: &Screw, frame: &Frame, y: Vec3) -> Option<Glide> {
+        let [p0, p1, p2, p3] = frame.control;
+        let first = [p1.sub(p0), p2.sub(p1), p3.sub(p2)].map(|d| d.scale(3.0).length()).into_iter().fold(0.0f64, f64::max);
+        let second = [p2.sub(p1.scale(2.0)).add(p0), p3.sub(p2.scale(2.0)).add(p1)].map(|d| d.scale(6.0).length()).into_iter().fold(0.0f64, f64::max);
+        let third = p3.sub(p2.scale(3.0)).add(p1.scale(3.0)).sub(p0).scale(6.0).length();
+        let (t0, t1) = (screw.t0, screw.t1);
+        let n = 256;
+        let slowest = (0..=n).map(|k| frame.first(t0 + (t1 - t0) * k as f64 / n as f64).length()).fold(f64::INFINITY, f64::min);
+        let floor = slowest - second * 0.5 * (t1 - t0) / n as f64;
+        if !(floor > 0.0) {
+            return None;
+        }
+        let w1 = first * second / (floor * floor);
+        let w2 = third * first / (floor * floor) + 2.0 * first * first * second * second / floor.powi(4);
+        let q = y.sub(frame.point(t0)).length() + first * (t1 - t0);
+        let curve = (w1 * w1 + w2) * q + 2.0 * w1 * first + second;
+        if !(curve.is_finite() && curve >= f64::MIN_POSITIVE) {
+            return None;
+        }
+        let zero = Vec3::new(0.0, 0.0, 0.0);
+        Some(Glide { e: frame.up, u: zero, v: zero, omega: 0.0, c: 0.0, c2: 0.0, curve, riding: Some((*frame, y)) })
+    }
+
+    /// `p'(t)`.
+    fn velocity(&self, t: f64) -> Vec3 {
+        if let Some((frame, y)) = &self.riding {
+            // p' = R(−θ)(−θ' up×q − P'), q = y − P(t).
+            let q = y.sub(frame.point(t));
+            let inner = frame.up.cross(q).scale(-frame.angle_rate(t)).sub(frame.first(t));
+            return inner.rotate_about(frame.up, -frame.angle(t));
+        }
+        let (sin, cos) = (self.omega * t).sin_cos();
+        self.e
+            .scale(-(self.c + 2.0 * self.c2 * t))
+            .sub(self.u.scale(self.omega * sin))
+            .sub(self.v.scale(self.omega * cos))
+    }
+
+    /// The second-order step from `t`, where the preimage is `p` at the
+    /// tool's distance `d` (at most `left`; 0 when it finds none).
+    #[allow(clippy::too_many_arguments)]
+    fn step(&self, split: &Split, p: Vec3, t: f64, d: f64, margin: f64, speed: f64, left: f64) -> f64 {
+        let velocity = self.velocity(t);
+        let m = self.curve;
+        match &split.shape {
+            // Each face's plane alone bounds the distance from below:
+            // g(t + h) ≥ g + g'·h − m·h²/2, held above −margin up to the root.
+            Shape::Planes(planes) => {
+                let mut best = 0.0f64;
+                for (n, offset) in planes {
+                    let g = n.dot(p) - offset;
+                    if g + margin <= 0.0 {
+                        continue;
+                    }
+                    let slope = n.dot(velocity);
+                    // The root, in the form that neither overflows nor cancels.
+                    let h = if m > 0.0 {
+                        let root = slope.hypot((2.0 * m * (g + margin)).sqrt());
+                        if slope >= 0.0 { (slope + root) / m } else { 2.0 * (g + margin) / (root - slope) }
+                    } else if slope >= 0.0 {
+                        left
+                    } else {
+                        (g + margin) / -slope
+                    };
+                    if h.is_finite() {
+                        best = best.max(h);
+                    }
+                }
+                best.min(left)
+            }
+            // In the meridian plane: the path (ρ, z) about the tool's axis and
+            // its tangent segment, whose distance from the outline is bounded
+            // below piece by piece; the path leaves the segment by at most
+            // m₂·h²/2, m₂ = 2m + speed²/ρ_min (the radius' bend), ρ_min > 0.
+            Shape::Revolved { origin, axis, meridian } => {
+                if d < 0.0 {
+                    return 0.0;
+                }
+                let r = p.sub(*origin);
+                let z = r.dot(*axis);
+                let flat = r.sub(axis.scale(z));
+                let rho = flat.length();
+                if rho <= 0.0 {
+                    return 0.0;
+                }
+                let dz = velocity.dot(*axis);
+                let dflat = velocity.sub(axis.scale(dz));
+                let drho = flat.dot(dflat) / rho;
+                let q = [rho, z];
+                let mut best = 0.0f64;
+                let mut h = (d + margin) / speed;
+                for _ in 0..64 {
+                    h *= 2.0;
+                    if h > left {
+                        h = left;
+                    }
+                    let low = rho - speed * h;
+                    if low <= 0.0 {
+                        break;
+                    }
+                    let bend = 2.0 * m + speed * speed / low;
+                    let end = [rho + drho * h, z + dz * h];
+                    let clear = meridian.iter().map(|piece| segment_clearance(piece, q, end)).fold(f64::INFINITY, f64::min);
+                    // A segment that touches the outline may enter the tool: no bound.
+                    let held = clear - 0.5 * bend * h * h;
+                    if !held.is_finite() || clear <= 0.0 || held < -margin {
+                        break;
+                    }
+                    best = h;
+                    if h >= left {
+                        break;
+                    }
+                }
+                best
+            }
+        }
+    }
+}
+
+/// A lower bound on the distance between the segment `a`–`b` and a meridian
+/// piece: a line piece's exact distance (0 where they cross), an arc's from
+/// its whole circle.
+fn segment_clearance(piece: &OutlinePiece, a: [f64; 2], b: [f64; 2]) -> f64 {
+    let sub = |p: [f64; 2], q: [f64; 2]| [p[0] - q[0], p[1] - q[1]];
+    let dot = |p: [f64; 2], q: [f64; 2]| p[0] * q[0] + p[1] * q[1];
+    let cross = |p: [f64; 2], q: [f64; 2]| p[0] * q[1] - p[1] * q[0];
+    let to_segment = |x: [f64; 2], s: [f64; 2], e: [f64; 2]| -> f64 {
+        let d = sub(e, s);
+        let len2 = dot(d, d);
+        let w = if len2 > 0.0 { (dot(sub(x, s), d) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let foot = [s[0] + d[0] * w, s[1] + d[1] * w];
+        let gap = sub(x, foot);
+        gap[0].hypot(gap[1])
+    };
+    match *piece {
+        OutlinePiece::Line { from, to } => {
+            let (d1, d2) = (sub(b, a), sub(to, from));
+            let denom = cross(d1, d2);
+            if denom != 0.0 {
+                let w = sub(from, a);
+                let (s, t) = (cross(w, d2) / denom, cross(w, d1) / denom);
+                if (0.0..=1.0).contains(&s) && (0.0..=1.0).contains(&t) {
+                    return 0.0;
+                }
+            }
+            to_segment(a, from, to).min(to_segment(b, from, to)).min(to_segment(from, a, b)).min(to_segment(to, a, b))
+        }
+        OutlinePiece::Arc { centre, radius, .. } => {
+            let near = to_segment(centre, a, b);
+            let far = { let (x, y) = (sub(a, centre), sub(b, centre)); x[0].hypot(x[1]).max(y[0].hypot(y[1])) };
+            (near - radius).max(radius - far).max(0.0)
+        }
+        // no bound read for an ellipse: zero is one
+        OutlinePiece::Ellipse { .. } => 0.0,
+    }
+}
+
+/// A bound on how fast the tool-frame preimage `screw.invert(t, y)` of the
+/// world point `y` moves per unit `t`; the tool's distance (1-Lipschitz)
+/// changes no faster along it.
+///
+/// A plain screw about one fixed axis carries the preimage round that axis at
+/// its distance from it, `ρ`, and along it at the advance's rate, two motions
+/// square to each other: no faster than `hypot(|ω|·ρ, rate)`. A point near the axis barely moves, so a probe beside
+/// a tool point on the axis (a coin turned about a line through its rim) walks
+/// the motion in a few long steps, not millions of floor-sized ones. A riding
+/// frame or two turns keep the coarser bound through `a`.
+fn preimage_speed_bound(screw: &Screw, split: &Split, y: Vec3) -> f64 {
+    let speed = if screw.frame.is_none() && screw.turns.is_none() {
+        let r = y.sub(screw.a);
+        let rho = r.sub(screw.e.scale(r.dot(screw.e))).length();
+        (screw.omega.abs() * rho).hypot(screw.rate_bound())
+    } else {
+        let reach = y.sub(screw.a).length() + split.scale + screw.extent;
+        screw.omega.abs() * reach + screw.rate_bound()
+    };
+    speed.max(1e-300)
+}
+
+/// How far a revolved tool reaches about a plain screw's axis: its axial
+/// coordinate `e·(x − a)` lies within `axial` and its distance from the axis
+/// within `radial`, for every tool point `x` (bounds, not extremes: a meridian
+/// line is bounded at its ends, an arc by its whole circle).
+///
+/// A plain screw keeps each point's distance from its axis and shifts its
+/// axial coordinate only by the advance (a slide keeps every coordinate across
+/// its direction), so a point `y` whose preimage stays outside these bounds
+/// all through the motion is never inside the tool, and `covered` need not
+/// walk the motion to say so. Without this a probe beside a face the tool runs
+/// along all through the motion (the flat top of a coin turned about a line
+/// through its rim, the floor of an end mill's pass) creeps through it in
+/// steps of its own tiny distance from the tool.
+struct ToolReach {
+    /// The tool's revolution: its origin less the screw's point, its unit axis
+    /// and its meridian (radius, height along the axis).
+    base: Vec3,
+    axis: Vec3,
+    meridian: Vec<OutlinePiece>,
+    axial: [f64; 2],
+    radial: [f64; 2],
+}
+
+/// The largest of |m₀|·p + m₁·q over a meridian (p ≥ 0): a line at its ends,
+/// an arc by its circle (Cauchy–Schwarz on the offset from its centre).
+fn meridian_most(meridian: &[OutlinePiece], p: f64, q: f64) -> f64 {
+    meridian
+        .iter()
+        .map(|piece| match *piece {
+            OutlinePiece::Line { from, to } => (from[0].abs() * p + from[1] * q).max(to[0].abs() * p + to[1] * q),
+            OutlinePiece::Arc { centre, radius, .. } => centre[0].abs() * p + centre[1] * q + radius * p.hypot(q),
+            // within the circle of its larger semi-axis
+            OutlinePiece::Ellipse { centre, semi, .. } => centre[0].abs() * p + centre[1] * q + semi[0].max(semi[1]) * p.hypot(q),
+        })
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
+impl ToolReach {
+    fn of(screw: &Screw, split: &Split) -> Option<ToolReach> {
+        if screw.frame.is_some() || screw.turns.is_some() {
+            return None;
+        }
+        let Shape::Revolved { origin, axis, meridian } = &split.shape else { return None };
+        let e = screw.e;
+        // x − a = (origin − a) + m₁·axis + m₀·(unit vector ⊥ axis).
+        let base = origin.sub(screw.a);
+        let along = axis.dot(e);
+        let across = axis.cross(e).length();
+        let middle = base.dot(e);
+        let top = middle + meridian_most(meridian, across, along);
+        let bottom = middle - meridian_most(meridian, across, -along);
+        // Off the axis: within |(origin − a)⊥| ± (|m₀| + |m₁|·|axis⊥e|).
+        let off = base.sub(e.scale(middle)).length();
+        let spread = meridian
+            .iter()
+            .map(|piece| match *piece {
+                OutlinePiece::Line { from, to } => (from[0].abs() + from[1].abs() * across).max(to[0].abs() + to[1].abs() * across),
+                OutlinePiece::Arc { centre, radius, .. } => centre[0].abs() + centre[1].abs() * across + radius * (1.0 + across * across).sqrt(),
+                OutlinePiece::Ellipse { centre, semi, .. } => centre[0].abs() + centre[1].abs() * across + semi[0].max(semi[1]) * (1.0 + across * across).sqrt(),
+            })
+            .fold(f64::NEG_INFINITY, f64::max);
+        let reach = ToolReach { base, axis: *axis, meridian: meridian.clone(), axial: [bottom, top], radial: [off - spread, off + spread] };
+        (top.is_finite() && bottom.is_finite() && spread.is_finite()).then_some(reach)
+    }
+
+    /// `covered` for a turn (no advance) about an axis along the tool's own,
+    /// walked in the tool's radius instead of in time; `None` when the motion
+    /// is not such a turn.
+    ///
+    /// The preimage keeps its height along the tool's axis, and its distance
+    /// from that axis is `ρ_w² = ρ² + s² − 2·ρ·s·cos(θ − θ_W)`, `ρ` its own
+    /// distance from the turn's axis, `s` the tool axis' and `θ − θ_W` the
+    /// angle between them, which the turn sweeps through an interval. So the
+    /// preimage takes every radius between the least and the most `ρ_w` over
+    /// that interval, and no other: it is ever deeper than the margin inside
+    /// the tool if and only if some radius in that range is, at that height.
+    /// The meridian's distance is 1-Lipschitz in the radius, so the range is
+    /// walked by it. Each radius is met once, where the walk in time crawls
+    /// past a probe the tool grazes (by the probe's own tiny offset over the
+    /// turn's speed at each step).
+    fn turn_about_parallel_axis(&self, screw: &Screw, y: Vec3, margin: f64) -> Option<Result<bool, KernelRefusal>> {
+        if screw.c != 0.0 || screw.c2 != 0.0 || screw.omega == 0.0 || self.axis.cross(screw.e).length() != 0.0 {
+            return None;
+        }
+        let e = screw.e;
+        let r = y.sub(screw.a);
+        // From the tool's origin to the probe, and its height along the tool's
+        // axis (the turn keeps it).
+        let from_tool = r.sub(self.base);
+        let height = from_tool.dot(self.axis);
+        // In the plane square to the axis, from the turn's axis: the probe `P`
+        // and the tool's axis `W`, and the probe from the tool's axis, `P − W`
+        // (formed as one difference, not as two far points less each other).
+        let flat = |x: Vec3| x.sub(e.scale(x.dot(e)));
+        let (probe, tool, apart) = (flat(r), flat(self.base), flat(from_tool));
+        let (rho, s) = (probe.length(), tool.length());
+        // Rounding of the coordinates read here, a few ulps of the largest: past
+        // a quarter of the margin, the walk in time decides instead.
+        let slack = 64.0 * f64::EPSILON * (r.length() + self.base.length() + height.abs());
+        if slack > 0.25 * margin {
+            return None;
+        }
+        // The preimage at time t is R(−ω·t)·P: its distance from the tool's axis
+        // is |R(φ)·(P − W) + (R(φ) − I)·W|, with R(φ) − I = −2 sin²(φ/2) + sin φ·(e ×).
+        let radius = |phi: f64| -> f64 {
+            let half = (0.5 * phi).sin();
+            let turned = apart.rotate_about(e, phi).add(tool.scale(-2.0 * half * half)).add(e.cross(tool).scale(phi.sin()));
+            turned.length()
+        };
+        let (phi0, phi1) = (-screw.omega * screw.t0, -screw.omega * screw.t1);
+        // The angle from W to P; R(φ)·P lies along W at start + φ ≡ 0 and opposite it at ≡ π.
+        let start = if rho == 0.0 || s == 0.0 { 0.0 } else { e.dot(tool.cross(probe)).atan2(tool.dot(probe)) };
+        let (lo, hi) = ((start + phi0).min(start + phi1), (start + phi0).max(start + phi1));
+        // Does [lo, hi] hold an angle ≡ `at` (mod 2π)?
+        let holds = |at: f64| (lo - at).div_euclid(TAU) != (hi - at).div_euclid(TAU) || (lo - at).rem_euclid(TAU) == 0.0;
+        let ends = [radius(phi0), radius(phi1)];
+        // | |P| − |W| | as |(P − W)·(P + W)| / (|P| + |W|): no cancellation.
+        let nearest = if rho + s > 0.0 { apart.dot(probe.add(tool)).abs() / (rho + s) } else { 0.0 };
+        let mut least = if holds(0.0) { nearest } else { ends[0].min(ends[1]) };
+        let mut most = if holds(PI) { rho + s } else { ends[0].max(ends[1]) };
+        least = (least - slack).max(0.0);
+        most += slack;
+        let mut at = least;
+        // No floor on the step (it is never less than the margin): a floor
+        // could step over a wall thinner than itself.
+        let mut steps = 0usize;
+        loop {
+            let d = outline_signed_distance(&self.meridian, [at, height]);
+            if d < -margin {
+                return Some(Ok(true));
+            }
+            if at >= most {
+                return Some(Ok(false));
+            }
+            if steps > 2_000_000 {
+                return Some(Err(refuse("probe_budget", "the one-pass check could not walk the motion past a point near the sweep".into())));
+            }
+            at = (at + d.abs() + margin).min(most);
+            steps += 1;
+        }
+    }
+
+    /// A bound on `u·(x − a)` over the tool, `u` a unit direction.
+    fn support(&self, u: Vec3) -> f64 {
+        let along = u.dot(self.axis);
+        let across = u.sub(self.axis.scale(along)).length();
+        u.dot(self.base) + meridian_most(&self.meridian, across, along)
+    }
+
+    /// Is `y`'s preimage outside the tool's reach, or within half the margin
+    /// of its edge, at every time of the motion? Then the tool's boundary is
+    /// within half the margin of every preimage inside (straight out of the
+    /// bound), and none is deeper than the margin. `normal`: the probe's face
+    /// normal, across which a slide is also tried.
+    fn never_inside(&self, screw: &Screw, y: Vec3, normal: Vec3, margin: f64) -> bool {
+        let r = y.sub(screw.a);
+        let z = r.dot(screw.e);
+        let rho = r.sub(screw.e.scale(z)).length();
+        let mut advances = vec![screw.advance(screw.t0), screw.advance(screw.t1)];
+        if screw.c2 != 0.0 {
+            let vertex = -screw.c / (2.0 * screw.c2);
+            if vertex > screw.t0 && vertex < screw.t1 {
+                advances.push(screw.advance(vertex));
+            }
+        }
+        let low = advances.iter().copied().fold(f64::INFINITY, f64::min);
+        let high = advances.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        // Half the margin, less what rounding may have cost the coordinates
+        // and bounds compared (a few ulps of the largest of them).
+        let size = r.length() + low.abs().max(high.abs()) + self.base.length() + self.radial[1].abs() + self.axial[0].abs().max(self.axial[1].abs());
+        let half = 0.5 * margin - 1e-13 * size;
+        if half <= 0.0 {
+            return false;
+        }
+        if z - high >= self.axial[1] - half || z - low <= self.axial[0] + half {
+            return true;
+        }
+        if rho >= self.radial[1] - half || (self.radial[0] > 0.0 && rho <= self.radial[0] + half) {
+            return true;
+        }
+        // A slide carries the preimage along its direction only. `u` is meant
+        // across it, but whatever of `e` rounding leaves in it moves `u·r`
+        // with the advance: take the least `u·r` reaches over the motion.
+        if screw.omega == 0.0 {
+            if let Ok(u) = normal.sub(screw.e.scale(normal.dot(screw.e))).normalized() {
+                let drift = u.dot(screw.e);
+                let least = u.dot(r) - (drift * low).max(drift * high);
+                if least >= self.support(u) - half {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -5288,6 +6259,7 @@ fn covered(screw: &Screw, split: &Split, y: Vec3, margin: f64) -> Result<bool, K
 /// of the tool rides higher than that over such a face is still found).
 fn check_single_pass(screw: &Screw, split: &Split, body: &BrepSolid, sliding: &std::collections::HashSet<u64>) -> Result<(), KernelRefusal> {
     let margin = 1e-9 * split.scale;
+    let reach = ToolReach::of(screw, split);
     for face in body.shells.iter().flat_map(|s| &s.faces) {
         let step = if sliding.contains(&face.id) { 1e-3 * split.scale } else { 1e-6 * split.scale };
         let surface = &face.surface;
@@ -5355,10 +6327,14 @@ fn check_single_pass(screw: &Screw, split: &Split, body: &BrepSolid, sliding: &s
             let dv = frag(surface.evaluate(u, vb), "probe")?.sub(frag(surface.evaluate(u, va), "probe")?).scale(1.0 / (vb - va));
             let Ok(n) = du.cross(dv).normalized() else { continue };
             let n = if face.same_sense { n } else { n.scale(-1.0) };
-            if covered(screw, split, p.add(n.scale(step)), margin)? {
+            if covered(screw, split, reach.as_ref(), p.add(n.scale(step)), n, margin)? {
                 return Err(refuse("folds", format!("the sweep passes over a point twice (just outside its own face at {p:?}); not one pass")));
             }
         }
     }
     Ok(())
 }
+
+
+#[path = "solid_sweep_ring_fold.rs"]
+mod ring_fold;

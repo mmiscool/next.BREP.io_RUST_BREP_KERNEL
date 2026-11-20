@@ -82,16 +82,22 @@ pub struct SweepStationReport {
     /// joint's curvature jump.
     pub spine_deviation: f64,
     /// The worst deviation of the loft's frame axes from the transported
-    /// frame, per unit of section reach. Reported, not driven: at a G1 joint
-    /// the frame's rate of turn JUMPS, and a cubic through samples of a kinked
-    /// function overshoots by a FIRST-order term in the local spacing (the
-    /// rounded-rectangle ring reads 2.4e-3 at its floor budget where its
-    /// centre track reads 6.6e-4, and 1.1e-3 against 7.6e-6 refined to 1e-5),
-    /// so stations buy it down a decade a decade of track, not four; that is
-    /// the fitted route's own limit and the plan's item 3 bar.
+    /// frame ACROSS the path's tangent, per unit of section reach: the part
+    /// that can stand the wall off the kinematic sweep. Reported, not driven.
     pub frame_deviation: f64,
-    /// `spine + reach × frame`: the worst distance any wall point stands off
-    /// the kinematic sweep's wall, mm.
+    /// The worst deviation of the frame axes ALONG the path's tangent, per
+    /// unit reach: the section SLIDING along the wall it lies in. At a G1
+    /// joint the frame's rate of turn jumps and one cubic through the frames
+    /// overshoots along the tangent by a term first order in the spacing
+    /// (2.3e-3 on the rounded-rectangle ring at 1e-4, where the across part
+    /// reads 3.5e-5); a slide `δ` moves the wall off itself only at second
+    /// order, `δ²κ / (2(1 − reach·κ))`, which is what `wall_deviation` adds.
+    pub frame_slide: f64,
+    /// `spine + reach × frame + (reach × slide)²·κ / (2(1 − reach·κ))`: the
+    /// worst distance any wall point stands off the kinematic sweep's wall, mm
+    /// — for a section square to the path, untwisted, unscaled and unrolled,
+    /// whose wall contains the path's tangent; otherwise, or where
+    /// `reach·κ ≥ 1`, `spine + reach × (frame + slide)`.
     pub wall_deviation: f64,
     /// The section's reach from its anchor, mm (a control-hull bound).
     pub reach: f64,
@@ -150,14 +156,15 @@ impl SweepStationReport {
                 "the swept wall is lofted through {} stations ({} from the floors, {} refinement \
                  round(s)); the loft's centre track stands within {:.3e} mm of the path against \
                  the requested {:.1e}{cap}; its frame stands within {:.3e} per unit reach of the \
-                 transported frame (a reach of {:.3}), so the wall is within {:.3e} mm of the \
-                 kinematic sweep's; {volume}",
+                 transported frame across the path and slides up to {:.3e} along it (a reach of \
+                 {:.3}), so the wall is within {:.3e} mm of the kinematic sweep's; {volume}",
                 self.budget.stations,
                 self.budget.initial,
                 self.budget.rounds,
                 self.spine_deviation,
                 self.tolerance,
                 self.frame_deviation,
+                self.frame_slide,
                 self.reach,
                 self.wall_deviation,
             ),
@@ -170,6 +177,37 @@ impl SweepStationReport {
 /// switch a probe or a whole-module run pulls) or by this thread's stub.
 pub(super) fn refinement_enabled() -> bool {
     switch!(live "BREP_SWEEP_STATION_REFINEMENT", true)
+}
+
+/// Whether the station lane BREAKS its wall columns at the joints where the
+/// path's curvature jumps (`BREP_SWEEP_JOINT_BREAKS`, default on; `=0`
+/// restores one interpolant per column): each run
+/// of stations between two such joints is interpolated on its own and the
+/// runs meet C0 there ([`crate::loft_topology::interpolate_column_broken`]),
+/// so the refinement no longer has to cluster stations at every joint.
+pub(super) fn joint_breaks_enabled() -> bool {
+    switch!(live "BREP_SWEEP_JOINT_BREAKS", true)
+}
+
+/// The loft's v-interpolant, broken at `breaks` when the run is broken
+/// (`Some`, the seam included on a ring) — exactly the columns
+/// [`crate::loft_topology::loft_profile_brep_broken`] and its closed twin
+/// build, so the instruments read the wall that is built.
+pub(super) fn interpolant_broken(
+    points: &[Vec3],
+    parameters: &[f64],
+    closed: bool,
+    breaks: Option<&[usize]>,
+) -> Result<NurbsCurve, String> {
+    match breaks {
+        None => interpolant(points, parameters, closed),
+        Some(breaks) if closed => {
+            let mut unrolled = points.to_vec();
+            unrolled.push(points[0]);
+            crate::loft_topology::interpolate_column_broken(&unrolled, parameters, breaks)
+        }
+        Some(breaks) => crate::loft_topology::interpolate_column_broken(points, parameters, breaks),
+    }
 }
 
 
@@ -300,9 +338,10 @@ pub(super) fn spine_deviations(
     params: &[StationParam],
     points: &[Vec3],
     closed: bool,
+    breaks: Option<&[usize]>,
 ) -> Result<Vec<f64>, String> {
     let parameters = chord_parameters(points, closed);
-    let spine = interpolant(points, &parameters, closed)?;
+    let spine = interpolant_broken(points, &parameters, closed, breaks)?;
     let spans = points.len() - 1 + usize::from(closed);
     let mut deviations = Vec::with_capacity(spans);
     for k in 0..spans {
@@ -335,8 +374,15 @@ pub(super) fn refine_parameters(
     tolerance: f64,
     closed: bool,
     emitted: usize,
+    breaks: Option<&[usize]>,
 ) -> Result<(usize, bool), String> {
     let count = params.len();
+    // A broken station (and a broken ring's seam) ends a run the cubic fits
+    // on its own: the span beside it keeps the `h⁴` law.
+    let broken_at = |station: usize| match breaks {
+        Some(breaks) => (closed && station == 0) || breaks.contains(&station),
+        None => false,
+    };
     let mut wanted: Vec<(usize, usize)> = Vec::new();
     for (k, &deviation) in deviations.iter().enumerate() {
         if deviation > tolerance {
@@ -345,7 +391,8 @@ pub(super) fn refine_parameters(
             let next = (k + 1) % count;
             let at_joint = (t_a == t0 && (k > 0 || closed))
                 || t_b == t1 && (next != 0 || closed) && (next == 0 || params[next].segment != segment);
-            let exponent = if at_joint { 0.5 } else { 0.25 };
+            let broken = (t_a == t0 && broken_at(k)) || (t_b == t1 && broken_at(next));
+            let exponent = if at_joint && !broken { 0.5 } else { 0.25 };
             let pieces = ((deviation / tolerance).powf(exponent).ceil() as usize).clamp(2, 8);
             wanted.push((k, pieces));
         }
@@ -455,6 +502,14 @@ pub(super) struct PlacedRun<'a> {
     pub shift: usize,
     pub budget: StationBudget,
     pub tolerance: f64,
+    /// The stations the loft broke its columns at (`None`: one interpolant).
+    pub breaks: Option<&'a [usize]>,
+    /// True when the path's tangent lies in the wall at every point, so a
+    /// slide of the section along it stands the wall off only at second
+    /// order: a section held square to the path (`Transplant`), untwisted,
+    /// unscaled and not rolled by a spatial ring's counter-twist. Otherwise
+    /// the slide is counted at first order.
+    pub slide_in_wall: bool,
 }
 
 /// One RMF step (Wang et al. 2008), as `sweep.rs::rmf_step` takes it, for the
@@ -505,9 +560,9 @@ pub(super) fn station_report(run: &PlacedRun<'_>) -> Result<SweepStationReport, 
     // --- The loft's interpolants of the centre track and the affine axes, on
     //     the loft's own parameters.
     let parameters = loft_parameters(run.sections, closed)?;
-    let centre = interpolant(run.centres, &parameters, closed).map_err(|e| refuse("centre", e))?;
-    let axis_1 = interpolant(run.e1, &parameters, closed).map_err(|e| refuse("axis 1", e))?;
-    let axis_2 = interpolant(run.e2, &parameters, closed).map_err(|e| refuse("axis 2", e))?;
+    let centre = interpolant_broken(run.centres, &parameters, closed, run.breaks).map_err(|e| refuse("centre", e))?;
+    let axis_1 = interpolant_broken(run.e1, &parameters, closed, run.breaks).map_err(|e| refuse("axis 1", e))?;
+    let axis_2 = interpolant_broken(run.e2, &parameters, closed, run.breaks).map_err(|e| refuse("axis 2", e))?;
 
     // --- The built volume: ∫ det[X_v, X_a, X_b] over the section and one lap,
     //     with X = C(v) + a·E1(v) + b·E2(v), by Gauss on every knot span of the
@@ -545,6 +600,8 @@ pub(super) fn station_report(run: &PlacedRun<'_>) -> Result<SweepStationReport, 
     };
     let mut spine_deviation: f64 = 0.0;
     let mut frame_deviation: f64 = 0.0;
+    let mut frame_slide: f64 = 0.0;
+    let mut kappa_max: f64 = 0.0;
     let mut length = 0.0;
     let mut moment_integral = 0.0;
     for k in 0..spans {
@@ -643,8 +700,14 @@ pub(super) fn station_report(run: &PlacedRun<'_>) -> Result<SweepStationReport, 
             spine_deviation = spine_deviation.max(distance);
             let e1_built = axis_1.evaluate(u).map_err(|e| refuse("axis 1", e))?;
             let e2_built = axis_2.evaluate(u).map_err(|e| refuse("axis 2", e))?;
-            let frame = (e1_built.sub(e1_true).length_squared() + e2_built.sub(e2_true).length_squared()).sqrt();
-            frame_deviation = frame_deviation.max(frame);
+            // Split along the path's tangent (a slide within the wall) and
+            // across it (a standoff).
+            let (d1, d2) = (e1_built.sub(e1_true), e2_built.sub(e2_true));
+            let (a1, a2) = (d1.dot(tangent), d2.dot(tangent));
+            let across = (d1.sub(tangent.scale(a1)).length_squared() + d2.sub(tangent.scale(a2)).length_squared()).sqrt();
+            frame_deviation = frame_deviation.max(across);
+            frame_slide = frame_slide.max((a1 * a1 + a2 * a2).sqrt());
+            kappa_max = kappa_max.max(kappa_n.length());
         }
         if corrections {
             // Composite Simpson on four equal steps of the path parameter.
@@ -656,7 +719,20 @@ pub(super) fn station_report(run: &PlacedRun<'_>) -> Result<SweepStationReport, 
     let (e1_0, e2_0) = (run.e1[0], run.e2[0]);
     let advance = run.tangents[0].dot(e1_0.cross(e2_0));
     let ideal = area * length * advance + moment_integral;
-    let wall_deviation = spine_deviation + run.reach * frame_deviation;
+    // Curvature at the stations too: a joint's jump lands there.
+    for k in 0..spans {
+        let (segment, t_a, t_b) = span_piece(run.chain, run.params, k, closed).map_err(|e| refuse("span", e))?;
+        for t in [t_a, t_b] {
+            let derivatives = run.chain[segment].derivatives_small(t, 2).map_err(|e| refuse("path", e))?;
+            kappa_max = kappa_max.max(super::sweep::curvature_vector(derivatives[1], derivatives[2]).length());
+        }
+    }
+    let slide = run.reach * frame_slide;
+    let wall_deviation = if run.slide_in_wall && run.reach * kappa_max < 1.0 {
+        spine_deviation + run.reach * frame_deviation + slide * slide * kappa_max / (2.0 * (1.0 - run.reach * kappa_max))
+    } else {
+        spine_deviation + run.reach * (frame_deviation + frame_slide)
+    };
     let (built_volume, ideal_volume, residual, crude) = if run.shift == 0 {
         (built.abs(), ideal.abs(), (built.abs() - ideal.abs()).abs(), false)
     } else {
@@ -670,6 +746,7 @@ pub(super) fn station_report(run: &PlacedRun<'_>) -> Result<SweepStationReport, 
         tolerance: run.tolerance,
         spine_deviation,
         frame_deviation,
+        frame_slide,
         wall_deviation,
         reach: run.reach,
         built_volume,

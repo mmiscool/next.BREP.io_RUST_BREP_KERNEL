@@ -10,9 +10,9 @@
 //! through the face it rides. The three 2026-10-21 reports
 //! (`tests/suites/inbox_20261021_fillet_local_relief.rs`):
 //!
-//! - 37e16630: r 1.7 on a face outline that runs around an r 1 round, so
+//! - the rounded-outline report: r 1.7 on a face outline that runs around an r 1 round, so
 //!   along that arc no ball over 1 fits;
-//! - 5e49bb42: r 2.2 on a cap whose outline turns at r 0.93, so the wall's
+//! - the sculpted-cap report: r 2.2 on a cap whose outline turns at r 0.93, so the wall's
 //!   rows fold at the turn;
 //! - and the same r 1 round at r 1.0 exactly, where the centre curve
 //!   collapses to a point and the station Newton is singular.
@@ -54,7 +54,7 @@
 //! `BREP_BLEND_RADIUS_RELIEF=0`/`off` is the escape hatch: the fold refuses
 //! as it did before 2026-10-21, and a support cusped under the edge's end is
 //! neither admitted by the support check nor tapered before the free end
-//! (`blend/taper_runout.rs`, report b46db89a).
+//! (`blend/taper_runout.rs`, the concave-sliver report).
 
 use crate::topology::{BrepSolid, EdgeRecord};
 use crate::{KernelRefusal, KernelStage, OrRefuse, Vec3};
@@ -72,8 +72,8 @@ const MARGIN: [f64; ATTEMPTS] = [1.0, 0.8, 0.8, 0.65];
 
 /// The ramp's mean slope (radius per unit length along the edges); the
 /// smoothstep's steepest is 1.875 times this. Steep first, to keep the
-/// requested radius on as much of the edge as builds: report 37e16630 builds
-/// at 0.25, while report 5e49bb42's sculpted wall misses the pcurve floor at
+/// requested radius on as much of the edge as builds: the rounded-outline report builds
+/// at 0.25, while the sculpted-cap report's sculpted wall misses the pcurve floor at
 /// 0.25 and 0.15 (1.7e-5, 4.8e-6) and builds at 0.1.
 const RAMP_SLOPE: [f64; ATTEMPTS] = [0.25, 0.15, 0.1, 0.1];
 
@@ -92,7 +92,7 @@ const BISECTIONS: usize = 7;
 /// this share of the edge's own advance: a contact rail that slows is turning
 /// tighter than the outline it follows (around a round of radius ρ a rail at
 /// offset `d` advances `1 − d/ρ`) and stops at its cusp, before any fold
-/// verdict reads it (report 5e49bb42's cap rail, at its tightest station:
+/// verdict reads it (the sculpted-cap report's cap rail, at its tightest station:
 /// 0.40 at r 0.92, 0.27 at r 1.10, 0.15 at r 1.28, 0.004 at r 1.47). The
 /// FITTED rows loop sooner where the turn is short (r 1.2 there): that is the
 /// network's rows-loop refusal, which the next attempt's [`MARGIN`] answers.
@@ -109,7 +109,7 @@ const REFINE: usize = 4;
 /// `1 − advance_floor`, the largest over the sweep), and no less than either
 /// neighbour, is refined like a short station: a turn narrower than the
 /// station spacing can fold between two stations that both read clear.
-/// Report 93aa19e7 (2026-10-25, r 1.2 on the sculpted cap's rim, measured
+/// The cap-rim report (2026-10-25, r 1.2 on the sculpted cap's rim, measured
 /// 2026-10-26): the apex of the cap outline's r 0.93 turn lies at 0.46615 of
 /// the rim, where the r 1.2 ball reads fold number 13.96 and section advance
 /// −2.33; the stations either side of it read 0.86 / 0.19 (0.46484) and
@@ -127,7 +127,7 @@ const PEAK_LEVELS: usize = 2;
 
 /// Law samples per edge (stops), endpoints included. The taper network
 /// interpolates them C1 (PCHIP), so its rails are only as smooth as the
-/// samples are dense: on report 5e49bb42 the relieved rim's pcurve missed its
+/// samples are dense: on the sculpted-cap report the relieved rim's pcurve missed its
 /// 1e-7 floor by 2.2e-5 at 64 samples and 4.4e-7 at 256.
 const LAW_SAMPLES: usize = 1024;
 
@@ -274,7 +274,7 @@ fn station_ceilings(solid: &BrepSolid, edge: &EdgeRecord, radius: f64, strict: b
                     // The largest over the sweep, not the last ball's: at
                     // r 1.7 the requested ball spans the sculpted cap's
                     // 0.93 turn and reads 0.55 at its apex, where the r 1.4
-                    // ball read 0.95 (report 67598fe2).
+                    // ball read 0.95 (the fold-ball report).
                     stress.set(stress.get().max((reading.number / fold_limit).max((1.0 - advance) / (1.0 - advance_floor))));
                 }
                 Some(fit)
@@ -375,7 +375,7 @@ fn station_ceilings(solid: &BrepSolid, edge: &EdgeRecord, radius: f64, strict: b
     }
     all.extend(refined);
     // A turn narrower than that spacing still reads clear either side of
-    // its apex (report 93aa19e7 at r 1.2: fold number 0.82 and advance 0.21
+    // its apex (the cap-rim report at r 1.2: fold number 0.82 and advance 0.21
     // at 0.46875 and 0.47396 of the rim, 13.96 and −2.33 at 0.46615 between
     // them): while no station reads short and the stress still peaks, two
     // spacings either side of the peak are read at a [`REFINE`]-fold finer
@@ -450,7 +450,7 @@ pub fn measure_ceilings(solid: &BrepSolid, edge_ids: &[u64], radius: f64) -> Res
 /// selected edges meet at a vertex as one carrier continued (the same two
 /// faces, tangent — `coalesce::merge_curve_continuation_edges_at`'s own
 /// test), they become one edge. A face's outline split into two edges of one
-/// curve (report 5e49bb42's cap rim: 0.27 and 22.85 long) is then one closed
+/// curve (the sculpted-cap report's cap rim: 0.27 and 22.85 long) is then one closed
 /// edge, whose law the closed march carries round (`blend_edge_variable`)
 /// where the network cannot march a tapered stripe across that vertex. `None`
 /// when nothing joins.

@@ -186,12 +186,7 @@ pub(super) fn revolved_parallel(source: &BrepSolid, distance: f64) -> Option<Off
     }
     match revolved_parallel_impl(source, distance) {
         Ok(Some(solid)) => {
-            let face_images = solid
-                .shells
-                .iter()
-                .flat_map(|shell| &shell.faces)
-                .map(|_| OffsetShellFaceImageRecord { role: OffsetFaceRole::Offset, source_face_id: 0 })
-                .collect();
+            let face_images = grown_provenance(source, &solid, distance);
             Some(OffsetShellResultRecord { solid, face_images })
         }
         Ok(None) => None,
@@ -200,6 +195,39 @@ pub(super) fn revolved_parallel(source: &BrepSolid, distance: f64) -> Option<Off
             None
         }
     }
+}
+
+/// Each grown face's source face: the one whose trimmed face holds the face's
+/// middle point moved back by `distance` along the face's outward normal, with
+/// the same outward normal there. A face moved off one source face reads that
+/// face; a rim's torus or a corner's ball reads 0 (moved back, its point lands
+/// on the rim or the corner, where no source face has its normal).
+fn grown_provenance(source: &BrepSolid, solid: &BrepSolid, distance: f64) -> Vec<OffsetShellFaceImageRecord> {
+    let scale = crate::solid_scale(source).max(1.0);
+    let sources: Vec<&FaceRecord> = source.shells.iter().flat_map(|shell| &shell.faces).collect();
+    let source_of = |face: &FaceRecord| -> Option<u64> {
+        let [u0, u1] = face.surface.domain_u().ok()?;
+        let [v0, v1] = face.surface.domain_v().ok()?;
+        let (u, v) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
+        let normal = super::face_normal(face, u, v).ok()?;
+        let back = face.surface.evaluate(u, v).ok()?.sub(normal.scale(distance));
+        sources.iter().find_map(|candidate| {
+            let foot = project_point_to_surface(&candidate.surface, back).ok()?;
+            if foot.distance > 1e-7 * scale {
+                return None;
+            }
+            let along = super::face_normal(candidate, foot.u, foot.v).ok()?;
+            // Inside that face's own trim: two faces may share one carrier.
+            let inside = parameter_point_in_face(candidate, Vec2 { x: foot.u, y: foot.v }, 1e-9).is_ok_and(|class| class == PolygonClass::Inside);
+            (inside && along.dot(normal) >= 1.0 - 1e-6).then_some(candidate.id)
+        })
+    };
+    solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .map(|face| OffsetShellFaceImageRecord { role: OffsetFaceRole::Offset, source_face_id: source_of(face).unwrap_or(0) })
+        .collect()
 }
 
 /// The axis (a point and a unit direction) and the body's frame across it.
@@ -244,6 +272,30 @@ fn on_face(face: &FaceRecord, axis: &Axis, p: P2, tolerance: f64) -> bool {
 /// refusal): a concave section arc grown by exactly its radius.
 fn collapsed_arc_enabled() -> bool {
     switch!("BREP_OFFSET_REVOLVED_COLLAPSED_ARC", true)
+}
+
+/// `BREP_OFFSET_REVOLVED_HAIR_CONCAVE` (default on; `=0` restores the
+/// 1e-12 bar): see [`concave_turn`].
+fn hair_concave_enabled() -> bool {
+    switch!("BREP_OFFSET_REVOLVED_HAIR_CONCAVE", true)
+}
+
+/// Whether a corner turning by `turn` (the cross product of the outward
+/// normals either side) is concave. A join the faces leave a hair off tangent
+/// is not: grown by `distance` its two offsets overlap by about
+/// `|turn| * distance`, the same bar under which a convex hair's corner arc is
+/// dropped as sweeping nothing. An exact fillet's rim solved to a few 1e-12
+/// off the equator of the ball it is tangent to turns -3e-12 there, and was
+/// read as a concave corner. Only normals that point the same way are a hair:
+/// a cross product as small at nearly opposite normals is a cusp (a narrow
+/// V-groove's floor), concave.
+fn concave_turn(n1: P2, n2: P2, distance: f64, tolerance: f64) -> bool {
+    let turn = n1.cross(n2);
+    if !hair_concave_enabled() {
+        return turn < -1e-12;
+    }
+    let same_way = n1.rho * n2.rho + n1.z * n2.z > 0.0;
+    turn < -1e-12 && (!same_way || -turn * distance > tolerance.max(1e-7 * distance))
 }
 
 /// `BREP_OFFSET_REVOLVED_FITTED_TORUS` (default on; `=0` restores): see
@@ -356,7 +408,118 @@ fn fitted_meridian_circle(face: &FaceRecord, axis: &Axis, tolerance: f64) -> Res
     Ok(Some((center, radius)))
 }
 
-fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<BrepSolid>, KernelRefusal> {
+/// A solid of revolution's half-section when every piece of it is a segment:
+/// the axis frame (`origin`, unit `axis`, unit radial `x`), the corners in
+/// (ρ, z) counter-clockwise, and `on_axis[k]` for the run from corner `k` to
+/// `k + 1` that closes the section along the axis (no face of the body).
+pub(super) struct HalfPolygon {
+    pub origin: Vec3,
+    pub axis: Vec3,
+    pub x: Vec3,
+    pub corners: Vec<(f64, f64)>,
+    pub on_axis: Vec<bool>,
+}
+
+/// [`HalfPolygon`] of `source`, or `None`.
+pub(super) fn half_section_polygon(source: &BrepSolid) -> Option<HalfPolygon> {
+    half_section_polygon_reading(source, false)
+}
+
+/// [`half_section_polygon`], also reading a cone to its apex on the axis as a
+/// segment when `cone_apex` (the revolved shell's reading; the eroders and the
+/// grower keep theirs).
+pub(super) fn half_section_polygon_reading(source: &BrepSolid, cone_apex: bool) -> Option<HalfPolygon> {
+    let (axis, chain) = read_half_section(source, true, cone_apex).ok()??;
+    let snap = 1e-7 * crate::solid_scale(source).max(1.0);
+    let mut runs: Vec<(P2, P2, bool)> = Vec::with_capacity(chain.len() + 1);
+    for piece in &chain {
+        let Piece::Line { start, end } = *piece else { return None };
+        runs.push((start, end, false));
+    }
+    let (head, tail) = (runs[0].0, runs[runs.len() - 1].1);
+    if head.rho.abs() <= snap && tail.rho.abs() <= snap {
+        let last = runs.len() - 1;
+        runs[0].0.rho = 0.0;
+        runs[last].1.rho = 0.0;
+        runs.push((P2 { rho: 0.0, z: tail.z }, P2 { rho: 0.0, z: head.z }, true));
+    } else if head.sub(tail).length() > snap {
+        return None;
+    }
+    let area2: f64 = runs.iter().map(|(a, b, _)| a.rho * b.z - b.rho * a.z).sum();
+    if area2 < 0.0 {
+        runs = runs.into_iter().rev().map(|(a, b, on)| (b, a, on)).collect();
+    }
+    Some(HalfPolygon {
+        origin: axis.origin,
+        axis: axis.axis,
+        x: axis.x,
+        corners: runs.iter().map(|(a, _, _)| (a.rho, a.z)).collect(),
+        on_axis: runs.iter().map(|(_, _, on)| *on).collect(),
+    })
+}
+
+/// Whether every point of `face`'s surface (a 7 × 7 grid) lies on one line of
+/// the meridian plane about `axis`.
+fn meridian_is_straight(face: &FaceRecord, axis: &Axis, tolerance: f64) -> Result<bool, KernelRefusal> {
+    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Classify, "domain_u")?;
+    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Classify, "domain_v")?;
+    let mut points = Vec::with_capacity(49);
+    for i in 0..7 {
+        for j in 0..7 {
+            let (u, v) = (u0 + (u1 - u0) * i as f64 / 6.0, v0 + (v1 - v0) * j as f64 / 6.0);
+            points.push(axis.to_2d(face.surface.evaluate(u, v).or_refuse(KernelStage::Classify, "evaluate")?));
+        }
+    }
+    // The two points farthest apart span the line.
+    let (mut a, mut b, mut span) = (points[0], points[0], 0.0);
+    for p in &points {
+        for q in &points {
+            let d = p.sub(*q).length();
+            if d > span {
+                (a, b, span) = (*p, *q, d);
+            }
+        }
+    }
+    if span <= tolerance {
+        return Ok(false);
+    }
+    let run = b.sub(a);
+    Ok(points.iter().all(|p| run.cross(p.sub(a)).abs() / span <= tolerance))
+}
+
+/// An edge that is an arc of a circle: the circle through its ends and its
+/// middle, every one of 32 samples on it within `tolerance`. `None` otherwise.
+fn fit_rim_arc(edge: &EdgeRecord, tolerance: f64) -> Result<Option<super::rim_welds::RimCircle>, KernelRefusal> {
+    let at = |fraction: f64| edge.curve.evaluate(edge.t0 + (edge.t1 - edge.t0) * fraction).or_refuse(KernelStage::Classify, "evaluate");
+    let (a, m, b) = (at(0.0)?, at(0.5)?, at(1.0)?);
+    let (u, w) = (m.sub(a), b.sub(a));
+    let normal = u.cross(w);
+    let Ok(axis) = normal.normalized() else { return Ok(None) };
+    // The circumcentre of a, m, b.
+    let n2 = normal.dot(normal);
+    let center = a.add(w.cross(normal).scale(u.dot(u) / (2.0 * n2)).add(normal.cross(u).scale(w.dot(w) / (2.0 * n2))));
+    let radius = a.sub(center).length();
+    if !(radius > tolerance) {
+        return Ok(None);
+    }
+    for k in 0..=32 {
+        let radial = at(k as f64 / 32.0)?.sub(center);
+        if radial.dot(axis).abs() > tolerance || (radial.length() - radius).abs() > tolerance {
+            return Ok(None);
+        }
+    }
+    Ok(Some(super::rim_welds::RimCircle { center, axis, radius }))
+}
+
+/// The body's axis and its half-section: the pieces in boundary order, from
+/// an axis end round to the other or round a loop clear of the axis. `None`
+/// where the body is not a solid of revolution this lane reads.
+///
+/// With `split_rims` a rim may be cut into arcs (a union cuts a drum's rim
+/// where the other operand's seam meets it): each arc is read as the exact
+/// circle through its ends and middle, and the arcs of one rim between the
+/// same two faces are one rim.
+fn read_half_section(source: &BrepSolid, split_rims: bool, cone_apex: bool) -> Result<Option<(Axis, Vec<Piece>)>, KernelRefusal> {
     let [shell] = source.shells.as_slice() else { return Ok(None) };
     let scale = crate::solid_scale(source).max(1.0);
     let tolerance = 1e-9 * scale;
@@ -381,7 +544,12 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
             continue; // a seam
         }
         let [a, b] = faces.as_slice() else { return Ok(None) };
-        let Some(circle) = super::rim_welds::fit_rim_circle(edge, tolerance)? else { return Ok(None) };
+        let fitted = match super::rim_welds::fit_rim_circle(edge, tolerance)? {
+            Some(circle) => Some(circle),
+            None if split_rims => fit_rim_arc(edge, 1e-7 * scale)?,
+            None => None,
+        };
+        let Some(circle) = fitted else { return Ok(None) };
         if axis.is_none() {
             let x = circle.axis.perpendicular().or_refuse(KernelStage::Classify, "perpendicular")?;
             axis = Some(Axis { origin: circle.center, axis: circle.axis, x });
@@ -390,7 +558,11 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
         if !frame.parallel(circle.axis) || !frame.on_axis(circle.center, tolerance) {
             return Ok(None);
         }
-        rims.push((edge.id, frame.to_2d(edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Classify, "evaluate")?), [*a, *b]));
+        let at = frame.to_2d(edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Classify, "evaluate")?);
+        if split_rims && rims.iter().any(|(_, p, f)| (*f == [*a, *b] || *f == [*b, *a]) && p.sub(at).length() <= 1e-7 * scale) {
+            continue;
+        }
+        rims.push((edge.id, at, [*a, *b]));
     }
     let Some(axis) = axis else { return Ok(None) };
 
@@ -425,9 +597,16 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
                 Some((P2 { rho: *major_radius, z: h }, *minor_radius))
             }
             // A face with no analytic reading (a fillet rolled round a
-            // rim is a fitted NURBS patch): it lies on a torus about the axis
-            // when every point of it lies on one circle of the meridian plane.
-            None if fitted_meridian_circle_enabled() => match fitted_meridian_circle(face, &axis, 1e-7 * scale)? {
+            // rim is a fitted NURBS patch), or an exact revolution of a
+            // conic arc (a constant fillet round a sphere-plane rim, built
+            // by the blend's exact revolution lane): it lies on a torus
+            // about the axis when every point of it lies on one circle of
+            // the meridian plane.
+            // With split rims (the eroders' reading), a revolved face whose
+            // meridian is straight (a revolved segment: a disk, an annulus, a
+            // cylinder or cone) is a segment of the section.
+            None | Some(AnalyticSurface::Revolution { .. }) if split_rims && meridian_is_straight(face, &axis, 1e-7 * scale)? => None,
+            None | Some(AnalyticSurface::Revolution { .. }) if fitted_meridian_circle_enabled() => match fitted_meridian_circle(face, &axis, 1e-7 * scale)? {
                 Some(circle) => Some(circle),
                 None => return Ok(None),
             },
@@ -455,6 +634,17 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
                 let start = rims[*a].1;
                 let axis_end = match face.surface.analytic() {
                     Some(AnalyticSurface::Plane { origin, .. }) => P2 { rho: 0.0, z: axis.to_2d(*origin).z },
+                    // A cone to its apex: the generatrix's end of radius 0.
+                    Some(AnalyticSurface::RuledRevolution { frame, rho0, rho1, height }) if cone_apex => {
+                        let along = if rho1.abs() <= tolerance && rho0.abs() > tolerance {
+                            *height
+                        } else if rho0.abs() <= tolerance && rho1.abs() > tolerance {
+                            0.0
+                        } else {
+                            return Ok(None);
+                        };
+                        P2 { rho: 0.0, z: axis.to_2d(frame.origin.add(frame.axis.scale(along))).z }
+                    }
                     _ => return Ok(None),
                 };
                 Piece::Line { start, end: axis_end }
@@ -489,7 +679,13 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
     // Order the pieces into one chain from the axis back to the axis, or one
     // loop clear of it, joined at the rims.
     let chain = order_pieces(&pieces, &rims, tolerance)?;
-    let Some(mut chain) = chain else { return Ok(None) };
+    Ok(chain.map(|chain| (axis, chain)))
+}
+
+fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<BrepSolid>, KernelRefusal> {
+    let scale = crate::solid_scale(source).max(1.0);
+    let tolerance = 1e-9 * scale;
+    let Some((axis, mut chain)) = read_half_section(source, false, false)? else { return Ok(None) };
     let touches_axis = chain.first().is_some_and(|p| p.start().rho.abs() <= tolerance);
     // A closed loop has no first piece: start it on a piece that does not
     // collapse (a concave arc grown by its radius is dropped between its two
@@ -520,6 +716,12 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
     // neighbours' offsets meet there in a sharp edge, with no corner arc.
     let collapse = 1e-7 * scale;
     let mut after_collapse = false;
+    // A concave arc grown PAST its radius vanishes: its neighbours' offsets
+    // cross and are cut at the crossing, a sharp concave crease
+    // (`BREP_OFFSET_REVOLVED_VANISHED_ARC`). The arc's centre picks the
+    // crossing; the check below that every grown piece lies the distance from
+    // the section stands guard.
+    let mut vanished: Option<P2> = None;
     for (k, piece) in chain.iter().enumerate() {
         let moved = match *piece {
             Piece::Line { start, end } => {
@@ -532,6 +734,19 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
                     after_collapse = true;
                     continue;
                 }
+                if !ccw && r < -collapse && vanished_arc_on() && vanished.is_none() && k > 0 && k + 1 < chain.len() {
+                    // Only a FILLET vanishes so: an arc tangent to both
+                    // neighbours, the rolling disk between them. A concave arc
+                    // meeting either at an angle is no closing, and extending
+                    // its neighbours would add material past the distance.
+                    let joins = |a: Option<P2>, b: Option<P2>| matches!((a, b), (Some(a), Some(b)) if a.sub(b).length() <= 1e-6);
+                    if !joins(outward(&chain[k - 1], true), outward(piece, false)) || !joins(outward(piece, true), outward(&chain[k + 1], false)) {
+                        os_debug!("revolved parallel lane: a concave arc grown past its radius is not tangent to its neighbours");
+                        return Ok(None);
+                    }
+                    vanished = Some(center);
+                    continue;
+                }
                 if !(r > tolerance) {
                     return Ok(None);
                 }
@@ -539,6 +754,23 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
                 Piece::Arc { center, radius: r, start: center.add(start.sub(center).scale(k)), end: center.add(end.sub(center).scale(k)), ccw }
             }
         };
+        if let Some(hub) = vanished.take() {
+            let Some(last) = grown.pop() else { return Ok(None) };
+            let Some(crease) = crossing_nearest(&last, &moved, hub) else {
+                os_debug!("revolved parallel lane: the offsets beside a vanished arc do not cross");
+                return Ok(None);
+            };
+            // The crease lies exactly the distance from the section, no farther
+            // (the check below reads only the near side).
+            let reach = chain.iter().map(|source| source.distance(crease)).fold(f64::INFINITY, f64::min);
+            if (reach - distance).abs() > 1e-7 * scale {
+                os_debug!("revolved parallel lane: the crease lies {reach:.9} from the section, not {distance:.9}");
+                return Ok(None);
+            }
+            grown.push(with_end(&last, crease));
+            grown.push(with_start(&moved, crease));
+            continue;
+        }
         if after_collapse {
             after_collapse = false;
             let Some(last) = grown.last() else { return Ok(None) };
@@ -554,7 +786,7 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
             let corner = piece.start();
             let (Some(n1), Some(n2)) = (outward(previous, true), outward(piece, false)) else { return Ok(None) };
             let turn = n1.cross(n2);
-            if turn < -1e-12 {
+            if concave_turn(n1, n2, distance, tolerance) {
                 os_debug!("revolved parallel lane: concave corner at ({:.6}, {:.6}), turn {turn:.3e}", corner.rho, corner.z);
                 return Ok(None); // concave
             }
@@ -581,7 +813,7 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
         let corner = first.start();
         let (Some(n1), Some(n2)) = (outward(last, true), outward(first, false)) else { return Ok(None) };
         let turn = n1.cross(n2);
-        if turn < -1e-12 {
+        if concave_turn(n1, n2, distance, tolerance) {
             return Ok(None);
         }
         if turn > 1e-12 || n1.rho * n2.rho + n1.z * n2.z < 0.0 {
@@ -688,6 +920,59 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
     }
     os_debug!("revolved parallel lane built {} faces from {} section pieces", solid.shells.iter().map(|s| s.faces.len()).sum::<usize>(), grown.len());
     Ok(Some(solid))
+}
+
+/// `BREP_OFFSET_REVOLVED_VANISHED_ARC` (default on; `=0` restores): a concave arc grown past
+/// its radius is dropped and its neighbours' offsets cut where they cross.
+fn vanished_arc_on() -> bool {
+    switch!("BREP_OFFSET_REVOLVED_VANISHED_ARC", true)
+}
+
+
+/// Where the carriers of `a` and `b` (a line or a circle each) cross, nearest
+/// `hub`; `None` when they do not cross.
+fn crossing_nearest(a: &Piece, b: &Piece, hub: P2) -> Option<P2> {
+    let circle = |piece: &Piece| match *piece {
+        Piece::Arc { center, radius, .. } => Some((center, radius)),
+        Piece::Line { .. } => None,
+    };
+    let line = |piece: &Piece| (piece.start(), piece.end().sub(piece.start()));
+    let line_circle = |(p, u): (P2, P2), (c, r): (P2, f64)| -> Vec<P2> {
+        let uu = u.rho * u.rho + u.z * u.z;
+        let w = p.sub(c);
+        let (half_b, cc) = ((w.rho * u.rho + w.z * u.z) / uu, (w.rho * w.rho + w.z * w.z - r * r) / uu);
+        let disc = half_b * half_b - cc;
+        if disc < 0.0 {
+            return Vec::new();
+        }
+        let root = disc.sqrt();
+        [-half_b - root, -half_b + root].iter().map(|t| p.add(u.scale(*t))).collect()
+    };
+    let points: Vec<P2> = match (circle(a), circle(b)) {
+        (None, None) => {
+            let ((p, u), (q, w)) = (line(a), line(b));
+            let den = u.cross(w);
+            if den.abs() <= 1e-15 * u.length() * w.length() {
+                return None;
+            }
+            vec![p.add(u.scale(q.sub(p).cross(w) / den))]
+        }
+        (None, Some(c)) => line_circle(line(a), c),
+        (Some(c), None) => line_circle(line(b), c),
+        (Some((c1, r1)), Some((c2, r2))) => {
+            let gap = c2.sub(c1).length();
+            if gap <= 1e-15 || gap > r1 + r2 || gap < (r1 - r2).abs() {
+                return None;
+            }
+            let along = (r1 * r1 - r2 * r2 + gap * gap) / (2.0 * gap);
+            let half = (r1 * r1 - along * along).max(0.0).sqrt();
+            let unit = c2.sub(c1).scale(1.0 / gap);
+            let foot = c1.add(unit.scale(along));
+            let across = P2 { rho: -unit.z, z: unit.rho };
+            vec![foot.add(across.scale(half)), foot.sub(across.scale(half))]
+        }
+    };
+    points.into_iter().min_by(|p, q| p.sub(hub).length().total_cmp(&q.sub(hub).length()))
 }
 
 /// The pieces in boundary order: from an axis end round to the other, or
@@ -814,3 +1099,4 @@ fn split_at_axis(piece: &Piece, tolerance: f64) -> Vec<Piece> {
         }
     }
 }
+

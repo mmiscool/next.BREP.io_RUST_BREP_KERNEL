@@ -1771,10 +1771,10 @@ pub fn fit_polyline_seeded_with_path(
     // the seeded set cannot respect the contract, and the attempt is DECLINED
     // to the identical full refit. Seeds are never dropped or moved, and no
     // new threshold is read: membership is `station_pool`'s own answer.
-    // Measured on the helmet's 2036x3009 section (2026-10-04, 42f031ae6): an
+    // Measured on the helmet's 2036x3009 section (2026-10-04): an
     // accepted seeded fit with one seed outside the pool met its polyline
     // floor at 6.373e-8 while its carrier mid-span rang to 1.945e-4. That
-    // seed is an insert SIMPLIFIED away (traced on c47bedc2a: insert
+    // seed is an insert SIMPLIFIED away (traced: insert
     // simplified 1, conditioned 0), not conditioned. The round's closest
     // seed pair (station-insert, 8.585e-8, same 59 seeds) sits under the
     // 4.881e-7 near-duplicate floor, but no seed was conditioned out; which
@@ -1866,7 +1866,7 @@ pub fn fit_polyline_seeded_with_path(
 /// ruling, 2026-10-04): `tight` indices of `points` (the refiner's own
 /// inserted true-carrier points) must lie within `tight_tolerance` of the
 /// curve (the refiner's existing carrier floor), while every other point is
-/// held to `tolerance` as before. Measured on e90c30c94's bend: round 2's
+/// held to `tolerance` as before. Measured on the bend: round 2's
 /// inserts were already within 1e-7 of round 1's 63-station curve, so the
 /// candidate added nothing, the carrier worst stayed 1.762e-8 against the
 /// 1e-8 floor, and the bounded retry ended on the full refit. A tight

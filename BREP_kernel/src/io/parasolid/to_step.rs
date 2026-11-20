@@ -164,6 +164,9 @@ struct Translator<'a> {
     /// ...and each vertex's position with its tolerance (mm, 0 when exact).
     edge_end_tolerances: Vec<(Vec3, f64)>,
     anchor: Option<(Vec3, Vec3)>,
+    /// Where each ring edge written so far closes (mm): the vertex STEP
+    /// gives it.
+    ring_points: HashMap<u32, Vec3>,
     /// Blend spines, fitted once each, or the reason one cannot be: a
     /// blend's boundary edges ask for its spine as well as its face, and a
     /// spine that does not fit is costly to fail again.
@@ -172,6 +175,9 @@ struct Translator<'a> {
     /// once no fin of the edge reads otherwise, the other face's statement
     /// of the edge being the better one where it has one.
     read_blend_sp: bool,
+    /// Tolerant vertices' points as written, each found the first time it
+    /// is asked for ([`Translator::seat_of`]), by vertex index.
+    seats: std::cell::RefCell<HashMap<u32, Vec3>>,
 }
 
 /// Translate one BODY node to a Part 21 document.
@@ -189,8 +195,10 @@ pub fn body_to_step(file: &XtFile, body: &Node, tag: usize) -> Result<BodyStep, 
         edge_ends: None,
         edge_end_tolerances: Vec::new(),
         anchor: None,
+        ring_points: HashMap::default(),
         spines: HashMap::default(),
         read_blend_sp: false,
+        seats: Default::default(),
     };
     t.body(body)?;
     // The loosest tolerance the file gives its edges and vertices (at least
@@ -436,6 +444,13 @@ impl<'a> Translator<'a> {
 
     /// Points along an edge's curve between its vertices, for bounding.
     fn edge_samples(&self, edge: &Node) -> Vec<Vec3> {
+        self.edge_samples_n(edge, 16, 0)
+    }
+
+    /// `pieces + 1` points along an edge's curve between its vertices, from
+    /// its negative fin's vertex to its positive fin's, and with `per_span`
+    /// above 0, `per_span - 1` more in each knot span of a B-curve.
+    fn edge_samples_n(&self, edge: &Node, pieces: usize, per_span: usize) -> Vec<Vec3> {
         let Some(curve) = self.file.follow(edge, "curve").and_then(|c| geometry::curve(self.file, c).ok()) else {
             return Vec::new();
         };
@@ -476,7 +491,21 @@ impl<'a> Translator<'a> {
                 None => return Vec::new(),
             },
         };
-        (0..=16).filter_map(|k| curve.point(range[0] + (range[1] - range[0]) * k as f64 / 16.0).ok()).collect()
+        let mut at: Vec<f64> = (0..=pieces).map(|k| range[0] + (range[1] - range[0]) * k as f64 / pieces as f64).collect();
+        if let (Curve::Nurbs(nurbs), true) = (&curve, per_span > 0) {
+            // Eight more points in each of the B-curve's knot spans the
+            // edge crosses, however narrow, so none goes unsampled.
+            let (lo, hi) = (range[0].min(range[1]), range[0].max(range[1]));
+            for w in nurbs.knots.windows(2) {
+                let (a, b) = (w[0].max(lo), w[1].min(hi));
+                if b > a {
+                    at.extend((1..per_span).map(|k| a + (b - a) * k as f64 / per_span as f64));
+                }
+            }
+            let forward = range[1] >= range[0];
+            at.sort_by(|a, b| if forward { a.total_cmp(b) } else { b.total_cmp(a) });
+        }
+        at.into_iter().filter_map(|t| curve.point(t).ok()).collect()
     }
 
     /// The fins of a loop in order: `forward` from `loop.halfedge`.
@@ -500,6 +529,14 @@ impl<'a> Translator<'a> {
         let surface_node = self.node(surface_index, "the surface of a face").map_err(|e| format!("face {face_id}: {e}"))?;
         let emitted = if surface_node.type_name() == "BLENDED_EDGE" {
             self.blend_surface(face, surface_node)
+        } else if let Some(band) = self.helical_band(face, surface_node) {
+            Ok(band)
+        } else if let Some(pinned) = self.pinned_offset(face, surface_node) {
+            Ok(pinned)
+        } else if let Some(extended) = self.extended_offset(face, surface_node) {
+            Ok(extended)
+        } else if let Some(turned) = self.turned_lemon(face, surface_node) {
+            Ok(turned)
         } else {
             self.surface(surface_node)
         }
@@ -547,6 +584,436 @@ impl<'a> Translator<'a> {
         Ok(id)
     }
 
+    /// A lemon torus face with a vertex beside the seam of the surface
+    /// written for it ([`SEAM_ROW_NEAR`]: near the arc its revolve starts at,
+    /// in the frame's x direction, but not on it), as its own revolve turned
+    /// about the axis to start in the middle of the widest turn between the
+    /// face's vertices. A STEP reader seams a face along its surface's first
+    /// section through the vertices on it; a vertex just beside that section
+    /// leaves the face's loop open in the surface's parameters by that much.
+    /// The turned surface is kept only when no vertex is beside its own seam
+    /// either, as a blend's is ([`Self::widest_vertex_gap`]).
+    fn turned_lemon(&mut self, face: &Node, surface_node: &Node) -> Option<usize> {
+        if surface_node.type_name() != "TORUS" {
+            return None;
+        }
+        let Ok(Surface::Torus { frame, major, minor }) = geometry::surface(self.file, surface_node, 0) else { return None };
+        if !(major < 0.0) {
+            return None;
+        }
+        let points: Vec<Vec3> = chain(self.file, face.ptr("loop"), "next")
+            .into_iter()
+            .flat_map(|lp| self.fins(lp))
+            .filter_map(|fin| self.vertex_location(fin.ptr("vertex")).ok())
+            .collect();
+        let turned = turned_lemon_frame(frame, major, minor, &points)?;
+        let Ok(Surface::Spun { profile: Curve::Nurbs(arc), axis_point, axis }) = geometry::lemon(turned, major, minor) else { return None };
+        // Oriented as the torus, as the shared lemon surface is.
+        let id = self.emit_nurbs_surface(&revolve(&arc, axis_point, axis).ok()?);
+        self.emitted.push(EmittedSurface { id, flipped: false });
+        Some(self.emitted.len() - 1)
+    }
+
+    /// The offset of a B-surface whose boundary row a face's vertex closes
+    /// (a keycap's dish: the base's arc sections shrink to the offset distance,
+    /// so the offset's last section shrinks to that point) as a B-surface with
+    /// that row pinned to the vertex. Offset at a radius of curvature equal to
+    /// its distance, the row's ends meet at the vertex but its middle runs out
+    /// and back along itself (0.086 mm on the keycap, the way out and back
+    /// within 1e-3 mm: no area), so a face's loop up one side, through the
+    /// vertex and down the other cannot close in the surface's parameters.
+    /// The offset is the carrier a STEP reader makes of the OFFSET_SURFACE
+    /// otherwise written; only that row's poles move, onto the vertex.
+    fn pinned_offset(&mut self, face: &Node, surface_node: &Node) -> Option<usize> {
+        if surface_node.type_name() != "OFFSET_SURF" {
+            return None;
+        }
+        let exact = geometry::surface(self.file, surface_node, 0).ok()?;
+        let Surface::Offset { base, base_sense, distance } = &exact else { return None };
+        let Surface::Nurbs(base) = base.as_ref() else { return None };
+        // Read on the exact offset first, so only a face that needs it pays
+        // for the fit.
+        let domain = [base.domain_u().ok()?, base.domain_v().ok()?];
+        let boundary = self.face_boundary_points(face);
+        let pins = self.folded_rows(face, &exact, domain, &boundary);
+        if pins.is_empty() {
+            return None;
+        }
+        // As the OFFSET_SURFACE would be written and read back (an
+        // unflipped B-surface basis offset along its own normal).
+        let along = if *base_sense { *distance } else { -*distance };
+        let carrier = crate::FaceRecord { id: 0, surface: base.clone(), same_sense: true, loops: Vec::new(), name: None };
+        let offset = crate::offset::offset_surface_for_import(&carrier, -along).or_else(|_| crate::offset_surface(&carrier, -along, 0.0)).ok()?;
+        if [offset.domain_u().ok()?, offset.domain_v().ok()?] != domain {
+            return None;
+        }
+        let offset = pin_rows(offset, &pins)?;
+        // The poles moved bend the surface across their spans: every point
+        // of the face's boundary must still lie on it (cross review: an
+        // edge beside the row would leave its face).
+        if !boundary.iter().all(|p| lies_on(&offset, *p, PIN_ON)) {
+            return None;
+        }
+        self.fitted_curves += 1;
+        let id = self.emit_nurbs_surface(&offset);
+        self.emitted.push(EmittedSurface { id, flipped: false });
+        Some(self.emitted.len() - 1)
+    }
+
+    /// The boundary rows of `exact` over `domain` (u at each end, then v:
+    /// sides 0 to 3) that close on a vertex of the face out and back along
+    /// themselves ([`Translator::pinned_offset`]), each with its vertex.
+    fn folded_rows(&self, face: &Node, exact: &Surface, [[u0, u1], [v0, v1]]: [[f64; 2]; 2], boundary: &[Vec3]) -> Vec<(usize, Vec3)> {
+        let vertices: Vec<Vec3> = chain(self.file, face.ptr("loop"), "next")
+            .into_iter()
+            .flat_map(|lp| self.fins(lp))
+            .filter_map(|fin| self.vertex_location(fin.ptr("vertex")).ok())
+            .collect();
+        let at = |side: usize, t: f64| match side {
+            0 => exact.point(u0, v0 + (v1 - v0) * t),
+            1 => exact.point(u1, v0 + (v1 - v0) * t),
+            2 => exact.point(u0 + (u1 - u0) * t, v0),
+            _ => exact.point(u0 + (u1 - u0) * t, v1),
+        };
+        let mut pins = Vec::new();
+        for side in 0..4 {
+            let (Ok(a), Ok(b)) = (at(side, 0.0), at(side, 1.0)) else { continue };
+            let Some(&vertex) = vertices.iter().find(|v| a.sub(**v).length() <= PIN_ENDS && b.sub(**v).length() <= PIN_ENDS) else { continue };
+            let samples: Vec<Vec3> = (0..=PIN_SAMPLES).filter_map(|k| at(side, k as f64 / PIN_SAMPLES as f64).ok()).collect();
+            if samples.len() != PIN_SAMPLES + 1 {
+                continue;
+            }
+            let excursion = samples.iter().map(|p| p.sub(vertex).length()).fold(0.0, f64::max);
+            let width = (0..=PIN_SAMPLES).map(|k| samples[k].sub(samples[PIN_SAMPLES - k]).length()).fold(0.0, f64::max);
+            // Out and back along itself, and no edge of the face along it:
+            // a narrow closed boundary of the face would have its edges
+            // there (cross review). The row's middle half stands at least a
+            // quarter of its excursion from the vertex.
+            let middle: Vec<Vec3> = samples[PIN_SAMPLES / 4..=3 * PIN_SAMPLES / 4].to_vec();
+            let bounded = boundary.iter().any(|b| middle.iter().any(|m| m.sub(*b).length() <= PIN_FIN * excursion));
+            if excursion > PIN_ENDS && excursion <= PIN_EXCURSION && width <= PIN_FIN * excursion && !bounded {
+                pins.push((side, vertex));
+            }
+        }
+        pins
+    }
+
+    /// The offset of a B-surface whose face runs past the base's domain, as
+    /// Parasolid lets it: the base goes on along its boundary tangent planes
+    /// (a keycap dish's triangle closes at an apex 0.3 mm past its base's
+    /// last row, where that row's offset is 0.09 mm wide). An OFFSET_SURFACE
+    /// would be read on the base's own domain and the face could not close,
+    /// so the base is extended on each side the face's SP-curves cross, just
+    /// as far as they go, and written as the B-surface a STEP reader makes
+    /// of its offset. None for a face within its base, and when the
+    /// extended offset does not carry every point of the face's boundary.
+    fn extended_offset(&mut self, face: &Node, surface_node: &Node) -> Option<usize> {
+        if surface_node.type_name() != "OFFSET_SURF" {
+            return None;
+        }
+        let exact = geometry::surface(self.file, surface_node, 0).ok()?;
+        let Surface::Offset { base, base_sense, distance } = &exact else { return None };
+        let Surface::Nurbs(base) = base.as_ref() else { return None };
+        let [u0, u1] = base.domain_u().ok()?;
+        let [v0, v1] = base.domain_v().ok()?;
+        // How far the face's SP-curves on this offset reach, over the
+        // stretch each fin's trim keeps: read at even steps and in every knot
+        // span, each extreme then refined between its neighbours (cross
+        // review: a narrow excursion between even steps).
+        let (mut low, mut high) = ([u0, v0], [u1, v1]);
+        let mut on_curves: Vec<[f64; 2]> = Vec::new();
+        for fin in chain(self.file, face.ptr("loop"), "next").into_iter().flat_map(|lp| self.fins(lp)) {
+            let mut curve = self.file.follow(fin, "curve");
+            let mut trim: Option<[f64; 2]> = None;
+            for _ in 0..8 {
+                let Some(c) = curve.filter(|c| c.type_name() == "TRIMMED_CURVE") else { break };
+                if let (Some(a), Some(b)) = (c.real("parm_1"), c.real("parm_2")) {
+                    trim = Some([a.min(b), a.max(b)]);
+                }
+                curve = self.file.follow(c, "basis_curve");
+            }
+            let Some(sp) = curve.filter(|c| c.type_name() == "SP_CURVE" && c.ptr("surface") == surface_node.index) else { continue };
+            let uv = geometry::parameter_curve(self.file, self.file.follow(sp, "b_curve")?).ok()?;
+            let [t0, t1] = uv.domain().ok()?;
+            let [a, b] = trim.map(|[a, b]| [a.max(t0), b.min(t1)]).filter(|[a, b]| b > a).unwrap_or([t0, t1]);
+            let mut ts: Vec<f64> = (0..=EXTEND_SAMPLES).map(|k| a + (b - a) * k as f64 / EXTEND_SAMPLES as f64).collect();
+            for w in uv.knots.windows(2) {
+                let (c, d) = (w[0].max(a), w[1].min(b));
+                if d > c {
+                    ts.extend((0..=8).map(|k| c + (d - c) * k as f64 / 8.0));
+                }
+            }
+            ts.sort_by(f64::total_cmp);
+            ts.dedup();
+            let read = |t: f64| uv.evaluate(t).ok().map(|p| [p.x, p.y]);
+            let points: Vec<[f64; 2]> = ts.iter().map(|&t| read(t)).collect::<Option<_>>()?;
+            on_curves.extend(points.iter().copied());
+            for p in &points {
+                low = [low[0].min(p[0]), low[1].min(p[1])];
+                high = [high[0].max(p[0]), high[1].max(p[1])];
+            }
+            // Each coordinate's least and greatest: every sample that stands
+            // at least as far as both its neighbours is refined between them
+            // by golden-section search (cross review: the best sample can sit
+            // on a plateau beside a narrower, higher peak).
+            let golden = 0.5 * (5f64.sqrt() - 1.0);
+            for axis in 0..2 {
+                for sign in [-1.0, 1.0] {
+                    let value = |t: f64| read(t).map_or(f64::NEG_INFINITY, |p| sign * p[axis]);
+                    let values: Vec<f64> = points.iter().map(|p| sign * p[axis]).collect();
+                    for i in 0..ts.len() {
+                        let (before, after) = (i.saturating_sub(1), (i + 1).min(ts.len() - 1));
+                        if values[i] < values[before] || values[i] < values[after] {
+                            continue;
+                        }
+                        let (mut lo, mut hi) = (ts[before], ts[after]);
+                        for _ in 0..60 {
+                            let (x1, x2) = (hi - golden * (hi - lo), lo + golden * (hi - lo));
+                            if value(x1) >= value(x2) { hi = x2 } else { lo = x1 }
+                        }
+                        let extreme = read(0.5 * (lo + hi))?;
+                        on_curves.push(extreme);
+                        low = [low[0].min(extreme[0]), low[1].min(extreme[1])];
+                        high = [high[0].max(extreme[0]), high[1].max(extreme[1])];
+                    }
+                }
+            }
+        }
+        let (closed_u, closed_v) = base.closed_directions().ok()?;
+        let past = |reach: f64, span: f64, closed: bool| if !closed && reach > EXTEND_PAST * span { reach } else { 0.0 };
+        let sides = [
+            (true, true, past(u0 - low[0], u1 - u0, closed_u)),
+            (true, false, past(high[0] - u1, u1 - u0, closed_u)),
+            (false, true, past(v0 - low[1], v1 - v0, closed_v)),
+            (false, false, past(high[1] - v1, v1 - v0, closed_v)),
+        ];
+        if sides.iter().all(|s| s.2 == 0.0) {
+            return None;
+        }
+        let mut extended = base.clone();
+        for (along_u, at_low, delta) in sides {
+            if delta > 0.0 {
+                extended = tangent_extension(&extended, along_u, at_low, delta)?;
+            }
+        }
+        // The strip follows the tangent planes the offset reads exactly only
+        // where the weights hold across the side (cross review): it must
+        // stand within the boundary's bar of them over the whole strip
+        // (8.8e-6 mm on the keycap, at its apex).
+        let [eu, ev] = [extended.domain_u().ok()?, extended.domain_v().ok()?];
+        for i in 0..=EXTEND_GRID {
+            for j in 0..=EXTEND_GRID {
+                let (u, v) = (eu[0] + (eu[1] - eu[0]) * i as f64 / EXTEND_GRID as f64, ev[0] + (ev[1] - ev[0]) * j as f64 / EXTEND_GRID as f64);
+                if !(u < u0 || u > u1 || v < v0 || v > v1) {
+                    continue;
+                }
+                let tangent = base.derivatives_extended(u, v, 0).ok()?[0][0];
+                if extended.evaluate(u, v).ok()?.sub(tangent).length() > EXTEND_ON {
+                    return None;
+                }
+            }
+        }
+        // As the OFFSET_SURFACE would be written and read back (an
+        // unflipped B-surface basis offset along its own normal).
+        let along = if *base_sense { *distance } else { -*distance };
+        let carrier = crate::FaceRecord { id: 0, surface: extended, same_sense: true, loops: Vec::new(), name: None };
+        let domain = [carrier.surface.domain_u().ok()?, carrier.surface.domain_v().ok()?];
+        let offset = crate::offset::offset_surface_for_import(&carrier, -along).or_else(|_| crate::offset_surface(&carrier, -along, 0.0)).ok()?;
+        if [offset.domain_u().ok()?, offset.domain_v().ok()?] != domain {
+            return None;
+        }
+        // Run on to a vertex, a side can close there out and back along
+        // itself as a pinned offset's does: pinned the same way.
+        let mut boundary = self.face_boundary_points(face);
+        let pins = self.folded_rows(face, &exact, domain, &boundary);
+        let offset = if pins.is_empty() { offset } else { pin_rows(offset, &pins)? };
+        // The SP-curves' own points too, at every sample their reach was
+        // read at (cross review: an edge's sampling could miss an excursion).
+        boundary.extend(on_curves.iter().filter_map(|p| exact.point(p[0], p[1]).ok()));
+        if !boundary.iter().all(|p| lies_on(&offset, *p, EXTEND_ON)) {
+            return None;
+        }
+        self.fitted_curves += 1;
+        let id = self.emit_nurbs_surface(&offset);
+        self.emitted.push(EmittedSurface { id, flipped: false });
+        Some(self.emitted.len() - 1)
+    }
+
+    /// A cylinder face that winds round its axis more than once, between
+    /// two helices (a modelled thread's crest or root), carried by one of its
+    /// helices swept along the axis: S(w, t) = C(t) + w·axis, the stretch of
+    /// w it uses. Every such sweep lies on the cylinder, but its parameters
+    /// run along the helix through every turn, where the cylinder's go round
+    /// once and the face's loop cannot close in them. Taken only where the
+    /// helix covers every turn of the face and the face is narrower along
+    /// the axis than half the helix's pitch, so the sweep, a little wider
+    /// than the face and narrower than the pitch, never meets itself;
+    /// None for every other face. Its normal is the cylinder's, outward.
+    fn helical_band(&mut self, face: &Node, surface_node: &Node) -> Option<usize> {
+        use std::f64::consts::{PI, TAU};
+        if surface_node.type_name() != "CYLINDER" {
+            return None;
+        }
+        let Ok(Surface::Cylinder { frame, radius }) = geometry::surface(self.file, surface_node, 0) else { return None };
+        let axis = frame.z.normalized().ok()?;
+        let (x, y) = (frame.x, frame.y());
+        let angle = |p: Vec3| {
+            let d = p.sub(frame.origin);
+            d.dot(y).atan2(d.dot(x))
+        };
+        let height = |p: Vec3| p.sub(frame.origin).dot(axis);
+        let wrap = |a: f64| a - TAU * (a / TAU).round();
+        let loops: Vec<&Node> = chain(self.file, face.ptr("loop"), "next").collect();
+        let [lp] = loops[..] else { return None };
+        // The loop walked densely, each fin from its start to its end, and
+        // its B-curves, which may be helices.
+        let fins = self.fins(lp);
+        let mut walk: Vec<Vec3> = Vec::new();
+        let mut guides: Vec<(NurbsCurve, usize)> = Vec::new();
+        for (k, fin) in fins.iter().enumerate() {
+            let edge = self.file.follow(fin, "edge")?;
+            let start = self.vertex_location(fins[(k + fins.len() - 1) % fins.len()].ptr("vertex")).ok()?;
+            let end = self.vertex_location(fin.ptr("vertex")).ok()?;
+            let curve = geometry::curve(self.file, self.file.follow(edge, "curve")?).ok()?;
+            let pieces = match &curve {
+                Curve::Line { .. } => 1,
+                Curve::Circle { .. } | Curve::Ellipse { .. } => 64,
+                Curve::Nurbs(nurbs) => 32 * nurbs.control_points.len(),
+            };
+            let mut samples = self.edge_samples_n(edge, pieces, 8);
+            if fin.char("sense") == Some(b'-') {
+                samples.reverse();
+            }
+            walk.push(start);
+            if let Curve::Nurbs(nurbs) = curve {
+                guides.push((nurbs, walk.len() - 1));
+            }
+            walk.extend(samples);
+            walk.push(end);
+        }
+        if walk.len() < 3 {
+            return None;
+        }
+        // Every point on the cylinder, and the walk round it unwrapped. A
+        // face that goes round the axis is a whole band, not this.
+        let tolerance = 1e-6 * (1.0 + radius);
+        if walk.iter().any(|p| (p.sub(frame.origin).sub(axis.scale(height(*p))).length() - radius).abs() > 1e3 * tolerance) {
+            return None;
+        }
+        let mut turned = vec![angle(walk[0])];
+        for k in 1..walk.len() {
+            let step = wrap(angle(walk[k]) - angle(walk[k - 1]));
+            if step.abs() > 0.5 * PI {
+                return None;
+            }
+            turned.push(turned[k - 1] + step);
+        }
+        let back = turned[walk.len() - 1] + wrap(angle(walk[0]) - angle(walk[walk.len() - 1]));
+        let (lo, hi) = turned.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &t| (a.min(t), b.max(t)));
+        if (back - turned[0]).abs() > 1e-6 || hi - lo <= TAU {
+            return None;
+        }
+        for (guide, anchor) in guides {
+            let [t0, t1] = guide.domain().ok()?;
+            // The helix tabled by its angle, unwrapped, and its height, at
+            // even steps and eight to each knot span, however narrow.
+            let pieces = 32 * guide.control_points.len();
+            let mut ts: Vec<f64> = (0..=pieces).map(|k| t0 + (t1 - t0) * k as f64 / pieces as f64).collect();
+            for w in guide.knots.windows(2) {
+                let (a, b) = (w[0].max(t0), w[1].min(t1));
+                if b > a {
+                    ts.extend((1..8).map(|k| a + (b - a) * k as f64 / 8.0));
+                }
+            }
+            ts.sort_by(f64::total_cmp);
+            ts.dedup();
+            let n = ts.len() - 1;
+            let mut table: Vec<(f64, f64)> = Vec::with_capacity(n + 1);
+            for &t in &ts {
+                let p = guide.evaluate(t).ok()?;
+                let a = match table.last() {
+                    Some(&(last, _)) => last + wrap(angle(p) - last),
+                    None => angle(p),
+                };
+                table.push((a, height(p)));
+            }
+            let rising = table[n].0 > table[0].0;
+            if table.windows(2).any(|w| (w[1].0 > w[0].0) != rising || (w[1].0 - w[0].0).abs() > 0.5 * PI) {
+                continue;
+            }
+            // How near its turns come along the axis anywhere: a helix whose
+            // pitch varies is as narrow as its closest turns (cross review).
+            let turn_height = |a: f64| -> Option<f64> {
+                let k = table.partition_point(|&(b, _)| if rising { b < a } else { b > a }).clamp(1, n);
+                let ((a0, h0), (a1, h1)) = (table[k - 1], table[k]);
+                Some(h0 + (h1 - h0) * (a - a0) / (a1 - a0))
+            };
+            // Each table point against the helix a turn on and a turn back,
+            // so a dip between table points is met from the other turn.
+            let (first, last) = (table[0].0.min(table[n].0), table[0].0.max(table[n].0));
+            let pitch = table
+                .iter()
+                .flat_map(|&(a, h)| [a + TAU, a - TAU].map(move |b| (b, h)))
+                .filter(|&(b, _)| (first..=last).contains(&b))
+                .filter_map(|(b, h)| Some((turn_height(b)? - h).abs()))
+                .fold(f64::INFINITY, f64::min);
+            if !pitch.is_finite() {
+                continue;
+            }
+            // The walk's anchor, a vertex of the helix's own edge, set on its turn.
+            let p = walk[anchor];
+            let at = crate::project_point_to_curve(&guide, p).ok()?.u;
+            if guide.evaluate(at).ok()?.sub(p).length() > 1e3 * tolerance {
+                continue;
+            }
+            let i = ts.partition_point(|&t| t <= at).clamp(1, n) - 1;
+            let shift = table[i].0 + wrap(angle(p) - table[i].0) - turned[anchor];
+            // Each point's height above the helix on its own turn.
+            let height_at = |a: f64| -> Option<f64> {
+                let (first, last) = (table[0].0.min(table[n].0), table[0].0.max(table[n].0));
+                if !(first..=last).contains(&a) {
+                    return None;
+                }
+                let k = table.partition_point(|&(b, _)| if rising { b < a } else { b > a }).clamp(1, n);
+                let (a0, h0) = table[k - 1];
+                let (a1, h1) = table[k];
+                Some(h0 + (h1 - h0) * (a - a0) / (a1 - a0))
+            };
+            let Some(offsets) = walk.iter().zip(&turned).map(|(p, t)| Some(height(*p) - height_at(t + shift)?)).collect::<Option<Vec<f64>>>() else {
+                continue;
+            };
+            let (w0, w1) = offsets.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &w| (a.min(w), b.max(w)));
+            if !(w1 - w0 < 0.5 * pitch) {
+                continue;
+            }
+            // The boundary between samples may stand a little past them
+            // (cross review), so the sweep reaches a quarter of the gap the
+            // pitch leaves on each side: never a whole pitch wide, so it
+            // never meets itself.
+            let pad = 0.25 * (pitch - (w1 - w0));
+            let (mut w0, mut w1) = (w0 - pad, w1 + pad);
+            // Outward: (w1 − w0)·axis × C′ points away from the axis.
+            let mid = 0.5 * (t0 + t1);
+            let tangent = guide.evaluate(mid + 1e-6 * (t1 - t0)).ok()?.sub(guide.evaluate(mid - 1e-6 * (t1 - t0)).ok()?);
+            let out = guide.evaluate(mid).ok()?.sub(frame.origin);
+            if axis.cross(tangent).dot(out) < 0.0 {
+                std::mem::swap(&mut w0, &mut w1);
+            }
+            let row = |w: f64| {
+                guide
+                    .control_points
+                    .iter()
+                    .map(|c| crate::Vec4 { x: c.x + w * axis.x * c.w, y: c.y + w * axis.y * c.w, z: c.z + w * axis.z * c.w, w: c.w })
+                    .collect::<Vec<_>>()
+            };
+            let band = NurbsSurface::new(1, guide.degree, vec![0.0, 0.0, 1.0, 1.0], guide.knots.clone(), vec![row(w0), row(w1)]).ok()?;
+            let id = self.emit_nurbs_surface(&band);
+            self.emitted.push(EmittedSurface { id, flipped: false });
+            return Some(self.emitted.len() - 1);
+        }
+        None
+    }
+
     /// Points on a face's boundary (mm): its vertices, points along its
     /// edges' exact curves and its intersection edges' charts.
     fn face_boundary_points(&self, face: &Node) -> Vec<Vec3> {
@@ -571,6 +1038,148 @@ impl<'a> Translator<'a> {
             }
         }
         points
+    }
+
+    /// Each loop of a face walked in order (mm), for telling how often it
+    /// goes round a closed spine: every fin from the vertex it starts at to
+    /// the one it ends at, through its edge's samples in the fin's own
+    /// direction. An intersection edge's chart runs over the whole curve,
+    /// past the edge's vertices (two edges can share one chart round a
+    /// ring), so only its stretch between them is taken, in the fin's
+    /// direction (cross review); an edge with no vertex, a whole ring, takes
+    /// its chart once.
+    fn face_boundary_walks(&self, face: &Node) -> Vec<Vec<Vec3>> {
+        let mut walks = Vec::new();
+        for lp in chain(self.file, face.ptr("loop"), "next") {
+            let mut points = Vec::new();
+            let fins = self.fins(lp);
+            for (k, fin) in fins.iter().enumerate() {
+                // A fin's vertex is the one it ends at; the fin before it
+                // in the loop ends where it starts.
+                let end = self.vertex_location(fin.ptr("vertex")).ok();
+                let start = self.vertex_location(fins[(k + fins.len() - 1) % fins.len()].ptr("vertex")).ok();
+                let along = fin.char("sense") != Some(b'-');
+                let Some(edge) = self.file.follow(fin, "edge") else { continue };
+                let curve_node = self.file.follow(edge, "curve");
+                let mut curve = curve_node;
+                for _ in 0..8 {
+                    match curve {
+                        Some(c) if c.type_name() == "TRIMMED_CURVE" => curve = self.file.follow(c, "basis_curve"),
+                        _ => break,
+                    }
+                }
+                points.extend(start);
+                if let Some(c) = curve.filter(|c| c.type_name() == "INTERSECTION") {
+                    let mut chart = self.intersection_points(c).unwrap_or_default();
+                    if chart.len() >= 2 {
+                        if along != curve_node.map_or(true, |n| runs_forward(self.file, n)) {
+                            chart.reverse();
+                        }
+                        let nearest = |p: Vec3| (0..chart.len()).min_by(|&i, &j| chart[i].sub(p).length().total_cmp(&chart[j].sub(p).length())).unwrap_or(0);
+                        let n = chart.len();
+                        let closed = chart[0].sub(chart[n - 1]).length() <= 1e-3;
+                        match (start, end) {
+                            (Some(s), Some(e)) => {
+                                let (i0, i1) = (nearest(s), nearest(e));
+                                if closed {
+                                    // Forward from the start round to the
+                                    // end (the repeated last point skipped);
+                                    // a fin from a vertex back to it, the
+                                    // whole turn.
+                                    let m = n - 1;
+                                    let (i0, i1) = (i0 % m, i1 % m);
+                                    let steps = if i1 > i0 { i1 - i0 } else { i1 + m - i0 };
+                                    points.extend((0..=steps).map(|k| chart[(i0 + k) % m]));
+                                } else if i0 <= i1 {
+                                    points.extend_from_slice(&chart[i0..=i1]);
+                                }
+                            }
+                            _ => points.extend(chart),
+                        }
+                    }
+                } else {
+                    let mut samples = self.edge_samples(edge);
+                    if !along {
+                        samples.reverse();
+                    }
+                    points.extend(samples);
+                }
+                points.extend(end);
+            }
+            walks.push(points);
+        }
+        walks
+    }
+
+    /// Where on a closed B-curve spine a face is seamed: the foot of its
+    /// seam edge's vertex (an edge both of whose fins bound the face), else
+    /// for a face of vertexless rings only, of the point its first ring
+    /// closes at (written here first, so that point is known: STEP gives
+    /// the ring its vertex there, and a loop of one closed edge closes in
+    /// the surface's parameters only across its seam). None for any other
+    /// face: a loop of several edges can cross the seam anywhere along one
+    /// (seamed at one of its vertices, three files were lost; seamed at a
+    /// ring beside one, keycaps that import as they are took step_import
+    /// up to ten times as long).
+    fn seam_spine_parameter(&mut self, face: &Node, spine: &Curve) -> Option<f64> {
+        let Curve::Nurbs(curve) = spine else { return None };
+        let mut seen = std::collections::HashSet::new();
+        let (mut ring, mut vertexed) = (None, false);
+        for lp in chain(self.file, face.ptr("loop"), "next") {
+            for fin in self.fins(lp) {
+                let vertex = self.vertex_location(fin.ptr("vertex")).ok();
+                vertexed |= vertex.is_some();
+                let edge = fin.ptr("edge");
+                if edge != 0 && vertex.is_none() {
+                    ring = ring.or(Some(edge));
+                }
+                if edge != 0 && !seen.insert(edge) {
+                    if let Some(point) = vertex {
+                        return crate::project_point_to_curve(curve, point).ok().map(|foot| foot.u);
+                    }
+                }
+            }
+        }
+        if vertexed {
+            return None;
+        }
+        let edge = ring?;
+        self.edge(edge).ok()?;
+        let point = *self.ring_points.get(&edge)?;
+        crate::project_point_to_curve(curve, point).ok().map(|foot| foot.u)
+    }
+
+    /// Whether a vertex of the face lies near the section at `u` of its
+    /// fitted surface but not on it ([`SEAM_ROW_NEAR`]).
+    fn vertex_beside_row(&self, face: &Node, surface: &NurbsSurface, u: f64) -> bool {
+        let Ok(row) = surface.iso_curve_u(u) else { return false };
+        let [on, near] = SEAM_ROW_NEAR;
+        chain(self.file, face.ptr("loop"), "next").into_iter().flat_map(|lp| self.fins(lp)).any(|fin| {
+            let Ok(point) = self.vertex_location(fin.ptr("vertex")) else { return false };
+            let Ok(foot) = crate::project_point_to_curve(&row, point) else { return false };
+            row.evaluate(foot.u).is_ok_and(|p| (on..near).contains(&p.sub(point).length()))
+        })
+    }
+
+    /// The middle of the widest stretch of a closed spine's period `[a, b]`
+    /// between the feet of a face's vertices, where its surface's period
+    /// may start with no vertex of the face on its seam.
+    fn widest_vertex_gap(&self, face: &Node, spine: &Curve, [a, b]: [f64; 2]) -> Option<f64> {
+        let Curve::Nurbs(curve) = spine else { return None };
+        let period = b - a;
+        let mut feet = Vec::new();
+        for lp in chain(self.file, face.ptr("loop"), "next") {
+            // A fin of a vertexless ring has no vertex to keep away from.
+            for point in self.fins(lp).into_iter().filter_map(|fin| self.vertex_location(fin.ptr("vertex")).ok()) {
+                let foot = crate::project_point_to_curve(curve, point).ok()?;
+                feet.push(a + (foot.u - a).rem_euclid(period));
+            }
+        }
+        feet.sort_by(f64::total_cmp);
+        let first = *feet.first()?;
+        feet.push(first + period);
+        let (gap, from) = feet.windows(2).map(|w| (w[1] - w[0], w[0])).max_by(|x, y| x.0.total_cmp(&y.0))?;
+        (gap > 0.0).then_some(from + 0.5 * gap)
     }
 
     /// A blend's two supports, as the file orders them, and its radius (mm).
@@ -642,6 +1251,25 @@ impl<'a> Translator<'a> {
         }
         let spine = self.spine_curve(spine_node).map_err(|e| format!("blend {id}: spine: {e}"))?;
         let points = self.face_boundary_points(face);
+        // A face with a loop that goes once round a closed spine spans all
+        // of it, however sparsely its boundary is sampled (an intersection's
+        // chart round the ring leaves gaps wider than the eighth of it that
+        // `spine_range` takes for a missing stretch, and the face was built
+        // over part of the ring with its edges 3 mm off it).
+        let whole = geometry::closed_range(&spine).filter(|_| self.face_boundary_walks(face).iter().any(|lp| winds_round(&spine, lp)));
+        // A whole face starts its surface's period where its seam is
+        // ([`Self::seam_spine_parameter`]). Started at the spine's start
+        // instead, the face's loop ran on past the surface's end and could
+        // not close (a SolidWorks screw's blend round its head, its rings'
+        // vertices a sixth of a millimetre on).
+        let seam = whole.and_then(|_| self.seam_spine_parameter(face, &spine));
+        let whole = whole.map(|[a, b]| match seam {
+            Some(s) => {
+                let s = a + (s - a).rem_euclid(b - a);
+                [s, s + (b - a)]
+            }
+            None => [a, b],
+        });
         let section = |t: f64| blend_section(&supports, radius, &spine, t);
         // A blend whose supports are only C1 (or C0) along some knot lines (a
         // B-surface's, or a swept B-curve's) has sections that kink where a
@@ -655,8 +1283,11 @@ impl<'a> Translator<'a> {
         // open spine's ends (feet taken on its extension, where a face runs
         // past the spine curve) only when that refuses: the extension can run
         // where the sections fail (cross review: a SolidWorks report's blend).
-        let fit = |extend: bool| -> Result<(NurbsSurface, [f64; 2]), String> {
-            let [t0, t1] = spine_range(&spine, &points, 1.0 / 50.0, extend).ok_or_else(|| "the face does not lie along its spine".to_string())?;
+        let fit = |whole: Option<[f64; 2]>, extend: bool| -> Result<(NurbsSurface, [f64; 2]), String> {
+            let [t0, t1] = match whole {
+                Some(range) => range,
+                None => spine_range(&spine, &points, 1.0 / 50.0, extend).ok_or_else(|| "the face does not lie along its spine".to_string())?,
+            };
             let surface = match fit_blend(&section, t0, t1) {
                 Ok(surface) => surface,
                 Err(e) => match pieces(t0, t1) {
@@ -671,10 +1302,30 @@ impl<'a> Translator<'a> {
             };
             Ok((surface, [t0, t1]))
         };
-        let (surface, [t0, t1]) = match fit(false) {
-            Ok(fitted) => fitted,
-            Err(e) => fit(true).map_err(|_| format!("blend {id}: {e}"))?,
+        let fit_either = |whole: Option<[f64; 2]>| match fit(whole, false) {
+            Ok(fitted) => Ok(fitted),
+            Err(e) => fit(whole, true).map_err(|_| format!("blend {id}: {e}")),
         };
+        let (mut surface, [mut t0, mut t1]) = fit_either(whole)?;
+        // A whole face with vertices and no seam edge is seamed by its STEP
+        // reader along the surface's first section, through the vertices on
+        // it. Where a ring's vertex lies beside that section instead (a
+        // keycap's, 0.013 mm across the blend from where it starts), the
+        // loop is left open by that much: its period starts in the widest
+        // stretch between its vertices, kept only when none of them is near
+        // the seam there either (cross review: a ring of many vertices can
+        // leave none of its gaps wide enough).
+        if let (Some([a, b]), None) = (whole, seam) {
+            if self.vertex_beside_row(face, &surface, t0) {
+                if let Some(start) = self.widest_vertex_gap(face, &spine, [a, b]) {
+                    if let Ok((refit, range)) = fit_either(Some([start, start + (b - a)])) {
+                        if !self.vertex_beside_row(face, &refit, range[0]) {
+                            (surface, t0, t1) = (refit, range[0], range[1]);
+                        }
+                    }
+                }
+            }
+        }
         self.fitted_curves += 1;
         let step = self.emit_nurbs_surface(&surface);
         // A blend's natural normal points away from its spine, as a torus's
@@ -768,7 +1419,20 @@ impl<'a> Translator<'a> {
                 let tube = self.add(format!("EDGE_CURVE('',#{corner},#{corner},#{tube},.T.)"));
                 vec![(around, true), (tube, true), (around, false), (tube, false)]
             }
-            _ => return Err("a face with no loop is not a whole sphere or torus, which is not read yet".into()),
+            // A B-surface closed both ways (a coil spring's tube) is bounded
+            // as a torus is: its seam iso curves through the corner at the
+            // start of both domains, v = v0 (u varying) and u = u0.
+            Surface::Nurbs(nurbs) if nurbs.closed_directions()? == (true, true) => {
+                let ([u0, _], [v0, _]) = (nurbs.domain_u()?, nurbs.domain_v()?);
+                let corner = self.point_id(nurbs.evaluate(u0, v0)?);
+                let corner = self.add(format!("VERTEX_POINT('',#{corner})"));
+                let around = self.emit_curve(&Curve::Nurbs(nurbs.iso_curve_v(v0)?))?;
+                let around = self.add(format!("EDGE_CURVE('',#{corner},#{corner},#{around},.T.)"));
+                let tube = self.emit_curve(&Curve::Nurbs(nurbs.iso_curve_u(u0)?))?;
+                let tube = self.add(format!("EDGE_CURVE('',#{corner},#{corner},#{tube},.T.)"));
+                vec![(around, true), (tube, true), (around, false), (tube, false)]
+            }
+            _ => return Err("a face with no loop is not a whole sphere, torus or B-surface closed both ways, which is not read yet".into()),
         };
         if !same_sense {
             members.reverse();
@@ -796,9 +1460,193 @@ impl<'a> Translator<'a> {
     }
 
     fn vertex_location(&self, index: u32) -> Result<Vec3, String> {
+        let tolerance = self.node(index, "vertex")?.real("tolerance").filter(|t| t.is_finite()).map_or(0.0, |t| t * MM_PER_METRE);
+        if tolerance <= SNAP_ENDS_MM {
+            return self.file_vertex_location(index);
+        }
+        if let Some(&seat) = self.seats.borrow().get(&index) {
+            return Ok(seat);
+        }
+        let at = self.file_vertex_location(index)?;
+        let seat = self.seat_of(index, at, tolerance).unwrap_or(at);
+        self.seats.borrow_mut().insert(index, seat);
+        Ok(seat)
+    }
+
+    /// Where the file puts vertex `index` (mm).
+    fn file_vertex_location(&self, index: u32) -> Result<Vec3, String> {
         let vertex = self.node(index, "vertex")?;
         let point = self.file.follow(vertex, "point").ok_or_else(|| format!("vertex {index} has no point"))?;
         point.vector("pvec").map(geometry::position).ok_or_else(|| format!("vertex {index}'s point has no position"))
+    }
+
+    /// Where tolerant vertex `index` (at `at` in the file, `tolerance` mm) is
+    /// written, when the curves meeting there miss it by more than
+    /// [`snap_ends`] closes: re-seated within its own stated tolerance.
+    /// Parasolid's tolerant vertex lies within its tolerance of the curves
+    /// meeting there (§4.3.9), which need not end at its point: a tight
+    /// edge's curve is right where it is to its own tolerance, and two such
+    /// curves can end 0.16 mm apart either side of a 0.3 mm vertex, one of
+    /// them 0.10 mm from it. STEP has no vertex tolerance and the curves
+    /// must end at the vertex. Where every edge there is long against the
+    /// tolerances at its two ends and every curve there either ends there
+    /// (an open SP-curve, fitted over its trim or whole: the end of it the
+    /// edge pairs with this vertex) or is an open intersection cut to it
+    /// ([`Self::follower`]), the vertex is written at [`reseat`]'s point.
+    /// Found from the vertex's own fins (`next_at_vx`) the first time it is
+    /// asked for; `None` keeps the file's point.
+    fn seat_of(&self, index: u32, at: Vec3, tolerance: f64) -> Option<Vec3> {
+        let file = self.file;
+        // The vertex's edges, by its fins (each edge's fin ending there),
+        // with the vertex at each edge's other end.
+        let mut incident = Vec::new();
+        let start = file.node(index)?.ptr("halfedge");
+        let mut fin_index = start;
+        for _ in 0..4096 {
+            let fin = file.node(fin_index)?;
+            if fin.ptr("vertex") != index {
+                return None;
+            }
+            let edge = file.node(fin.ptr("edge"))?;
+            let other = file.node(fin.ptr("other"))?.ptr("vertex");
+            incident.push((edge, other));
+            fin_index = fin.ptr("next_at_vx");
+            if fin_index == start || fin_index == 0 {
+                break;
+            }
+        }
+        if fin_index != start && fin_index != 0 {
+            return None;
+        }
+        let mut ends = Vec::new();
+        let mut followers = Vec::new();
+        let mut paths = Vec::new();
+        let debug = std::env::var("BREP_DEBUG_XT_RESEAT").is_ok();
+        for &(edge, other) in &incident {
+            // Each vertex moves within its own tolerance: an edge to a vertex
+            // further than twice both tolerances keeps its length, a shorter
+            // one could close up (cross review).
+            let there = self.file_vertex_location(other).ok()?;
+            let other_tolerance = file.node(other).and_then(|n| n.real("tolerance")).filter(|t| t.is_finite()).map_or(0.0, |t| t * MM_PER_METRE);
+            if there.sub(at).length() <= 2.0 * (tolerance + other_tolerance) {
+                return None;
+            }
+            let curve = self.edge_written_curve(edge)?;
+            match self.fixed_curve_ends(curve) {
+                Some((pair, path)) => {
+                    let end = paired_end(pair, at, there)?;
+                    let place = if end.sub(pair[0]).length() == 0.0 { 0.0 } else { (path.len() - 1) as f64 };
+                    ends.push(end);
+                    paths.push((path, place));
+                }
+                // The cut must happen at the other end too: that vertex as
+                // near the chart as a seat may be (cross review).
+                None => {
+                    let chart = self.follower(curve)?;
+                    if chart_distance(&chart, there) > FOLLOW_CHART_MM {
+                        return None;
+                    }
+                    followers.push(chart);
+                }
+            }
+        }
+        // An intersection follows the seat within the vertex's tolerance of
+        // it, as the file's vertex must lie (§4.3.9: 0.15 mm off the chart of
+        // a 0.3 mm one), well within its cut's reach, and on the same passage
+        // of it: along the chart, no further from where the file's vertex
+        // falls than twice the tolerance (a seat by another passage would cut
+        // the edge the long way round, cross review). A curve that ends there
+        // is trimmed by the STEP lane where the seat falls on it: by its own
+        // end, not another passage of it (cross review).
+        let follows = |seat: Vec3| {
+            followers.iter().all(|chart| {
+                let ((_, from), (off, to)) = (place_on_chart(chart, at), place_on_chart(chart, seat));
+                off <= tolerance.min(FOLLOW_CHART_MM) && chart_length_between(chart, from, to) <= 2.0 * tolerance
+            }) && paths.iter().all(|(path, end)| chart_length_between(path, *end, place_on_chart(path, seat).1) <= 2.0 * tolerance)
+        };
+        let seat = reseat(at, tolerance, &ends, follows);
+        if debug && ends.iter().any(|end| end.sub(at).length() > SNAP_ENDS_MM) {
+            eprintln!(
+                "xt-reseat: vertex {index} (tolerance {tolerance:.6}) ends {:?}: {}",
+                ends.iter().map(|end| end.sub(at).length()).collect::<Vec<_>>(),
+                seat.map_or("kept".to_string(), |seat| format!("moved {:.6} mm", seat.sub(at).length())),
+            );
+        }
+        seat
+    }
+
+    /// The curve node an edge is written from: its own, or else a fin's
+    /// (the positive fin's first), as [`Self::edge_curve`] tries them.
+    fn edge_written_curve(&self, edge: &Node) -> Option<&'a Node> {
+        let file = self.file;
+        file.follow(edge, "curve").or_else(|| {
+            let (positive, negative) = edge_fins(file, edge).ok()?;
+            file.follow(positive, "curve").or_else(|| file.follow(negative, "curve"))
+        })
+    }
+
+    /// The two ends (mm) of an open SP-curve, over its trim or else its
+    /// whole domain, as it is fitted: an edge written from it ends where it
+    /// ends; with points along it, ends included. `None` for any other
+    /// curve, and for a closed SP-curve, taken whole.
+    fn fixed_curve_ends(&self, curve: &Node) -> Option<([Vec3; 2], Vec<Vec3>)> {
+        let file = self.file;
+        let mut node = curve;
+        let mut trim = None;
+        for _ in 0..8 {
+            if node.type_name() != "TRIMMED_CURVE" {
+                break;
+            }
+            if let (Some(a), Some(b)) = (node.real("parm_1"), node.real("parm_2")) {
+                trim = Some([a.min(b), a.max(b)]);
+            }
+            node = file.follow(node, "basis_curve")?;
+        }
+        if node.type_name() != "SP_CURVE" {
+            return None;
+        }
+        let (surface, uv) = self.sp_curve_parts(node).ok()?;
+        // One written exactly (a conic, or a B-curve on a plane) is not
+        // fitted to its ends (cross review).
+        if exact_sp_curve(&surface, &uv).is_some() {
+            return None;
+        }
+        let [t0, t1] = uv.domain().ok()?;
+        if uv.evaluate(t0).ok()?.sub(uv.evaluate(t1).ok()?).length() <= 1e-9 {
+            return None;
+        }
+        let [a, b] = trim.map(|[a, b]: [f64; 2]| [a.max(t0), b.min(t1)]).filter(|[a, b]| b - a > 1e-9 * (t1 - t0)).unwrap_or([t0, t1]);
+        let at = |t: f64| uv.evaluate(t).ok().and_then(|p| surface.point(p.x, p.y).ok());
+        // 64 even steps, and every knot inside with the middle of each span,
+        // so no span's turn is missed (cross review).
+        let mut params: Vec<f64> = (0..=64).map(|k| a + (b - a) * k as f64 / 64.0).collect();
+        let knots: Vec<f64> = uv.knots.iter().copied().filter(|&k| k > a && k < b).collect();
+        params.extend(&knots);
+        params.extend(std::iter::once(a).chain(knots.iter().copied()).zip(knots.iter().copied().chain(std::iter::once(b))).map(|(p, q)| 0.5 * (p + q)));
+        params.sort_by(f64::total_cmp);
+        params.dedup();
+        let path = params.into_iter().map(at).collect::<Option<Vec<Vec3>>>()?;
+        Some(([path[0], path[path.len() - 1]], path))
+    }
+
+    /// The chart of an open intersection an edge is cut from where its
+    /// vertices fall on it ([`cut_open_chart`]): the one kind of curve that
+    /// follows a re-seated vertex. `None` for any other (a line, conic or
+    /// B-curve is cut or snapped by rules of its own, which a moved vertex
+    /// can defeat: cross reviews), and for a closed intersection, kept whole.
+    fn follower(&self, curve: &Node) -> Option<Vec<Vec3>> {
+        let file = self.file;
+        let mut node = curve;
+        for _ in 0..8 {
+            if node.type_name() != "TRIMMED_CURVE" {
+                break;
+            }
+            node = file.follow(node, "basis_curve")?;
+        }
+        if node.type_name() != "INTERSECTION" {
+            return None;
+        }
+        self.intersection_points(node).ok().filter(|chart| chart.len() >= 2 && chart[0].sub(chart[chart.len() - 1]).length() > 1e-6)
     }
 
     fn vertex(&mut self, index: u32) -> Result<usize, String> {
@@ -837,6 +1685,7 @@ impl<'a> Translator<'a> {
         let (start, end) = if start_vertex == 0 || end_vertex == 0 {
             // A ring edge has no vertices (§4.3.9); STEP closes it at one.
             let p = closed_point.ok_or_else(|| format!("ring edge {edge_id}'s curve has no closing point"))?;
+            self.ring_points.insert(index, p);
             let point = self.point_id(p);
             let v = self.add(format!("VERTEX_POINT('',#{point})"));
             (v, v)
@@ -851,11 +1700,72 @@ impl<'a> Translator<'a> {
         Ok(id)
     }
 
+    /// An edge on a circle or ellipse whose vertices stand off it by more
+    /// than the file's resolution but within their own tolerances (§4.3.9:
+    /// a tolerant vertex lies within its tolerance of the curves meeting
+    /// there): the arc between the vertices' angles, in the edge's direction,
+    /// as an exact rational B-curve with its ends moved onto the vertices.
+    /// STEP has no vertex tolerance, and an exact conic arc that misses its
+    /// vertices by more than the STEP lane's conic band is refused there
+    /// (8e-3 mm off a 1 mm circle, within a 2e-2 mm vertex tolerance).
+    /// `None` for every other edge, emitted as before.
+    fn tolerant_conic(&self, curve: &Node, sense: bool) -> Result<Option<NurbsCurve>, String> {
+        let Some((start, end)) = self.edge_ends else { return Ok(None) };
+        let mut basis = curve;
+        for _ in 0..8 {
+            match self.file.follow(basis, "basis_curve") {
+                Some(b) if basis.type_name() == "TRIMMED_CURVE" => basis = b,
+                _ => break,
+            }
+        }
+        let (frame, major, minor) = match geometry::curve(self.file, basis) {
+            Ok(Curve::Circle { frame, radius }) => (frame, radius, radius),
+            Ok(Curve::Ellipse { frame, major, minor }) => (frame, major, minor),
+            _ => return Ok(None),
+        };
+        let y = frame.y();
+        let angle = |p: Vec3| {
+            let d = p.sub(frame.origin);
+            (d.dot(y) / minor).atan2(d.dot(frame.x) / major)
+        };
+        let on = |t: f64| frame.origin.add(frame.x.scale(major * t.cos())).add(y.scale(minor * t.sin()));
+        let tolerance_of = |p: Vec3| self.edge_end_tolerances.iter().find(|(at, _)| at.sub(p).length() <= 1e-9).map_or(0.0, |(_, t)| *t);
+        let gaps = [start, end].map(|p| (p.sub(on(angle(p))).length(), tolerance_of(p)));
+        let snap = 10.0 * RESOLUTION_MM;
+        // Only gaps `snap_ends` closes (cross review: a 0.2 mm gap inside a
+        // 0.3 mm tolerance would have kept the arc's own ends).
+        if gaps.iter().all(|(gap, _)| *gap <= snap)
+            || gaps.iter().any(|(gap, tolerance)| *gap > snap && (*gap > tolerance + RESOLUTION_MM || *gap > SNAP_ENDS_MM))
+        {
+            return Ok(None);
+        }
+        // Along the curve's own direction: from the edge's start when the
+        // edge runs with the curve, from its end otherwise.
+        let (from, to) = if sense { (start, end) } else { (end, start) };
+        let a0 = angle(from);
+        let mut a1 = angle(to);
+        while a1 <= a0 + 1e-12 {
+            a1 += std::f64::consts::TAU;
+        }
+        let unit = crate::make_arc(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), 1.0, a0, a1)?;
+        let mut arc = unit.clone();
+        for q in &mut arc.control_points {
+            let p = frame.origin.add(frame.x.scale(major * q.x / q.w)).add(y.scale(minor * q.y / q.w));
+            *q = crate::Vec4 { x: p.x * q.w, y: p.y * q.w, z: p.z * q.w, w: q.w };
+        }
+        let arc = snap_ends(arc, (from, to));
+        // The STEP edge runs with the arc, which starts at `from`.
+        Ok(Some(if sense { arc } else { arc.reversed()? }))
+    }
+
     /// (STEP curve, whether the edge runs along it, a point to close a ring
     /// edge at).
     fn edge_curve(&mut self, edge: &Node, positive: &Node) -> Result<(usize, bool, Option<Vec3>), String> {
         if let Some(curve) = self.file.follow(edge, "curve") {
             let sense = runs_forward(self.file, curve);
+            if let Some(arc) = self.tolerant_conic(curve, sense)? {
+                return Ok((self.emit_curve(&Curve::Nurbs(arc))?, true, None));
+            }
             self.anchor = self.edge_ends.map(|(start, end)| if sense { (start, end) } else { (end, start) });
             let (id, closing) = match self.curve(curve) {
                 Ok(read) => read,
@@ -1018,6 +1928,9 @@ impl<'a> Translator<'a> {
                 // edge on part of it is trimmed from its first vertex along
                 // the curve, so the fitted curve must start there, or the
                 // trim runs the long way round through the chart's seam.
+                // An edge cut to the straight chord between its vertices
+                // ([`cut_ring_to_short_edge`]), written as that chord.
+                let mut chord_only = false;
                 if let Some((begin, finish)) = self.anchor.take() {
                     // Vertices closer together than the chart's chords are
                     // long, on a loop that passes near them more than once
@@ -1032,6 +1945,16 @@ impl<'a> Translator<'a> {
                         }
                     }
                     chart = reseat_closed_chart(chart, begin, finish);
+                    // A loop restarted in the edge's gap, on which the edge
+                    // is too short for the STEP lane to trim to, is cut to
+                    // the edge ([`cut_ring_to_short_edge`]). An edge that is
+                    // the whole loop keeps it.
+                    let ring = chart.len() > 3 && chart[0].sub(chart[chart.len() - 1]).length() <= 1e-6;
+                    if ring && begin.sub(finish).length() > 1e-9 {
+                        let crossing = self.intersection_crossing(node);
+                        chart = cut_ring_to_short_edge(crossing.as_ref(), chart, begin, finish);
+                        chord_only = chart.len() == 2;
+                    }
                     // An open chart is cut to the stretch between the edge's
                     // vertices: a trimmed intersection's chart can run far
                     // past its edge (54 mm past a 7.8 mm one along a
@@ -1047,7 +1970,10 @@ impl<'a> Translator<'a> {
                 };
                 let tolerances = [tolerance_at(chart.first()), tolerance_at(chart.last())];
                 let chart = uncrowd_chart_ends(chart, tolerances);
-                let crossing = self.intersection_crossing(node);
+                // Nothing is solved along a chord cut to its vertices: from a
+                // chord tilted between unequally tolerant vertices the
+                // solved points fall past its ends (cross review).
+                let crossing = if chord_only { None } else { self.intersection_crossing(node) };
                 // With nothing solved between chart points the densities all
                 // give the chart, and the fit's check proves nothing: count
                 // it as unverified rather than measured.
@@ -1063,8 +1989,14 @@ impl<'a> Translator<'a> {
             "SP_CURVE" if self.read_blend_sp && self.file.follow(node, "surface").is_some_and(|s| s.type_name() == "BLENDED_EDGE") => {
                 // An SP-curve on a rolling-ball or cliff-edge blend: the blend
                 // in its own parameters (§5.2.2.6), u along the spine and v
-                // from 0 at the first support (the second when the spine runs
-                // backwards) to 1 at the other, proportional to the angle.
+                // proportional to the angle across it. The reference puts v = 0
+                // on the first support (the second when the spine runs
+                // backwards); written files run it the other way round. Every
+                // blend SP-curve that ends on its edge's vertices, in the
+                // imported files checked alike (60 of 60,
+                // elliptical spines forwards and intersection spines
+                // backwards), starts at the foot on the support the reference
+                // would put at v = 1: so v runs from that one here.
                 let blend = self.file.follow(node, "surface").ok_or("an SP-curve has no surface")?;
                 let blend_id = blend.int("node_id").unwrap_or(blend.index as i64);
                 let (mut supports, radius) = self.blend_supports(blend, 0)?;
@@ -1080,13 +2012,23 @@ impl<'a> Translator<'a> {
                         _ => break,
                     }
                 }
-                if basis.type_name() == "INTERSECTION" {
-                    return Err(format!("an SP-curve on blend {blend_id}, whose spine is an intersection curve, is not read yet"));
-                }
+                // An intersection spine's parameter is the file's own
+                // (§5.2.1.5): the point there, found on the fitted spine.
+                let along = match basis.type_name() {
+                    "INTERSECTION" => Some(
+                        self.intersection_parameters(basis)
+                            .map_err(|e| format!("an SP-curve on blend {blend_id}: spine: {e}"))?,
+                    ),
+                    _ => None,
+                };
                 if spine_node.char("sense") == Some(b'-') {
                     supports.swap(0, 1);
                 }
                 let spine = self.spine_curve(spine_node).map_err(|e| format!("blend {blend_id}: spine: {e}"))?;
+                let spine_u = |u: f64| -> Result<f64, String> {
+                    let (Some(along), Curve::Nurbs(fitted)) = (&along, &spine) else { return Ok(u) };
+                    parameter_on_extended(fitted, along.point(u)?)
+                };
                 let uv = geometry::parameter_curve(self.file, self.file.follow(node, "b_curve").ok_or("an SP-curve has no 2D curve")?)?;
                 // The same rational quadratic section the face's surface is
                 // fitted through, at the parameter where the angle from its
@@ -1096,8 +2038,9 @@ impl<'a> Translator<'a> {
                 // On a circular rational quadratic of half-angle α the angle
                 // φ from its start has tan((φ - α)/2) = tan(α/2)·(2w - 1).
                 let point = |u: f64, v: f64| -> Result<Vec3, String> {
+                    let u = spine_u(u)?;
                     let centre = ball_centre(&supports, radius, &spine, u)?;
-                    Ok(section_at_angle(&blend_section(&supports, radius, &spine, u)?, centre, v))
+                    Ok(section_at_angle(&blend_section(&supports, radius, &spine, u)?, centre, 1.0 - v))
                 };
                 let [t0, t1] = uv.domain()?;
                 let open = uv.evaluate(t0)?.sub(uv.evaluate(t1)?).length() > 1e-9;
@@ -1107,7 +2050,7 @@ impl<'a> Translator<'a> {
                     .filter(|[a, b]| b - a > 1e-9 * (t1 - t0))
                     .unwrap_or([t0, t1]);
                 let trimmed = range != [t0, t1];
-                let fitted = fit_sp_curve_by(&point, &uv, range)
+                let fitted = fit_sp_curve_by(&point, &uv, range, &[Vec::new(), Vec::new()], [0.0; 2])
                     .map_err(|e| format!("SP-curve {} on blend {blend_id}: {e}", node.int("node_id").unwrap_or(node.index as i64)))?;
                 let fitted = match self.edge_ends {
                     Some(ends) if trimmed => snap_ends(fitted, ends),
@@ -1146,14 +2089,22 @@ impl<'a> Translator<'a> {
                     };
                     return Ok((self.emit_curve(&exact)?, closing));
                 }
-                let fitted = fit_sp_curve(&surface, &uv, range)
+                // An end a tolerant vertex stands off, in line with it, runs
+                // on along the surface to it.
+                let tolerance_of = |p: Vec3| self.edge_end_tolerances.iter().find(|(at, _)| at.sub(p).length() <= 1e-9).map_or(0.0, |(_, t)| *t);
+                let extend = match self.anchor {
+                    Some((from, to)) => sp_curve_extension(&|u, v| surface.point(u, v), &uv, range, [(from, tolerance_of(from)), (to, tolerance_of(to))]),
+                    None => [0.0; 2],
+                };
+                let extended = extend.iter().any(|&d| d > 0.0);
+                let fitted = fit_sp_curve(&surface, &uv, range, extend)
                     .map_err(|e| format!("SP-curve {}: {e}", node.int("node_id").unwrap_or(node.index as i64)))?;
                 // A trimmed SP-curve ends at its trim parameters, which a
                 // tolerant edge's vertices stand off by up to their
                 // tolerance: move its ends onto them, so the edge runs
                 // exactly vertex to vertex and nothing is left to trim.
                 let fitted = match self.edge_ends {
-                    Some(ends) if trimmed => snap_ends(fitted, ends),
+                    Some(ends) if trimmed || extended => snap_ends(fitted, ends),
                     _ => fitted,
                 };
                 self.fitted_curves += 1;
@@ -1197,6 +2148,48 @@ impl<'a> Translator<'a> {
             }
         }
         Ok(points)
+    }
+
+    /// An intersection curve in the file's own parameter (§5.2.1.5): its
+    /// chart points' parameters, from the chart's base parameter and scale,
+    /// each chord's factor carried across a chart point by the ratio of the
+    /// angles the curve's tangent there makes with its two chords, so the
+    /// parameter is C1.
+    fn intersection_parameters(&self, node: &Node) -> Result<ChartParameters, String> {
+        let chart = self.file.follow(node, "chart").ok_or("an intersection curve has no chart")?;
+        let points: Vec<Vec3> = chart
+            .vectors("hvec")
+            .into_iter()
+            .map(|p| p.map(geometry::position).ok_or("an intersection chart has an unset point"))
+            .collect::<Result<_, _>>()?;
+        let [first, second] = self.intersection_surfaces(node).ok_or("the intersection's surfaces are not both read")?;
+        let (Some(mut t), Some(mut factor)) = (chart.real("base_parameter"), chart.real("base_scale")) else {
+            return Err("an intersection chart has no parameterisation".into());
+        };
+        if points.len() < 2 {
+            return Err("an intersection chart has fewer than two points".into());
+        }
+        let mut parameters = vec![t];
+        for i in 1..points.len() {
+            let previous = points[i].sub(points[i - 1]);
+            // The file's parameter runs in its own unit, metres.
+            t += previous.length() / MM_PER_METRE * factor;
+            parameters.push(t);
+            if i + 1 < points.len() {
+                let normal = |s: &Surface| s.distance(points[i]).map(|(_, n)| n);
+                let tangent = normal(&first)
+                    .zip(normal(&second))
+                    .and_then(|(a, b)| a.cross(b).normalized().ok())
+                    .ok_or("the intersection has no tangent at a chart point")?;
+                let next = points[i + 1].sub(points[i]);
+                let (cos_b, cos_a) = (tangent.dot(previous) / previous.length(), tangent.dot(next) / next.length());
+                if !(cos_a.abs() > 1e-9) {
+                    return Err("a chart chord is normal to the curve's tangent".into());
+                }
+                factor *= cos_b / cos_a;
+            }
+        }
+        Ok(ChartParameters { points, parameters, crossing: Crossing::Surfaces(first, second) })
     }
 
     /// The two surfaces of an intersection curve, when the reader reads both.
@@ -1649,6 +2642,55 @@ fn analytic_outward(surface: &Surface, p: Vec3) -> Result<Vec3, String> {
     }
 }
 
+/// The frame of a lemon torus (`major` < 0) turned about its axis so the
+/// revolve written for a face with vertices at `points` starts in the middle
+/// of the widest stretch between their turns, or `None` to keep the shared
+/// surface: when no vertex is beside its seam ([`SEAM_ROW_NEAR`]: near the
+/// arc at the frame's x direction but not on it), or one would be beside the
+/// turned seam too.
+pub(super) fn turned_lemon_frame(frame: Frame, major: f64, minor: f64, points: &[Vec3]) -> Option<Frame> {
+    let [on, near] = SEAM_ROW_NEAR;
+    let beside = |frame: Frame| -> Option<bool> {
+        let Ok(Surface::Spun { profile: Curve::Nurbs(arc), .. }) = geometry::lemon(frame, major, minor) else { return None };
+        Some(points.iter().any(|&point| {
+            crate::project_point_to_curve(&arc, point)
+                .ok()
+                .and_then(|foot| arc.evaluate(foot.u).ok())
+                .is_some_and(|p| (on..near).contains(&p.sub(point).length()))
+        }))
+    };
+    if !beside(frame)? {
+        return None;
+    }
+    // Only a vertex on the axis (within the on-seam distance) is on every
+    // section; one nearer the axis than `near` still has its turn (a thin
+    // lemon's equator stands under 0.1 mm off it, cross review).
+    let turn = widest_turn(frame, points, on)?;
+    let turned = Frame { origin: frame.origin, z: frame.z, x: frame.x.scale(turn.cos()).add(frame.y().scale(turn.sin())) };
+    (!beside(turned)?).then_some(turned)
+}
+
+/// The turn about `frame`'s axis, from its x direction right-handedly, in
+/// the middle of the widest stretch between `points`' turns. A point within
+/// `near` of the axis (a pole) has no turn and is on every section.
+pub(super) fn widest_turn(frame: Frame, points: &[Vec3], near: f64) -> Option<f64> {
+    use std::f64::consts::TAU;
+    let y = frame.y();
+    let mut turns: Vec<f64> = points
+        .iter()
+        .filter_map(|&point| {
+            let d = point.sub(frame.origin);
+            let (along_x, along_y) = (d.dot(frame.x), d.dot(y));
+            (along_x.hypot(along_y) > near).then(|| along_y.atan2(along_x).rem_euclid(TAU))
+        })
+        .collect();
+    turns.sort_by(f64::total_cmp);
+    let first = *turns.first()?;
+    turns.push(first + TAU);
+    let (gap, from) = turns.windows(2).map(|w| (w[1] - w[0], w[0])).max_by(|a, b| a.0.total_cmp(&b.0))?;
+    (gap > 0.0).then_some((from + 0.5 * gap).rem_euclid(TAU))
+}
+
 /// The rational B-surface of `profile` turned once about the axis through
 /// `axis_point` along unit `axis`, right-handedly: u is the profile's
 /// parameter and v runs once round, a quadratic circle of nine vertices.
@@ -1799,23 +2841,156 @@ pub(super) fn cut_open_chart(chart: Vec<Vec3>, begin: Vec3, finish: Vec3) -> Vec
     if n < 2 || chart[0].sub(chart[n - 1]).length() <= 1e-6 {
         return chart;
     }
-    // A point's position along the chart (chord index plus the fraction
-    // along it) and its distance from it.
-    let place = |p: Vec3| -> (f64, f64) {
-        let mut best = (f64::INFINITY, 0.0);
-        for i in 0..n - 1 {
-            let (a, b) = (chart[i], chart[i + 1]);
-            let ab = b.sub(a);
-            let t = (p.sub(a).dot(ab) / ab.dot(ab).max(1e-300)).clamp(0.0, 1.0);
-            let d = p.sub(a.add(ab.scale(t))).length();
-            if d < best.0 {
-                best = (d, i as f64 + t);
-            }
-        }
-        best
+    cut_chart(chart, begin, finish)
+}
+
+/// A closed chart restarted in an edge's gap ([`reseat_closed_chart`]) cut
+/// to the edge: the seam lies in the gap, so the edge runs between its two
+/// copies, from `begin` to `finish`, and is cut there as an open chart is.
+/// Returned as it is when the cut would not run from `begin` to `finish`
+/// in the chart's direction.
+pub(super) fn cut_ring_to_edge(chart: Vec<Vec3>, begin: Vec3, finish: Vec3) -> Vec<Vec3> {
+    let cut = cut_chart(chart.clone(), begin, finish);
+    let runs = cut.len() >= 2 && cut[0].sub(begin).length() <= 1e-9 && cut[cut.len() - 1].sub(finish).length() <= 1e-9;
+    if runs { cut } else { chart }
+}
+
+/// The share of a closed chart's length below which an edge on it may be
+/// cut to its own stretch. The STEP lane trims a whole closed curve to an
+/// edge by its vertices' parameters, and keeps the whole curve when they are
+/// closer than 1e-6 of its domain, which the chord-length fit makes 1e-6 of
+/// its length: two vertices 1.8e-4 mm apart on a 600 mm loop (a keycap's
+/// dish meeting a plane at a glyph's corner) were taken as the whole loop.
+/// A hundred times that bar leaves every longer edge as the whole loop the
+/// STEP lane trims well, with its chart's own density (a lobe edge 12 mm
+/// long between vertices 0.45 mm apart, cut, imported three times slower).
+const RING_CUT_SHARE: f64 = 1e-4;
+
+/// An edge at most [`RING_CUT_SHARE`] of its loop, whose straight chord
+/// stays within [`FIT_TOLERANCE`] of the curve, written as that chord: its
+/// two vertices alone, fitted with nothing solved between them. The chord's
+/// sag is bounded by L²/8R, R the least radius through three consecutive
+/// chart points about the stretch; it stands off the curve by that and by
+/// its vertices' own distance from it, within their tolerance. Any
+/// other edge keeps the whole loop. Cut to tolerant vertices off the
+/// surfaces, a longer stretch is fitted unsolved from them, as a chord
+/// 4.7e-3 mm off a 100 m radius or overshooting a tilted chord's ends
+/// (cross reviews), so it is not cut at all; nor is one holding a chart
+/// point more than [`FIT_TOLERANCE`] off the chord, which it would leave.
+///
+/// Where the two surfaces are known, the chord is also checked against the
+/// curve itself: a point solved at its middle must lie on it within its
+/// vertices' own distance from the surfaces and [`FIT_TOLERANCE`]
+/// ([`chord_holds_on`]). Chart triples do not bound the curvature between
+/// chart points (cross review: a thin ellipse's tip between them), and the
+/// chart's own chordal error is far looser than the tolerance (5.4e-3 on a
+/// keycap's charts).
+pub(super) fn cut_ring_to_short_edge(crossing: Option<&Crossing>, chart: Vec<Vec3>, begin: Vec3, finish: Vec3) -> Vec<Vec3> {
+    let n = chart.len();
+    let length: f64 = chart.windows(2).map(|w| w[1].sub(w[0]).length()).sum();
+    let chord = finish.sub(begin).length();
+    if n < 3 || chord > RING_CUT_SHARE * length {
+        return chart;
+    }
+    // A stretch holding a chart point off the chord keeps the loop: the
+    // chord would drop it (cross review: a thin ellipse's tip, 5e-5 mm off).
+    let cut = cut_ring_to_edge(chart.clone(), begin, finish);
+    let direction = finish.sub(begin).scale(1.0 / chord);
+    let off_chord = |p: &Vec3| {
+        let along = p.sub(begin).dot(direction).clamp(0.0, chord);
+        p.sub(begin.add(direction.scale(along))).length()
     };
+    if cut.len() == n || cut.len() < 2 || cut[1..cut.len() - 1].iter().any(|p| off_chord(p) > FIT_TOLERANCE) {
+        return chart;
+    }
+    let stretch = chord;
+    // The least circumradius over the chart triples about the stretch.
+    let ((_, sb), (_, sf)) = (place_on_chart(&chart, begin), place_on_chart(&chart, finish));
+    let first = (sb.min(sf).floor() as usize).saturating_sub(1);
+    let last = ((sb.max(sf).ceil() as usize) + 1).min(n - 1);
+    let radius = (first..last.saturating_sub(1))
+        .map(|i| {
+            let (a, b, c) = (chart[i], chart[i + 1], chart[i + 2]);
+            let twice_area = b.sub(a).cross(c.sub(a)).length();
+            b.sub(a).length() * c.sub(b).length() * c.sub(a).length() / (2.0 * twice_area).max(1e-300)
+        })
+        .fold(f64::INFINITY, f64::min);
+    let held = match crossing {
+        Some(crossing @ Crossing::Surfaces(..)) => chord_holds_on(crossing, begin, finish),
+        _ => true,
+    };
+    if held && radius.is_finite() && stretch * stretch / (8.0 * radius) <= FIT_TOLERANCE { vec![begin, finish] } else { chart }
+}
+
+/// Whether the chord from `begin` to `finish` lies on the curve two surfaces
+/// cross in. Points of the curve are solved beside the chord's ends and at
+/// each eighth along it, each in the plane normal to the curve there (the
+/// surfaces' normals crossed; normal to the chord, a chord tilted between
+/// unequally tolerant vertices reached past its ends). Each inner one must
+/// lie within [`FIT_TOLERANCE`] of the chord, beyond the further vertex's
+/// own distance from the curve (cross review: a vertex off both surfaces is
+/// further from their curve than from either; one point at the middle
+/// would miss an S-shaped excursion). Not where a point does not solve, or
+/// the surfaces are tangent, or the crossing is a blend's contact.
+pub(super) fn chord_holds_on(crossing: &Crossing, begin: Vec3, finish: Vec3) -> bool {
+    let Crossing::Surfaces(first, second) = crossing else { return false };
+    let chord = finish.sub(begin);
+    let length = chord.length();
+    if !(length > 0.0) {
+        return false;
+    }
+    let axis = chord.scale(1.0 / length);
+    // The point of the curve beside `p`, reaching no further than `reach`.
+    let beside = |p: Vec3, reach: f64| -> Option<Vec3> {
+        let (_, g1) = first.distance(p)?;
+        let (_, g2) = second.distance(p)?;
+        let direction = g1.cross(g2).normalized().ok()?;
+        crossing.solve(p, direction, reach)
+    };
+    let reach = length + 1.0;
+    let (Some(b), Some(f)) = (beside(begin, reach), beside(finish, reach)) else { return false };
+    let slack = b.sub(begin).length().max(f.sub(finish).length()) + FIT_TOLERANCE;
+    (1..8).all(|k| {
+        let station = begin.add(chord.scale(k as f64 / 8.0));
+        beside(station, 0.5 * length + 2.0 * slack).is_some_and(|p| {
+            let along = p.sub(begin).dot(axis).clamp(0.0, length);
+            p.sub(begin.add(axis.scale(along))).length() <= slack
+        })
+    })
+}
+
+/// A point's position along a chart (chord index plus the fraction along
+/// it) and its distance from it: `(distance, position)`.
+fn place_on_chart(chart: &[Vec3], p: Vec3) -> (f64, f64) {
+    let mut best = (f64::INFINITY, 0.0);
+    for i in 0..chart.len().saturating_sub(1) {
+        let (a, b) = (chart[i], chart[i + 1]);
+        let ab = b.sub(a);
+        let t = (p.sub(a).dot(ab) / ab.dot(ab).max(1e-300)).clamp(0.0, 1.0);
+        let d = p.sub(a.add(ab.scale(t))).length();
+        if d < best.0 {
+            best = (d, i as f64 + t);
+        }
+    }
+    best
+}
+
+/// How far from a chart (mm) [`cut_chart`] places a vertex on it.
+const CUT_CHART_REACH_MM: f64 = 1.0;
+
+/// How far from an intersection's chart (mm) a re-seated vertex, and the
+/// edge's other vertex, may stand for the edge to follow the seat: well
+/// within [`CUT_CHART_REACH_MM`].
+const FOLLOW_CHART_MM: f64 = 0.5 * CUT_CHART_REACH_MM;
+
+fn cut_chart(chart: Vec<Vec3>, begin: Vec3, finish: Vec3) -> Vec<Vec3> {
+    let n = chart.len();
+    if n < 2 {
+        return chart;
+    }
+    let place = |p: Vec3| place_on_chart(&chart, p);
     let ((db, sb), (df, sf)) = (place(begin), place(finish));
-    if db > 1.0 || df > 1.0 || (sb - sf).abs() < 1e-12 {
+    if db > CUT_CHART_REACH_MM || df > CUT_CHART_REACH_MM || (sb - sf).abs() < 1e-12 {
         return chart;
     }
     let ((lo, first), (hi, last)) = if sb <= sf { ((sb, begin), (sf, finish)) } else { ((sf, finish), (sb, begin)) };
@@ -1991,6 +3166,31 @@ fn solve3(a: [Vec3; 3], b: [f64; 3]) -> Option<Vec3> {
 
 /// How far a fitted curve may stray from the exact points it stands for (mm).
 const FIT_TOLERANCE: f64 = 1e-5;
+/// A whole blend face's vertex this near its surface's first section (mm),
+/// but more than a hundred fits off it, is one STEP readers take for a
+/// vertex on the seam ([`Translator::blend_surface`]).
+const SEAM_ROW_NEAR: [f64; 2] = [100.0 * FIT_TOLERANCE, 0.1];
+/// A boundary row of an offset pinned to a face's vertex
+/// ([`Translator::pinned_offset`]): its ends within this of the vertex (mm),
+/// its farthest point within the excursion of it (mm), the way out and the
+/// way back within the fin's fraction of that apart, read at these samples.
+const PIN_ENDS: f64 = 10.0 * FIT_TOLERANCE;
+const PIN_EXCURSION: f64 = 0.5;
+const PIN_FIN: f64 = 0.05;
+const PIN_SAMPLES: usize = 32;
+/// ...and every point of the face's boundary still this near the pinned
+/// surface (mm).
+const PIN_ON: f64 = 10.0 * FIT_TOLERANCE;
+/// An offset extended past its base ([`Translator::extended_offset`]): its
+/// face's SP-curves read at these samples each, reaching past the base's
+/// domain by more than this fraction of it, and every point of the face's
+/// boundary this near the extended offset (mm).
+const EXTEND_SAMPLES: usize = 64;
+const EXTEND_PAST: f64 = 1e-6;
+const EXTEND_ON: f64 = 10.0 * FIT_TOLERANCE;
+/// ...and the extended base read against its tangent planes at this many
+/// steps a side over its strip.
+const EXTEND_GRID: usize = 32;
 /// Beyond this the fit is refused rather than handed on (mm).
 const FIT_REFUSAL: f64 = 1e-3;
 /// The densest sampling tried: 2^7 times the starting density, and never
@@ -2104,12 +3304,74 @@ struct ChartStations<'a> {
     crossing: Option<&'a Crossing>,
     chart: &'a [Vec3],
     memo: Option<std::cell::RefCell<HashMap<(usize, u64), Option<Vec3>>>>,
+    /// Whether each chart point is on both surfaces as read
+    /// ([`CHART_ON_SURFACE_MM`]): measured once, on the first chord asked for.
+    on_surfaces: std::cell::OnceCell<Vec<bool>>,
 }
+
+/// The parameter of `curve`, continued past its ends along its end
+/// tangents at its end speeds as [`geometry::extended_point`] continues it,
+/// whose point is nearest `p`: a point past an end is not clamped to it.
+pub(super) fn parameter_on_extended(curve: &NurbsCurve, p: Vec3) -> Result<f64, String> {
+    let foot = crate::project_point_to_curve(curve, p)?.u;
+    let [a, b] = curve.domain()?;
+    let h = 1e-6 * (b - a);
+    // How far past `end` (towards the outside, opposite `inward`) p lies.
+    let beyond = |end: f64, inward: f64| -> Result<Option<f64>, String> {
+        if (foot - end).abs() > h {
+            return Ok(None);
+        }
+        let at = curve.evaluate(end)?;
+        let velocity = at.sub(curve.evaluate(end + inward)?).scale(-1.0 / inward);
+        let past = p.sub(at).dot(velocity) / velocity.dot(velocity).max(1e-300);
+        Ok((past != 0.0 && (past > 0.0) == (inward < 0.0)).then_some(end + past))
+    };
+    Ok(beyond(b, -h)?.or(beyond(a, h)?).unwrap_or(foot))
+}
+
+/// An intersection curve's chart points with their parameters in the file
+/// (§5.2.1.5): [`Translator::intersection_parameters`].
+pub(super) struct ChartParameters {
+    points: Vec<Vec3>,
+    parameters: Vec<f64>,
+    crossing: Crossing,
+}
+
+impl ChartParameters {
+    /// The curve's point at the file's parameter `t`: a chart point's own
+    /// position at its parameter; between two, the point of the curve on
+    /// the plane normal to their chord through the chord's point
+    /// proportioned by `t` (past an end, the end chord carried on).
+    fn point(&self, t: f64) -> Result<Vec3, String> {
+        let n = self.parameters.len();
+        let i = self.parameters[1..n - 1].iter().take_while(|&&p| p <= t).count();
+        let (t0, t1) = (self.parameters[i], self.parameters[i + 1]);
+        let (a, b) = (self.points[i], self.points[i + 1]);
+        let s = (t - t0) / (t1 - t0);
+        if s == 0.0 {
+            return Ok(a);
+        }
+        if s == 1.0 {
+            return Ok(b);
+        }
+        let chord = b.sub(a);
+        let direction = chord.normalized()?;
+        self.crossing
+            .solve(a.add(chord.scale(s)), direction, chord.length() * (1.0 + s.abs().max((s - 1.0).abs())))
+            .ok_or_else(|| format!("no point of the intersection at its parameter {t}"))
+    }
+}
+
+/// How far a chart point may stand from a surface it is stated on and still
+/// count as on it: ten times the file's resolution, which a chart point is
+/// rounded to (those of a curve the reader evaluates exactly sit within
+/// 1e-11 mm of both surfaces; past a clamped base, 1e-2 mm and more).
+const CHART_ON_SURFACE_MM: f64 = 10.0 * RESOLUTION_MM;
 
 impl<'a> ChartStations<'a> {
     fn new(crossing: Option<&'a Crossing>, chart: &'a [Vec3]) -> Self {
         let memo = crate::step_import::import_lean().then(|| std::cell::RefCell::new(HashMap::default()));
-        Self { crossing, chart, memo }
+        Self { crossing, chart, memo, on_surfaces: std::cell::OnceCell::new() }
     }
 
     /// The point of the curve at `fraction` of chord `i`, solved from the
@@ -2135,6 +3397,21 @@ impl<'a> ChartStations<'a> {
         let mut out = vec![a];
         let Some(crossing) = self.crossing else { return out };
         let Ok(direction) = b.sub(a).normalized() else { return out };
+        // A chord whose chart points are not on both surfaces as read runs
+        // where the reader's surfaces are not the file's: past a B-surface's
+        // domain, where an offset of it is extended and the reader's distance
+        // stops at the domain's edge (chart points 0.04 mm off it, exact
+        // elsewhere). Solving there would trace a different curve: the chart
+        // alone stands for it.
+        if let Crossing::Surfaces(first, second) = crossing {
+            let on = self.on_surfaces.get_or_init(|| {
+                let on = |p: &Vec3| [first, second].iter().all(|s| s.distance(*p).is_some_and(|(d, _)| d.abs() <= CHART_ON_SURFACE_MM));
+                self.chart.iter().map(on).collect()
+            });
+            if !(on[i] && on[i + 1]) {
+                return out;
+            }
+        }
         for k in 1..splits {
             // A point further from its station than the chord is long has
             // left the branch the chart traces.
@@ -2175,7 +3452,7 @@ impl<'a> ChartStations<'a> {
         let chart = self.chart;
         let fit = |stations: &ChartStations| fit_by_pieces(chart.len() - 1, |i, s| Ok(stations.chord(i, s)), chart[chart.len() - 1], 8);
         match (fit(self), self.crossing) {
-            (Err(_), Some(Crossing::Contact { .. })) => Ok((fit(&ChartStations { crossing: None, chart, memo: None })?, true)),
+            (Err(_), Some(Crossing::Contact { .. })) => Ok((fit(&ChartStations { crossing: None, chart, memo: None, on_surfaces: std::cell::OnceCell::new() })?, true)),
             (result, _) => Ok((result?, false)),
         }
     }
@@ -2183,27 +3460,306 @@ impl<'a> ChartStations<'a> {
 
 
 /// An SP-curve over [t0, t1] fitted knot span by knot span
-/// ([`fit_by_pieces`]).
-fn fit_sp_curve(surface: &Surface, uv: &NurbsCurve, range: [f64; 2]) -> Result<NurbsCurve, String> {
-    fit_sp_curve_by(&|u, v| surface.point(u, v), uv, range)
+/// ([`fit_by_pieces`]), and broken again where it crosses a crease of its
+/// surface ([`surface_creases`]).
+fn fit_sp_curve(surface: &Surface, uv: &NurbsCurve, range: [f64; 2], extend: [f64; 2]) -> Result<NurbsCurve, String> {
+    fit_sp_curve_by(&|u, v| surface.point(u, v), uv, range, &surface_creases(surface), extend)
 }
 
-/// [`fit_sp_curve`] on a surface given by its point function.
-fn fit_sp_curve_by(point: &impl Fn(f64, f64) -> Result<Vec3, String>, uv: &NurbsCurve, [t0, t1]: [f64; 2]) -> Result<NurbsCurve, String> {
+/// `offset` with each listed boundary row's poles (sides as
+/// [`Translator::folded_rows`] numbers them) set on its vertex.
+fn pin_rows(mut offset: NurbsSurface, pins: &[(usize, Vec3)]) -> Option<NurbsSurface> {
+    let (nu, nv) = (offset.control_points.len(), offset.control_points[0].len());
+    for &(side, vertex) in pins {
+        let cells: Vec<(usize, usize)> = match side {
+            0 => (0..nv).map(|j| (0, j)).collect(),
+            1 => (0..nv).map(|j| (nu - 1, j)).collect(),
+            2 => (0..nu).map(|i| (i, 0)).collect(),
+            _ => (0..nu).map(|i| (i, nv - 1)).collect(),
+        };
+        for (i, j) in cells {
+            let w = offset.control_points[i][j].w;
+            offset.control_points[i][j] = crate::Vec4 { x: vertex.x * w, y: vertex.y * w, z: vertex.z * w, w };
+        }
+    }
+    NurbsSurface::new(offset.degree_u, offset.degree_v, offset.knots_u.clone(), offset.knots_v.clone(), offset.control_points.clone()).ok()
+}
+
+/// Whether `p` lies within `tolerance` of `surface` (mm).
+fn lies_on(surface: &NurbsSurface, p: Vec3, tolerance: f64) -> bool {
+    crate::project_point_to_surface(surface, p).ok().and_then(|f| surface.evaluate(f.u, f.v).ok()).is_some_and(|q| q.sub(p).length() <= tolerance)
+}
+
+/// A clamped B-surface continued past one side of its domain by `delta`
+/// along its boundary tangent plane, as Parasolid extends one: a new span
+/// on that side, each control line's homogeneous point running on linearly
+/// along its end derivative. Over the old domain the surface is unchanged
+/// (its knots and poles kept), and with constant weights across the side
+/// the strip is the tangent plane's ruled extension exactly; otherwise it
+/// leaves it at second order in `delta` times the weights' change. None for
+/// a side not clamped, or a strip whose weights would not stay positive.
+fn tangent_extension(surface: &NurbsSurface, along_u: bool, at_low: bool, delta: f64) -> Option<NurbsSurface> {
+    use crate::Vec4;
+    let (degree, knots) = if along_u { (surface.degree_u, &surface.knots_u) } else { (surface.degree_v, &surface.knots_v) };
+    let p = degree;
+    let m = knots.len();
+    if p == 0 || m < 2 * (p + 1) {
+        return None;
+    }
+    let clamped = |slice: &[f64]| slice.iter().all(|k| *k == slice[0]);
+    if (at_low && !clamped(&knots[..=p])) || (!at_low && !clamped(&knots[m - p - 1..])) {
+        return None;
+    }
+    let (rows, columns) = (surface.control_points.len(), surface.control_points[0].len());
+    let lines: Vec<Vec<Vec4>> = if along_u {
+        (0..columns).map(|j| (0..rows).map(|i| surface.control_points[i][j]).collect()).collect()
+    } else {
+        surface.control_points.clone()
+    };
+    let lerp = |a: Vec4, d: Vec4, s: f64| Vec4 { x: a.x + d.x * s, y: a.y + d.y * s, z: a.z + d.z * s, w: a.w + d.w * s };
+    let diff = |a: Vec4, b: Vec4, k: f64| Vec4 { x: (a.x - b.x) * k, y: (a.y - b.y) * k, z: (a.z - b.z) * k, w: (a.w - b.w) * k };
+    let mut extended_lines = Vec::with_capacity(lines.len());
+    for line in &lines {
+        let n = line.len();
+        // The homogeneous end derivative, and the line through the end
+        // point along it as a Bézier span of the same degree over the strip:
+        // a linear function's poles are its values at even steps.
+        let (end, slope) = if at_low {
+            (line[0], diff(line[1], line[0], p as f64 / (knots[p + 1] - knots[0])))
+        } else {
+            (line[n - 1], diff(line[n - 1], line[n - 2], p as f64 / (knots[m - 1] - knots[m - p - 2])))
+        };
+        let strip: Vec<Vec4> = (0..=p).map(|i| lerp(end, slope, if at_low { -delta * (p - i) as f64 / p as f64 } else { delta * i as f64 / p as f64 })).collect();
+        if strip.iter().any(|q| !(q.w > 0.0)) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(n + p);
+        if at_low {
+            out.extend_from_slice(&strip[..p]);
+            out.extend_from_slice(line);
+        } else {
+            out.extend_from_slice(line);
+            out.extend_from_slice(&strip[1..]);
+        }
+        extended_lines.push(out);
+    }
+    // The end knot kept to multiplicity p between the old span and the
+    // strip, the strip's far end clamped.
+    let new_knots: Vec<f64> = if at_low {
+        std::iter::repeat(knots[0] - delta).take(p + 1).chain(knots[1..].iter().copied()).collect()
+    } else {
+        knots[..m - 1].iter().copied().chain(std::iter::repeat(knots[m - 1] + delta).take(p + 1)).collect()
+    };
+    let net: Vec<Vec<Vec4>> = if along_u {
+        let length = extended_lines[0].len();
+        (0..length).map(|i| extended_lines.iter().map(|line| line[i]).collect()).collect()
+    } else {
+        extended_lines
+    };
+    let (knots_u, knots_v) = if along_u { (new_knots, surface.knots_v.clone()) } else { (surface.knots_u.clone(), new_knots) };
+    NurbsSurface::new(surface.degree_u, surface.degree_v, knots_u, knots_v, net).ok()
+}
+
+/// The u and v values of a B-surface's interior knots of multiplicity at
+/// least its degree, where it is only C0 (a surface written as Bézier
+/// patches): a curve across one can turn there, which a cubic fitted
+/// through evenly spaced points rounds off. An offset has its base's.
+fn surface_creases(surface: &Surface) -> [Vec<f64>; 2] {
+    let creases = |knots: &[f64], degree: usize| -> Vec<f64> {
+        let (first, last) = (knots[0], knots[knots.len() - 1]);
+        let mut out: Vec<f64> = Vec::new();
+        for &k in knots.iter().filter(|&&k| k > first && k < last) {
+            if out.last() != Some(&k) && knots.iter().filter(|&&j| j == k).count() >= degree {
+                out.push(k);
+            }
+        }
+        out
+    };
+    match surface {
+        Surface::Nurbs(n) if !n.knots_u.is_empty() && !n.knots_v.is_empty() => {
+            [creases(&n.knots_u, n.degree_u), creases(&n.knots_v, n.degree_v)]
+        }
+        Surface::Offset { base, .. } => surface_creases(base),
+        _ => [Vec::new(), Vec::new()],
+    }
+}
+
+/// [`fit_sp_curve`] on a surface given by its point function, with the
+/// surface's creases in u and v.
+fn fit_sp_curve_by(
+    point: &impl Fn(f64, f64) -> Result<Vec3, String>,
+    uv: &NurbsCurve,
+    [t0, t1]: [f64; 2],
+    creases: &[Vec<f64>; 2],
+    extend: [f64; 2],
+) -> Result<NurbsCurve, String> {
     let mut breaks = vec![t0];
     breaks.extend(uv.knots.iter().copied().filter(|&k| k > t0 && k < t1));
     breaks.push(t1);
     breaks.dedup();
     let at = |t: f64| -> Result<Vec3, String> {
-        let p = uv.evaluate(t)?;
+        let p = uv_on_tangents(uv, [t0, t1], t)?;
         point(p.x, p.y)
     };
+    if creases.iter().any(|c| !c.is_empty()) {
+        // Where the 2D curve crosses a crease: each span is scanned in 16
+        // steps for a change of side, then bisected; a step landing on the
+        // crease is a crossing itself. (Two crossings inside one step are
+        // not seen; that stretch is fitted as before, and checked.)
+        let side = |t: f64, axis: usize, c: f64| -> Result<f64, String> {
+            let p = uv.evaluate(t)?;
+            Ok(if axis == 0 { p.x - c } else { p.y - c })
+        };
+        let mut crossings = Vec::new();
+        for pair in breaks.windows(2) {
+            for (axis, values) in creases.iter().enumerate() {
+                for &c in values {
+                    let mut a = pair[0];
+                    let mut fa = side(a, axis, c)?;
+                    for k in 1..=16 {
+                        let b = pair[0] + (pair[1] - pair[0]) * k as f64 / 16.0;
+                        let fb = side(b, axis, c)?;
+                        if fb == 0.0 && k < 16 {
+                            crossings.push(b);
+                        } else if fa * fb < 0.0 {
+                            let (mut lo, mut hi, mut flo) = (a, b, fa);
+                            for _ in 0..60 {
+                                let mid = 0.5 * (lo + hi);
+                                let fm = side(mid, axis, c)?;
+                                if flo * fm <= 0.0 {
+                                    hi = mid;
+                                } else {
+                                    (lo, flo) = (mid, fm);
+                                }
+                            }
+                            crossings.push(0.5 * (lo + hi));
+                        }
+                        (a, fa) = (b, fb);
+                    }
+                }
+            }
+        }
+        // A crossing is added only away from every break already there (the
+        // 2D curve's own knots are all kept), in parameter and on the
+        // surface: one whose stretch to a break stays within ten times the
+        // file's resolution of it (a crease a hair before the curve's end)
+        // would only crowd that piece's points together. The stretch is
+        // looked at in quarters, so a turn between two such creases keeps
+        // them.
+        let close = 1e-9 * (t1 - t0);
+        for t in crossings {
+            let mut apart = true;
+            for &b in &breaks {
+                let near = if (t - b).abs() <= close {
+                    true
+                } else {
+                    let base = at(b)?;
+                    let mut within = true;
+                    for k in 1..=4 {
+                        if at(b + (t - b) * f64::from(k) / 4.0)?.sub(base).length() > CHART_ON_SURFACE_MM {
+                            within = false;
+                            break;
+                        }
+                    }
+                    within
+                };
+                if near {
+                    apart = false;
+                    break;
+                }
+            }
+            if apart {
+                breaks.push(t);
+            }
+        }
+        breaks.sort_by(f64::total_cmp);
+    }
+    // The stretches run on past each end along the 2D curve's tangent there
+    // ([`sp_curve_extension`]): a piece each.
+    if extend[0] > 0.0 {
+        breaks.insert(0, t0 - extend[0]);
+    }
+    if extend[1] > 0.0 {
+        breaks.push(t1 + extend[1]);
+    }
     fit_by_pieces(
         breaks.len() - 1,
         |i, s| (0..s).map(|k| at(breaks[i] + (breaks[i + 1] - breaks[i]) * k as f64 / s as f64)).collect(),
-        at(t1)?,
+        at(t1 + extend[1].max(0.0))?,
         8,
     )
+}
+
+/// A 2D curve's point at `t`, inside [t0, t1] the curve's own and past
+/// either end straight on along its tangent there.
+fn uv_on_tangents(uv: &NurbsCurve, [t0, t1]: [f64; 2], t: f64) -> Result<Vec3, String> {
+    if t >= t0 && t <= t1 {
+        return uv.evaluate(t);
+    }
+    let h = 1e-6 * (t1 - t0).abs().max(1e-12);
+    let (end, inner) = if t < t0 { (t0, t0 + h) } else { (t1, t1 - h) };
+    let (p, q) = (uv.evaluate(end)?, uv.evaluate(inner)?);
+    let velocity = p.sub(q).scale(1.0 / (end - inner));
+    Ok(p.add(velocity.scale(t - end)))
+}
+
+/// How far past each end of [t0, t1] an SP-curve's 2D curve runs on along its
+/// tangent for its surface point to reach that end's vertex: for an end whose
+/// vertex (with its tolerance, in the curve's direction) stands off it by more
+/// than ten times the resolution and within the tolerance, where the vertex
+/// lies along that extension: it comes to within half the gap and within
+/// [`SNAP_ENDS_MM`], which [`snap_ends`] then closes. Parasolid leaves a
+/// curve short of a tolerant vertex by up to its tolerance (two SP-curves
+/// stopping 0.33 mm either side of a 0.33 mm vertex, in line with it; on the
+/// surface the extension passes 0.01 to 0.04 mm from it); the extension stays
+/// on the surface, where moving the end the whole way would bend the curve off
+/// it. 0 elsewhere.
+fn sp_curve_extension(
+    point: &impl Fn(f64, f64) -> Result<Vec3, String>,
+    uv: &NurbsCurve,
+    [t0, t1]: [f64; 2],
+    vertices: [(Vec3, f64); 2],
+) -> [f64; 2] {
+    let at = |t: f64| -> Option<Vec3> {
+        let p = uv_on_tangents(uv, [t0, t1], t).ok()?;
+        point(p.x, p.y).ok()
+    };
+    let mut out = [0.0; 2];
+    for (k, (end, outwards)) in [(t0, -1.0), (t1, 1.0)].into_iter().enumerate() {
+        let (vertex, tolerance) = vertices[k];
+        let Some(here) = at(end) else { continue };
+        let gap = here.sub(vertex).length();
+        if !(gap > 10.0 * RESOLUTION_MM && gap <= tolerance + RESOLUTION_MM) {
+            continue;
+        }
+        // Golden sections, no further than the parameter that covers twice
+        // the gap at the end's speed: the vertex stands just off the end, so
+        // a stretch that goes further (round a periodic surface and back,
+        // cross review) is not running on to it.
+        let miss = |d: f64| at(end + outwards * d).map_or(f64::INFINITY, |p| p.sub(vertex).length());
+        let h = 1e-6 * (t1 - t0).abs().max(1e-12);
+        let speed = at(end + outwards * h).map_or(0.0, |p| p.sub(here).length() / h);
+        if !(speed > 0.0) {
+            continue;
+        }
+        let golden = 0.5 * (5f64.sqrt() - 1.0);
+        let (mut lo, mut hi) = (0.0, (t1 - t0).abs().min(2.0 * gap / speed));
+        for _ in 0..80 {
+            let (a, b) = (hi - golden * (hi - lo), lo + golden * (hi - lo));
+            if miss(a) <= miss(b) {
+                hi = b;
+            } else {
+                lo = a;
+            }
+        }
+        let d = 0.5 * (lo + hi);
+        let left = miss(d);
+        // Heading for it: halfway along, already nearer than the end.
+        if d > 0.0 && left <= 0.5 * gap && left <= SNAP_ENDS_MM && miss(0.5 * d) < gap {
+            out[k] = d;
+        }
+    }
+    out
 }
 
 /// Points of an SP-curve, `per_span` to each knot span of its 2D curve,
@@ -2301,11 +3857,107 @@ fn exact_sp_curve(surface: &Surface, uv: &NurbsCurve) -> Option<Curve> {
     }
 }
 
+/// How far `p` stands from a chart (mm), along its chords.
+fn chart_distance(chart: &[Vec3], p: Vec3) -> f64 {
+    place_on_chart(chart, p).0
+}
+
+/// The length (mm) of a chart between two places on it ([`place_on_chart`]:
+/// chord index plus the share along it).
+pub(super) fn chart_length_between(chart: &[Vec3], a: f64, b: f64) -> f64 {
+    let (a, b) = (a.min(b), a.max(b));
+    let at = |s: f64| {
+        let i = (s.floor() as usize).min(chart.len().saturating_sub(2));
+        chart[i].add(chart[i + 1].sub(chart[i]).scale(s - i as f64))
+    };
+    let (first, last) = (a.floor() as usize + 1, b.floor() as usize);
+    if first > last {
+        return at(b).sub(at(a)).length();
+    }
+    let mut length = chart[first].sub(at(a)).length() + at(b).sub(chart[last.min(chart.len() - 1)]).length();
+    for k in first..last.min(chart.len() - 1) {
+        length += chart[k + 1].sub(chart[k]).length();
+    }
+    length
+}
+
+/// Of a curve's two ends, the one an edge from `here` to `there` (its two
+/// vertices) starts at: the pairing of ends with vertices that lies
+/// nearer, as [`snap_ends`] pairs them, so the two vertices of a short
+/// edge never take the same end (cross review). `None` when neither
+/// pairing is nearer (by a nanometre): the vertices do not say which end
+/// is whose.
+pub(super) fn paired_end([first, last]: [Vec3; 2], here: Vec3, there: Vec3) -> Option<Vec3> {
+    let straight = first.sub(here).length() + last.sub(there).length();
+    let crossed = first.sub(there).length() + last.sub(here).length();
+    if (straight - crossed).abs() <= 1e-6 {
+        None
+    } else if straight < crossed {
+        Some(first)
+    } else {
+        Some(last)
+    }
+}
+
+/// Where a tolerant vertex at `at` (mm), of stated `tolerance`, is written,
+/// given the `ends` of the curves that end there and whether a point stays
+/// near enough every intersection cut to the vertex (`follows`): the centre
+/// of the least ball about the ends, when some end stands more than
+/// [`SNAP_ENDS_MM`] from `at`, the ball's radius is within it (so
+/// [`snap_ends`] then closes a trimmed SP-curve's end, and a whole one's is
+/// left within it, as a vertex under 0.1 mm off is today), its centre is
+/// within the tolerance of `at`, and it `follows`. `None` keeps the file's
+/// point.
+pub(super) fn reseat(at: Vec3, tolerance: f64, ends: &[Vec3], follows: impl Fn(Vec3) -> bool) -> Option<Vec3> {
+    if ends.iter().any(|end| end.sub(at).length() > tolerance) || ends.iter().all(|end| end.sub(at).length() <= SNAP_ENDS_MM) {
+        return None;
+    }
+    let (centre, radius) = least_ball(ends)?;
+    (radius <= SNAP_ENDS_MM && centre.sub(at).length() <= tolerance && follows(centre)).then_some(centre)
+}
+
+/// The least ball (centre, radius, mm) holding every one of `points`, for
+/// up to a few points: the least of the balls on one point, on two as a
+/// diameter, or through three on their circumcircle, that holds them all.
+/// `None` for no points, or when only a ball through four would hold them.
+pub(super) fn least_ball(points: &[Vec3]) -> Option<(Vec3, f64)> {
+    let holds = |centre: Vec3, radius: f64| points.iter().all(|p| p.sub(centre).length() <= radius * (1.0 + 1e-12) + 1e-12);
+    let mut best: Option<(Vec3, f64)> = None;
+    let mut offer = |centre: Vec3, radius: f64| {
+        if best.is_none_or(|(_, r)| radius < r) && holds(centre, radius) {
+            best = Some((centre, radius));
+        }
+    };
+    let n = points.len();
+    for i in 0..n {
+        offer(points[i], 0.0);
+        for j in i + 1..n {
+            let centre = points[i].add(points[j]).scale(0.5);
+            offer(centre, centre.sub(points[i]).length());
+            for k in j + 1..n {
+                // The circumcentre of the triangle, in its plane.
+                let (a, b) = (points[j].sub(points[i]), points[k].sub(points[i]));
+                let normal = a.cross(b);
+                let area = normal.dot(normal);
+                if area <= 0.0 {
+                    continue;
+                }
+                let centre = points[i].add(b.cross(normal).scale(a.dot(a)).add(normal.cross(a).scale(b.dot(b))).scale(0.5 / area));
+                offer(centre, centre.sub(points[i]).length());
+            }
+        }
+    }
+    best
+}
+
 /// `curve` with its end control points moved onto the edge's vertices (the
 /// nearer to each end), where both stand within a tenth of a millimetre of
 /// the ends they replace; otherwise unchanged. A clamped B-spline's ends
 /// are its end control points, so only the spans at its ends move, by the
 /// gap.
+/// The furthest [`snap_ends`] moves a curve's end onto its vertex (mm).
+const SNAP_ENDS_MM: f64 = 0.1;
+
 fn snap_ends(mut curve: NurbsCurve, (start, end): (Vec3, Vec3)) -> NurbsCurve {
     let n = curve.control_points.len();
     if n < 2 {
@@ -2318,7 +3970,7 @@ fn snap_ends(mut curve: NurbsCurve, (start, end): (Vec3, Vec3)) -> NurbsCurve {
     } else {
         (end, start)
     };
-    if first.sub(a).length() > 0.1 || last.sub(b).length() > 0.1 {
+    if first.sub(a).length() > SNAP_ENDS_MM || last.sub(b).length() > SNAP_ENDS_MM {
         return curve;
     }
     for (k, p) in [(0, a), (n - 1, b)] {
@@ -2335,6 +3987,27 @@ pub(super) fn edge_fins<'f>(file: &'f XtFile, edge: &Node) -> Result<(&'f Node, 
     let first = file.follow(edge, "halfedge").ok_or("has no fin")?;
     let other = file.follow(first, "other").ok_or("has one fin")?;
     Ok(if first.char("sense") == Some(b'-') && other.char("sense") != Some(b'-') { (other, first) } else { (first, other) })
+}
+
+/// Whether a loop's points, in order, go once round a closed B-curve spine:
+/// their feet's steps, each taken the short way round the period, add up to
+/// a whole period (to a quarter of one).
+fn winds_round(spine: &Curve, points: &[Vec3]) -> bool {
+    let (Curve::Nurbs(curve), Some([a, b])) = (spine, geometry::closed_range(spine)) else { return false };
+    let period = b - a;
+    let feet: Vec<f64> = points.iter().filter_map(|p| crate::project_point_to_curve(curve, *p).ok().map(|f| f.u)).collect();
+    if feet.len() < 3 {
+        return false;
+    }
+    let step = |from: f64, to: f64| {
+        let d = (to - from).rem_euclid(period);
+        if d > 0.5 * period { d - period } else { d }
+    };
+    let mut total = 0.0;
+    for k in 0..feet.len() {
+        total += step(feet[k], feet[(k + 1) % feet.len()]);
+    }
+    (total.abs() - period).abs() <= 0.25 * period
 }
 
 /// The parameter range of `spine` that the points lie along, widened by a
@@ -2505,21 +4178,55 @@ fn pipe_axis_point(spine: &Curve, inner: &Option<Box<([Support; 2], f64)>>, x: V
         Some([a, b]) if b > a => 1e-6 * (b - a),
         _ => 1e-6 / MM_PER_METRE,
     };
-    for _ in 0..12 {
-        let c = centre(k)?;
+    // (x - c(k))·c'(k) and |c'(k)|².
+    let f = |k: f64| -> Option<(f64, f64)> {
         let slope = centre(k + h)?.sub(centre(k - h)?).scale(0.5 / h);
-        let speed = slope.dot(slope);
-        if !(speed > 0.0) {
-            return Some(c);
+        Some((x.sub(centre(k)?).dot(slope), slope.dot(slope)))
+    };
+    let (mut f0, speed) = f(k)?;
+    if !(speed > 0.0) {
+        return centre(k);
+    }
+    // The first step as if the curve were straight; then secant steps,
+    // which take its bend into account. Stepped as if straight throughout,
+    // each step is (x - c)·c''/|c'|² times the last: past the curve's
+    // centre of curvature (36.7 mm from a centre curve bending at 12.2) it
+    // grew threefold each time and stopped wherever it was, 1.7e-3 mm off
+    // and different at each section, so no surface came within 1e-3 mm of
+    // a blend resting on that pipe.
+    // Each step is kept only where the centre it reaches is no farther from
+    // `x` than the nearest so far, halved until it is: the point sought is
+    // the nearest, and an unbounded step could run where the centre curve
+    // has no centres and stop on a stray one (cross review: 0.33 mm off).
+    let distance = |k: f64| centre(k).map_or(f64::INFINITY, |c| x.sub(c).length());
+    let mut best = (k, distance(k));
+    let mut k1 = k + f0 / speed;
+    for _ in 0..30 {
+        let mut d1 = distance(k1);
+        let mut halvings = 0;
+        while !(d1 <= best.1 + 1e-12 * (1.0 + best.1)) && halvings < 20 {
+            k1 = 0.5 * (k1 + best.0);
+            d1 = distance(k1);
+            halvings += 1;
         }
-        let step = x.sub(c).dot(slope) / speed;
-        k += step;
-        if step.abs() <= 1e-13 * (1.0 + k.abs()) {
+        if !(d1 <= best.1 + 1e-12 * (1.0 + best.1)) {
             break;
         }
+        best = (k1, d1);
+        if (k1 - k).abs() <= 1e-13 * (1.0 + k1.abs()) {
+            break;
+        }
+        let (f1, _) = f(k1)?;
+        let denominator = f1 - f0;
+        if denominator == 0.0 || !denominator.is_finite() {
+            break;
+        }
+        let next = k1 - f1 * (k1 - k) / denominator;
+        (k, f0, k1) = (k1, f1, next);
     }
-    centre(k)
+    centre(best.0)
 }
+
 
 /// A support's signed distance from `x` and its unit gradient, where it has
 /// one: a surface's own, a pipe's |x - spine| - radius. A cliff edge has none.
@@ -2584,7 +4291,7 @@ pub(super) fn blend_section(supports: &[Support; 2], radius: f64, spine: &Curve,
     let foot = |s: &Support| -> Result<Vec3, String> {
         match s {
             Support::Surface(s) => {
-                let (distance, gradient) = s.distance(centre).ok_or("a supporting surface has no distance there")?;
+                let (distance, gradient) = s.distance_near(centre, radius, false, 0.05 * radius + 1e-6).ok_or("a supporting surface has no distance there")?;
                 if (distance.abs() - radius).abs() > 0.05 * radius + 1e-6 {
                     return Err(format!("the spine stands {:.3e} mm from a support, not the radius {radius:.3e} mm", distance.abs()));
                 }

@@ -694,6 +694,10 @@ pub fn blend_closed_edge_keep(
             .vertices
             .retain(|candidate| candidate.id != old_vertex);
     }
+    // The kept rim's pcurve is interpolated at the stations; between them it
+    // drifts off the edge's parameter (on the row, so only the pace): the
+    // same-parameter pass rebuilds it from the edge itself.
+    crate::blend::same_parameter_trims(solid, &mut result);
     Ok(result)
 }
 

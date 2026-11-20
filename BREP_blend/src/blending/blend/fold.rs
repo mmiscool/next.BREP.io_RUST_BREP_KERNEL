@@ -662,7 +662,7 @@ pub(super) struct FoldReading {
 /// step that hopped a seam).
 ///
 /// The number alone does not see every fold. Where a contact runs INSIDE a
-/// convex turn of its face's outline (report 5e49bb42's cap, an r 0.93 turn)
+/// convex turn of its face's outline (the sculpted-cap report's cap, an r 0.93 turn)
 /// the centre curve is that turn offset inward: it tightens as the ball grows
 /// and passes through a cusp into a swallowtail, while the section arc never
 /// faces its curvature vector. The fold factor reads zero to the cusp and

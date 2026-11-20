@@ -25,9 +25,9 @@
 //!   uses, so the two lanes cannot drift apart. The kernel test suite asserts
 //!   the strong form of this: replaying this module's output through the flat
 //!   lane's own `transform_brep` call reproduces `resolve_assembly`'s solids
-//!   BIT-for-bit on every single-context assembly fixture.
+//!   BIT-for-bit on every assembly fixture, the mixed-unit one included.
 //!
-//! **Units are resolved PER PRODUCT here**, not once per file.
+//! **Units are resolved PER PRODUCT**, in both lanes, not once per file.
 //! `derive_length_scale_mm` picks one global scale out of `HashMap` iteration
 //! order, which a mixed-unit assembly — each product representation carrying
 //! its own `GLOBAL_UNIT_ASSIGNED_CONTEXT` — makes both wrong and
@@ -206,22 +206,11 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     let mut scales = ProductScales::new(&structure, global_scale);
 
     // Each edge's placement, read at the scale of the representation each of its
-    // frames is an item of: an ITEM_DEFINED_TRANSFORMATION's AXIS2_PLACEMENT_3D
-    // origins are lengths in the PARENT representation's context (§3.6.2), so
-    // the parent's unit — not the file-global one — converts them to
-    // millimetres, and a mapped item's `mapping_origin` is an item of the CHILD
-    // representation and takes the child's (`mapped.rs`). The rotation blocks
-    // are dimensionless and unaffected.
-    //
-    // (Strictly, a NAUO's `item_1` lives in the CHILD representation too, so a
-    // file that BOTH mixes units AND gives item_1 a non-identity origin would
-    // want its two frames scaled separately. Every producer we have seen writes
-    // item_1 as the child rep's origin placement, where the two agree; splitting
-    // them would mean reimplementing `nauo_edge_transform` rather than handing
-    // it a Resolver, which is a worse trade for a case no fixture exhibits. A
-    // MAPPED_ITEM is not in that position: its two frames are REQUIRED to be
-    // items of the two different representations, so the split is the only
-    // correct reading and `mapped-item-nested-nauo.step` exhibits it.)
+    // frames is an item of (§3.6.2): an ITEM_DEFINED_TRANSFORMATION has
+    // `transform_item_1` in rep_1 and `transform_item_2` in rep_2, and a mapped
+    // item's `mapping_origin` is an item of the CHILD representation, its target
+    // of the PARENT's (`mapped.rs`). The rotation blocks are dimensionless and
+    // unaffected.
     //
     // A mapping we cannot express as a rigid placement is REFUSED here: its edge
     // is dropped, so nothing under it is instantiated, and the refusal is
@@ -251,16 +240,18 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
         .map(|(index, &pd)| (pd, index))
         .collect();
 
-    // Each product's own bodies, built at that product's own unit scale. The
-    // cache is keyed by (body, scale) rather than by body alone: two products
-    // can only share a body entity by sharing a representation, in which case
-    // they share a context and the scale key is redundant — but if they ever do
-    // not, the second product gets its own build instead of the first's.
+    // Each body built at the unit of the representation that lists it, else
+    // its product's (`body_scale`). The cache is keyed by (body, scale) rather
+    // than by body alone, as in the flat lane, so a body reached at two units
+    // gets a build for each.
     // The file's presentation entities, read ONCE for the whole document.
     let styles = StyleTable::read(&entities);
+    // Every per-body resolver derives from this one, so they share its lazily
+    // derived angle unit instead of each sweeping the file for it.
+    let base = Resolver::new(&entities, global_scale).without_trim_readings();
     let build_part = |(body, scale_key): (StepBody, u64)| {
         // The readings are dropped below, so the build does not take them.
-        let resolver = Resolver::new(&entities, f64::from_bits(scale_key)).without_trim_readings();
+        let resolver = base.with_length_scale(f64::from_bits(scale_key));
         build_step_body(&resolver, body)
             .map(|(solid, _readings)| {
                 let appearance = step_body_appearance(&resolver, &styles, body, &solid);
@@ -277,9 +268,11 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
         let mut seen: HashSet<(StepBody, u64)> = HashSet::default();
         for (&pd, &scale) in pd_refs.iter().zip(&product_scales) {
             let resolver = Resolver::new(&entities, scale);
+            let owners = node_representations(&structure, &resolver, pd);
             for body in pd_step_bodies(&structure, &resolver, pd) {
-                if seen.insert((body, scale.to_bits())) {
-                    part_keys.push((body, scale.to_bits()));
+                let key = (body, body_scale(&structure.units, body, &owners, scale).to_bits());
+                if seen.insert(key) {
+                    part_keys.push(key);
                 }
             }
         }
@@ -300,7 +293,7 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     let mut solid_cache: HashMap<(StepBody, u64), Result<(BrepSolid, BodyAppearance), String>> =
         build_distinct_bodies(
             part_keys,
-            |(body, scale_key)| step_body_face_count(&Resolver::new(&entities, f64::from_bits(scale_key)), body),
+            |(body, _)| step_body_face_count(&base, body),
             &timed_build,
         ).into_iter().collect();
     phase("body builds");
@@ -331,13 +324,14 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     let mut body_items: Vec<Vec<Vec<usize>>> = Vec::with_capacity(pd_refs.len());
     for (&pd, &scale) in pd_refs.iter().zip(&product_scales) {
         let resolver = Resolver::new(&entities, scale);
-        let scale_key = scale.to_bits();
         let mut bodies = Vec::new();
         let mut appearances = Vec::new();
         let mut product_face_refs = Vec::new();
         let mut failed_bodies = 0usize;
         let mut items = Vec::new();
+        let owners = node_representations(&structure, &resolver, pd);
         for body in pd_step_bodies(&structure, &resolver, pd) {
+            let scale_key = body_scale(&structure.units, body, &owners, scale).to_bits();
             let built = solid_cache
                 .entry((body, scale_key))
                 .or_insert_with(|| build_part((body, scale_key)));
@@ -471,7 +465,9 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
     }))
 }
 
-/// Per-product length units, memoised.
+/// Per-product length units, memoised: the fallback for a body or placement
+/// frame whose own representation's context names no unit
+/// (`RepresentationUnits` answers first, for mapped-item frames too).
 ///
 /// A product's geometry is expressed in the REPRESENTATION_CONTEXT of the shape
 /// representation that defines it, and that context carries its own unit
@@ -481,8 +477,9 @@ pub fn read_step_assembly(text: &str) -> Result<Option<StepAssembly>, String> {
 ///
 /// Falls back to the file-global scale for a product with no resolvable context
 /// (a pure assembly node with no shape representation, typically), so a
-/// single-context file resolves to the identical scale everywhere and the
-/// structured lane's geometry stays byte-identical to the flat lane's.
+/// single-context file resolves to the identical scale everywhere. The flat
+/// lane (`resolve_assembly`) reads its scales through this same memo, so the
+/// two lanes agree on every file.
 pub(super) struct ProductScales<'a> {
     structure: &'a StructureIndex<'a>,
     global: f64,

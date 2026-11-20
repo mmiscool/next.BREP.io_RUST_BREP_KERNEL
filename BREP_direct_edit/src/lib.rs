@@ -81,10 +81,12 @@ pub use direct_edit::{
     offset_revolution_face, offset_revolution_face_unchecked, offset_ruled_face, offset_ruled_face_unchecked, offset_sphere_face,
     offset_sphere_face_unchecked, offset_torus_face, offset_torus_face_unchecked,
     rebuild_displaced_blends, with_blend_rebuild_decline,
-    recut_moved_planes, recut_moved_planes_rigid, recut_moved_planes_unchecked, reblend_lost_fillets, resolve_face_by_point, rotate_faces, rotate_faces_unchecked,
+    recut_moved_planes, recut_moved_planes_rigid, redrill_moved_bore, recut_convex_body, recut_moved_planes_unchecked, reblend_lost_fillets, resolve_face_by_point, rotate_faces, rotate_faces_unchecked,
     route_reading, RouteReading,
 };
 pub use direct_edit::{face_refusal_slugs, face_transform_reason, FaceTransformReason};
+pub use direct_edit::{deform_shell, ShellDeformPick, ShellDeformReport, ShellDeformSpec};
+pub use direct_edit::{deform_face, face_deform_default_anchor, FaceDeformPick, FaceDeformReport, FaceDeformSpec};
 pub use direct_edit::{
     refit_faces_as_one, refit_refusal_phrases, RefitCarrier, RefitReport, RefitSurfaceKind,
 };

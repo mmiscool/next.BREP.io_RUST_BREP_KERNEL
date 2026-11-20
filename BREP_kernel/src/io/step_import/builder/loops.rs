@@ -773,13 +773,31 @@ impl<'a> SolidBuilder<'a> {
                 if k != 0.0 && ((from - to) - k * span).abs() <= tol { k * span } else { 0.0 }
             };
             let closing = whole_jump(coord(placed[placed.len() - 1].end), coord(placed[0].start));
-            if span > 1e-12 && closing != 0.0 {
-                let (du, dv) = if axis == 0 { (closing, 0.0) } else { (0.0, closing) };
+            // The same wrong branch shows as a jump on the OTHER side of the
+            // first coedge when the gap at the loop's close is not a whole
+            // period: a half cone's loop of ruling, rim and ruling with no
+            // apex edge closes at the apex, where the gap-fill bridges half a
+            // period, and the whole-period jump sits between the seam ruling
+            // and the rim. Moving the ruling across the seam removes that jump,
+            // and the gap-fill then bridges the face's own half (measured: a
+            // half cone read 242.35875 mm2 against pi r s / 2 = 242.26184).
+            let leading = whole_jump(coord(placed[1].start), coord(placed[0].end));
+            let shift = if closing != 0.0 {
+                closing
+            } else if switch!("BREP_STEP_SEAM_LEADING_SHIFT", true) {
+                leading
+            } else {
+                0.0
+            };
+            if span > 1e-12 && shift != 0.0 {
+                let (du, dv) = if axis == 0 { (shift, 0.0) } else { (0.0, shift) };
                 let shifted = shift_pcurve(&placed[0].pcurve, du, dv)?;
                 if pcurve_in_domain(&shifted, u0, u1, v0, v1) {
                     let dom = shifted.domain()?;
                     let (s, e) = (shifted.evaluate(dom[0])?, shifted.evaluate(dom[1])?);
-                    if whole_jump(coord((e.x, e.y)), coord(placed[1].start)) == 0.0 {
+                    if whole_jump(coord((e.x, e.y)), coord(placed[1].start)) == 0.0
+                        && whole_jump(coord(placed[placed.len() - 1].end), coord((s.x, s.y))) == 0.0
+                    {
                         placed[0].pcurve = shifted;
                         placed[0].start = (s.x, s.y);
                         placed[0].end = (e.x, e.y);

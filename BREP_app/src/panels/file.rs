@@ -4862,6 +4862,9 @@ impl FileDialog {
             "name": docs.active().name(),
             "nameBuf": self.name_buf,
             "selected": self.explorer.selected(),
+            // The highlighted FOLDER: one click selects a folder row without
+            // entering it (a double click, Enter or Open enters it).
+            "selectedFolder": self.explorer.selected_folder(),
             "location": store.browser_location(),
             // The last folder of each purpose (Open/Save As/Insert, Import,
             // KiCad), which is where that modal opens next.

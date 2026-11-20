@@ -51,6 +51,7 @@ fn build_shell_faces_in_namespace(
     // (mesh-derived region fits) becomes exactly planar triangles BEFORE the
     // reconcile step below can bend its edges onto one plane or the other.
     builder.split_off_plane_planar_faces(&mut pending)?;
+    builder.seat_vertices_on_conic_ends()?;
     builder.reconcile_edges_onto_surfaces(&pending)?;
     let mut faces = Vec::with_capacity(pending.len());
     // The planar split can have minted more pending faces than STEP faces, so
@@ -671,6 +672,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     // reconcile step below can bend its edges onto one plane or the other.
     builder.split_off_plane_planar_faces(&mut pending)?;
     lap("planar_split", &mut lap_started, &mut laps);
+    builder.seat_vertices_on_conic_ends()?;
     builder.reconcile_edges_onto_surfaces(&pending)?;
     lap("reconcile", &mut lap_started, &mut laps);
     // `BREP_STEP_PREFIT`: a large body's projection fits start on idle
@@ -679,6 +681,9 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     if prefits.is_some() {
         lap("prefit", &mut lap_started, &mut laps);
     }
+    // `BREP_STEP_ALIAS_VERDICTS`: the helpers' aliasing verdicts, taken with
+    // their faces' fits and read by the face loop (`builder/alias_verdicts.rs`).
+    let alias_verdicts = super::alias_verdicts::MemoScope::open(prefits.as_ref().is_some_and(|prefits| prefits.verdicts()));
     let mut faces = Vec::with_capacity(pending.len());
     // The planar split can have minted more pending faces than STEP faces, so
     // each pending face carries its own source reference.
@@ -724,6 +729,8 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     if let Some(prefits) = prefits.take() {
         prefits.report(shell_ref);
     }
+    alias_verdicts.report(shell_ref);
+    drop(alias_verdicts);
 
     builder.report_supplied_pcurves();
     let shell_id = builder.fresh();
@@ -771,6 +778,14 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
     if solid.kind == crate::BodyKind::Sheet {
         return Ok((solid, captured, readings::BodyReadings { bounded, closure: ClosureNote::Unjudged }));
     }
+    // A face whose outer loop winds against the sense the file gives it
+    // takes its loop's: the loop's edges agree with its neighbours' (the shell
+    // validated), so the sense is the file's slip. SolidWorks wrote one face
+    // of a keycap `.F.` with its loop counter-clockwise about its carrier's
+    // own normal, which points out of the solid; read as given, its volume
+    // term had the wrong sign (the part 3% large; OpenCASCADE's reader heals
+    // the face the same way).
+    resense_faces_by_winding(&mut solid);
     // Vendor face senses can leave the whole shell pointing inward; a closed
     // shell's material side is defined by its signed volume, so restore the
     // outward convention.
@@ -849,4 +864,57 @@ fn finalize_imported_solid(mut solid: BrepSolid) -> Result<BrepSolid, StepBodyEr
         solid.genus = euler_genus(&solid);
     }
     Ok(solid)
+}
+
+/// Each face on a carrier closed in neither direction whose largest loop
+/// winds in its parameters against its sense (counter-clockwise for a face
+/// that keeps its carrier's normal, clockwise for one that reverses it) has
+/// its sense turned to the loop's. A loop too small to read a winding from
+/// is left alone. Each pcurve is read at its knots and at even steps within
+/// every knot span (cross review: a detour packed into a narrow span), and
+/// the area taken about the loop's first point (cross review: products of
+/// large parameters cancel). Returns how many faces turned.
+pub(in crate::step_import) fn resense_faces_by_winding(solid: &mut crate::BrepSolid) -> usize {
+    const STEPS: usize = 16;
+    const SPAN_STEPS: usize = 8;
+    let mut turned = 0;
+    for face in solid.shells.iter_mut().flat_map(|shell| shell.faces.iter_mut()) {
+        if !matches!(face.surface.closed_directions(), Ok((false, false))) {
+            continue;
+        }
+        let (Ok([u0, u1]), Ok([v0, v1])) = (face.surface.domain_u(), face.surface.domain_v()) else { continue };
+        let mut largest = 0.0f64;
+        for lp in &face.loops {
+            let mut uv: Vec<[f64; 2]> = Vec::new();
+            for coedge in &lp.coedges {
+                let Ok([t0, t1]) = coedge.pcurve.domain() else { continue };
+                let mut ts: Vec<f64> = (0..STEPS).map(|k| t0 + (t1 - t0) * k as f64 / STEPS as f64).collect();
+                for w in coedge.pcurve.knots.windows(2) {
+                    let (a, b) = (w[0].max(t0), w[1].min(t1));
+                    if b > a {
+                        ts.extend((0..SPAN_STEPS).map(|k| a + (b - a) * k as f64 / SPAN_STEPS as f64));
+                    }
+                }
+                ts.retain(|t| *t < t1);
+                ts.sort_by(f64::total_cmp);
+                ts.dedup();
+                uv.extend(ts.into_iter().filter_map(|t| coedge.pcurve.evaluate(t).ok()).map(|p| [p.x, p.y]));
+            }
+            let n = uv.len();
+            if n < 3 {
+                continue;
+            }
+            let o = uv[0];
+            let at = |i: usize| [uv[i % n][0] - o[0], uv[i % n][1] - o[1]];
+            let area = 0.5 * (0..n).map(|i| at(i)[0] * at(i + 1)[1] - at(i + 1)[0] * at(i)[1]).sum::<f64>();
+            if area.abs() > largest.abs() {
+                largest = area;
+            }
+        }
+        if largest.abs() > 1e-6 * (u1 - u0) * (v1 - v0) && (largest > 0.0) != face.same_sense {
+            face.same_sense = !face.same_sense;
+            turned += 1;
+        }
+    }
+    turned
 }

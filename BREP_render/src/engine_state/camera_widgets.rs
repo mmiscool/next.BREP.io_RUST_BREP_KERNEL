@@ -116,6 +116,22 @@ impl EngineState {
         changed
     }
 
+    /// The sketch camera is locked flat to its plane: nothing may turn the
+    /// view (the rule `pointer_down` applies to an orbit drag). Pan and zoom
+    /// keep the orientation and stay available.
+    pub fn camera_rotation_locked(&self) -> bool {
+        self.sketch_mode() && self.sketch_camera_locked
+    }
+
+    /// One frame of SpaceMouse / Spaceball motion: pan and zoom only while
+    /// [`Self::camera_rotation_locked`].
+    pub fn six_dof(&mut self, motion: &crate::controls::SixDofMotion) -> bool {
+        let allow_rotate = !self.camera_rotation_locked();
+        let changed = self.controls.six_dof(&mut self.camera, motion, allow_rotate);
+        self.dirty |= changed;
+        changed
+    }
+
     // --- Camera commands (R21) --------------------------------------------
 
     pub fn toggle_projection(&mut self) -> &'static str {

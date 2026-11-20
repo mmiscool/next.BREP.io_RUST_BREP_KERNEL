@@ -1765,6 +1765,29 @@ pub(super) fn outward_miter_scale(worst_tan: Option<f64>) -> f64 {
     }
 }
 
+/// `BREP_OFFSET_OPENING_REACH` (default on; `=0` restores): see [`opening_reach_tan`].
+pub(super) fn opening_reach_on() -> bool {
+    switch!("BREP_OFFSET_OPENING_REACH", true)
+}
+
+/// How far, per unit offset, a face's OUTWARD offset must run along the face
+/// past its rim on an opening to reach the opening's plane: `−c/√(1 − c²)`
+/// with c the cosine between the face's and the opening's outward normals,
+/// zero where the face leans away from the opening (c ≥ 0). One at 45°, which
+/// the plain extension d already reaches; past that a d extension falls short.
+/// Measured on a block whose side leans out 7 over height 6 (40.6° to its top)
+/// shelled outward through a top with a slot: the side's carrier stopped at
+/// z = 5.892 below the opening plane at 6, the wall cut nothing and the
+/// shell refused with open edges (without the slot the planar shell lane
+/// built it; with one the imprint pipeline did not).
+pub(super) fn opening_reach_tan(station: &JunctionStation) -> f64 {
+    let c = station.normal.dot(station.mate_normal).clamp(-1.0, 1.0);
+    if c >= 0.0 {
+        return 0.0;
+    }
+    -c / (1.0 - c * c).max(1e-12).sqrt()
+}
+
 /// OUTWARD (negative distance) per-side extension of a retained face's
 /// carrier: `amount` (= |distance|) across every side of the trim's uv
 /// bounding box, EXCEPT a side the face runs along SMOOTHLY into retained
@@ -1843,8 +1866,24 @@ pub(super) fn outward_carrier_extension(
             high.x = high.x.max(uv.x);
             high.y = high.y.max(uv.y);
         }
-        let mate = junction_mate(source_faces, face, coedge.edge_id)
-            .filter(|(mate, _)| !opening_set.contains(&mate.id));
+        let raw_mate = junction_mate(source_faces, face, coedge.edge_id);
+        // A side running along an OPENING must reach the opening plane, which
+        // the offset crosses d·(−c)/√(1 − c²) along the face past the rim, c
+        // the cosine between the two outward normals: more than d where the
+        // face meets the opening at under 45° (`opening_reach_tan`).
+        if opening_reach_on() {
+            if let Some((opening, _)) = raw_mate.filter(|(mate, _)| opening_set.contains(&mate.id)) {
+                if let Some(edge) = edge_by_id.get(&coedge.edge_id) {
+                    let reach = junction_stations(face, coedge, edge, opening)?
+                        .iter()
+                        .map(opening_reach_tan)
+                        .fold(None, |worst: Option<f64>, tan| Some(worst.unwrap_or(0.0).max(tan)));
+                    uses.push((samples, false, reach));
+                    continue;
+                }
+            }
+        }
+        let mate = raw_mate.filter(|(mate, _)| !opening_set.contains(&mate.id));
         let (smooth, convex_tan) = match mate {
             Some((mate, mate_use)) => {
                 let smooth = uses_are_tangent(face, coedge, mate, mate_use)?;
@@ -1931,6 +1970,51 @@ pub(super) fn outward_wall_pad(
     let (worst, _) =
         opening_wall_extension_factor(source, opening, source_faces, opening_set, true)?;
     Ok(amount * outward_miter_scale(worst))
+}
+
+/// [`outward_wall_pad`] per outline EDGE: each edge padded for its OWN
+/// neighbour (`d/sin θ` through `outward_miter_scale`), not for the worst
+/// junction of the whole outline. A slot 3 wide through the top of a block
+/// whose far side leans out (the drafted junction's pad ≈ 1.94) had its own
+/// edges, which need only d, offset by 1.94: the notch closed and the outline
+/// offset refused. Edges with no convex junction (a smooth or reflex one, or
+/// none) take `amount`.
+///
+/// The caller adds a clearance to every edge when these differ: padded by
+/// exactly d beside an edge padded more, a perpendicular edge's wall boundary
+/// lands ON its neighbour's offset section and the imprint drops that section
+/// as boundary.
+pub(super) fn outward_wall_pads_per_edge(
+    source: &BrepSolid,
+    opening: &FaceRecord,
+    source_faces: &[&FaceRecord],
+    opening_set: &HashSet<u64>,
+    amount: f64,
+) -> Result<HashMap<u64, f64>, KernelRefusal> {
+    let edge_by_id = source.edges.iter().map(|edge| (edge.id, edge)).collect::<HashMap<_, _>>();
+    let mut pads = HashMap::default();
+    for coedge in opening.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let Some(edge) = edge_by_id.get(&coedge.edge_id) else { continue };
+        let mut worst: Option<f64> = None;
+        if !edge.degenerate {
+            if let Some((mate, _)) = junction_mate(source_faces, opening, coedge.edge_id)
+                .filter(|(mate, _)| !opening_set.contains(&mate.id))
+            {
+                for station in junction_stations(opening, coedge, edge, mate)? {
+                    if !station.is_convex() {
+                        continue;
+                    }
+                    let sin_dihedral = station.normal.cross(station.mate_normal).length();
+                    if sin_dihedral <= 1e-6 {
+                        continue;
+                    }
+                    worst = Some(worst.unwrap_or(0.0).max(1.0 / sin_dihedral));
+                }
+            }
+        }
+        pads.insert(coedge.edge_id, amount * outward_miter_scale(worst));
+    }
+    Ok(pads)
 }
 
 /// An inward offset at a REFLEX opening rim crosses beyond the original
@@ -2360,7 +2444,7 @@ pub fn outward_fold_the_carve_missed_with_certificate(
     distance: f64,
     enabled: bool,
 ) -> Result<Option<crate::offset_regularity::FoldSample>, KernelRefusal> {
-    use crate::offset_regularity::{fold_sample_at, scan_offset_regularity, TrimRegion};
+    use crate::offset_regularity::{fold_sample_at, least_fold_factor, TrimRegion};
     if distance >= 0.0 || face.surface.is_affine().or_refuse(KernelStage::Refine, "is_affine")? {
         return Ok(None);
     }
@@ -2372,14 +2456,12 @@ pub fn outward_fold_the_carve_missed_with_certificate(
     }
     let region = TrimRegion::from_face(face)?;
     let displacement = [shell_displacement(face, distance)];
-    let scan = scan_offset_regularity(
-        &face.surface,
-        &region,
-        &displacement,
-        COLLAPSE_FACTOR,
-        UNSEEN_FOLD_BUDGET,
-    )?;
-    let Some(mut worst) = scan.worst else {
+    // The census's own reading of the face (grid, rim, refinement, descent and
+    // certainty step), at this hunt's denser budget. Its `bound` is not acted
+    // on: this guard refuses a fold it FINDS, and an uncertain reading near a
+    // locus is the normal case; the polish below walks to the minimum instead.
+    let reading = least_fold_factor(face, &displacement, COLLAPSE_FACTOR, UNSEEN_FOLD_BUDGET)?;
+    let Some(mut worst) = reading.least else {
         return Ok(None);
     };
     // The scan's refinement stops at a fixed depth, which leaves a smooth

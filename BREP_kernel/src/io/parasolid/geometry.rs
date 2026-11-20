@@ -161,9 +161,19 @@ impl Surface {
                 .add(frame.z.scale(minor * v.sin())),
             Surface::Nurbs(surface) => surface.evaluate(u, v)?,
             Surface::Offset { base, base_sense, distance } => {
-                let normal = base.natural_normal(u, v)?;
                 let sign = if *base_sense { 1.0 } else { -1.0 };
-                base.point(u, v)?.add(normal.scale(sign * distance))
+                // A B-surface base runs on past its domain along its boundary
+                // tangent planes, as Parasolid extends it: an SP-curve on the
+                // offset can run there (a keycap dish's apex stands 0.3 mm
+                // past its base's last row, which the domain's edge stood in
+                // for).
+                match base.as_ref() {
+                    Surface::Nurbs(surface) if outside_domain(surface, u, v) => {
+                        let d = surface.derivatives_extended(u, v, 1)?;
+                        d[0][0].add(d[1][0].cross(d[0][1]).normalized()?.scale(sign * distance))
+                    }
+                    _ => base.point(u, v)?.add(base.natural_normal(u, v)?.scale(sign * distance)),
+                }
             }
             Surface::Spun { profile, axis_point, axis } => {
                 let c = profile.point(u)?;
@@ -239,8 +249,48 @@ impl Surface {
             Surface::Offset { base, base_sense, distance } => {
                 // The offset lies where the base's distance, measured along
                 // the base's natural normal, is the offset.
-                let (f, g) = base.distance(x)?;
+                // A B-surface base is continued past its domain along its
+                // boundary tangent planes: an offset's intersection can run
+                // there, and the domain's edge would stand in for it (chart
+                // points 0.04 mm off a clamped base).
                 let normal_side = if *base_sense { *distance } else { -distance };
+                let (f, g) = match base.as_ref() {
+                    Surface::Nurbs(surface) => {
+                        let (foot, normal) = extended_foot(surface, x)?;
+                        (x.sub(foot).dot(normal), normal)
+                    }
+                    // An offset of a swept surface is swept too, by the
+                    // section's offset across the sweep: measured to that
+                    // curve. Where the section bends tighter than the offset
+                    // on its concave side, the base's nearest point is not
+                    // the one whose offset passes through x (the offset of a
+                    // section's sharp start read 0.015 mm off its own points
+                    // through its base's nearest point, on the extension).
+                    // Only a point the base reads off the offset is looked
+                    // for on the offset itself: one it reads on is.
+                    Surface::Swept { section, direction } => {
+                        let (f, g) = base.distance(x)?;
+                        if (f - normal_side).abs() <= 10.0 * 1e-5 {
+                            (f, g)
+                        } else {
+                            let d = unit(*direction)?;
+                            let across = |p: Vec3| p.sub(d.scale(p.dot(d)));
+                            let normal_at = |u: f64| unit(curve_tangent(section, u)?.cross(d));
+                            let offset_at = |u: f64| -> Option<Vec3> { Some(extended_point(section, u).ok()?.add(normal_at(u)?.scale(normal_side))) };
+                            let u = nearest_parameter_by(section, [true, true], |u| offset_at(u).map_or(f64::INFINITY, |o| across(o.sub(x)).length()))?;
+                            let (o, normal) = (offset_at(u)?, normal_at(u)?);
+                            // Through the offset itself: its distance is f - side.
+                            (x.sub(o).dot(normal) + normal_side, normal)
+                        }
+                    }
+                    // A spun base's foot is the one the offset stands
+                    // out from, where its turn is tighter than the offset.
+                    // Any other foot is looked for beyond the resolution:
+                    // within the blend's 5% the wrong side's foot moved a
+                    // spine point already on the offset (cross review).
+                    Surface::Spun { .. } => base.distance_near(x, normal_side, true, 1e-5)?,
+                    other => other.distance(x)?,
+                };
                 // Orient the base distance with the natural normal: the
                 // analytic distances above grow outwards, as their natural
                 // normals point; a B-surface's is measured along its normal.
@@ -263,14 +313,8 @@ impl Surface {
             // trace's nearest to x's (height, radius), turned to x's side.
             // Measured along the natural normal, dP/du × dP/dv.
             Surface::Spun { profile, axis_point, axis } => {
-                let k = unit(*axis)?;
-                let split = |p: Vec3| {
-                    let d = p.sub(*axis_point);
-                    let h = d.dot(k);
-                    (h, d.sub(k.scale(h)))
-                };
+                let split = spun_split(*axis_point, *axis)?;
                 let (h, radial) = split(x);
-                let e = unit(radial)?;
                 // A profile is not continued past an end on the axis (a
                 // dome's pole): past it the trace folds back on itself.
                 let off_axis = |t: f64| profile.point(t).is_ok_and(|c| split(c).1.length() > 1e-6);
@@ -279,16 +323,151 @@ impl Surface {
                     let (hc, rc) = split(c);
                     (hc - h).hypot(rc.length() - radial.length())
                 })?;
-                let (hc, rc) = split(extended_point(profile, u).ok()?);
-                let foot = axis_point.add(k.scale(hc)).add(e.scale(rc.length()));
-                let t = curve_tangent(profile, u)?;
-                // The profile's tangent, turned with its point onto x's side.
-                let along = k.scale(t.dot(k)).add(e.scale(unit(rc).map_or(0.0, |r| t.dot(r))));
-                let normal = unit(along.cross(k.cross(e)))?;
-                Some((x.sub(foot).dot(normal), normal))
+                spun_distance_at(profile, *axis_point, *axis, x, u)
             }
         }
     }
+
+    /// [`Self::distance`], but where the nearest point does not stand
+    /// `want` (mm) from `x` within `band` (signed when `signed`, else either side), the
+    /// foot among the surface's local nearest points that comes nearest to
+    /// standing `want` from it. Inside a spun profile's turn tighter than
+    /// `want`, a point `want` from one side of the turn can be nearer its
+    /// other side, beyond the face: a rolling ball's spine, refined as the
+    /// meeting of its supports' offsets, was read through that side and
+    /// fell to 0.07 mm from the support it rests on at 0.8. Only a spun
+    /// surface has more than one foot looked for; the others read as
+    /// [`Self::distance`] does.
+    pub fn distance_near(&self, x: Vec3, want: f64, signed: bool, band: f64) -> Option<(f64, Vec3)> {
+        let miss = |d: f64| if signed { (d - want).abs() } else { (d.abs() - want).abs() };
+        let nearest = self.distance(x);
+        if nearest.is_some_and(|(d, _)| miss(d) <= band) {
+            return nearest;
+        }
+        let Surface::Spun { profile, axis_point, axis } = self else { return nearest };
+        let split = spun_split(*axis_point, *axis)?;
+        let (h, radial) = split(x);
+        let trace = |u: f64| {
+            extended_point(profile, u).ok().map_or(f64::INFINITY, |c| {
+                let (hc, rc) = split(c);
+                (hc - h).hypot(rc.length() - radial.length())
+            })
+        };
+        // The profile's own range only, sampled finely enough to part two
+        // feet either side of a tight turn. A profile with no range of its
+        // own (a line) has no other foot (cross review: it read none).
+        let range = match profile {
+            Curve::Nurbs(nurbs) => nurbs.domain().ok(),
+            _ => profile.natural_range(),
+        };
+        let Some([a, b]) = range else { return nearest };
+        let closed = matches!(profile, Curve::Circle { .. } | Curve::Ellipse { .. }) || closed_range(profile).is_some();
+        let n = 2048;
+        let samples: Vec<f64> = (0..=n).map(|k| a + (b - a) * k as f64 / n as f64).collect();
+        let values: Vec<f64> = samples.iter().map(|&u| trace(u)).collect();
+        let tolerance = 1e-12 * (b - a).abs().max(1e-300);
+        let mut best = nearest;
+        for i in 0..=n {
+            let (prev, next) = match (i, closed) {
+                (0, true) => (values[n - 1], values[1]),
+                (0, false) => (f64::INFINITY, values[1]),
+                (i, _) if i == n => {
+                    if closed {
+                        continue;
+                    }
+                    (values[n - 1], f64::INFINITY)
+                }
+                (i, _) => (values[i - 1], values[i + 1]),
+            };
+            // Every foot, the distance's least and greatest along the
+            // profile: beyond a turn's centre of curvature the foot a point
+            // stands out from is the greatest of its neighbours (cross
+            // review), an end of an open profile only the least.
+            let least = values[i] <= prev && values[i] <= next;
+            let greatest = values[i] >= prev && values[i] >= next && prev.is_finite() && next.is_finite();
+            if !((least || greatest) && values[i].is_finite()) {
+                continue;
+            }
+            let step = (b - a) / n as f64;
+            let (lo, hi) = (samples[i] - step, samples[i] + step);
+            let (lo, hi) = if closed { (lo, hi) } else { (lo.max(a), hi.min(b)) };
+            let u = if least { brent_minimum(&trace, lo, hi, tolerance) } else { brent_minimum(&|u: f64| -trace(u), lo, hi, tolerance) };
+            let Some(candidate) = spun_distance_at(profile, *axis_point, *axis, x, u) else { continue };
+            if best.is_none_or(|(d, _)| miss(candidate.0) < miss(d)) {
+                best = Some(candidate);
+            }
+        }
+        best
+    }
+}
+
+/// A point's height along a spun surface's axis and its offset across it.
+fn spun_split(axis_point: Vec3, axis: Vec3) -> Option<impl Fn(Vec3) -> (f64, Vec3)> {
+    let k = axis.normalized().ok()?;
+    Some(move |p: Vec3| {
+        let d = p.sub(axis_point);
+        let h = d.dot(k);
+        (h, d.sub(k.scale(h)))
+    })
+}
+
+/// A spun surface's signed distance from `x` through the profile's point
+/// at `u`, turned onto x's side of the axis, and its gradient: measured
+/// along the natural normal, dP/du × dP/dv.
+fn spun_distance_at(profile: &Curve, axis_point: Vec3, axis: Vec3, x: Vec3, u: f64) -> Option<(f64, Vec3)> {
+    let unit = |v: Vec3| v.normalized().ok();
+    let k = unit(axis)?;
+    let split = spun_split(axis_point, axis)?;
+    let e = unit(split(x).1)?;
+    let (hc, rc) = split(extended_point(profile, u).ok()?);
+    let foot = axis_point.add(k.scale(hc)).add(e.scale(rc.length()));
+    let t = curve_tangent(profile, u)?;
+    // The profile's tangent, turned with its point onto x's side.
+    let along = k.scale(t.dot(k)).add(e.scale(unit(rc).map_or(0.0, |r| t.dot(r))));
+    let normal = unit(along.cross(k.cross(e)))?;
+    Some((x.sub(foot).dot(normal), normal))
+}
+
+/// Whether (u, v) lies past an open side of a B-surface's domain (a closed
+/// direction wraps; it has no past).
+fn outside_domain(surface: &NurbsSurface, u: f64, v: f64) -> bool {
+    let (Ok([u0, u1]), Ok([v0, v1]), Ok((closed_u, closed_v))) = (surface.domain_u(), surface.domain_v(), surface.closed_directions()) else { return false };
+    (!closed_u && (u < u0 || u > u1)) || (!closed_v && (v < v0 || v > v1))
+}
+
+/// The nearest point of `surface` to `x` and its unit natural normal, the
+/// surface continued past an open edge of its domain along the boundary's
+/// tangent plane ([`NurbsSurface::derivatives_extended`]): the domain's
+/// projection, refined by Gauss-Newton on the extension when it stops at the
+/// domain's edge.
+fn extended_foot(surface: &NurbsSurface, x: Vec3) -> Option<(Vec3, Vec3)> {
+    let foot = crate::project_point_to_surface(surface, x).ok()?;
+    let [u0, u1] = surface.domain_u().ok()?;
+    let [v0, v1] = surface.domain_v().ok()?;
+    let at_edge = |t: f64, a: f64, b: f64| (t - a).abs() <= 1e-9 * (b - a) || (b - t).abs() <= 1e-9 * (b - a);
+    if !at_edge(foot.u, u0, u1) && !at_edge(foot.v, v0, v1) {
+        return Some((foot.point, surface.normal(foot.u, foot.v).ok()?));
+    }
+    let (mut u, mut v) = (foot.u, foot.v);
+    for _ in 0..50 {
+        let d = surface.derivatives_extended(u, v, 1).ok()?;
+        let (su, sv) = (d[1][0], d[0][1]);
+        let r = x.sub(d[0][0]);
+        let (a, b, c) = (su.dot(su), su.dot(sv), sv.dot(sv));
+        let det = a * c - b * b;
+        if !(det > 0.0) {
+            break;
+        }
+        let (g1, g2) = (r.dot(su), r.dot(sv));
+        let (du, dv) = ((c * g1 - b * g2) / det, (a * g2 - b * g1) / det);
+        u += du;
+        v += dv;
+        if du.abs() <= 1e-15 * (u1 - u0) && dv.abs() <= 1e-15 * (v1 - v0) {
+            break;
+        }
+    }
+    let d = surface.derivatives_extended(u, v, 1).ok()?;
+    Some((d[0][0], d[1][0].cross(d[0][1]).normalized().ok()?))
 }
 
 /// A point of `curve` at `t`, a bounded B-curve continued past its ends
@@ -331,7 +510,12 @@ pub fn closed_range(curve: &Curve) -> Option<[f64; 2]> {
 /// its period, a bounded B-curve over its range and as far again past each
 /// end `extend` names, a line over ±1 km about its point.
 pub fn nearest_parameter(curve: &Curve, extend: [bool; 2], distance: impl Fn(Vec3) -> f64) -> Option<f64> {
-    let f = |t: f64| extended_point(curve, t).ok().map_or(f64::INFINITY, &distance);
+    nearest_parameter_by(curve, extend, |t| extended_point(curve, t).ok().map_or(f64::INFINITY, &distance))
+}
+
+/// [`nearest_parameter`] with the distance given as a function of the
+/// curve's parameter, searched over the same samples and bounds.
+pub fn nearest_parameter_by(curve: &Curve, extend: [bool; 2], f: impl Fn(f64) -> f64) -> Option<f64> {
     // The samples, and the bounds the search may not pass: a B-curve's ends
     // it is not extended past. A closed curve's search is unbounded (its
     // foot just below the seam lies before the first sample) and wraps.
@@ -470,6 +654,9 @@ pub fn curve_tangent(curve: &Curve, t: f64) -> Option<Vec3> {
         Curve::Ellipse { frame, major, minor } => frame.x.scale(-major * t.sin()).add(frame.y().scale(minor * t.cos())).normalized().ok(),
         Curve::Nurbs(nurbs) => {
             let [a, b] = nurbs.domain().ok()?;
+            // Round a closed curve as [`extended_point`] goes, not along an
+            // end's tangent line.
+            let t = if closed_range(curve).is_some() { a + (t - a).rem_euclid(b - a) } else { t };
             nurbs.point_and_unit_tangent_extended(t, a, b).ok().map(|(_, tangent)| tangent)
         }
     }

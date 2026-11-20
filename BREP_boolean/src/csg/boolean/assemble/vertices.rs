@@ -217,7 +217,7 @@ fn refresh_section_trims(
         // The END witness. The whole-trim reading above compares maxima, and
         // on a section that stands off a curved carrier by its own standoff
         // that maximum is the INTERIOR standoff, which hides the ends: on
-        // fixture 25 (a4c84871, BREP_DEBUG_JOINTS) settling moved three
+        // fixture 25 (BREP_DEBUG_JOINTS) settling moved three
         // vertices 2.0e-7..5.5e-7 onto their carriers, every section trim on
         // the curved faces read TrimIsWitness (trim off its paired carrier
         // 3.3e-7..5.8e-6 against an edge 1.65e-6..1.27e-5 off its carriers),

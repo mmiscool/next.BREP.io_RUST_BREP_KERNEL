@@ -17,7 +17,7 @@
 //! tolerance stay open and are counted in the report; nothing is force-welded.
 
 use crate::{KernelRefusal, KernelStage, OrRefuse};
-use crate::mass_properties::solid_signed_volume;
+use crate::mass_properties::{solid_sign_coarse_certificate, solid_signed_volume, solid_signed_volume_for_sign, COARSE_SIGN_DEPTH};
 use crate::orientation::{flip_all_faces, orient_open_solid_faces};
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, ShellRecord, VertexRecord};
 use crate::{build_pcurve_on_surface, project_point_to_curve, NurbsCurve, Vec3};
@@ -688,11 +688,37 @@ fn sew_solid_with_search(
         // directions coherent across the shared edges, then restore outward
         // normals by signed volume.
         orient_open_solid_faces(&mut result)?;
-        if let Ok(volume) = solid_signed_volume(&result) {
-            if volume < 0.0 {
-                flip_all_faces(&mut result)?;
+        let bar = tolerance * tolerance * tolerance;
+        let check = sew_sign_reading_check();
+        let reading = sew_sign_by_reading(&result, bar, check);
+        match reading {
+            Some(flip) if !check => {
+                if flip {
+                    flip_all_faces(&mut result)?;
+                }
+                oriented_outward = true;
             }
-            oriented_outward = volume.abs() > tolerance * tolerance * tolerance;
+            _ => {
+                let exact = solid_signed_volume(&result);
+                if check {
+                    let agree = match (reading, exact.as_ref()) {
+                        (Some(flip), Ok(volume)) => flip == (*volume < 0.0) && volume.abs() > bar,
+                        _ => true,
+                    };
+                    eprintln!(
+                        "sew.sign_reading{} decided={} volume={:?}",
+                        if agree { "" } else { " DISAGREE" },
+                        match reading { Some(false) => "outward", Some(true) => "flipped", None => "none" },
+                        exact.as_ref().ok(),
+                    );
+                }
+                if let Ok(volume) = exact {
+                    if volume < 0.0 {
+                        flip_all_faces(&mut result)?;
+                    }
+                    oriented_outward = volume.abs() > bar;
+                }
+            }
         }
     }
     // Re-derive genus from the Euler characteristic (V − E + F − H = 2 − 2g,
@@ -737,6 +763,131 @@ fn sew_solid_with_search(
         pairs_examined,
     ))
 }
+
+/// `BREP_SEW_SIGN_READING` (default on; `0`/`off` integrates the full mass
+/// properties as before): the sewn result's orientation read
+/// for its sign alone, instead of by its full mass properties (area and volume
+/// integrated to the mass cache's precision, most of a large sew's time).
+///
+/// The sew needs two answers from the volume `v`: flip when `v < 0`, and call
+/// the body oriented when `|v| > bar` (`bar` = tolerance³). The sign reading
+/// ([`solid_signed_volume_for_sign`]) returns a value whose comparison with ITS
+/// bar is the exact integral's comparison, and nothing more. So:
+///
+/// * read against `bar`: above it, `v > bar`, so no flip and oriented;
+/// * otherwise read against `-bar` (the faces' terms are memoised by the first
+///   read): below it, `v < -bar`, so flip and oriented;
+/// * anything else (`|v| <= bar`, a sliver of no thickness, or an error in
+///   either read) decides nothing here: `None`, and the caller integrates the
+///   full volume exactly as before.
+///
+/// Where it answers and the full integral would succeed, its answer is the
+/// exact path's. The reading skips work the integral does (control-net
+/// bounds, skipped straight-chord corrections), so it can also answer where
+/// the integral would have failed and left the body unflipped and not
+/// oriented. The second read's certificates can only prove a value above
+/// their bar, so against `-bar` it is the reading itself that decides; an
+/// inside-out sew pays for both. `check` reads it even with the switch off
+/// (the caller then still integrates and compares).
+fn sew_sign_by_reading(solid: &BrepSolid, bar: f64, check: bool) -> Option<bool> {
+    if !(check || sew_sign_reading_enabled()) || !(bar > 0.0) || !bar.is_finite() {
+        return None;
+    }
+    let (coarse_on, coarse_check) = (sew_sign_coarse_enabled(), sew_sign_coarse_check());
+    let coarse = if coarse_on && !coarse_check { sew_sign_by_coarse_certificate(solid, bar) } else { None };
+    if let (Some(flip), true, false) = (coarse, coarse_on, coarse_check) {
+        return Some(flip);
+    }
+    let decided = (|| {
+        if solid_signed_volume_for_sign(solid, bar).ok()? > bar {
+            return Some(false);
+        }
+        if solid_signed_volume_for_sign(solid, -bar).ok()? < -bar {
+            return Some(true);
+        }
+        None
+    })();
+    if coarse_check {
+        // The certificate is held to the full integral: its interval must
+        // hold it, and a verdict it settles must be the integral's. One line
+        // per depth, so a census shows what each depth would decide.
+        let volume = solid_signed_volume(solid).ok();
+        let exact = volume.filter(|volume| volume.abs() > bar).map(|volume| volume < 0.0);
+        for depth in [COARSE_SIGN_DEPTH, 2, 3] {
+            let certificate = solid_sign_coarse_certificate(solid, depth);
+            let settled = certificate.and_then(|certificate| coarse_verdict(certificate.reading, certificate.bound, bar));
+            let held = match (certificate, volume) {
+                (Some(certificate), Some(volume)) => (volume - certificate.reading).abs() <= certificate.bound,
+                _ => true,
+            };
+            let agree = held && (settled.is_none() || settled == exact);
+            let (reading, bound, skipped) =
+                certificate.map_or((f64::NAN, f64::NAN, f64::NAN), |c| (c.reading, c.bound, c.skipped));
+            eprintln!(
+                "sew.sign_coarse{} depth={depth} coarse={} exact={} reading={reading:.6e} bound={bound:.3e} skipped={skipped:.3e} volume={:.6e} bar={bar:.1e}",
+                if agree { "" } else { " DISAGREE" },
+                match settled { Some(false) => "outward", Some(true) => "flipped", None => "none" },
+                match exact { Some(false) => "outward", Some(true) => "flipped", None => "none" },
+                volume.unwrap_or(f64::NAN),
+            );
+        }
+    }
+    decided
+}
+
+/// The orientation the coarse certificate settles, if any. Contract: the
+/// certificate (`solid_sign_coarse_certificate`) gives an interval
+/// `reading ± bound` that holds the volume. A verdict comes only when the
+/// whole interval clears the bar. Flip (`Some(true)`) when it lies below
+/// `-bar`, keep (`Some(false)`) when it lies above `bar`. Otherwise `None`:
+/// the sign reading and the full integral decide, as they would without it.
+/// That covers no certificate, a straddling interval, and anything
+/// non-finite.
+fn sew_sign_by_coarse_certificate(solid: &BrepSolid, bar: f64) -> Option<bool> {
+    let certificate = solid_sign_coarse_certificate(solid, COARSE_SIGN_DEPTH)?;
+    coarse_verdict(certificate.reading, certificate.bound, bar)
+}
+
+fn coarse_verdict(reading: f64, bound: f64, bar: f64) -> Option<bool> {
+    if !(reading.is_finite() && bound.is_finite() && bound >= 0.0) {
+        return None;
+    }
+    if reading - bound > bar {
+        Some(false)
+    } else if reading + bound < -bar {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// `BREP_SEW_SIGN_COARSE` (default on since 2026-11-20; `=0` skips the
+/// coarse certificate): the sew's orientation is first read
+/// by the coarse certificate ([`sew_sign_by_coarse_certificate`]); where that
+/// settles it, the sign reading and the full integral are not run.
+fn sew_sign_coarse_enabled() -> bool {
+    crate::switch!("BREP_SEW_SIGN_COARSE", true)
+}
+
+/// `BREP_SEW_SIGN_COARSE_CHECK=1`: let the old path decide, and print, per
+/// sew and per depth, one `sew.sign_coarse` line with the certificate's
+/// reading, bound and verdict against the full integral (` DISAGREE` where
+/// the interval misses the integral or the verdict differs).
+fn sew_sign_coarse_check() -> bool {
+    crate::debug_flag!("BREP_SEW_SIGN_COARSE_CHECK")
+}
+
+fn sew_sign_reading_enabled() -> bool {
+    crate::switch!("BREP_SEW_SIGN_READING", true)
+}
+
+/// `BREP_SEW_SIGN_READING_CHECK=1`: run the reading AND the full integral,
+/// let the integral decide, and print one `sew.sign_reading` line per sew
+/// (` DISAGREE` where the reading decided otherwise), for an agreement census.
+fn sew_sign_reading_check() -> bool {
+    crate::debug_flag!("BREP_SEW_SIGN_READING_CHECK")
+}
+
 
 
 /// Split PINCHED vertices — points where two (or more) umbrella fans of

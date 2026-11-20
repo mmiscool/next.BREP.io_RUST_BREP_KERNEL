@@ -1,4 +1,5 @@
 use super::*;
+use super::path::{stationary_limit, PathSide, StationaryFault};
 pub use super::stations::{
     StationBudget, StationParam, SweepStationReport, SWEEP_DEFAULT_TOLERANCE, SWEEP_MAX_STATIONS,
     SWEEP_REFINEMENT_ROUNDS,
@@ -776,7 +777,7 @@ fn sweep_profile_along_path_stations_scaled(
     //        always had, refined only where the measured deviation is over the
     //        tolerance (`chain_stations`).
     let chain = std::slice::from_ref(path);
-    let (samples, budget) = chain_stations(chain, false, SamplerLane::SingleCurve, stations, tolerance)?;
+    let (samples, budget) = chain_stations(chain, false, SamplerLane::SingleCurve, stations, tolerance, None)?;
     let StationSamples {
         points,
         tangents,
@@ -804,6 +805,7 @@ fn sweep_profile_along_path_stations_scaled(
             tolerance,
             measure_report,
             end_scale,
+            breaks: None,
         },
     )
 }
@@ -1108,7 +1110,7 @@ fn sweep_profile_along_chain_stations(
         && twist_angle == 0.0
         && std::env::var("BREP_SWEEP_BEND_GUARD").as_deref() != Ok("0")
     {
-        let (floor, _) = chain_stations(path.curves.as_slice(), path.closed, SamplerLane::Chain, stations, 0.0)?;
+        let (floor, _) = chain_stations(path.curves.as_slice(), path.closed, SamplerLane::Chain, stations, 0.0, None)?;
         let profile_stations = floor_bend_stations(profile, &placement, path, &floor)?;
         if let Some(refusal) = tight_bend_refusal(&profile_stations, floor.points.len()) {
             return Err(with_envelope_gap(refusal, Some(envelope_gap.as_str())));
@@ -1117,13 +1119,32 @@ fn sweep_profile_along_chain_stations(
 
     // --- Sample the chain as ONE trajectory (budget, domains, stations), and
     //     refine it to the requested tolerance.
+    //     With `BREP_SWEEP_JOINT_BREAKS` on (the default), the wall columns are BROKEN at
+    //     every joint where the path's curvature jumps (G1), so refinement and
+    //     loft both fit each run between such joints on its own. Not on a
+    //     twisted ring, whose seam-shifted columns run several laps.
+    let break_after: Option<Vec<bool>> = if super::stations::joint_breaks_enabled()
+        && !(path.closed && twist_angle != 0.0)
+    {
+        let mut after = vec![false; chain.len()];
+        for joint in &path.joints {
+            if joint.continuity == JointContinuity::G1 {
+                after[joint.before] = true;
+            }
+        }
+        Some(after).filter(|after| after.iter().any(|&jump| jump))
+    } else {
+        None
+    };
     let (samples, budget) = chain_stations(
         path.curves.as_slice(),
         path.closed,
         SamplerLane::Chain,
         stations,
         tolerance,
+        break_after.as_deref(),
     )?;
+    let breaks = break_after.as_deref().map(|after| station_breaks(&samples, after));
     let StationSamples {
         points,
         tangents,
@@ -1156,8 +1177,22 @@ fn sweep_profile_along_chain_stations(
             tolerance,
             measure_report,
             end_scale: None,
+            breaks: breaks.as_deref(),
         },
     )
+}
+
+/// The stations a broken run's columns break at: every interior JOINT station
+/// (one that arrives on segment `i` and departs into `i + 1`) whose joint
+/// `break_after[i]` marks as a curvature jump. A ring's seam (station 0) is
+/// not listed; its loft breaks there whenever the run is broken.
+fn station_breaks(samples: &StationSamples, break_after: &[bool]) -> Vec<usize> {
+    (1..samples.points.len())
+        .filter(|&k| {
+            let arriving = samples.segments[k];
+            samples.params[k].segment != arriving && break_after.get(arriving).copied().unwrap_or(false)
+        })
+        .collect()
 }
 
 /// How a station run CLOSES — which frame a ring's sections are placed on.
@@ -1295,6 +1330,7 @@ pub fn sweep_closure(
         SamplerLane::Chain,
         stations.clamp(2, 1024),
         SWEEP_DEFAULT_TOLERANCE,
+        None,
     )?;
     let screw = Some((segments.as_slice(), path)).filter(|_| placement_mode == SectionPlacement::Rigid);
     let closure = ring_frame(path, &tangents)?;
@@ -1748,6 +1784,7 @@ fn chain_stations(
     lane: SamplerLane,
     stations: usize,
     tolerance: f64,
+    break_after: Option<&[bool]>,
 ) -> Result<(StationSamples, StationBudget), KernelRefusal> {
     let position_tolerance = 1e-6;
     // --- Per-segment arc-length estimate, and the domain each one is sampled
@@ -1877,7 +1914,8 @@ fn chain_stations(
     let mut samples = sample_chain(chain, closed, lane, &domains, &per_segment)?;
     if refine {
         loop {
-            let deviations = super::stations::spine_deviations(chain, &samples.params, &samples.points, closed)
+            let breaks = break_after.map(|after| station_breaks(&samples, after));
+            let deviations = super::stations::spine_deviations(chain, &samples.params, &samples.points, closed, breaks.as_deref())
                 .map_err(|error| {
                     KernelRefusal::internal(
                         KernelStage::Refine,
@@ -1901,6 +1939,7 @@ fn chain_stations(
                 tolerance,
                 closed,
                 emitted,
+                breaks.as_deref(),
             )
             .map_err(|error| {
                 KernelRefusal::internal(
@@ -1959,7 +1998,8 @@ fn sample_chain(
             // the bend would go unnamed; on the wire harness's own span the two
             // ends are mirror images and only ONE of them was being read.
             let derivatives = curve.derivatives_small(t0, 2).or_refuse(KernelStage::Collect, "derivatives")?;
-            let arriving = curvature_vector(derivatives[1], derivatives[2]);
+            let (_, arriving) = station_reading(curve, t0, PathSide::Departing, &derivatives)
+                .map_err(|fault| fault.refusal(&format!("the start of segment {index}"), t0))?;
             if let Some(departing) = curvatures.last_mut() {
                 if arriving.length() > departing.length() {
                     *departing = arriving;
@@ -1973,19 +2013,22 @@ fn sample_chain(
         let last = count - usize::from(closed && index + 1 == chain.len());
         for (sample, &t) in list.iter().enumerate().take(last).skip(first) {
             let derivatives = curve.derivatives_small(t, 2).or_refuse(KernelStage::Collect, "derivatives")?;
-            let tangent = derivatives[1].normalized().map_err(|_| {
-                KernelRefusal::input(
-                    KernelStage::Classify,
-                    "path_tangent",
-                    match lane {
-                        SamplerLane::Chain => format!("sweepSolid: path tangent is degenerate on segment {index}"),
-                        SamplerLane::SingleCurve => format!("sweepSolid: path tangent is degenerate at station {sample}"),
+            // A station on a STATIONARY parameter reads the one-sided limit:
+            // the side the span after it lies on, or the arriving side at a
+            // segment's end (whose station departs into the next segment).
+            let side = if sample + 1 == count { PathSide::Arriving } else { PathSide::Departing };
+            let (tangent, curvature) = station_reading(curve, t, side, &derivatives).map_err(|fault| {
+                fault.refusal(
+                    &match lane {
+                        SamplerLane::Chain => format!("station {sample} of segment {index}"),
+                        SamplerLane::SingleCurve => format!("station {sample}"),
                     },
+                    t,
                 )
             })?;
             points.push(derivatives[0]);
             tangents.push(tangent);
-            curvatures.push(curvature_vector(derivatives[1], derivatives[2]));
+            curvatures.push(curvature);
             segments.push(index);
             params.push(StationParam { segment: index, t });
         }
@@ -1996,7 +2039,8 @@ fn sample_chain(
     if closed {
         if let (Some(curve), Some(domain)) = (chain.last(), domains.last()) {
             let derivatives = curve.derivatives_small(domain[1], 2).or_refuse(KernelStage::Collect, "derivatives")?;
-            let arriving = curvature_vector(derivatives[1], derivatives[2]);
+            let (_, arriving) = station_reading(curve, domain[1], PathSide::Arriving, &derivatives)
+                .map_err(|fault| fault.refusal(&format!("the end of segment {}", chain.len() - 1), domain[1]))?;
             if let Some(departing) = curvatures.first_mut() {
                 if arriving.length() > departing.length() {
                     *departing = arriving;
@@ -2011,6 +2055,23 @@ fn sample_chain(
         segments,
         params,
     })
+}
+
+/// The unit tangent and curvature vector a station reads at `t` from the
+/// derivatives already evaluated there: the regular reading wherever the first
+/// derivative has a direction (bit for bit what the sampler always read), and
+/// the one-sided limit on `side` where the parameter is STATIONARY
+/// ([`stationary_limit`]) — a refusal where that limit does not exist.
+fn station_reading(
+    curve: &NurbsCurve,
+    t: f64,
+    side: PathSide,
+    derivatives: &[Vec3; 3],
+) -> Result<(Vec3, Vec3), StationaryFault> {
+    match derivatives[1].normalized() {
+        Ok(tangent) => Ok((tangent, curvature_vector(derivatives[1], derivatives[2]))),
+        Err(_) => stationary_limit(curve, t, side).map(|limit| (limit.tangent, limit.curvature)),
+    }
 }
 
 /// The ring frame's fixed reference axis: the path plane's own normal, oriented
@@ -2260,6 +2321,7 @@ pub fn sweep_bend_profile(
         SamplerLane::Chain,
         stations.clamp(2, 1024),
         0.0,
+        None,
     )?;
     floor_bend_stations(profile, &placement, path, &samples)
 }
@@ -2404,6 +2466,9 @@ struct StationRun<'a> {
     /// [`sweep_profile_twisted_scaled`]). `None` for every other builder, which
     /// leaves the placement bit-identical to the unscaled one.
     end_scale: Option<f64>,
+    /// The stations the wall's columns break at (`BREP_SWEEP_JOINT_BREAKS`);
+    /// `None` keeps one interpolant per column.
+    breaks: Option<&'a [usize]>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2876,13 +2941,21 @@ fn sweep_sections_through_samples(
             // The loft mints its own refusals; its class rides through the
             // sweep's wrap (a station cap stays a deferral, the acceptance's
             // fold stays an UnsoundResult).
-            crate::loft_profile_brep_closed_shifted(&sections, requested.shift).map_err(|error| {
+            match run.breaks.filter(|_| requested.shift == 0) {
+                Some(breaks) => crate::loft_topology::loft_profile_brep_closed_broken(&sections, breaks),
+                None => crate::loft_profile_brep_closed_shifted(&sections, requested.shift),
+            }
+            .map_err(|error| {
                 error.with_message(|error| {
                     format!("sweepSolid: closed loft through swept sections failed: {error}")
                 })
             })?
         }
-        RingFrame::Open => loft_profile_brep(&sections).map_err(|error| {
+        RingFrame::Open => match run.breaks.filter(|breaks| !breaks.is_empty()) {
+            Some(breaks) => crate::loft_topology::loft_profile_brep_broken(&sections, breaks),
+            None => loft_profile_brep(&sections),
+        }
+        .map_err(|error| {
             error.with_message(|error| {
                 format!("sweepSolid: loft through swept sections failed: {error}")
             })
@@ -2930,6 +3003,14 @@ fn sweep_sections_through_samples(
         shift: requested.shift,
         budget: run.budget,
         tolerance: run.tolerance,
+        breaks: match closure {
+            RingFrame::Open => run.breaks.filter(|breaks| !breaks.is_empty()),
+            _ => run.breaks.filter(|_| requested.shift == 0),
+        },
+        slide_in_wall: !rigid
+            && twist_angle == 0.0
+            && station_scales.is_none()
+            && !matches!(closure, RingFrame::Spatial),
     })?;
     timing.lap("approximation");
     Ok(SweptChain {

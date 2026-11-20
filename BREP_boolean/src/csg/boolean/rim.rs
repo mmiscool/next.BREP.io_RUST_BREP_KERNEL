@@ -914,6 +914,14 @@ fn normalize_covering_rim_strips(solid: &mut BrepSolid) -> Result<Vec<u64>, Kern
     Ok(normalized_faces)
 }
 
+/// `BREP_BAND_SEAM_LAZY_BASELINE` (default on; `0` validates the operand up
+/// front as before): [`normalize_operand_band_seams`]
+/// validates its operand only when an attempt changed it (a boolean's operand
+/// with no band to seam pays no whole-body validation here).
+fn band_seam_lazy_baseline_enabled() -> bool {
+    switch!("BREP_BAND_SEAM_LAZY_BASELINE", true)
+}
+
 /// Insert band seams (see `insert_periodic_band_seam_edges`), reverting the
 /// whole solid if the normalized topology validates WORSE than the input
 /// (soft-fail: the boolean then proceeds exactly as before).
@@ -927,7 +935,13 @@ pub fn normalize_operand_band_seams(solid: &mut BrepSolid) -> Result<(), KernelR
         return Ok(());
     }
     let backup = solid.clone();
-    let baseline_issues = backup.validate().len();
+    // `BREP_BAND_SEAM_LAZY_BASELINE`: the backup's issues are read only when an
+    // attempt changed the solid; an attempt that normalized no strip and
+    // inserted no seam left the solid as the backup holds it, and is accepted
+    // as before without reading either.
+    let lazy = band_seam_lazy_baseline_enabled();
+    let mut baseline = if lazy { None } else { Some(backup.validate().len()) };
+    let mut baseline_issues = |backup: &BrepSolid| *baseline.get_or_insert_with(|| backup.validate().len());
     let debug = std::env::var("BREP_DEBUG_BOOL").is_ok();
 
     // ATTEMPT 1 — COVERING-PLANE RIM NORMALIZATION + seam insertion. The
@@ -961,8 +975,11 @@ pub fn normalize_operand_band_seams(solid: &mut BrepSolid) -> Result<(), KernelR
         })
     };
     if let Ok(count) = attempt {
+        if lazy && count == 0 && normalized_faces.is_empty() {
+            return Ok(());
+        }
         let issues = solid.validate().len();
-        if issues <= baseline_issues && all_seamed(solid) {
+        if issues <= baseline_issues(&backup) && all_seamed(solid) {
             if debug && (count > 0 || !normalized_faces.is_empty()) {
                 eprintln!(
                     "band_seams: inserted {count} seam edge(s); covering-rim normalized {} face(s)",
@@ -982,6 +999,7 @@ pub fn normalize_operand_band_seams(solid: &mut BrepSolid) -> Result<(), KernelR
         Ok(0) => {}
         Ok(count) => {
             let issues = solid.validate().len();
+            let baseline_issues = baseline_issues(&backup);
             if issues > baseline_issues {
                 if debug {
                     eprintln!(

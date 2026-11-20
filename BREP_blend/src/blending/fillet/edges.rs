@@ -372,6 +372,7 @@ fn chamfer_by_setback_law(
     })?;
     heal_edge_vertex_gaps(&mut result, reach)?;
     crate::blend::fit_planar_charts_to_trims(&healed, &mut result)?;
+    crate::blend::same_parameter_trims(&healed, &mut result);
     let result = settle_cutter_scaffold(result);
     refuse_invalid_result(&result, entry)?;
     super::analyze::check_blend_interference(&healed, &result, &[edge_id], "chamfer")?;
@@ -818,7 +819,7 @@ fn relieve_fold(
                         .collect();
                     // The note states what was built: where the law never
                     // climbs back to the requested radius on the zone's edges
-                    // (report 5e49bb42's rim, 1.08 to 1.78 against r 2.2), it
+                    // (the sculpted-cap report's rim, 1.08 to 1.78 against r 2.2), it
                     // says so instead of "locally".
                     let (low, high) = zone
                         .edges
@@ -1019,6 +1020,23 @@ pub fn fillet_edges_reported(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<(BrepSolid, BlendSelection), KernelRefusal> {
+    // `BREP_BLEND_SAME_PARAMETER`: the operation's iso-line trims take their
+    // edges' parameter, read against the solid the operation started from so
+    // every face it made counts as touched (corner sectors and patches close
+    // after the per-edge lanes, past their own post-passes). No-op off.
+    let (mut result, selection) = fillet_edges_reported_inner(solid, edge_points, edge_names, radius, chamfer, name)?;
+    crate::blend::same_parameter_trims(solid, &mut result);
+    Ok((result, selection))
+}
+
+fn fillet_edges_reported_inner(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+) -> Result<(BrepSolid, BlendSelection), KernelRefusal> {
     // The translation control (`BREP_TRANSLATION_CONTROL`, `brep/recentre.rs`):
     // the outermost entry runs the fillet on a translated solid.
     if let Some(offset) = crate::recentre::control_offset_at_entry() {
@@ -1104,15 +1122,15 @@ pub fn fillet_edges_reported(
     // overhang in rather than clipping it. The faces it runs along come back
     // with self-crossing loops that `validate()`, `solid_self_intersections`,
     // the connectivity report and the Euler check all pass — and that
-    // `check_loop_self_crossings` REFUSES since 9e50f6d55, so the split is not
-    // a route to ten walls either: blend the concave half first and the
-    // acceptance refuses every convex edge whose wall runs out into it — on
-    // the rib both spines, at that same station, so that feature fails
-    // outright; blend the convex half first and the maximal-valid-subset
-    // search drops one ring edge and returns NINE walls of ten. The
-    // construction that is missing is the runout itself: past that station the
-    // ball rolls on one input face and on the concave stripe's own surface, so
-    // the march needs a STRIPE as its second carrier.
+    // `check_loop_self_crossings` REFUSES, so the split is not a route to ten
+    // walls either: blend the concave half first and the acceptance refuses
+    // every convex edge whose wall runs out into it — on the rib both spines,
+    // at that same station, so that feature fails outright; blend the convex
+    // half first and the maximal-valid-subset search drops one ring edge and
+    // returns NINE walls of ten. The construction that is missing is the
+    // runout itself: past that station the ball rolls on one input face and on
+    // the concave stripe's own surface, so the march needs a STRIPE as its
+    // second carrier.
     //
     // And more than that, measured 2026-09-13 (`blend/runout.rs`, which this
     // refusal now reports): the KEPT mate runs out too, at the mirror-image
@@ -1125,13 +1143,17 @@ pub fn fillet_edges_reported(
     // spine first, then the rest with the spine's foot on the floor added to
     // the concave chain (`spine_first.rs`); taken by the selection's shape
     // alone, and declined to the lanes below when a stage does not build.
-    // Only where the corner analysis below sees no mixed corner (a closed
-    // edge in the selection, such as the cylinder's rim, blinds it): where it
-    // sees them, the rounded-boss and runout compositions already build the
-    // class (the 2026-10-12 sprocket's spine over its cylindrical rim).
+    // Here only where the corner analysis below sees no mixed corner (a
+    // closed edge in the selection, such as the cylinder's rim, blinds it):
+    // where it sees them, the rounded-boss and runout compositions go first
+    // (they build the 2026-10-12 sprocket's spine over its cylindrical rim),
+    // and spine-first is tried again only when every one of them declines.
+    // Blind, no composition below closes a planar floor's corner either (a
+    // block's edge dying through a cylinder's flat cap), so spine-first takes
+    // planar floors here too.
     if !chamfer && crate::blend::mixed_convexity_corners(solid, &selected_ids, radius).is_empty() {
         if let Some(built) = super::spine_first::spine_first_composition(
-            solid, &selected_ids, edge_points, edge_names, radius, name,
+            solid, &selected_ids, edge_points, edge_names, radius, name, true,
         ) {
             return Ok(built);
         }
@@ -1192,7 +1214,7 @@ pub fn fillet_edges_reported(
                     if declined { error } else { pad_error }
                 })
             }).or_else(|error| {
-                // The cusp composition (reports 80c5d9d1 and 6dfd5a22): every
+                // The cusp composition (the straight-sliver and cusp-chain reports): every
                 // mixed corner a CUSP, the convex and concave edges leaving it
                 // tangent. Declines by class on any other corner, and every
                 // other refusal keeps the one before it: it is the last try.
@@ -1241,6 +1263,18 @@ pub fn fillet_edges_reported(
                 Err(error) => {
                     if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                         eprintln!("runout composition refused: {error}");
+                    }
+                    // Where the corner analysis sees the corners but no
+                    // composition above closes them, a spine dying into a
+                    // curved floor still builds spine first: the spine's
+                    // round turns its corner into a smooth concave chain, so
+                    // the corner is no longer mixed once the spine is built
+                    // (a block's top edges into a cylinder with that
+                    // cylinder's bottom rim picked and its top rim not).
+                    if let Some(built) = super::spine_first::spine_first_composition(
+                        solid, &selected_ids, edge_points, edge_names, radius, name, false,
+                    ) {
+                        return Ok(built);
                     }
                     check_mixed_corner_convexity(
                         solid, &selected_ids, edge_points, edge_names, radius, name, Some(&error),
@@ -2585,17 +2619,17 @@ fn open_pad_composition(
     Ok(result)
 }
 
-/// The CUSP composition (2026-10-24/25 reports 80c5d9d1 and 6dfd5a22): a
+/// The CUSP composition (2026-10-24/25 straight-sliver and cusp-chain reports): a
 /// selection whose every mixed corner is a CUSP — a convex edge and a concave
 /// edge leaving the vertex tangent to each other, the face they share
-/// narrowing to zero width between them. Report 6dfd5a22 selects the whole
+/// narrowing to zero width between them. The cusp-chain report selects the whole
 /// of E6's start-face sliver outside F2's r 5 round: its two straight convex
 /// edges run on G1 into the concave arc at both tips.
 ///
 /// No other composition admits it: the pads of the open-pad composition
 /// trim into the boss, and here both blends must TAPER to the tip, each
 /// against the face the other leaves. Built in two stages, each an ordinary
-/// group build, the order report 80c5d9d1 took by hand (F9, then F10):
+/// group build, the order the straight-sliver report took by hand (F9, then F10):
 ///
 /// 1. Every CONCAVE edge first: its round tapers to zero at each cusp
 ///    (`blend/taper_runout.rs`), leaving a hairline of the shared face
@@ -2737,6 +2771,7 @@ fn runout_composition(
     let mut result = crate::blend::build_runout_walls(&ring, &spine_walls, radius)?;
     heal_edge_vertex_gaps(&mut result, radius)?;
     crate::blend::fit_planar_charts_to_trims(&ring, &mut result)?;
+    crate::blend::same_parameter_trims(&ring, &mut result);
     let issues = result.validate();
     if !issues.is_empty() {
         return Err(KernelRefusal::new(
@@ -3171,7 +3206,7 @@ struct GroupBody {
 /// by a WALL FOLD and the cutter composition then failed too by that fold,
 /// not by the composition's own text: the fold is the reason, and the
 /// composition's last cutter ("mates share their end boundary edge" on the
-/// 2026-10-21 sculpted cap, report 5e49bb42) names nothing the user can act
+/// 2026-10-21 sculpted-cap report) names nothing the user can act
 /// on. The fold keeps its class, so the subset search above stops on it.
 fn fillet_edges_group_unchecked(
     solid: &BrepSolid,
@@ -3241,6 +3276,7 @@ fn concave_first_network_stage(
     let entry = "fillet_edges";
     let healed = heal_edge_vertex_gaps(&mut body, radius);
     let charts = crate::blend::fit_planar_charts_to_trims(input, &mut body);
+    crate::blend::same_parameter_trims(input, &mut body);
     let issues = body.validate_memoised();
     let interference = check_blend_interference(input, &body, edge_ids, entry);
     let bowtie = check_loop_self_crossings(&body, entry).and_then(|()| check_blend_wall_loops(&body, entry));
@@ -3795,7 +3831,7 @@ fn fillet_edges_group_lanes(
                 }
                 // A stripe whose TAPER to a cusp reaches its full radius only
                 // inside the corner setback at its other end has no constant
-                // run at all (report 80c5d9d1's F10, 2026-10-24: r 1 on the two
+                // run at all (the straight-sliver report's F10, 2026-10-24: r 1 on the two
                 // straight edges of a sliver at most 2 wide within 0.9 of its
                 // square corner). The round is built at the largest smaller
                 // radius whose taper clears the setback, and says so, as the
@@ -3854,7 +3890,7 @@ fn fillet_edges_group_lanes(
                     GROUP_NETWORK_FOLD.with(|fold| *fold.borrow_mut() = Some(refusal.clone()));
                 }
                 // A refusal that is not a fold where the ball does not fit
-                // (report 37e16630 at r 1.0, a ball the size of the round it
+                // (the rounded-outline report at r 1.0, a ball the size of the round it
                 // rides: its centre curve collapses to a point and the station
                 // Newton is singular) is the fold the relief answers, not a
                 // question for the composition, which took 143 s over it.
@@ -3884,7 +3920,7 @@ fn fillet_edges_group_lanes(
                 // RAIL is not: the ball pokes out through the face it rides,
                 // there is no lens to carve, and every cutter sweeps the same
                 // envelope. Until 2026-10-21 the group fell through on that too:
-                // report 37e16630's end face at r 1.7 around an r 1 round on its
+                // the rounded-outline report's end face at r 1.7 around an r 1 round on its
                 // outline ran the composition and its subset search for over 20
                 // minutes. A lens fold the composition cannot rescue either is
                 // answered by the fold (`fillet_edges_group_unchecked`).
@@ -4770,9 +4806,12 @@ fn fillet_edges_variable_impl(
         )? {
             Ok(built) => return Ok(built),
             // A radius relief's law is the network's to build: the
-            // composition below took 75 s a plan on report 37e16630 at r 1.0
+            // composition below took 75 s a plan on the rounded-outline report at r 1.0
             // and built none, so the relief's next plan is asked instead.
             Err(refusal) if crate::blend::relief::relieving() => return Err(refusal),
+            // A star whose corner stands outside a neighbouring blend has no
+            // smooth corner fill on any lane: its named reason is the answer.
+            Err(refusal) if crate::blend::is_n_sided_undercut_refusal(&refusal) => return Err(refusal),
             Err(_) => {}
         }
     }
