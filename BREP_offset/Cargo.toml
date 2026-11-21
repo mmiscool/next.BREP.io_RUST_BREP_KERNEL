@@ -1,6 +1,6 @@
 [package]
 name = "BREP_offset"
-version = "0.25.0"
+version = "0.25.1"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "Solid offsets, shells and thickening of the BREP kernel."

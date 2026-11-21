@@ -458,19 +458,71 @@ pub(super) fn half_section_polygon_reading(source: &BrepSolid, cone_apex: bool) 
     })
 }
 
-/// Whether every point of `face`'s surface (a 7 × 7 grid) lies on one line of
-/// the meridian plane about `axis`.
+/// Whether `face` is a revolved segment about `axis` (see
+/// [`meridian_is_exactly_straight`]). It was read from a 7 × 7 grid of samples
+/// until a spline side bumped inside one knot span read straight and the
+/// eroders shrank the tube as if the bump were not there.
 fn meridian_is_straight(face: &FaceRecord, axis: &Axis, tolerance: f64) -> Result<bool, KernelRefusal> {
-    let [u0, u1] = face.surface.domain_u().or_refuse(KernelStage::Classify, "domain_u")?;
-    let [v0, v1] = face.surface.domain_v().or_refuse(KernelStage::Classify, "domain_v")?;
-    let mut points = Vec::with_capacity(49);
-    for i in 0..7 {
-        for j in 0..7 {
-            let (u, v) = (u0 + (u1 - u0) * i as f64 / 6.0, v0 + (v1 - v0) * j as f64 / 6.0);
-            points.push(axis.to_2d(face.surface.evaluate(u, v).or_refuse(KernelStage::Classify, "evaluate")?));
+    Ok(meridian_is_exactly_straight(face, axis, tolerance))
+}
+
+/// A meridian reads straight only by its construction, never by samples (a
+/// bump inside one knot span, or weights that pin every station to the line,
+/// pass any sampling): the face's net must
+/// be `make_revolution` of its own generatrix about the lane's axis (points to
+/// `tolerance`, weights' ratios to 1e-12), the generatrix in one meridian
+/// half-plane, and its control points on one line of (ρ, z). With positive
+/// weights the curve lies in its controls' hull, so on that line.
+fn meridian_is_exactly_straight(face: &FaceRecord, axis: &Axis, tolerance: f64) -> bool {
+    let surface = &face.surface;
+    let Some(structure) = crate::revolution_structure(surface) else { return false };
+    if !axis.parallel(structure.frame.axis) || !axis.on_axis(structure.frame.origin, tolerance) {
+        return false;
+    }
+    let generatrix = &structure.generatrix;
+    let Ok(rebuilt) = crate::make_revolution(structure.frame.origin, structure.frame.axis, generatrix, structure.sweep) else { return false };
+    let same_knots = |a: &[f64], b: &[f64]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-12);
+    if !same_knots(&rebuilt.knots_u, &surface.knots_u)
+        || !same_knots(&rebuilt.knots_v, &surface.knots_v)
+        || rebuilt.degree_u != surface.degree_u
+        || rebuilt.degree_v != surface.degree_v
+        || rebuilt.control_points.len() != surface.control_points.len()
+    {
+        return false;
+    }
+    for (row, stored) in rebuilt.control_points.iter().zip(&surface.control_points) {
+        if row.len() != stored.len() {
+            return false;
+        }
+        for (built, held) in row.iter().zip(stored) {
+            let (Ok(p), Ok(q)) = (built.point(), held.point()) else { return false };
+            if !(held.w > 0.0) || p.sub(q).length() > tolerance || (built.w - held.w).abs() > 1e-12 * held.w {
+                return false;
+            }
         }
     }
-    // The two points farthest apart span the line.
+    let mut controls = Vec::with_capacity(generatrix.control_points.len());
+    for control in &generatrix.control_points {
+        let Ok(point) = control.point() else { return false };
+        if !(control.w > 0.0) {
+            return false;
+        }
+        controls.push(point);
+    }
+    // One meridian half-plane: every control's radial part along one direction.
+    let radial = |p: Vec3| {
+        let from = p.sub(axis.origin);
+        from.sub(axis.axis.scale(from.dot(axis.axis)))
+    };
+    let Some(reference) = controls.iter().map(|p| radial(*p)).find(|r| r.length() > tolerance) else { return false };
+    let unit = reference.scale(1.0 / reference.length());
+    if controls.iter().any(|p| {
+        let r = radial(*p);
+        r.cross(unit).length() > tolerance || r.dot(unit) < -tolerance
+    }) {
+        return false;
+    }
+    let points: Vec<P2> = controls.iter().map(|p| axis.to_2d(*p)).collect();
     let (mut a, mut b, mut span) = (points[0], points[0], 0.0);
     for p in &points {
         for q in &points {
@@ -481,10 +533,10 @@ fn meridian_is_straight(face: &FaceRecord, axis: &Axis, tolerance: f64) -> Resul
         }
     }
     if span <= tolerance {
-        return Ok(false);
+        return false;
     }
     let run = b.sub(a);
-    Ok(points.iter().all(|p| run.cross(p.sub(a)).abs() / span <= tolerance))
+    points.iter().all(|p| run.cross(p.sub(a)).abs() / span <= tolerance)
 }
 
 /// An edge that is an arc of a circle: the circle through its ends and its
