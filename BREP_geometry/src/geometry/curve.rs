@@ -642,6 +642,15 @@ pub struct NurbsCurve {
     /// re-validating the knot vector on every evaluation.
     #[serde(skip, default)]
     validated: std::cell::Cell<bool>,
+    /// Read from a file (STEP, Parasolid, IGES) rather than built by the
+    /// kernel. The strict edge/pcurve bar judges only coedges whose edge
+    /// curve and pcurve are both kernel-built. Carried by `Clone` and by the
+    /// curve's own derivations (`reversed`, `insert_knot`, `split`); a curve
+    /// built afresh with [`NurbsCurve::new`] is kernel-built. Never part of
+    /// the geometry: no comparison or identity hash reads it. Serialized
+    /// only when set, so a kernel-built curve's JSON is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    imported: bool,
 }
 
 impl NurbsCurve {
@@ -662,9 +671,27 @@ impl NurbsCurve {
             knots,
             control_points,
             validated: std::cell::Cell::new(false),
+            imported: false,
         };
         curve.ensure_valid()?;
         Ok(curve)
+    }
+
+    /// Whether this curve was read from a file (see the `imported` field).
+    pub fn is_imported(&self) -> bool {
+        self.imported
+    }
+
+    /// Marks this curve as read from a file, or as kernel-built.
+    pub fn set_imported(&mut self, imported: bool) {
+        self.imported = imported;
+    }
+
+    /// This curve carrying `source`'s provenance: for a curve derived from
+    /// `source` (a piece, a reversal, a transform of it).
+    pub fn with_provenance_of(mut self, source: &NurbsCurve) -> Self {
+        self.imported = source.imported;
+        self
     }
 
     /// The full construction-time checks, run at most once per instance.
@@ -1275,10 +1302,14 @@ impl NurbsCurve {
             .map(|knot| start + end - knot)
             .collect();
         let control_points = self.control_points.iter().rev().copied().collect();
-        Self::new(self.degree, knots, control_points)
+        Ok(Self::new(self.degree, knots, control_points)?.with_provenance_of(self))
     }
 
     pub fn insert_knot(&self, parameter: f64, requested: usize) -> Result<Self, String> {
+        Ok(self.insert_knot_raw(parameter, requested)?.with_provenance_of(self))
+    }
+
+    fn insert_knot_raw(&self, parameter: f64, requested: usize) -> Result<Self, String> {
         let knot_vector = self.knot_vector()?;
         let degree = self.degree;
         let parameter = knot_vector.clamp_param(parameter);
@@ -1353,6 +1384,11 @@ impl NurbsCurve {
     }
 
     pub fn split(&self, parameter: f64) -> Result<(Self, Self), String> {
+        let (left, right) = self.split_raw(parameter)?;
+        Ok((left.with_provenance_of(self), right.with_provenance_of(self)))
+    }
+
+    fn split_raw(&self, parameter: f64) -> Result<(Self, Self), String> {
         let [start, end] = self.domain()?;
         if parameter <= start + KNOT_IDENTITY_TOL || parameter >= end - KNOT_IDENTITY_TOL {
             return Err(format!(

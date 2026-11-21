@@ -113,7 +113,7 @@ fn scale_controls(points: &[Vec4], factor: f64) -> Vec<Vec4> {
 }
 
 fn scale_curve(curve: &NurbsCurve, factor: f64) -> Result<NurbsCurve, String> {
-    NurbsCurve::new(curve.degree, curve.knots.clone(), scale_controls(&curve.control_points, factor))
+    Ok(NurbsCurve::new(curve.degree, curve.knots.clone(), scale_controls(&curve.control_points, factor))?.with_provenance_of(curve))
 }
 
 /// Whether `surface` is parameterised by length along u and along v: the

@@ -404,7 +404,7 @@ fn project_point_to_curve_uncached(curve: &NurbsCurve, point: Vec3) -> Result<Cu
 /// again (an extrusion's reduced profile): the projector reads the held samples instead of
 /// hashing the curve's content into the seed cache on every call. Same samples, same answer.
 #[derive(Clone)]
-pub(crate) struct HeldCurve {
+pub struct HeldCurve {
     pub(crate) curve: NurbsCurve,
     seeds: Option<SeedSet>,
 }
@@ -416,7 +416,7 @@ impl std::fmt::Debug for HeldCurve {
 }
 
 impl HeldCurve {
-    pub(crate) fn new(curve: NurbsCurve) -> Self {
+    pub fn new(curve: NurbsCurve) -> Self {
         let seeds = curve.domain().ok().and_then(|[start, end]| {
             let bound = curve.knots.len().saturating_add(1).saturating_mul(4usize.max(curve.degree + 2).saturating_add(1));
             if bound > CURVE_SEED_BUDGET { return None; }
@@ -434,7 +434,7 @@ impl HeldCurve {
 
     /// `project_point_to_curve(&self.curve, point)`, bit for bit. A straight curve keeps the
     /// projector's own memo, and a curve whose samples are not held goes the projector's way.
-    pub(crate) fn project(&self, point: Vec3) -> Result<CurveProjection, String> {
+    pub fn project(&self, point: Vec3) -> Result<CurveProjection, String> {
         match &self.seeds {
             Some(seeds) if !(projection_memo_enabled() && straight_projection_key(&self.curve, point).is_some()) => {
                 project_point_to_curve_seeded(&self.curve, point, Some(seeds))
@@ -826,6 +826,34 @@ pub fn project_point_to_surface(
         }
     }
     project_point_to_surface_general(surface, point)
+}
+
+/// [`project_point_to_surface`] without the general projector's global stage:
+/// the same closed forms on analytic, ellipsoid and extrusion carriers, and on
+/// any other carrier Newton from the seed grid's nearest sample
+/// ([`project_point_to_surface_from_nearest_seed`]). A local foot: its distance
+/// is an upper bound on the nearest point's. For a caller that only needs a
+/// start on the surface near the point, such as a Newton's opening iterate.
+pub fn project_point_to_surface_local(
+    surface: &NurbsSurface,
+    point: Vec3,
+) -> Result<SurfaceProjection, String> {
+    if let Some(analytic) = surface.analytic() {
+        if let Some(projection) = analytic.project(surface, point) {
+            return Ok(projection);
+        }
+    }
+    if let Some(ellipsoid) = surface.affine_sphere() {
+        if let Some(projection) = ellipsoid.project(surface, point) {
+            return Ok(projection);
+        }
+    }
+    if switch!("BREP_EXTRUSION_PROJECTION", true) {
+        if let Some(projection) = surface.linear_extrusion().and_then(|e| e.project(surface, point)) {
+            return Ok(projection);
+        }
+    }
+    project_point_to_surface_from_nearest_seed(surface, point)
 }
 
 /// Project a point onto a surface starting Newton from an explicit `(u, v)`
@@ -1857,6 +1885,84 @@ fn audit_record(caller: &std::panic::Location<'_>, surface: &NurbsSurface, local
 /// descent per candidate cell the hull bound does not exclude.
 #[track_caller]
 pub fn project_point_to_surface_general(
+    surface: &NurbsSurface,
+    point: Vec3,
+) -> Result<SurfaceProjection, String> {
+    if !surface_projection_memo_enabled() || !surface_projection_memo_admitted() {
+        return project_point_to_surface_general_fresh(surface, point);
+    }
+    let key = (surface.content_key(), [point.x.to_bits(), point.y.to_bits(), point.z.to_bits()], forced_switches_key());
+    if let Some(hit) = SURFACE_PROJECTION_MEMO.with(|memo| memo.borrow().get(&key).copied()) {
+        if surface_projection_memo_check() {
+            let fresh = project_point_to_surface_general_fresh(surface, point)?;
+            let bits = |p: &SurfaceProjection| [p.u.to_bits(), p.v.to_bits(), p.point.x.to_bits(), p.point.y.to_bits(), p.point.z.to_bits(), p.distance.to_bits()];
+            assert_eq!(bits(&hit), bits(&fresh), "surface projection memo check: held {hit:?} vs fresh {fresh:?}");
+        }
+        return Ok(hit);
+    }
+    let answer = project_point_to_surface_general_fresh(surface, point)?;
+    SURFACE_PROJECTION_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= SURFACE_PROJECTION_MEMO_ENTRIES {
+            memo.clear();
+        }
+        memo.insert(key, answer);
+    });
+    Ok(answer)
+}
+
+/// `BREP_SURFACE_PROJECTION_MEMO` (default on; =0 projects every call): the general projector keeps
+/// its answers per thread, keyed by the surface's content hash
+/// ([`NurbsSurface::content_key`]) and the point's bits, and answers a repeated
+/// query from the memo. The projector is a pure function of the net and the
+/// point (its grids and cells are built from the net), so a hit returns the
+/// answer it computed. On a ball screwed round a tight helix 37% of the
+/// general projections repeat one already made (the imprint's start points,
+/// pierces and pair readings ask the same points again). Bypassed while a
+/// call-site filter or the audit is set (they read the caller) and while
+/// switches are read live (`BREP_ENV_READ_ONCE=0`); the switches a test forces
+/// are part of the key. `BREP_SURFACE_PROJECTION_MEMO_CHECK=1` (with the memo
+/// on) projects afresh on every hit and stops on any bit difference.
+fn surface_projection_memo_enabled() -> bool {
+    switch!("BREP_SURFACE_PROJECTION_MEMO", true)
+}
+
+fn surface_projection_memo_check() -> bool {
+    switch!("BREP_SURFACE_PROJECTION_MEMO_CHECK", false)
+}
+
+/// No call-site filter and no audit (both read the caller), and switches read
+/// once per process: under `BREP_ENV_READ_ONCE=0` a switch the projector reads
+/// can change between two queries, which the key does not hold.
+fn surface_projection_memo_admitted() -> bool {
+    static CALLER_FREE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    crate::env_read::read_once_enabled() && *CALLER_FREE.get_or_init(|| {
+        env_read!("BREP_PROJECTION_GLOBAL_SITES").is_none()
+            && env_read!("BREP_PROJECTION_GLOBAL_EXCEPT").is_none()
+            && env_read!("BREP_PROJECTION_AUDIT").is_none()
+    })
+}
+
+/// The switches a test forces on this thread, as part of the memo's key: an
+/// answer read under one setting is never returned under another. Zero
+/// outside tests.
+fn forced_switches_key() -> u64 {
+    0
+}
+
+/// The memo's bound per thread: cleared when it holds this many answers. An
+/// entry is 96 bytes (key and answer), so the table stays under about 3.2 MB
+/// a thread for the thread's life (32k buckets at most), under the curve seed
+/// cache's own budget. Entries are keyed by content, never stale; a long-lived
+/// process (the app, the PLM worker) holds at most this per kernel thread.
+const SURFACE_PROJECTION_MEMO_ENTRIES: usize = 1 << 14;
+
+thread_local! {
+    static SURFACE_PROJECTION_MEMO: std::cell::RefCell<rustc_hash::FxHashMap<([u64; 2], [u64; 3], u64), SurfaceProjection>> = Default::default();
+}
+
+#[track_caller]
+fn project_point_to_surface_general_fresh(
     surface: &NurbsSurface,
     point: Vec3,
 ) -> Result<SurfaceProjection, String> {
@@ -2989,6 +3095,7 @@ pub fn curve_foot_newton(
     let (_, nearest, squared) = curve_foot_newton_state(curve, point, seed, bracket, policy)?;
     Ok((nearest, squared))
 }
+
 
 
 

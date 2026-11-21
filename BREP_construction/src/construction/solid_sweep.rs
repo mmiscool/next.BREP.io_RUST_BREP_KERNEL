@@ -741,6 +741,12 @@ struct Interval {
     hi_source: usize,
 }
 
+/// The switch for the level engine's walk speed about one line (default
+/// on; `BREP_SWEEP_LINE_SPEED=0` restores the reach grown by every advance).
+pub fn line_speed_on() -> bool {
+    crate::switch!("BREP_SWEEP_LINE_SPEED", true)
+}
+
 fn wrap_pi(angle: f64) -> f64 {
     let wrapped = (angle + PI).rem_euclid(TAU) - PI;
     wrapped
@@ -1297,6 +1303,14 @@ impl<'a> Engine<'a> {
 
     /// An upper bound on how fast the preimage `M(t)⁻¹ x` moves per unit `t`.
     fn speed_bound(&self, x: Vec3) -> f64 {
+        // Steps about one line commute and keep a point's distance d to it:
+        // the preimage moves at most Σ|turn|·d + Σ|advance| (a slide along
+        // the line carries a point no further from it).
+        if let Some(d) = self.line_distance(x) {
+            let turning: f64 = self.motion.steps.iter().map(|step| step.turn.abs()).sum();
+            let sliding: f64 = self.motion.steps.iter().map(|step| step.advance.abs()).sum();
+            return ((turning * d + sliding) * (1.0 + 1e-12)).max(1e-300);
+        }
         let centre = self.frame.origin;
         let span = self.motion.from.abs().max(self.motion.to.abs());
         let mut reach = x.sub(centre).length();
@@ -1310,6 +1324,19 @@ impl<'a> Engine<'a> {
             .map(|step| step.turn.abs() * (reach + step.axis_origin.sub(centre).length()) + step.advance.abs())
             .sum();
         speed.max(1e-300)
+    }
+
+    /// The distance from `x` to the line every step turns about and slides
+    /// along, where there is one (behind `BREP_SWEEP_LINE_SPEED`).
+    fn line_distance(&self, x: Vec3) -> Option<f64> {
+        let (first, axis) = (self.motion.steps.first()?, *self.axes.first()?);
+        let tolerance = 1e-12 * self.scale.max(1e-300);
+        let on_line = |p: Vec3| p.sub(first.axis_origin).cross(axis).length() <= tolerance;
+        let one = self.motion.steps.iter().zip(&self.axes).all(|(step, a)| a.cross(axis).length() <= 1e-12 && on_line(step.axis_origin));
+        if !(one && line_speed_on()) {
+            return None;
+        }
+        Some(x.sub(first.axis_origin).cross(axis).length())
     }
 
     /// The region's intervals at a level, sorted by `lo` (angular: `lo` in
@@ -1892,6 +1919,42 @@ pub fn sweep_solid_within(
             return Ok(parts);
         }
     }
+    level_sweep(tool, motion, clip, false).map(|bodies| bodies.unwrap_or_default())
+}
+
+/// The clip region less the sweep of `tool` along `motion` (default on;
+/// `BREP_SWEEP_CLIP_LESS=0` answers None, so the caller subtracts the sweep): the workpiece the clip names (a rod: radius
+/// from 0, no angle window) with everything the tool passes through taken
+/// out, built by the level engine directly, without a boolean. At each level
+/// the material is what the sweep leaves; its walls are the sweep's own, and
+/// at the clip's outer radius the boundary is the circle less the sweep's
+/// spans there. Over a crest (`BREP_SWEEP_CLIP_LESS_CREST`, default off) it is
+/// what stays below the crest. `None` where this is not built (another class than a screw,
+/// a crest with that switch off, a sweep that never reaches the outer radius or leaves more than
+/// one region, or anything the level engine refuses): the caller subtracts
+/// the sweep instead, and that route answers for its own refusals.
+pub fn sweep_clip_less(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip) -> Result<Option<Vec<BrepSolid>>, KernelRefusal> {
+    if !clip_less_on() || clip.radius[0] != 0.0 || clip.angle.is_some() {
+        return Ok(None);
+    }
+    Ok(level_sweep(tool, motion, clip, true).unwrap_or(None))
+}
+
+/// The switch for [`sweep_clip_less`] (default on).
+pub fn clip_less_on() -> bool {
+    crate::switch!("BREP_SWEEP_CLIP_LESS", true)
+}
+
+/// The switch for [`sweep_clip_less`] over a screw whose turns meet at a crest
+/// (default off): above the crest the sweep takes all the clip holds, so the
+/// clip less the sweep is what stays below it, which the engine builds anyway.
+pub fn clip_less_crest_on() -> bool {
+    crate::switch!("BREP_SWEEP_CLIP_LESS_CREST", false)
+}
+
+/// The level engine: the sweep within the clip, or (`complement`) the clip
+/// less the sweep, `None` where the complement is not built.
+fn level_sweep(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip, complement: bool) -> Result<Option<Vec<BrepSolid>>, KernelRefusal> {
     let narrowed: SweepClip;
     // --- Frame and classification.
     let ez = clip
@@ -2208,22 +2271,37 @@ pub fn sweep_solid_within(
         check_ends_clear(&engine)?;
     }
 
+    // The clip less the sweep is built for a screw only.
+    if complement && !matches!(class, Class::Screw(_)) {
+        return Ok(None);
+    }
+
     // --- A screw whose grooves meet: above a crest level nothing stays. Build
     //     what stays below it, and take that from the clip at the end.
+    //     The clip less the sweep is then what stays itself (default off).
     let mut crest = None;
+    let mut kept_only = false;
     if matches!(class, Class::Screw(_)) && clip.radius[0] == 0.0 && clip.angle.is_none() && whole_level_on() {
         crest = crest_level(&engine)?;
+        if complement && crest.is_some() {
+            if !clip_less_crest_on() {
+                return Ok(None);
+            }
+            kept_only = true;
+        }
         if let Some(level) = crest {
             narrowed = SweepClip { radius: [0.0, level], ..clip.clone() };
             engine.clip = &narrowed;
             engine.crest_gap = true;
         }
     }
+    // What stays below a crest is built as for the sweep; only the answer differs.
+    let complement = complement && !kept_only;
 
     // --- A straight-sided prism along a screw's axis: its reduced section
     //     exactly (default off), built as the levels' pieces would be.
     if let (Class::Screw(c), None, None, true, SweptTool::Prism { origin, normal, x_axis, outline, from, to }) =
-        (class, crest, engine.bar.as_ref(), crate::planar_region::screw_section_on(), tool)
+        (class, crest, engine.bar.as_ref(), crate::planar_region::screw_section_on() && !complement, tool)
     {
         let n = normal.normalized_or(*normal);
         let xa = x_axis.sub(n.scale(x_axis.dot(n))).normalized_or(*x_axis);
@@ -2261,7 +2339,7 @@ pub fn sweep_solid_within(
                         .collect();
                     bodies.push(build_body(&engine, &pieces)?);
                 }
-                return Ok(bodies);
+                return Ok(Some(bodies));
             }
         }
     }
@@ -2452,7 +2530,13 @@ pub fn sweep_solid_within(
         band_ends.push((a, b, pairs));
     }
     if pieces.is_empty() {
-        return Ok(Vec::new());
+        return Ok(if complement { None } else { Some(Vec::new()) });
+    }
+    // The clip less the sweep: the sweep must reach the clip's outer radius,
+    // where the material's boundary is the circle less the sweep's spans.
+    let top = engine.clip.radius[1];
+    if complement && !band_ends.iter().any(|(_, b, pairs)| !pairs.is_empty() && (b - top).abs() < 1e-12 * scale) {
+        return Ok(None);
     }
     if debug {
         eprintln!("solid sweep: after bands {:?}", engine.counters.get());
@@ -2524,6 +2608,11 @@ pub fn sweep_solid_within(
             }
         }
         let tolerance = if engine.angular { 1e-9 * scale / level.max(1e-12) } else { 1e-9 * scale };
+        // At the outer radius the material is the circle less the sweep's
+        // spans (the symmetric difference with the whole circle above).
+        if complement && (level - top).abs() < 1e-12 * scale {
+            above = vec![(0.0, TAU)];
+        }
         for (lo, hi) in symmetric_difference(&below, &above, engine.angular, tolerance) {
             let steps = 2;
             pieces.push(Piece {
@@ -2559,6 +2648,10 @@ pub fn sweep_solid_within(
     }
     // --- Assemble loops and build the bodies.
     let loops = assemble_loops(&engine, pieces)?;
+    // The material is one region round the axis, or it is not built here.
+    if complement && loops.len() != 1 {
+        return Ok(None);
+    }
     let mut bodies = Vec::new();
     for pieces in loops {
         bodies.push(build_body(&engine, &pieces)?);
@@ -2567,9 +2660,12 @@ pub fn sweep_solid_within(
         let [kept] = bodies.as_slice() else {
             return Err(refuse("whole_level", "what stays below the crest is not one body".into()));
         };
-        return clip_less(clip, frame_base(&engine), kept);
+        if kept_only {
+            return Ok(Some(bodies));
+        }
+        return clip_less(clip, frame_base(&engine), kept).map(Some);
     }
-    Ok(bodies)
+    Ok(Some(bodies))
 }
 
 /// Replace a screw loft's side surfaces and helical edges by quintic splines

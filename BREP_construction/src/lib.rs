@@ -57,7 +57,7 @@ pub use brep_boolean::*;
 #[doc(hidden)]
 pub mod solid_sweep;
 pub use solid_sweep::{
-    sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
+    clip_less_on, sweep_clip_less, sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
 };
 pub use planar_region::{cut_planar_sweep_from_prism, region_cut_on, swept_region_holds, target_outline_holds};
 #[path = "construction/turn_window.rs"]
@@ -135,7 +135,7 @@ pub use sweep_topology::{
 };
 #[path = "construction/gears.rs"]
 pub mod gears;
-pub use gears::{cycloidal_gear_section, cycloidal_gear_solid, CycloidalGear, cycloidal_disc_section, cycloidal_disc_solid, cycloidal_pin_ring, CycloidalDisc, worm_section, worm_solid, Worm, geneva_section, geneva_sizes, geneva_solid, GenevaWheel, ratchet_section, ratchet_solid, Ratchet, timing_pulley_section, timing_pulley_solid, TimingPulley, hub_from_section, straight_spline_hub, straight_spline_section, straight_spline_shaft, StraightSpline, helical_solid, helical_transverse, twisted_prism, Hand, HelicalGear, Twist, rack_section, rack_solid, ring_section, ring_solid, ring_solid_helical, sprocket_section, sprocket_solid, spur_section, spur_solid, GearData, GearSection, Rack, RingGear, SectionCurve, Sprocket, SprocketForm, SpurGear, GEAR_FIT_TOLERANCE};
+pub use gears::{worm_wheel_sizes, worm_wheel_solid, WormWheel, elliptical_section, elliptical_sizes, elliptical_solid, EllipticalGear, bevel_cones, bevel_section, bevel_solid, prism_by_rows, BevelGear, cycloidal_gear_section, cycloidal_gear_solid, CycloidalGear, cycloidal_disc_section, cycloidal_disc_solid, cycloidal_pin_ring, CycloidalDisc, worm_section, worm_solid, Worm, geneva_section, geneva_sizes, geneva_solid, GenevaWheel, ratchet_section, ratchet_solid, Ratchet, timing_pulley_section, timing_pulley_solid, TimingPulley, hub_from_section, straight_spline_hub, straight_spline_section, straight_spline_shaft, StraightSpline, helical_solid, helical_transverse, twisted_prism, Hand, HelicalGear, Twist, rack_section, rack_solid, ring_section, ring_solid, ring_solid_helical, sprocket_section, sprocket_solid, spur_section, spur_solid, GearData, GearSection, Rack, RingGear, SectionCurve, Sprocket, SprocketForm, SpurGear, GEAR_FIT_TOLERANCE};
 #[path = "construction/revolve_topology.rs"]
 #[doc(hidden)]
 pub mod revolve_topology;

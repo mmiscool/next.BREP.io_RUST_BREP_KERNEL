@@ -17,7 +17,7 @@
 //! tolerance stay open and are counted in the report; nothing is force-welded.
 
 use crate::{KernelRefusal, KernelStage, OrRefuse};
-use crate::mass_properties::{solid_sign_coarse_certificate, solid_signed_volume, solid_signed_volume_for_sign, COARSE_SIGN_DEPTH};
+use crate::mass_properties::{sign_coarse_thin_enabled, solid_sign_coarse_certificate, solid_signed_volume, solid_signed_volume_for_sign, COARSE_SIGN_DEPTH};
 use crate::orientation::{flip_all_faces, orient_open_solid_faces};
 use crate::topology::{BrepSolid, CoedgeRecord, EdgeRecord, FaceRecord, ShellRecord, VertexRecord};
 use crate::{build_pcurve_on_surface, project_point_to_curve, NurbsCurve, Vec3};
@@ -814,7 +814,9 @@ fn sew_sign_by_reading(solid: &BrepSolid, bar: f64, check: bool) -> Option<bool>
         let volume = solid_signed_volume(solid).ok();
         let exact = volume.filter(|volume| volume.abs() > bar).map(|volume| volume < 0.0);
         for depth in [COARSE_SIGN_DEPTH, 2, 3] {
+            let started = web_time::Instant::now();
             let certificate = solid_sign_coarse_certificate(solid, depth);
+            let ms = started.elapsed().as_secs_f64() * 1e3;
             let settled = certificate.and_then(|certificate| coarse_verdict(certificate.reading, certificate.bound, bar));
             let held = match (certificate, volume) {
                 (Some(certificate), Some(volume)) => (volume - certificate.reading).abs() <= certificate.bound,
@@ -824,8 +826,9 @@ fn sew_sign_by_reading(solid: &BrepSolid, bar: f64, check: bool) -> Option<bool>
             let (reading, bound, skipped) =
                 certificate.map_or((f64::NAN, f64::NAN, f64::NAN), |c| (c.reading, c.bound, c.skipped));
             eprintln!(
-                "sew.sign_coarse{} depth={depth} coarse={} exact={} reading={reading:.6e} bound={bound:.3e} skipped={skipped:.3e} volume={:.6e} bar={bar:.1e}",
+                "sew.sign_coarse{} depth={depth} thin={} coarse={} exact={} reading={reading:.6e} bound={bound:.3e} skipped={skipped:.3e} volume={:.6e} bar={bar:.1e} ms={ms:.3}",
                 if agree { "" } else { " DISAGREE" },
+                sign_coarse_thin_enabled(),
                 match settled { Some(false) => "outward", Some(true) => "flipped", None => "none" },
                 match exact { Some(false) => "outward", Some(true) => "flipped", None => "none" },
                 volume.unwrap_or(f64::NAN),

@@ -1,7 +1,7 @@
 # BREP_blend
 
 `BREP_blend` holds the fillets, chamfers and blends of the BREP kernel. Its Rust library
-target is `brep_blend`; this is version **0.25.0**.
+target is `brep_blend`; this is version **0.26.0**.
 
 It is one of the implementation crates the kernel is built from. Applications
 should depend on [`BREP_kernel`](https://crates.io/crates/BREP_kernel), which

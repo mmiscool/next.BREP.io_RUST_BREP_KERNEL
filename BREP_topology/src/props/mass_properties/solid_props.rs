@@ -294,6 +294,60 @@ pub fn solid_signed_volume_for_sign_with_bound(solid: &BrepSolid, bar: f64, enab
 /// split this often, against four times for the exact reading.
 pub const COARSE_SIGN_DEPTH: usize = 1;
 
+/// `BREP_SEW_SIGN_COARSE_THIN` (default on since the 2026-11-20 tier-P
+/// promotion; `=0` restores the coarse quadtree on every face): in
+/// [`solid_sign_coarse_certificate`], a face whose trim cannot hold one whole
+/// coarse cell ([`trim_holds_no_coarse_cell`]) is read by its exact route
+/// instead of the coarse quadtree. The coarse pass reads nothing of such a
+/// face and bounds all of it by its net, so this only replaces a bound with
+/// the reading's own terms.
+pub fn sign_coarse_thin_enabled() -> bool {
+    crate::switch!("BREP_SEW_SIGN_COARSE_THIN", true)
+}
+
+/// Whether no cell of the coarse quadtree at `depth` can lie inside the
+/// face's trim, so that the coarse pass would integrate none of it. The
+/// quadtree's root cells are the carrier's knot spans, halved `depth` times;
+/// a region narrower in u (or in v) than those cells on every span it meets
+/// holds none whole. The region is boxed by its pcurves' control points
+/// (with positive weights each pcurve lies in their hull). A routing test
+/// only: either answer leaves the certificate sound. `false` when the box
+/// cannot be read, or lies off the carrier's spans (an unwrapped trim).
+fn trim_holds_no_coarse_cell(face: &FaceRecord, depth: usize) -> bool {
+    let Ok((u_breaks, v_breaks)) = surface_breaks(&face.surface) else {
+        return false;
+    };
+    let (mut low, mut high) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        for control in &coedge.pcurve.control_points {
+            let Ok(point) = control.point() else {
+                return false;
+            };
+            if !(control.w > 0.0) || !point.x.is_finite() || !point.y.is_finite() {
+                return false;
+            }
+            low = [low[0].min(point.x), low[1].min(point.y)];
+            high = [high[0].max(point.x), high[1].max(point.y)];
+        }
+    }
+    let cell = 0.5f64.powi(depth.min(60) as i32);
+    let narrow = |breaks: &[f64], low: f64, high: f64| -> bool {
+        let mut met = false;
+        for pair in breaks.windows(2) {
+            if pair[1] <= low || pair[0] >= high {
+                continue;
+            }
+            met = true;
+            if !(high - low < (pair[1] - pair[0]) * cell) {
+                return false;
+            }
+        }
+        met
+    };
+    low[0] <= high[0] && low[1] <= high[1]
+        && (narrow(&u_breaks, low[0], high[0]) || narrow(&v_breaks, low[1], high[1]))
+}
+
 /// [`solid_sign_coarse_certificate`]'s reading and the half-width of the
 /// interval it certifies.
 #[derive(Clone, Copy, Debug)]
@@ -319,6 +373,12 @@ pub struct CoarseSign {
 /// `depth` and the partial cells left there are NOT integrated
 /// ([`super::trimmed::with_coarse_quadtree`]). The full cells, the chord
 /// corrections and every other route are term for term the exact reading's.
+/// Under `BREP_SEW_SIGN_COARSE_THIN` ([`sign_coarse_thin_enabled`]) a face
+/// whose trim cannot hold one whole cell at `depth`
+/// ([`trim_holds_no_coarse_cell`]) is read whole by its exact route, with no
+/// skipped region and so no bound: a thin strip of a full-turn carrier, whose
+/// coarse cells are all boundary cells, otherwise adds its whole area times
+/// the net's `n · r` to the bound.
 ///
 /// The bound, per face. The volume flux is
 /// `(1/3) ∫∫_R (S − ref)·(S_u × S_v) du dv` over the trimmed region `R`.
@@ -385,9 +445,14 @@ pub fn solid_sign_coarse_certificate(solid: &BrepSolid, depth: usize) -> Option<
     }
     faces.sort_by(|a, b| b.3.total_cmp(&a.3));
     {
+        let thin_route = sign_coarse_thin_enabled();
         for &(face, local, reference, _) in &faces {
-            let (terms, measure) =
-                super::trimmed::with_coarse_quadtree(depth, || face_volume_terms_about(face, local));
+            let (terms, measure) = if thin_route && trim_holds_no_coarse_cell(face, depth) {
+                // Read whole by its exact route: bound zero, the reading's own terms.
+                (face_volume_terms_about(face, local), super::trimmed::CoarseMeasure { depth, ..Default::default() })
+            } else {
+                super::trimmed::with_coarse_quadtree(depth, || face_volume_terms_about(face, local))
+            };
             let terms = terms.ok()?;
             if measure.declined || !terms.iter().all(|v| v.is_finite()) {
                 return None;

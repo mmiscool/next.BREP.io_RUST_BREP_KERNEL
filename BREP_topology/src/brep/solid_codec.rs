@@ -59,6 +59,14 @@ pub struct SolidNames {
     pub faces: BTreeMap<u64, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub edges: BTreeMap<u64, String>,
+    /// Edges whose curve was read from a file ([`NurbsCurve::is_imported`]).
+    /// The flat image carries geometry only, so provenance rides here, and
+    /// a kernel-built solid's names keep their bytes.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub imported_edges: std::collections::BTreeSet<u64>,
+    /// Coedges whose pcurve was read from a file.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub imported_coedges: std::collections::BTreeSet<u64>,
 }
 
 fn push_curve(data: &mut Vec<f64>, curve: &NurbsCurve) {
@@ -126,6 +134,9 @@ pub fn encode_solid(solid: &BrepSolid) -> Result<(Vec<f64>, SolidNames), String>
             if edge.degenerate { 1.0 } else { 0.0 },
         ]);
         push_curve(&mut data, &edge.curve);
+        if edge.curve.is_imported() {
+            names.imported_edges.insert(edge.id);
+        }
         if let Some(name) = &edge.name {
             names.edges.insert(edge.id, name.clone());
         }
@@ -148,6 +159,9 @@ pub fn encode_solid(solid: &BrepSolid) -> Result<(Vec<f64>, SolidNames), String>
                         if coedge.forward { 1.0 } else { 0.0 },
                     ]);
                     push_curve(&mut data, &coedge.pcurve);
+                    if coedge.pcurve.is_imported() {
+                        names.imported_coedges.insert(coedge.id);
+                    }
                 }
             }
             if let Some(name) = &face.name {
@@ -307,7 +321,8 @@ pub fn decode_solid(data: &[f64], names: &SolidNames) -> Result<BrepSolid, Strin
         let start_vertex_id = reader.next_id()?;
         let end_vertex_id = reader.next_id()?;
         let degenerate = reader.next()? != 0.0;
-        let curve = reader.curve()?;
+        let mut curve = reader.curve()?;
+        curve.set_imported(names.imported_edges.contains(&id));
         edges.push(EdgeRecord {
             id,
             curve,
@@ -338,7 +353,8 @@ pub fn decode_solid(data: &[f64], names: &SolidNames) -> Result<BrepSolid, Strin
                     let coedge_id = reader.next_id()?;
                     let edge_id = reader.next_id()?;
                     let forward = reader.next()? != 0.0;
-                    let pcurve = reader.curve()?;
+                    let mut pcurve = reader.curve()?;
+                    pcurve.set_imported(names.imported_coedges.contains(&coedge_id));
                     coedges.push(CoedgeRecord {
                         id: coedge_id,
                         edge_id,

@@ -332,6 +332,10 @@ pub enum BudgetReason {
     /// No rung was accepted and a reading acceptance needs could not be taken
     /// (non-finite, or no shipped coverage); the top rung ships as built.
     Unread,
+    /// The request stopped refining before its rounds were spent: a round's
+    /// reading was no better than a set fraction of the best before it, so
+    /// the accepted rung it read ships (`BREP_BLEND_CLOSED_REQUEST_STALL`).
+    Stalled,
 }
 
 /// One edge whose built curve stands off one of its carriers, as an

@@ -1829,6 +1829,89 @@ const CLOSED_WALL_CENTRES: usize = 32;
 /// Section-angle probes across the wall, k/8 for k = 1..7.
 const CLOSED_WALL_SECTIONS: usize = 8;
 
+/// `BREP_BLEND_WALL_CENTRE_REUSE` (on unless `=0`/`off`): the closed-edge
+/// wall verdict's exact centres, kept across the refinement ladder's rounds
+/// of one march. A round re-reads every interval's wall on its refitted rows,
+/// but an interval the round did not split solves the same centres: they are
+/// a function of the interval's left node (t, uv, centre), its right t, the
+/// predict switch and the Jacobian the previous interval left, all read here
+/// to the bit, and the march frame, which one march does not change. A hit
+/// returns the stored centres and the Jacobian they left, so every later
+/// interval solves from the same state: byte-identical by construction.
+/// `BREP_BLEND_WALL_CENTRE_REUSE_CHECK=1` re-solves each hit and panics on a
+/// disagreement; `=<path>` also appends each hit's verdict to that file.
+#[derive(Default)]
+pub(super) struct WallCentreCache {
+    entries: std::collections::HashMap<Vec<u64>, (Option<Vec<Vec3>>, Option<[[f64; 4]; 4]>)>,
+}
+
+pub(crate) fn wall_centre_reuse_on() -> bool {
+    crate::switch!(live "BREP_BLEND_WALL_CENTRE_REUSE", true)
+}
+
+impl WallCentreCache {
+    fn centres(
+        &mut self,
+        left: &MarchNode,
+        right_t: f64,
+        predict: bool,
+        jacobian: &mut Option<[[f64; 4]; 4]>,
+        solve: impl Fn(&mut Option<[[f64; 4]; 4]>) -> Option<Vec<Vec3>>,
+    ) -> Option<Vec<Vec3>> {
+        let mut key = Vec::with_capacity(27);
+        key.extend([left.t.to_bits(), right_t.to_bits(), predict as u64]);
+        key.extend(left.uv.iter().map(|value| value.to_bits()));
+        let center = left.station.center;
+        key.extend([center.x.to_bits(), center.y.to_bits(), center.z.to_bits()]);
+        match jacobian {
+            Some(matrix) => {
+                key.push(1);
+                key.extend(matrix.iter().flatten().map(|value| value.to_bits()));
+            }
+            None => key.push(0),
+        }
+        if let Some((centres, after)) = self.entries.get(&key) {
+            crate::blend::record_count("count.closed.march.wall_centre_reused", 1);
+            if let Some(check) = std::env::var_os("BREP_BLEND_WALL_CENTRE_REUSE_CHECK") {
+                let mut fresh_jacobian = *jacobian;
+                let fresh = solve(&mut fresh_jacobian);
+                let bits = |c: &Option<Vec<Vec3>>| c.as_ref().map(|c| c.iter().flat_map(|p| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]).collect::<Vec<u64>>());
+                let jbits = |j: &Option<[[f64; 4]; 4]>| j.map(|m| m.iter().flatten().map(|v| v.to_bits()).collect::<Vec<u64>>());
+                crate::blend::record_count("count.closed.march.wall_centre_reuse_checked", 1);
+                let agrees = bits(&fresh) == bits(centres) && jbits(&fresh_jacobian) == jbits(after);
+                // A value other than `1` names a file each check appends its
+                // verdict to, so a census reads how many hits it checked.
+                if check != "1" {
+                    use std::io::Write;
+                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&check) {
+                        let _ = writeln!(file, "{}", if agrees { "agree" } else { "DISAGREE" });
+                    }
+                }
+                assert!(agrees, "BREP_BLEND_WALL_CENTRE_REUSE_CHECK: the kept centres of t {} .. {right_t} disagree with a fresh solve", left.t);
+            }
+            *jacobian = *after;
+            return centres.clone();
+        }
+        let centres = solve(jacobian);
+        self.entries.insert(key, (centres.clone(), *jacobian));
+        centres
+    }
+}
+
+/// `BREP_BLEND_CLOSED_REQUEST_STALL` (on unless `=0`/`off`; promoted 2026-11-20): the closed-edge
+/// ladder stops refining an accepted rung toward the construction request
+/// once a round's reading is no longer under [`REQUEST_STALL_RATIO`] of the
+/// best before it. Measured 2026-11-20 on the slant-cut cylinder grown by 1:
+/// the request (1e-7) read 5.0, 2.2, 1.75, 1.59, 1.82, 1.70, 1.92e-7 over
+/// rounds 0..6 and ended unmet after all six, the fitted wall's own reading
+/// plateauing (its uncertainty is 1.5e-11).
+pub(crate) fn closed_request_stall_on() -> bool {
+    crate::switch!(live "BREP_BLEND_CLOSED_REQUEST_STALL", true)
+}
+
+/// A request round must read under this fraction of the best earlier round.
+const REQUEST_STALL_RATIO: f64 = 0.8;
+
 /// Every interval's largest DECLARED wall reading (reading + uncertainty)
 /// on the fitted fillet `rows`, `None` where any centre did not solve or any
 /// probe was unreadable (which fails the interval). Each interval's exact ball
@@ -1840,6 +1923,7 @@ fn closed_wall_interval_misses(
     parameters: &[f64],
     radius: f64,
     frame: &MarchFrame<'_>,
+    mut reuse: Option<&mut WallCentreCache>,
 ) -> Vec<Option<f64>> {
     let [low, high] = rows.u_domain;
     let [v_low, v_high] = match rows.surface.domain_v() {
@@ -1859,29 +1943,40 @@ fn closed_wall_interval_misses(
     (0..nodes.len().saturating_sub(1))
         .map(|interval| {
             let (left, right) = (&nodes[interval], &nodes[interval + 1]);
-            let mut centres = Vec::with_capacity(CLOSED_WALL_CENTRES + 1);
-            centres.push(left.station.center);
-            let mut previous = left.clone();
-            let mut previous_section = None;
-            let mut history: Vec<(f64, [f64; 4])> = vec![(left.t, left.uv)];
             let centres_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.wall.centres_ms");
-            for step in 1..CLOSED_WALL_CENTRES {
-                let t = left.t + (right.t - left.t) * step as f64 / CLOSED_WALL_CENTRES as f64;
-                previous = if predict {
-                    let seed = extrapolated_seed(&history, t);
-                    let node = frame.continue_node_predicted(&previous, seed, t, &mut jacobian, &mut previous_section).ok()?;
-                    history.push((t, node.uv));
-                    if history.len() > 3 {
-                        history.remove(0);
-                    }
-                    crate::blend::record_count("count.closed.march.wall_centre_predicted", 1);
-                    node
-                } else {
-                    frame.continue_node(previous.t, previous.uv, previous.station.center, t, None, true).ok()?
-                };
-                centres.push(previous.station.center);
-            }
+            // The interval's exact centres, continued from its left node
+            // under the Jacobian the previous interval left (`jacobian`, read
+            // and written). `None` where a solve failed.
+            let solve = |jacobian: &mut Option<[[f64; 4]; 4]>| -> Option<Vec<Vec3>> {
+                let mut centres = Vec::with_capacity(CLOSED_WALL_CENTRES + 1);
+                centres.push(left.station.center);
+                let mut previous = left.clone();
+                let mut previous_section = None;
+                let mut history: Vec<(f64, [f64; 4])> = vec![(left.t, left.uv)];
+                for step in 1..CLOSED_WALL_CENTRES {
+                    let t = left.t + (right.t - left.t) * step as f64 / CLOSED_WALL_CENTRES as f64;
+                    previous = if predict {
+                        let seed = extrapolated_seed(&history, t);
+                        let node = frame.continue_node_predicted(&previous, seed, t, jacobian, &mut previous_section).ok()?;
+                        history.push((t, node.uv));
+                        if history.len() > 3 {
+                            history.remove(0);
+                        }
+                        crate::blend::record_count("count.closed.march.wall_centre_predicted", 1);
+                        node
+                    } else {
+                        frame.continue_node(previous.t, previous.uv, previous.station.center, t, None, true).ok()?
+                    };
+                    centres.push(previous.station.center);
+                }
+                Some(centres)
+            };
+            let centres = match reuse.as_deref_mut() {
+                Some(cache) => cache.centres(left, right.t, predict, &mut jacobian, solve),
+                None => solve(&mut jacobian),
+            };
             centres_timing.stop();
+            let mut centres = centres?;
             crate::blend::record_count("count.closed.march.wall_centres", (CLOSED_WALL_CENTRES - 1) as u64);
             let _probes_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.wall.probes_ms");
             centres.push(right.station.center);
@@ -2144,6 +2239,9 @@ fn march_stations_impl(
             // after the ladder reads the nodes it ships, and the seed march's
             // probe already read these very nodes when nothing replaced them.
             let mut nodes_changed = false;
+            let mut wall_centres = wall_centre_reuse_on().then(WallCentreCache::default);
+            let request_stall = closed_request_stall_on();
+            let mut best_request: Option<f64> = None;
             for round in 0..=REFINE_ROUNDS {
                 crate::blend::record_count("count.closed.march.rounds", 1);
                 let stations: Vec<Station> = nodes.iter().map(|node| node.station).collect();
@@ -2187,7 +2285,7 @@ fn march_stations_impl(
                         match fillet {
                             Ok(fillet) => {
                                 let wall_read_timing = crate::blend::BlendTimer::start("timing.closed.march.ladder.wall.read_ms");
-                                let walls = closed_wall_interval_misses(&fillet, &nodes, &parameters, check.radius, &frame);
+                                let walls = closed_wall_interval_misses(&fillet, &nodes, &parameters, check.radius, &frame, wall_centres.as_mut());
                                 wall_read_timing.stop();
                                 wall_failing = walls.iter().map(|wall| !matches!(wall, Some(declared) if *declared <= check.bar)).collect();
                                 wall_worst = walls.iter().flatten().copied().fold(0.0_f64, f64::max);
@@ -2240,6 +2338,20 @@ fn march_stations_impl(
                         rails.iter().filter(|rail| !rail.is_finite()).count(),
                         walls.iter().flatten().copied().fold(0.0_f64, f64::max),
                     ))));
+                    // `BREP_BLEND_CLOSED_REQUEST_STALL` (on by default): a round
+                    // whose request reading is not under REQUEST_STALL_RATIO
+                    // of the best earlier round's has stalled (the inserted
+                    // stations do not lower it), so the rung it reads ships
+                    // as the request's last, reported as stalled.
+                    // Acceptance is unchanged: this rung passed its bars.
+                    if request_stall {
+                        if best_request.is_some_and(|best| !(declared < REQUEST_STALL_RATIO * best)) {
+                            crate::blend::record_count("count.closed.march.request_stalled", 1);
+                            unmet = Some((declared, crate::BudgetReason::Stalled, round, nodes.len()));
+                            break;
+                        }
+                        best_request = Some(best_request.map_or(declared, |best: f64| best.min(declared)));
+                    }
                     if round == REFINE_ROUNDS {
                         unmet = Some((declared, crate::BudgetReason::RoundsSpent, round, nodes.len()));
                         break;

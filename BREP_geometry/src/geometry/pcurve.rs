@@ -445,6 +445,100 @@ fn hold_pole_row_ends(surface: &NurbsSurface, points: &mut [Vec3], parameters: &
     Ok(())
 }
 
+/// `BREP_PCURVE_SPHERE_POLE_ENDS` (default OFF, `1` on): a trim on the analytic
+/// sphere that ENDS at a pole, where the projector answers an arbitrary
+/// longitude, holds the longitude it reaches the pole at
+/// ([`pole_longitude`]) to a sliver of the parameter short of the pole and
+/// links along the collapsed row to the station's own (u, v), so the loop's
+/// parameter-space closure is unchanged. Off, the interpolant runs through
+/// the arbitrary longitude and swings sideways in its last spans: the octant
+/// pocket's meridian read 1e-3 off its edge near the pole (box − ball r = 5,
+/// pcurve u 0.75 -> 1.0 at the pole; 3.9e-3 once pushed to r = 19.5), and a
+/// great circle through both poles (a sphere about x cut by z = 0) 1.07e-3,
+/// its half ball 7.9e-6 short. Not on the branch-reset path, where the band
+/// stations beside an end keep raw longitudes while the regular runs are
+/// unwrapped apart, so an extrapolation from both would mix branches.
+/// Default off until a napkin ring with sphere poles on its rims reads its
+/// STEP's volume with it on (it read 0.27 too large).
+fn sphere_pole_ends() -> bool {
+    switch!(live "BREP_PCURVE_SPHERE_POLE_ENDS", false)
+}
+
+/// [`sphere_pole_ends`]: the interpolant with each pole END held at its
+/// approach longitude and a linear C0 link (in (u, v), along the collapsed
+/// row, so one 3D point) over half the end span of the parameter to the station's
+/// own (u, v). `None` when no end needs it, or when the stations cannot
+/// carry a cubic or do not ascend (the caller then builds the plain
+/// interpolant).
+fn sphere_pole_end_links(
+    surface: &NurbsSurface,
+    points: &[Vec3],
+    parameters: &[f64],
+    joins: &[f64],
+    pole_rows: bool,
+) -> Result<Option<NurbsCurve>, String> {
+    if points.len() < 4 || points.len() != parameters.len() || !parameters.windows(2).all(|pair| pair[1] > pair[0]) {
+        return Ok(None);
+    }
+    let ([u0, u1], _) = surface_domains(surface)?;
+    let period = (u1 - u0).abs();
+    let last = points.len() - 1;
+    let held_longitude = |end: usize, near: usize, far: usize| -> Result<Option<f64>, String> {
+        if !row_collapsed(surface, points[end].y)? || row_collapsed(surface, points[near].y)? {
+            return Ok(None);
+        }
+        let longitude = pole_longitude(points, parameters, end, near, far);
+        // The same longitude a whole period away needs no link either.
+        let apart = (longitude - points[end].x).rem_euclid(period.max(f64::MIN_POSITIVE));
+        let apart = apart.min(period - apart);
+        Ok((longitude.is_finite() && apart > 1e-12 * period.max(1.0)).then_some(longitude))
+    };
+    let start = held_longitude(0, 1, 2)?;
+    let end = held_longitude(last, last - 1, last - 2)?;
+    if start.is_none() && end.is_none() {
+        return Ok(None);
+    }
+    // The link takes half the end span. Its 3D point is the pole throughout,
+    // so the width moves no geometry; a 1e-9 sliver (a link speed of ~1e8 in
+    // u) made the boolean drop the disk of a sphere about x cut by z = 0.
+    let (mut held, mut stations) = (points.to_vec(), parameters.to_vec());
+    if let Some(longitude) = start {
+        held[0].x = longitude;
+        stations[0] += 0.5 * (parameters[1] - parameters[0]);
+    }
+    if let Some(longitude) = end {
+        held[last].x = longitude;
+        stations[last] -= 0.5 * (parameters[last] - parameters[last - 1]);
+    }
+    let body = interpolate_stations(surface, held.clone(), &stations, joins, pole_rows)?;
+    if body.degree != 3 {
+        return Ok(None);
+    }
+    let link = |from: Vec3, to: Vec3, along: f64| Vec4::from_point(Vec3::new(from.x + (to.x - from.x) * along, from.y + (to.y - from.y) * along, 0.0), 1.0);
+    let mut knots: Vec<f64> = Vec::with_capacity(body.knots.len() + 6);
+    let mut control: Vec<Vec4> = Vec::with_capacity(body.control_points.len() + 6);
+    let body_knots = &body.knots[..];
+    let mut body_from = 0usize;
+    if start.is_some() {
+        knots.extend(std::iter::repeat(parameters[0]).take(4));
+        knots.extend(std::iter::repeat(stations[0]).take(3));
+        body_from = 4;
+        for along in [0.0, 1.0 / 3.0, 2.0 / 3.0] {
+            control.push(link(points[0], held[0], along));
+        }
+    }
+    let body_to = if end.is_some() { body_knots.len() - 1 } else { body_knots.len() };
+    knots.extend(body_knots[body_from..body_to].iter().copied());
+    control.extend(body.control_points.iter().copied());
+    if end.is_some() {
+        for along in [1.0 / 3.0, 2.0 / 3.0, 1.0] {
+            control.push(link(held[last], points[last], along));
+        }
+        knots.extend(std::iter::repeat(parameters[last]).take(4));
+    }
+    Ok(Some(NurbsCurve::new(3, knots, control)?))
+}
+
 fn c0_joins() -> bool {
     switch!("BREP_PCURVE_C0_JOIN", true)
 }
@@ -635,7 +729,8 @@ pub fn build_interpolant_joined(
     // longitude changes by at least half a period: a true through-pole branch
     // reset whose two meridian runs must be unwrapped independently.
     // Prefix/suffix pole samples on normal sphere caps retain the legacy
-    // interpolation byte-for-byte. Include the exactly-half-period case so
+    // interpolation byte-for-byte, except a trim's pole END under
+    // `BREP_PCURVE_SPHERE_POLE_ENDS` ([`sphere_pole_end_links`]). Include the exactly-half-period case so
     // floating-point noise cannot decide which entire run is lifted (ABC 5603).
     let has_interior_pole_crossing = sphere_u_singular
         .iter()
@@ -719,14 +814,6 @@ pub fn build_interpolant_joined(
         }
         points.push(Vec3::new(u, v, 0.0));
     }
-    let degree = 3usize.min(points.len() - 1);
-    let mut bounds: Vec<usize> = joins
-        .iter()
-        .filter_map(|join| curve_parameters.iter().position(|parameter| parameter == join))
-        .filter(|&index| index > 0 && index + 1 < curve_parameters.len())
-        .collect();
-    bounds.sort_unstable();
-    bounds.dedup();
     // A trim that ENDS on a collapsed row (a pole of a closed-u carrier)
     // holds the longitude of its nearest regular station through the pole
     // band, as the cone apex does (`BREP_PCURVE_POLE_ROW_CROSSING`).
@@ -737,9 +824,37 @@ pub fn build_interpolant_joined(
     if pole_rows {
         hold_pole_row_ends(surface, &mut points, curve_parameters)?;
     }
+    if sphere_pole_ends() && closed_u && !interior_pole_branch_reset && matches!(surface.analytic(), Some(AnalyticSurface::Sphere { .. })) {
+        // A link that cannot be built leaves the plain interpolant.
+        if let Ok(Some(curve)) = sphere_pole_end_links(surface, &points, curve_parameters, joins, pole_rows) {
+            return Ok((curve, excursion, distance));
+        }
+    }
+    let curve = interpolate_stations(surface, points, curve_parameters, joins, pole_rows)?;
+    Ok((curve, excursion, distance))
+}
+
+/// The interpolant through `points` (pcurve stations in (u, v)) at
+/// `curve_parameters`: one cubic, or C0-joined pieces at `joins`
+/// ([`build_interpolant_joined`]), with the pole-row crossing links when
+/// `pole_rows`.
+fn interpolate_stations(
+    surface: &NurbsSurface,
+    points: Vec<Vec3>,
+    curve_parameters: &[f64],
+    joins: &[f64],
+    pole_rows: bool,
+) -> Result<NurbsCurve, String> {
+    let degree = 3usize.min(points.len() - 1);
+    let mut bounds: Vec<usize> = joins
+        .iter()
+        .filter_map(|join| curve_parameters.iter().position(|parameter| parameter == join))
+        .filter(|&index| index > 0 && index + 1 < curve_parameters.len())
+        .collect();
+    bounds.sort_unstable();
+    bounds.dedup();
     if degree < 3 || bounds.is_empty() || !c0_joins() {
-        let curve = interpolate_curve(&points, degree, curve_parameters)?;
-        return Ok((curve, excursion, distance));
+        return interpolate_curve(&points, degree, curve_parameters);
     }
     // Every piece needs four stations for a cubic: drop the join that
     // closes a shorter piece, from the left, until all pieces carry one.
@@ -754,8 +869,7 @@ pub fn build_interpolant_joined(
     }
     pieces.push(curve_parameters.len() - 1);
     if pieces.len() < 3 {
-        let curve = interpolate_curve(&points, degree, curve_parameters)?;
-        return Ok((curve, excursion, distance));
+        return interpolate_curve(&points, degree, curve_parameters);
     }
     // A join on a collapsed row (a pole of a closed-u carrier) where the
     // trim leaves along another longitude than it came in on: each side holds
@@ -804,8 +918,7 @@ pub fn build_interpolant_joined(
         let multiplicity = if piece == last_piece { 4 } else { 3 };
         knots.extend(std::iter::repeat(curve_parameters[to]).take(multiplicity));
     }
-    let curve = NurbsCurve::new(3, knots, control)?;
-    Ok((curve, excursion, distance))
+    NurbsCurve::new(3, knots, control)
 }
 
 /// The 3D residual a pcurve's image must reach before `build_pcurve_on_surface`

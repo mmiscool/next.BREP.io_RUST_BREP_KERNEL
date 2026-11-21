@@ -26,11 +26,12 @@
 use super::*;
 use crate::env_read::Mode;
 
-/// `BREP_MASS_SPHERE_CAPS`: `0|off` (default) keeps the trimmed route;
-/// `check` reads both, prints the comparison and returns the trimmed
-/// reading; `1|on` returns the closed form.
+/// `BREP_MASS_SPHERE_CAPS`: `1|on` (default since the 2026-11-20 tier-P
+/// promotion) returns the closed form; `check` reads both, prints the
+/// comparison and returns the trimmed reading; `0|off` keeps the trimmed
+/// route.
 pub(super) fn sphere_caps_mode() -> Mode {
-    crate::mode_switch!(live "BREP_MASS_SPHERE_CAPS", false)
+    crate::mode_switch!(live "BREP_MASS_SPHERE_CAPS", true)
 }
 
 

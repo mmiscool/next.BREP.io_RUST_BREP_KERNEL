@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 1000 1000" width="1000" height="1000" brep:glyph-name="bevel_gear" brep:unicode="E0F3">
+  <path d="M120 760L880 760L740 300L260 300Z" fill="#7a4d10"/>
+  <path d="M165 725L835 725L715 335L285 335Z" fill="#f0b840"/>
+  <path d="M190 725L245 725L338 335L300 335Z M305 725L360 725L418 335L380 335Z M420 725L475 725L498 335L460 335Z M535 725L590 725L578 335L540 335Z M650 725L705 725L658 335L620 335Z M765 725L820 725L738 335L700 335Z" fill="#c9871a"/>
+</svg>

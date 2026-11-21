@@ -88,14 +88,15 @@ impl Plane {
     }
 }
 
-/// `BREP_OFFSET_SPHERE_CUT_CLOSED_VOLUME` (default off): the hull's and the
+/// `BREP_OFFSET_SPHERE_CUT_CLOSED_VOLUME` (default on since the tier P
+/// promotion of 2026-11-20; `=0` restores the integrals): the hull's and the
 /// cavity's volumes read in closed form ([`ball_cut_volume`]) when their caps
 /// are disjoint, each integral run only when the closed form does not agree,
 /// so nothing the measured check accepts declines. shell/sphere-pinhole-opening
 /// spent ~38 of ~145 ms on those two integrals (host); their closed forms sit
 /// 1e-15 from them, 1e-7 of the check's bar.
 fn closed_volume_on() -> bool {
-    switch!("BREP_OFFSET_SPHERE_CUT_CLOSED_VOLUME", false)
+    switch!("BREP_OFFSET_SPHERE_CUT_CLOSED_VOLUME", true)
 }
 
 

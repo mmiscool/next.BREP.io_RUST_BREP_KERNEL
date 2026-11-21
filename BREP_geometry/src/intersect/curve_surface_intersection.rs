@@ -97,19 +97,81 @@ fn solve_three(matrix: [[f64; 3]; 3], rhs: Vec3) -> Option<[f64; 3]> {
     Some([x, y, z])
 }
 
+/// `BREP_CS_NEWTON_LOCAL_START` (default on; =0 opens from the global foot): on a classifier's ray
+/// ([`intersect_ray_surface`]), each seed's Newton opens from
+/// the local foot of its curve point ([`crate::projection::project_point_to_surface_local`]:
+/// Newton from the seed grid's nearest sample) instead of the nearest point of
+/// the whole surface. The opening foot is only a start: the Newton then solves
+/// curve = surface on its own, and the gap filter and duplicate guard read its
+/// answer as before. On a ray through a winding carrier the global stage was
+/// nine tenths of each Newton's cost.
+pub fn newton_local_start_enabled() -> bool {
+    switch!("BREP_CS_NEWTON_LOCAL_START", true)
+}
+
+/// `BREP_CS_NEWTON_LOCAL_START_CHECK=1` (with the start switch on): solve every
+/// call from both starts, return the local one's answer, and count (and print)
+/// each opening foot more than the model tolerance from the global one's and
+/// each call whose hits differ ([`newton_start_check_counts`]).
+fn newton_local_start_check() -> bool {
+    switch!("BREP_CS_NEWTON_LOCAL_START_CHECK", false)
+}
+
+static START_CHECK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static START_CHECK_FEET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static START_CHECK_FOOT_DISAGREEMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static START_CHECK_HIT_DISAGREEMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What the check mode has compared in this process: `(calls, opening feet,
+/// feet apart by more than the model tolerance, calls whose hits differ)`.
+pub fn newton_start_check_counts() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        START_CHECK_CALLS.load(Relaxed),
+        START_CHECK_FEET.load(Relaxed),
+        START_CHECK_FOOT_DISAGREEMENTS.load(Relaxed),
+        START_CHECK_HIT_DISAGREEMENTS.load(Relaxed),
+    )
+}
+
+/// The Newton's opening foot of `point`: local or the whole surface's nearest.
+/// In check mode the local start also reads the global foot and counts the two
+/// apart by more than the model tolerance.
+fn opening_foot(surface: &NurbsSurface, point: Vec3, local: bool, check: bool) -> Result<[f64; 2], String> {
+    if !local {
+        let projection = project_point_to_surface(surface, point)?;
+        return Ok([projection.u, projection.v]);
+    }
+    let projection = crate::projection::project_point_to_surface_local(surface, point)?;
+    if check {
+        use std::sync::atomic::Ordering::Relaxed;
+        START_CHECK_FEET.fetch_add(1, Relaxed);
+        let nearest = project_point_to_surface(surface, point)?;
+        let apart = projection.point.sub(nearest.point).length();
+        if apart > crate::tolerance::DEFAULT_MODEL {
+            START_CHECK_FOOT_DISAGREEMENTS.fetch_add(1, Relaxed);
+            eprintln!(
+                "cs newton start check: foot apart {apart:.3e} (local {:.3e} at ({:.9},{:.9}), nearest {:.3e} at ({:.9},{:.9}))",
+                projection.distance, projection.u, projection.v, nearest.distance, nearest.u, nearest.v
+            );
+        }
+    }
+    Ok([projection.u, projection.v])
+}
+
 fn newton_curve_surface(
     curve: &NurbsCurve,
     surface: &NurbsSurface,
     seed: f64,
+    local_start: bool,
+    check: bool,
 ) -> Result<[f64; 3], String> {
     let [t0, t1] = curve.domain()?;
     let [u0, u1] = surface.domain_u()?;
     let [v0, v1] = surface.domain_v()?;
     let (closed_u, closed_v) = surface.closed_directions()?;
     let mut t = seed;
-    let projection = project_point_to_surface(surface, curve.evaluate(t)?)?;
-    let mut u = projection.u;
-    let mut v = projection.v;
+    let [mut u, mut v] = opening_foot(surface, curve.evaluate(t)?, local_start, check)?;
     for _ in 0..60 {
         let (curve_point, tangent) = curve.deriv1(t)?;
         let (surface_point, du, dv) = surface.deriv1(u, v)?;
@@ -224,10 +286,75 @@ pub fn intersect_curve_surface_from_seeds(
     tolerance: f64,
     seeds: Vec<f64>,
 ) -> Result<Vec<CurveSurfaceIntersection>, String> {
+    solve_counted(curve, surface, tolerance, &seeds, false)
+}
+
+/// [`intersect_curve_surface`] for a point classifier's ray: the same search,
+/// with each Newton opened from the local foot when
+/// `BREP_CS_NEWTON_LOCAL_START` is on. Only a ray caller may take it: it reads
+/// the parity of transversal crossings and casts another direction on a
+/// grazing hit, so a cluster of roots where a curve runs along the surface (an
+/// edge on a face, where the two starts can keep different members of the
+/// cluster) never decides its answer.
+pub fn intersect_ray_surface(
+    curve: &NurbsCurve,
+    surface: &NurbsSurface,
+    tolerance: f64,
+) -> Result<Vec<CurveSurfaceIntersection>, String> {
+    let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_INTERSECT_CURVE_SURFACE, surface);
+    let seeds = sampled_seeds(curve, surface, tolerance)?;
+    solve_counted(curve, surface, tolerance, &seeds, true)
+}
+
+fn solve_counted(
+    curve: &NurbsCurve,
+    surface: &NurbsSurface,
+    tolerance: f64,
+    seeds: &[f64],
+    ray: bool,
+) -> Result<Vec<CurveSurfaceIntersection>, String> {
+    if !ray || !newton_local_start_enabled() {
+        return solve_from_seeds(curve, surface, tolerance, seeds, false, false);
+    }
+    if !newton_local_start_check() {
+        return solve_from_seeds(curve, surface, tolerance, seeds, true, false);
+    }
+    let local = solve_from_seeds(curve, surface, tolerance, seeds, true, true)?;
+    let global = solve_from_seeds(curve, surface, tolerance, seeds, false, false)?;
+    START_CHECK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !same_hits(&local, &global, tolerance) {
+        START_CHECK_HIT_DISAGREEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let read = |hits: &[CurveSurfaceIntersection]| hits.iter().map(|hit| hit.t).collect::<Vec<_>>();
+        eprintln!(
+            "cs newton start check: hits differ: local t {:?} global t {:?}",
+            read(&local),
+            read(&global)
+        );
+    }
+    Ok(local)
+}
+
+/// The two starts read the same hits: as many, each at the same place within
+/// the duplicate guard's chord (`tolerance * 10`), with the same tangency.
+fn same_hits(first: &[CurveSurfaceIntersection], second: &[CurveSurfaceIntersection], tolerance: f64) -> bool {
+    first.len() == second.len()
+        && first.iter().zip(second).all(|(a, b)| {
+            a.point.sub(b.point).length() <= tolerance * 10.0 && a.tangential == b.tangential
+        })
+}
+
+fn solve_from_seeds(
+    curve: &NurbsCurve,
+    surface: &NurbsSurface,
+    tolerance: f64,
+    seeds: &[f64],
+    local_start: bool,
+    check: bool,
+) -> Result<Vec<CurveSurfaceIntersection>, String> {
     let [t0, t1] = curve.domain()?;
     let mut results: Vec<CurveSurfaceIntersection> = Vec::new();
-    for seed in seeds {
-        let [t, u, v] = newton_curve_surface(curve, surface, seed)?;
+    for &seed in seeds {
+        let [t, u, v] = newton_curve_surface(curve, surface, seed, local_start, check)?;
         let on_curve = curve.evaluate(t)?;
         let on_surface = surface.evaluate(u, v)?;
         let gap = on_curve.sub(on_surface).length();

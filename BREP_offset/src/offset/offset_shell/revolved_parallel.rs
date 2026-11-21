@@ -737,7 +737,14 @@ fn read_half_section(source: &BrepSolid, split_rims: bool, cone_apex: bool) -> R
 fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<BrepSolid>, KernelRefusal> {
     let scale = crate::solid_scale(source).max(1.0);
     let tolerance = 1e-9 * scale;
-    let Some((axis, mut chain)) = read_half_section(source, false, false)? else { return Ok(None) };
+    // A boolean's result carries each rim as arcs, not one circle: the
+    // trimmed lane reads those too (the eroders' reading).
+    let read = match read_half_section(source, false, false)? {
+        Some(read) => Some(read),
+        None if trimmed_growth_on() => read_half_section(source, true, false)?,
+        None => None,
+    };
+    let Some((axis, mut chain)) = read else { return Ok(None) };
     let touches_axis = chain.first().is_some_and(|p| p.start().rho.abs() <= tolerance);
     // A closed loop has no first piece: start it on a piece that does not
     // collapse (a concave arc grown by its radius is dropped between its two
@@ -758,183 +765,14 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
         chain = chain.iter().rev().map(Piece::reversed).collect();
     }
 
-    // Offset every piece outward; round every corner; decline a concave one.
-    let outward = |piece: &Piece, at_end: bool| -> Option<P2> {
-        piece.tangent(at_end).map(|t| P2 { rho: t.z, z: -t.rho })
+    let grown = match walked_growth(&chain, touches_axis, distance, scale, tolerance) {
+        Some(grown) => grown,
+        None if trimmed_growth_on() => match trimmed_growth(&chain, touches_axis, distance, scale, tolerance) {
+            Some(grown) => grown,
+            None => return Ok(None),
+        },
+        None => return Ok(None),
     };
-    let mut grown: Vec<Piece> = Vec::new();
-    // A concave arc grown by exactly its radius (a fillet's root grown by the
-    // fillet's radius) shrinks to its centre: it is dropped, and its two
-    // neighbours' offsets meet there in a sharp edge, with no corner arc.
-    let collapse = 1e-7 * scale;
-    let mut after_collapse = false;
-    // A concave arc grown PAST its radius vanishes: its neighbours' offsets
-    // cross and are cut at the crossing, a sharp concave crease
-    // (`BREP_OFFSET_REVOLVED_VANISHED_ARC`). The arc's centre picks the
-    // crossing; the check below that every grown piece lies the distance from
-    // the section stands guard.
-    let mut vanished: Option<P2> = None;
-    for (k, piece) in chain.iter().enumerate() {
-        let moved = match *piece {
-            Piece::Line { start, end } => {
-                let Some(n) = outward(piece, false) else { return Ok(None) };
-                Piece::Line { start: start.add(n.scale(distance)), end: end.add(n.scale(distance)) }
-            }
-            Piece::Arc { center, radius, start, end, ccw } => {
-                let r = if ccw { radius + distance } else { radius - distance };
-                if !ccw && r.abs() <= collapse && collapsed_arc_enabled() && k > 0 && k + 1 < chain.len() {
-                    after_collapse = true;
-                    continue;
-                }
-                if !ccw && r < -collapse && vanished_arc_on() && vanished.is_none() && k > 0 && k + 1 < chain.len() {
-                    // Only a FILLET vanishes so: an arc tangent to both
-                    // neighbours, the rolling disk between them. A concave arc
-                    // meeting either at an angle is no closing, and extending
-                    // its neighbours would add material past the distance.
-                    let joins = |a: Option<P2>, b: Option<P2>| matches!((a, b), (Some(a), Some(b)) if a.sub(b).length() <= 1e-6);
-                    if !joins(outward(&chain[k - 1], true), outward(piece, false)) || !joins(outward(piece, true), outward(&chain[k + 1], false)) {
-                        os_debug!("revolved parallel lane: a concave arc grown past its radius is not tangent to its neighbours");
-                        return Ok(None);
-                    }
-                    vanished = Some(center);
-                    continue;
-                }
-                if !(r > tolerance) {
-                    return Ok(None);
-                }
-                let k = r / radius;
-                Piece::Arc { center, radius: r, start: center.add(start.sub(center).scale(k)), end: center.add(end.sub(center).scale(k)), ccw }
-            }
-        };
-        if let Some(hub) = vanished.take() {
-            let Some(last) = grown.pop() else { return Ok(None) };
-            let Some(crease) = crossing_nearest(&last, &moved, hub) else {
-                os_debug!("revolved parallel lane: the offsets beside a vanished arc do not cross");
-                return Ok(None);
-            };
-            // The crease lies exactly the distance from the section, no farther
-            // (the check below reads only the near side).
-            let reach = chain.iter().map(|source| source.distance(crease)).fold(f64::INFINITY, f64::min);
-            if (reach - distance).abs() > 1e-7 * scale {
-                os_debug!("revolved parallel lane: the crease lies {reach:.9} from the section, not {distance:.9}");
-                return Ok(None);
-            }
-            grown.push(with_end(&last, crease));
-            grown.push(with_start(&moved, crease));
-            continue;
-        }
-        if after_collapse {
-            after_collapse = false;
-            let Some(last) = grown.last() else { return Ok(None) };
-            if last.end().sub(moved.start()).length() > collapse {
-                os_debug!("revolved parallel lane: the offsets beside a collapsed arc miss by {:.3e}", last.end().sub(moved.start()).length());
-                return Ok(None);
-            }
-            grown.push(moved);
-            continue;
-        }
-        if k > 0 {
-            let previous = &chain[k - 1];
-            let corner = piece.start();
-            let (Some(n1), Some(n2)) = (outward(previous, true), outward(piece, false)) else { return Ok(None) };
-            let turn = n1.cross(n2);
-            if concave_turn(n1, n2, distance, tolerance) {
-                os_debug!("revolved parallel lane: concave corner at ({:.6}, {:.6}), turn {turn:.3e}", corner.rho, corner.z);
-                return Ok(None); // concave
-            }
-            if turn > 1e-12 || n1.rho * n2.rho + n1.z * n2.z < 0.0 {
-                grown.push(Piece::Arc {
-                    center: corner,
-                    radius: distance,
-                    start: corner.add(n1.scale(distance)),
-                    end: corner.add(n2.scale(distance)),
-                    ccw: true,
-                });
-            }
-        }
-        grown.push(moved);
-    }
-    if touches_axis {
-        let (first, last) = (grown[0].start(), grown[grown.len() - 1].end());
-        if first.rho.abs() > tolerance || last.rho.abs() > tolerance {
-            return Ok(None); // an end leaves the axis: an apex, not built here
-        }
-        grown.push(Piece::Line { start: last, end: first });
-    } else {
-        let (last, first) = (&chain[chain.len() - 1], &chain[0]);
-        let corner = first.start();
-        let (Some(n1), Some(n2)) = (outward(last, true), outward(first, false)) else { return Ok(None) };
-        let turn = n1.cross(n2);
-        if concave_turn(n1, n2, distance, tolerance) {
-            return Ok(None);
-        }
-        if turn > 1e-12 || n1.rho * n2.rho + n1.z * n2.z < 0.0 {
-            grown.push(Piece::Arc {
-                center: corner,
-                radius: distance,
-                start: corner.add(n1.scale(distance)),
-                end: corner.add(n2.scale(distance)),
-                ccw: true,
-            });
-        }
-    }
-    // A loop clear of the axis whose growth crosses it (a bore grown shut):
-    // the grown half-section is the loop's own growth cut at ρ = 0, since a
-    // point with ρ ≥ 0 is never nearer the section's mirror half than its own
-    // ((ρ + a)² ≥ (ρ − a)² for a ≥ 0). The part kept must be one run, closed
-    // up the axis.
-    if !touches_axis && grown.iter().any(|piece| piece.start().rho < -tolerance || piece.middle().rho < -tolerance) {
-        let split: Vec<Piece> = grown.iter().flat_map(|piece| split_at_axis(piece, tolerance)).collect();
-        let kept: Vec<bool> = split.iter().map(|piece| piece.middle().rho >= -tolerance).collect();
-        let count = split.len();
-        let starts: Vec<usize> = (0..count).filter(|&k| kept[k] && !kept[(k + count - 1) % count]).collect();
-        let [first] = starts.as_slice() else { return Ok(None) };
-        let mut run: Vec<Piece> = Vec::new();
-        for offset in 0..count {
-            let k = (first + offset) % count;
-            if !kept[k] {
-                break;
-            }
-            run.push(split[k]);
-        }
-        let (head, tail) = (run[0].start(), run[run.len() - 1].end());
-        if head.rho.abs() > 1e-7 * scale || tail.rho.abs() > 1e-7 * scale {
-            return Ok(None);
-        }
-        let snap = |p: P2| P2 { rho: 0.0, z: p.z };
-        let last = run.len() - 1;
-        run[0] = with_start(&run[0], snap(head));
-        run[last] = with_end(&run[last], snap(tail));
-        run.push(Piece::Line { start: snap(tail), end: snap(head) });
-        grown = run;
-    }
-    // Every grown piece stays in the half-plane.
-    for piece in &grown {
-        for p in [piece.start(), piece.end(), piece.middle()] {
-            if p.rho < -tolerance {
-                return Ok(None);
-            }
-        }
-    }
-
-    // The corners were read one at a time, so growths that meet across a gap
-    // (the two rims of a narrow groove) are not seen there. Every point of the
-    // true boundary lies exactly the distance from the section: a grown piece
-    // with a point nearer than that to any source piece is not the boundary,
-    // and the lane declines.
-    for piece in &grown {
-        if matches!(piece, Piece::Line { start, end } if start.rho.abs() <= tolerance && end.rho.abs() <= tolerance) {
-            continue; // the closing run along the axis
-        }
-        for step in 1..16 {
-            let p = piece.at(step as f64 / 16.0);
-            let nearest = chain.iter().map(|source| source.distance(p)).fold(f64::INFINITY, f64::min);
-            if nearest < distance - 1e-7 * scale {
-                os_debug!("revolved parallel lane declined: a grown piece passes {nearest:.6} from the section, under {distance:.6}");
-                return Ok(None);
-            }
-        }
-    }
 
     // The grown half-section as curves in the plane of `x` and the axis, revolved.
     let mut curves: Vec<NurbsCurve> = Vec::with_capacity(grown.len());
@@ -972,6 +810,509 @@ fn revolved_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<Br
     }
     os_debug!("revolved parallel lane built {} faces from {} section pieces", solid.shells.iter().map(|s| s.faces.len()).sum::<usize>(), grown.len());
     Ok(Some(solid))
+}
+
+/// The growth read corner by corner: every piece moved out, every convex corner
+/// rounded; `None` at a concave corner or anything else the walk declines.
+fn walked_growth(chain: &[Piece], touches_axis: bool, distance: f64, scale: f64, tolerance: f64) -> Option<Vec<Piece>> {
+    // Offset every piece outward; round every corner; decline a concave one.
+    let outward = |piece: &Piece, at_end: bool| -> Option<P2> {
+        piece.tangent(at_end).map(|t| P2 { rho: t.z, z: -t.rho })
+    };
+    let mut grown: Vec<Piece> = Vec::new();
+    // A concave arc grown by exactly its radius (a fillet's root grown by the
+    // fillet's radius) shrinks to its centre: it is dropped, and its two
+    // neighbours' offsets meet there in a sharp edge, with no corner arc.
+    let collapse = 1e-7 * scale;
+    let mut after_collapse = false;
+    // A concave arc grown PAST its radius vanishes: its neighbours' offsets
+    // cross and are cut at the crossing, a sharp concave crease
+    // (`BREP_OFFSET_REVOLVED_VANISHED_ARC`). The arc's centre picks the
+    // crossing; the check below that every grown piece lies the distance from
+    // the section stands guard.
+    let mut vanished: Option<P2> = None;
+    for (k, piece) in chain.iter().enumerate() {
+        let moved = match *piece {
+            Piece::Line { start, end } => {
+                let Some(n) = outward(piece, false) else { return None };
+                Piece::Line { start: start.add(n.scale(distance)), end: end.add(n.scale(distance)) }
+            }
+            Piece::Arc { center, radius, start, end, ccw } => {
+                let r = if ccw { radius + distance } else { radius - distance };
+                if !ccw && r.abs() <= collapse && collapsed_arc_enabled() && k > 0 && k + 1 < chain.len() {
+                    after_collapse = true;
+                    continue;
+                }
+                if !ccw && r < -collapse && vanished_arc_on() && vanished.is_none() && k > 0 && k + 1 < chain.len() {
+                    // Only a FILLET vanishes so: an arc tangent to both
+                    // neighbours, the rolling disk between them. A concave arc
+                    // meeting either at an angle is no closing, and extending
+                    // its neighbours would add material past the distance.
+                    let joins = |a: Option<P2>, b: Option<P2>| matches!((a, b), (Some(a), Some(b)) if a.sub(b).length() <= 1e-6);
+                    if !joins(outward(&chain[k - 1], true), outward(piece, false)) || !joins(outward(piece, true), outward(&chain[k + 1], false)) {
+                        os_debug!("revolved parallel lane: a concave arc grown past its radius is not tangent to its neighbours");
+                        return None;
+                    }
+                    vanished = Some(center);
+                    continue;
+                }
+                if !(r > tolerance) {
+                    return None;
+                }
+                let k = r / radius;
+                Piece::Arc { center, radius: r, start: center.add(start.sub(center).scale(k)), end: center.add(end.sub(center).scale(k)), ccw }
+            }
+        };
+        if let Some(hub) = vanished.take() {
+            let Some(last) = grown.pop() else { return None };
+            let Some(crease) = crossing_nearest(&last, &moved, hub) else {
+                os_debug!("revolved parallel lane: the offsets beside a vanished arc do not cross");
+                return None;
+            };
+            // The crease lies exactly the distance from the section, no farther
+            // (the check below reads only the near side).
+            let reach = chain.iter().map(|source| source.distance(crease)).fold(f64::INFINITY, f64::min);
+            if (reach - distance).abs() > 1e-7 * scale {
+                os_debug!("revolved parallel lane: the crease lies {reach:.9} from the section, not {distance:.9}");
+                return None;
+            }
+            grown.push(with_end(&last, crease));
+            grown.push(with_start(&moved, crease));
+            continue;
+        }
+        if after_collapse {
+            after_collapse = false;
+            let Some(last) = grown.last() else { return None };
+            if last.end().sub(moved.start()).length() > collapse {
+                os_debug!("revolved parallel lane: the offsets beside a collapsed arc miss by {:.3e}", last.end().sub(moved.start()).length());
+                return None;
+            }
+            grown.push(moved);
+            continue;
+        }
+        if k > 0 {
+            let previous = &chain[k - 1];
+            let corner = piece.start();
+            let (Some(n1), Some(n2)) = (outward(previous, true), outward(piece, false)) else { return None };
+            let turn = n1.cross(n2);
+            if concave_turn(n1, n2, distance, tolerance) {
+                os_debug!("revolved parallel lane: concave corner at ({:.6}, {:.6}), turn {turn:.3e}", corner.rho, corner.z);
+                return None; // concave
+            }
+            if turn > 1e-12 || n1.rho * n2.rho + n1.z * n2.z < 0.0 {
+                grown.push(Piece::Arc {
+                    center: corner,
+                    radius: distance,
+                    start: corner.add(n1.scale(distance)),
+                    end: corner.add(n2.scale(distance)),
+                    ccw: true,
+                });
+            }
+        }
+        grown.push(moved);
+    }
+    if touches_axis {
+        let (first, last) = (grown[0].start(), grown[grown.len() - 1].end());
+        if first.rho.abs() > tolerance || last.rho.abs() > tolerance {
+            return None; // an end leaves the axis: an apex, not built here
+        }
+        grown.push(Piece::Line { start: last, end: first });
+    } else {
+        let (last, first) = (&chain[chain.len() - 1], &chain[0]);
+        let corner = first.start();
+        let (Some(n1), Some(n2)) = (outward(last, true), outward(first, false)) else { return None };
+        let turn = n1.cross(n2);
+        if concave_turn(n1, n2, distance, tolerance) {
+            return None;
+        }
+        if turn > 1e-12 || n1.rho * n2.rho + n1.z * n2.z < 0.0 {
+            grown.push(Piece::Arc {
+                center: corner,
+                radius: distance,
+                start: corner.add(n1.scale(distance)),
+                end: corner.add(n2.scale(distance)),
+                ccw: true,
+            });
+        }
+    }
+    // A loop clear of the axis whose growth crosses it (a bore grown shut):
+    // the grown half-section is the loop's own growth cut at ρ = 0, since a
+    // point with ρ ≥ 0 is never nearer the section's mirror half than its own
+    // ((ρ + a)² ≥ (ρ − a)² for a ≥ 0). The part kept must be one run, closed
+    // up the axis.
+    if !touches_axis && grown.iter().any(|piece| piece.start().rho < -tolerance || piece.middle().rho < -tolerance) {
+        let split: Vec<Piece> = grown.iter().flat_map(|piece| split_at_axis(piece, tolerance)).collect();
+        let kept: Vec<bool> = split.iter().map(|piece| piece.middle().rho >= -tolerance).collect();
+        let count = split.len();
+        let starts: Vec<usize> = (0..count).filter(|&k| kept[k] && !kept[(k + count - 1) % count]).collect();
+        let [first] = starts.as_slice() else { return None };
+        let mut run: Vec<Piece> = Vec::new();
+        for offset in 0..count {
+            let k = (first + offset) % count;
+            if !kept[k] {
+                break;
+            }
+            run.push(split[k]);
+        }
+        let (head, tail) = (run[0].start(), run[run.len() - 1].end());
+        if head.rho.abs() > 1e-7 * scale || tail.rho.abs() > 1e-7 * scale {
+            return None;
+        }
+        let snap = |p: P2| P2 { rho: 0.0, z: p.z };
+        let last = run.len() - 1;
+        run[0] = with_start(&run[0], snap(head));
+        run[last] = with_end(&run[last], snap(tail));
+        run.push(Piece::Line { start: snap(tail), end: snap(head) });
+        grown = run;
+    }
+    // Every grown piece stays in the half-plane.
+    for piece in &grown {
+        for p in [piece.start(), piece.end(), piece.middle()] {
+            if p.rho < -tolerance {
+                return None;
+            }
+        }
+    }
+
+    // The corners were read one at a time, so growths that meet across a gap
+    // (the two rims of a narrow groove) are not seen there. Every point of the
+    // true boundary lies exactly the distance from the section: a grown piece
+    // with a point nearer than that to any source piece is not the boundary,
+    // and the walk declines.
+    if !holds_the_distance(&grown, chain, distance, scale, tolerance) {
+        return None;
+    }
+    Some(grown)
+}
+
+/// Every grown piece (but the closing run along the axis) lies at least
+/// `distance` from the section, read at 15 points along it.
+fn holds_the_distance(grown: &[Piece], chain: &[Piece], distance: f64, scale: f64, tolerance: f64) -> bool {
+    for piece in grown {
+        if matches!(piece, Piece::Line { start, end } if start.rho.abs() <= tolerance && end.rho.abs() <= tolerance) {
+            continue; // the closing run along the axis
+        }
+        for step in 1..16 {
+            let p = piece.at(step as f64 / 16.0);
+            let nearest = chain.iter().map(|source| source.distance(p)).fold(f64::INFINITY, f64::min);
+            if nearest < distance - 1e-7 * scale {
+                os_debug!("revolved parallel lane declined: a grown piece passes {nearest:.6} from the section, under {distance:.6}");
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// `BREP_OFFSET_REVOLVED_TRIMMED` (default off): where the walk declines (a
+/// concave corner, or growths that meet across a gap, such as a groove
+/// narrower than twice the distance) or the rims are arcs, the grown
+/// half-section is read whole. It is the boundary of the section's points
+/// within `distance`, so it lies on the pieces moved out and the arcs of
+/// radius `distance` about the convex corners. Each candidate is cut wherever
+/// it crosses another or the axis, and a cut piece is kept when its middle is
+/// at least `distance` from every source piece but its own. The kept pieces
+/// must chain into one run between two axis ends, or one loop clear of the
+/// axis. A tie (a cut piece exactly `distance` from another source piece), an
+/// ambiguous join, a second loop (a sealed void) or two kept pieces that come
+/// close away from their join all decline.
+fn trimmed_growth_on() -> bool {
+    switch!("BREP_OFFSET_REVOLVED_TRIMMED", false)
+}
+
+
+/// The grown half-section read whole (see [`trimmed_growth_on`]); `None` where
+/// it declines. `chain` runs anticlockwise.
+fn trimmed_growth(chain: &[Piece], touches_axis: bool, distance: f64, scale: f64, tolerance: f64) -> Option<Vec<Piece>> {
+    let near = 1e-7 * scale;
+    let outward = |piece: &Piece, at_end: bool| piece.tangent(at_end).map(|t| P2 { rho: t.z, z: -t.rho });
+    // Each candidate with the source pieces its points keep the distance from.
+    let count = chain.len();
+    let mut candidates: Vec<(Piece, [usize; 2])> = Vec::new();
+    for (k, piece) in chain.iter().enumerate() {
+        if k > 0 || !touches_axis {
+            let previous = (k + count - 1) % count;
+            let (n1, n2) = (outward(&chain[previous], true)?, outward(piece, false)?);
+            let turn = n1.cross(n2);
+            if !concave_turn(n1, n2, distance, tolerance) && (turn > 1e-12 || n1.rho * n2.rho + n1.z * n2.z < 0.0) {
+                let corner = piece.start();
+                let arc = Piece::Arc { center: corner, radius: distance, start: corner.add(n1.scale(distance)), end: corner.add(n2.scale(distance)), ccw: true };
+                candidates.push((arc, [previous, k]));
+            }
+        }
+        let moved = match *piece {
+            Piece::Line { start, end } => {
+                let n = outward(piece, false)?;
+                Piece::Line { start: start.add(n.scale(distance)), end: end.add(n.scale(distance)) }
+            }
+            Piece::Arc { center, radius, start, end, ccw } => {
+                let r = if ccw { radius + distance } else { radius - distance };
+                if r <= near {
+                    continue; // a concave arc grown to its centre or past it
+                }
+                let k = r / radius;
+                Piece::Arc { center, radius: r, start: center.add(start.sub(center).scale(k)), end: center.add(end.sub(center).scale(k)), ccw }
+            }
+        };
+        candidates.push((moved, [k, k]));
+    }
+    // Cut each candidate where it crosses another.
+    let mut cuts: Vec<Vec<P2>> = vec![Vec::new(); candidates.len()];
+    for i in 0..candidates.len() {
+        for j in i + 1..candidates.len() {
+            let (a, b) = (&candidates[i].0, &candidates[j].0);
+            for p in carrier_crossings(a, b, near) {
+                if a.distance(p) <= near && b.distance(p) <= near {
+                    cuts[i].push(p);
+                    cuts[j].push(p);
+                }
+            }
+        }
+    }
+    let mut kept: Vec<Piece> = Vec::new();
+    for ((candidate, sources), points) in candidates.iter().zip(&cuts) {
+        for part in cut_at(candidate, points, near) {
+            for part in split_at_axis(&part, tolerance) {
+                let middle = part.middle();
+                if middle.rho < -tolerance {
+                    continue;
+                }
+                let others = chain
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| !sources.contains(k))
+                    .map(|(_, source)| source.distance(middle))
+                    .fold(f64::INFINITY, f64::min);
+                if (others - distance).abs() <= near {
+                    os_debug!("revolved trimmed lane: a cut piece ties at ({:.6}, {:.6})", middle.rho, middle.z);
+                    return None;
+                }
+                if others > distance {
+                    kept.push(part);
+                }
+            }
+        }
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    // Chain the kept pieces: each end meets exactly one start.
+    let close = |a: P2, b: P2| a.sub(b).length() <= near;
+    let starts_after = |p: P2, used: &[bool]| -> Vec<usize> { (0..kept.len()).filter(|&k| !used[k] && close(kept[k].start(), p)).collect() };
+    let free_starts: Vec<usize> = (0..kept.len()).filter(|&k| !kept.iter().any(|other| close(other.end(), kept[k].start()))).collect();
+    let first = match free_starts.as_slice() {
+        [] => 0,
+        [one] if kept[*one].start().rho.abs() <= near => *one,
+        _ => {
+            os_debug!("revolved trimmed lane: {} kept pieces start where none ends", free_starts.len());
+            return None;
+        }
+    };
+    let on_axis = !free_starts.is_empty();
+    let mut used = vec![false; kept.len()];
+    used[first] = true;
+    let mut grown = vec![kept[first]];
+    loop {
+        let tail = grown[grown.len() - 1].end();
+        let next = starts_after(tail, &used);
+        match next.as_slice() {
+            [] => break,
+            [one] => {
+                used[*one] = true;
+                grown.push(with_start(&kept[*one], tail));
+            }
+            _ => {
+                os_debug!("revolved trimmed lane: an ambiguous join at ({:.6}, {:.6})", tail.rho, tail.z);
+                return None;
+            }
+        }
+    }
+    if used.iter().any(|u| !u) {
+        os_debug!("revolved trimmed lane: the kept pieces make more than one loop");
+        return None;
+    }
+    let (head, tail) = (grown[0].start(), grown[grown.len() - 1].end());
+    if on_axis {
+        if tail.rho.abs() > near {
+            return None;
+        }
+        let snap = |p: P2| P2 { rho: 0.0, z: p.z };
+        let last = grown.len() - 1;
+        grown[0] = with_start(&grown[0], snap(head));
+        grown[last] = with_end(&grown[last], snap(tail));
+        grown.push(Piece::Line { start: snap(tail), end: snap(head) });
+    } else {
+        if !close(head, tail) {
+            return None;
+        }
+        let last = grown.len() - 1;
+        grown[last] = with_end(&grown[last], head);
+    }
+    // Pieces that are not neighbours stay apart (no pinch, no sealed void
+    // touching the boundary).
+    let count = grown.len();
+    for i in 0..count {
+        for j in i + 1..count {
+            if j == i + 1 || (i == 0 && j == count - 1) {
+                continue;
+            }
+            if piece_gap(&grown[i], &grown[j]) <= 1e-6 * scale {
+                os_debug!("revolved trimmed lane: pieces {i} and {j} of the grown section touch");
+                return None;
+            }
+        }
+    }
+    for piece in &grown {
+        if [piece.start(), piece.end(), piece.middle()].iter().any(|p| p.rho < -tolerance) {
+            return None;
+        }
+    }
+    if !holds_the_distance(&grown, chain, distance, scale, tolerance) {
+        return None;
+    }
+    os_debug!("revolved trimmed lane: {} pieces from {} candidates", grown.len(), candidates.len());
+    Some(grown)
+}
+
+/// Where the carriers of `a` and `b` (a line or a circle each) cross: none
+/// where they are parallel or apart; where they coincide, the ends of each that
+/// lie on the other.
+fn carrier_crossings(a: &Piece, b: &Piece, near: f64) -> Vec<P2> {
+    let circle = |piece: &Piece| match *piece {
+        Piece::Arc { center, radius, .. } => Some((center, radius)),
+        Piece::Line { .. } => None,
+    };
+    let line = |piece: &Piece| (piece.start(), piece.end().sub(piece.start()));
+    let ends_on_each_other = || -> Vec<P2> {
+        let mut points = Vec::new();
+        for p in [a.start(), a.end()] {
+            if b.distance(p) <= near {
+                points.push(p);
+            }
+        }
+        for p in [b.start(), b.end()] {
+            if a.distance(p) <= near {
+                points.push(p);
+            }
+        }
+        points
+    };
+    let line_circle = |(p, u): (P2, P2), (c, r): (P2, f64)| -> Vec<P2> {
+        let uu = u.rho * u.rho + u.z * u.z;
+        if !(uu > 0.0) {
+            return Vec::new();
+        }
+        let w = p.sub(c);
+        let (half_b, cc) = ((w.rho * u.rho + w.z * u.z) / uu, (w.rho * w.rho + w.z * w.z - r * r) / uu);
+        let disc = half_b * half_b - cc;
+        if disc < 0.0 {
+            return Vec::new();
+        }
+        let root = disc.sqrt();
+        [-half_b - root, -half_b + root].iter().map(|t| p.add(u.scale(*t))).collect()
+    };
+    match (circle(a), circle(b)) {
+        (None, None) => {
+            let ((p, u), (q, w)) = (line(a), line(b));
+            let den = u.cross(w);
+            if den.abs() <= 1e-12 * u.length() * w.length() {
+                let offset = if u.length() > 0.0 { q.sub(p).cross(u).abs() / u.length() } else { f64::INFINITY };
+                return if offset <= near { ends_on_each_other() } else { Vec::new() };
+            }
+            vec![p.add(u.scale(q.sub(p).cross(w) / den))]
+        }
+        (None, Some(c)) => line_circle(line(a), c),
+        (Some(c), None) => line_circle(line(b), c),
+        (Some((c1, r1)), Some((c2, r2))) => {
+            let gap = c2.sub(c1).length();
+            if gap <= near && (r1 - r2).abs() <= near {
+                return ends_on_each_other();
+            }
+            if gap <= near || gap > r1 + r2 || gap < (r1 - r2).abs() {
+                return Vec::new();
+            }
+            let along = (r1 * r1 - r2 * r2 + gap * gap) / (2.0 * gap);
+            let half = (r1 * r1 - along * along).max(0.0).sqrt();
+            let unit = c2.sub(c1).scale(1.0 / gap);
+            let foot = c1.add(unit.scale(along));
+            let across = P2 { rho: -unit.z, z: unit.rho };
+            vec![foot.add(across.scale(half)), foot.sub(across.scale(half))]
+        }
+    }
+}
+
+/// `piece` cut at `points` (each on it), in order along it; points within
+/// `near` of an end or of each other cut once.
+fn cut_at(piece: &Piece, points: &[P2], near: f64) -> Vec<Piece> {
+    let fraction = |p: P2| -> f64 {
+        match *piece {
+            Piece::Line { start, end } => {
+                let along = end.sub(start);
+                let w = p.sub(start);
+                (w.rho * along.rho + w.z * along.z) / (along.rho * along.rho + along.z * along.z)
+            }
+            Piece::Arc { center, start, end, ccw, .. } => {
+                let sweep = Piece::sweep(center, start, end, ccw);
+                let a0 = (start.z - center.z).atan2(start.rho - center.rho);
+                let mut delta = (p.z - center.z).atan2(p.rho - center.rho) - a0;
+                delta = if ccw { delta.rem_euclid(std::f64::consts::TAU) } else { -(-delta).rem_euclid(std::f64::consts::TAU) };
+                delta / sweep
+            }
+        }
+    };
+    let on = |p: P2| -> P2 {
+        match *piece {
+            Piece::Line { .. } => p,
+            Piece::Arc { center, radius, .. } => {
+                let r = p.sub(center);
+                center.add(r.scale(radius / r.length()))
+            }
+        }
+    };
+    let mut cuts: Vec<(f64, P2)> = points.iter().map(|p| (fraction(*p), on(*p))).filter(|(t, _)| t.is_finite()).collect();
+    cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut parts = Vec::new();
+    let mut from = piece.start();
+    for (_, p) in cuts {
+        if p.sub(from).length() <= near || p.sub(piece.end()).length() <= near {
+            continue;
+        }
+        parts.push(with_end(&with_start(piece, from), p));
+        from = p;
+    }
+    parts.push(with_start(piece, from));
+    parts
+}
+
+/// The least distance between two pieces that do not cross: at an end of
+/// either, or where an arc faces the other piece's carrier.
+fn piece_gap(a: &Piece, b: &Piece) -> f64 {
+    let mut gap = [a.distance(b.start()), a.distance(b.end()), b.distance(a.start()), b.distance(a.end())]
+        .into_iter()
+        .fold(f64::INFINITY, f64::min);
+    for (arc, other) in [(a, b), (b, a)] {
+        let Piece::Arc { center, radius, .. } = *arc else { continue };
+        let toward = match *other {
+            Piece::Line { start, end } => {
+                let along = end.sub(start);
+                let w = center.sub(start);
+                let t = (w.rho * along.rho + w.z * along.z) / (along.rho * along.rho + along.z * along.z);
+                start.add(along.scale(t)).sub(center)
+            }
+            Piece::Arc { center: other_center, .. } => other_center.sub(center),
+        };
+        let length = toward.length();
+        if !(length > 0.0) {
+            continue;
+        }
+        for sign in [1.0, -1.0] {
+            let p = center.add(toward.scale(sign * radius / length));
+            if arc.distance(p) <= 1e-12 * (1.0 + radius) {
+                gap = gap.min(other.distance(p));
+            }
+        }
+    }
+    gap
 }
 
 /// `BREP_OFFSET_REVOLVED_VANISHED_ARC` (default on; `=0` restores): a concave arc grown past

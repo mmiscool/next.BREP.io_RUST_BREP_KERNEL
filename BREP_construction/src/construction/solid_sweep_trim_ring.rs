@@ -339,7 +339,7 @@ impl<'a> ConvexSweep<'a> {
                             if worst > 1e-7 * self.size {
                                 return Err(refuse("trim_sheet_fit", format!("a ring envelope misses by {worst:.2e}")));
                             }
-                            return Ok(SheetSurface { surface, strip: None, band: None });
+                            return Ok(SheetSurface { surface, strip: None, band: None, cap: None });
                         }
                     }
                 }
@@ -382,7 +382,7 @@ impl<'a> ConvexSweep<'a> {
                 )?;
                 let spans_u = (surface.knots_u.len() - 6) / 2 + 1;
                 let spans_v = (generatrix.knots.len() - 6) / 2 + 1;
-                Ok(SheetSurface { surface: moved, strip: None, band: Some(BandChart { psi0, v_low, theta_v, spans_u, spans_v }) })
+                Ok(SheetSurface { surface: moved, strip: None, band: Some(BandChart { psi0, v_low, theta_v, spans_u, spans_v }), cap: None })
             }
             _ => Err(refuse("trim_ring", "not a ring sheet".into())),
         }

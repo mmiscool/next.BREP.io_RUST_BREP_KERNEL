@@ -1099,7 +1099,13 @@ fn rejoin_across_corners(
             if end.sub(start).length() <= tolerance {
                 return None;
             }
-            let curve = make_line(start, end).ok()?;
+            let mut curve = make_line(start, end).ok()?;
+            // Both ends on vertices read from a file: the line is fixed by the
+            // vendor's data alone, so it is theirs (an offset between those
+            // vertices is the file's, not the heal's).
+            if is_imported_vertex(solid, corners[index].vertex) && is_imported_vertex(solid, corners[other].vertex) {
+                curve.set_imported(true);
+            }
             let [t0, t1] = curve.domain().ok()?;
             EdgeRecord {
                 id: next_id,
@@ -1201,6 +1207,14 @@ fn rejoin_across_corners(
     Some((rebuilt, bridges))
 }
 
+/// Whether `vertex` ends an edge read from a file: its position is then the
+/// file's, not the kernel's.
+fn is_imported_vertex(solid: &BrepSolid, vertex: u64) -> bool {
+    solid.edges.iter().any(|edge| {
+        edge.curve.is_imported() && (edge.start_vertex_id == vertex || edge.end_vertex_id == vertex)
+    })
+}
+
 /// The bridge between two paired corners: the straight piece of their shared
 /// line that the deleted band took out of it.
 ///
@@ -1251,7 +1265,13 @@ fn bridge_edge(
             return None;
         }
     }
-    let curve = make_line(start, end).ok()?;
+    let mut curve = make_line(start, end).ok()?;
+    // One interrupted edge made whole: when both spines were read from a file,
+    // so is the edge they rejoin into (the rule a split keeps).
+    let imported_spine = |corner: &Corner| solid.edges.iter().any(|edge| Some(edge.id) == corner.spine && edge.curve.is_imported());
+    if imported_spine(from) && imported_spine(to) {
+        curve.set_imported(true);
+    }
     let [t0, t1] = curve.domain().ok()?;
     Some(EdgeRecord {
         id,

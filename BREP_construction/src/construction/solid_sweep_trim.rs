@@ -580,6 +580,81 @@ fn pose_bound_on() -> bool {
     crate::switch!("BREP_SWEEP_POSE_BOUND", true)
 }
 
+/// Whether a grid edge's contour crossing is solved by a safeguarded
+/// regula falsi (Illinois) instead of 48 halvings (default on;
+/// BREP_SWEEP_TRIM_SECANT=0 restores the halvings): the same final bracket width, 2^-48 of the
+/// edge, in a few evaluations where the value is smooth across it.
+fn trim_secant_on() -> bool {
+    crate::switch!("BREP_SWEEP_TRIM_SECANT", true)
+}
+
+/// The bracket `(lo, hi)` of [0, 1], at most 2^-48 wide, about where `f`
+/// leaves the sign class of `f0 = f(0)` (positive, or not) for that of
+/// `f1 = f(1)`: `lo` on `f0`'s side, `hi` on the other, as halving would
+/// leave them. Illinois steps; an end creeping onto the root in strides far
+/// below the bracket is followed by a probe twice its stride beyond it (across
+/// the root where the creep converges). After 12 reads, halvings: at most
+/// 12 + 48 reads where the value jumps or kinks, a dozen where it is smooth.
+#[doc(hidden)]
+pub fn bracket_sign_change(f: impl Fn(f64) -> f64, f0: f64, f1: f64) -> (f64, f64) {
+    const WIDTH: f64 = 1.0 / (1u64 << 48) as f64;
+    const BUDGET: usize = 12;
+    let side = f0 > 0.0;
+    let (mut lo, mut hi, mut flo, mut fhi) = (0.0f64, 1.0f64, f0, f1);
+    // Which end the last step moved (1: lo, -1: hi): an end kept twice
+    // running has its value halved.
+    let mut last = 0i32;
+    let mut reads = 0usize;
+    let mut probe: Option<f64> = None;
+    while hi - lo > WIDTH {
+        let width = hi - lo;
+        let m = if reads >= BUDGET {
+            0.5 * (lo + hi)
+        } else if let Some(p) = probe {
+            p
+        } else {
+            let secant = lo + width * flo / (flo - fhi);
+            if secant > lo && secant < hi {
+                secant
+            } else if secant <= lo {
+                lo + 0.5 * WIDTH
+            } else if secant >= hi {
+                hi - 0.5 * WIDTH
+            } else {
+                0.5 * (lo + hi)
+            }
+        };
+        probe = None;
+        // Clear of the ends, so every read shrinks the bracket.
+        let m = m.clamp(lo + 0.25 * WIDTH, hi - 0.25 * WIDTH);
+        let fm = f(m);
+        reads += 1;
+        let moved_lo = (fm > 0.0) == side;
+        let stride = if moved_lo { m - lo } else { hi - m };
+        if moved_lo {
+            lo = m;
+            flo = fm;
+            if last == 1 {
+                fhi *= 0.5;
+            }
+            last = 1;
+        } else {
+            hi = m;
+            fhi = fm;
+            if last == -1 {
+                flo *= 0.5;
+            }
+            last = -1;
+        }
+        if stride < 1e-2 * width {
+            let reach = (2.0 * stride).max(0.5 * WIDTH);
+            probe = Some(if moved_lo { lo + reach } else { hi - reach });
+            last = 0;
+        }
+    }
+    (lo, hi)
+}
+
 /// One sheet's sample census: its name, how many grid nodes it has, how many
 /// of them are hidden.
 #[derive(Clone, Debug, PartialEq)]
@@ -1212,15 +1287,20 @@ impl<'a> ConvexSweep<'a> {
             }
             let (p, q, vp) = (param(a.0, a.1), param(b.0, b.1), values[a.0][a.1]);
             let at = |s: f64| [p[0] + (q[0] - p[0]) * s, p[1] + (q[1] - p[1]) * s];
-            let (mut lo, mut hi) = (0.0f64, 1.0f64);
-            for _ in 0..48 {
-                let m = 0.5 * (lo + hi);
-                if (self.eval(sheet, at(m)) > 0.0) == (vp > 0.0) {
-                    lo = m;
-                } else {
-                    hi = m;
+            let (lo, hi) = if trim_secant_on() {
+                bracket_sign_change(|s| self.eval(sheet, at(s)), vp, values[b.0][b.1])
+            } else {
+                let (mut lo, mut hi) = (0.0f64, 1.0f64);
+                for _ in 0..48 {
+                    let m = 0.5 * (lo + hi);
+                    if (self.eval(sheet, at(m)) > 0.0) == (vp > 0.0) {
+                        lo = m;
+                    } else {
+                        hi = m;
+                    }
                 }
-            }
+                (lo, hi)
+            };
             let (kept, outside) = if vp > 0.0 { (lo, hi) } else { (hi, lo) };
             // The decisive function is the one that turns negative across the
             // zero: read it just outside, name the partner from just inside.
@@ -1929,10 +2009,22 @@ impl<'a> ConvexSweep<'a> {
             SheetId::Cap(end, face) => {
                 let own = if end == 0 { 0 } else { self.grid.times.len() - 1 };
                 let pose = self.grid.poses[own];
-                // Bilinear through the polygon's corners: planar, exact.
-                let at = |u: f64, w: f64| Vec4::from_point(pose.apply(self.cap_at(face, [u, w])), 1.0);
+                // The face's plane in its own frame, over the polygon's box
+                // (padded): planar, exact, and regular everywhere. (The
+                // arrangement's bilinear chart on the corners collapses a
+                // triangle's last side to a vertex, where an edge's pcurve
+                // leaving it sweeps across the face.)
+                let frame = self.frame(face);
+                let (mut lo, mut hi) = ((f64::INFINITY, f64::INFINITY), (f64::NEG_INFINITY, f64::NEG_INFINITY));
+                for &(a, b) in &frame.coords {
+                    lo = (lo.0.min(a), lo.1.min(b));
+                    hi = (hi.0.max(a), hi.1.max(b));
+                }
+                let pad = 0.01 * (hi.0 - lo.0).max(hi.1 - lo.1);
+                let (lo, size) = ((lo.0 - pad, lo.1 - pad), (hi.0 - lo.0 + 2.0 * pad, hi.1 - lo.1 + 2.0 * pad));
+                let at = |a: f64, b: f64| Vec4::from_point(pose.apply(frame.origin.add(frame.u.scale(lo.0 + size.0 * a)).add(frame.w.scale(lo.1 + size.1 * b))), 1.0);
                 let surface = frag(NurbsSurface::new(1, 1, vec![0.0, 0.0, 1.0, 1.0], vec![0.0, 0.0, 1.0, 1.0], vec![vec![at(0.0, 0.0), at(0.0, 1.0)], vec![at(1.0, 0.0), at(1.0, 1.0)]]), "cap_surface")?;
-                Ok(SheetSurface { surface, strip: None, band: None })
+                Ok(SheetSurface { surface, strip: None, band: None, cap: Some(CapChart { face, origin: frame.origin, u: frame.u, w: frame.w, lo, size }) })
             }
             SheetId::Trace(edge) => {
                 let [a, b, _, _] = tool.edges[edge];
@@ -1941,7 +2033,7 @@ impl<'a> ConvexSweep<'a> {
                     [pose.apply(tool.vertices[a]), pose.apply(tool.vertices[b])]
                 };
                 let surface = self.ruled_in_time(lo, hi, &rows)?;
-                Ok(SheetSurface { surface, strip: None, band: None })
+                Ok(SheetSurface { surface, strip: None, band: None, cap: None })
             }
             SheetId::Strip(face) => {
                 let frame = self.frame(face);
@@ -1985,7 +2077,7 @@ impl<'a> ConvexSweep<'a> {
                     }
                 };
                 let surface = self.ruled_in_time(lo, hi, &rows)?;
-                Ok(SheetSurface { surface, strip: Some(StripChart { face, centre, reach, reference }), band: None })
+                Ok(SheetSurface { surface, strip: Some(StripChart { face, centre, reach, reference }), band: None, cap: None })
             }
         }
     }
@@ -2028,6 +2120,10 @@ impl<'a> ConvexSweep<'a> {
     fn surface_uv(&self, sheet: SheetId, chart: &SheetSurface, p: [f64; 2]) -> [f64; 2] {
         if let (Some(band), SheetId::Band(end, half)) = (&chart.band, sheet) {
             return self.band_uv(band, end, half, p);
+        }
+        if let (Some(cap), SheetId::Cap(_, face)) = (&chart.cap, sheet) {
+            let x = self.cap_at(face, p).sub(cap.origin);
+            return [(x.dot(cap.u) - cap.lo.0) / cap.size.0, (x.dot(cap.w) - cap.lo.1) / cap.size.1];
         }
         match (&chart.strip, sheet) {
             (Some(c), SheetId::Strip(face)) => {
@@ -2288,6 +2384,17 @@ impl<'a> ConvexSweep<'a> {
 
     /// +1 when a face's surface parameters keep its sheet's orientation.
     fn chart_orientation(&self, lp: &LoopRecordT, arrangement: &Arrangement, chart: &SheetSurface) -> f64 {
+        if chart.cap.is_some() {
+            // The sign of the map's Jacobian (the arrangement's chart to the
+            // face's frame) at a loop sample.
+            let arc = &arrangement.arcs[lp.arcs[0]];
+            let p = arc.params[arc.params.len() / 2];
+            let h = 1e-6;
+            let (a, b) = (self.surface_uv(lp.sheet, chart, [p[0] - h, p[1]]), self.surface_uv(lp.sheet, chart, [p[0] + h, p[1]]));
+            let (c, d) = (self.surface_uv(lp.sheet, chart, [p[0], p[1] - h]), self.surface_uv(lp.sheet, chart, [p[0], p[1] + h]));
+            let det = (b[0] - a[0]) * (d[1] - c[1]) - (b[1] - a[1]) * (d[0] - c[0]);
+            return if det >= 0.0 { 1.0 } else { -1.0 };
+        }
         if chart.strip.is_none() {
             return 1.0;
         }
@@ -2426,9 +2533,24 @@ pub struct RefinedArc {
     pub partner: Option<SheetId>,
 }
 
+#[derive(Clone, Debug)]
+/// A cap's frame chart: the face's plane in its own frame (origin, u, w in
+/// the tool's frame), over the box from `lo` of `size`.
+struct CapChart {
+    #[allow(dead_code)]
+    face: usize,
+    origin: Vec3,
+    u: Vec3,
+    w: Vec3,
+    lo: (f64, f64),
+    size: (f64, f64),
+}
+
 /// A face's surface and, for a strip, its chart across the zero line.
 #[derive(Clone, Debug)]
 struct SheetSurface {
+    /// A cap's frame chart (None for every other sheet).
+    cap: Option<CapChart>,
     surface: NurbsSurface,
     strip: Option<StripChart>,
     /// A ring's band: its exact torus patch's chart.

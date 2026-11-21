@@ -369,6 +369,17 @@ pub fn sheet_from_sheets(sheets: &[BrepSolid], tolerance: f64) -> Result<BrepSol
 /// One closed face is a solid by itself (a ball's or a ring's face from
 /// [`face_from_surface`]). Refuses sheets that leave an edge open after
 /// sewing, saying how many, and a joined body the kernel's validation rejects.
+/// `BREP_SHEETS_SIGN_ONLY` (default on; `=0` restores): [`solid_from_sheets`]
+/// orients the sewn shell by its volume's SIGN, read by
+/// `solid_signed_volume_for_sign` against 0, whose verdict is the exact
+/// integral's (a certified bound, a reading far from 0, or the exact value
+/// itself), instead of integrating the whole volume. offset/elliptic-cylinder-
+/// grown's five sheets: a 37 ms sign certificate, then a 127 ms integral the
+/// flip never needed (host).
+fn sheets_sign_only_on() -> bool {
+    crate::switch!("BREP_SHEETS_SIGN_ONLY", true)
+}
+
 pub fn solid_from_sheets(sheets: &[BrepSolid], tolerance: f64) -> Result<BrepSolid, KernelRefusal> {
     let joined = joined_sheets(sheets, tolerance)?;
     let (mut solid, report) = sew_solid(&joined, tolerance)?;
@@ -395,7 +406,9 @@ pub fn solid_from_sheets(sheets: &[BrepSolid], tolerance: f64) -> Result<BrepSol
         return Err(refuse(KernelStage::Validate, "sheets_euler", format!("the joined faces' counts describe no closed surface (2g = {twice})")));
     }
     solid.genus = twice / 2;
-    let volume = crate::solid_signed_volume(&solid).or_refuse(KernelStage::Validate, "surfaceFace.volume")?;
+    // Only the sign is read (`BREP_SHEETS_SIGN_ONLY`).
+    let volume = if sheets_sign_only_on() { crate::solid_signed_volume_for_sign(&solid, 0.0) } else { crate::solid_signed_volume(&solid) }
+        .or_refuse(KernelStage::Validate, "surfaceFace.volume")?;
     if volume < 0.0 {
         crate::orientation::flip_all_faces(&mut solid)?;
     }

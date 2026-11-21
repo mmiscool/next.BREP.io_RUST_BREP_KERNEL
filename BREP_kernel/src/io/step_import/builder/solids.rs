@@ -863,6 +863,16 @@ fn finalize_imported_solid(mut solid: BrepSolid) -> Result<BrepSolid, StepBodyEr
     if crate::split_pinched_vertices(&mut solid)? > 0 {
         solid.genus = euler_genus(&solid);
     }
+    // Every curve of the body was read from the file (or projected onto a
+    // read surface from a read edge curve): the strict edge/pcurve bar
+    // judges only kernel-built pairs (`NurbsCurve::is_imported`). Parasolid
+    // and IGES reach this through their STEP translation.
+    for edge in &mut solid.edges {
+        edge.curve.set_imported(true);
+    }
+    for coedge in solid.shells.iter_mut().flat_map(|shell| shell.faces.iter_mut()).flat_map(|face| face.loops.iter_mut()).flat_map(|lp| lp.coedges.iter_mut()) {
+        coedge.pcurve.set_imported(true);
+    }
     Ok(solid)
 }
 

@@ -107,9 +107,24 @@ pub struct NurbsSurface {
     /// (`intersect/curve_clear.rs`), built on its first query of this surface.
     #[serde(skip, default)]
     pub(crate) bezier_patches: std::cell::OnceCell<Option<std::sync::Arc<crate::curve_clear::SurfacePatches>>>,
+    /// Cached content hash of the net (degrees, knots, weighted controls),
+    /// the surface's part of the projection memo's key
+    /// (`projection.rs`, `BREP_SURFACE_PROJECTION_MEMO`).
+    #[serde(skip, default)]
+    content_key: std::cell::OnceCell<[u64; 2]>,
 }
 
 impl NurbsSurface {
+    /// The net's content hash ([`crate::identity_hash::hash_surface`]),
+    /// computed once per value and carried by its clones.
+    pub fn content_key(&self) -> [u64; 2] {
+        *self.content_key.get_or_init(|| {
+            let mut lane = crate::identity_hash::TwoLane::new();
+            crate::identity_hash::hash_surface(&mut lane, self);
+            lane.finish()
+        })
+    }
+
     pub fn new(
         degree_u: usize,
         degree_v: usize,
@@ -134,6 +149,7 @@ impl NurbsSurface {
             projection_ring_grid: std::cell::OnceCell::new(),
             projection_cells: std::cell::OnceCell::new(),
             bezier_patches: std::cell::OnceCell::new(),
+            content_key: std::cell::OnceCell::new(),
         };
         surface.ensure_valid()?;
         Ok(surface)

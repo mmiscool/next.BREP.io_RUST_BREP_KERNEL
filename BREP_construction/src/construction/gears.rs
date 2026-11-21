@@ -744,7 +744,7 @@ fn snap_junctions(curves: &mut [SectionCurve]) {
         let curve = &mut curves[index].curve;
         let last = curve.control_points.len() - 1;
         let w = curve.control_points[last].w;
-        curve.control_points[last] = Vec4 { x: start.x / start.w * w, y: start.y / start.w * w, z: 0.0, w };
+        curve.control_points[last] = Vec4 { x: start.x / start.w * w, y: start.y / start.w * w, z: start.z / start.w * w, w };
     }
 }
 
@@ -1266,78 +1266,63 @@ fn twist_basis(twist: Twist, reach: f64, tolerance: f64) -> Result<(Vec<f64>, Ve
 }
 
 /// Carry a section curve along the twist: the curve turned by theta and lifted
-/// by t · width, as a surface (u along the curve, v = t).
-fn twisted_surface(curve: &NurbsCurve, width: f64, knots_v: &[f64], basis: &[[f64; 3]]) -> Result<NurbsSurface, KernelRefusal> {
-    let rows = curve
-        .control_points
-        .iter()
-        .map(|p| {
-            basis
-                .iter()
-                .map(|[c, s, t]| Vec4 { x: c * p.x - s * p.y, y: s * p.x + c * p.y, z: p.z + p.w * t * width, w: p.w })
-                .collect()
-        })
-        .collect();
-    NurbsSurface::new(curve.degree, 3, curve.knots.clone(), knots_v.to_vec(), rows).map_err(|e| refuse("gear_surface", e))
-}
 
-/// The axial edge through a section point.
-fn twisted_edge(point: Vec4, width: f64, knots_v: &[f64], basis: &[[f64; 3]]) -> Result<NurbsCurve, KernelRefusal> {
-    let (x, y) = (point.x / point.w, point.y / point.w);
-    let points = basis
-        .iter()
-        .map(|[c, s, t]| Vec4 { x: c * x - s * y, y: s * x + c * y, z: t * width, w: 1.0 })
-        .collect();
-    NurbsCurve::new(3, knots_v.to_vec(), points).map_err(|e| refuse("gear_edge", e))
-}
 
 /// A counter-clockwise section (z = 0) carried up to z = width while turning
 /// by `twist`: side faces in section order, then the face at z = 0, then the
 /// face at z = width (exactly the section turned by the end angle).
 pub fn twisted_prism(section: &GearSection, width: f64, twist: Twist, tolerance: f64) -> Result<BrepSolid, KernelRefusal> {
-    use crate::sweep_topology::{curve_to_plane_parameters, make_plane, parameter_line, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord, VertexRecord};
     if !(width > 0.0) {
         return Err(refuse("gear_input", format!("The face width must be greater than zero (it is {width}).")));
     }
-    let curves: Vec<NurbsCurve> = section.curves.iter().map(|piece| piece.curve.clone()).collect();
-    let count = curves.len();
-    let reach = curves
+    let reach = section
+        .curves
         .iter()
-        .flat_map(|c| c.control_points.iter())
+        .flat_map(|c| c.curve.control_points.iter())
         .map(|p| (p.x / p.w).hypot(p.y / p.w))
         .fold(0.0, f64::max);
     let (knots_v, basis) = twist_basis(twist, reach, tolerance)?;
-    let end_angle = twist.angle(1.0);
-    let lift = |curve: &NurbsCurve| -> NurbsCurve {
-        let mut top = rotated(curve, end_angle);
-        for point in &mut top.control_points {
-            point.z += point.w * width;
-        }
-        top
+    let rows = |p: Vec4| -> Vec<Vec4> {
+        basis.iter().map(|[c, s, t]| Vec4 { x: c * p.x - s * p.y, y: s * p.x + c * p.y, z: p.z + p.w * t * width, w: p.w }).collect()
     };
-    let starts: Vec<Vec4> = curves.iter().map(|c| c.control_points[0]).collect();
+    prism_by_rows(section, 3, &knots_v, &rows)
+}
+
+/// A planar counter-clockwise section (in a plane z = const) carried along
+/// v in [0, 1] by `rows`, which maps each homogeneous control point to the
+/// control points of its v-curve (degree `degree_v` on `knots_v`); the last
+/// row must again be planar at a constant z (the top cap). Side faces in
+/// section order, then the face at v = 0, then the face at v = 1.
+pub fn prism_by_rows(section: &GearSection, degree_v: usize, knots_v: &[f64], rows: &dyn Fn(Vec4) -> Vec<Vec4>) -> Result<BrepSolid, KernelRefusal> {
+    use crate::sweep_topology::{curve_to_plane_parameters, make_plane, parameter_line, CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord, VertexRecord};
+    let curves: Vec<NurbsCurve> = section.curves.iter().map(|piece| piece.curve.clone()).collect();
+    let count = curves.len();
+    let top_of = |curve: &NurbsCurve| -> Result<NurbsCurve, KernelRefusal> {
+        let points = curve.control_points.iter().map(|p| *rows(*p).last().expect("a row")).collect();
+        NurbsCurve::new(curve.degree, curve.knots.clone(), points).map_err(|e| refuse("gear_curve", e))
+    };
     let point_of = |p: Vec4| Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w);
+    let unit = |p: Vec4| Vec4 { x: p.x / p.w, y: p.y / p.w, z: p.z / p.w, w: 1.0 };
+    let starts: Vec<Vec4> = curves.iter().map(|c| c.control_points[0]).collect();
     let mut vertices = Vec::with_capacity(2 * count);
     for (index, start) in starts.iter().enumerate() {
         vertices.push(VertexRecord { id: index as u64 + 1, point: point_of(*start) });
     }
-    let (se, ce) = end_angle.sin_cos();
     for (index, start) in starts.iter().enumerate() {
-        let p = point_of(*start);
-        vertices.push(VertexRecord {
-            id: (count + index) as u64 + 1,
-            point: Vec3::new(ce * p.x - se * p.y, se * p.x + ce * p.y, width),
-        });
+        vertices.push(VertexRecord { id: (count + index) as u64 + 1, point: point_of(*rows(unit(*start)).last().expect("a row")) });
     }
-    // Ids: edges from 10, coedges/loops/faces past every edge id.
     let edge_id = |kind: usize, index: usize| 10 + (kind * count + index) as u64;
     let mut edges = Vec::with_capacity(3 * count);
+    let mut tops = Vec::with_capacity(count);
     for (index, curve) in curves.iter().enumerate() {
         let [start, end] = curve.domain().map_err(|e| refuse("gear_domain", e))?;
         let next = (index + 1) % count;
+        let top = top_of(curve)?;
+        let axial = NurbsCurve::new(degree_v, knots_v.to_vec(), rows(unit(starts[index]))).map_err(|e| refuse("gear_edge", e))?;
         edges.push(EdgeRecord { id: edge_id(0, index), curve: curve.clone(), t0: start, t1: end, start_vertex_id: index as u64 + 1, end_vertex_id: next as u64 + 1, degenerate: false, name: None });
-        edges.push(EdgeRecord { id: edge_id(1, index), curve: lift(curve), t0: start, t1: end, start_vertex_id: (count + index) as u64 + 1, end_vertex_id: (count + next) as u64 + 1, degenerate: false, name: None });
-        edges.push(EdgeRecord { id: edge_id(2, index), curve: twisted_edge(starts[index], width, &knots_v, &basis)?, t0: 0.0, t1: 1.0, start_vertex_id: index as u64 + 1, end_vertex_id: (count + index) as u64 + 1, degenerate: false, name: None });
+        edges.push(EdgeRecord { id: edge_id(1, index), curve: top.clone(), t0: start, t1: end, start_vertex_id: (count + index) as u64 + 1, end_vertex_id: (count + next) as u64 + 1, degenerate: false, name: None });
+        edges.push(EdgeRecord { id: edge_id(2, index), curve: axial, t0: 0.0, t1: 1.0, start_vertex_id: index as u64 + 1, end_vertex_id: (count + index) as u64 + 1, degenerate: false, name: None });
+        tops.push(top);
     }
     let line = |a: [f64; 2], b: [f64; 2]| parameter_line(a[0], a[1], b[0], b[1]).map_err(|e| refuse("gear_pcurve", e));
     let mut next_id = 10 + 3 * count as u64 + 1000;
@@ -1352,28 +1337,25 @@ pub fn twisted_prism(section: &GearSection, width: f64, twist: Twist, tolerance:
             CoedgeRecord { id: next_id + 3, edge_id: edge_id(2, index), forward: false, pcurve: line([start, 1.0], [start, 0.0])? },
         ];
         next_id += 4;
-        faces.push(FaceRecord {
-            id: next_id + 1,
-            surface: twisted_surface(curve, width, &knots_v, &basis)?,
-            same_sense: true,
-            loops: vec![LoopRecord { id: next_id, coedges }],
-            name: None,
-        });
+        let surface_rows: Vec<Vec<Vec4>> = curve.control_points.iter().map(|p| rows(*p)).collect();
+        let surface = NurbsSurface::new(curve.degree, degree_v, curve.knots.clone(), knots_v.to_vec(), surface_rows).map_err(|e| refuse("gear_surface", e))?;
+        faces.push(FaceRecord { id: next_id + 1, surface, same_sense: true, loops: vec![LoopRecord { id: next_id, coedges }], name: None });
         next_id += 2;
     }
+    let reach = curves.iter().chain(tops.iter()).flat_map(|c| c.control_points.iter()).map(|p| (p.x / p.w).hypot(p.y / p.w)).fold(0.0, f64::max);
     let pad = reach * 1.1 + 1.0;
     let x_axis = Vec3::new(1.0, 0.0, 0.0);
     let y_axis = Vec3::new(0.0, 1.0, 0.0);
-    let bottom_origin = Vec3::new(-pad, -pad, 0.0);
+    let z0 = vertices[0].point.z;
+    let z1 = vertices[count].point.z;
+    let bottom_origin = Vec3::new(-pad, -pad, z0);
     let mut bottom = Vec::with_capacity(count);
     for index in (0..count).rev() {
         bottom.push(CoedgeRecord {
             id: next_id,
             edge_id: edge_id(0, index),
             forward: false,
-            pcurve: curve_to_plane_parameters(&curves[index], bottom_origin, x_axis, y_axis)
-                .and_then(|c| c.reversed())
-                .map_err(|e| refuse("gear_pcurve", e))?,
+            pcurve: curve_to_plane_parameters(&curves[index], bottom_origin, x_axis, y_axis).and_then(|c| c.reversed()).map_err(|e| refuse("gear_pcurve", e))?,
         });
         next_id += 1;
     }
@@ -1385,14 +1367,14 @@ pub fn twisted_prism(section: &GearSection, width: f64, twist: Twist, tolerance:
         name: None,
     });
     next_id += 2;
-    let top_origin = Vec3::new(-pad, -pad, width);
+    let top_origin = Vec3::new(-pad, -pad, z1);
     let mut top = Vec::with_capacity(count);
-    for (index, curve) in curves.iter().enumerate() {
+    for (index, curve) in tops.iter().enumerate() {
         top.push(CoedgeRecord {
             id: next_id,
             edge_id: edge_id(1, index),
             forward: true,
-            pcurve: curve_to_plane_parameters(&lift(curve), top_origin, x_axis, y_axis).map_err(|e| refuse("gear_pcurve", e))?,
+            pcurve: curve_to_plane_parameters(curve, top_origin, x_axis, y_axis).map_err(|e| refuse("gear_pcurve", e))?,
         });
         next_id += 1;
     }
@@ -1418,7 +1400,7 @@ pub fn twisted_prism(section: &GearSection, width: f64, twist: Twist, tolerance:
     if issues.is_empty() {
         Ok(solid)
     } else {
-        Err(KernelRefusal::internal(KernelStage::Validate, "validate", format!("twisted gear prism is not valid: {issues:?}")))
+        Err(KernelRefusal::internal(KernelStage::Validate, "validate", format!("gear prism is not valid: {issues:?}")))
     }
 }
 
@@ -2321,5 +2303,986 @@ pub fn cycloidal_gear_solid(gear: &CycloidalGear) -> Result<(BrepSolid, Vec<Stri
     names.push("F".into());
     names.push("B".into());
     Ok((solid, names, section.data))
+}
+
+/// A straight bevel gear with spherical-involute teeth (the true conjugate
+/// form; not Tredgold's back-cone approximation). Module at the heel, shaft
+/// angle 90°, pitch cone angle atan(z / z_mate). Apex at the origin, axis +z,
+/// the teeth between cone distances R − face width and R; back and front
+/// faces are the back and front cones (perpendicular to the pitch cone).
+#[derive(Clone, Debug)]
+pub struct BevelGear {
+    pub module: f64,
+    pub teeth: usize,
+    pub mate_teeth: usize,
+    pub pressure_angle: f64,
+    pub addendum: f64,
+    pub dedendum: f64,
+    pub face_width: f64,
+    pub backlash: f64,
+}
+
+/// Derived bevel sizes: (pitch cone angle, cone distance, base cone angle).
+pub fn bevel_cones(gear: &BevelGear) -> (f64, f64, f64) {
+    let delta = (gear.teeth as f64).atan2(gear.mate_teeth as f64);
+    let cone = gear.module * gear.teeth as f64 / (2.0 * delta.sin());
+    let base = (delta.sin() * gear.pressure_angle.cos()).asin();
+    (delta, cone, base)
+}
+
+/// A point of the spherical involute of the base cone (half angle `base`) on
+/// the sphere of radius `r`, unwrapped by `phi` from the base circle at azimuth 0.
+fn spherical_involute(r: f64, base: f64, phi: f64) -> [f64; 3] {
+    let (s, c) = base.sin_cos();
+    let t = phi * s;
+    [
+        r * (t.cos() * s * phi.cos() + t.sin() * phi.sin()),
+        r * (t.cos() * s * phi.sin() - t.sin() * phi.cos()),
+        r * t.cos() * c,
+    ]
+}
+
+/// The polar angle from the axis (the cone angle) of a point.
+fn cone_angle(p: [f64; 3]) -> f64 {
+    p[0].hypot(p[1]).atan2(p[2])
+}
+
+/// Central projection from the apex onto the plane z = h.
+fn project(p: [f64; 3], h: f64) -> [f64; 2] {
+    [p[0] * h / p[2], p[1] * h / p[2]]
+}
+
+/// The bevel gear section: the spherical tooth outline on the sphere through
+/// the heel, centrally projected onto the plane z = h (so every surface the
+/// apex sees edge-on — tooth flanks, root and tip cones — becomes a planar
+/// curve; the cones' circles project to exact arcs). Counter-clockwise; roles
+/// as the spur gear's: `V/R/K/L/W/G` with `V/W` the radial (meridian) root
+/// extension below the base cone when the root lies under it.
+pub fn bevel_section(gear: &BevelGear, h: f64) -> Result<GearSection, KernelRefusal> {
+    let m = gear.module;
+    if !(m > 0.0 && gear.face_width > 0.0 && gear.addendum > 0.0 && gear.dedendum > 0.0 && gear.backlash >= 0.0) {
+        return Err(refuse("gear_input", "The module, face width, addendum and dedendum must be positive.".into()));
+    }
+    if gear.teeth < 6 || gear.mate_teeth < 6 {
+        return Err(refuse("gear_input", "A bevel pair needs at least 6 teeth on each gear.".into()));
+    }
+    let degrees = gear.pressure_angle.to_degrees();
+    if !(10.0 - 1e-9..=35.0 + 1e-9).contains(&degrees) {
+        return Err(refuse("gear_input", format!("The pressure angle must be between 10° and 35° (it is {degrees}°).")));
+    }
+    let (delta, r, base) = bevel_cones(gear);
+    if gear.face_width > r / 3.0 + 1e-9 {
+        return Err(refuse(
+            "face_too_wide",
+            format!("The face width ({}) is over a third of the cone distance ({:.4}): the teeth would be too small at the toe.", gear.face_width, r),
+        ));
+    }
+    let z = gear.teeth as f64;
+    let tip = delta + gear.addendum * m / r;
+    let root = delta - gear.dedendum * m / r;
+    if !(root > 0.0) {
+        return Err(refuse("root_below_centre", "The root cone passes the axis: fewer dedendum or more teeth.".into()));
+    }
+    // The unwrap angle where the involute reaches a cone angle theta: cos(phi sin b) cos b = cos theta.
+    let phi_at = |theta: f64| ((theta.cos() / base.cos()).clamp(-1.0, 1.0)).acos() / base.sin();
+    let azimuth = |p: [f64; 3]| p[1].atan2(p[0]);
+    // Position the left flank: half the tooth thickness (arc on the pitch circle of radius r sin delta) at the pitch cone.
+    let half = (PI * m / 2.0 - gear.backlash) / (2.0 * r * delta.sin());
+    let p_pitch = spherical_involute(r, base, phi_at(delta));
+    // The involute (unwrapping counter-clockwise) leans to positive azimuth as it rises: the left flank
+    // is it mirrored, turned so its pitch point sits at +half.
+    let shift = half + azimuth(p_pitch);
+    let left = |phi: f64| {
+        let p = spherical_involute(r, base, phi);
+        let q = [p[0], -p[1], p[2]];
+        let (s, c) = shift.sin_cos();
+        [c * q[0] - s * q[1], s * q[0] + c * q[1], q[2]]
+    };
+    let tip_phi = phi_at(tip);
+    if azimuth(left(tip_phi)) <= 1e-6 * m / r {
+        return Err(refuse("pointed_tip", "The teeth come to a point below the tip cone: reduce the addendum.".into()));
+    }
+    // At the base cone the involute leaves with zero speed (a cusp in phi):
+    // when the root lies under it, the flank starts a little above (2% of the
+    // unwrap) and the radial root extension runs up to that point.
+    let extend = !(root > base); // the root lies on or under the base cone: a radial extension
+    let start_phi = if extend { 0.02 * tip_phi } else { phi_at(root) };
+    let tolerance = GEAR_FIT_TOLERANCE * m;
+    let flank = fit_planar(&|phi| project(left(phi), h), start_phi, tip_phi, tolerance)?; // root side -> tip
+    let tau = TAU / z;
+    let base_point = project(left(start_phi), h);
+    let root_r = h * root.tan();
+    let tip_r = h * tip.tan();
+    let foot_angle = base_point[1].atan2(base_point[0]);
+    let mut tooth: Vec<(&'static str, NurbsCurve)> = Vec::new();
+    let tip_angle = {
+        let p = project(left(tip_phi), h);
+        p[1].atan2(p[0])
+    };
+    // Right side (mirror), going up: [V radial] + R; tip K; then L down + [W radial]; G root land.
+    let radial_foot = [root_r * foot_angle.cos(), root_r * foot_angle.sin()];
+    if extend {
+        tooth.push(("V", line([radial_foot[0], -radial_foot[1]], [base_point[0], -base_point[1]])?));
+    }
+    tooth.push(("R", mirrored(&flank)));
+    tooth.push(("K", arc(tip_r, -tip_angle, tip_angle)?));
+    tooth.push(("L", flank.reversed().map_err(|e| refuse("gear_fit", e))?));
+    if extend {
+        tooth.push(("W", line(base_point, radial_foot)?));
+    }
+    if foot_angle >= tau / 2.0 - 1e-9 {
+        return Err(refuse("teeth_overlap", "The tooth roots meet: fewer teeth or a smaller pressure angle.".into()));
+    }
+    tooth.push(("G", arc(root_r, foot_angle, tau - foot_angle)?));
+    let mut curves = Vec::with_capacity(tooth.len() * gear.teeth);
+    for index in 0..gear.teeth {
+        let angle = tau * index as f64;
+        for (role, curve) in &tooth {
+            curves.push(SectionCurve { curve: rotated(curve, angle), role, tooth: index });
+        }
+    }
+    // Lift the section into the plane z = h.
+    for piece in &mut curves {
+        for p in &mut piece.curve.control_points {
+            p.z = p.w * h;
+        }
+    }
+    snap_junctions(&mut curves);
+    // Diameters at the heel: where each cone meets the back cone (perpendicular
+    // to the pitch cone at cone distance r).
+    let heel = |angle: f64| 2.0 * r * angle.sin() / (angle - delta).cos();
+    let data = GearData {
+        pitch_diameter: 2.0 * r * delta.sin(),
+        tip_diameter: heel(tip),
+        root_diameter: heel(root),
+        ..GearData::default()
+    };
+    Ok(GearSection { curves, data })
+}
+
+/// A straight bevel gear solid: the section's cone (every curve carried to
+/// and from the apex by scaling, so the flanks are exactly the cones over the
+/// spherical involutes) cut to the back and front cones. Faces carry their
+/// roles in `face.name` (`R3`, `K0`, …, `BACK`, `FRONT`).
+pub fn bevel_solid(gear: &BevelGear) -> Result<(BrepSolid, GearData), KernelRefusal> {
+    let (delta, r, _) = bevel_cones(gear);
+    let rho = r - gear.face_width;
+    let m = gear.module;
+    let tip = delta + gear.addendum * m / r;
+    let h = r * delta.cos();
+    let mut section = bevel_section(gear, h)?;
+    // The cone of the section, from below the lowest blank point inside it to above the back cone's apex.
+    let z_lo = 0.5 * rho * tip.cos() / (tip - delta).cos();
+    let z_hi = 1.05 * r / delta.cos();
+    let (s_lo, s_hi) = (z_lo / h, z_hi / h);
+    for piece in &mut section.curves {
+        for p in &mut piece.curve.control_points {
+            p.x *= s_lo;
+            p.y *= s_lo;
+            p.z *= s_lo;
+        }
+    }
+    let grow = s_hi / s_lo;
+    let rows = |p: Vec4| vec![p, Vec4 { x: p.x * grow, y: p.y * grow, z: p.z * grow, w: p.w }];
+    let mut cone = prism_by_rows(&section, 1, &[0.0, 0.0, 1.0, 1.0], &rows)?;
+    let count = section.curves.len();
+    for (index, face) in cone.shells[0].faces.iter_mut().enumerate() {
+        face.name = Some(if index < count { section.curves[index].suffix() } else { "CAP".into() });
+    }
+    // The blank: between the front and back cones, out past the tip.
+    let r_out = r * tip.sin() * 1.2 + m;
+    let (sd, cd) = delta.sin_cos();
+    let back_apex = [0.0, r / cd];
+    let front_apex = [0.0, rho / cd];
+    let out = |along: f64| {
+        // From the pitch point at cone distance `along`, outwards on the line perpendicular to the pitch cone.
+        let t = (r_out - along * sd) / cd;
+        [along * sd + t * cd, along * cd - t * sd]
+    };
+    let (f2, b2) = (out(rho), out(r));
+    let at = |q: [f64; 2]| Vec3::new(q[0], 0.0, q[1]);
+    let line3 = |a: [f64; 2], b: [f64; 2]| crate::make_line(at(a), at(b)).map_err(|e| refuse("gear_blank", e));
+    let revolve = |profile: Vec<NurbsCurve>, names: &[&str]| -> Result<BrepSolid, KernelRefusal> {
+        let names: Vec<Option<String>> = names.iter().map(|n| Some(n.to_string())).collect();
+        crate::revolve_profile_brep_named(&profile, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), TAU, &names, &[])
+            .map_err(|e| refuse("gear_blank", e))
+    };
+    // Below the back cone: a cone of material under it, out past the tip and down below the cone's foot.
+    // Below everything the back cone bounds: under the cone prism's foot and the back cone's outer point.
+    let low = (z_lo * 0.5).min(b2[1]) - m;
+    let back = revolve(
+        vec![line3(back_apex, b2)?, line3(b2, [b2[0], low])?, line3([b2[0], low], [0.0, low])?, line3([0.0, low], back_apex)?],
+        &["BACK", "BX1", "BX2", "BX3"],
+    )?;
+    // Above the front cone.
+    let high = z_hi * 1.1;
+    let front = revolve(
+        vec![line3(front_apex, [0.0, high])?, line3([0.0, high], [f2[0], high])?, line3([f2[0], high], f2)?, line3(f2, front_apex)?],
+        &["FX1", "FX2", "FX3", "FRONT"],
+    )?;
+    let cut = crate::boolean_operation_nary(&[cone, back], crate::BooleanOperation::Intersect)?;
+    let gear_solid = crate::boolean_operation_nary(&[cut, front], crate::BooleanOperation::Intersect)?;
+    Ok((gear_solid, section.data))
+}
+
+/// An elliptical gear: the pitch curve is an ellipse turning about one of its
+/// foci, and the teeth are generated by rolling the standard basic rack round
+/// it without slip (the rack's pitch line tangent to the ellipse, the contact
+/// normal through the touching point), as a spur gear is generated round its
+/// pitch circle. Two identical elliptical gears with an odd tooth count mesh
+/// at a centre distance of the major axis (see [`elliptical_sizes`]).
+///
+/// The ellipse is sized so its perimeter is exactly `teeth` circular pitches
+/// (π · module), so the teeth close. Tooth 0 is centred on the near vertex
+/// (on +x, closest to the pivot).
+#[derive(Clone, Debug)]
+pub struct EllipticalGear {
+    pub module: f64,
+    pub teeth: usize,
+    /// Eccentricity of the pitch ellipse (0 is a spur gear turning about its centre).
+    pub eccentricity: f64,
+    pub pressure_angle: f64,
+    /// Addendum coefficient × module, measured normal to the pitch curve.
+    pub addendum: f64,
+    /// Dedendum coefficient × module, normal to the pitch curve.
+    pub dedendum: f64,
+    /// Tip radius of the generating rack × module.
+    pub root_fillet: f64,
+    /// Arc length added to each tooth space along the pitch curve.
+    pub backlash: f64,
+    pub face_width: f64,
+}
+
+/// The pitch ellipse about its focus, by arc length.
+struct PitchEllipse {
+    /// Semi-latus rectum: r(θ) = p / (1 + e cos θ) about the focus.
+    latus: f64,
+    e: f64,
+    /// Cumulative arc length at θ = 2π i / SEGMENTS.
+    table: Vec<f64>,
+}
+
+impl PitchEllipse {
+    const SEGMENTS: usize = 1024;
+
+    fn new(latus: f64, e: f64) -> Self {
+        let mut curve = Self { latus, e, table: Vec::with_capacity(Self::SEGMENTS + 1) };
+        // Five-point Gauss-Legendre per segment.
+        let nodes = [0.0, -0.538_469_310_105_683_1, 0.538_469_310_105_683_1, -0.906_179_845_938_664, 0.906_179_845_938_664];
+        let weights = [0.568_888_888_888_888_9, 0.478_628_670_499_366_5, 0.478_628_670_499_366_5, 0.236_926_885_056_189_1, 0.236_926_885_056_189_1];
+        let step = TAU / Self::SEGMENTS as f64;
+        let mut total = 0.0;
+        curve.table.push(0.0);
+        for i in 0..Self::SEGMENTS {
+            let mid = (i as f64 + 0.5) * step;
+            let sum: f64 = nodes.iter().zip(&weights).map(|(x, w)| w * curve.speed(mid + 0.5 * step * x)).sum();
+            total += 0.5 * step * sum;
+            curve.table.push(total);
+        }
+        curve
+    }
+
+    fn length(&self) -> f64 {
+        self.table[Self::SEGMENTS]
+    }
+
+    /// Point, first and second derivatives in θ.
+    fn derivatives(&self, theta: f64) -> ([f64; 2], [f64; 2], [f64; 2]) {
+        let (s, c) = theta.sin_cos();
+        let d = 1.0 + self.e * c;
+        let d1 = -self.e * s;
+        let d2 = -self.e * c;
+        let r = self.latus / d;
+        let r1 = -self.latus * d1 / (d * d);
+        let r2 = -self.latus * (d2 * d - 2.0 * d1 * d1) / (d * d * d);
+        (
+            [r * c, r * s],
+            [r1 * c - r * s, r1 * s + r * c],
+            [r2 * c - 2.0 * r1 * s - r * c, r2 * s + 2.0 * r1 * c - r * s],
+        )
+    }
+
+    fn speed(&self, theta: f64) -> f64 {
+        let (_, d1, _) = self.derivatives(theta);
+        d1[0].hypot(d1[1])
+    }
+
+    /// The polar angle at arc length `s` (any real; the curve is periodic).
+    fn theta_at(&self, s: f64) -> f64 {
+        let length = self.length();
+        let turns = (s / length).floor();
+        let local = s - turns * length;
+        let index = self.table.partition_point(|&value| value <= local).clamp(1, Self::SEGMENTS) - 1;
+        let step = TAU / Self::SEGMENTS as f64;
+        let (lo, hi) = (index as f64 * step, (index + 1) as f64 * step);
+        let span = self.table[index + 1] - self.table[index];
+        let mut theta = lo + step * (local - self.table[index]) / span;
+        // Newton on the segment's arc length, measured from its start by Gauss-Legendre.
+        let nodes = [0.0, -0.538_469_310_105_683_1, 0.538_469_310_105_683_1, -0.906_179_845_938_664, 0.906_179_845_938_664];
+        let weights = [0.568_888_888_888_888_9, 0.478_628_670_499_366_5, 0.478_628_670_499_366_5, 0.236_926_885_056_189_1, 0.236_926_885_056_189_1];
+        for _ in 0..8 {
+            let half = 0.5 * (theta - lo);
+            let arc: f64 = half * nodes.iter().zip(&weights).map(|(x, w)| w * self.speed(lo + half * (1.0 + x))).sum::<f64>();
+            let error = self.table[index] + arc - local;
+            theta = (theta - error / self.speed(theta)).clamp(lo, hi);
+            if error.abs() < 1e-15 * length {
+                break;
+            }
+        }
+        theta + turns * TAU
+    }
+
+    /// Point, unit tangent (counter-clockwise), outward unit normal and signed curvature at arc length `s`.
+    fn frame(&self, s: f64) -> ([f64; 2], [f64; 2], [f64; 2], f64) {
+        let (p, d1, d2) = self.derivatives(self.theta_at(s));
+        let speed = d1[0].hypot(d1[1]);
+        let t = [d1[0] / speed, d1[1] / speed];
+        let curvature = (d1[0] * d2[1] - d1[1] * d2[0]) / speed.powi(3);
+        (p, t, [t[1], -t[0]], curvature)
+    }
+}
+
+/// The derived sizes of an elliptical gear: (semi-major axis, eccentricity,
+/// perimeter, centre distance to an identical mate = 2 × semi-major axis).
+pub fn elliptical_sizes(gear: &EllipticalGear) -> (f64, f64, f64, f64) {
+    let e = gear.eccentricity;
+    let unit = PitchEllipse::new(1.0 - e * e, e); // semi-major axis 1
+    let a = PI * gear.module * gear.teeth as f64 / unit.length();
+    (a, e, PI * gear.module * gear.teeth as f64, 2.0 * a)
+}
+
+/// The rack, pitch line on y = 0 with +y away from the gear, rolled to arc
+/// length `s`: rack point (x, y) lies at P(s) + (x − s) T(s) + y N(s).
+struct RollingRack<'a> {
+    pitch: &'a PitchEllipse,
+}
+
+impl RollingRack<'_> {
+    /// The gear point generated by the rack point `q` with normal direction `n`
+    /// (either sense): the normal through q meets the pitch line at the rolling position.
+    fn envelope(&self, q: [f64; 2], n: [f64; 2]) -> [f64; 2] {
+        let s = q[0] - q[1] * n[0] / n[1];
+        self.place(q, s)
+    }
+
+    fn place(&self, q: [f64; 2], s: f64) -> [f64; 2] {
+        let (p, t, n, _) = self.pitch.frame(s);
+        let u = q[0] - s;
+        [p[0] + u * t[0] + q[1] * n[0], p[1] + u * t[1] + q[1] * n[1]]
+    }
+
+    /// The arc length of the foot of the normal from `g` to the pitch curve
+    /// (starting near `guess`) and the signed distance along the outward normal.
+    fn foot(&self, g: [f64; 2], guess: f64) -> (f64, f64) {
+        let mut sigma = guess;
+        for _ in 0..40 {
+            let (p, t, n, curvature) = self.pitch.frame(sigma);
+            let v = [g[0] - p[0], g[1] - p[1]];
+            let along = v[0] * t[0] + v[1] * t[1];
+            let distance = v[0] * n[0] + v[1] * n[1];
+            let step = along / (1.0 + curvature * distance);
+            sigma += step;
+            if step.abs() < 1e-15 * self.pitch.length() {
+                break;
+            }
+        }
+        let (p, _, n, _) = self.pitch.frame(sigma);
+        (sigma, (g[0] - p[0]) * n[0] + (g[1] - p[1]) * n[1])
+    }
+}
+
+/// The elliptical gear section, counter-clockwise about the pivot (the focus,
+/// at the origin). Roles per tooth k, as the spur gear's: `V<k>` root fillet,
+/// `R<k>` flank rising to `K<k>` the tip land (normal offset of the pitch
+/// curve), `L<k>` the falling flank, `W<k>` root fillet, `G<k>` the root land
+/// (inward offset) of the space after tooth k.
+pub fn elliptical_section(gear: &EllipticalGear) -> Result<GearSection, KernelRefusal> {
+    let m = gear.module;
+    if !(m > 0.0 && gear.face_width > 0.0 && gear.addendum > 0.0 && gear.dedendum > 0.0) {
+        return Err(refuse("gear_input", "The module, face width, addendum and dedendum must be positive.".into()));
+    }
+    if !(gear.root_fillet >= 0.0 && gear.backlash >= 0.0) {
+        return Err(refuse("gear_input", "The root fillet and the backlash cannot be negative.".into()));
+    }
+    if !(0.0..=0.8).contains(&gear.eccentricity) {
+        return Err(refuse("gear_input", format!("The eccentricity must be from 0 to 0.8 (it is {}).", gear.eccentricity)));
+    }
+    if gear.teeth < 8 || gear.teeth > 1000 {
+        return Err(refuse("gear_input", format!("An elliptical gear needs from 8 to 1000 teeth (it has {}).", gear.teeth)));
+    }
+    let degrees = gear.pressure_angle.to_degrees();
+    if !(10.0 - 1e-9..=35.0 + 1e-9).contains(&degrees) {
+        return Err(refuse("gear_input", format!("The pressure angle must be between 10° and 35° (it is {degrees}°).")));
+    }
+    let (a, e, perimeter, _) = elliptical_sizes(gear);
+    let pitch_curve = PitchEllipse::new(a * (1.0 - e * e), e);
+    let rack = RollingRack { pitch: &pitch_curve };
+    let z = gear.teeth as f64;
+    let p = perimeter / z;
+    let alpha = gear.pressure_angle;
+    let (sin_a, cos_a, tan_a) = (alpha.sin(), alpha.cos(), alpha.tan());
+    let h_a = gear.addendum * m;
+    let h_f = gear.dedendum * m;
+    let rho = gear.root_fillet * m;
+    let tolerance = GEAR_FIT_TOLERANCE * m;
+    // The sharpest point of the ellipse is its major vertex: radius b²/a.
+    let min_radius = a * (1.0 - e * e);
+    if h_f >= min_radius {
+        return Err(refuse(
+            "undercut",
+            format!("The root would fold at the ellipse's ends (radius of curvature {min_radius:.4} there): add teeth or lower the eccentricity."),
+        ));
+    }
+    // Cutter tooth centred on x = 0 (it cuts the space there): half width at height y is w0 + y tan α.
+    let w0 = p / 4.0 + gear.backlash / 2.0;
+    let centre_y = -h_f + rho;
+    let centre_x = -w0 - (centre_y - rho * sin_a) * tan_a + rho * cos_a; // low-side fillet centre
+    if centre_x >= 0.0 {
+        return Err(refuse("root_fillet_too_large", "The root fillet is larger than fits the tooth space; lower it.".into()));
+    }
+    let y_join = centre_y - rho * sin_a;
+    let low_flank = |c: f64, y: f64| rack.envelope([c - w0 - y * tan_a, y], [cos_a, sin_a]);
+    let high_flank = |c: f64, y: f64| rack.envelope([c + w0 + y * tan_a, y], [-cos_a, sin_a]);
+    // ψ ∈ [0, 1]: from the flank tangency (0) to the tip line (1).
+    let fillet_normal = |t: f64| {
+        let psi = -PI + alpha + t * (PI / 2.0 - alpha);
+        [psi.cos(), psi.sin()]
+    };
+    let low_fillet = |c: f64, t: f64| {
+        let n = fillet_normal(t);
+        if rho == 0.0 {
+            return rack.envelope([c + centre_x, centre_y], n);
+        }
+        rack.envelope([c + centre_x + rho * n[0], centre_y + rho * n[1]], n)
+    };
+    let high_fillet = |c: f64, t: f64| {
+        let n = fillet_normal(t);
+        if rho == 0.0 {
+            return rack.envelope([c - centre_x, centre_y], [-n[0], n[1]]);
+        }
+        rack.envelope([c - centre_x - rho * n[0], centre_y + rho * n[1]], [-n[0], n[1]])
+    };
+    let root = |x: f64| rack.place([x, -h_f], x);
+    let tip = |sigma: f64| {
+        let (q, _, n, _) = pitch_curve.frame(sigma);
+        [q[0] + h_a * n[0], q[1] + h_a * n[1]]
+    };
+    // The generated flank is regular while sin²α + y κ > 0 down to its foot (it cusps
+    // where the rack flank passes the point of interference); κ is largest, 1 / min_radius,
+    // at the major vertices.
+    if sin_a * sin_a + y_join / min_radius <= 1e-9 {
+        return Err(refuse(
+            "undercut",
+            format!(
+                "The teeth would be undercut where the ellipse is sharpest (radius of curvature {min_radius:.4}): add teeth, lower the eccentricity or raise the pressure angle."
+            ),
+        ));
+    }
+    // The flank height where a generated flank reaches the tip offset (offset distance h_a).
+    let top_of = |flank: &dyn Fn(f64) -> [f64; 2], guess: f64| -> Result<(f64, f64), KernelRefusal> {
+        let offset = |y: f64| rack.foot(flank(y), guess).1 - h_a;
+        let (mut lo, mut hi) = (y_join, h_a + 2.0 * m);
+        if !(offset(lo) < 0.0 && offset(hi) > 0.0) {
+            return Err(refuse("gear_fit", "The generated flank does not reach the tip curve.".into()));
+        }
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if offset(mid) < 0.0 { lo = mid } else { hi = mid }
+        }
+        let y = 0.5 * (lo + hi);
+        Ok((y, rack.foot(flank(y), guess).0))
+    };
+    let mut curves = Vec::with_capacity(6 * gear.teeth);
+    let reversed = |curve: NurbsCurve| curve.reversed().map_err(|error| refuse("gear_fit", error));
+    for k in 0..gear.teeth {
+        let before = (k as f64 - 0.5) * p; // the space before tooth k
+        let after = (k as f64 + 0.5) * p;
+        let rising = |y: f64| high_flank(before, y);
+        let falling = |y: f64| low_flank(after, y);
+        let (y_rise, sigma_rise) = top_of(&rising, k as f64 * p - w0)?;
+        let (y_fall, sigma_fall) = top_of(&falling, k as f64 * p + w0)?;
+        if sigma_fall - sigma_rise <= 1e-6 * m {
+            return Err(refuse("pointed_tip", "The teeth come to a point below the tip curve: reduce the addendum or the backlash.".into()));
+        }
+        curves.push(SectionCurve { curve: reversed(fit_planar(&|t| high_fillet(before, t), 0.0, 1.0, tolerance)?)?, role: "V", tooth: k });
+        curves.push(SectionCurve { curve: fit_planar(&rising, y_join, y_rise, tolerance)?, role: "R", tooth: k });
+        curves.push(SectionCurve { curve: fit_planar(&tip, sigma_rise, sigma_fall, tolerance)?, role: "K", tooth: k });
+        curves.push(SectionCurve { curve: reversed(fit_planar(&falling, y_join, y_fall, tolerance)?)?, role: "L", tooth: k });
+        curves.push(SectionCurve { curve: fit_planar(&|t| low_fillet(after, t), 0.0, 1.0, tolerance)?, role: "W", tooth: k });
+        if centre_x < -1e-9 * m {
+            curves.push(SectionCurve { curve: fit_planar(&root, after + centre_x, after - centre_x, tolerance)?, role: "G", tooth: k });
+        }
+    }
+    snap_junctions(&mut curves);
+    let samples = 4096;
+    let (mut tip_max, mut root_min) = (0.0_f64, f64::INFINITY);
+    for i in 0..samples {
+        let s = perimeter * i as f64 / samples as f64;
+        tip_max = tip_max.max(radius_of(tip(s)));
+        root_min = root_min.min(radius_of(rack.place([s, -h_f], s)));
+    }
+    let data = GearData {
+        pitch_diameter: perimeter / PI,
+        tip_diameter: 2.0 * tip_max,
+        root_diameter: 2.0 * root_min,
+        tooth_thickness: p / 2.0 - gear.backlash,
+        ..GearData::default()
+    };
+    Ok(GearSection { curves, data })
+}
+
+/// An elliptical gear solid: the section extruded along +z by the face width;
+/// names as the section's roles, then `F` and `B`.
+pub fn elliptical_solid(gear: &EllipticalGear) -> Result<(BrepSolid, Vec<String>, GearData), KernelRefusal> {
+    let section = elliptical_section(gear)?;
+    let solid = extrude_section(&section, gear.face_width)?;
+    let mut names: Vec<String> = section.curves.iter().map(SectionCurve::suffix).collect();
+    names.push("F".into());
+    names.push("B".into());
+    Ok((solid, names, section.data))
+}
+
+/// The parameter breaks (normalised to [0, 1]) at which [`fit_planar`] would
+/// split `f` on `[a, b]` to fit it within `tolerance`.
+fn adaptive_breaks(f: &dyn Fn(f64) -> [f64; 2], tolerance: f64) -> Result<Vec<f64>, KernelRefusal> {
+    let mut breaks = vec![0.0];
+    let mut pending: Vec<(f64, f64, usize)> = (0..4).rev().map(|i| (i as f64 / 4.0, (i + 1) as f64 / 4.0, 0)).collect();
+    while let Some((t0, t1, depth)) = pending.pop() {
+        if hermite_span_error(f, t0, t1) > tolerance {
+            if depth >= 16 {
+                return Err(refuse("gear_fit", format!("gear curve fit did not converge on [{t0}, {t1}]")));
+            }
+            let mid = 0.5 * (t0 + t1);
+            pending.push((mid, t1, depth + 1));
+            pending.push((t0, mid, depth + 1));
+        } else {
+            breaks.push(t1);
+        }
+    }
+    Ok(breaks)
+}
+
+/// The cubic Hermite span of `f` on `[t0, t1]` (numeric end derivatives) as Bézier points.
+fn hermite_span(f: &dyn Fn(f64) -> [f64; 2], t0: f64, t1: f64) -> [[f64; 2]; 4] {
+    let derivative = |t: f64| {
+        let h = 1e-6;
+        let (p, q) = (f(t + h), f(t - h));
+        [(p[0] - q[0]) / (2.0 * h), (p[1] - q[1]) / (2.0 * h)]
+    };
+    let (p0, p1) = (f(t0), f(t1));
+    let (d0, d1) = (derivative(t0), derivative(t1));
+    let k = (t1 - t0) / 3.0;
+    [p0, [p0[0] + d0[0] * k, p0[1] + d0[1] * k], [p1[0] - d1[0] * k, p1[1] - d1[1] * k], p1]
+}
+
+fn hermite_span_error(f: &dyn Fn(f64) -> [f64; 2], t0: f64, t1: f64) -> f64 {
+    let c = hermite_span(f, t0, t1);
+    [0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875]
+        .iter()
+        .map(|&u| {
+            let exact = f(t0 + (t1 - t0) * u);
+            let v = 1.0 - u;
+            let w = [v * v * v, 3.0 * v * v * u, 3.0 * v * u * u, u * u * u];
+            let x = w[0] * c[0][0] + w[1] * c[1][0] + w[2] * c[2][0] + w[3] * c[3][0];
+            let y = w[0] * c[0][1] + w[1] * c[1][1] + w[2] * c[2][1] + w[3] * c[3][1];
+            (exact[0] - x).hypot(exact[1] - y)
+        })
+        .fold(0.0, f64::max)
+}
+
+/// `f` on [0, 1] as C1 cubic Hermite spans at the given breaks (as
+/// [`fit_planar`] lays them out), and its worst error over the spans.
+fn fit_on_breaks(f: &dyn Fn(f64) -> [f64; 2], breaks: &[f64]) -> Result<(NurbsCurve, f64), KernelRefusal> {
+    let to_point = |p: [f64; 2]| Vec4::from_point(Vec3::new(p[0], p[1], 0.0), 1.0);
+    let mut knots = vec![0.0; 4];
+    let mut points = Vec::with_capacity(2 * breaks.len() + 2);
+    let mut worst = 0.0_f64;
+    let spans = breaks.len() - 1;
+    for index in 0..spans {
+        let (t0, t1) = (breaks[index], breaks[index + 1]);
+        let c = hermite_span(f, t0, t1);
+        worst = worst.max(hermite_span_error(f, t0, t1));
+        if index == 0 {
+            points.push(to_point(c[0]));
+        }
+        points.push(to_point(c[1]));
+        points.push(to_point(c[2]));
+        if index + 1 < spans {
+            knots.extend([t1, t1]);
+        } else {
+            points.push(to_point(c[3]));
+        }
+    }
+    knots.extend([1.0; 4]);
+    Ok((NurbsCurve::new(3, knots, points).map_err(|error| refuse("gear_fit", error))?, worst))
+}
+
+/// A throated (single-enveloping) worm wheel: the teeth are cut as a hob of
+/// the mating ZA worm cuts them, the worm's thread swept by the generating
+/// motion (the worm turning, the wheel turning with it at the gear ratio).
+/// In every plane across the face width the worm's thread section moves as a
+/// rack and the wheel section is its envelope; the flanks, tips (the throat,
+/// a torus about the worm's axis) and roots are skinned through those
+/// sections. Front face on z = 0, back face on z = face width; the worm's
+/// axis runs along +y at x = centre distance, z = face width / 2.
+#[derive(Clone, Debug)]
+pub struct WormWheel {
+    /// The mating worm (its length is not used).
+    pub worm: Worm,
+    pub teeth: usize,
+    /// Wheel addendum × module, in the mid-plane (the throat).
+    pub addendum: f64,
+    /// Wheel dedendum × module, in the mid-plane: the hob's tip (the worm's tip plus the clearance).
+    pub dedendum: f64,
+    pub face_width: f64,
+    /// Axial backlash: the hob's thread is that much thicker than the worm's.
+    pub backlash: f64,
+}
+
+/// The worm wheel's sizes: (pitch radius, centre distance, throat radius in the mid-plane, outside radius at the faces).
+pub fn worm_wheel_sizes(wheel: &WormWheel) -> (f64, f64, f64, f64) {
+    let m = wheel.worm.axial_module;
+    let r2 = m * wheel.teeth as f64 / 2.0;
+    let a = r2 + wheel.worm.reference_diameter / 2.0;
+    let throat = r2 + wheel.addendum * m;
+    let tube = a - throat;
+    let half = wheel.face_width / 2.0;
+    (r2, a, throat, a - (tube * tube - half * half).max(0.0).sqrt())
+}
+
+/// One plane z = c (from the mid-plane) of the wheel: the hob section as a rack.
+struct WheelPlane<'a> {
+    wheel: &'a WormWheel,
+    c: f64,
+    r2: f64,
+    a: f64,
+    /// The hob's tip radius about the worm axis.
+    rho_tip: f64,
+    /// The wheel's tip (throat) radius in this plane.
+    r_tip: f64,
+    /// Flank parameters (radius about the worm axis) where each flank reaches the tip: [- side, + side].
+    rho_clip: [f64; 2],
+}
+
+impl<'a> WheelPlane<'a> {
+    fn new(wheel: &'a WormWheel, c: f64) -> Result<Self, KernelRefusal> {
+        let m = wheel.worm.axial_module;
+        let (r2, a, throat, _) = worm_wheel_sizes(wheel);
+        let rho_tip = a - (r2 - wheel.dedendum * m);
+        let tube = a - throat;
+        let r_tip = a - (tube * tube - c * c).sqrt();
+        let mut plane = Self { wheel, c, r2, a, rho_tip, r_tip, rho_clip: [0.0; 2] };
+        for (index, side) in [-1.0, 1.0].into_iter().enumerate() {
+            // The generated flank falls from above the tip to the root. A hob point with rho under the throat's
+            // tube radius sits beyond the throat (x = a - sqrt(rho^2 - c^2) > r_tip), and so does its envelope.
+            let (mut lo, mut hi) = (0.5 * (c.abs() + tube), rho_tip);
+            if !(radius_of(plane.flank(side, lo)) > r_tip && radius_of(plane.flank(side, hi)) < r_tip) {
+                return Err(refuse("gear_fit", "A worm wheel flank does not reach its throat.".into()));
+            }
+            for _ in 0..200 {
+                let mid = 0.5 * (lo + hi);
+                if radius_of(plane.flank(side, mid)) > r_tip { lo = mid } else { hi = mid }
+            }
+            plane.rho_clip[index] = 0.5 * (lo + hi);
+        }
+        Ok(plane)
+    }
+
+    /// The hob flank point (radial x from the wheel axis, y along the worm axis) at radius `rho`
+    /// about the worm axis, on the `side` (±1) of the thread centred on y = 0.
+    fn hob(&self, side: f64, rho: f64) -> [f64; 2] {
+        let worm = &self.wheel.worm;
+        let hand = if worm.hand == Hand::Right { 1.0 } else { -1.0 };
+        let thickness = worm.axial_thickness(rho) + self.wheel.backlash;
+        let angle = (self.c / rho).clamp(-1.0, 1.0).asin();
+        [self.a - (rho * rho - self.c * self.c).max(0.0).sqrt(), side * thickness / 2.0 + hand * worm.lead() * angle / TAU]
+    }
+
+    fn hob_normal(&self, side: f64, rho: f64) -> [f64; 2] {
+        // d/drho of hob(): x = a - sqrt(rho^2 - c^2), y = side t(rho) / 2 + hand L asin(c / rho) / 2 pi (exact:
+        // a difference quotient's rounding noise is magnified by the fits' own derivative steps).
+        let worm = &self.wheel.worm;
+        let hand = if worm.hand == Hand::Right { 1.0 } else { -1.0 };
+        let root = (rho * rho - self.c * self.c).max(1e-300).sqrt();
+        let t = [-rho / root, -side * worm.pressure_angle.tan() - hand * worm.lead() * self.c / (TAU * rho * root)];
+        let length = t[0].hypot(t[1]);
+        // Outward of the thread: +y on the + side.
+        let n = [-t[1] / length, t[0] / length];
+        if n[1] * side >= 0.0 { n } else { [-n[0], -n[1]] }
+    }
+
+    /// The wheel point generated by the hob point `q` with normal `n` (rolling at the pitch radius).
+    fn envelope(&self, q: [f64; 2], n: [f64; 2]) -> [f64; 2] {
+        let s = (q[0] - self.r2) * n[1] / n[0] - q[1];
+        rotate([q[0], q[1] + s], -s / self.r2)
+    }
+
+    fn flank(&self, side: f64, rho: f64) -> [f64; 2] {
+        self.envelope(self.hob(side, rho), self.hob_normal(side, rho))
+    }
+
+    /// The root fillet the hob's sharp tip corner traces, `t` from the flank (0) to the tip land (1).
+    fn fillet(&self, side: f64, t: f64) -> [f64; 2] {
+        let n = self.hob_normal(side, self.rho_tip);
+        let from = n[1].atan2(n[0]);
+        let psi = from + t * (side * PI - from);
+        self.envelope(self.hob(side, self.rho_tip), [psi.cos(), psi.sin()])
+    }
+
+    /// The six pieces of tooth 0 on normalised parameters, in section order V, R, K, L, W, G.
+    fn piece(&self, role: usize, t: f64) -> [f64; 2] {
+        let tau = TAU / self.wheel.teeth as f64;
+        let half = tau / 2.0;
+        let turn = |p: [f64; 2], angle: f64| rotate(p, angle);
+        let root_r = self.a - (self.rho_tip * self.rho_tip - self.c * self.c).sqrt();
+        match role {
+            0 => turn(self.fillet(1.0, 1.0 - t), -half),
+            1 => turn(self.flank(1.0, self.rho_tip + t * (self.rho_clip[1] - self.rho_tip)), -half),
+            2 => {
+                let from = polar_angle(self.flank(1.0, self.rho_clip[1]));
+                let to = tau + polar_angle(self.flank(-1.0, self.rho_clip[0]));
+                let angle = from + t * (to - from) - half;
+                [self.r_tip * angle.cos(), self.r_tip * angle.sin()]
+            }
+            3 => turn(self.flank(-1.0, self.rho_clip[0] + t * (self.rho_tip - self.rho_clip[0])), half),
+            4 => turn(self.fillet(-1.0, t), half),
+            _ => {
+                // The root land of the space after the tooth (the base space turned by tau, then by -half).
+                let from = polar_angle(self.fillet(-1.0, 1.0));
+                let to = polar_angle(self.fillet(1.0, 1.0));
+                let angle = from + t * (to - from) + half;
+                [root_r * angle.cos(), root_r * angle.sin()]
+            }
+        }
+    }
+
+    /// Refuse a plane whose teeth are pointed, whose roots meet, or whose flanks are undercut.
+    fn check(&self) -> Result<(), KernelRefusal> {
+        let m = self.wheel.worm.axial_module;
+        let tau = TAU / self.wheel.teeth as f64;
+        let tip_span = tau + polar_angle(self.flank(-1.0, self.rho_clip[0])) - polar_angle(self.flank(1.0, self.rho_clip[1]));
+        if tip_span * self.r_tip <= 1e-6 * m {
+            return Err(refuse("pointed_tip", format!("The wheel teeth come to a point below the throat {:.4} from the mid-plane: lower the addendum or the face width.", self.c)));
+        }
+        let root_span = polar_angle(self.fillet(1.0, 1.0)) - polar_angle(self.fillet(-1.0, 1.0));
+        if root_span <= 1e-9 {
+            return Err(refuse("teeth_overlap", "The worm thread is wider than the wheel's tooth space at the root: lower the dedendum.".into()));
+        }
+        // Each flank must fall steadily from its tip to its root, and the corner's trace must not cross it.
+        for side in [-1.0, 1.0] {
+            let index = if side < 0.0 { 0 } else { 1 };
+            let flank: Vec<[f64; 2]> = (0..=96).map(|i| self.flank(side, self.rho_clip[index] + (self.rho_tip - self.rho_clip[index]) * i as f64 / 96.0)).collect();
+            let fillet: Vec<[f64; 2]> = (0..=48).map(|i| self.fillet(side, i as f64 / 48.0)).collect();
+            let falling = flank.windows(2).all(|pair| radius_of(pair[1]) < radius_of(pair[0]));
+            let crosses = flank[..flank.len() - 2].windows(2).any(|f| fillet[1..].windows(2).any(|g| segments_cross(f[0], f[1], g[0], g[1])));
+            if !falling || crosses {
+                return Err(refuse(
+                    "undercut",
+                    format!("The worm undercuts the wheel teeth {:.4} from the mid-plane: add wheel teeth, narrow the face width or raise the pressure angle.", self.c),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn segments_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
+    let cross = |o: [f64; 2], p: [f64; 2], q: [f64; 2]| (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0]);
+    let (d1, d2) = (cross(c, d, a), cross(c, d, b));
+    let (d3, d4) = (cross(a, b, c), cross(a, b, d));
+    d1 * d2 < 0.0 && d3 * d4 < 0.0
+}
+
+const WHEEL_ROLES: [&str; 6] = ["V", "R", "K", "L", "W", "G"];
+
+/// Tooth 0's six curves in the plane `c`, fitted on the shared breaks, at height z.
+fn wheel_tooth(plane: &WheelPlane, breaks: &[Vec<f64>], z: f64) -> Result<(Vec<NurbsCurve>, f64), KernelRefusal> {
+    let mut curves = Vec::with_capacity(6);
+    let mut worst = 0.0_f64;
+    for (role, role_breaks) in breaks.iter().enumerate() {
+        let (mut curve, error) = fit_on_breaks(&|t| plane.piece(role, t), role_breaks)?;
+        worst = worst.max(error);
+        for p in &mut curve.control_points {
+            p.z = z * p.w;
+        }
+        curves.push(curve);
+    }
+    Ok((curves, worst))
+}
+
+/// The full section (every tooth) from tooth 0's curves, junctions shared.
+fn wheel_section(tooth: &[NurbsCurve], teeth: usize) -> Vec<SectionCurve> {
+    let tau = TAU / teeth as f64;
+    let mut curves = Vec::with_capacity(6 * teeth);
+    for index in 0..teeth {
+        for (role, curve) in tooth.iter().enumerate() {
+            curves.push(SectionCurve { curve: rotated(curve, tau * index as f64), role: WHEEL_ROLES[role], tooth: index });
+        }
+    }
+    snap_junctions(&mut curves);
+    curves
+}
+
+/// A throated worm wheel solid and its data; face names as the spur gear's
+/// per tooth (`V/R/K/L/W/G<n>`, the `K` faces making the throat), then `F` (z = 0) and `B`.
+pub fn worm_wheel_solid(wheel: &WormWheel) -> Result<(BrepSolid, Vec<String>, GearData), KernelRefusal> {
+    let worm = &wheel.worm;
+    let m = worm.axial_module;
+    worm_section(worm)?; // the worm's own checks
+    if wheel.teeth < 12 || wheel.teeth > 400 {
+        return Err(refuse("gear_input", format!("A worm wheel needs from 12 to 400 teeth (it has {}).", wheel.teeth)));
+    }
+    if !(wheel.addendum > 0.0 && wheel.dedendum > 0.0 && wheel.face_width > 0.0 && wheel.backlash >= 0.0) {
+        return Err(refuse("gear_input", "The wheel's addendum, dedendum and face width must be positive, the backlash not negative.".into()));
+    }
+    let (r2, a, throat, _) = worm_wheel_sizes(wheel);
+    let tube = a - throat;
+    let limit = 0.9 * tube;
+    if wheel.face_width / 2.0 > limit {
+        return Err(refuse(
+            "face_too_wide",
+            format!("The face width ({}) must stay inside the throat: at most {:.4} for this worm.", wheel.face_width, 2.0 * limit),
+        ));
+    }
+    // The hob's thread at the wheel's tip (in the mid-plane) must leave a tooth in the axial pitch. Checked
+    // here, before any polar angle: a thread a whole pitch wider wraps round to the same teeth.
+    if worm.axial_thickness(tube) + wheel.backlash >= PI * m - 1e-6 * m {
+        return Err(refuse("pointed_tip", format!("The backlash ({}) leaves no wheel tooth: the hob's thread fills the whole axial pitch at the throat.", wheel.backlash)));
+    }
+    if worm.axial_thickness(a - (r2 - wheel.dedendum * m)) + wheel.backlash <= 1e-6 * m {
+        return Err(refuse("pointed_tip", "The hob's thread (the worm's, grown to the wheel's root) comes to a point: lower the wheel dedendum.".into()));
+    }
+    let half = wheel.face_width / 2.0;
+    let tolerance = GEAR_FIT_TOLERANCE * m;
+    let skin_tolerance = 1e-5 * m;
+    // Shared breaks per role from the mid-plane and both faces.
+    let probe: Vec<WheelPlane> = [-half, 0.0, half].iter().map(|&c| WheelPlane::new(wheel, c)).collect::<Result<_, _>>()?;
+    for plane in &probe {
+        plane.check()?;
+    }
+    let mut breaks: Vec<Vec<f64>> = Vec::with_capacity(6);
+    for role in 0..6 {
+        let mut all: Vec<f64> = Vec::new();
+        for plane in &probe {
+            all.extend(adaptive_breaks(&|t| plane.piece(role, t), tolerance)?);
+        }
+        all.sort_by(f64::total_cmp);
+        all.dedup_by(|x, y| (*x - *y).abs() < 1e-12);
+        breaks.push(all);
+    }
+    // Planes across the face; each plane's control points carried along v by
+    // cubic Hermite spans (derivatives from planes a step either side).
+    let mut planes = 8usize;
+    loop {
+        let step = wheel.face_width / planes as f64;
+        let delta = 1e-3 * step;
+        let mut rows: Vec<Vec<NurbsCurve>> = Vec::with_capacity(planes + 1); // tooth 0 per plane
+        let mut slopes: Vec<Vec<Vec<[f64; 2]>>> = Vec::with_capacity(planes + 1);
+        let mut refit = false;
+        for j in 0..=planes {
+            let c = -half + step * j as f64;
+            let plane = WheelPlane::new(wheel, c)?;
+            plane.check()?;
+            let (tooth, worst) = wheel_tooth(&plane, &breaks, c + half)?;
+            if worst > tolerance {
+                refit = true;
+                break;
+            }
+            let lo = wheel_tooth(&WheelPlane::new(wheel, c - delta)?, &breaks, 0.0)?.0;
+            let hi = wheel_tooth(&WheelPlane::new(wheel, c + delta)?, &breaks, 0.0)?.0;
+            let slope: Vec<Vec<[f64; 2]>> = lo
+                .iter()
+                .zip(&hi)
+                .map(|(l, h)| l.control_points.iter().zip(&h.control_points).map(|(p, q)| [(q.x - p.x) / (2.0 * delta), (q.y - p.y) / (2.0 * delta)]).collect())
+                .collect();
+            rows.push(tooth);
+            slopes.push(slope);
+        }
+        if refit {
+            // A plane the shared breaks fit too loosely: halve every span and start over.
+            for role_breaks in &mut breaks {
+                let mut finer = Vec::with_capacity(2 * role_breaks.len());
+                for pair in role_breaks.windows(2) {
+                    finer.push(pair[0]);
+                    finer.push(0.5 * (pair[0] + pair[1]));
+                }
+                finer.push(1.0);
+                *role_breaks = finer;
+            }
+            continue;
+        }
+        // Check the skin halfway between planes against the exact plane there.
+        let mut worst = 0.0_f64;
+        for j in 0..planes {
+            let c = -half + step * (j as f64 + 0.5);
+            let exact = wheel_tooth(&WheelPlane::new(wheel, c)?, &breaks, 0.0)?.0;
+            for role in 0..6 {
+                for (k, p) in exact[role].control_points.iter().enumerate() {
+                    let (p0, p1) = (rows[j][role].control_points[k], rows[j + 1][role].control_points[k]);
+                    let (d0, d1) = (slopes[j][role][k], slopes[j + 1][role][k]);
+                    let x = 0.5 * (p0.x + p1.x) + step * (d0[0] - d1[0]) / 8.0;
+                    let y = 0.5 * (p0.y + p1.y) + step * (d0[1] - d1[1]) / 8.0;
+                    worst = worst.max((x - p.x).hypot(y - p.y));
+                }
+            }
+        }
+        if worst > skin_tolerance {
+            if planes >= 256 {
+                return Err(refuse("gear_fit", format!("The worm wheel's flanks could not be skinned within {skin_tolerance:.2e} ({worst:.2e}).")));
+            }
+            planes *= 2;
+            continue;
+        }
+        // Rows along v for every control point of the full bottom section, keyed by its bits.
+        let sections: Vec<Vec<SectionCurve>> = rows.iter().map(|tooth| wheel_section(tooth, wheel.teeth)).collect();
+        let tau = TAU / wheel.teeth as f64;
+        let mut table: std::collections::HashMap<[u64; 4], Vec<Vec4>> = std::collections::HashMap::new();
+        let h = 1.0 / planes as f64;
+        for (index, piece) in sections[0].iter().enumerate() {
+            let (role, tooth) = (index % 6, index / 6);
+            let (s, cs) = (tau * tooth as f64).sin_cos();
+            for (k, p) in piece.curve.control_points.iter().enumerate() {
+                let mut row = Vec::with_capacity(3 * planes + 1);
+                for j in 0..=planes {
+                    let q = sections[j][index].curve.control_points[k];
+                    let d = slopes[j][role][k];
+                    // The slope in v (per unit v: face width per unit c), turned with the tooth.
+                    let dv = [wheel.face_width * (cs * d[0] - s * d[1]), wheel.face_width * (s * d[0] + cs * d[1]), wheel.face_width];
+                    let point = Vec3::new(q.x, q.y, q.z);
+                    if j > 0 {
+                        row.push(Vec4::from_point(Vec3::new(point.x - dv[0] * h / 3.0, point.y - dv[1] * h / 3.0, point.z - dv[2] * h / 3.0), 1.0));
+                    }
+                    if j == 0 || j == planes {
+                        row.push(Vec4::from_point(point, 1.0));
+                    }
+                    if j < planes {
+                        row.push(Vec4::from_point(Vec3::new(point.x + dv[0] * h / 3.0, point.y + dv[1] * h / 3.0, point.z + dv[2] * h / 3.0), 1.0));
+                    }
+                }
+                table.insert([p.x.to_bits(), p.y.to_bits(), p.z.to_bits(), p.w.to_bits()], row);
+            }
+        }
+        let mut knots_v = vec![0.0; 4];
+        for j in 1..planes {
+            let v = j as f64 * h;
+            knots_v.extend([v, v]);
+        }
+        knots_v.extend([1.0; 4]);
+        let section = GearSection { curves: sections[0].clone(), data: GearData::default() };
+        let solid = prism_by_rows(&section, 3, &knots_v, &|p: Vec4| {
+            table.get(&[p.x.to_bits(), p.y.to_bits(), p.z.to_bits(), p.w.to_bits()]).cloned().expect("a row for every section control point")
+        })?;
+        let mut names: Vec<String> = section.curves.iter().map(SectionCurve::suffix).collect();
+        names.push("F".into());
+        names.push("B".into());
+        let data = GearData {
+            pitch_diameter: 2.0 * r2,
+            tip_diameter: 2.0 * throat,
+            root_diameter: 2.0 * (r2 - wheel.dedendum * m),
+            tip_thickness: 0.0,
+            ..GearData::default()
+        };
+        return Ok((solid, names, data));
+    }
 }
 

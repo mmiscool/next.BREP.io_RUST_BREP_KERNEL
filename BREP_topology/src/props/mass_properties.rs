@@ -218,7 +218,7 @@ pub use measures::{
 };
 pub use solid_props::{
     solid_mass_properties, solid_mass_properties_full, signed_volume_against, solid_signed_volume, solid_signed_volume_for_sign,
-    solid_sign_coarse_certificate, CoarseSign, COARSE_SIGN_DEPTH,
+    solid_sign_coarse_certificate, sign_coarse_thin_enabled, CoarseSign, COARSE_SIGN_DEPTH,
 };
 pub use solid_props::shell_signed_volume;
 pub use polygons::trim_polygons;

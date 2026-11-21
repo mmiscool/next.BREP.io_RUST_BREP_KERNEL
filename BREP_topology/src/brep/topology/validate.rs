@@ -113,6 +113,14 @@ impl BrepSolid {
         let pcurve_limit = tolerances.pcurve_acceptance(model_diagonal);
         let census = pcurve_census_enabled();
         let (mut census_coedges, mut census_worst) = (0usize, 0.0f64);
+        // `BREP_PCURVE_STRICT_COUNT` (count only): coedges over each candidate
+        // kernel-built bar on the GEOMETRIC gap, and the speed-only ones
+        // (matched-parameter gap over the bar, geometric gap under it).
+        let strict = pcurve_strict_count_enabled();
+        let strict_bars = STRICT_BAR_FACTORS.map(|factor| strict_bar(factor, model_diagonal));
+        let (mut strict_read, mut strict_over, mut strict_speed_only, mut strict_unmeasured) = (0usize, [0usize; 3], [0usize; 3], 0usize);
+        let mut strict_worst = 0.0f64;
+        let mut strict_exempt = 0usize;
         // Vendor STEP files commit a vertex point and its incident edges' 3D-curve
         // endpoints as INDEPENDENT approximations that disagree by a small, roughly
         // ABSOLUTE amount (ABC 00000084/109/218 fail ONLY here: every gap clusters
@@ -276,6 +284,47 @@ impl BrepSolid {
                         ) {
                             Ok(error) => {
                                 max_pcurve_error = max_pcurve_error.max(error);
+                                if strict && (current.pcurve.is_imported() || current_edge.curve.is_imported()) {
+                                    // A pair read from a file is not the kernel's to answer for.
+                                    strict_exempt += 1;
+                                } else if strict {
+                                    strict_read += 1;
+                                    // The adaptive matched read is tolerance-steered and can
+                                    // under-read the geometric gap (1e-3 read as 2e-4 on a
+                                    // through-poles sphere trim), so the geometric read starts
+                                    // a decade under the smallest bar.
+                                    if error > 0.1 * strict_bars[0] {
+                                        let matched_at = |q: f64| pcurve.domain().ok().and_then(|[q0, q1]| coedge_sample(surface, &pcurve, &curve, current_edge, current.forward, (q - q0) / (q1 - q0)).ok()).map(|sample| sample.0);
+                                        let (geometric, unmeasured, worst_q) = geometric_pcurve_gap_at(surface, &pcurve, &curve, current_edge.t0, current_edge.t1, matched_at);
+                                        let worst_uv = pcurve.evaluate(worst_q).map(|uv| format!("{:.6},{:.6}@{:.4}", uv.x, uv.y, worst_q)).unwrap_or_default();
+                                        // A plain dense matched read (no steering) bounds the geometric gap from above.
+                                        let dense = (0..=2000).filter_map(|k| coedge_sample(surface, &pcurve, &curve, current_edge, current.forward, k as f64 / 2000.0).ok().map(|s| s.0)).fold(0.0f64, f64::max);
+                                        let at_worst = pcurve.domain().ok().and_then(|[q0, q1]| coedge_sample(surface, &pcurve, &curve, current_edge, current.forward, (worst_q - q0) / (q1 - q0)).ok()).map(|s| s.0).unwrap_or(f64::NAN);
+                                        strict_worst = strict_worst.max(geometric);
+                                        strict_unmeasured += usize::from(unmeasured > 0);
+                                        for (slot, bar) in strict_bars.iter().enumerate() {
+                                            if geometric > *bar || unmeasured > 0 {
+                                                strict_over[slot] += 1;
+                                            } else if error > *bar {
+                                                strict_speed_only[slot] += 1;
+                                            }
+                                        }
+                                        eprintln!(
+                                            "PCSTRICT coedge test={} face={} name={} kind={} edge={} gap={:.3e} geometric={:.3e} unmeasured={} diagonal={:.6e} over={} worst_uv={worst_uv} dense_matched={dense:.3e} matched_at_worst={at_worst:.3e} domain={:?}",
+                                            census_thread(),
+                                            face.id,
+                                            face.name.as_deref().unwrap_or("-").replace(' ', "_"),
+                                            surface.analytic().map(|a| a.kind_label()).unwrap_or("freeform").replace(' ', "_"),
+                                            current_edge.id,
+                                            error,
+                                            geometric,
+                                            unmeasured,
+                                            model_diagonal,
+                                            strict_bars.iter().map(|bar| if geometric > *bar || unmeasured > 0 { "G" } else if error > *bar { "s" } else { "." }).collect::<String>(),
+                                            pcurve.domain().ok(),
+                                        );
+                                    }
+                                }
                                 if census {
                                     census_coedges += 1;
                                     census_worst = census_worst.max(error);
@@ -590,6 +639,40 @@ impl BrepSolid {
                 if !used.contains(&vertex.id) {
                     issues.push(ValidationIssue::error(format!("wire vertex {} is on no edge", vertex.id)));
                 }
+            }
+        }
+        if strict {
+            eprintln!(
+                "PCSTRICT solid test={} coedges={} exempt={} worst_geometric={:.3e} diagonal={:.6e} over={:?} speed_only={:?} unmeasured={} bars={:?} accepted={}",
+                census_thread(),
+                strict_read,
+                strict_exempt,
+                strict_worst,
+                model_diagonal,
+                strict_over,
+                strict_speed_only,
+                strict_unmeasured,
+                strict_bars.map(|bar| format!("{bar:.3e}")),
+                !issues.iter().any(|issue| issue.severity == "error"),
+            );
+            // Who asked: an operation's last word on its result, or a check
+            // of a candidate it may still drop.
+            if strict_over[1] > 0 && !issues.iter().any(|issue| issue.severity == "error") {
+                let trace = std::backtrace::Backtrace::force_capture().to_string();
+                let chain: Vec<String> = trace
+                    .lines()
+                    .map(str::trim)
+                    .filter_map(|line| line.split_once(": ").map(|(_, name)| name))
+                    .filter(|name| name.starts_with("brep_") && !name.contains("::validate"))
+                    .map(|name| {
+                        let name = name.rsplit_once("::h").map_or(name, |(head, _)| head);
+                        name.splitn(2, "::").nth(1).unwrap_or(name).to_string()
+                    })
+                    .take(10)
+                    .collect();
+                #[cfg(not(test))]
+                let forced = String::new();
+                eprintln!("PCSTRICT callers test={} forced=[{forced}] chain={}", census_thread(), chain.join("<"));
             }
         }
         if census {
@@ -1902,6 +1985,72 @@ pub(crate) fn vertex_match_band(tolerances: &KernelTolerances, model_diagonal: f
 /// leave against the size-coupled acceptance limit.
 fn pcurve_census_enabled() -> bool {
     debug_flag!("BREP_PCURVE_CENSUS")
+}
+
+/// COUNT ONLY (`BREP_PCURVE_STRICT_COUNT=1`, observation, no behaviour
+/// change): the staged kernel-built edge/pcurve bar, read on the GEOMETRIC
+/// gap, at each of [`STRICT_BAR_FACTORS`] of the model diagonal (floor
+/// [`STRICT_BAR_FLOOR`]). Every validate prints one `PCSTRICT solid` line
+/// (coedges read, worst geometric gap, how many coedges each bar would
+/// refuse, how many only at matched parameters (speed-only), whether the
+/// body is accepted today), and a `PCSTRICT coedge` line for each coedge over
+/// the smallest bar at matched parameters (`over`: per bar, `G` over on the
+/// geometric gap, `s` speed-only, `.` under).
+fn pcurve_strict_count_enabled() -> bool {
+    debug_flag!("BREP_PCURVE_STRICT_COUNT")
+}
+
+/// The candidate bars, as fractions of the model diagonal, smallest first.
+const STRICT_BAR_FACTORS: [f64; 3] = [1e-5, 1e-4, 1e-3];
+/// The candidate bars' absolute floor.
+const STRICT_BAR_FLOOR: f64 = 1e-6;
+
+fn strict_bar(factor: f64, model_diagonal: f64) -> f64 {
+    STRICT_BAR_FLOOR.max(factor * model_diagonal)
+}
+
+/// The geometric edge/pcurve gap: the largest distance from a lifted pcurve
+/// point to the edge's curve on its own range `[t0, t1]`, read at 64 uniform
+/// pcurve stations plus each pcurve knot span's quarter points, with the
+/// count of stations that could not be read (never read as exact).
+/// The geometric gap and the pcurve parameter of its worst station. Each
+/// station's nearest-point read is capped by its own matched-parameter
+/// distance (`matched`), which bounds the nearest distance from above: the
+/// search's coarse candidates (257 over the range) can miss the nearest
+/// point of a long edge, and an uncapped read reported 1.8e-2 on a cylinder
+/// coedge whose matched distance at that very station was 6e-5.
+fn geometric_pcurve_gap_at(surface: &crate::NurbsSurface, pcurve: &NurbsCurve, curve: &NurbsCurve, t0: f64, t1: f64, matched: impl Fn(f64) -> Option<f64>) -> (f64, usize, f64) {
+    let Ok([q0, q1]) = pcurve.domain() else { return (f64::INFINITY, 65, f64::NAN) };
+    let mut stations: Vec<f64> = (0..=64).map(|k| q0 + (q1 - q0) * k as f64 / 64.0).collect();
+    let mut knots: Vec<f64> = pcurve.knots.iter().copied().filter(|k| *k > q0 && *k < q1).collect();
+    knots.push(q0);
+    knots.push(q1);
+    knots.sort_by(f64::total_cmp);
+    knots.dedup();
+    for pair in knots.windows(2) {
+        for quarter in 1..4 {
+            stations.push(pair[0] + (pair[1] - pair[0]) * quarter as f64 / 4.0);
+        }
+    }
+    let (mut worst, mut unmeasured, mut at) = (0.0f64, 0usize, f64::NAN);
+    for q in stations {
+        let distance = pcurve
+            .evaluate(q)
+            .ok()
+            .and_then(|uv| surface.evaluate_extended(uv.x, uv.y).ok())
+            .and_then(|point| census_distance_to_range(curve, t0, t1, point))
+            .map(|distance| matched(q).map_or(distance, |bound| distance.min(bound)));
+        match distance {
+            Some(distance) if distance.is_finite() => {
+                if distance > worst {
+                    worst = distance;
+                    at = q;
+                }
+            }
+            _ => unmeasured += 1,
+        }
+    }
+    (worst, unmeasured, at)
 }
 
 /// The running thread's name: the test's name under the test harness.

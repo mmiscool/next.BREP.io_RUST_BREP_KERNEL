@@ -33,7 +33,7 @@
 //! name, as is a corner where the open creases are not exactly three.
 use crate::topology::FaceRecord;
 use crate::{
-    boolean_operation, boolean_operation_nary, extrude_profile_brep, make_arc, make_line, make_sphere_brep_framed, project_point_to_surface,
+    boolean_operation, boolean_operation_nary, extrude_profile_brep, AnalyticSurface, make_arc, make_line, make_sphere_brep_framed, project_point_to_surface,
     solid_from_polygons, thicken_trimmed_sheet, BooleanOperation, BooleanOptions, BrepSolid, KernelRefusal, KernelStage, NurbsCurve, OffsetCorners,
     OrRefuse, Vec3,
 };
@@ -162,6 +162,10 @@ pub fn thicken_sheet_faces(faces: &[BrepSolid], thickness: f64, corners: OffsetC
 
     // the slabs, face by face
     let mut parts = Vec::new();
+    // `BREP_THICKEN_GLUE`: each part's container (a point set whose hull holds
+    // it; `None` reads a polyhedral part's own vertices), and whether the
+    // parts can be glued at all
+    let mut glueable = thicken_glue_on();
     for (_, face) in &records {
         let loops: Vec<Vec<NurbsCurve>> = face.loops.iter().map(|record| record.coedges.iter().map(|coedge| coedge.pcurve.clone()).collect()).collect();
         let along = if face.same_sense { thickness } else { -thickness };
@@ -170,10 +174,14 @@ pub fn thicken_sheet_faces(faces: &[BrepSolid], thickness: f64, corners: OffsetC
             None => past_its_ring(face, along, tolerance)?,
         };
         match wedges {
-            Some(wedges) => parts.extend(wedges),
+            Some(wedges) => {
+                glueable = false;
+                parts.extend(wedges)
+            }
             None => parts.extend(thicken_trimmed_sheet(&face.surface, &loops, along, false)?),
         }
     }
+    let mut containers: Vec<Option<Vec<Vec3>>> = vec![None; parts.len()];
 
     // the creases: two faces' uses of one edge, run opposite ways
     struct Open {
@@ -207,9 +215,11 @@ pub fn thicken_sheet_faces(faces: &[BrepSolid], thickness: f64, corners: OffsetC
             let steady = |side: &Side| side.normals.iter().all(|normal| normal.sub(side.normals[1]).length() <= 1e-9);
             if lean.abs() <= 1e-9 {
                 // the faces meet smoothly: the slabs' ends are one wall
+                glueable = false;
                 continue;
             }
             if lean > 0.0 {
+                glueable = false;
                 // the crease closes toward the thickened side. At a right angle, or wider, the
                 // slabs end on each other or overlap, and the union is the answer. Tighter than a
                 // right angle their square ends stand out behind the other face, and are cut off.
@@ -234,6 +244,7 @@ pub fn thicken_sheet_faces(faces: &[BrepSolid], thickness: f64, corners: OffsetC
                 return Err(refuse("crease_curved", format!("the crease between faces {} and {} opens toward the thickened side and is not a straight line with constant normals", a.face, b.face)));
             }
             parts.push(crease_fill(a.start, run, moved, t, corners)?);
+            containers.push(crease_container(a.start, run, moved, t));
             open.push(Open { faces: [a.face, b.face], ends: [a.start, a.end], moved });
         }
     }
@@ -265,8 +276,14 @@ pub fn thicken_sheet_faces(faces: &[BrepSolid], thickness: f64, corners: OffsetC
             return Err(refuse("corner", format!("{} open creases between {} faces meet in one corner; exactly three between three faces are built", here.len(), around.len())));
         }
         parts.push(corner_fill(point, [around[0].1, around[1].1, around[2].1], t, corners)?);
+        containers.push(corner_container(point, [around[0].1, around[1].1, around[2].1], t));
     }
 
+    if glueable && cuts.is_empty() && parts.len() > 1 {
+        if let Some(glued) = glue_parts(&parts, &containers, tolerance)? {
+            return Ok(glued);
+        }
+    }
     let united = if parts.len() == 1 { parts.remove(0) } else { boolean_operation_nary(&parts, BooleanOperation::Union)? };
     if cuts.is_empty() {
         return Ok(united);
@@ -274,6 +291,208 @@ pub fn thicken_sheet_faces(faces: &[BrepSolid], thickness: f64, corners: OffsetC
     let mut operands = vec![united];
     operands.extend(cuts);
     boolean_operation_nary(&operands, BooleanOperation::Subtract)
+}
+
+/// `BREP_THICKEN_GLUE` (default on since the tier P promotion of
+/// 2026-11-20; `=0` restores the union): the parts of a sheet thickened across
+/// open creases only (slabs, crease fills, corner fills; no closing or smooth
+/// crease, no cut, no wedge past an axis) touch only along whole faces, a
+/// slab's end against a fill's flat side, a fill's end against a corner's.
+/// Their union is then their faces with each touching pair dropped, sewn and
+/// its coplanar neighbours merged, which [`glue_parts`] builds without the
+/// union's imprint. thicken/open-box-outward-rounded: seventeen parts, about
+/// 0.38 s of its 0.57 s in the union's imprint (host).
+fn thicken_glue_on() -> bool {
+    switch!("BREP_THICKEN_GLUE", true)
+}
+
+
+/// A crease fill's container: the sharp fill's section (the start, the two
+/// moved edges' points and the point at the thickness from both faces) at both
+/// ends of the crease. The rounded section's arc lies in it (the arc's
+/// tangents at its ends meet at that point). `None` when the faces turn so far
+/// that the point runs off.
+fn crease_container(start: Vec3, run: Vec3, moved: [Vec3; 2], t: f64) -> Option<Vec<Vec3>> {
+    let turn = 1.0 + moved[0].dot(moved[1]);
+    if turn <= 1e-6 {
+        return None;
+    }
+    let section = [start, start.add(moved[0].scale(t)), start.add(moved[0].add(moved[1]).scale(t / turn)), start.add(moved[1].scale(t))];
+    Some(section.iter().flat_map(|point| [*point, point.add(run)]).collect())
+}
+
+/// A corner fill's container: the sharp corner (the corner, the three moved
+/// faces' points, the points at the thickness from two faces and from all
+/// three), which is the cone of the moved directions cut by the three planes
+/// at the thickness; the rounded fill (the ball of radius `t` in that cone)
+/// lies in it. `None` when the directions do not span space.
+fn corner_container(corner: Vec3, moved: [Vec3; 3], t: f64) -> Option<Vec<Vec3>> {
+    let [a, b, c] = moved;
+    let volume = a.dot(b.cross(c));
+    if volume.abs() <= 1e-9 {
+        return None;
+    }
+    let at = |direction: Vec3, length: f64| corner.add(direction.scale(length));
+    let mut points = vec![corner, at(b.cross(c).add(c.cross(a)).add(a.cross(b)).scale(1.0 / volume), t)];
+    for (i, j) in [(0, 1), (1, 2), (2, 0)] {
+        let turn = 1.0 + moved[i].dot(moved[j]);
+        if turn <= 1e-6 {
+            return None;
+        }
+        points.push(at(moved[i], t));
+        points.push(at(moved[i].add(moved[j]), t / turn));
+    }
+    Some(points)
+}
+
+/// [`thicken_glue_on`]: the union of `parts` read as their faces with each
+/// touching pair dropped, sewn ([`crate::solid_from_sheets`]), its
+/// coplanar neighbours merged and the edges that continue each other joined,
+/// as the boolean finishes. `None` (the caller takes the union) unless:
+/// every touching is a whole planar face of one part against a whole planar
+/// face of another, facing it, with the same corners and edge midpoints;
+/// every part touches another; no other pair of the parts' planar faces lies
+/// coplanar facing across an overlap; and every two parts are apart, their
+/// containers (`containers`, or a polyhedral part's own vertices) on the two
+/// sides of one of their planar faces' planes or of a box gap. The sewing
+/// refuses any edge left open, so a partial touching declines too.
+fn glue_parts(parts: &[BrepSolid], containers: &[Option<Vec<Vec3>>], tolerance: f64) -> Result<Option<BrepSolid>, KernelRefusal> {
+    struct Flat {
+        part: usize,
+        face: u64,
+        normal: Vec3,
+        offset: f64,
+        corners: Vec<Vec3>,
+        middles: Vec<Vec3>,
+    }
+    let stage = KernelStage::Classify;
+    let near = |a: Vec3, b: Vec3| a.sub(b).length() <= tolerance;
+    let mut flats: Vec<Flat> = Vec::new();
+    let mut hulls: Vec<Vec<Vec3>> = Vec::with_capacity(parts.len());
+    for (index, part) in parts.iter().enumerate() {
+        let edges: std::collections::HashMap<u64, &crate::topology::EdgeRecord> = part.edges.iter().map(|edge| (edge.id, edge)).collect();
+        let straight = |edge: &crate::topology::EdgeRecord| -> Result<bool, KernelRefusal> {
+            let (from, to) = (edge.curve.evaluate(edge.t0).or_refuse(stage, "thickenFaces.glue")?, edge.curve.evaluate(edge.t1).or_refuse(stage, "thickenFaces.glue")?);
+            let chord = to.sub(from);
+            let length = chord.length();
+            if length <= tolerance {
+                return Ok(false);
+            }
+            for control in &edge.curve.control_points {
+                let point = control.point().or_refuse(stage, "thickenFaces.glue")?;
+                if point.sub(from).cross(chord).length() > tolerance * length {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        let mut polyhedral = true;
+        for edge in &part.edges {
+            if !edge.degenerate && !straight(edge)? {
+                polyhedral = false;
+            }
+        }
+        for face in part.shells.iter().flat_map(|shell| &shell.faces) {
+            if !matches!(face.surface.analytic(), Some(AnalyticSurface::Plane { .. })) {
+                polyhedral = false;
+                continue;
+            }
+            if face.loops.len() != 1 {
+                continue;
+            }
+            let normal = crate::face_merge::outward_normal(face)?.normalized().or_refuse(stage, "thickenFaces.glue")?;
+            let (mut corners, mut middles) = (Vec::new(), Vec::new());
+            for coedge in &face.loops[0].coedges {
+                let edge = edges.get(&coedge.edge_id).ok_or_else(|| input("faces", "a part's face refers to a missing edge".into()))?;
+                corners.push(edge.curve.evaluate(if coedge.forward { edge.t0 } else { edge.t1 }).or_refuse(stage, "thickenFaces.glue")?);
+                middles.push(edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)).or_refuse(stage, "thickenFaces.glue")?);
+            }
+            let Some(first) = corners.first().copied() else { continue };
+            flats.push(Flat { part: index, face: face.id, normal, offset: normal.dot(first), corners, middles });
+        }
+        hulls.push(match &containers[index] {
+            Some(points) => points.clone(),
+            None if polyhedral => part.vertices.iter().map(|vertex| vertex.point).collect(),
+            None => return Ok(None),
+        });
+    }
+    let same_set = |x: &[Vec3], y: &[Vec3]| x.len() == y.len() && x.iter().all(|p| y.iter().any(|q| near(*p, *q))) && y.iter().all(|q| x.iter().any(|p| near(*p, *q)));
+    let bounds = |points: &[Vec3]| {
+        points.iter().fold(([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]), |(low, high), point| {
+            let p = [point.x, point.y, point.z];
+            (std::array::from_fn(|k| low[k].min(p[k])), std::array::from_fn(|k| high[k].max(p[k])))
+        })
+    };
+    // touching faces, each once; a coplanar pair facing across an overlap that is not one declines
+    let mut partner: Vec<Option<usize>> = vec![None; flats.len()];
+    for i in 0..flats.len() {
+        for j in i + 1..flats.len() {
+            let (f, g) = (&flats[i], &flats[j]);
+            if f.part == g.part || f.normal.dot(g.normal) > -1.0 + 1e-9 || (f.offset + g.offset).abs() > tolerance {
+                continue;
+            }
+            if same_set(&f.corners, &g.corners) && same_set(&f.middles, &g.middles) {
+                if partner[i].is_some() || partner[j].is_some() {
+                    return Ok(None);
+                }
+                partner[i] = Some(j);
+                partner[j] = Some(i);
+                continue;
+            }
+            let (low_f, high_f) = bounds(&[f.corners.as_slice(), f.middles.as_slice()].concat());
+            let (low_g, high_g) = bounds(&[g.corners.as_slice(), g.middles.as_slice()].concat());
+            let shared = (0..3).filter(|&k| high_f[k].min(high_g[k]) - low_f[k].max(low_g[k]) > tolerance).count();
+            let apart = (0..3).any(|k| high_f[k].min(high_g[k]) - low_f[k].max(low_g[k]) < -tolerance);
+            if !apart && shared >= 2 {
+                return Ok(None);
+            }
+        }
+    }
+    if (0..parts.len()).any(|index| !flats.iter().zip(&partner).any(|(flat, other)| flat.part == index && other.is_some())) {
+        return Ok(None);
+    }
+    // every two parts apart
+    for i in 0..parts.len() {
+        for j in i + 1..parts.len() {
+            let ((low_i, high_i), (low_j, high_j)) = (bounds(&hulls[i]), bounds(&hulls[j]));
+            if (0..3).any(|k| low_i[k] > high_j[k] + tolerance || low_j[k] > high_i[k] + tolerance) {
+                continue;
+            }
+            let separated = flats.iter().filter(|flat| flat.part == i || flat.part == j).any(|flat| {
+                let (own, other) = if flat.part == i { (&hulls[i], &hulls[j]) } else { (&hulls[j], &hulls[i]) };
+                own.iter().all(|point| flat.normal.dot(*point) <= flat.offset + tolerance)
+                    && other.iter().all(|point| flat.normal.dot(*point) >= flat.offset - tolerance)
+            });
+            if !separated {
+                return Ok(None);
+            }
+        }
+    }
+    let mut bodies = Vec::with_capacity(parts.len());
+    for (index, part) in parts.iter().enumerate() {
+        let dropped: std::collections::HashSet<u64> =
+            flats.iter().zip(&partner).filter(|(flat, other)| flat.part == index && other.is_some()).map(|(flat, _)| flat.face).collect();
+        let mut body = part.clone();
+        for shell in &mut body.shells {
+            shell.faces.retain(|face| !dropped.contains(&face.id));
+        }
+        body.shells.retain(|shell| !shell.faces.is_empty());
+        let used: std::collections::HashSet<u64> =
+            body.shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| &face.loops).flat_map(|record| &record.coedges).map(|coedge| coedge.edge_id).collect();
+        body.edges.retain(|edge| used.contains(&edge.id));
+        let ends: std::collections::HashSet<u64> = body.edges.iter().flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id]).collect();
+        body.vertices.retain(|vertex| ends.contains(&vertex.id));
+        body.mass_properties_cache = Default::default();
+        bodies.push(body);
+    }
+    let Ok(sewn) = crate::solid_from_sheets(&bodies, tolerance) else { return Ok(None) };
+    let Ok(merged) = crate::merge_same_surface_faces(&sewn, tolerance) else { return Ok(None) };
+    match crate::merge_curve_continuation_edges(&merged, tolerance) {
+        Ok(merged) if merged.validate().is_empty() => {
+            Ok(Some(merged))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// A whole patch of a round cylinder (an arc along u, slid straight along v)

@@ -151,6 +151,8 @@ pub mod analytic_body;
 pub mod torus_face;
 #[path = "soundness/concentric_balls.rs"]
 pub mod concentric_balls;
+#[path = "soundness/coaxial_revolution.rs"]
+pub mod coaxial_revolution;
 #[path = "soundness/tube_grid.rs"]
 pub mod tube_grid;
 #[path = "soundness/resolve.rs"]
@@ -827,6 +829,26 @@ pub fn solid_self_intersections(
         }
         return Ok(SelfIntersectionReport {
             certificate: Some("analytic_plane_cylinder"),
+            ..empty_intersection_report(options)
+        });
+    }
+    if coaxial_revolution::enabled() && coaxial_revolution::certifies(solid, options) {
+        if coaxial_revolution::check_mode() {
+            let full = solid_self_intersections_full(solid, options)?;
+            // an undecided candidate is a refusal the certificate would skip
+            if full.is_flagged() || full.undecided > 0 || full.fold_undecided > 0 || full.truncated {
+                eprintln!("soundness.coaxial_revolution DISAGREES: the full scan flags a body the certificate passed: {:?} (undecided {}, fold undecided {}, truncated {})", full.summary(), full.undecided, full.fold_undecided, full.truncated);
+            } else {
+                // one line per body certified and agreed, so a check run shows it fired
+                eprintln!("soundness.coaxial_revolution AGREES faces={}", solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
+            }
+            return Ok(full);
+        }
+        if let Some(started) = started {
+            profile_line!("soundness.profile ms={:.2} faces={} certificate=coaxial_revolution triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
+        }
+        return Ok(SelfIntersectionReport {
+            certificate: Some("coaxial_revolution"),
             ..empty_intersection_report(options)
         });
     }

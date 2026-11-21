@@ -60,9 +60,12 @@ fn rot(a: P2, angle: f64) -> P2 {
     [c * a[0] - s * a[1], s * a[0] + c * a[1]]
 }
 
-/// The motion in the plane: turns (centre, rate) applied in order.
+/// The motion in the plane: steps applied in order, each a turn (centre,
+/// rate) and a slide (velocity) beside it, `slides[k]` with `turns[k]` (a
+/// turn's slide zero, a slide's turn of rate zero).
 struct Motion {
     turns: Vec<(P2, f64)>,
+    slides: Vec<P2>,
     t0: f64,
     t1: f64,
 }
@@ -71,13 +74,19 @@ impl Motion {
     /// The pose at t: `x ↦ R(θ) x + b`, as (θ, b), and their rates.
     fn pose(&self, t: f64) -> (f64, P2, f64, P2) {
         let (mut theta, mut b, mut dtheta, mut db) = (0.0, [0.0, 0.0], 0.0, [0.0, 0.0]);
-        for &(c, w) in &self.turns {
+        for (k, &(c, w)) in self.turns.iter().enumerate() {
             // b ← R(wt)(b − c) + c; db ← R(wt) db + w J R(wt)(b − c)
             let rel = rot(sub(b, c), w * t);
             db = add(rot(db, w * t), mul([-rel[1], rel[0]], w));
             b = add(rel, c);
             theta += w * t;
             dtheta += w;
+            // A slide: b ← b + s t; db ← db + s.
+            let slide = self.slides[k];
+            if slide != [0.0, 0.0] {
+                b = add(b, mul(slide, t));
+                db = add(db, slide);
+            }
         }
         (theta, b, dtheta, db)
     }
@@ -102,12 +111,17 @@ impl Motion {
     /// b'' ← R b'' + 2wJR b' + w²J²R(b − c)).
     fn accel_bound(&self, y: P2) -> f64 {
         let (mut b, mut d1, mut d2, mut omega) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        for &(c, w) in &self.turns {
+        let span = self.t0.abs().max(self.t1.abs());
+        for (k, &(c, w)) in self.turns.iter().enumerate() {
             let arm = b + norm(c);
             d2 += 2.0 * w.abs() * d1 + w * w * arm;
             d1 += w.abs() * arm;
             b += 2.0 * norm(c);
             omega += w;
+            // A slide adds s t to b and s to b' (nothing to b'').
+            let slide = norm(self.slides[k]);
+            d1 += slide;
+            b += slide * span;
         }
         let omega = omega.abs();
         let v = omega * (norm(y) + b) + d1;
@@ -120,12 +134,17 @@ impl Motion {
     /// in [`Motion::accel_bound`]).
     fn point_rate_bounds(&self, x: P2) -> (f64, f64) {
         let (mut b, mut d1, mut d2, mut omega) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        for &(c, w) in &self.turns {
+        let span = self.t0.abs().max(self.t1.abs());
+        for (k, &(c, w)) in self.turns.iter().enumerate() {
             let arm = b + norm(c);
             d2 += 2.0 * w.abs() * d1 + w * w * arm;
             d1 += w.abs() * arm;
             b += 2.0 * norm(c);
             omega += w;
+            // A slide adds s t to b and s to b' (nothing to b'').
+            let slide = norm(self.slides[k]);
+            d1 += slide;
+            b += slide * span;
         }
         let omega = omega.abs();
         ((omega * norm(x) + d1) * (1.0 + 1e-9), (omega * omega * norm(x) + d2) * (1.0 + 1e-9))
@@ -137,7 +156,25 @@ impl Motion {
         for &(c, _) in &self.turns {
             reach += 2.0 * norm(c);
         }
-        self.turns.iter().map(|&(c, w)| w.abs() * (reach + norm(c))).sum::<f64>().max(1e-300)
+        // Slides carry points out by |s| t and move them at |s|.
+        let span = self.t0.abs().max(self.t1.abs());
+        let slid: f64 = self.slides.iter().map(|s| norm(*s)).sum();
+        if slid > 0.0 {
+            reach += slid * span;
+        }
+        let turning = self.turns.iter().map(|&(c, w)| w.abs() * (reach + norm(c))).sum::<f64>();
+        (if slid > 0.0 { turning + slid } else { turning }).max(1e-300)
+    }
+
+    /// Does the motion slide anywhere?
+    fn slides(&self) -> bool {
+        self.slides.iter().any(|s| *s != [0.0, 0.0])
+    }
+
+    /// How far its slides can carry a point (0 without slides).
+    fn slide_reach(&self) -> f64 {
+        let span = self.t0.abs().max(self.t1.abs());
+        self.slides.iter().map(|s| norm(*s) * span).sum()
     }
 }
 
@@ -356,7 +393,11 @@ impl Region<'_> {
                     continue;
                 }
                 let g = dot(gradient, xv);
-                step = step.min((g + (g * g + 2.0 * accel * d).sqrt()) / accel);
+                // The positive root of d + g s − A s²/2; approaching (g < 0)
+                // in the form without cancellation (2d over the root's
+                // conjugate), which a near-zero A would round to nothing.
+                let root = (g * g + 2.0 * accel * d).sqrt();
+                step = step.min(if g >= 0.0 { (g + root) / accel } else { 2.0 * d / (root - g) });
             }
             if inside && !touches {
                 return true;
@@ -369,6 +410,13 @@ impl Region<'_> {
         }
         true
     }
+}
+
+/// The switch for slides in the region engine's motions (default on;
+/// `BREP_SWEEP_REGION_SLIDE=0` leaves them to the level engine): a slide
+/// square to the clip's axis beside the turns (a rack rolled round its blank).
+pub fn region_slide_on() -> bool {
+    crate::switch!("BREP_SWEEP_REGION_SLIDE", true)
 }
 
 /// The switch for [`Region::inside_curved`] (default on;
@@ -464,12 +512,21 @@ fn prepare(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip) -> Result<O
         [d.dot(ex), d.dot(ey)]
     };
     let mut turns = Vec::new();
+    let mut slides = Vec::new();
     for ScrewStep { axis_origin, axis_direction, turn, advance } in &motion.steps {
         let axis = axis_direction.normalized().or_refuse(KernelStage::Collect, "step_axis")?;
+        // A slide square to the clip's axis (behind its switch): it moves
+        // the plane in itself.
+        if *turn == 0.0 && *advance != 0.0 && axis.dot(ez).abs() <= 1e-12 && region_slide_on() {
+            turns.push(([0.0, 0.0], 0.0));
+            slides.push([axis.dot(ex) * advance, axis.dot(ey) * advance]);
+            continue;
+        }
         if *advance != 0.0 || axis.cross(ez).length() > 1e-12 {
             return Ok(None);
         }
         turns.push((plane(*axis_origin), turn * axis.dot(ez).signum()));
+        slides.push([0.0, 0.0]);
     }
     // The clip's axial range must lie within the prism (as for the level engine).
     let base = clip.axis_origin.sub(*origin).dot(n);
@@ -486,7 +543,7 @@ fn prepare(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip) -> Result<O
         corners.push(plane(origin.add(xa.scale(q[0])).add(ya.scale(q[1]))));
     }
     let polygon = Polygon { corners };
-    let motion2 = Motion { turns, t0: motion.from, t1: motion.to };
+    let motion2 = Motion { turns, slides, t0: motion.from, t1: motion.to };
     // An angle range of a whole turn or more is no range.
     let angle = clip.angle.filter(|[a0, a1]| a1 - a0 < TAU);
     let clip2 = Clip { r: clip.radius, angle };
@@ -495,7 +552,7 @@ fn prepare(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip) -> Result<O
     let turns = &motion2.turns;
     if let Some(&(c0, _)) = turns.first() {
         let one = turns.iter().all(|(c, _)| norm(sub(*c, c0)) <= 1e-12 * norm(c0).max(1.0));
-        if one && turns.iter().map(|(_, w)| w).sum::<f64>().abs() <= 1e-15 * turns.iter().map(|(_, w)| w.abs()).sum::<f64>() {
+        if one && !motion2.slides() && turns.iter().map(|(_, w)| w).sum::<f64>().abs() <= 1e-15 * turns.iter().map(|(_, w)| w.abs()).sum::<f64>() {
             return Ok(None);
         }
     }
@@ -504,7 +561,7 @@ fn prepare(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip) -> Result<O
     // the probes past the tool).
     let corner_reach = polygon.corners.iter().map(|c| norm(*c)).fold(0.0f64, f64::max);
     let centres: f64 = motion2.turns.iter().map(|(c, _)| norm(*c)).sum();
-    let reach = corner_reach + 2.0 * centres;
+    let reach = if motion2.slides() { corner_reach + 2.0 * centres + motion2.slide_reach() } else { corner_reach + 2.0 * centres };
     let scale = corner_reach.max(motion2.turns.iter().map(|(c, _)| norm(*c)).fold(0.0f64, f64::max)).max(clip.radius[1].min(reach));
     if clip.radius[1] - clip.radius[0] < 1e-6 * scale {
         return Ok(None);
@@ -624,7 +681,7 @@ fn on_sweep_curve(prepared: &Prepared, pieces: &[TargetPiece], tolerance: f64) -
     let corners = &prepared.polygon.corners;
     let n = corners.len();
     let centre = motion.turns[0].0;
-    let one_centre = motion.turns.iter().all(|(c, _)| norm(sub(*c, centre)) <= 1e-12 * prepared.scale);
+    let one_centre = !motion.slides() && motion.turns.iter().all(|(c, _)| norm(sub(*c, centre)) <= 1e-12 * prepared.scale);
     let mut orbits = Vec::new();
     if one_centre {
         for k in 0..n {
@@ -859,7 +916,7 @@ fn region_loops(region: &Region) -> Result<Option<Vec<Vec<Arc>>>, KernelRefusal>
     // of a circle about it, and those at one distance coincide; each distance
     // gets one curve over the union of its arcs.
     let centre = motion.turns[0].0;
-    let one_centre = motion.turns.iter().all(|(c, _)| norm(sub(*c, centre)) <= 1e-12 * scale);
+    let one_centre = !motion.slides() && motion.turns.iter().all(|(c, _)| norm(sub(*c, centre)) <= 1e-12 * scale);
     if one_centre {
         let rate: f64 = motion.turns.iter().map(|(_, w)| w).sum();
         let mut arcs_at: Vec<(f64, f64, f64)> = Vec::new(); // (radius, angle from, angle to)
@@ -988,7 +1045,8 @@ fn region_loops(region: &Region) -> Result<Option<Vec<Vec<Arc>>>, KernelRefusal>
     // Every pose keeps the polygon within this distance of the clip's axis
     // (a turn about c moves a point by at most 2|c| further out): clip curves
     // beyond it meet nothing and are left out.
-    let reach = polygon.corners.iter().map(|c| norm(*c)).fold(0.0f64, f64::max) + 2.0 * motion.turns.iter().map(|(c, _)| norm(*c)).sum::<f64>();
+    let turned = polygon.corners.iter().map(|c| norm(*c)).fold(0.0f64, f64::max) + 2.0 * motion.turns.iter().map(|(c, _)| norm(*c)).sum::<f64>();
+    let reach = if motion.slides() { turned + motion.slide_reach() } else { turned };
     let shadowed = |r: f64| region.target.is_some_and(|t| t.shadowed.contains(&r));
     let within = |r: f64| r > 0.0 && r <= reach * (1.0 + 1e-12) && !shadowed(r);
     match clip.angle {
@@ -1501,7 +1559,7 @@ pub fn screw_section_loops(corners: Vec<[f64; 2]>, z: [f64; 2], c: f64, radius: 
         return Ok(None);
     }
     let polygon = Polygon { corners };
-    let motion = Motion { turns: vec![([0.0, 0.0], -1.0 / c)], t0: z[0], t1: z[1] };
+    let motion = Motion { turns: vec![([0.0, 0.0], -1.0 / c)], slides: vec![[0.0, 0.0]], t0: z[0], t1: z[1] };
     let clip = Clip { r: radius, angle: None };
     let corner_reach = polygon.corners.iter().map(|q| norm(*q)).fold(0.0f64, f64::max);
     let scale = corner_reach.max(radius[1].min(corner_reach));

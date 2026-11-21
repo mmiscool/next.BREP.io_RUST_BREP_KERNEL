@@ -661,6 +661,33 @@ fn refine_interior_bounded(
         let value = uv_bound + residual + 256.0 * f64::EPSILON * scale;
         Ok(value.is_finite().then_some(value))
     };
+    // A spline face reads its splits by the bound's metric and stops when a
+    // pass makes no headway (`BREP_SCAN_MESH_SPLINE`; every other bound
+    // keeps its rule): a face the passes cannot close falls back now rather
+    // than after the whole pass budget.
+    let spline = match bound {
+        crate::watertight_tessellation::scan_mesh::FaceBound::Spline(spline) => Some(spline.clone()),
+        _ => None,
+    };
+    // A boundary edge is shared with the neighbouring face and is never
+    // split, so its own sag stays. A triangle that only touches its end
+    // gets none of it as allowance, and refining toward the edge chases that
+    // sag without end: the teapot body's seam edge (0.25 of v, bound
+    // 2.9e-2 against a 4.95e-3 chord) held its corner fans at 1.29e-2 for
+    // every pass. Such a face keeps the display refinement from the start.
+    if spline.is_some() {
+        let mut pairs: Vec<(usize, usize)> = boundary_pairs.iter().copied().collect();
+        pairs.sort_unstable();
+        for (a, b) in pairs {
+            match bound_of(vertices, [a, b, b])? {
+                Some(own) if own <= chord_tolerance => {}
+                _ => return Ok(false),
+            }
+        }
+    }
+    let mut previous_count: Option<usize> = None;
+    let mut idle_passes = 0usize;
+    let mut stall_from = f64::INFINITY;
     for _ in 0..SCAN_REFINE_PASSES {
         tess_profile(|p| p.refine_passes += 1);
         let mut users: HashMap<(usize, usize), u32> = HashMap::with_capacity(triangles.len() * 2);
@@ -672,6 +699,7 @@ fn refine_interior_bounded(
         }
         let splittable = |edge: &(usize, usize)| !boundary_pairs.contains(edge) && users.get(edge) == Some(&2);
         let mut chosen: Vec<(usize, usize)> = Vec::new();
+        let mut worst_over = 0.0f64;
         for triangle in triangles.iter() {
             let Some(deviation) = bound_of(vertices, *triangle)? else {
                 return Ok(false);
@@ -692,7 +720,14 @@ fn refine_interior_bounded(
                     return Ok(false);
                 };
                 if splittable(&edge) {
-                    let rank = (edge_bound, pb.sub(pa).dot(pb.sub(pa)));
+                    let own = match &spline {
+                        Some(spline) => match spline.edge_metric(vertices[a].uv, vertices[b].uv) {
+                            Some(metric) => metric,
+                            None => return Ok(false),
+                        },
+                        None => edge_bound,
+                    };
+                    let rank = (own, pb.sub(pa).dot(pb.sub(pa)));
                     if longest.map_or(true, |(best, best_edge)| rank > best || (rank == best && edge < best_edge)) {
                         longest = Some((rank, edge));
                     }
@@ -704,11 +739,29 @@ fn refine_interior_bounded(
                 continue;
             }
             if let Some((_, edge)) = longest {
+                worst_over = worst_over.max(deviation);
                 chosen.push(edge);
             }
         }
         if chosen.is_empty() {
             return Ok(true);
+        }
+        if spline.is_some() {
+            // No headway: three passes in a row each split no fewer edges
+            // than the one before while the worst triangle over the chord
+            // fell by under 5% across them (the teapot's seam slivers creep
+            // down 1-3% a pass toward a floor above the chord). The face
+            // goes back to the display refinement then, not after the whole
+            // pass budget.
+            let no_fewer = previous_count.is_some_and(|count| chosen.len() >= count);
+            idle_passes = if no_fewer { idle_passes + 1 } else { 0 };
+            if idle_passes == 1 {
+                stall_from = worst_over;
+            }
+            if idle_passes >= 3 && worst_over >= 0.95 * stall_from {
+                return Ok(false);
+            }
+            previous_count = Some(chosen.len());
         }
         // Sorted, so the midpoint indices (and the flips' cocircular
         // tie-break) do not depend on hash order.

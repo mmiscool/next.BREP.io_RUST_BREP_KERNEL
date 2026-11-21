@@ -100,6 +100,7 @@ pub fn transform_curve(
             .map(|point| transform.homogeneous(*point))
             .collect::<Result<_, _>>()?,
     )
+    .map(|moved| moved.with_provenance_of(curve))
 }
 
 pub fn transform_surface(

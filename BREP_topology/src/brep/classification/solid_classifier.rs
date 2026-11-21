@@ -208,7 +208,7 @@ fn ray_face_intersections(
             return Ok(Vec::new());
         }
     }
-    intersect_curve_surface(sub_ray, surface, tolerance)
+    crate::curve_surface_intersection::intersect_ray_surface(sub_ray, surface, tolerance)
 }
 
 /// `BREP_CLASSIFY_RAY_CLEAR` (default on since its promotion; `=0` restores the search alone): a ray the sampled search would take against a freeform

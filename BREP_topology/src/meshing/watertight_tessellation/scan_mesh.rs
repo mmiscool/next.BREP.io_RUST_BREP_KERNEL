@@ -114,14 +114,14 @@ pub enum FaceBound {
     Spline(std::sync::Arc<SplineBound>),
 }
 
-/// `BREP_SCAN_MESH_SPLINE` (default off: on by default for a few hours on
-/// 2026-11-20, back off because the Utah teapot's soundness scan went from
-/// 0.54 to 0.91 s; `=1` enables): the scan meshes a polynomial
+/// `BREP_SCAN_MESH_SPLINE` (default on since the 2026-11-20 tier-P
+/// promotion, after the boundary sag gate made the Utah teapot neutral; `=0`
+/// restores the display refinement): the scan meshes a polynomial
 /// spline face with a SOUND deviation bound ([`SplineBound::triangle`]) in
 /// the bounded refinement, in place of the display's sampled chord and
 /// angular checks (and its rectangle grid attempt).
 pub fn spline_enabled() -> bool {
-    spline_force().unwrap_or_else(|| crate::switch!(live "BREP_SCAN_MESH_SPLINE", false))
+    spline_force().unwrap_or_else(|| crate::switch!(live "BREP_SCAN_MESH_SPLINE", true))
 }
 
 /// `BREP_SCAN_MESH_SPLINE_CHECK=1`: the scan runs twice, the spline bound
@@ -268,6 +268,18 @@ impl SplineBound {
             }
         }
         Some(Self { knots_u: ku.clone(), knots_v: kv.clone(), degree_u: p, degree_v: q, spans_v, table })
+    }
+
+    /// The length of the uv edge `a`–`b` in the bound's own metric,
+    /// `√(M_uu du² + |M_uv du dv| + M_vv dv²)` over the spans it crosses:
+    /// what a split of that edge takes out of the bound. Splitting the
+    /// longest edge in this metric shrinks a sliver across its long side;
+    /// the largest-own-bound rule could keep bisecting its short one.
+    pub fn edge_metric(&self, a: [f64; 2], b: [f64; 2]) -> Option<f64> {
+        let [muu, muv, mvv] = self.over([a[0].min(b[0]), a[0].max(b[0]), a[1].min(b[1]), a[1].max(b[1])])?;
+        let (du, dv) = (b[0] - a[0], b[1] - a[1]);
+        let value = (muu * du * du + muv * (du * dv).abs() + mvv * dv * dv).sqrt();
+        value.is_finite().then_some(value)
     }
 
     /// The largest `[M_uu, M_uv, M_vv]` over the spans meeting `[u0, u1] ×

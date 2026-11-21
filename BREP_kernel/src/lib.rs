@@ -147,7 +147,7 @@ pub use brep_boolean::mesh_segment::{
 };
 pub use brep_boolean::spherical_union::reconstruct_spherical_mesh_union;
 pub use brep_construction::solid_sweep::{
-    sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
+    clip_less_on, sweep_clip_less, sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
 };
 pub use brep_construction::gears;
 pub use brep_construction::gears::{helical_solid, Hand, HelicalGear, rack_section, rack_solid, ring_section, ring_solid, sprocket_section, sprocket_solid, spur_section, spur_solid, GearData, GearSection, Rack, RingGear, Sprocket, SprocketForm, SpurGear};

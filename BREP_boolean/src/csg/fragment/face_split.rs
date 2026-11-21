@@ -396,6 +396,93 @@ fn near_touch(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f
     if !hull(cut)?.intersects(hull(other)?, search * 8.0) {
         return None;
     }
+    if !near_touch_held_enabled() {
+        return near_touch_search(face, cut, other, search, None);
+    }
+    let held = crate::projection::HeldCurve::new(other.clone());
+    let quick = NearTouchQuick { held: &held, spans: span_hulls(other) };
+    let found = near_touch_search(face, cut, other, search, Some(&quick));
+    if near_touch_held_check() {
+        let fresh = near_touch_search(face, cut, other, search, None);
+        let bits = |found: Option<(f64, f64)>| found.map(|(a, b)| (a.to_bits(), b.to_bits()));
+        assert_eq!(bits(found), bits(fresh), "near touch held check: held {found:?} vs fresh {fresh:?}");
+    }
+    found
+}
+
+/// `BREP_NEAR_TOUCH_HELD` (default on; =0 runs the full scan with fresh projections): [`near_touch`] projects onto `other`
+/// through a [`crate::projection::HeldCurve`] (its seed samples read once, not
+/// its content hashed into the seed cache on each of the search's ~420
+/// projections; the same answers bit for bit) and its closest-approach scan
+/// projects only the samples whose distance bound from `other`'s span hulls
+/// could reach the scan's minimum. The scan's pick, the first sample at the
+/// least distance, is the same. `BREP_NEAR_TOUCH_HELD_CHECK=1` (read only with
+/// the switch on, like every check mode of a default-off switch) searches both
+/// ways and stops on any difference.
+fn near_touch_held_enabled() -> bool {
+    crate::switch!("BREP_NEAR_TOUCH_HELD", true)
+}
+
+fn near_touch_held_check() -> bool {
+    crate::switch!("BREP_NEAR_TOUCH_HELD_CHECK", false)
+}
+
+/// What the quick search holds for `other`: the held curve and the boxes of
+/// its spans' control points.
+struct NearTouchQuick<'a> {
+    held: &'a crate::projection::HeldCurve,
+    spans: Option<Vec<crate::spatial::Aabb>>,
+}
+
+/// The box of each knot span's control points. A span of a curve with finite
+/// positive weights lies in the hull of its `degree + 1` controls, so every
+/// point of the curve lies in one of these boxes; `None` when a weight or a
+/// coordinate does not allow that.
+fn span_hulls(curve: &NurbsCurve) -> Option<Vec<crate::spatial::Aabb>> {
+    let degree = curve.degree;
+    let controls = &curve.control_points;
+    if controls.iter().any(|c| !(c.w.is_finite() && c.w > 0.0 && c.x.is_finite() && c.y.is_finite() && c.z.is_finite())) {
+        return None;
+    }
+    let mut boxes = Vec::new();
+    for index in degree..controls.len() {
+        if index + 1 >= curve.knots.len() || curve.knots[index] >= curve.knots[index + 1] {
+            continue;
+        }
+        let points = controls[index - degree..=index].iter().map(|c| c.point()).collect::<Result<Vec<_>, _>>().ok()?;
+        boxes.push(crate::spatial::Aabb::from_points(points));
+    }
+    (!boxes.is_empty()).then_some(boxes)
+}
+
+/// A lower bound of the distance from `point` to any point in `boxes`,
+/// cushioned for the rounding of the gap and of an evaluated curve point
+/// (relative 1e-9 plus 64 ulps of the coordinates' size); never above the
+/// true distance from `point` to the curve the boxes hold.
+fn distance_floor(point: Vec3, boxes: &[crate::spatial::Aabb]) -> f64 {
+    let single = crate::spatial::Aabb { minimum: point, maximum: point };
+    boxes
+        .iter()
+        .map(|bounds| {
+            let gap = single.separation(*bounds);
+            let cushion = 64.0 * f64::EPSILON * (point.length() + bounds.minimum.length() + bounds.maximum.length());
+            gap * (1.0 - 1e-9) - cushion
+        })
+        .fold(f64::INFINITY, f64::min)
+        .max(0.0)
+}
+
+fn near_touch_search(
+    face: &FaceRecord,
+    cut: &NurbsCurve,
+    other: &NurbsCurve,
+    search: f64,
+    quick: Option<&NearTouchQuick>,
+) -> Option<(f64, f64)> {
+    let project = |point: Vec3| match quick {
+        Some(quick) => quick.held.project(point),
+        None => project_point_to_curve(other, point),
+    };
     let [lo, hi] = cut.domain().ok()?;
     let [other_lo, other_hi] = other.domain().ok()?;
     // A cut that ENDS on `other` has no near touch with it, and saying so
@@ -412,7 +499,7 @@ fn near_touch(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f
     // the search.
     let ends_on_other = [lo, hi].into_iter().any(|t| {
         let Ok(point) = cut.evaluate(t) else { return false };
-        let Ok(foot) = project_point_to_curve(other, point) else { return false };
+        let Ok(foot) = project(point) else { return false };
         let identity = crate::classification::surface_uv_band(&face.surface, point.x, point.y, 1e-7);
         if foot.distance > (search * 1e-3).min(identity) {
             return false;
@@ -427,7 +514,7 @@ fn near_touch(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f
     }
     let gap = |parameter: f64| -> Option<(f64, Vec3, Vec3, f64)> {
         let point = cut.evaluate(parameter).ok()?;
-        let projected = project_point_to_curve(other, point).ok()?;
+        let projected = project(point).ok()?;
         Some((projected.distance, point, projected.point, projected.u))
     };
     // A closed curve's ends are a seam, not a junction; an open one's are
@@ -442,12 +529,45 @@ fn near_touch(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f
     const SAMPLES: usize = 256;
     let step = (hi - lo) / SAMPLES as f64;
     let mut best: Option<(f64, f64)> = None;
-    for i in 0..=SAMPLES {
-        let parameter = lo + step * i as f64;
-        if let Some((distance, _, _, _)) = gap(parameter) {
-            if best.is_none_or(|(_, d)| distance < d) {
-                best = Some((parameter, distance));
+    match quick.and_then(|quick| quick.spans.as_deref()) {
+        None => {
+            for i in 0..=SAMPLES {
+                let parameter = lo + step * i as f64;
+                if let Some((distance, _, _, _)) = gap(parameter) {
+                    if best.is_none_or(|(_, d)| distance < d) {
+                        best = Some((parameter, distance));
+                    }
+                }
             }
+        }
+        Some(spans) => {
+            // The same pick: the FIRST sample at the least distance. Samples
+            // are projected in order of their distance floor until the floor
+            // passes the least distance found, so every sample left unprojected
+            // is strictly farther than the pick and cannot tie with it.
+            let mut order = Vec::with_capacity(SAMPLES + 1);
+            for i in 0..=SAMPLES {
+                let parameter = lo + step * i as f64;
+                // A sample that does not evaluate is tried as the full scan tries it.
+                let floor = cut.evaluate(parameter).map_or(0.0, |point| distance_floor(point, spans));
+                order.push((floor, i));
+            }
+            order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let mut least: Option<(usize, f64)> = None;
+            for (floor, i) in order {
+                if least.is_some_and(|(_, d)| floor > d) {
+                    break;
+                }
+                if let Some((distance, _, _, _)) = gap(lo + step * i as f64) {
+                    if distance.is_nan() {
+                        return near_touch_search(face, cut, other, search, None);
+                    }
+                    if least.is_none_or(|(j, d)| distance < d || (distance == d && i < j)) {
+                        least = Some((i, distance));
+                    }
+                }
+            }
+            best = least.map(|(i, distance)| (lo + step * i as f64, distance));
         }
     }
     let (centre, _) = best?;

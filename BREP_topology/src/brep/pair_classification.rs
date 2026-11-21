@@ -280,13 +280,51 @@ pub fn classify_surface_pair_cached(
         });
     }
 
+    let cull = classify_sample_cull_enabled();
+    let reading = sampled_classification(first, first_data, second, second_data, hull_separation, contact, angular_tolerance, cull);
+    if cull && classify_sample_cull_check() {
+        let fresh = sampled_classification(first, first_data, second, second_data, hull_separation, contact, angular_tolerance, false);
+        assert!(same_reading(&reading, &fresh), "pair sample cull check: culled {reading:?} vs fresh {fresh:?}");
+    }
+    reading
+}
+
+/// The sampled reading of a pair whose control boxes meet within `contact`:
+/// every sample of each surface projected onto the other. With `cull`, a
+/// sample is not projected when its distance to the other surface's control
+/// box already exceeds `contact` ([`provably_beyond`]): the surface lies in the
+/// convex hull of its controls (finite, positive weights), so the projection's
+/// foot, a point of the surface, is at least that far away, and the sample can
+/// be neither close nor parallel. Only `minimum_separation` can differ, and only
+/// when no sample is close (`Candidate`): it is then the least of the projected
+/// distances and the culled samples' box bounds, a lower bound of the sampled
+/// reading, which the imprint reads only for grazing pairs (that always have a
+/// close sample, so there it is the same reading).
+#[allow(clippy::too_many_arguments)]
+fn sampled_classification(
+    first: &NurbsSurface,
+    first_data: &SurfaceClassifyData,
+    second: &NurbsSurface,
+    second_data: &SurfaceClassifyData,
+    hull_separation: f64,
+    contact: f64,
+    angular_tolerance: f64,
+    cull: bool,
+) -> Result<SurfacePairClassification, String> {
     let mut minimum_separation = f64::INFINITY;
     let mut minimum_normal_cross = f64::INFINITY;
     let mut close_samples = 0usize;
     let mut parallel_close_samples = 0usize;
     let mut singular_close_sample = false;
-    for (source_data, target) in [(first_data, second), (second_data, first)] {
+    for (source_data, target, target_bounds) in [(first_data, second, second_data.bounds), (second_data, first, first_data.bounds)] {
+        let hull_holds = cull && controls_bound_the_surface(target);
         for &(_, _, point, source_normal) in &source_data.samples {
+            if hull_holds {
+                if let Some(reach) = provably_beyond(point, target_bounds, contact) {
+                    minimum_separation = minimum_separation.min(reach);
+                    continue;
+                }
+            }
             let projection = project_point_to_surface(target, point)?;
             minimum_separation = minimum_separation.min(projection.distance);
             if projection.distance > contact {
@@ -328,6 +366,54 @@ pub fn classify_surface_pair_cached(
         minimum_normal_cross,
         tangential_only: close_samples > 0 && parallel_close_samples == close_samples,
     })
+}
+
+
+
+/// Whether every control of `surface` is finite with a finite, positive weight:
+/// the premise under which the surface lies in its control box.
+fn controls_bound_the_surface(surface: &NurbsSurface) -> bool {
+    surface.control_points.iter().flatten().all(|control| {
+        control.w.is_finite() && control.w > 0.0 && control.x.is_finite() && control.y.is_finite() && control.z.is_finite()
+    })
+}
+
+/// A lower bound of `point`'s distance to any point within `bounds`, when it
+/// exceeds `contact`; `None` otherwise. The box gap is cushioned for the
+/// rounding of the gap itself and of an evaluated surface point: relative
+/// 1e-9, plus 64 ulps of the coordinates' size.
+fn provably_beyond(point: Vec3, bounds: Bounds, contact: f64) -> Option<f64> {
+    let gap = (Bounds { minimum: point, maximum: point }).separation(bounds);
+    let cushion = 64.0 * f64::EPSILON * (point.length() + bounds.minimum.length() + bounds.maximum.length());
+    let reach = gap * (1.0 - 1e-9) - cushion;
+    (reach.is_finite() && reach > contact).then_some(reach)
+}
+
+/// `BREP_CLASSIFY_SAMPLE_CULL` (default on; =0 projects every sample): the pair classifier does not
+/// project a sample its box bound already places beyond the contact band
+/// ([`sampled_classification`]); every field the kernel reads is the same.
+pub fn classify_sample_cull_enabled() -> bool {
+    crate::switch!("BREP_CLASSIFY_SAMPLE_CULL", true)
+}
+
+/// `BREP_CLASSIFY_SAMPLE_CULL_CHECK=1`: classify both ways and stop on any
+/// difference in the relation, `tangential_only` or `minimum_normal_cross`,
+/// or in `minimum_separation` of a pair that is not a `Candidate`.
+fn classify_sample_cull_check() -> bool {
+    crate::switch!("BREP_CLASSIFY_SAMPLE_CULL_CHECK", false)
+}
+
+fn same_reading(culled: &Result<SurfacePairClassification, String>, fresh: &Result<SurfacePairClassification, String>) -> bool {
+    match (culled, fresh) {
+        (Ok(a), Ok(b)) => {
+            a.relation == b.relation
+                && a.tangential_only == b.tangential_only
+                && a.minimum_normal_cross.to_bits() == b.minimum_normal_cross.to_bits()
+                && (a.relation == SurfacePairRelation::Candidate || a.minimum_separation.to_bits() == b.minimum_separation.to_bits())
+        }
+        (Err(a), Err(b)) => a == b,
+        _ => false,
+    }
 }
 
 
