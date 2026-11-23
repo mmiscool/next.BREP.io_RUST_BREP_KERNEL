@@ -466,21 +466,18 @@ fn meridian_is_straight(face: &FaceRecord, axis: &Axis, tolerance: f64) -> Resul
     Ok(meridian_is_exactly_straight(face, axis, tolerance))
 }
 
-/// A meridian reads straight only by its construction, never by samples (a
-/// bump inside one knot span, or weights that pin every station to the line,
-/// pass any sampling): the face's net must
-/// be `make_revolution` of its own generatrix about the lane's axis (points to
-/// `tolerance`, weights' ratios to 1e-12), the generatrix in one meridian
-/// half-plane, and its control points on one line of (ρ, z). With positive
-/// weights the curve lies in its controls' hull, so on that line.
-fn meridian_is_exactly_straight(face: &FaceRecord, axis: &Axis, tolerance: f64) -> bool {
+/// The generatrix of `face` when its net is exactly `make_revolution` of it
+/// about `axis` (points to `tolerance`, weights' ratios to 1e-12), every
+/// control weighted positively and in one meridian half-plane; `None`
+/// otherwise.
+fn exact_generatrix_about(face: &FaceRecord, axis: &Axis, tolerance: f64) -> Option<NurbsCurve> {
     let surface = &face.surface;
-    let Some(structure) = crate::revolution_structure(surface) else { return false };
+    let Some(structure) = crate::revolution_structure(surface) else { return None };
     if !axis.parallel(structure.frame.axis) || !axis.on_axis(structure.frame.origin, tolerance) {
-        return false;
+        return None;
     }
     let generatrix = &structure.generatrix;
-    let Ok(rebuilt) = crate::make_revolution(structure.frame.origin, structure.frame.axis, generatrix, structure.sweep) else { return false };
+    let Ok(rebuilt) = crate::make_revolution(structure.frame.origin, structure.frame.axis, generatrix, structure.sweep) else { return None };
     let same_knots = |a: &[f64], b: &[f64]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-12);
     if !same_knots(&rebuilt.knots_u, &surface.knots_u)
         || !same_knots(&rebuilt.knots_v, &surface.knots_v)
@@ -488,24 +485,24 @@ fn meridian_is_exactly_straight(face: &FaceRecord, axis: &Axis, tolerance: f64) 
         || rebuilt.degree_v != surface.degree_v
         || rebuilt.control_points.len() != surface.control_points.len()
     {
-        return false;
+        return None;
     }
     for (row, stored) in rebuilt.control_points.iter().zip(&surface.control_points) {
         if row.len() != stored.len() {
-            return false;
+            return None;
         }
         for (built, held) in row.iter().zip(stored) {
-            let (Ok(p), Ok(q)) = (built.point(), held.point()) else { return false };
+            let (Ok(p), Ok(q)) = (built.point(), held.point()) else { return None };
             if !(held.w > 0.0) || p.sub(q).length() > tolerance || (built.w - held.w).abs() > 1e-12 * held.w {
-                return false;
+                return None;
             }
         }
     }
     let mut controls = Vec::with_capacity(generatrix.control_points.len());
     for control in &generatrix.control_points {
-        let Ok(point) = control.point() else { return false };
+        let Ok(point) = control.point() else { return None };
         if !(control.w > 0.0) {
-            return false;
+            return None;
         }
         controls.push(point);
     }
@@ -514,14 +511,33 @@ fn meridian_is_exactly_straight(face: &FaceRecord, axis: &Axis, tolerance: f64) 
         let from = p.sub(axis.origin);
         from.sub(axis.axis.scale(from.dot(axis.axis)))
     };
-    let Some(reference) = controls.iter().map(|p| radial(*p)).find(|r| r.length() > tolerance) else { return false };
+    let Some(reference) = controls.iter().map(|p| radial(*p)).find(|r| r.length() > tolerance) else { return None };
     let unit = reference.scale(1.0 / reference.length());
     if controls.iter().any(|p| {
         let r = radial(*p);
         r.cross(unit).length() > tolerance || r.dot(unit) < -tolerance
     }) {
-        return false;
+        return None;
     }
+    Some(generatrix.clone())
+}
+
+/// [`exact_generatrix_about`] for an axis through `origin` along the unit `direction`.
+pub(super) fn exact_generatrix(face: &FaceRecord, origin: Vec3, direction: Vec3, tolerance: f64) -> Option<NurbsCurve> {
+    let x = direction.perpendicular().ok()?;
+    exact_generatrix_about(face, &Axis { origin, axis: direction, x }, tolerance)
+}
+
+/// A meridian reads straight only by its construction, never by samples (a
+/// bump inside one knot span, or weights that pin every station to the line,
+/// pass any sampling): the face's net must
+/// be `make_revolution` of its own generatrix about the lane's axis (points to
+/// `tolerance`, weights' ratios to 1e-12), the generatrix in one meridian
+/// half-plane, and its control points on one line of (ρ, z). With positive
+/// weights the curve lies in its controls' hull, so on that line.
+fn meridian_is_exactly_straight(face: &FaceRecord, axis: &Axis, tolerance: f64) -> bool {
+    let Some(generatrix) = exact_generatrix_about(face, axis, tolerance) else { return false };
+    let controls: Vec<Vec3> = generatrix.control_points.iter().filter_map(|control| control.point().ok()).collect();
     let points: Vec<P2> = controls.iter().map(|p| axis.to_2d(*p)).collect();
     let (mut a, mut b, mut span) = (points[0], points[0], 0.0);
     for p in &points {
@@ -1004,7 +1020,8 @@ fn holds_the_distance(grown: &[Piece], chain: &[Piece], distance: f64, scale: f6
     true
 }
 
-/// `BREP_OFFSET_REVOLVED_TRIMMED` (default off): where the walk declines (a
+/// `BREP_OFFSET_REVOLVED_TRIMMED` (default on since the tier P promotion of
+/// 2026-11-21; `=0` restores the walk alone): where the walk declines (a
 /// concave corner, or growths that meet across a gap, such as a groove
 /// narrower than twice the distance) or the rims are arcs, the grown
 /// half-section is read whole. It is the boundary of the section's points
@@ -1017,7 +1034,7 @@ fn holds_the_distance(grown: &[Piece], chain: &[Piece], distance: f64, scale: f6
 /// ambiguous join, a second loop (a sealed void) or two kept pieces that come
 /// close away from their join all decline.
 fn trimmed_growth_on() -> bool {
-    switch!("BREP_OFFSET_REVOLVED_TRIMMED", false)
+    switch!("BREP_OFFSET_REVOLVED_TRIMMED", true)
 }
 
 

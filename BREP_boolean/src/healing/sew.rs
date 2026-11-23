@@ -537,6 +537,18 @@ fn sew_solid_with_search(
     tolerance: f64,
     search: PairSearch,
 ) -> Result<(BrepSolid, SewReport, usize), KernelRefusal> {
+    sew_solid_with_pattern(solid, tolerance, search, None)
+}
+
+/// [`sew_solid_with_search`] told, by [`sew_rotated_copies`], that `solid`
+/// is rotated copies of one cell ([`PatternHint`]), so that the orientation
+/// may be read from one copy ([`sew_sign_by_pattern`]).
+fn sew_solid_with_pattern(
+    solid: &BrepSolid,
+    tolerance: f64,
+    search: PairSearch,
+    pattern: Option<&PatternHint>,
+) -> Result<(BrepSolid, SewReport, usize), KernelRefusal> {
     if !(tolerance.is_finite() && tolerance > 0.0) {
         return Err(KernelRefusal::input(KernelStage::Collect, "tolerance", "sew_solid: tolerance must be positive"));
     }
@@ -687,10 +699,39 @@ fn sew_solid_with_search(
         // Components can arrive arbitrarily flipped; make the coedge
         // directions coherent across the shared edges, then restore outward
         // normals by signed volume.
+        // Each face's sense before orientation, for the pattern reading only.
+        let senses: HashMap<u64, bool> = if pattern.is_some() {
+            result.shells.iter().flat_map(|shell| &shell.faces).map(|face| (face.id, face.same_sense)).collect()
+        } else {
+            HashMap::default()
+        };
         orient_open_solid_faces(&mut result)?;
         let bar = tolerance * tolerance * tolerance;
         let check = sew_sign_reading_check();
-        let reading = sew_sign_by_reading(&result, bar, check);
+        let by_pattern = match (pattern, sew_pattern_sign_mode()) {
+            (Some(hint), crate::env_read::Mode::On) if !check => sew_sign_by_pattern(&result, &senses, hint, bar),
+            (Some(hint), crate::env_read::Mode::Check) => {
+                // Held to the full integral: a verdict it gives must be the
+                // integral's, and the integral must clear the bar.
+                let started = web_time::Instant::now();
+                let pattern_reading = sew_sign_by_pattern(&result, &senses, hint, bar);
+                let ms = started.elapsed().as_secs_f64() * 1e3;
+                let volume = solid_signed_volume(&result).ok();
+                let exact = volume.filter(|volume| volume.abs() > bar).map(|volume| volume < 0.0);
+                let verdict = |flip: Option<bool>| match flip { Some(false) => "outward", Some(true) => "flipped", None => "none" };
+                eprintln!(
+                    "sew.sign_pattern{} pattern={} exact={} volume={:.6e} copies={} ms={ms:.3}",
+                    if pattern_reading.is_some() && pattern_reading != exact { " DISAGREE" } else { "" },
+                    verdict(pattern_reading),
+                    verdict(exact),
+                    volume.unwrap_or(f64::NAN),
+                    hint.count,
+                );
+                None
+            }
+            _ => None,
+        };
+        let reading = by_pattern.or_else(|| sew_sign_by_reading(&result, bar, check));
         match reading {
             Some(flip) if !check => {
                 if flip {
@@ -789,6 +830,266 @@ fn sew_solid_with_search(
 /// their bar, so against `-bar` it is the reading itself that decides; an
 /// inside-out sew pays for both. `check` reads it even with the switch off
 /// (the caller then still integrates and compares).
+/// What [`sew_rotated_copies`] tells the sew about its soup: face `f` of the
+/// cell is face `f + (k + 1) * span` of copy `k`, every copy turned about the
+/// axis through `axis_origin`, and the copies make one full turn.
+struct PatternHint {
+    /// The cell's kept face ids, in the cell's order.
+    kept: Vec<u64>,
+    span: u64,
+    count: usize,
+    axis_origin: Vec3,
+    full_turn: bool,
+}
+
+/// `BREP_SEW_PATTERN_SIGN` (default on since 2026-11-21: check mode agreed on
+/// every caller, the bench's two hobbed gears, and it reaches nothing but
+/// [`sew_rotated_copies`]; `0` off, `check` reads it beside the
+/// full integral and prints one `sew.sign_pattern` line per sew, ` DISAGREE`
+/// where it decides otherwise): [`sew_rotated_copies`] reads the sewn
+/// pattern's orientation from one copy ([`sew_sign_by_pattern`]).
+fn sew_pattern_sign_mode() -> crate::env_read::Mode {
+    crate::mode_switch!("BREP_SEW_PATTERN_SIGN", true)
+}
+
+/// The sewn pattern's orientation read from ONE copy: `Some(true)` to flip,
+/// `Some(false)` to keep, `None` to leave it to the readings as before.
+///
+/// A face's volume term about a point `p`, `(1/3) ∫ (S − p) · N dA`, is
+/// unchanged when the face is turned about an axis through `p`: the turn
+/// moves `S − p` and `N` alike. So when every copy's SEWN faces are copy 0's
+/// sewn faces turned (and the copies close one full turn), the solid's signed
+/// volume is `count` times the sum of copy 0's terms about a point on the axis.
+/// That is checked, cheaply and by provenance, before it is used:
+/// - one shell, every non-degenerate edge used twice (closed);
+/// - `orient_open_solid_faces` flipped no face, or every face (a mixed flip
+///   would make the copies differ in sense);
+/// - every sewn face belongs to exactly one copy by its id offset, each copy
+///   holds every kept face once, and each face of copy `k` matches its copy-0
+///   face in carrier degrees, control net size, sense, loop count and every
+///   loop's coedge count (a face the sew merged, split or re-trimmed across a
+///   copy boundary breaks this and falls back);
+/// - the copies are turns in floating point and their sewn trims re-project
+///   per copy, so the reading decides only when `count · Σ` clears the bar by
+///   `1e-2` of `count · Σ |term|` (orders of magnitude above that rounding,
+///   and above the trimmed integrator's known loop-start sensitivity).
+fn sew_sign_by_pattern(result: &BrepSolid, senses: &HashMap<u64, bool>, hint: &PatternHint, bar: f64) -> Option<bool> {
+    if !hint.full_turn || hint.count == 0 || hint.kept.is_empty() {
+        return None;
+    }
+    let [shell] = result.shells.as_slice() else {
+        return None;
+    };
+    let degenerate: HashSet<u64> = result.edges.iter().filter(|edge| edge.degenerate).map(|edge| edge.id).collect();
+    let mut uses = HashMap::<u64, usize>::default();
+    for coedge in shell.faces.iter().flat_map(|face| &face.loops).flat_map(|loop_record| &loop_record.coedges) {
+        if !degenerate.contains(&coedge.edge_id) {
+            *uses.entry(coedge.edge_id).or_default() += 1;
+        }
+    }
+    if uses.values().any(|&count| count != 2) {
+        return None;
+    }
+    let flipped = shell.faces.iter().filter(|face| senses.get(&face.id).is_some_and(|&sense| sense != face.same_sense)).count();
+    if shell.faces.iter().any(|face| !senses.contains_key(&face.id)) || (flipped != 0 && flipped != shell.faces.len()) {
+        return None;
+    }
+    if shell.faces.len() != hint.count * hint.kept.len() {
+        return None;
+    }
+    let by_id: HashMap<u64, &FaceRecord> = shell.faces.iter().map(|face| (face.id, face)).collect();
+    let shape = |face: &FaceRecord| {
+        (
+            face.surface.degree_u,
+            face.surface.degree_v,
+            face.surface.control_points.len(),
+            face.surface.control_points.first().map_or(0, Vec::len),
+            face.same_sense,
+            face.loops.iter().map(|loop_record| loop_record.coedges.len()).collect::<Vec<_>>(),
+        )
+    };
+    let mut sum = 0.0f64;
+    let mut magnitude = 0.0f64;
+    for &kept in &hint.kept {
+        let first = by_id.get(&(kept + hint.span))?;
+        let first_shape = shape(first);
+        for k in 1..hint.count as u64 {
+            let copy = by_id.get(&(kept + (k + 1) * hint.span))?;
+            if shape(copy) != first_shape {
+                return None;
+            }
+        }
+        let terms = crate::mass_properties::face_volume_terms_about(first, hint.axis_origin).ok()?;
+        if !terms[0].is_finite() {
+            return None;
+        }
+        sum += terms[0];
+        magnitude += terms[0].abs();
+    }
+    let count = hint.count as f64;
+    let (volume, margin) = (count * sum, bar + 1e-2 * count * magnitude);
+    if !(volume.is_finite() && margin.is_finite()) {
+        None
+    } else if volume > margin {
+        Some(false)
+    } else if volume < -margin {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Sew `count` copies of `cell`'s faces `kept_faces`, copy `k` turned by
+/// `k · step` (radians, right-handed about `axis_direction`) about the axis
+/// through `axis_origin`, into one solid: the faces left out are the cell's
+/// faces on the surfaces dividing it from its neighbours, where a copy meets
+/// the next. The soup is the cell's kept faces per copy, ids offset per copy
+/// by one span past the cell's largest id (copy `k` by `(k + 1) · span`),
+/// with the edges and vertices they use, sewn as [`sew_solid`] sews.
+/// Beside the solid and its report, the result's face ids by copy (copy `k`
+/// at index `k`, each in the cell's face order).
+///
+/// The orientation: with `BREP_SEW_PATTERN_SIGN` (default on) and `count · step` one
+/// full turn, it is read from one copy ([`sew_sign_by_pattern`]), else as
+/// [`sew_solid`] reads it. About the z axis through the origin each turn is
+/// the matrix `[c −s 0 0; s c 0 0; 0 0 1 0]` of `(s, c) = (k·step).sin_cos()`.
+///
+/// Refused: a cell that is not a plain solid of one shell (a cellular body's
+/// regions would name the cell's ids), no kept face, a kept id the cell
+/// lacks, a zero count, a non-finite or zero axis, a non-finite step, or ids
+/// too large for `count + 1` spans.
+pub fn sew_rotated_copies(
+    cell: &BrepSolid,
+    kept_faces: &[u64],
+    axis_origin: Vec3,
+    axis_direction: Vec3,
+    step: f64,
+    count: usize,
+    tolerance: f64,
+) -> Result<(BrepSolid, SewReport, Vec<Vec<u64>>), KernelRefusal> {
+    let refuse = |what: &'static str, why: String| Err(KernelRefusal::input(KernelStage::Collect, what, why));
+    let [shell] = cell.shells.as_slice() else {
+        return refuse("cell", "sew_rotated_copies: the cell is not one shell".into());
+    };
+    if cell.kind != crate::BodyKind::Solid || !cell.cells.is_empty() {
+        return refuse("cell", "sew_rotated_copies: the cell is not a plain solid".into());
+    }
+    if kept_faces.is_empty() {
+        return refuse("kept_faces", "sew_rotated_copies: no face of the cell is kept".into());
+    }
+    if let Some(missing) = kept_faces.iter().find(|&&id| !shell.faces.iter().any(|face| face.id == id)) {
+        return refuse("kept_faces", format!("sew_rotated_copies: the cell has no face {missing}"));
+    }
+    if count == 0 {
+        return refuse("count", "sew_rotated_copies: count must be at least one".into());
+    }
+    if !step.is_finite() || ![axis_origin.x, axis_origin.y, axis_origin.z].iter().all(|v| v.is_finite()) {
+        return refuse("step", "sew_rotated_copies: the step and the axis origin must be finite".into());
+    }
+    // Scaled to its largest component first, so that no square overflows.
+    let largest = axis_direction.x.abs().max(axis_direction.y.abs()).max(axis_direction.z.abs());
+    let axis = (largest > 0.0 && largest.is_finite())
+        .then(|| Vec3::new(axis_direction.x / largest, axis_direction.y / largest, axis_direction.z / largest).normalized().ok())
+        .flatten()
+        .filter(|axis| (axis.length() - 1.0).abs() <= 1e-12);
+    let Some(axis) = axis else {
+        return refuse("axis_direction", "sew_rotated_copies: the axis direction must be a finite, non-zero vector".into());
+    };
+    let along_z = axis_direction.x == 0.0 && axis_direction.y == 0.0 && axis_direction.z > 0.0;
+    let turn = |angle: f64| -> Result<crate::transform_topology::AffineTransform, KernelRefusal> {
+        let (s, c) = angle.sin_cos();
+        let r = if along_z {
+            [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+        } else {
+            let (x, y, z) = (axis.x, axis.y, axis.z);
+            let t = 1.0 - c;
+            [
+                [c + t * x * x, t * x * y - s * z, t * x * z + s * y],
+                [t * x * y + s * z, c + t * y * y, t * y * z - s * x],
+                [t * x * z - s * y, t * y * z + s * x, c + t * z * z],
+            ]
+        };
+        let o = axis_origin;
+        let moved = |row: [f64; 3]| row[0] * o.x + row[1] * o.y + row[2] * o.z;
+        let shift = if o.x == 0.0 && o.y == 0.0 && o.z == 0.0 {
+            [0.0; 3]
+        } else {
+            [o.x - moved(r[0]), o.y - moved(r[1]), o.z - moved(r[2])]
+        };
+        crate::transform_topology::AffineTransform::new([
+            r[0][0], r[0][1], r[0][2], shift[0], //
+            r[1][0], r[1][1], r[1][2], shift[1], //
+            r[2][0], r[2][1], r[2][2], shift[2], //
+            0.0, 0.0, 0.0, 1.0,
+        ])
+        .map_err(|why| KernelRefusal::input(KernelStage::Collect, "step", format!("sew_rotated_copies: {why}")))
+    };
+    let kept: Vec<u64> = shell.faces.iter().map(|face| face.id).filter(|id| kept_faces.contains(id)).collect();
+    let kept_set: HashSet<u64> = kept.iter().copied().collect();
+    let largest_id = cell
+        .vertices
+        .iter()
+        .map(|vertex| vertex.id)
+        .chain(cell.edges.iter().map(|edge| edge.id))
+        .chain(shell.faces.iter().flat_map(|face| {
+            std::iter::once(face.id).chain(face.loops.iter().flat_map(|loop_record| {
+                std::iter::once(loop_record.id).chain(loop_record.coedges.iter().map(|coedge| coedge.id))
+            }))
+        }))
+        .max()
+        .unwrap_or(0);
+    // Every id of copy k is below (k + 2) * span: count + 1 spans must fit.
+    let spans = (count as u64).checked_add(1);
+    let Some(span) = largest_id.checked_add(1).filter(|span| spans.is_some_and(|spans| span.checked_mul(spans).is_some())) else {
+        return refuse("cell", "sew_rotated_copies: the cell's ids are too large for this many copies".into());
+    };
+    let mut soup = cell.clone();
+    soup.shells[0].faces.clear();
+    soup.vertices.clear();
+    soup.edges.clear();
+    for k in 0..count as u64 {
+        let copy = crate::transform_topology::transform_brep(cell, turn(step * k as f64)?, false)
+            .map_err(|why| KernelRefusal::internal(KernelStage::Collect, "transform", format!("sew_rotated_copies: {why}")))?;
+        let offset = (k + 1) * span;
+        let mut used_edges = HashSet::default();
+        for face in copy.shells[0].faces.iter().filter(|face| kept_set.contains(&face.id)) {
+            let mut face = face.clone();
+            face.id += offset;
+            for loop_record in &mut face.loops {
+                loop_record.id += offset;
+                for coedge in &mut loop_record.coedges {
+                    used_edges.insert(coedge.edge_id);
+                    coedge.id += offset;
+                    coedge.edge_id += offset;
+                }
+            }
+            soup.shells[0].faces.push(face);
+        }
+        let mut used_vertices = HashSet::default();
+        for edge in copy.edges.iter().filter(|edge| used_edges.contains(&edge.id)) {
+            let mut edge = edge.clone();
+            used_vertices.extend([edge.start_vertex_id, edge.end_vertex_id]);
+            edge.id += offset;
+            edge.start_vertex_id += offset;
+            edge.end_vertex_id += offset;
+            soup.edges.push(edge);
+        }
+        for vertex in copy.vertices.iter().filter(|vertex| used_vertices.contains(&vertex.id)) {
+            let mut vertex = vertex.clone();
+            vertex.id += offset;
+            soup.vertices.push(vertex);
+        }
+    }
+    let full_turn = ((count as f64) * step.abs() - std::f64::consts::TAU).abs() <= 1e-9 * std::f64::consts::TAU;
+    let hint = PatternHint { kept: kept.clone(), span, count, axis_origin, full_turn };
+    let (sewn, report, _) = sew_solid_with_pattern(&soup, tolerance, PairSearch::Hashed, Some(&hint))?;
+    let present: HashSet<u64> = sewn.shells.iter().flat_map(|shell| &shell.faces).map(|face| face.id).collect();
+    let copy_faces = (0..count as u64)
+        .map(|k| kept.iter().map(|id| id + (k + 1) * span).filter(|id| present.contains(id)).collect())
+        .collect();
+    Ok((sewn, report, copy_faces))
+}
+
 fn sew_sign_by_reading(solid: &BrepSolid, bar: f64, check: bool) -> Option<bool> {
     if !(check || sew_sign_reading_enabled()) || !(bar > 0.0) || !bar.is_finite() {
         return None;

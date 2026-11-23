@@ -70,6 +70,67 @@ pub fn split_solid_by_plane(
     plane_point: Vec3,
     plane_normal: Vec3,
 ) -> Result<(BrepSolid, BrepSolid), String> {
+    let options = BooleanOptions::default();
+    let cut = |cover: f64| -> Result<_, String> {
+        let (tool_below, tool_above) = plane_tools(solid, plane_point, plane_normal, cover)?;
+        Ok((
+            boolean_operation(solid, &tool_below, BooleanOperation::Intersect, &options),
+            boolean_operation(solid, &tool_above, BooleanOperation::Intersect, &options),
+        ))
+    };
+    // Three diagonals first, as every caller has read the pieces' cap
+    // carriers. Where that cut fails, a box 1.2 diagonals across, which still
+    // covers the solid: the wider cut face resolves small sections on it
+    // coarser, and a ball 1.8e-4 wider than its rod, a plate with a grid of
+    // holes and a chain of links each came back from the 3x box with an open
+    // loop and cut cleanly at 1.2x.
+    let (mut below, mut above) = cut(3.0)?;
+    if below.is_err() || above.is_err() {
+        (below, above) = cut(1.2)?;
+    }
+
+    match (below, above) {
+        (Ok(below), Ok(above)) if !is_empty_piece(&below) && !is_empty_piece(&above) => {
+            Ok((below, above))
+        }
+        _ => Err("split_solid_by_plane: plane does not intersect the solid".into()),
+    }
+}
+
+/// The piece of `solid` on one side of the plane through `plane_point` with
+/// normal `plane_normal`: the −n side when `above` is false, the +n side when
+/// it is true. The cutting box spans `cover` times the diagonal of the
+/// solid's control-point box (at least 1; [`split_solid_by_plane`] uses 3),
+/// centred on that box's centre projected onto the plane, so it covers every
+/// part of the solid on its side whenever the plane meets that box.
+/// `Ok(None)` when nothing of the solid lies on that side; an error only when
+/// the cut itself fails, so a caller can tell a plane that misses from a
+/// boolean that declined (which [`split_solid_by_plane`] reports alike).
+pub fn solid_piece_by_plane(
+    solid: &BrepSolid,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+    above: bool,
+    cover: f64,
+) -> Result<Option<BrepSolid>, String> {
+    if !(cover >= 1.0 && cover.is_finite()) {
+        return Err("solid_piece_by_plane: the cover must be at least 1".into());
+    }
+    let (tool_below, tool_above) = plane_tools(solid, plane_point, plane_normal, cover)?;
+    let tool = if above { tool_above } else { tool_below };
+    let piece = boolean_operation(solid, &tool, BooleanOperation::Intersect, &BooleanOptions::default())
+        .map_err(|error| format!("solid_piece_by_plane: {error}"))?;
+    Ok((!is_empty_piece(&piece)).then_some(piece))
+}
+
+/// The two half-space tool boxes of a plane cut of `solid`, each `cover`
+/// times the solid's diagonal on a side: (below, above).
+fn plane_tools(
+    solid: &BrepSolid,
+    plane_point: Vec3,
+    plane_normal: Vec3,
+    cover: f64,
+) -> Result<(BrepSolid, BrepSolid), String> {
     let n = plane_normal.normalized()?;
     // Orthonormal frame (n, u, v): u ⟂ n (unit), v = n × u (unit); [u v n] is
     // right-handed so the tool placement is a proper rotation.
@@ -84,9 +145,9 @@ pub fn split_solid_by_plane(
     if diagonal <= 0.0 {
         return Err("split_solid_by_plane: solid is degenerate".into());
     }
-    // A tool box 3× the solid diagonal on every side easily covers the body in
-    // the plane's tangent directions.
-    let length = 3.0 * diagonal;
+    // A tool box `cover` × the solid diagonal on every side (3× for the
+    // split) covers the body in the plane's tangent directions.
+    let length = cover * diagonal;
     let half = 0.5 * length;
 
     // Centre the tool in the tangent (u, v) plane on the projection of the AABB
@@ -107,17 +168,7 @@ pub fn split_solid_by_plane(
     // ABOVE: mirror to the +n side (centre at plane + n·half).
     let above_center = center_on_plane.add(n.scale(half));
     let tool_above = transform_brep(&cube, frame_transform(u, v, n, above_center)?, false)?;
-
-    let options = BooleanOptions::default();
-    let below = boolean_operation(solid, &tool_below, BooleanOperation::Intersect, &options);
-    let above = boolean_operation(solid, &tool_above, BooleanOperation::Intersect, &options);
-
-    match (below, above) {
-        (Ok(below), Ok(above)) if !is_empty_piece(&below) && !is_empty_piece(&above) => {
-            Ok((below, above))
-        }
-        _ => Err("split_solid_by_plane: plane does not intersect the solid".into()),
-    }
+    Ok((tool_below, tool_above))
 }
 
 // ---------------------------------------------------------------------------

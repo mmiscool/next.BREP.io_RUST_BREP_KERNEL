@@ -45,19 +45,39 @@ pub use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};
 
 #[path = "fillet/analyze.rs"]
 pub mod analyze;
+#[path = "fillet/g2_prism.rs"]
+mod g2_prism;
+#[path = "fillet/faces.rs"]
+mod faces;
+pub use faces::fillet_faces;
+#[path = "fillet/full_round.rs"]
+mod full_round;
+#[path = "fillet/parallel_walls.rs"]
+mod parallel_walls;
+#[path = "fillet/chamfer_extent.rs"]
+mod chamfer_extent;
+pub use parallel_walls::{pinch_refusal, PARALLEL_WALL_LIMIT_WHAT};
+pub use full_round::full_round;
+#[path = "fillet/linear_asym.rs"]
+mod linear_asym;
+pub use linear_asym::chamfer_edges_asymmetric_linear;
 #[path = "fillet/chamfer_star.rs"]
 mod chamfer_star;
 #[path = "fillet/edges.rs"]
 pub mod edges;
+#[path = "fillet/planar_clip.rs"]
+mod planar_clip;
 #[path = "fillet/tool.rs"]
 pub mod tool;
+#[path = "fillet/vanishing.rs"]
+mod vanishing;
 #[path = "fillet/spine_first.rs"]
 mod spine_first;
 
 pub use edges::{
     chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,
-    chamfer_edges_asymmetric, fillet_edge, fillet_edge_conic, fillet_edges, fillet_edges_conic, fillet_edges_reported, fillet_edges_reported_at_offset,
-    fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
+    chamfer_edges_asymmetric, fillet_edge, fillet_edge_conic, fillet_edges, fillet_edges_conic, fillet_edges_conic_distances, fillet_edges_conic_setback, fillet_edges_reported, fillet_edges_reported_at_offset,
+    fillet_edge_g2, fillet_edges_g2, fillet_edges_radii, fillet_edges_setback, fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
     BlendSelection,
 };
 pub use analyze::into_face_direction;

@@ -78,12 +78,12 @@ fn across(axis: Vec3) -> (Vec3, Vec3) {
     (first, axis.cross(first))
 }
 
-/// The straight bores of `source` of radius at most `distance`, open at both ends.
-fn bores(source: &BrepSolid, distance: f64, scale: f64) -> Vec<Bore> {
+/// The straight bores of `source` whose radius `keep` admits, open at an end.
+fn bores(source: &BrepSolid, scale: f64, keep: impl Fn(f64) -> bool) -> Vec<Bore> {
     let mut found: Vec<Bore> = Vec::new();
     for face in source.shells.iter().flat_map(|shell| &shell.faces) {
         let Some((origin, axis, radius)) = cylinder_of(&face.surface) else { continue };
-        if !(radius > 0.0 && radius <= distance * (1.0 + 1e-9)) {
+        if !(radius > 0.0 && keep(radius)) {
             continue;
         }
         let axial = |p: Vec3| p.sub(origin).dot(axis);
@@ -178,6 +178,21 @@ fn flat_end(source: &BrepSolid, bore: &Bore, t: f64, out: Vec3, distance: f64, s
 /// read by its edges other than the rim: the rim is the dimple's cause, and the
 /// face's region is the end plane itself, at height zero under the dimple.
 fn clear_of_others(source: &BrepSolid, bore: &Bore, t: f64, out: Vec3, distance: f64, scale: f64) -> bool {
+    reach_of_others(source, bore, t, out, distance, scale, false)
+}
+
+/// [`clear_of_others`], except that, where `beside` is set, a straight edge
+/// of the end face lying in the end plane (a plate's outer edge beside the
+/// bore), and a planar side square to the end plane, wholly on the body's
+/// side of it and within the span of its own end-plane edge, are passed over
+/// however near: neither is ever nearer a dimple point than the rim is. A
+/// dimple point lies over the rim's disc (ρ < r) at height h > 0; such an
+/// edge's points lie in the end plane outside the rim (ρ ≥ r), so their
+/// horizontal distance is at least r − ρ and their height the same h, and a
+/// side's nearest point past the plane is on its end-plane edge. So the
+/// dimple is the growth's void whatever they are. Anything else within
+/// `distance` declines.
+fn reach_of_others(source: &BrepSolid, bore: &Bore, t: f64, out: Vec3, distance: f64, scale: f64, beside: bool) -> bool {
     let (x, y) = across(bore.axis);
     let centre = bore.origin.add(bore.axis.scale(t));
     let gap = |p: Vec3| {
@@ -280,6 +295,24 @@ fn clear_of_others(source: &BrepSolid, bore: &Bore, t: f64, out: Vec3, distance:
             })
         })
     };
+    // A straight edge in the end plane: its two ends, both at height zero
+    // (and its middle, so a curve through them is not read as one).
+    let height = |p: Vec3| p.sub(centre).dot(out);
+    // The segment is the edge's own, between its vertices (its carrier may
+    // run past them).
+    let in_plane_segment = |edge: &crate::topology::EdgeRecord| -> Option<(Vec3, Vec3)> {
+        edge.curve.straight_segment(1e-9 * scale)?;
+        let vertex = |id: u64| source.vertices.iter().find(|v| v.id == id).map(|v| v.point);
+        let segment = (vertex(edge.start_vertex_id)?, vertex(edge.end_vertex_id)?);
+        let middle = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)).ok()?;
+        let on_chord = {
+            let (a, b) = segment;
+            let along = b.sub(a);
+            let length = along.length();
+            length > 0.0 && middle.sub(a).sub(along.scale(middle.sub(a).dot(along) / (length * length))).length() <= 1e-9 * scale
+        };
+        (on_chord && [segment.0, segment.1, middle].iter().all(|p| height(*p).abs() <= 1e-9 * scale)).then_some(segment)
+    };
     for face in source.shells.iter().flat_map(|shell| &shell.faces) {
         if bore.faces.contains(&face.id) {
             continue;
@@ -289,13 +322,49 @@ fn clear_of_others(source: &BrepSolid, bore: &Bore, t: f64, out: Vec3, distance:
         // the dimple, and its boundary elsewhere is what could come near). Every other face is
         // read by its whole untrimmed surface, which holds the face.
         let edges = face_edges(source, face);
-        let owns_rim = matches!(face.surface.analytic(), Some(AnalyticSurface::Plane { .. })) && edges.iter().any(|edge| on_rim(edge));
-        let clear = if owns_rim {
-            edges.iter().filter(|edge| !on_rim(edge)).all(|edge| edge_clear(edge))
-        } else {
-            surface_clear(&face.surface)
+        let planar = matches!(face.surface.analytic(), Some(AnalyticSurface::Plane { .. }));
+        let owns_rim = planar && edges.iter().any(|edge| on_rim(edge));
+        if owns_rim {
+            for edge in edges.iter().filter(|edge| !on_rim(edge)) {
+                if edge_clear(edge) {
+                    continue;
+                }
+                if !(beside && in_plane_segment(edge).is_some()) {
+                    os_debug!("bore dimples: edge {} of the end face stands within {distance} of the dimple at {t}", edge.id);
+                    return false;
+                }
+            }
+            continue;
+        }
+        if surface_clear(&face.surface) {
+            continue;
+        }
+        // A side: planar, square to the end plane, wholly at or below it,
+        // with exactly one edge in it, straight, whose span (along it) holds
+        // the whole face. Its nearest point to anything past the plane is on
+        // that edge.
+        let side = beside && planar && {
+            let corners: Vec<Vec3> = edges.iter().flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id]).filter_map(|id| source.vertices.iter().find(|v| v.id == id)).map(|v| v.point).collect();
+            let normal = match (face.surface.domain_u(), face.surface.domain_v()) {
+                (Ok([u0, u1]), Ok([v0, v1])) => face.surface.normal(0.5 * (u0 + u1), 0.5 * (v0 + v1)).ok(),
+                _ => None,
+            };
+            let square = normal.is_some_and(|n| n.dot(out).abs() <= 1e-9);
+            let below = corners.iter().all(|p| height(*p) <= 1e-9 * scale);
+            let top: Vec<(Vec3, Vec3)> = edges.iter().filter_map(|edge| in_plane_segment(edge)).collect();
+            let within = top.len() == 1 && {
+                let (a, b) = top[0];
+                let along = b.sub(a);
+                let length = along.length();
+                length > 0.0 && corners.iter().all(|p| {
+                    let s = p.sub(a).dot(along) / (length * length);
+                    (-1e-9..=1.0 + 1e-9).contains(&s)
+                })
+            };
+            let straight = edges.iter().all(|edge| edge.curve.straight_segment(1e-9 * scale).is_some());
+            square && below && within && straight
         };
-        if !clear {
+        if !side {
             os_debug!("bore dimples: face {} stands within {distance} of the dimple at {t}", face.id);
             return false;
         }
@@ -327,7 +396,7 @@ pub(super) fn carve_bore_dimples(source: &BrepSolid, grown: &BrepSolid, distance
     }
     let scale = crate::solid_scale(source).max(1.0);
     let mut voids = Vec::new();
-    let found = bores(source, distance, scale);
+    let found = bores(source, scale, |radius| radius <= distance * (1.0 + 1e-9));
     os_debug!("bore dimples: {} bore(s) of radius at most {distance}", found.len());
     for bore in found {
         for (t, out, open) in [(bore.span[1], bore.axis, bore.open[1]), (bore.span[0], bore.axis.scale(-1.0), bore.open[0])] {
@@ -338,7 +407,7 @@ pub(super) fn carve_bore_dimples(source: &BrepSolid, grown: &BrepSolid, distance
                 os_debug!("bore dimples: the end at {t} is not flat at its rim");
                 return None;
             }
-            if !clear_of_others(source, &bore, t, out, distance, scale) {
+            if !reach_of_others(source, &bore, t, out, distance, scale, true) {
                 os_debug!("bore dimples: a bore of radius {} declined at its end {t}", bore.radius);
                 return None;
             }
@@ -350,7 +419,8 @@ pub(super) fn carve_bore_dimples(source: &BrepSolid, grown: &BrepSolid, distance
                 os_debug!("bore dimples: the growth is already carved at {probe:?}");
                 return None;
             }
-            voids.push(dimple(centre, out, bore.radius, distance).ok()?);
+            let void = dimple(centre, out, bore.radius, distance).ok()?;
+            voids.push(void);
         }
     }
     if voids.is_empty() {
@@ -368,3 +438,88 @@ pub(super) fn carve_bore_dimples(source: &BrepSolid, grown: &BrepSolid, distance
     }
     carved.validate().is_empty().then_some(carved)
 }
+
+/// An end of a bore wider than the growth, whose sharp offset keeps the bore
+/// (radius `r − d`) with a sharp rim at the grown end plane: the rim the
+/// rounding would roll a ball of radius `d` round, a ring torus about the
+/// source rim (major `r`, minor `d`). Its centre on the source end plane, the
+/// end's outward axis and the source bore's radius.
+pub(super) struct WideRim {
+    pub centre: Vec3,
+    pub out: Vec3,
+    pub radius: f64,
+}
+
+impl WideRim {
+    /// Whether `p` lies on this rim's sharp edge in the grown body: the circle
+    /// of radius `r − d` at `d` past the end plane.
+    pub fn holds(&self, p: Vec3, distance: f64, tolerance: f64) -> bool {
+        let rel = p.sub(self.centre);
+        let along = rel.dot(self.out);
+        let rho = rel.sub(self.out.scale(along)).length();
+        (along - distance).abs() <= tolerance && (rho - (self.radius - distance)).abs() <= tolerance
+    }
+}
+
+/// The open ends of `source`'s straight bores wider than `distance` (the
+/// growth keeps them, narrowed to `r − d`), each flat at its rim and clear of
+/// every other face and edge within `d` of the cusp (the region the rim's
+/// torus leaves between the narrowed bore and the grown end plane): the
+/// rims whose rounding is the torus exactly. Ends that do not qualify are
+/// left out (their rims are rounded as any other join).
+pub(super) fn wide_bore_rims(source: &BrepSolid, distance: f64) -> Vec<WideRim> {
+    if !bore_dimples_enabled() || !(distance > 0.0) {
+        return Vec::new();
+    }
+    let scale = crate::solid_scale(source).max(1.0);
+    let mut rims = Vec::new();
+    for bore in bores(source, scale, |radius| radius > distance * (1.0 + 1e-9)) {
+        for (t, out, open) in [(bore.span[1], bore.axis, bore.open[1]), (bore.span[0], bore.axis.scale(-1.0), bore.open[0])] {
+            if !open || !flat_end(source, &bore, t, out, distance, scale) || !clear_of_others(source, &bore, t, out, distance, scale) {
+                os_debug!("bore cusps: the end at {t} of a bore of radius {} does not qualify", bore.radius);
+                continue;
+            }
+            rims.push(WideRim { centre: bore.origin.add(bore.axis.scale(t)), out, radius: bore.radius });
+        }
+    }
+    os_debug!("bore cusps: {} rim(s) of bores wider than {distance}", rims.len());
+    rims
+}
+
+/// The cusp at a wide rim: between the end plane grown by `d`, the narrowed
+/// bore and the rim's torus (about `(r, 0)` from straight up to the bore,
+/// radius `d`), run in to the axis across the empty bore, revolved.
+fn cusp(rim: &WideRim, d: f64) -> Result<BrepSolid, String> {
+    let (x, _) = across(rim.out);
+    let at = |rho: f64, z: f64| rim.centre.add(x.scale(rho)).add(rim.out.scale(z));
+    let r = rim.radius;
+    let on_axis = make_line(at(0.0, 0.0), at(0.0, d))?;
+    let lid = make_line(at(0.0, d), at(r, d))?;
+    let arc = make_arc(at(r, 0.0), x, rim.out, d, 0.5 * PI, PI)?;
+    let floor = make_line(at(r - d, 0.0), at(0.0, 0.0))?;
+    revolve_profile_brep(&[on_axis, lid, arc, floor], rim.centre, rim.out, 2.0 * PI)
+}
+
+/// `body` (the growth with each wide rim left sharp) with each rim's cusp
+/// carved, or a refusal naming what declined.
+pub(super) fn carve_wide_rims(body: &BrepSolid, rims: &[WideRim], distance: f64) -> Result<BrepSolid, String> {
+    let scale = crate::solid_scale(body).max(1.0);
+    let mut carved = body.clone();
+    for rim in rims {
+        let (x, _) = across(rim.out);
+        // The cusp is still material before the carve (a point in it, off the
+        // torus by a tenth of the growth).
+        let probe = rim.centre.add(x.scale(rim.radius - 0.5 * distance)).add(rim.out.scale(0.95 * distance));
+        if classify(&carved, probe, scale) != Some(PointClass::In) {
+            return Err(format!("the cusp at the rim about {:?} is not material in the growth", rim.centre));
+        }
+        let tool = cusp(rim, distance)?;
+        carved = boolean_operation(&carved, &tool, BooleanOperation::Subtract, &BooleanOptions::default()).map_err(|error| format!("the cusp carve declined: {}", error.message))?;
+    }
+    let issues = carved.validate();
+    if !issues.is_empty() {
+        return Err(format!("the carved growth is not valid: {issues:?}"));
+    }
+    Ok(carved)
+}
+

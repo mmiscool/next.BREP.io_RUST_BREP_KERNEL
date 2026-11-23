@@ -1,6 +1,6 @@
 [package]
 name = "BREP_topology"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "Topology layer of the BREP kernel: B-rep solids, validation, soundness, classification, mass properties and tessellation."
@@ -26,7 +26,7 @@ include = [
 name = "brep_topology"
 
 [dependencies]
-BREP_geometry = { version = "0.26.0", path = "../BREP_geometry" }
+BREP_geometry = { version = "0.27.0", path = "../BREP_geometry" }
 BREP_RANSAC = { version = "0.2.2", path = "../BREP_RANSAC" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -283,6 +283,8 @@ fn blend_closed_smooth_chain_unmemoized(
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
     let bar = crate::blend::setback::chain_bar(solid, crate::KernelTolerances::for_solid(solid, 1e-7).intersection_fit);
+    // Dense contacts are kept for this ladder only (`BREP_CHAIN_DENSE_REUSE`).
+    let _dense_contacts = dense_contact_scope();
     // The plain collar climbs the same measured ladder the carve does, from the
     // same first rung: a budget picked once is a resolution request in disguise.
     let mut budget = ChainBudget::for_chain(segments, CHAIN_PER_SEGMENT)?;

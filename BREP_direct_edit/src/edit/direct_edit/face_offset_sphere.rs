@@ -430,12 +430,49 @@ pub fn offset_sphere_face_unchecked(
                     ).or_refuse(KernelStage::Refine, "make_arc")?
                 }
                 RimKind::NeighbourSphere => {
-                    return Err(KernelRefusal::unsupported(
-                        KernelStage::Classify,
-                        "sphere_seam_rim",
-                        "offset_sphere_face: a sphere neighbour whose rim crosses the \
-                                pushed sphere's seam is deferred in this slice",
-                    ))
+                    // A sphere neighbour centred ON the pushed sphere's axis
+                    // meets the grown sphere in a latitude: the circle at
+                    // a = (d^2 + R'^2 - r^2) / 2d along the axis, built in the
+                    // sphere's own frame so it starts on the seam (two balls
+                    // united with their poles on the centre line, each seam
+                    // crossing the crease). Any other placement is oblique to
+                    // the seam and still refuses.
+                    let (ns, nf) = find_face(solid, *neighbour).unwrap();
+                    let Some(AnalyticSurface::Sphere { frame: neighbour_frame, radius: neighbour_radius }) =
+                        solid.shells[ns].faces[nf].surface.analytic()
+                    else {
+                        return Err(KernelRefusal::internal(KernelStage::Classify, "sphere_seam_rim", "offset_sphere_face: the sphere neighbour lost its carrier"));
+                    };
+                    let offset = neighbour_frame.origin.sub(center);
+                    let distance = offset.length();
+                    if distance <= tolerance || offset.cross(axis).length() > plane_tolerance {
+                        return Err(KernelRefusal::unsupported(
+                            KernelStage::Classify,
+                            "sphere_seam_rim",
+                            "offset_sphere_face: a sphere neighbour whose rim crosses the \
+                                    pushed sphere's seam, centred off the pushed sphere's axis, \
+                                    is deferred in this slice",
+                        ));
+                    }
+                    let along = (distance * distance + radius_new * radius_new - neighbour_radius * neighbour_radius) / (2.0 * distance);
+                    let a = along * offset.dot(axis).signum();
+                    let rr2 = radius_new * radius_new - a * a;
+                    if rr2 <= tolerance * tolerance || distance >= radius_new + neighbour_radius {
+                        return Err(KernelRefusal::unsupported(
+                            KernelStage::Refine,
+                            "separated",
+                            "offset_sphere_face: the grown sphere no longer meets its sphere \
+                                    neighbour (tangent / separated) — refusing",
+                        ));
+                    }
+                    crate::make_arc(
+                        center.add(axis.scale(a)),
+                        seam_x,
+                        seam_y,
+                        rr2.sqrt(),
+                        0.0,
+                        std::f64::consts::TAU,
+                    ).or_refuse(KernelStage::Refine, "make_arc")?
                 }
                 RimKind::CoaxialRuled => {
                     // A coaxial ruled neighbour meets the sphere in latitude

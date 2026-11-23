@@ -389,6 +389,57 @@ fn guard_area(face: &crate::topology::FaceRecord, memo: &mut crate::mass_propert
     read.or_refuse(KernelStage::Sew, "parameter_space_area")
 }
 
+/// `BREP_CONTINUATION_POLE_GUARD` (default on; =0 merges as before): two
+/// continuation edges that would close into one loop at a pole of an analytic
+/// sphere face, one of them running along that face's seam, stay two edges. A great circle cut
+/// through both poles with the seam in its plane has one half on the seam, and
+/// that half absorbs the seam; merged across the pole with the other half, the
+/// rebuilt pcurve cannot tell the seam's two sides apart and started on the
+/// far one from the loop's pole row: the face read a lune and a half through
+/// its chart, a ball about an axis in the plane z = 0 at 39-66 degrees cut by
+/// the box below it 785.4 for its half ball's 261.8, validate clean. An open
+/// merge still joins at a pole (a quarter ball's half circle through its pole
+/// is one edge, and a chamfer's composition beside a seam ending at a pole
+/// joins its pieces there).
+fn continuation_pole_guard_on() -> bool {
+    crate::switch!("BREP_CONTINUATION_POLE_GUARD", true)
+}
+
+/// Whether `join` is a pole of `surface`, an analytic sphere, and one of
+/// `pieces` (trims on it) runs along its seam.
+fn sphere_pole_seam_join(
+    surface: &crate::NurbsSurface,
+    join: Option<Vec3>,
+    pieces: [&crate::NurbsCurve; 2],
+    tolerance: f64,
+) -> Result<bool, KernelRefusal> {
+    let (Some(join), Some(crate::AnalyticSurface::Sphere { frame, radius })) = (join, surface.analytic()) else {
+        return Ok(false);
+    };
+    let axis = frame.axis.normalized().or_refuse(KernelStage::Sew, "normalized")?;
+    if ![1.0, -1.0].iter().any(|side| frame.origin.add(axis.scale(side * radius)).sub(join).length() <= tolerance.max(1e-9 * radius)) {
+        return Ok(false);
+    }
+    let u = crate::KnotVector::new(surface.knots_u.clone(), surface.degree_u).or_refuse(KernelStage::Sew, "knots")?.domain();
+    let period = (u[1] - u[0]).abs();
+    for piece in pieces {
+        let [t0, t1] = piece.domain().or_refuse(KernelStage::Sew, "domain")?;
+        let mut on_seam = true;
+        for fraction in [0.25, 0.5, 0.75] {
+            let at = piece.evaluate(t0 + (t1 - t0) * fraction).or_refuse(KernelStage::Sew, "evaluate")?;
+            let off = (at.x - u[0]).rem_euclid(period.max(f64::MIN_POSITIVE));
+            if off.min(period - off) > 1e-9 * period.max(1.0) {
+                on_seam = false;
+                break;
+            }
+        }
+        if on_seam {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn merge_curve_continuation_edges_impl(
     solid: &BrepSolid,
     tolerance: f64,
@@ -508,6 +559,19 @@ fn merge_curve_continuation_edges_impl(
                                 .len()
                             != first_mate.coedge
                     {
+                        continue;
+                    }
+                    // A join that closes a loop at a pole of a sphere face
+                    // beside its seam: the rebuilt pcurve cannot tell the
+                    // seam's sides apart.
+                    if continuation_pole_guard_on()
+                        && traversal_vertex_ids(first_edge, first).0 == traversal_vertex_ids(second_edge, second).1
+                        && {
+                        let join = vertices.get(&first_end).copied();
+                        let mate = &faces[first_mate.face].loops[first_mate.loop_index].coedges;
+                        sphere_pole_seam_join(&faces[face_index].surface, join, [&first.pcurve, &second.pcurve], tolerance)?
+                            || sphere_pole_seam_join(&faces[first_mate.face].surface, join, [&mate[first_mate.coedge].pcurve, &mate[second_mate.coedge].pcurve], tolerance)?
+                    } {
                         continue;
                     }
                     let first_parameter = if first.forward {

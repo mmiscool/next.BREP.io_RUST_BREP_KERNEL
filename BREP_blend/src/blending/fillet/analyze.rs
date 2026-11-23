@@ -76,27 +76,47 @@ pub fn into_face_direction(
         .cross(construct_tangent)
         .normalized()
         .or_refuse(KernelStage::Classify, "construct_candidate")?;
-    for sign in [1.0, -1.0] {
-        let probe = probe_point.add(probe_candidate.scale(sign * probe_step));
+    // Both sides are probed. When both land inside the trim, the step jumped
+    // a gap narrower than itself (a hole smaller than a quarter of the ball
+    // beside a bore's rim) to the face beyond it, so the step is quartered
+    // and both are probed again: only the side the material is on stays
+    // inside at every step.
+    let inside = |sign: f64, step: f64| -> Result<bool, KernelRefusal> {
+        let probe = probe_point.add(probe_candidate.scale(sign * step));
         let projection = crate::project_point_to_surface(&face.surface, probe)
             .or_refuse(KernelStage::Classify, "probe_projection")?;
         // The in-plane probe leaves a CURVED carrier by the sagitta
         // (~step²·curvature); the trim classification below is what
         // actually decides the side, so the distance gate only rejects
         // far-away wrap-around projections.
-        if projection.distance <= probe_step * 0.5 {
-            let class = crate::parameter_point_in_face(
-                face,
-                crate::Vec2 {
-                    x: projection.u,
-                    y: projection.v,
-                },
-                1e-6,
-            )
-            .or_refuse(KernelStage::Classify, "probe_trim_class")?;
-            if class == crate::PolygonClass::Inside {
-                return Ok(construct_candidate.scale(sign));
-            }
+        if projection.distance > step * 0.5 {
+            return Ok(false);
+        }
+        let class = crate::parameter_point_in_face(
+            face,
+            crate::Vec2 {
+                x: projection.u,
+                y: projection.v,
+            },
+            1e-6,
+        )
+        .or_refuse(KernelStage::Classify, "probe_trim_class")?;
+        Ok(class == crate::PolygonClass::Inside)
+    };
+    let mut step = probe_step;
+    for _ in 0..8 {
+        match (inside(1.0, step)?, inside(-1.0, step)?) {
+            (true, false) => return Ok(construct_candidate),
+            (false, true) => return Ok(construct_candidate.scale(-1.0)),
+            (false, false) => break,
+            (true, true) => step *= 0.25,
+        }
+    }
+    if step < probe_step {
+        // (inside both ways down to the floor: the face lies on both sides,
+        // as at a seam; read as before)
+        if inside(1.0, probe_step)? {
+            return Ok(construct_candidate);
         }
     }
     Err(support_direction_refusal(face))

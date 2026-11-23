@@ -113,12 +113,16 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
             false,
             Some(&blend_base),
         ),
-        None => crate::fillet_edges(
+        // Through the options call, so a sliver the round swallows is healed
+        // where the plain build refuses (`fillet_edges_with_options`). The
+        // chains are already followed above as the option asks, and the
+        // pinch keeps its ridge: users get what they got, plus that heal.
+        None => crate::fillet_edges_with_options(
             solid,
             &target.edge_points,
             Some(&blend_names),
             radius,
-            false,
+            crate::FilletOptions { follow_tangent_chains: false, refuse_pinch: false },
             Some(&blend_base),
         ),
     })

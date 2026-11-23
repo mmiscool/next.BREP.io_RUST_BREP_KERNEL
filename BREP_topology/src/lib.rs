@@ -106,6 +106,12 @@ pub mod transform_topology;
 #[path = "brep/recentre.rs"]
 #[doc(hidden)]
 pub mod recentre;
+#[path = "brep/boundary_query.rs"]
+pub mod boundary_query;
+pub use boundary_query::{
+    nearest_boundary_point, solid_closest_points, solid_gap, solid_least_box, solid_outward_normals, solid_principal_curvatures, BoundaryFoot,
+    BoundaryPlace,
+};
 #[path = "brep/rescale.rs"]
 #[doc(hidden)]
 pub mod rescale;

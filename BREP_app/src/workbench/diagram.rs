@@ -1,4 +1,4 @@
-//! The "Diagram" workbench — wiring and systems diagrams, whose output is the
+//! The "Harness diagram" workbench (id `diagram`) — wiring and systems diagrams, whose output is the
 //! point-to-point connection list, in eCAD's sheet editor on a WIRING document.
 //!
 //! Like PMI and Drawing it creates no features. A wiring diagram has no nets
@@ -19,7 +19,7 @@ static BUTTONS: &[WorkbenchButton] = &[
 
 pub static DIAGRAM: Workbench = Workbench {
     id: "diagram",
-    label: "Diagram",
+    label: "Harness diagram",
     glyph: "\u{E079}",
     includes: no_features,
     buttons: BUTTONS,

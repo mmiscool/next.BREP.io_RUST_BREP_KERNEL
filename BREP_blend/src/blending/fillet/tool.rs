@@ -4,7 +4,7 @@ use super::*;
 /// the plane perpendicular to the edge: corner at the edge, support
 /// tangency points at r/tan(θ/2) along each face, and the rolling-ball
 /// arc (fillet) or its chord (chamfer) between them.
-fn cross_section_profile(
+pub(super) fn cross_section_profile(
     cross: &EdgeCross,
     radius: f64,
     chamfer: bool,
@@ -185,6 +185,194 @@ pub(super) fn conic_cross_section(
     )
     .or_refuse(KernelStage::Fragment, "conic_profile_curve")?;
     Ok(vec![line(corner, first)?, conic, line(second, corner)?])
+}
+
+/// [`conic_cross_section`] with its contacts `d1` along the first face and `d2`
+/// along the second from the edge, whatever the angle between them: the
+/// rational quadratic through the two contacts whose middle pole is the
+/// edge's point, weights `1, rho / (1 − rho), 1`. Between faces at a right
+/// angle `rho = √2 − 1` makes it the quarter ellipse of semi-axes `d1` and
+/// `d2` (the affine image of the ball's quarter circle).
+pub(super) fn conic_cross_section_distances(
+    cross: &EdgeCross,
+    d1: f64,
+    d2: f64,
+    rho: f64,
+) -> Result<Vec<NurbsCurve>, KernelRefusal> {
+    let corner = cross.start;
+    let theta = cross.into_first.dot(cross.into_second).clamp(-1.0, 1.0).acos();
+    if theta <= 1e-6 || theta >= std::f64::consts::PI - 1e-6 {
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "conic_dihedral_degenerate",
+            "fillet_edge_conic: the faces meet too nearly flat or too nearly folded",
+        ));
+    }
+    let first = corner.add(cross.into_first.scale(d1));
+    let second = corner.add(cross.into_second.scale(d2));
+    let line = |from: Vec3, to: Vec3| make_line(from, to).or_refuse(KernelStage::Fragment, "conic_profile_line");
+    let conic = NurbsCurve::new(
+        2,
+        vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        vec![
+            crate::Vec4::from_point(first, 1.0),
+            crate::Vec4::from_point(corner, rho / (1.0 - rho)),
+            crate::Vec4::from_point(second, 1.0),
+        ],
+    )
+    .or_refuse(KernelStage::Fragment, "conic_profile_curve")?;
+    Ok(vec![line(corner, first)?, conic, line(second, corner)?])
+}
+
+/// The legs' weights `(α, β)` of the order-2 blend section of thumbweight `w`
+/// at `t` (E. Hartmann, "Parametric Gⁿ blending of curves and surfaces", 2001):
+/// the point `apex + α(a − apex) + β(b − apex)`, with `α = (1 − w)s⁴/(q·(1 − w + wt))`,
+/// `β = (1 − w)t⁴/(q·(1 − wt))`, `s = 1 − t`, `q = s³ + t³`.
+fn g2_weights(w: f64, t: f64) -> [f64; 2] {
+    let s = 1.0 - t;
+    let q = s * s * s + t * t * t;
+    [(1.0 - w) * s.powi(4) / (q * (1.0 - w + w * t)), (1.0 - w) * t.powi(4) / (q * (1.0 - w * t))]
+}
+
+/// `(α', β')` and `(α'', β'')` at `t` by five-point differences of the exact
+/// weights (error near h⁴).
+fn g2_weight_derivatives(w: f64, t: f64) -> ([f64; 2], [f64; 2]) {
+    let h = 1e-3 * (2.0 * t.min(1.0 - t)).clamp(1e-3, 1.0);
+    let at = |k: f64| g2_weights(w, t + k * h);
+    let (m2, m1, p1, p2, z) = (at(-2.0), at(-1.0), at(1.0), at(2.0), at(0.0));
+    let first = |i: usize| (m2[i] - 8.0 * m1[i] + 8.0 * p1[i] - p2[i]) / (12.0 * h);
+    let second = |i: usize| (-m2[i] + 16.0 * m1[i] - 30.0 * z[i] + 16.0 * p1[i] - p2[i]) / (12.0 * h * h);
+    ([first(0), first(1)], [second(0), second(1)])
+}
+
+/// The radius of curvature at the middle of the order-2 section of thumbweight
+/// `w` whose legs are `d` long and meet at `theta`.
+fn g2_center_radius(w: f64, theta: f64, d: f64) -> f64 {
+    let ([a1, b1], [a2, b2]) = g2_weight_derivatives(w, 0.5);
+    let speed = a1 * a1 + b1 * b1 + 2.0 * a1 * b1 * theta.cos();
+    d * speed.powf(1.5) / ((a1 * b2 - a2 * b1).abs() * theta.sin())
+}
+
+/// The share `∫ αβ' − α'β dt` of the legs' triangle the section takes off.
+fn g2_area_share(w: f64) -> f64 {
+    const X: [f64; 5] = [0.0, -0.538_469_310_105_683_1, 0.538_469_310_105_683_1, -0.906_179_845_938_664, 0.906_179_845_938_664];
+    const W: [f64; 5] = [0.568_888_888_888_888_9, 0.478_628_670_499_366_5, 0.478_628_670_499_366_5, 0.236_926_885_056_189_1, 0.236_926_885_056_189_1];
+    let panels = 256;
+    let h = 1.0 / panels as f64;
+    let mut sum = 0.0;
+    for k in 0..panels {
+        let mid = (k as f64 + 0.5) * h;
+        for (x, wt) in X.iter().zip(W) {
+            let t = mid + 0.5 * h * x;
+            let v = g2_weights(w, t);
+            let (d, _) = g2_weight_derivatives(w, t);
+            sum += wt * 0.5 * h * (v[0] * d[1] - d[0] * v[1]);
+        }
+    }
+    sum
+}
+
+/// Bisect a decreasing `f` for `f(w) = target` on a bracket stepped down from
+/// −1 (the section's shape parameter runs below 1).
+fn g2_bisect(target: f64, f: impl Fn(f64) -> f64) -> f64 {
+    let (mut lo, mut hi) = (-1.0f64, 1.0 - 1e-9);
+    let mut steps = 0;
+    while f(lo) < target && steps < 60 {
+        hi = lo;
+        lo = 2.0 * lo - 1.0;
+        steps += 1;
+    }
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if f(mid) > target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if hi - lo <= 1e-15 * (1.0 - lo) {
+            break;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+/// The thumbweight of the order-2 section in a wedge of `theta` with legs `d`:
+/// the one whose middle radius of curvature is `center`, or, where `center` is
+/// not positive, the one that takes off what the circle tangent at the same
+/// contacts does.
+pub(super) fn g2_thumbweight(theta: f64, d: f64, center: f64) -> f64 {
+    if center > 0.0 {
+        g2_bisect(center, |w| g2_center_radius(w, theta, d))
+    } else {
+        let c = 1.0 / (theta / 2.0).tan();
+        let target = (c - (std::f64::consts::PI - theta) / 2.0) / (c * (theta / 2.0).cos().powi(2));
+        g2_bisect(target, g2_area_share)
+    }
+}
+
+/// The order-2 section from `a` to `b` in the wedge at `apex`, thumbweight
+/// `w`, as the rational quintic it is: numerator `q·D₁·D₂·apex + (1 − w)s⁴D₂·(a − apex)
+/// + (1 − w)t⁴D₁·(b − apex)` over `q·D₁·D₂` (`q = 1 − 3t + 3t²`, `D₁ = 1 − w + wt`,
+/// `D₂ = 1 − wt`), each a polynomial of degree at most 5 turned into its
+/// Bernstein coefficients. None where a weight is not positive.
+pub(super) fn g2_section_curve(a: Vec3, apex: Vec3, b: Vec3, w: f64) -> Option<NurbsCurve> {
+    // Power-basis coefficients (degree ≤ 5) of the scalar polynomials.
+    let mul = |x: &[f64], y: &[f64]| -> Vec<f64> {
+        let mut out = vec![0.0; x.len() + y.len() - 1];
+        for (i, xi) in x.iter().enumerate() {
+            for (j, yj) in y.iter().enumerate() {
+                out[i + j] += xi * yj;
+            }
+        }
+        out
+    };
+    let pad = |mut v: Vec<f64>| -> Vec<f64> {
+        v.resize(6, 0.0);
+        v
+    };
+    let q = [1.0, -3.0, 3.0];
+    let d1 = [1.0 - w, w];
+    let d2 = [1.0, -w];
+    let s4 = [1.0, -4.0, 6.0, -4.0, 1.0];
+    let t4 = [0.0, 0.0, 0.0, 0.0, 1.0];
+    let weight = pad(mul(&mul(&q, &d1), &d2));
+    let along_a = pad(mul(&s4, &d2).iter().map(|c| c * (1.0 - w)).collect());
+    let along_b = pad(mul(&t4, &d1).iter().map(|c| c * (1.0 - w)).collect());
+    // Power to Bernstein, degree 5: bᵢ = Σⱼ≤ᵢ C(i, j)/C(5, j) aⱼ.
+    let choose = |n: usize, k: usize| -> f64 { (0..k).fold(1.0, |acc, i| acc * (n - i) as f64 / (i + 1) as f64) };
+    let bernstein = |power: &[f64]| -> Vec<f64> { (0..6).map(|i| (0..=i).map(|j| choose(i, j) / choose(5, j) * power[j]).sum()).collect() };
+    let (bw, ba, bb) = (bernstein(&weight), bernstein(&along_a), bernstein(&along_b));
+    if bw.iter().any(|&x| !(x > 1e-12)) {
+        return None;
+    }
+    let (ea, eb) = (a.sub(apex), b.sub(apex));
+    let controls: Vec<crate::Vec4> = (0..6)
+        .map(|i| {
+            let numerator = apex.scale(bw[i]).add(ea.scale(ba[i])).add(eb.scale(bb[i]));
+            crate::Vec4 { x: numerator.x, y: numerator.y, z: numerator.z, w: bw[i] }
+        })
+        .collect();
+    NurbsCurve::new(5, vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], controls).ok()
+}
+
+/// The cross-section of a curvature-continuous (order 2) fillet: the corner,
+/// the contacts where a ball of `offset` would touch the faces (`offset/tan(θ/2)`
+/// from the corner), and the section of thumbweight for `center` between them.
+pub(super) fn g2_cross_section(cross: &EdgeCross, offset: f64, center: f64) -> Result<Vec<NurbsCurve>, KernelRefusal> {
+    let corner = cross.start;
+    let theta = cross.into_first.dot(cross.into_second).clamp(-1.0, 1.0).acos();
+    if theta <= 1e-6 || theta >= std::f64::consts::PI - 1e-6 {
+        return Err(KernelRefusal::input(KernelStage::Classify, "g2_dihedral_degenerate", "fillet_edge_g2: the faces meet too nearly flat or too nearly folded"));
+    }
+    let d = offset / (theta * 0.5).tan();
+    let first = corner.add(cross.into_first.scale(d));
+    let second = corner.add(cross.into_second.scale(d));
+    let w = g2_thumbweight(theta, d, center);
+    let section = g2_section_curve(first, corner, second, w).ok_or_else(|| {
+        KernelRefusal::unsupported(KernelStage::Fragment, "g2_section", format!("fillet_edge_g2: the section of thumbweight {w:.6} has a weight that is not positive"))
+    })?;
+    let line = |from: Vec3, to: Vec3| make_line(from, to).or_refuse(KernelStage::Fragment, "g2_profile_line");
+    Ok(vec![line(corner, first)?, section, line(second, corner)?])
 }
 
 /// Given setback `d1` on face 1 and the angle α between the chamfer face and
@@ -461,7 +649,7 @@ fn fillet_or_chamfer_inner(
     } else if std::env::var("BREP_CUTTER_FIRST").is_ok() {
         Err(lane_note("cutter_first_env", "BREP_CUTTER_FIRST set"))
     } else if closed {
-        crate::blend::blend_closed_edge(solid, edge_id, radius, chamfer, name)
+        crate::blend::blend_closed_edge_reusing(solid, edge_id, radius, chamfer, name)
     } else {
         // An open edge may be one tangent-continuous arc of a CLOSED smooth
         // chain (e.g. a cyl×cyl saddle split into arcs by the two carriers'
@@ -544,7 +732,7 @@ fn fillet_or_chamfer_inner(
                 // The last rung: a support pcurve off the floor is terminal for
                 // the whole fillet here, so the closed rim gets ONE knot-aware
                 // retry; a retry that also fails keeps the first refusal.
-                crate::blend::blend_closed_edge(solid, edge_id, radius, chamfer, name).or_else(|first| {
+                crate::blend::blend_closed_edge_reusing(solid, edge_id, radius, chamfer, name).or_else(|first| {
                     if crate::blend::is_pcurve_floor_refusal(&first) {
                         crate::blend::blend_closed_edge_knot_aware(solid, edge_id, radius, chamfer, name).map_err(|_| first)
                     } else {

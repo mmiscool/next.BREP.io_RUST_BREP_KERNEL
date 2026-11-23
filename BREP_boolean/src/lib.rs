@@ -52,7 +52,7 @@ pub use brep_topology::*;
 #[doc(hidden)]
 pub mod split;
 pub use split::{
-    split_solid_by_face_surface, split_solid_by_plane, split_solid_by_surface, SplitSurface,
+    split_solid_by_face_surface, solid_piece_by_plane, split_solid_by_plane, split_solid_by_surface, SplitSurface,
 };
 #[path = "csg/imprint.rs"]
 #[doc(hidden)]
@@ -123,7 +123,7 @@ pub use faceted_repair::{mesh_to_faceted_brep, repair_triangle_soup, MeshRepairR
 #[path = "healing/sew.rs"]
 #[doc(hidden)]
 pub mod sew;
-pub use sew::{sew_solid, split_pinched_vertices, SewReport};
+pub use sew::{sew_rotated_copies, sew_solid, split_pinched_vertices, SewReport};
 #[path = "meshing/mesh_segment.rs"]
 #[doc(hidden)]
 pub mod mesh_segment;

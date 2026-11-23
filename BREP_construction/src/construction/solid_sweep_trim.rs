@@ -23,6 +23,40 @@ fn frag<T>(result: Result<T, String>, what: &'static str) -> Result<T, KernelRef
     result.or_refuse(KernelStage::Fragment, what)
 }
 
+/// `BREP_SWEEP_TRIM_END_SLIVERS` (default on, `=0` leaves them unmated as before): unmated arcs the imprint
+/// leaves within two time steps of the motion's start or end, shorter than
+/// the closure band, are contracted and the arcs mated again
+/// (`Arrangement::contract_unmated_end_slivers`). Only an arrangement that
+/// would not close reaches it.
+fn end_slivers_on() -> bool {
+    crate::switch!("BREP_SWEEP_TRIM_END_SLIVERS", true)
+}
+
+/// `BREP_SWEEP_TRIM_ONE_SIDED` (default on, `=0` gives the vertex up as before): the vertex solve's Jacobian
+/// read one-sided where a sheet ends within the difference step (a strip's
+/// zero line leaving its face at the vertex), where it gave the vertex up.
+fn one_sided_on() -> bool {
+    crate::switch!("BREP_SWEEP_TRIM_ONE_SIDED", true)
+}
+
+/// `BREP_SWEEP_TRIM_STRIP_JACOBIAN` (default on, `=0` reads du alone as before): a strip face's chart
+/// orientation by its parameter map's whole Jacobian, not its first
+/// derivative alone (a strip chart that runs the sheet's time the other way
+/// built its face inside out).
+fn strip_jacobian_on() -> bool {
+    crate::switch!("BREP_SWEEP_TRIM_STRIP_JACOBIAN", true)
+}
+
+thread_local! {
+    static END_SLIVERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// End slivers contracted on this thread since the last call (the check
+/// reading of `BREP_SWEEP_TRIM_END_SLIVERS`).
+pub fn trim_end_slivers_take() -> u64 {
+    END_SLIVERS.with(|cell| cell.replace(0))
+}
+
 /// The engine's switch (default on; `=0` refuses a tumbled polyhedron as before).
 pub fn trim_engine_on() -> bool {
     crate::switch!("BREP_SWEEP_TRIM_ENGINE", true)
@@ -341,6 +375,12 @@ pub struct Competitor {
 /// The motion's poses at evenly spaced times.
 /// (Read-only once made: the pose table is made from the poses.)
 pub struct PoseGrid {
+    /// The motion the poses sample (the basin jump reads its velocity).
+    motion: TwoTurnMotion,
+    /// Each pose's second turn alone, as `TwoTurnMotion::velocity` builds it.
+    seconds: Vec<Rigid>,
+    /// The farthest a pose's centre lies from the origin (for rounding).
+    farthest: f64,
     times: Vec<f64>,
     poses: Vec<Rigid>,
     centres: Vec<Vec3>,
@@ -367,7 +407,7 @@ impl PoseGrid {
         let times: Vec<f64> = (0..count).map(|i| t0 + (t1 - t0) * i as f64 / (count - 1) as f64).collect();
         let poses: Vec<Rigid> = times.iter().map(|&t| motion.pose(t)).collect();
         let (centre, reach) = tool.centre_and_reach();
-        let centres = poses.iter().map(|p| p.apply(centre)).collect();
+        let centres: Vec<Vec3> = poses.iter().map(|p| p.apply(centre)).collect();
         // The outer turn moves y at |r1|·dist(y, its axis) <= |r1|·|y − p1|;
         // the inner one at |r0|·dist(z, its axis) <= |r0|·(|z − p1| + |p1 − p0|),
         // z = y turned back about the outer axis, so |z − p1| = |y − p1|.
@@ -386,7 +426,9 @@ impl PoseGrid {
             }
             PoseTable { faces, table }
         });
-        PoseGrid { times, poses, centres, reach, speed_bound, planes }
+        let seconds = if trim_reuse_on() { times.iter().map(|&t| Rigid::turn(motion.points[1], motion.directions[1], motion.rates[1] * t)).collect() } else { Vec::new() };
+        let farthest = centres.iter().map(|c: &Vec3| c.length()).fold(0.0, f64::max);
+        PoseGrid { motion: *motion, seconds, farthest, times, poses, centres, reach, speed_bound, planes }
     }
 
     pub fn times(&self) -> &[f64] {
@@ -431,6 +473,73 @@ impl PoseGrid {
         }
     }
 
+    /// Whether the depth of `y` is shown to fall at every step from pose `i`
+    /// to pose `j` (either way), by more than rounding: the walk would pass
+    /// every pose between. `depth`: the depth read at `i`.
+    ///
+    /// Each face's term `G = d − n·x(t)` (read centred, as the walk reads it),
+    /// x the preimage of y, has
+    /// `|G''| <= M`, M the bound on |x''| the two turns give (see `turns_bend`):
+    /// over the run (length Δ in t, step h) a face either falls everywhere
+    /// (`G' <= s + M·Δ`, s its slope at i in the walk's direction, at most
+    /// −2ρ/h, so each step falls by more than twice the rounding ρ) or stays
+    /// above the depth at i by more than 3ρ (`G >= g + min(s, 0)·Δ − M·Δ²/2`),
+    /// so it is never the least. The least at every pose is then a falling
+    /// face, and each read depth is at most the one before.
+    fn falls_through(&self, table: &PoseTable, y: Vec3, i: usize, j: usize, depth: f64) -> bool {
+        let (ti, tj) = (self.times[i], self.times[j]);
+        let delta = (tj - ti).abs();
+        let steps = i.abs_diff(j) as f64;
+        if !(delta > 0.0 && steps >= 1.0) {
+            return false;
+        }
+        let h = delta / steps;
+        // Each face's term read as the walk reads it, centred on the pose's
+        // centre (`table_depth`: e − N·(y − C)), so nothing cancels however
+        // far the tool lies from the origin; its slope N·v (= −n·x', the
+        // preimage's velocity x' = −Rᵀv, v the material velocity at y).
+        let faces = table.faces.len();
+        let q = y.sub(self.centres[i]);
+        let v = match self.seconds.get(i) {
+            // `TwoTurnMotion::velocity` at the pose's time, its second turn read once.
+            Some(second) => {
+                let m = &self.motion;
+                let z = second.invert(y);
+                let inner = m.directions[0].cross(z.sub(m.points[0])).scale(m.rates[0]);
+                m.directions[1].cross(y.sub(m.points[1])).scale(m.rates[1]).add(second.rotate(inner))
+            }
+            None => self.motion.velocity(ti, y),
+        };
+        // Along the walk in time (a grid may run backwards in t).
+        let v = if tj > ti { v } else { v.scale(-1.0) };
+        let bend = turns_bend(&self.motion, y);
+        // The rounding of a term: of its parts' sizes (the tool, the offset
+        // from the pose's centre), of the velocity read at y, and of the
+        // pose's centre and the point themselves, placed in absolute
+        // coordinates (the centres are the tool's turned and moved there).
+        let absolute = y.length() + self.centres[i].length() + self.motion.points[0].length() + self.motion.points[1].length();
+        // And of the poses' angles, rate·t rounded: a pose a little off the
+        // motion's own moves the tool by that angle times its arm.
+        let [r0, r1] = self.motion.rates;
+        let arm = self.reach + q.length() + y.sub(self.motion.points[1]).length() + self.motion.points[1].sub(self.motion.points[0]).length();
+        let angles = (r0.abs() + r1.abs()) * (ti.abs() + tj.abs()) * arm;
+        let rho = 64.0 * f64::EPSILON * (self.reach + q.length() + absolute + angles + delta * (v.length() + bend * delta));
+        if !(bend.is_finite() && rho.is_finite() && rho > 0.0) {
+            return false;
+        }
+        for row in &table.table[i * faces..(i + 1) * faces] {
+            let normal = Vec3::new(row[0], row[1], row[2]);
+            let g = row[3] - normal.dot(q);
+            let slope = normal.dot(v);
+            let falls = slope + bend * delta <= -2.0 * rho / h;
+            let above = g + slope.min(0.0) * delta - 0.5 * bend * delta * delta > depth + 3.0 * rho;
+            if !(falls || above) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn table_depth(&self, table: &PoseTable, i: usize, y: Vec3) -> f64 {
         let faces = table.faces.len();
         let q = y.sub(self.centres[i]);
@@ -471,8 +580,33 @@ impl PoseGrid {
                 fold = true;
             }
             let mut i = first;
+            let jump = table.filter(|_| basin_jump_on());
+            let mut quiet = 0usize;
+            let mut run = BASIN_RUN;
             // Walk while the depth keeps falling.
             loop {
+                // A run of poses the depth is shown to fall through, step by
+                // step beyond rounding, is passed at once (`basin_jump`).
+                if let Some(t) = jump {
+                    if quiet == 0 {
+                        let target = if sign > 0 { (i + run).min(n - 1) } else { i.saturating_sub(run) };
+                        if target != i && self.falls_through(t, y, i, target, previous) {
+                            i = target;
+                            previous = self.depth_with(table, tool, i, y);
+                            // A run passed: try one twice as long next.
+                            run = (2 * run).min(BASIN_RUN_MOST);
+                            continue;
+                        }
+                        if run > BASIN_RUN {
+                            // A long run failed: try the short one at once.
+                            run = BASIN_RUN;
+                            continue;
+                        }
+                        quiet = BASIN_QUIET;
+                    } else {
+                        quiet -= 1;
+                    }
+                }
                 let Some(next) = step(i) else {
                     last = i;
                     break;
@@ -528,8 +662,16 @@ impl PoseGrid {
     fn deepest_with<T: Depth>(&self, table: Option<&PoseTable>, tool: &T, y: Vec3, speed: (f64, Vec3, f64), own: usize, ranges: [(usize, usize); 2]) -> (f64, usize) {
         const RUN: usize = 16;
         let rate = speed.0 * y.sub(speed.1).length() + speed.2;
-        // Rounding in a depth (a few ulps of the tool's and the point's size).
-        let slack = 1e-12 * (self.reach + y.sub(self.centres[0]).length() + rate);
+        // Rounding in a depth (a few ulps of the tool's and the point's size),
+        // and of the absolute coordinates the poses' centres are placed at and
+        // of their angles (rate·t rounded, times the arm), which far from the
+        // origin or at large times exceed it.
+        let [r0, r1] = self.motion.rates;
+        let (t_first, t_last) = (self.times[0], self.times[self.times.len() - 1]);
+        let absolute = y.length() + self.farthest + self.motion.points[0].length() + self.motion.points[1].length();
+        let arm = self.reach + y.sub(self.centres[0]).length() + y.sub(self.motion.points[1]).length() + self.motion.points[1].sub(self.motion.points[0]).length();
+        let angles = (r0.abs() + r1.abs()) * (t_first.abs().max(t_last.abs())) * arm;
+        let slack = 1e-12 * (self.reach + y.sub(self.centres[0]).length() + rate) + 64.0 * f64::EPSILON * (absolute + angles);
         let mut best = f64::NEG_INFINITY;
         let mut at = own;
         // The pose-by-pose rule, `value` the pose's depth when already known.
@@ -565,6 +707,49 @@ impl PoseGrid {
         }
         (best, at)
     }
+}
+
+/// Whether the trim grid reads a node's sign alone where its own point is
+/// outside its pose, its full value only where a crossing needs it (default
+/// on, `=0` reads every value; the same contour).
+fn grid_lazy_on() -> bool {
+    crate::switch!("BREP_SWEEP_GRID_LAZY", true)
+}
+
+/// Whether the trim engine reuses what it has read: each pose's second turn
+/// for the velocity, and a search's depths at times it reads again (default
+/// on, `=0` reads each again; the same values, bit for bit).
+fn trim_reuse_on() -> bool {
+    crate::switch!("BREP_SWEEP_TRIM_REUSE", true)
+}
+
+/// Poses a basin jump tries to pass at once, and single steps after a failed
+/// try before the next.
+const BASIN_RUN: usize = 32;
+const BASIN_RUN_MOST: usize = 512;
+const BASIN_QUIET: usize = 8;
+
+/// A bound on |x''| for the preimage x(t) of a fixed world point y under the
+/// two turns: z(t) = y turned back about the second axis, x = z turned back
+/// about the first, so |x''| <= r0²·|z − p0| + 2|r0|·|z'| + |z''| with
+/// |z − p0| <= |y − p1| + |p1 − p0|, |z'| <= |r1|·|y − p1|, |z''| <= r1²·|y − p1|.
+pub(crate) fn turns_bend(motion: &TwoTurnMotion, y: Vec3) -> f64 {
+    let [r0, r1] = motion.rates;
+    // A rate whose square underflows bends no less for it over a long time:
+    // no bound read then (the jump declines).
+    if [r0, r1].iter().any(|&r| r != 0.0 && !(r * r).is_normal()) {
+        return f64::INFINITY;
+    }
+    let (p0, p1) = (motion.points[0], motion.points[1]);
+    let a = y.sub(p1).length();
+    let b = p1.sub(p0).length();
+    (r0 * r0 * (a + b) + 2.0 * r0.abs() * r1.abs() * a + r1 * r1 * a) * (1.0 + 1e-12)
+}
+
+/// Whether the competitor's basin walk passes runs of poses the depth is
+/// shown to fall through (default on, `=0` walks pose by pose; the same basin).
+fn basin_jump_on() -> bool {
+    crate::switch!("BREP_SWEEP_BASIN_JUMP", true)
 }
 
 /// Whether the pose grid tests a point against each pose's faces as world
@@ -1035,6 +1220,29 @@ impl<'a> ConvexSweep<'a> {
 
     /// The sheet point's visibility value (positive: on the sweep's boundary)
     /// and what decides it.
+    /// The depth of the world point `y` at time s, `self.depth(pose(s).invert(y))`;
+    /// with `BREP_SWEEP_TRIM_REUSE` the last few times read are kept by their
+    /// bits, so a golden-section search reading a time again reads it once.
+    fn depth_memo(&self, y: Vec3) -> impl Fn(f64) -> f64 + '_ {
+        let reuse = trim_reuse_on();
+        let kept: std::cell::RefCell<[(u64, f64); 4]> = std::cell::RefCell::new([(u64::MAX, 0.0); 4]);
+        let next = std::cell::Cell::new(0usize);
+        move |s: f64| {
+            if reuse {
+                if let Some(&(_, d)) = kept.borrow().iter().find(|(bits, _)| *bits == s.to_bits()) {
+                    return d;
+                }
+            }
+            let d = self.depth(self.motion.pose(s).invert(y));
+            if reuse {
+                let k = next.get();
+                kept.borrow_mut()[k] = (s.to_bits(), d);
+                next.set((k + 1) % 4);
+            }
+            d
+        }
+    }
+
     pub fn value(&self, sheet: SheetId, point: &SheetPoint) -> (f64, Active) {
         let side = match sheet {
             SheetId::Cap(0, _) | SheetId::Band(0, _) => 1,
@@ -1077,7 +1285,7 @@ impl<'a> ConvexSweep<'a> {
             let hi = if c.at + 1 == c.basin.0 { c.at } else { c.at + 1 };
             let (lo, hi) = (lo.max(if c.at > c.basin.1 { c.basin.1 + 1 } else { 0 }), hi.min(if c.at < c.basin.0 { c.basin.0 - 1 } else { n - 1 }));
             if hi > lo {
-                let depth_at = |s: f64| self.depth(self.motion.pose(s).invert(point.world));
+                let depth_at = self.depth_memo(point.world);
                 let (mut a, mut b) = (self.grid.times[lo], self.grid.times[hi]);
                 let g = 0.5 * (5f64.sqrt() - 1.0);
                 for _ in 0..60 {
@@ -1125,7 +1333,7 @@ impl<'a> ConvexSweep<'a> {
                 let n = self.grid.times.len();
                 let (t0, t1) = (self.grid.times[0], self.grid.times[n - 1]);
                 let step = (t1 - t0) / (n - 1) as f64;
-                let depth_at = |s: f64| self.depth(self.motion.pose(s).invert(point.world));
+                let depth_at = self.depth_memo(point.world);
                 let g = 0.5 * (5f64.sqrt() - 1.0);
                 let mut best: Option<(f64, f64)> = None;
                 for sign in [1.0, -1.0] {
@@ -1175,7 +1383,7 @@ impl<'a> ConvexSweep<'a> {
             Active::Competitor(at) => {
                 let n = self.grid.times.len();
                 // Refine the competing time: the depth's maximum near `at`.
-                let depth_at = |s: f64| self.depth(self.motion.pose(s).invert(point.world));
+                let depth_at = self.depth_memo(point.world);
                 let s_star = if at == 0 || at == n - 1 {
                     self.grid.times[at]
                 } else {
@@ -1267,7 +1475,41 @@ impl<'a> ConvexSweep<'a> {
         let param = |i: usize, j: usize| -> [f64; 2] {
             if sheet.is_cap() { [along_r[i], along_c[j]] } else { [along_c[j], along_r[i]] }
         };
-        let values: Vec<Vec<f64>> = (0..nr).map(|i| (0..nc).map(|j| self.eval(sheet, param(i, j))).collect()).collect();
+        // A node whose own point is outside its pose (`local < 0`) is negative
+        // whatever its competitor (`value` returns that or less): its sign is
+        // read without the scan, its full value only where a crossing needs
+        // it (`BREP_SWEEP_GRID_LAZY`); every other use reads signs alone.
+        let lazy = grid_lazy_on();
+        let unread: std::cell::RefCell<Vec<Vec<bool>>> = std::cell::RefCell::new(vec![vec![false; nc]; nr]);
+        let values: Vec<Vec<f64>> = (0..nr)
+            .map(|i| {
+                (0..nc)
+                    .map(|j| {
+                        if lazy {
+                            if let Some(point) = self.point(sheet, param(i, j)) {
+                                if point.local < 0.0 {
+                                    unread.borrow_mut()[i][j] = true;
+                                    return -1.0;
+                                }
+                                return self.value(sheet, &point).0;
+                            }
+                            return -1.0;
+                        }
+                        self.eval(sheet, param(i, j))
+                    })
+                    .collect()
+            })
+            .collect();
+        let values = std::cell::RefCell::new(values);
+        // A node's full value, read now if its sign alone was.
+        let full = |(i, j): (usize, usize)| -> f64 {
+            if unread.borrow()[i][j] {
+                let v = self.eval(sheet, param(i, j));
+                values.borrow_mut()[i][j] = v;
+                unread.borrow_mut()[i][j] = false;
+            }
+            values.borrow()[i][j]
+        };
         let label = |p: [f64; 2]| -> Border {
             match self.point(sheet, p) {
                 Some(point) => {
@@ -1285,10 +1527,10 @@ impl<'a> ConvexSweep<'a> {
             if let Some(hit) = cache.get(&(a, b)) {
                 return *hit;
             }
-            let (p, q, vp) = (param(a.0, a.1), param(b.0, b.1), values[a.0][a.1]);
+            let (p, q, vp) = (param(a.0, a.1), param(b.0, b.1), full(a));
             let at = |s: f64| [p[0] + (q[0] - p[0]) * s, p[1] + (q[1] - p[1]) * s];
             let (lo, hi) = if trim_secant_on() {
-                bracket_sign_change(|s| self.eval(sheet, at(s)), vp, values[b.0][b.1])
+                bracket_sign_change(|s| self.eval(sheet, at(s)), vp, full(b))
             } else {
                 let (mut lo, mut hi) = (0.0f64, 1.0f64);
                 for _ in 0..48 {
@@ -1317,7 +1559,7 @@ impl<'a> ConvexSweep<'a> {
         for i in 0..nr - 1 {
             for j in 0..nc - 1 {
                 let corners = [(i, j), (i, j + 1), (i + 1, j + 1), (i + 1, j)];
-                let kept: Vec<bool> = corners.iter().map(|&(a, b)| values[a][b] > 0.0).collect();
+                let kept: Vec<bool> = corners.iter().map(|&(a, b)| values.borrow()[a][b] > 0.0).collect();
                 let count = kept.iter().filter(|&&k| k).count();
                 if count == 0 || count == 4 {
                     continue;
@@ -1383,7 +1625,7 @@ impl<'a> ConvexSweep<'a> {
         for (side, nodes) in &sides {
             for pair in nodes.windows(2) {
                 let (na, nb) = (pair[0], pair[1]);
-                let (va, vb) = (values[na.0][na.1], values[nb.0][nb.1]);
+                let (va, vb) = (values.borrow()[na.0][na.1], values.borrow()[nb.0][nb.1]);
                 if va <= 0.0 && vb <= 0.0 {
                     continue;
                 }
@@ -1550,6 +1792,12 @@ impl<'a> ConvexSweep<'a> {
             p.1 *= sign;
         }
         (sign * total, parts, misses)
+    }
+
+    /// [`ConvexSweep::flux_raw`]'s total: the flux volume as oriented by the
+    /// face signs alone.
+    pub fn flux_volume_raw(&self, arrangement: &Arrangement, closure: &Closure, scanlines: usize) -> f64 {
+        self.flux_raw(arrangement, closure, scanlines).0
     }
 
     /// The flux volume as oriented by the face signs alone (its sign says
@@ -1939,12 +2187,21 @@ impl<'a> ConvexSweep<'a> {
                     let (mut pp, mut pm) = (params.clone(), params.clone());
                     pp[i][k] += h;
                     pm[i][k] -= h;
-                    let (Some(fp), Some(fm)) = (residual(&pp), residual(&pm)) else {
-                        ok = false;
-                        break;
+                    // One-sided where a sheet ends within the step (a
+                    // strip's zero line leaves its face at the vertex).
+                    let (fp, fm) = (residual(&pp), residual(&pm));
+                    let one_sided = one_sided_on();
+                    let (upper, lower, width) = match (&fp, &fm) {
+                        (Some(fp), Some(fm)) => (fp, fm, 2.0 * h),
+                        (Some(fp), None) if one_sided => (fp, &f, h),
+                        (None, Some(fm)) if one_sided => (&f, fm, h),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
                     };
                     for r in 0..f.len() {
-                        jac[r][c] = (fp[r] - fm[r]) * 0.5 / h;
+                        jac[r][c] = (upper[r] - lower[r]) / width;
                     }
                 }
                 if !ok {
@@ -2159,6 +2416,13 @@ impl<'a> ConvexSweep<'a> {
     /// vertex class (its solved point). Faces are oriented outward by their
     /// orientation signs and the enclosed volume's sign.
     pub fn build(&self, arrangement: &Arrangement, closure: &Closure, refined: &[RefinedArc], vertices: &[SolvedVertex]) -> Result<BrepSolid, KernelRefusal> {
+        self.build_with_sign(arrangement, closure, refined, vertices, None)
+    }
+
+    /// [`ConvexSweep::build`] with the face signs' overall orientation given
+    /// (the sign of a flux reading the caller has taken, as `flux_raw` gives
+    /// it), or read here at 200 scanlines when `None`.
+    pub fn build_with_sign(&self, arrangement: &Arrangement, closure: &Closure, refined: &[RefinedArc], vertices: &[SolvedVertex], sign: Option<f64>) -> Result<BrepSolid, KernelRefusal> {
         // A polyhedron's sweep is a sphere; a ring's may be of any genus and
         // meet itself at its double curves' tips.
         let closed = match self.tool {
@@ -2168,7 +2432,10 @@ impl<'a> ConvexSweep<'a> {
         if !closed {
             return Err(refuse("trim_arrangement", "the trimmed sheets do not close into one oriented shell".into()));
         }
-        let sign = self.flux_raw(arrangement, closure, 200).0.signum();
+        let sign = match sign {
+            Some(sign) => sign.signum(),
+            None => self.flux_raw(arrangement, closure, 200).0.signum(),
+        };
         let n = arrangement.arcs.len();
         let mut next = 1u64;
         let mut id = || {
@@ -2404,6 +2671,22 @@ impl<'a> ConvexSweep<'a> {
         let h = 1e-6;
         let a = self.surface_uv(lp.sheet, chart, [p[0] - h, p[1]]);
         let b = self.surface_uv(lp.sheet, chart, [p[0] + h, p[1]]);
+        if strip_jacobian_on() {
+            // The whole Jacobian's sign (a strip's chart need not keep the
+            // sheet's time direction), read at the first loop sample where
+            // it is not degenerate.
+            for &id in &lp.arcs {
+                let params = &arrangement.arcs[id].params;
+                for q in [params[params.len() / 2], params[params.len() / 4], params[3 * params.len() / 4]] {
+                    let (a, b) = (self.surface_uv(lp.sheet, chart, [q[0] - h, q[1]]), self.surface_uv(lp.sheet, chart, [q[0] + h, q[1]]));
+                    let (c, d) = (self.surface_uv(lp.sheet, chart, [q[0], q[1] - h]), self.surface_uv(lp.sheet, chart, [q[0], q[1] + h]));
+                    let det = (b[0] - a[0]) * (d[1] - c[1]) - (b[1] - a[1]) * (d[0] - c[0]);
+                    if det.abs() > 1e-9 * h * h {
+                        return if det > 0.0 { 1.0 } else { -1.0 };
+                    }
+                }
+            }
+        }
         if b[0] >= a[0] { 1.0 } else { -1.0 }
     }
 
@@ -2796,6 +3079,41 @@ impl Arrangement {
         removed
     }
 
+    /// Unmated arcs the imprint left at the motion's very start or end, below
+    /// the grid (every parameter within two time steps of an end, shorter
+    /// than `below`): a partner sheet's arc there was never
+    /// resolved, so the arc is a corner of its loop, contracted as the fold
+    /// corners are (its neighbours meet at its middle; the vertex solve
+    /// then finds the exact point). Returns how many.
+    fn contract_unmated_end_slivers(&mut self, unmated: &[usize], below: f64) -> usize {
+        let band = 2.0 * self.time_step;
+        let sliver = |arc: &ArcRecord| {
+            !arc.points.is_empty()
+                && arc.length() < below
+                && (arc.params.iter().all(|p| p[1] <= band) || arc.params.iter().all(|p| p[1] >= 1.0 - band))
+        };
+        let mut removed = 0;
+        for &id in unmated {
+            if !sliver(&self.arcs[id]) {
+                continue;
+            }
+            let Some(lp) = self.loops.iter_mut().find(|l| l.arcs.contains(&id)) else { continue };
+            let n = lp.arcs.len();
+            if n <= 2 {
+                continue;
+            }
+            let i = lp.arcs.iter().position(|&a| a == id).expect("in its loop");
+            let middle = self.arcs[id].points[0].add(*self.arcs[id].points.last().expect("points")).scale(0.5);
+            let (prev, next) = (lp.arcs[(i + n - 1) % n], lp.arcs[(i + 1) % n]);
+            *self.arcs[prev].points.last_mut().expect("points") = middle;
+            self.arcs[next].points[0] = middle;
+            lp.arcs.remove(i);
+            self.arcs[id].points.clear();
+            removed += 1;
+        }
+        removed
+    }
+
     /// Each hole's face: for a loop running clockwise in its sheet's
     /// parameters (area <= 0), the smallest counter-clockwise loop on the
     /// same sheet whose polygon holds it; None for an outer loop (or a hole
@@ -2971,7 +3289,14 @@ impl Arrangement {
         let contracted = self.contract_fold_corners(below);
         self.split_returning_self_arcs(tolerance);
         let imprinted = self.imprint(tolerance);
-        let mating = self.mate(tolerance);
+        let mut mating = self.mate(tolerance);
+        if !mating.unmated.is_empty() && end_slivers_on() {
+            let dropped = self.contract_unmated_end_slivers(&mating.unmated, below);
+            if dropped > 0 {
+                END_SLIVERS.with(|cell| cell.set(cell.get() + dropped as u64));
+                mating = self.mate(tolerance);
+            }
+        }
         let pinched = self.split_pinched_loops(&mating);
         let n = self.arcs.len();
         let faces = self.loops.iter().filter(|l| !l.arcs.is_empty() && l.area > 0.0).count();
@@ -3213,3 +3538,4 @@ impl Arrangement {
 #[path = "solid_sweep_trim_ring.rs"]
 mod ring;
 pub use ring::{next_fit_counts, ring_trim_on, sweep_ring_tumbled, RING_BRANCH_MARGIN};
+

@@ -84,6 +84,10 @@ pub const CHORD_MM: f64 = 0.005;
 /// Deepest a sampled interval is halved in search of [`CHORD_MM`].
 const MAX_SUBDIVISION: u32 = 14;
 
+/// The same for [`hidden_line_drawing`], whose chords may be asked a
+/// billionth of the solid's size: far past what that needs of any curve.
+const EXACT_SUBDIVISION: u32 = 48;
+
 /// The kernel's tangency bar on a curve-surface hit (`intersect_curve_surface`
 /// flags `|n · t| <= 1e-3`), used for the closed-form plane too: a face the
 /// view ray only grazes has no area in front of the piece to hide it with.
@@ -179,9 +183,16 @@ pub struct Floors {
 
 impl Floors {
     pub fn of(scale: f64) -> Floors {
-        let bar = KernelTolerances::default().pcurve_consistency;
+        let bar = EXACT_BAR.with(|bar| bar.get()).unwrap_or(KernelTolerances::default().pcurve_consistency);
         Floors { bar, depth_mm: bar * scale, crossing_mm: bar * scale }
     }
+}
+
+thread_local! {
+    /// The agreement bar of the pass running on this thread where it is not
+    /// the B-rep's own: [`hidden_line_drawing`] reads its solid far finer
+    /// than any sheet does.
+    static EXACT_BAR: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
 }
 
 /// The exact result of one placement: the visible runs on the paper, plus
@@ -189,6 +200,9 @@ impl Floors {
 #[derive(Debug, Clone, Default)]
 pub struct HlrResult {
     pub runs: Vec<Vec<[f64; 2]>>,
+    /// The hidden runs on the paper: the pieces the solids hide, chained as
+    /// the visible ones are (a sheet draws them only as hidden lines).
+    pub hidden: Vec<Vec<[f64; 2]>>,
     /// Inked candidate curves before splitting (edges and silhouette pieces).
     pub inked: usize,
     /// Silhouette pieces among them.
@@ -402,9 +416,25 @@ fn sample(
     let initial = if carrier.straight() { 1 } else { initial.max(2) };
     let Some(first) = carrier.at(s0) else { return out };
     out.push(s0, first, frame, placed);
-    for k in 0..initial {
-        let a = s0 + (s1 - s0) * k as f64 / initial as f64;
-        let b = s0 + (s1 - s0) * (k + 1) as f64 / initial as f64;
+    let mut stations: Vec<f64> = (0..=initial).map(|k| s0 + (s1 - s0) * k as f64 / initial as f64).collect();
+    // For [`hidden_line_drawing`], every knot of the curve inside the range is
+    // a station too, so each stretch halved is one polynomial span: a kink or
+    // a short span between two stations is never stepped over.
+    if EXACT_BAR.with(|bar| bar.get()).is_some() {
+        let knots = match carrier {
+            Carrier::Edge(curve) => Some(&curve.knots),
+            Carrier::Curve(curve) => Some(&curve.knots),
+            _ => None,
+        };
+        if let Some(knots) = knots {
+            let (low, high) = (s0.min(s1), s0.max(s1));
+            stations.extend(knots.iter().copied().filter(|&k| k > low && k < high));
+            stations.sort_by(|a, b| if s1 >= s0 { a.total_cmp(b) } else { b.total_cmp(a) });
+            stations.dedup();
+        }
+    }
+    for w in stations.windows(2) {
+        let (a, b) = (w[0], w[1]);
         let (Some(pa), Some(pb)) = (carrier.at(a), carrier.at(b)) else { continue };
         subdivide(carrier, (a, pa), (b, pb), 0, frame, placed, &mut out);
     }
@@ -420,7 +450,8 @@ fn subdivide(
     placed: &PlacedView,
     out: &mut Samples,
 ) {
-    if depth < MAX_SUBDIVISION && !carrier.straight() {
+    let deepest = if EXACT_BAR.with(|bar| bar.get()).is_some() { EXACT_SUBDIVISION } else { MAX_SUBDIVISION };
+    if depth < deepest && !carrier.straight() {
         let mid = 0.5 * (a + b);
         if let Some(pm) = carrier.at(mid) {
             let (paper_a, _) = project(frame, placed, pa);
@@ -1668,6 +1699,10 @@ struct Scene<'a> {
     /// view ray toward the eye can stop looking.
     near: f64,
     clip: &'a Clip<'a>,
+    /// Pin each split where a curve's end lands on another on that curve's
+    /// exact image, and let it stand for the chord crossings of a tangential
+    /// meeting near it ([`hidden_line_drawing`]); a sheet keeps the chords'.
+    exact_cuts: bool,
 }
 
 impl Scene<'_> {
@@ -1849,6 +1884,85 @@ pub fn visible_edges(solids: &[&BrepSolid], frame: &ViewFrame, placed: &PlacedVi
     visible_edges_with(solids, &trims, frame, placed, clip)
 }
 
+/// A solid's hidden-line drawing looking along `direction`: its inked edges
+/// and outlines in the view plane, split into what the viewer sees and what
+/// the solid hides.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HiddenLineDrawing {
+    pub visible: Vec<Vec<[f64; 2]>>,
+    pub hidden: Vec<Vec<[f64; 2]>>,
+}
+
+/// The hidden-line drawing of `solid` looking along `direction`, by the exact
+/// pass ([`visible_edges`]), each polyline's points on its exact curve and
+/// each chord within `tolerance` of it. The view plane's axes are `u`,
+/// `direction × z` made unit (`direction × x` when it runs along z: when
+/// `|direction × z|² < 1e-12` for the unit direction, as the conformance
+/// protocol's `view_axes` reads it), and `v = u × direction`; a point `p`
+/// draws at `(p·u, p·v)`.
+///
+/// The pass samples to its paper chord floor, so the drawing is made at the
+/// paper scale that puts that floor at the lesser of half `tolerance` and a
+/// ten-millionth of the solid's diagonal: the places a curve passes behind
+/// another, found on those chords, then lie that close to the exact ones.
+/// Refuses a direction that is not finite and non-zero, and a tolerance that
+/// is not positive or is under a billionth of the solid's size.
+pub fn hidden_line_drawing(solid: &BrepSolid, direction: [f64; 3], tolerance: f64) -> Result<HiddenLineDrawing, brep_kernel::KernelRefusal> {
+    let refuse = |what: &'static str, message: String| brep_kernel::KernelRefusal::input(brep_kernel::KernelStage::Collect, what, message);
+    // Scaled by its largest component first, so no square of one overflows
+    // or underflows.
+    let largest = direction.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    if !(largest.is_finite() && largest > 0.0) || direction.iter().any(|x| !x.is_finite()) {
+        return Err(refuse("hidden_line_direction", format!("hidden_line_drawing: the direction {direction:?} is not a direction")));
+    }
+    let d = Vec3::new(direction[0] / largest, direction[1] / largest, direction[2] / largest);
+    let d = d.scale(1.0 / d.length());
+    if !(tolerance.is_finite() && tolerance > 0.0) {
+        return Err(refuse("hidden_line_tolerance", format!("hidden_line_drawing: the tolerance {tolerance} is not positive")));
+    }
+    let across = d.cross(Vec3::new(0.0, 0.0, 1.0));
+    let u = if across.dot(across) < 1e-12 { d.cross(Vec3::new(1.0, 0.0, 0.0)) } else { across };
+    let u = u.scale(1.0 / u.length());
+    let v = u.cross(d);
+    let [low, high] = brep_kernel::solid_least_box(solid, 1e-7)?;
+    let diagonal = high.sub(low).length().max(1e-9);
+    if tolerance < 1e-9 * diagonal {
+        return Err(refuse(
+            "hidden_line_tolerance",
+            format!("hidden_line_drawing: the tolerance {tolerance} is under a billionth of the solid's size ({diagonal}), the pass's own floors"),
+        ));
+    }
+    let scale = CHORD_MM / (0.5 * tolerance).min(1e-7 * diagonal);
+    let frame = ViewFrame { target: [0.0; 3], right: a3(u), up: a3(v), forward: a3(d) };
+    let placed = PlacedView {
+        id: String::new(),
+        view: String::new(),
+        position: [0.0, 0.0],
+        scale,
+        projection: super::ORTHOGRAPHIC.into(),
+        flatten_text: false,
+        three_d: false,
+        section: None,
+        detail: None,
+    };
+    let trims = SolidTrims::of(solid);
+    // The pass's floors at a billionth of the solid's diagonal: the drawing
+    // is asked for its cuts and ends far inside the B-rep's own agreement bar
+    // (which a primitive's exact trims meet), and the floors in paper units
+    // scale with it.
+    struct Restore(Option<f64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXACT_BAR.with(|bar| bar.set(self.0));
+        }
+    }
+    let _restore = Restore(EXACT_BAR.with(|bar| bar.replace(Some(1e-9 * diagonal))));
+    let result = edges_pass(&[solid], &[&trims], &frame, &placed, &Clip::Whole, true);
+    // The paper runs x right and y down, in millimetres of the scale.
+    let back = |runs: Vec<Vec<[f64; 2]>>| runs.into_iter().map(|run| run.into_iter().map(|p| [p[0] / scale, -p[1] / scale]).collect()).collect();
+    Ok(HiddenLineDrawing { visible: back(result.runs), hidden: back(result.hidden) })
+}
+
 /// [`visible_edges`] with each solid's [`SolidTrims`] kept from before.
 pub fn visible_edges_with(
     solids: &[&BrepSolid],
@@ -1856,6 +1970,17 @@ pub fn visible_edges_with(
     frame: &ViewFrame,
     placed: &PlacedView,
     clip: &Clip,
+) -> HlrResult {
+    edges_pass(solids, trims, frame, placed, clip, false)
+}
+
+fn edges_pass(
+    solids: &[&BrepSolid],
+    trims: &[&SolidTrims],
+    frame: &ViewFrame,
+    placed: &PlacedView,
+    clip: &Clip,
+    exact_cuts: bool,
 ) -> HlrResult {
     TRIM_QUERIES.with(|count| count.set(0));
     RAY_QUERIES.with(|count| count.set(0));
@@ -1928,7 +2053,7 @@ pub fn visible_edges_with(
             }
         }
     }
-    decide(candidates, occluders, extent, near, frame, placed, clip)
+    decide(candidates, occluders, extent, near, frame, placed, clip, exact_cuts)
 }
 
 /// The shared back half of both passes: split every candidate where the
@@ -1942,6 +2067,7 @@ fn decide(
     frame: &ViewFrame,
     placed: &PlacedView,
     clip: &Clip,
+    exact_cuts: bool,
 ) -> HlrResult {
     let floors = Floors::of(placed.scale);
     let mut result = HlrResult::default();
@@ -1960,6 +2086,7 @@ fn decide(
         grid,
         near: near - floors.bar * 10.0 - 1.0,
         clip,
+        exact_cuts,
     };
 
     let stations = split_parameters(&candidates, &scene);
@@ -1976,16 +2103,18 @@ fn decide(
             *valence.entry(end).or_default() += 1;
         }
     }
-    let mut runs: Vec<Run> = Vec::new();
+    let (mut runs, mut hidden): (Vec<Run>, Vec<Run>) = (Vec::new(), Vec::new());
     for (index, candidate) in candidates.iter().enumerate() {
         if !candidate.inked {
             continue;
         }
         let pieces = pieces_of(candidate, &stations[index], &scene);
         result.pieces += pieces.len();
-        runs.extend(runs_of(candidate, &pieces, &scene));
+        runs.extend(runs_of(candidate, &pieces, &scene, true));
+        hidden.extend(runs_of(candidate, &pieces, &scene, false));
     }
     result.runs = chain_runs(runs, &valence, floors.crossing_mm);
+    result.hidden = chain_runs(hidden, &valence, floors.crossing_mm);
     result.trim_queries = TRIM_QUERIES.with(|count| count.get());
     result.ray_queries = RAY_QUERIES.with(|count| count.get());
     result
@@ -2081,7 +2210,7 @@ pub fn visible_mesh_lines(meshes: &[MeshSolid], frame: &ViewFrame, placed: &Plac
             occluders.push(Occluder { cover: Cover::Triangle { corners, normal }, bounds, whole: clip.whole(solid_index) });
         }
     }
-    decide(candidates, occluders, extent, near, frame, placed, clip)
+    decide(candidates, occluders, extent, near, frame, placed, clip, false)
 }
 
 /// An inked candidate on a model polyline (a display edge, a mesh silhouette
@@ -2242,6 +2371,11 @@ fn split_parameters(candidates: &[Candidate], scene: &Scene) -> Vec<Vec<f64>> {
     };
     let tolerance = floors.crossing_mm + CHORD_MM;
     let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    // In exact mode: each candidate's chord crossings (parameter, paper
+    // point, how far off they may be, the other curve) and the paper points
+    // ends land at (with the curve that ends there).
+    let mut crossings: Vec<Vec<(f64, [f64; 2], f64, usize)>> = vec![Vec::new(); candidates.len()];
+    let mut landings: Vec<Vec<([f64; 2], usize)>> = vec![Vec::new(); candidates.len()];
     for bucket in &grid.buckets {
         for (k, &first) in bucket.iter().enumerate() {
             for &second in &bucket[k + 1..] {
@@ -2260,8 +2394,20 @@ fn split_parameters(candidates: &[Candidate], scene: &Scene) -> Vec<Vec<f64>> {
                 let pb = &candidates[cb].samples.paper;
                 let vec2 = |p: [f64; 2]| Vec2 { x: p[0], y: p[1] };
                 if let Some([ta, tb]) = segment_intersection(vec2(pa[sa]), vec2(pa[sa + 1]), vec2(pb[sb]), vec2(pb[sb + 1]), tolerance) {
-                    splits[ca].push(param_at(ca, sa, ta));
-                    splits[cb].push(param_at(cb, sb, tb));
+                    if scene.exact_cuts {
+                        // How far along the chords the crossing may stand
+                        // from the curves' own: their sag over the sine of
+                        // the angle they cross at.
+                        let (da, db) = ([pa[sa + 1][0] - pa[sa][0], pa[sa + 1][1] - pa[sa][1]], [pb[sb + 1][0] - pb[sb][0], pb[sb + 1][1] - pb[sb][1]]);
+                        let sine = (da[0] * db[1] - da[1] * db[0]).abs() / (da[0].hypot(da[1]) * db[0].hypot(db[1])).max(f64::MIN_POSITIVE);
+                        let reach = 4.0 * tolerance / sine.max(1e-12);
+                        let at = [pa[sa][0] + da[0] * ta, pa[sa][1] + da[1] * ta];
+                        crossings[ca].push((param_at(ca, sa, ta), at, reach, cb));
+                        crossings[cb].push((param_at(cb, sb, tb), at, reach, ca));
+                    } else {
+                        splits[ca].push(param_at(ca, sa, ta));
+                        splits[cb].push(param_at(cb, sb, tb));
+                    }
                 }
                 // An END of one on the other, including along a collinear
                 // overlap the crossing test does not report.
@@ -2275,10 +2421,27 @@ fn split_parameters(candidates: &[Candidate], scene: &Scene) -> Vec<Vec<f64>> {
                         }
                         let (distance, t) = segment_foot(end, op[onto_seg], op[onto_seg + 1]);
                         if distance <= tolerance {
-                            splits[onto].push(param_at(onto, onto_seg, t));
+                            if scene.exact_cuts {
+                                let params = &candidates[onto].samples.params;
+                                let s = landing(&candidates[onto].carrier, end, (params[onto_seg], params[onto_seg + 1]), (params[0], *params.last().unwrap()), scene);
+                                splits[onto].push(s);
+                                landings[onto].push((end, from));
+                            } else {
+                                splits[onto].push(param_at(onto, onto_seg, t));
+                            }
                         }
                     }
                 }
+            }
+        }
+    }
+    // A crossing with a curve whose end lands on this one, as near that
+    // landing as the crossing may be off, is that meeting read on the chords:
+    // the landing stands for it.
+    for (ci, list) in crossings.into_iter().enumerate() {
+        for (s, at, reach, partner) in list {
+            if !landings[ci].iter().any(|&(end, from)| from == partner && paper_distance(end, at) <= reach) {
+                splits[ci].push(s);
             }
         }
     }
@@ -2322,11 +2485,39 @@ fn split_parameters(candidates: &[Candidate], scene: &Scene) -> Vec<Vec<f64>> {
     splits
 }
 
+/// The parameter in `[lo, hi]` (widened by its own length each way, inside
+/// the sampled range `[first, last]`) where the curve's image passes nearest
+/// the paper point `end`, by golden-section search.
+fn landing(carrier: &Carrier, end: [f64; 2], (lo, hi): (f64, f64), (first, last): (f64, f64), scene: &Scene) -> f64 {
+    let width = hi - lo;
+    let (mut lo, mut hi) = ((lo - width).max(first.min(last)), (hi + width).min(first.max(last)));
+    let gap = |s: f64| carrier.at(s).map_or(f64::INFINITY, |p| paper_distance(project(&scene.frame, scene.placed, p).0, end));
+    let ratio = 0.5 * (5f64.sqrt() - 1.0);
+    let (mut x, mut y) = (hi - ratio * (hi - lo), lo + ratio * (hi - lo));
+    let (mut fx, mut fy) = (gap(x), gap(y));
+    for _ in 0..80 {
+        if fx <= fy {
+            hi = y;
+            (y, fy) = (x, fx);
+            x = hi - ratio * (hi - lo);
+            fx = gap(x);
+        } else {
+            lo = x;
+            (x, fx) = (y, fy);
+            y = lo + ratio * (hi - lo);
+            fy = gap(y);
+        }
+    }
+    0.5 * (lo + hi)
+}
+
 /// One decided piece of a candidate: its parameter span and its paper ends.
 struct Piece {
     lo: f64,
     hi: f64,
     visible: bool,
+    /// Inside the clip: a piece the clip removes is neither seen nor hidden.
+    kept: bool,
 }
 
 /// Cut a candidate at its split parameters (merging any closer together on
@@ -2365,7 +2556,7 @@ fn pieces_of(candidate: &Candidate, splits: &[f64], scene: &Scene) -> Vec<Piece>
             Clip::Circle { radius } => (view[0] * view[0] + view[1] * view[1]).sqrt() <= radius + scene.floors.bar,
         };
         let visible = kept && !scene.hidden(mid, &mut hint);
-        pieces.push(Piece { lo, hi, visible });
+        pieces.push(Piece { lo, hi, visible, kept });
     }
     pieces
 }
@@ -2378,10 +2569,11 @@ struct Run {
     end: Option<VertexKey>,
 }
 
-/// The visible runs of one candidate: maximal chains of consecutive visible
-/// pieces, wrapped round the seam of a closed curve. A run keeps its own ends
-/// and the SAMPLES strictly between them, so a straight edge is two points.
-fn runs_of(candidate: &Candidate, pieces: &[Piece], scene: &Scene) -> Vec<Run> {
+/// The visible runs of one candidate (or, `seen` false, its hidden runs):
+/// maximal chains of consecutive pieces of that kind, wrapped round the seam
+/// of a closed curve. A run keeps its own ends and the SAMPLES strictly
+/// between them, so a straight edge is two points.
+fn runs_of(candidate: &Candidate, pieces: &[Piece], scene: &Scene, seen: bool) -> Vec<Run> {
     let samples = &candidate.samples;
     let closed = samples.len() > 2
         && paper_distance(samples.paper[0], *samples.paper.last().unwrap()) < scene.floors.crossing_mm
@@ -2389,12 +2581,13 @@ fn runs_of(candidate: &Candidate, pieces: &[Piece], scene: &Scene) -> Vec<Run> {
     let mut spans: Vec<(f64, f64, bool, bool)> = Vec::new(); // (lo, hi, touches start, touches end)
     let mut i = 0;
     while i < pieces.len() {
-        if !pieces[i].visible {
+        let of_kind = |piece: &Piece| piece.kept && piece.visible == seen;
+        if !of_kind(&pieces[i]) {
             i += 1;
             continue;
         }
         let first = i;
-        while i < pieces.len() && pieces[i].visible {
+        while i < pieces.len() && of_kind(&pieces[i]) {
             i += 1;
         }
         spans.push((pieces[first].lo, pieces[i - 1].hi, first == 0, i == pieces.len()));

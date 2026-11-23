@@ -45,6 +45,7 @@ pub mod instructions;
 pub mod modeling;
 pub mod pads;
 pub mod pcb;
+pub mod schematic;
 pub mod pmi;
 pub mod sheet_metal;
 pub mod simulation;
@@ -232,6 +233,9 @@ pub static WORKBENCHES: &[&Workbench] = &[
     &simulation::SIMULATION,
     // Gear generators: one feature per gear type.
     &gears::GEARS,
+    // PCB diagram: the schematic of PCB's document, its own workbench since
+    // 2026-11-21 (appended last: MCP scripts read `/workbenches/N`).
+    &schematic::SCHEMATIC,
 ];
 
 /// Workbenches DECLARED but not yet in the dropdown — none today. A
@@ -314,12 +318,12 @@ pub fn shared_buttons() -> &'static [WorkbenchButton] {
 /// the borrower's row, and therefore [`offered_buttons`], `describe_workbenches`
 /// and what `workbench_button` will press while it is active.
 ///
-/// PCB borrows Assembly's ADD COMPONENT because a board is an assembly of
+/// PCB diagram and PCB borrow Assembly's ADD COMPONENT because a board is an assembly of
 /// placed parts and the user asked for "the same one": inserting a component
 /// is one action wherever it is reached from, and a second declaration would
 /// be two ids for it.
 pub static BORROWED: &[(&str, &[&WorkbenchButton])] =
-    &[("pcb", &[assembly::ADD_COMPONENT])];
+    &[("schematic", &[assembly::ADD_COMPONENT]), ("pcb", &[assembly::ADD_COMPONENT])];
 
 /// The buttons workbench `id` BORROWS ([`BORROWED`]) — empty for a workbench
 /// that borrows none, and for `"all"`, whose union already carries every
@@ -381,7 +385,7 @@ pub fn button_by_id(id: &str) -> Option<&'static WorkbenchButton> {
 /// take their buttons from one table: eCAD's editor actions (`view.*`,
 /// `edit.*`, `sheet.*`, `board.*`) are Diagram's and PCB's alike, so each
 /// leads them with its own — `diagram.sheet.tool.wire`,
-/// `pcb.sheet.tool.wire` — while the symbol and pads editors' ids already
+/// `schematic.sheet.tool.wire` — while the symbol and pads editors' ids already
 /// lead with `symbol.` and `pads.` and need nothing added. The shared sketch
 /// tools belong to no workbench and lead with none of theirs (`sketch.`).
 pub fn button_prefix(wb: &Workbench) -> String {
@@ -443,7 +447,7 @@ pub const SYNONYMS: &[(&[&str], &str)] = &[
             "sketch.tool.select",
             "sketch3d.tool.select",
             "diagram.sheet.tool.select",
-            "pcb.sheet.tool.select",
+            "schematic.sheet.tool.select",
             "pcb.board.tool.select",
             "symbol.tool.select",
             "pads.tool.select",
@@ -457,7 +461,7 @@ pub const SYNONYMS: &[(&[&str], &str)] = &[
     (&["sketch.tool.pickEdges", "sketch3d.tool.pickRef"], "links model geometry into the sketch as a fixed reference"),
     (&["sketch.tool.rect", "symbol.tool.rectangle", "pads.tool.rectangle"], "draws a rectangle"),
     (&["sketch.tool.circle", "symbol.tool.circle", "pads.tool.circle"], "draws a circle"),
-    (&["pcb.sheet.wire.finish", "pcb.board.route.finish", "pcb.board.draw.finish"], "ends the path being drawn"),
+    (&["schematic.sheet.wire.finish", "pcb.board.route.finish", "pcb.board.draw.finish"], "ends the path being drawn"),
     (&["pcb.board.zone.finish", "pcb.board.cutout.finish"], "closes the outline being drawn"),
 ];
 

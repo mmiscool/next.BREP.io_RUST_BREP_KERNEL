@@ -540,14 +540,188 @@ fn sliver_bound_enabled() -> bool {
 /// exact fallback, and this returns a lower bound on that value. Otherwise
 /// `None`, and the reading runs as before (an error anywhere also yields
 /// `None`, so the reading reports it).
+///
+/// Under `BREP_SIGN_CANONICAL_LOOPS` ([`sign_canonical_loops_mode`]) every face
+/// is read in its canonical rotation ([`canonical_loops`]), so that a face a
+/// later boolean hands back with its loops started one coedge further on keys
+/// and reads the same terms as before.
 pub fn sliver_bound_certificate(solid: &BrepSolid, bar: f64) -> Option<f64> {
+    match sign_canonical_loops_mode() {
+        crate::env_read::Mode::Off => sliver_bound_reading(solid, bar, false),
+        crate::env_read::Mode::On => sliver_bound_reading(solid, bar, true),
+        crate::env_read::Mode::Check => {
+            let given = sliver_bound_reading(solid, bar, false);
+            let canonical = sliver_bound_reading(solid, bar, true);
+            canonical_loops_check(solid, given, canonical);
+            given
+        }
+    }
+}
+
+/// `BREP_SIGN_CANONICAL_LOOPS` (default on since the 2026-11-21 tier-P
+/// promotion; `0|off` reads every face as given; `check` reads both and prints
+/// one `mass.sign_canonical_check` line per certificate, the given rotation
+/// deciding): see [`sliver_bound_certificate`].
+pub fn sign_canonical_loops_mode() -> crate::env_read::Mode {
+    crate::mode_switch!(live "BREP_SIGN_CANONICAL_LOOPS", true)
+}
+
+
+/// `face` with each loop started at the coedge that makes its sequence of
+/// `(pcurve identity, sense)` least (loop order kept): the same region, read
+/// from the same pcurves, whichever coedge a boolean happened to start the
+/// loop at. Borrowed when every loop already starts there.
+pub fn canonical_loops(face: &FaceRecord) -> std::borrow::Cow<'_, FaceRecord> {
+    let starts: Vec<usize> = face
+        .loops
+        .iter()
+        .map(|loop_record| {
+            let keys: Vec<([u64; 2], bool)> = loop_record
+                .coedges
+                .iter()
+                .map(|coedge| {
+                    let mut lane = super::identity::TwoLane::new();
+                    super::identity::hash_curve(&mut lane, &coedge.pcurve);
+                    (lane.finish(), coedge.forward)
+                })
+                .collect();
+            let n = keys.len();
+            (0..n)
+                .min_by(|&a, &b| (0..n).map(|k| keys[(a + k) % n]).cmp((0..n).map(|k| keys[(b + k) % n])))
+                .unwrap_or(0)
+        })
+        .collect();
+    if starts.iter().all(|&start| start == 0) {
+        return std::borrow::Cow::Borrowed(face);
+    }
+    let mut rotated = face.clone();
+    for (loop_record, start) in rotated.loops.iter_mut().zip(starts) {
+        loop_record.coedges.rotate_left(start);
+    }
+    std::borrow::Cow::Owned(rotated)
+}
+
+/// The key the sign certificate's memo holds `face`'s terms under: its content
+/// identity about its own volume reference (`reference` when it has none).
+pub fn sign_face_identity(face: &FaceRecord, reference: Vec3) -> [u64; 2] {
+    let local = face_volume_reference(face).unwrap_or(reference);
+    super::identity::face_contribution_identity(face, local)
+}
+
+/// The check mode of `BREP_SIGN_CANONICAL_LOOPS`: both certificates' verdicts,
+/// and per face the worst relative difference between its bounded terms read
+/// in the given and the canonical rotation (its contribution about the shell
+/// reference against the face's own magnitude, and its vector area).
+fn canonical_loops_check(solid: &BrepSolid, given: Option<f64>, canonical: Option<f64>) {
+    let (mut faces, mut rotated, mut worst_contribution, mut worst_area, mut unread) = (0usize, 0usize, 0.0f64, 0.0f64, 0usize);
+    let mut worst_face = String::from("-");
+    let mut worst_of_bound = 0.0f64;
+    // The certificate's margin is relative to the faces' summed magnitudes, so
+    // each face's difference is read against that too.
+    let (mut worst_absolute, mut total_magnitude) = (0.0f64, 0.0f64);
+    super::trimmed::with_straight_corrections_skipped(|| {
+        for shell in &solid.shells {
+            let Ok(reference) = shell_volume_reference(shell) else { continue };
+            for face in &shell.faces {
+                faces += 1;
+                if let Some(local) = face_volume_reference(face) {
+                    if let Ok(terms) = face_volume_terms_about(face, local) {
+                        let area = Vec3::new(terms[1], terms[2], terms[3]);
+                        total_magnitude += (terms[0] + local.sub(reference).dot(area)).abs();
+                    }
+                }
+                let canon = canonical_loops(face);
+                let std::borrow::Cow::Owned(canon) = canon else { continue };
+                rotated += 1;
+                let read = |face: &FaceRecord| {
+                    let local = face_volume_reference(face).unwrap_or(reference);
+                    let offset = local.sub(reference).length();
+                    let (terms, bound) = match bounded_face_terms(face, local) {
+                        Some((terms, per_offset, fixed, _)) => (terms, fixed + per_offset * offset),
+                        None => (face_volume_terms_about(face, local).ok()?, 0.0),
+                    };
+                    let area = Vec3::new(terms[1], terms[2], terms[3]);
+                    Some((terms[0] + local.sub(reference).dot(area), area, terms[0].abs() + offset * area.length(), bound))
+                };
+                match (read(face), read(&canon)) {
+                    (Some((c0, a0, m0, b0)), Some((c1, a1, m1, b1))) => {
+                        // Both readings leave the same region's corrections out and bound them:
+                        // their difference must lie inside the two bounds together.
+                        worst_of_bound = worst_of_bound.max((c0 - c1).abs() / (b0 + b1).max(f64::MIN_POSITIVE));
+                        worst_absolute = worst_absolute.max((c0 - c1).abs());
+                        let magnitude = m0.max(m1).max(f64::MIN_POSITIVE);
+                        let relative = (c0 - c1).abs() / magnitude;
+                        if relative > worst_contribution {
+                            worst_contribution = relative;
+                            let (closed_u, closed_v) = face.surface.closed_directions().unwrap_or((false, false));
+                            worst_face = format!(
+                                "{}:{}{}:loops{}",
+                                face.surface.analytic().map_or("freeform", |kind| kind.kind_label()).replace(' ', "_"),
+                                if closed_u { "U" } else { "u" },
+                                if closed_v { "V" } else { "v" },
+                                face.loops.len()
+                            );
+                        }
+                        worst_area = worst_area.max(a0.sub(a1).length() / a0.length().max(a1.length()).max(f64::MIN_POSITIVE));
+                    }
+                    _ => unread += 1,
+                }
+            }
+        }
+    });
+    let verdict = |value: Option<f64>| if value.is_some() { "certified" } else { "none" };
+    // Both certify, or both leave the sign to the reading: anything else is a
+    // disagreement to look at, though either outcome stays sound.
+    let agree = given.is_some() == canonical.is_some();
+    eprintln!(
+        "mass.sign_canonical_check{} given={} canonical={} faces={faces} rotated={rotated} unread={unread} worst_rel_contribution={worst_contribution:.3e} worst_rel_area={worst_area:.3e} worst_face={worst_face} difference_of_bound={worst_of_bound:.3e} difference_of_shell={:.3e} thread={}",
+        if agree { "" } else { " DISAGREE" },
+        verdict(given),
+        verdict(canonical),
+        worst_absolute / total_magnitude.max(f64::MIN_POSITIVE),
+        std::thread::current().name().unwrap_or("-"),
+    );
+}
+
+/// A face's bounded sign terms read about `from` (the canonical rotation's
+/// reference), restated about `to` (the given rotation's): the volume term moves
+/// by `(from - to) · area`, exactly as the divergence theorem moves it, and the
+/// correction bound is recomputed about `to` from the same control net and the
+/// same skipped measure (`per_offset = measure · n / 3`, `fixed = per_offset ·
+/// r`, with `(n, r)` the net's bounds about the point), so the certificate
+/// reads what the given rotation reads, to rounding.
+fn rebase_bounded(
+    surface: &crate::NurbsSurface,
+    from: Vec3,
+    to: Vec3,
+    (terms, per_offset, fixed, rounding): ([f64; 4], f64, f64, f64),
+) -> Option<([f64; 4], f64, f64, f64)> {
+    let terms = rebase_terms(from, to, terms);
+    if per_offset == 0.0 && fixed == 0.0 {
+        return Some((terms, 0.0, 0.0, rounding));
+    }
+    let (n_from, _) = surface_flux_bounds(surface, from)?;
+    let (n_to, r_to) = surface_flux_bounds(surface, to)?;
+    let measure = 3.0 * per_offset / n_from;
+    let per_offset = measure * n_to / 3.0;
+    let fixed = per_offset * r_to;
+    [per_offset, fixed].iter().all(|v| v.is_finite()).then_some((terms, per_offset, fixed, rounding))
+}
+
+/// Volume and vector-area terms about `from`, restated about `to`.
+fn rebase_terms(from: Vec3, to: Vec3, terms: [f64; 4]) -> [f64; 4] {
+    let area = Vec3::new(terms[1], terms[2], terms[3]);
+    [terms[0] + from.sub(to).dot(area), terms[1], terms[2], terms[3]]
+}
+
+fn sliver_bound_reading(solid: &BrepSolid, bar: f64, canonical: bool) -> Option<f64> {
     if !bar.is_finite() {
         return None;
     }
     let token = super::profile::begin("solid_sign_sliver_bound");
     // `BREP_SIGN_PREFETCH`: a large solid's face terms start on idle threads;
     // the loop below takes each finished one in place of computing it.
-    let mut prefetched = SignPrefetch::spawn(solid);
+    let mut prefetched = SignPrefetch::spawn(solid, canonical);
     let outcome = super::trimmed::with_straight_corrections_skipped(|| -> Option<(f64, f64, f64, f64, [usize; 3])> {
         let (mut reading, mut magnitude, mut bound, mut scale) = (0.0, 0.0, 0.0, 0.0);
         let mut counts = [0usize; 3]; // exact terms held, bounded, integrated exactly
@@ -556,9 +730,16 @@ pub fn sliver_bound_certificate(solid: &BrepSolid, bar: f64) -> Option<f64> {
             let reference = shell_volume_reference(shell).ok()?;
             let (mut volume, mut compensation) = (0.0f64, 0.0f64);
             for face in &shell.faces {
-                let local = face_volume_reference(face).unwrap_or(reference);
-                let identity = super::identity::face_contribution_identity(face, local);
-                let offset = local.sub(reference);
+                // The terms are read (and memoised) in the canonical rotation about its
+                // own reference, then restated about the given rotation's, so every
+                // number below is the given rotation's to rounding.
+                let given = face_volume_reference(face).unwrap_or(reference);
+                let held = if canonical { canonical_loops(face) } else { std::borrow::Cow::Borrowed(face) };
+                let read_face: &FaceRecord = &held;
+                let local = if canonical { face_volume_reference(read_face).unwrap_or(reference) } else { given };
+                let identity = super::identity::face_contribution_identity(read_face, local);
+                let moved = [local.x, local.y, local.z].map(f64::to_bits) != [given.x, given.y, given.z].map(f64::to_bits);
+                let offset = given.sub(reference);
                 let ready = prefetched.as_mut().and_then(|prefetched| prefetched.claim(slot));
                 slot += 1;
                 let (ready_bounded, ready_exact) = match ready {
@@ -568,21 +749,24 @@ pub fn sliver_bound_certificate(solid: &BrepSolid, bar: f64) -> Option<f64> {
                 let (terms, face_bound, face_scale) = match crate::reading_memo::peek_sign_terms(identity) {
                     Some(terms) => {
                         counts[0] += 1;
-                        (terms?, 0.0, 0.0)
+                        let terms = terms?;
+                        (if moved { rebase_terms(local, given, terms) } else { terms }, 0.0, 0.0)
                     }
                     None => match crate::reading_memo::memoized_bounded_sign_terms(identity, || {
-                        prefetched_or(ready_bounded, || bounded_face_terms(face, local))
+                        prefetched_or(ready_bounded, || bounded_face_terms(read_face, local))
                     }) {
-                        Some((terms, per_offset, fixed, rounding)) => {
+                        Some(bounded) => {
                             counts[1] += 1;
+                            let (terms, per_offset, fixed, rounding) =
+                                if moved { rebase_bounded(&read_face.surface, local, given, bounded)? } else { bounded };
                             (terms, fixed + per_offset * offset.length(), rounding)
                         }
                         None => {
                             counts[2] += 1;
                             let terms = crate::reading_memo::memoized_sign_terms(identity, || {
-                                prefetched_or(ready_exact, || face_volume_terms_about(face, local).ok())
+                                prefetched_or(ready_exact, || face_volume_terms_about(read_face, local).ok())
                             })?;
-                            (terms, 0.0, 0.0)
+                            (if moved { rebase_terms(local, given, terms) } else { terms }, 0.0, 0.0)
                         }
                     },
                 };
@@ -684,7 +868,7 @@ struct SignPrefetch {
 }
 
 impl SignPrefetch {
-    fn spawn(solid: &BrepSolid) -> Option<Self> {
+    fn spawn(solid: &BrepSolid, canonical: bool) -> Option<Self> {
         let mode = sign_prefetch_mode();
         let faces: usize = solid.shells.iter().map(|shell| shell.faces.len()).sum();
         if mode == crate::env_read::Mode::Off
@@ -697,8 +881,9 @@ impl SignPrefetch {
         for shell in &solid.shells {
             let reference = shell_volume_reference(shell).ok()?;
             for face in &shell.faces {
-                let local = face_volume_reference(face).unwrap_or(reference);
-                jobs.push(SignJob { face: face.clone(), local });
+                let face = if canonical { canonical_loops(face).into_owned() } else { face.clone() };
+                let local = face_volume_reference(&face).unwrap_or(reference);
+                jobs.push(SignJob { face, local });
             }
         }
         let slots = crate::claim_slots::ClaimSlots::spawn(jobs, sign_job)?;

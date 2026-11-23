@@ -2387,6 +2387,18 @@ impl eframe::App for BrepApp {
         }
 
         crate::panels::ecad_parts::sync(self.docs.active_mut());
+        // PCB diagram and PCB show one editor, each in its own view: hold it
+        // there before any row or pane reads it, whatever changed the workbench.
+        // Both the tab and the document drawn in it (a Work part edited in
+        // place is `view`, not `active`); one document when no Work part is up.
+        {
+            let doc = self.docs.active_mut();
+            let workbench = doc.engine.settings.workbench.clone();
+            doc.ecad.pin_view(&workbench);
+            let doc = self.docs.view_mut();
+            let workbench = doc.engine.settings.workbench.clone();
+            doc.ecad.pin_view(&workbench);
+        }
         // A sheet's Duplicate past the last offered occurrence: another assembly component.
         crate::panels::ecad_parts::answer_duplicate_requests(self.docs.active_mut());
         let requests = crate::panels::ecad_parts::take_open_requests(self.docs.active_mut());

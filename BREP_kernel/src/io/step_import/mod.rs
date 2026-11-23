@@ -42,6 +42,7 @@ mod styles;
 mod pmi;
 mod precision;
 mod trim_readings;
+mod tessellated;
 pub(crate) use bodies::import_lean;
 /// The projected-foot refinement's body face cap (`0` = uncapped); the
 /// soundness fixture sweep reads it to know which trims the import refined.
@@ -202,6 +203,19 @@ pub fn import_step_bodies(text: &str) -> Result<ImportedStep, StepBodyError> {
         })));
     }
     if imported.solids.is_empty() {
+        // A file of AP242 tessellated solids and no B-rep body at all reads as
+        // polyhedra; a B-rep body that failed keeps its own error.
+        let entities = parse_data_section(text).map_err(StepBodyError::Text)?;
+        let brep = entities.values().any(|e| e.has("MANIFOLD_SOLID_BREP") || e.has("FACETED_BREP") || e.has("BREP_WITH_VOIDS"));
+        let solids = if brep || imported.failed > 0 {
+            Vec::new()
+        } else {
+            tessellated::tessellated_solids(&entities, derive_length_scale_mm(&entities)).map_err(StepBodyError::Text)?
+        };
+        if !solids.is_empty() {
+            let appearances = solids.iter().map(|_| BodyAppearance::default()).collect();
+            return Ok(ImportedStep { solids, appearances, approximations: Vec::new() });
+        }
         return Err(StepBodyError::Text(imported.first_error.unwrap_or_else(|| {
             "step_import: no MANIFOLD_SOLID_BREP/FACETED_BREP/BREP_WITH_VOIDS body imported (unsupported or invalid representation)"
                 .into()
@@ -457,6 +471,31 @@ pub fn import_step_report(text: &str) -> Result<StepImportReport, String> {
 /// lane's, whose translation writes a sheet body as an open shell.
 pub(crate) fn import_step_report_with_sheets(text: &str) -> Result<StepImportReport, String> {
     import_step_report_with(text, true, true)
+}
+
+/// The faces of a STEP file sewn into one solid where their edges lie within
+/// `tolerance` (mm) of each other: every body the file holds, an open shell or a
+/// face set read as a sheet, joined and sewn by [`crate::solid_from_sheets`].
+/// Refuses a file with nothing to sew, a body that did not reconstruct, and
+/// sheets that leave an edge open (saying how many) or do not close a valid
+/// solid.
+pub fn sew_step(text: &str, tolerance: f64) -> Result<crate::BrepSolid, crate::KernelRefusal> {
+    use crate::{KernelRefusal, KernelStage};
+    if !(tolerance.is_finite() && tolerance > 0.0) {
+        return Err(KernelRefusal::input(KernelStage::Collect, "sew_step_tolerance", format!("sew_step: tolerance {tolerance} must be positive")));
+    }
+    let report = import_step_report_with_sheets(text).map_err(|e| KernelRefusal::input(KernelStage::Collect, "sew_step_read", format!("sew_step: {e}")))?;
+    if report.failed > 0 {
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "sew_step_body",
+            format!("sew_step: {} bodies did not reconstruct: {}", report.failed, report.first_error.unwrap_or_default()),
+        ));
+    }
+    if report.solids.is_empty() {
+        return Err(KernelRefusal::input(KernelStage::Collect, "sew_step_empty", "sew_step: the file holds no faces".to_string()));
+    }
+    crate::solid_from_sheets(&report.solids, tolerance)
 }
 
 /// [`import_step_report`] (with `sheets` as [`import_step_report_with_sheets`])

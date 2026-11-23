@@ -45,7 +45,7 @@ use mixed_support::{
 };
 pub(in crate::blend) use mixed_support::cylinder_wall_carrier;
 pub use patch::{build_chamfer_corner_facet, build_corner_patch_exact, build_general_corner_patch};
-pub(in crate::blend) use ribbon_star::{build_n_sided_star, build_ribbon_star_patch, RibbonRib};
+pub(in crate::blend) use ribbon_star::{build_n_sided_star, build_n_sided_star_with, build_ribbon_star_patch, RibbonRib};
 pub use ribbon_star::{is_n_sided_undercut_refusal, n_sided_star_on, N_SIDED_FOLD_WHAT, N_SIDED_UNDERCUT_WHAT};
 use patch::build_octant_face;
 

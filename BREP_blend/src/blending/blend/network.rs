@@ -4657,9 +4657,24 @@ fn blend_star_network_building(
             super::record_count("count.n_sided_star_fills", 1);
             result.vertices.extend(star.vertices);
             result.edges.extend(star.edges);
-            for (rib_edge, first_half, second_half, (first_pcurve, second_pcurve)) in star.splits {
+            for (rib_edge, first_half, second_half, (mut first_pcurve, mut second_pcurve)) in star.splits {
                 // The stripe's loop takes the two halves in place of the rib,
                 // in the rib's stored direction (the stripe uses it forward).
+                // The halves' pcurves are in the stripe's rows' (u, z), as the
+                // rib's was; a stripe on the exact extrusion lane was sewn
+                // transposed (`transpose_face`), so on its wall they are (z, u).
+                let transposed = patch
+                    .ribs
+                    .iter()
+                    .find(|(_, edge, _)| edge.id == rib_edge)
+                    .is_some_and(|(index, _, _)| stripes[*index].rows.exact_extrusion);
+                if transposed {
+                    for pcurve in [&mut first_pcurve, &mut second_pcurve] {
+                        for control in &mut pcurve.control_points {
+                            std::mem::swap(&mut control.x, &mut control.y);
+                        }
+                    }
+                }
                 let mut replaced = false;
                 for face in result.shells.iter_mut().flat_map(|shell| shell.faces.iter_mut()) {
                     for lp in &mut face.loops {
@@ -6054,6 +6069,13 @@ fn plan_cap_end(
     ))
 }
 
+/// A stopped end's cap takes its sense from its loop's winding
+/// (`BREP_BLEND_CAP_SENSE_WINDING`, default on; `=0` restores the section's
+/// outward guess).
+fn cap_sense_by_winding_on() -> bool {
+    crate::switch!("BREP_BLEND_CAP_SENSE_WINDING", true)
+}
+
 /// Sew a cap's bulkhead: a planar face in the section plane whose loop is
 /// leg (vertex -> first rim), arc (first rim -> second rim), leg (second rim
 /// -> vertex), each used with the sense OPPOSITE to its neighbour (the blend
@@ -6148,8 +6170,25 @@ fn sew_cap(
             pcurve: mapped_pcurve(piece.0)?,
         });
     }
+    // The loop's sense is its neighbours' (each edge walked opposite to the
+    // face across it), so the face's normal is the side the loop winds
+    // anticlockwise about: the plane's own where the loop runs anticlockwise
+    // in (u, v), the other way where it does not. (The section's own
+    // `outward`, the edge's tangent turned back, is the other side where the
+    // material runs on past the vertex and the blend lies behind it.)
+    let mut winding = 0.0f64;
+    for coedge in &coedges {
+        let [p0, p1] = coedge.pcurve.domain().or_refuse(KernelStage::Refine, "domain")?;
+        let samples = 16 * coedge.pcurve.degree.max(1);
+        let mut last = coedge.pcurve.evaluate(p0).or_refuse(KernelStage::Refine, "evaluate")?;
+        for k in 1..=samples {
+            let next = coedge.pcurve.evaluate(p0 + (p1 - p0) * k as f64 / samples as f64).or_refuse(KernelStage::Refine, "evaluate")?;
+            winding += last.x * next.y - next.x * last.y;
+            last = next;
+        }
+    }
     let plane_normal = plane.normal(0.5, 0.5).or_refuse(KernelStage::Refine, "normal")?;
-    let same_sense = plane_normal.dot(cap.outward) > 0.0;
+    let same_sense = if cap_sense_by_winding_on() && winding != 0.0 { winding > 0.0 } else { plane_normal.dot(cap.outward) > 0.0 };
     let loop_id = take_id();
     let face = FaceRecord {
         id: take_id(),

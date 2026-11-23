@@ -731,6 +731,61 @@ pub struct DenseContacts {
     pub unsolved_at: Vec<usize>,
 }
 
+/// One dense contact's outcome: both contacts and the ball's centre, or `None`
+/// when the continuation did not solve.
+type DenseOutcome = Option<(Vec3, Vec3, Option<Vec3>)>;
+
+thread_local! {
+    /// The dense contacts of the ladder in progress (see [`dense_contact_scope`]).
+    static DENSE_CONTACTS_KEPT: std::cell::RefCell<Option<std::collections::HashMap<Vec<u64>, DenseOutcome>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `BREP_CHAIN_DENSE_REUSE` (on unless `=0`/`off`): a chain ladder's dense
+/// contacts, kept for the ladder's duration. Each contact is the continuation
+/// of its interval's LEFT station alone — nothing carries from one contact to
+/// the next — so it is a function of the segment, that station (t, uv,
+/// centre), the contact's t, and the rung's station step, scale and signed
+/// radii, all read here to the bit. Two readings repeat it: the rail stencil's
+/// fractions (j/16) are every other fraction of the wall stencil's (j/32),
+/// the same doubles; and a local round re-reads every interval while it split
+/// only the failing ones. A hit returns the stored outcome: byte-identical by
+/// construction. `BREP_CHAIN_DENSE_REUSE_CHECK=1` re-solves each hit and
+/// panics on a disagreement; `=<path>` also appends each verdict to that file.
+fn dense_reuse_on() -> bool {
+    switch!(live "BREP_CHAIN_DENSE_REUSE", true)
+}
+
+/// Keeps dense contacts until dropped (restoring whatever an enclosing ladder
+/// kept), so nothing outlives the ladder that solved it.
+pub(crate) struct DenseContactScope(Option<Option<std::collections::HashMap<Vec<u64>, DenseOutcome>>>);
+
+pub(crate) fn dense_contact_scope() -> DenseContactScope {
+    if !dense_reuse_on() {
+        return DenseContactScope(None);
+    }
+    DenseContactScope(Some(DENSE_CONTACTS_KEPT.with(|kept| kept.replace(Some(Default::default())))))
+}
+
+impl Drop for DenseContactScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            DENSE_CONTACTS_KEPT.with(|kept| *kept.borrow_mut() = previous);
+        }
+    }
+}
+
+fn dense_outcome_bits(outcome: &DenseOutcome) -> Option<Vec<u64>> {
+    outcome.map(|(p1, p2, center)| {
+        let mut bits = vec![p1.x.to_bits(), p1.y.to_bits(), p1.z.to_bits(), p2.x.to_bits(), p2.y.to_bits(), p2.z.to_bits()];
+        match center {
+            Some(c) => bits.extend([1, c.x.to_bits(), c.y.to_bits(), c.z.to_bits()]),
+            None => bits.push(0),
+        }
+        bits
+    })
+}
+
 pub fn chain_dense_contacts(
     segments: &[ChainSegment<'_>],
     radius: f64,
@@ -739,6 +794,7 @@ pub fn chain_dense_contacts(
     subdivisions: usize,
 ) -> Result<DenseContacts, KernelRefusal> {
     let mut out = DenseContacts { solved: Vec::new(), centers: Vec::new(), unsolved: 0, unsolved_at: Vec::new() };
+    let keeping = DENSE_CONTACTS_KEPT.with(|kept| kept.borrow().is_some());
     for (index, segment) in segments.iter().enumerate() {
         let per_segment = budget.count(index);
         let (rho1, rho2) = signed_radii(
@@ -779,18 +835,65 @@ pub fn chain_dense_contacts(
                 uv: [left.station.uv1[0], left.station.uv1[1], left.station.uv2[0], left.station.uv2[1]],
                 center: Some(left.station.center),
             };
+            let solve_one = |t: f64| -> Result<DenseOutcome, KernelRefusal> {
+                let Ok(node) = continue_station(&solve_centered, &hop, &from, t, 0) else {
+                    return Ok(None);
+                };
+                let (section_point, tangent) = section_at(t)?;
+                let (_, p1, p2, _) = tangency_residual(surface1, surface2, rho, node.uv, section_point, tangent)?;
+                Ok(Some((p1, p2, node.center)))
+            };
             for step in 1..subdivisions {
                 let fraction = step as f64 / subdivisions as f64;
                 let t = left.t + fraction * (next.t - left.t);
-                let Ok(node) = continue_station(&solve_centered, &hop, &from, t, 0) else {
+                let outcome = if keeping {
+                    let mut key = Vec::with_capacity(16);
+                    key.extend([index as u64, station_step.to_bits(), scale.to_bits(), rho[0].to_bits(), rho[1].to_bits()]);
+                    key.extend([from.t.to_bits(), t.to_bits()]);
+                    key.extend(from.uv.iter().map(|value| value.to_bits()));
+                    let center = left.station.center;
+                    key.extend([center.x.to_bits(), center.y.to_bits(), center.z.to_bits()]);
+                    let kept = DENSE_CONTACTS_KEPT.with(|kept| kept.borrow().as_ref().and_then(|map| map.get(&key).copied()));
+                    match kept {
+                        Some(outcome) => {
+                            crate::blend::record_count("count.chain.dense.reused", 1);
+                            if let Some(check) = std::env::var_os("BREP_CHAIN_DENSE_REUSE_CHECK") {
+                                let agrees = dense_outcome_bits(&solve_one(t)?) == dense_outcome_bits(&outcome);
+                                crate::blend::record_count("count.chain.dense.reuse_checked", 1);
+                                // A value other than `1` names a file each check
+                                // appends its verdict to.
+                                if check != "1" {
+                                    use std::io::Write;
+                                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&check) {
+                                        let _ = writeln!(file, "{}", if agrees { "agree" } else { "DISAGREE" });
+                                    }
+                                }
+                                assert!(agrees, "BREP_CHAIN_DENSE_REUSE_CHECK: the kept contact at t {t} from {} disagrees with a fresh solve", from.t);
+                            }
+                            outcome
+                        }
+                        None => {
+                            let outcome = solve_one(t)?;
+                            crate::blend::record_count("count.chain.dense.solved", 1);
+                            DENSE_CONTACTS_KEPT.with(|kept| {
+                                if let Some(map) = kept.borrow_mut().as_mut() {
+                                    map.insert(key, outcome);
+                                }
+                            });
+                            outcome
+                        }
+                    }
+                } else {
+                    crate::blend::record_count("count.chain.dense.solved", 1);
+                    solve_one(t)?
+                };
+                let Some((p1, p2, center)) = outcome else {
                     out.unsolved += 1;
                     out.unsolved_at.push(pair[0]);
                     continue;
                 };
-                let (section_point, tangent) = section_at(t)?;
-                let (_, p1, p2, _) = tangency_residual(surface1, surface2, rho, node.uv, section_point, tangent)?;
                 out.solved.push((pair[0], pair[1], fraction, p1, p2));
-                out.centers.push(node.center);
+                out.centers.push(center);
             }
         }
     }

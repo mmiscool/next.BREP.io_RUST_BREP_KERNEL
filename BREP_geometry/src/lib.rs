@@ -225,7 +225,7 @@ pub use gordon::{gordon_surface, gordon_surface_reported, GordonRefusal, GordonR
 #[path = "geometry/n_sided.rs"]
 #[doc(hidden)]
 pub mod n_sided;
-pub use n_sided::{n_sided_fill, n_sided_fill_shortening_reach, n_sided_fill_shortening_reach_spokes_off_sides, reentrant_corners as n_sided_reentrant_corners, NSidedRefusal, NSidedReport};
+pub use n_sided::{n_sided_fill, n_sided_fill_centre_solved, n_sided_fill_shortening_reach, n_sided_fill_shortening_reach_spokes_off_sides, reentrant_corners as n_sided_reentrant_corners, NSidedRefusal, NSidedReport};
 #[path = "geometry/regularity.rs"]
 #[doc(hidden)]
 pub mod regularity;

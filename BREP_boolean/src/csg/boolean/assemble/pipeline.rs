@@ -1251,7 +1251,25 @@ fn sign_chords_analytic_only_enabled() -> bool {
 }
 
 fn every_face_analytic(solid: &BrepSolid) -> bool {
-    solid.shells.iter().flat_map(|shell| &shell.faces).all(|face| face.surface.analytic().is_some())
+    let extrusions = sign_chords_extrusions_enabled();
+    solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .all(|face| face.surface.analytic().is_some() || (extrusions && face.surface.linear_extrusion().is_some()))
+}
+
+/// `BREP_SIGN_CHORDS_EXTRUSIONS` (on by default; `=0` keeps the gate to analytic
+/// carriers): the analytic-only gate of the
+/// sign chords ([`sign_chords_analytic_only_enabled`]) also admits a face
+/// whose carrier is a recognised linear extrusion (a profile swept straight:
+/// a sweep slid along a line). A chord still crosses such a face by the
+/// sampled Newton search a non-analytic face takes, but over a patch straight
+/// along its rulings that search is short; a screw thread's helicoid, where
+/// it costs seconds, is no extrusion and stays with the volume. A ring leaning 35 degrees pushed into a block: the
+/// sign check fell from 370 ms to 37 ms, the body the same to the bit.
+fn sign_chords_extrusions_enabled() -> bool {
+    switch!("BREP_SIGN_CHORDS_EXTRUSIONS", true)
 }
 
 /// Whether chords read the assembled solid as positively oriented at every

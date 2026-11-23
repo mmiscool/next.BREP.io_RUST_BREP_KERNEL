@@ -106,6 +106,24 @@ impl OutlinePiece {
         }
     }
 
+    /// The derivative of [`Self::point`] with respect to `s`.
+    fn tangent(&self, s: f64) -> [f64; 2] {
+        match *self {
+            OutlinePiece::Line { from, to } => [to[0] - from[0], to[1] - from[1]],
+            OutlinePiece::Arc { radius, start, end, .. } => {
+                let angle = start + (end - start) * s;
+                let k = radius * (end - start);
+                [-k * angle.sin(), k * angle.cos()]
+            }
+            OutlinePiece::Ellipse { semi, rotation, start, end, .. } => {
+                let theta = start + (end - start) * s;
+                let (x, y) = (-semi[0] * theta.sin() * (end - start), semi[1] * theta.cos() * (end - start));
+                let (c, s) = (rotation.cos(), rotation.sin());
+                [c * x - s * y, s * x + c * y]
+            }
+        }
+    }
+
     fn is_full_circle(&self) -> bool {
         matches!(*self, OutlinePiece::Arc { start, end, .. } | OutlinePiece::Ellipse { start, end, .. } if ((end - start).abs() - TAU).abs() < 1e-12)
     }
@@ -508,6 +526,197 @@ fn fast_levels_on() -> bool {
     crate::switch!("BREP_SWEEP_FAST_LEVELS", true)
 }
 
+/// `BREP_SWEEP_EXTREMUM_JET` (default on; `=0` differences it): a face's extremum Newton
+/// reads the residual's gradients of the reduced coordinates exactly (from the
+/// source's own derivatives) instead of by central differences. The differenced
+/// residual costs five points and carries noise at its own stopping bar, so the
+/// Newton ran on into failed line searches; the exact one settles.
+pub(crate) fn extremum_jet_on() -> bool {
+    crate::switch!("BREP_SWEEP_EXTREMUM_JET", true)
+}
+
+/// `BREP_SWEEP_EXTREMUM_JET_CHECK` (default off): every level read both
+/// ways and compared, the differenced reading kept; the tally is this
+/// thread's [`extremum_jet_check_take`].
+fn extremum_jet_check_on() -> bool {
+    crate::switch!("BREP_SWEEP_EXTREMUM_JET_CHECK", false)
+}
+
+/// `BREP_SWEEP_CRITICAL_EVENTS` (on by default; `=0` restores the plain
+/// bisection): a scan interval whose two ends
+/// differ, with one source's critical level inside it, first reads just
+/// below and just above that level (`CRITICAL_EVENT_STEP` of the scale). If
+/// the structure changes across the pair, the event is the critical level
+/// itself (only where the count of intervals changes across it, a birth or
+/// death): the break the bisection's event is snapped to anyway (within
+/// `1e-5` of the scale, no other critical nearer). The two outer parts are
+/// searched as before. A tip's event no longer bisects to `1e-13` of the
+/// scale through some forty cold reads (the 0.27.0 torus-screwed row: about
+/// 40% of its build).
+pub(crate) fn critical_events_on() -> bool {
+    crate::switch!("BREP_SWEEP_CRITICAL_EVENTS", true)
+}
+
+/// `BREP_SWEEP_CRITICAL_EVENTS_CHECK` (default off): the scan's events found
+/// both ways, the snapped breaks compared, the bisection's kept; the tally
+/// is this thread's [`critical_events_check_take`].
+fn critical_events_check_on() -> bool {
+    crate::switch!("BREP_SWEEP_CRITICAL_EVENTS_CHECK", false)
+}
+
+/// How far either side of a critical level the shortcut reads, to the scale:
+/// a tenth of the snap's reach, so the event it names is the one the snap
+/// would give.
+const CRITICAL_EVENT_STEP: f64 = 1e-6;
+
+thread_local! {
+    static CRITICAL_EVENTS_CHECK: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// (scans compared, scans whose snapped breaks differed or whose shortcut
+/// refused, events the shortcut named) on this thread since the last call.
+pub fn critical_events_check_take() -> (u64, u64, u64) {
+    CRITICAL_EVENTS_CHECK.with(|cell| cell.replace((0, 0, 0)))
+}
+
+fn critical_events_record(compared: u64, differed: u64, named: u64) {
+    CRITICAL_EVENTS_CHECK.with(|cell| {
+        let (a, b, c) = cell.get();
+        cell.set((a + compared, b + differed, c + named));
+    });
+}
+
+/// How far (to the scale) the two readings of a level's ends may part: the
+/// differenced reading's own error where a contour grazes (a disc carried by
+/// two turns, near its start pose's farthest reach, read its ends 1.7e-9 and
+/// 2.1e-9 rad off an independent 40-digit solve of the extremum, the exact
+/// reading 1e-12 and 1e-15).
+const JET_CHECK_BAR: f64 = 2e-8;
+
+/// The level's gradient (to the scale, per unit of a source's parameter)
+/// below which the extremum Newton keeps the differenced residual: about a
+/// tip, where the contour closes on a point, its ends move as the root of the
+/// level's distance from the tip's, and the two readings of the condition part
+/// by more than either's error away from it (a ball turned about an axis read
+/// its Pappus volume 7x closer differenced).
+const JET_GRADIENT_FLOOR: f64 = 1e-3;
+
+/// How near (to the scale) a critical level a reading counts as at a tip.
+/// There the differenced reading is the one that strays: the rod less a
+/// screwed torus, 1e-5 and 6e-5 above its tip level, read its ends 2.7e-8 and
+/// 1.6e-9 off an independent extremum of the contour (40 digits), the exact
+/// reading 5e-14 and 7e-13.
+const JET_CHECK_TIP: f64 = 1e-4;
+
+/// The check mode's tally on one thread.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct JetCheck {
+    /// Levels read both ways.
+    pub levels: usize,
+    /// Levels whose readings differ (another count of intervals, an end past
+    /// the bar, or one refusing), away from every tip.
+    pub mismatches: usize,
+    /// Those within `JET_CHECK_TIP` of a critical level.
+    pub near_tip: usize,
+    /// The largest end difference there, to the scale, where both read as
+    /// many intervals.
+    pub worst_tip: f64,
+    /// Levels there read with another count of intervals. A ball turned about
+    /// an axis through its centre's circle: the plain reading holds nothing at
+    /// levels 1e-6 about its centre's, where its poles sit and its whole
+    /// diameter lies; the exact one holds the diameter.
+    pub tip_counts: usize,
+    /// Levels read alike but whose ends two sources name differently (a tie).
+    pub relabelled: usize,
+    /// The largest end difference away from the tips, to the scale.
+    pub worst_end: f64,
+    /// Residuals compared at a Newton's seed, and the largest difference of
+    /// the extremum condition between the two (the differenced one's own error
+    /// included).
+    pub residuals: usize,
+    pub worst_residual: f64,
+}
+
+thread_local! {
+    static JET_CHECK: std::cell::Cell<JetCheck> = std::cell::Cell::new(JetCheck::default());
+}
+
+fn jet_check_record(update: impl FnOnce(&mut JetCheck)) {
+    JET_CHECK.with(|cell| {
+        let mut stats = cell.get();
+        update(&mut stats);
+        cell.set(stats);
+    });
+}
+
+/// This thread's check tally, reset.
+#[allow(dead_code)]
+pub(crate) fn extremum_jet_check_take() -> JetCheck {
+    JET_CHECK.with(|cell| cell.replace(JetCheck::default()))
+}
+
+/// The check mode at a Newton's seed: the exact residual's extremum
+/// condition against the differenced one's.
+fn jet_check_residual(engine: &Engine, source: Source, level: f64, u: f64, v: f64, hu: f64, hv: f64) {
+    let Some((_, (lu, ou), (lv, ov))) = engine.source_reduced_jet(source, u, v) else { return };
+    // About a tip the exact residual is not read (below).
+    if lu.hypot(lv) < JET_GRADIENT_FLOOR * engine.scale {
+        return;
+    }
+    // Where the differences would read past a domain's end (a bar's side clamps there, a closed
+    // section's seam included, so they read half the slope) there is no fair reading to compare with.
+    let (ur, vr, v_periodic) = engine.domain(source);
+    let u_periodic = engine.u_periodic(source) && !matches!(source, Source::BarSide { .. });
+    if (!u_periodic && (u - hu < ur[0] || u + hu > ur[1])) || (!v_periodic && (v - hv < vr[0] || v + hv > vr[1])) {
+        return;
+    }
+    let _ = level;
+    let (lu1, ou1) = engine.source_reduced(source, u + hu, v);
+    let (lu0, ou0) = engine.source_reduced(source, u - hu, v);
+    let (lv1, ov1) = engine.source_reduced(source, u, v + hv);
+    let (lv0, ov0) = engine.source_reduced(source, u, v - hv);
+    let (dlu, dlv) = ((lu1 - lu0) / (2.0 * hu), (lv1 - lv0) / (2.0 * hv));
+    let dou = engine.o_difference(ou1, ou0) / (2.0 * hu);
+    let dov = engine.o_difference(ov1, ov0) / (2.0 * hv);
+    let exact = (ou * lv - ov * lu) / lu.hypot(lv).max(1e-300);
+    let plain = (dou * dlv - dov * dlu) / dlu.hypot(dlv).max(1e-300);
+    // Relative to the condition's own size (that of ∇o).
+    let size = ou.hypot(ov).max(1e-12);
+    jet_check_record(|stats| {
+        stats.residuals += 1;
+        stats.worst_residual = stats.worst_residual.max((exact - plain).abs() / size);
+    });
+}
+
+/// `BREP_SWEEP_LEVEL_EDGES` (default on; `=0` scans the whole grid): a face's crossings of a
+/// level are read from the grid edges whose levels span it, binned once,
+/// instead of every edge of the grid at every level. The same crossings in
+/// the same order: the reading is unchanged to the bit.
+fn level_edges_on() -> bool {
+    crate::switch!("BREP_SWEEP_LEVEL_EDGES", true)
+}
+
+/// `BREP_SWEEP_EDGE_TIPS` (default on; `=0` skips them): a closed edge's
+/// extremum of the level at its parameter's seam is one of its critical
+/// levels too (the scan read interior samples only, so a circle whose seam
+/// sits at its farthest or nearest point lost that tip).
+/// `BREP_SWEEP_APEX_BREAKS` (default on; `=0` reads them as events only): a
+/// solid of revolution's point on its own axis breaks the bands at its level.
+fn apex_breaks_on() -> bool {
+    crate::switch!("BREP_SWEEP_APEX_BREAKS", true)
+}
+
+/// `BREP_SWEEP_BAR_JET` (default on; `=0` differences it): the extremum
+/// Newton's exact residual on a bar's sides too.
+fn bar_jet_on() -> bool {
+    crate::switch!("BREP_SWEEP_BAR_JET", true)
+}
+
+fn edge_tips_on() -> bool {
+    crate::switch!("BREP_SWEEP_EDGE_TIPS", true)
+}
+
+
 fn thread_rows_on() -> bool {
     crate::switch!("BREP_SWEEP_THREAD_ROWS", true)
 }
@@ -721,6 +930,12 @@ struct Engine<'a> {
     /// Debug counters: (levels evaluated, oracle calls, oracle steps, seconds in
     /// candidates, seconds in the oracle).
     counters: std::cell::Cell<(usize, usize, usize, f64, f64)>,
+    /// The extremum Newton reads its residual exactly ([`extremum_jet_on`]).
+    /// Under the check mode it starts off, so every reading answers as the
+    /// plain one, and is flipped only to read a level the second way.
+    jet: std::cell::Cell<bool>,
+    /// The tool's own frame, as [`tool_frame`] reads it once.
+    tool_frame: [Vec3; 3],
 }
 
 struct Grid {
@@ -730,6 +945,84 @@ struct Grid {
     v: [f64; 2],
     v_periodic: bool,
     values: Vec<(f64, f64)>,
+    /// Its edges by the levels they span ([`level_edges_on`]), made on first use.
+    edges: std::cell::OnceCell<EdgeIndex>,
+}
+
+/// A grid's edges binned by the levels they span. Edge ids run as the whole
+/// scan meets them: those along v from each node row by row (`i · jmax + j`),
+/// then those along u (`nu · jmax + i · nv + j`).
+struct EdgeIndex {
+    low: f64,
+    width: f64,
+    bins: Vec<Vec<u32>>,
+}
+
+impl EdgeIndex {
+    const BINS: usize = 1024;
+
+    /// The ids of every edge whose two levels hold `level` between them (with
+    /// a margin), ascending; the caller's own test decides each.
+    fn spanning(&self, level: f64) -> Vec<u32> {
+        if self.bins.is_empty() || !level.is_finite() {
+            return Vec::new();
+        }
+        let k = if self.width > 0.0 { ((level - self.low) / self.width).floor() } else { 0.0 };
+        if !(k >= -1.0 && k <= Self::BINS as f64) {
+            return Vec::new();
+        }
+        let k = (k.max(0.0) as usize).min(Self::BINS - 1);
+        self.bins[k].clone()
+    }
+}
+
+impl Grid {
+    fn edges(&self) -> &EdgeIndex {
+        self.edges.get_or_init(|| {
+            let at = |i: usize, j: usize| self.values[i * self.nv + j % self.nv].0;
+            let jmax = if self.v_periodic { self.nv } else { self.nv - 1 };
+            let mut spans: Vec<(u32, f64, f64)> = Vec::with_capacity(2 * self.nu * self.nv);
+            let mut push = |id: usize, a: f64, b: f64| {
+                // An edge whose ends share a level, or carry no number, never crosses.
+                if a != b && a.is_finite() && b.is_finite() {
+                    spans.push((id as u32, a.min(b), a.max(b)));
+                }
+            };
+            for i in 0..self.nu {
+                for j in 0..jmax {
+                    push(i * jmax + j, at(i, j), at(i, j + 1));
+                }
+            }
+            for i in 0..self.nu.saturating_sub(1) {
+                for j in 0..self.nv {
+                    push(self.nu * jmax + i * self.nv + j, at(i, j), at(i + 1, j));
+                }
+            }
+            if spans.is_empty() {
+                return EdgeIndex { low: 0.0, width: 0.0, bins: Vec::new() };
+            }
+            let low = spans.iter().map(|s| s.1).fold(f64::INFINITY, f64::min);
+            let high = spans.iter().map(|s| s.2).fold(f64::NEG_INFINITY, f64::max);
+            let width = (high - low) / EdgeIndex::BINS as f64;
+            // A margin well past where the scan's product test could read a
+            // crossing outside an edge's levels (its product underflowing).
+            let pad = (1e-9 * (high - low)).max(1e-150);
+            let bin = |x: f64| -> usize {
+                if width > 0.0 {
+                    (((x - low) / width).floor().max(0.0) as usize).min(EdgeIndex::BINS - 1)
+                } else {
+                    0
+                }
+            };
+            let mut bins = vec![Vec::new(); EdgeIndex::BINS];
+            for &(id, lo, hi) in &spans {
+                for k in bin(lo - pad)..=bin(hi + pad) {
+                    bins[k].push(id);
+                }
+            }
+            EdgeIndex { low, width, bins }
+        })
+    }
 }
 
 /// One interval of the region at a level, with the sources of its ends.
@@ -745,6 +1038,26 @@ struct Interval {
 /// on; `BREP_SWEEP_LINE_SPEED=0` restores the reach grown by every advance).
 pub fn line_speed_on() -> bool {
     crate::switch!("BREP_SWEEP_LINE_SPEED", true)
+}
+
+/// The frame a tool's points are read in: a solid of revolution's axis and
+/// its two radial directions (the radial one square to the axis), or a
+/// prism's normal, its outline's first axis and the second (the normal
+/// across the first). Zero for a bar.
+fn tool_frame(tool: &SweptTool) -> [Vec3; 3] {
+    match tool {
+        SweptTool::Revolved { axis_direction, radial, .. } => {
+            let axis = axis_direction.normalized_or(*axis_direction);
+            let r0 = radial.sub(axis.scale(radial.dot(axis))).normalized_or(*radial);
+            [axis, r0, axis.cross(r0)]
+        }
+        SweptTool::Prism { normal, x_axis, .. } => {
+            let n = normal.normalized_or(*normal);
+            let xa = x_axis.normalized_or(*x_axis);
+            [n, xa, n.cross(xa)]
+        }
+        SweptTool::Bar { .. } => [Vec3::new(0.0, 0.0, 0.0); 3],
+    }
 }
 
 fn wrap_pi(angle: f64) -> f64 {
@@ -786,17 +1099,15 @@ impl<'a> Engine<'a> {
         }
         match self.tool {
             SweptTool::Bar { .. } => f64::INFINITY,
-            SweptTool::Revolved { axis_origin, axis_direction, meridian, .. } => {
-                let axis = axis_direction.normalized_or(*axis_direction);
+            SweptTool::Revolved { axis_origin, meridian, .. } => {
+                let [axis, _, _] = self.tool_frame;
                 let d = x.sub(*axis_origin);
                 let e = d.dot(axis);
                 let radial = d.sub(axis.scale(e)).length();
                 outline_signed_distance(meridian, [radial, e])
             }
-            SweptTool::Prism { origin, normal, x_axis, outline, from, to } => {
-                let n = normal.normalized_or(*normal);
-                let xa = x_axis.normalized_or(*x_axis);
-                let ya = n.cross(xa);
+            SweptTool::Prism { origin, outline, from, to, .. } => {
+                let [n, xa, ya] = self.tool_frame;
                 let d = x.sub(*origin);
                 let h = d.dot(n);
                 let planar = outline_signed_distance(outline, [d.dot(xa), d.dot(ya)]);
@@ -818,10 +1129,8 @@ impl<'a> Engine<'a> {
         }
         match (self.tool, source) {
             (SweptTool::Bar { origin, .. }, _) => *origin,
-            (SweptTool::Revolved { axis_origin, axis_direction, radial, meridian }, _) => {
-                let axis = axis_direction.normalized_or(*axis_direction);
-                let r0 = radial.sub(axis.scale(radial.dot(axis))).normalized_or(*radial);
-                let r1 = axis.cross(r0);
+            (SweptTool::Revolved { axis_origin, meridian, .. }, _) => {
+                let [axis, r0, r1] = self.tool_frame;
                 let (m, phi) = match source {
                     Source::RevolvedFace { piece } => (meridian[piece].point(u), v),
                     Source::RevolvedCorner { piece } => (meridian[piece].point(0.0), u),
@@ -832,10 +1141,8 @@ impl<'a> Engine<'a> {
                     .add(r1.scale(m[0] * phi.sin()))
                     .add(axis.scale(m[1]))
             }
-            (SweptTool::Prism { origin, normal, x_axis, outline, from, to }, _) => {
-                let n = normal.normalized_or(*normal);
-                let xa = x_axis.normalized_or(*x_axis);
-                let ya = n.cross(xa);
+            (SweptTool::Prism { origin, outline, from, to, .. }, _) => {
+                let [n, xa, ya] = self.tool_frame;
                 let at_own_place = match source {
                     Source::ScrewPrismSide { piece } => Some((outline[piece].point(u), v)),
                     Source::ScrewPrismEdge { piece } => Some((outline[piece].point(0.0), u)),
@@ -865,6 +1172,91 @@ impl<'a> Engine<'a> {
 
     fn source_reduced(&self, source: Source, u: f64, v: f64) -> (f64, f64) {
         self.reduce(self.frame.local(self.source_point(source, u, v)))
+    }
+
+    /// A face source's world point and its derivatives along its two
+    /// parameters, where they are read exactly (a solid of revolution's face, a
+    /// prism's side at its own place or carried through the motion); `None` for
+    /// a bar's side, whose caller differences instead.
+    fn source_point_jet(&self, source: Source, u: f64, v: f64) -> Option<(Vec3, Vec3, Vec3)> {
+        if let Some(bar) = &self.bar {
+            // A bar's side at its own place (`BREP_SWEEP_BAR_JET`, default on; `=0` differences it).
+            return match source {
+                Source::BarSide { piece } if bar_jet_on() => bar.side_jet(piece, u, v),
+                _ => None,
+            };
+        }
+        // A solid of revolution's face: its point as `source_point` writes it
+        // (the same products, to the bit), the trigonometry shared with the derivatives.
+        if let (SweptTool::Revolved { axis_origin, meridian, .. }, Source::RevolvedFace { piece }) = (self.tool, source) {
+            let [axis, r0, r1] = self.tool_frame;
+            let (m, dm) = match meridian[piece] {
+                OutlinePiece::Arc { centre, radius, start, end } => {
+                    let angle = start + (end - start) * u;
+                    let (sa, ca) = (angle.sin(), angle.cos());
+                    let k = radius * (end - start);
+                    ([centre[0] + radius * ca, centre[1] + radius * sa], [-k * sa, k * ca])
+                }
+                ref other => (other.point(u), other.tangent(u)),
+            };
+            let (sin, cos) = (v.sin(), v.cos());
+            let point = axis_origin.add(r0.scale(m[0] * cos)).add(r1.scale(m[0] * sin)).add(axis.scale(m[1]));
+            let du = r0.scale(dm[0] * cos).add(r1.scale(dm[0] * sin)).add(axis.scale(dm[1]));
+            let dv = r0.scale(-m[0] * sin).add(r1.scale(m[0] * cos));
+            return Some((point, du, dv));
+        }
+        let point = self.source_point(source, u, v);
+        match (self.tool, source) {
+            (SweptTool::Prism { outline, .. }, Source::ScrewPrismSide { piece }) => {
+                let [n, xa, ya] = self.tool_frame;
+                let dq = outline[piece].tangent(u);
+                Some((point, xa.scale(dq[0]).add(ya.scale(dq[1])), n))
+            }
+            (SweptTool::Prism { origin, outline, .. }, Source::PrismFace { piece }) => {
+                let [n, xa, ya] = self.tool_frame;
+                let (q, dq) = (outline[piece].point(u), outline[piece].tangent(u));
+                // Carried step by step: each turns the point and both derivatives,
+                // and adds its own velocity to the derivative along time.
+                let mut x = origin.add(xa.scale(q[0])).add(ya.scale(q[1])).add(n.scale(self.prism_height));
+                let mut du = xa.scale(dq[0]).add(ya.scale(dq[1]));
+                let mut dv = Vec3::new(0.0, 0.0, 0.0);
+                for (step, axis) in self.motion.steps.iter().zip(&self.axes) {
+                    let angle = step.turn * v;
+                    let arm = x.sub(step.axis_origin).rotate_about(*axis, angle);
+                    du = du.rotate_about(*axis, angle);
+                    dv = dv.rotate_about(*axis, angle).add(axis.cross(arm).scale(step.turn)).add(axis.scale(step.advance));
+                    x = step.apply(v, x, *axis);
+                }
+                Some((point, du, dv))
+            }
+            _ => None,
+        }
+    }
+
+    /// The reduced coordinates of a face source and their derivatives along its
+    /// two parameters: `(ℓ, (ℓᵤ, oᵤ), (ℓᵥ, oᵥ))` (the Newton's residual reads no
+    /// `o`). The level is [`Self::source_reduced`]'s to the bit. `None` where the source is not read
+    /// exactly, or the point lies within a hair of the clip's axis (where the
+    /// polar coordinates have no derivative).
+    fn source_reduced_jet(&self, source: Source, u: f64, v: f64) -> Option<(f64, (f64, f64), (f64, f64))> {
+        let (point, du, dv) = self.source_point_jet(source, u, v)?;
+        let p = self.frame.local(point);
+        let level = p[0].hypot(p[1]);
+        if !(level > 1e-9 * self.scale) {
+            return None;
+        }
+        let along = |d: Vec3| -> (f64, f64) {
+            let q = [d.dot(self.frame.ex), d.dot(self.frame.ey), d.dot(self.frame.ez)];
+            let dl = (p[0] * q[0] + p[1] * q[1]) / level;
+            let dangle = (p[0] * q[1] - p[1] * q[0]) / (level * level);
+            let o = match self.class {
+                Class::Screw(c) => dangle - q[2] / c,
+                Class::Turn => q[2],
+                Class::Planar => dangle,
+            };
+            (dl, o)
+        };
+        Some((level, along(du), along(dv)))
     }
 
     fn is_face(source: Source) -> bool {
@@ -911,6 +1303,17 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Is an edge source a closed curve in its parameter (a revolved corner's
+    /// circle about the tool's axis, a whole circle of a prism's outline)? A
+    /// bar's rim is left out: its spline is not read past its ends.
+    fn edge_periodic(&self, source: Source) -> bool {
+        match (self.tool, source) {
+            (_, Source::RevolvedCorner { .. }) => true,
+            (SweptTool::Prism { outline, .. }, Source::PrismEnd { piece, .. } | Source::ScrewPrismRim { piece, .. }) => outline[piece].is_full_circle(),
+            _ => false,
+        }
+    }
+
     fn o_difference(&self, a: f64, b: f64) -> f64 {
         if self.angular {
             wrap_pi(a - b)
@@ -924,7 +1327,19 @@ impl<'a> Engine<'a> {
         let (ur, vr, periodic) = self.domain(source);
         let hu = 1e-6 * (ur[1] - ur[0]).max(1e-3);
         let hv = 1e-6 * (vr[1] - vr[0]).max(1e-3);
+        let jet = self.jet.get();
+        if extremum_jet_check_on() {
+            jet_check_residual(self, source, level, u, v, hu, hv);
+        }
         let residual = |u: f64, v: f64| -> [f64; 2] {
+            if jet {
+                if let Some((l, (lu, ou), (lv, ov))) = self.source_reduced_jet(source, u, v) {
+                    let norm = lu.hypot(lv);
+                    if norm >= JET_GRADIENT_FLOOR * self.scale {
+                        return [l - level, (ou * lv - ov * lu) / norm];
+                    }
+                }
+            }
             let (l, o) = self.source_reduced(source, u, v);
             let (lu1, ou1) = self.source_reduced(source, u + hu, v);
             let (lu0, ou0) = self.source_reduced(source, u - hu, v);
@@ -1030,7 +1445,7 @@ impl<'a> Engine<'a> {
                 values.push(self.source_reduced(source, uu, vv));
             }
         }
-        Grid { nu, nv, u, v, v_periodic, values }
+        Grid { nu, nv, u, v, v_periodic, values, edges: std::cell::OnceCell::new() }
     }
 
     fn grid_param(grid: &Grid, i: usize, j: usize) -> (f64, f64) {
@@ -1054,30 +1469,51 @@ impl<'a> Engine<'a> {
             let at = |i: usize, j: usize| grid.values[i * grid.nv + j % grid.nv];
             let jmax = if grid.v_periodic { grid.nv } else { grid.nv - 1 };
             let mut crossings: Vec<(usize, usize, f64, f64, f64)> = Vec::new();
-            for i in 0..grid.nu {
-                for j in 0..jmax {
-                    let a = at(i, j);
-                    let b = at(i, j + 1);
-                    if (a.0 - level) * (b.0 - level) <= 0.0 && a.0 != b.0 {
-                        let w = (level - a.0) / (b.0 - a.0);
-                        let o = a.1 + self.o_difference(b.1, a.1) * w;
-                        let (u, v0) = Self::grid_param(grid, i, j);
-                        let (_, v1) = Self::grid_param(grid, i, j + 1);
-                        let v1 = if grid.v_periodic && j + 1 == grid.nv { grid.v[1] } else { v1 };
-                        crossings.push((i, j, o, u, v0 + (v1 - v0) * w));
+            // The crossing of the edge from node (i, j) along v, or along u.
+            let along_v = |crossings: &mut Vec<(usize, usize, f64, f64, f64)>, i: usize, j: usize| {
+                let a = at(i, j);
+                let b = at(i, j + 1);
+                if (a.0 - level) * (b.0 - level) <= 0.0 && a.0 != b.0 {
+                    let w = (level - a.0) / (b.0 - a.0);
+                    let o = a.1 + self.o_difference(b.1, a.1) * w;
+                    let (u, v0) = Self::grid_param(grid, i, j);
+                    let (_, v1) = Self::grid_param(grid, i, j + 1);
+                    let v1 = if grid.v_periodic && j + 1 == grid.nv { grid.v[1] } else { v1 };
+                    crossings.push((i, j, o, u, v0 + (v1 - v0) * w));
+                }
+            };
+            let along_u = |crossings: &mut Vec<(usize, usize, f64, f64, f64)>, i: usize, j: usize| {
+                let a = at(i, j);
+                let b = at(i + 1, j);
+                if (a.0 - level) * (b.0 - level) <= 0.0 && a.0 != b.0 {
+                    let w = (level - a.0) / (b.0 - a.0);
+                    let o = a.1 + self.o_difference(b.1, a.1) * w;
+                    let (u0, v) = Self::grid_param(grid, i, j);
+                    let (u1, _) = Self::grid_param(grid, i + 1, j);
+                    crossings.push((i, j, o, u0 + (u1 - u0) * w, v));
+                }
+            };
+            if level_edges_on() {
+                // Only the edges whose levels span this one, in the order the
+                // whole scan below meets them.
+                for id in grid.edges().spanning(level) {
+                    let id = id as usize;
+                    if id < grid.nu * jmax {
+                        along_v(&mut crossings, id / jmax, id % jmax);
+                    } else {
+                        let id = id - grid.nu * jmax;
+                        along_u(&mut crossings, id / grid.nv, id % grid.nv);
                     }
                 }
-            }
-            for i in 0..grid.nu.saturating_sub(1) {
-                for j in 0..grid.nv {
-                    let a = at(i, j);
-                    let b = at(i + 1, j);
-                    if (a.0 - level) * (b.0 - level) <= 0.0 && a.0 != b.0 {
-                        let w = (level - a.0) / (b.0 - a.0);
-                        let o = a.1 + self.o_difference(b.1, a.1) * w;
-                        let (u0, v) = Self::grid_param(grid, i, j);
-                        let (u1, _) = Self::grid_param(grid, i + 1, j);
-                        crossings.push((i, j, o, u0 + (u1 - u0) * w, v));
+            } else {
+                for i in 0..grid.nu {
+                    for j in 0..jmax {
+                        along_v(&mut crossings, i, j);
+                    }
+                }
+                for i in 0..grid.nu.saturating_sub(1) {
+                    for j in 0..grid.nv {
+                        along_u(&mut crossings, i, j);
                     }
                 }
             }
@@ -1347,7 +1783,7 @@ impl<'a> Engine<'a> {
         }
         let clock = web_time::Instant::now();
         let before = self.counters.get();
-        let intervals = self.intervals_uncached(level)?;
+        let intervals = if extremum_jet_check_on() { self.intervals_checked(level)? } else { self.intervals_uncached(level)? };
         if clock.elapsed().as_secs_f64() > 0.5 && std::env::var("BREP_DEBUG_SOLID_SWEEP").is_ok() {
             let after = self.counters.get();
             eprintln!(
@@ -1362,6 +1798,78 @@ impl<'a> Engine<'a> {
         }
         self.cache.borrow_mut().insert(level.to_bits(), intervals.clone());
         Ok(intervals)
+    }
+
+    /// The check mode of [`extremum_jet_on`]: the level read both ways, the
+    /// two compared (same intervals from the same sources, ends within
+    /// `JET_CHECK_BAR` of the scale), the differenced reading answered.
+    fn intervals_checked(&self, level: f64) -> Result<Vec<Interval>, KernelRefusal> {
+        let kept = self.jet.get();
+        self.jet.set(false);
+        let plain = self.intervals_uncached(level);
+        self.jet.set(true);
+        let exact = self.intervals_uncached(level);
+        self.jet.set(kept);
+        let (plain, exact) = match (plain, exact) {
+            (Ok(a), Ok(b)) => (a, b),
+            (plain, exact) => {
+                if plain.is_ok() != exact.is_ok() {
+                    jet_check_record(|stats| stats.mismatches += 1);
+                    if std::env::var("BREP_DEBUG_SOLID_SWEEP").is_ok() {
+                        eprintln!("extremum jet check: level {level}: refusal differs ({} / {})", plain.is_ok(), exact.is_ok());
+                    }
+                }
+                return plain;
+            }
+        };
+        let length = |d: f64| if self.angular { d.abs() * level } else { d.abs() };
+        // An interval narrower than the bar is a reading of the region's edge
+        // (the rim of a cone 6e-13 inside its reach holds one 1.2e-12 wide): both
+        // readings agree with it there or not.
+        let wide = |list: &[Interval]| -> Vec<Interval> {
+            list.iter().copied().filter(|x| length(self.o_difference(x.hi, x.lo)) > JET_CHECK_BAR * self.scale).collect()
+        };
+        let (plain_wide, exact_wide) = (wide(&plain), wide(&exact));
+        // Ends compared by value: two sources meeting at one end (a tie the
+        // sort settles either way) name it differently and are the same end.
+        let worst = if plain_wide.len() == exact_wide.len() {
+            plain_wide
+                .iter()
+                .zip(&exact_wide)
+                .map(|(a, b)| length(self.o_difference(a.lo, b.lo)).max(length(self.o_difference(a.hi, b.hi))))
+                .fold(0.0, f64::max)
+        } else {
+            f64::INFINITY
+        };
+        let bad = worst > JET_CHECK_BAR * self.scale;
+        // The same ends, named by other sources (the events read the names).
+        let relabelled = !bad && plain_wide.iter().zip(&exact_wide).any(|(a, b)| a.lo_source != b.lo_source || a.hi_source != b.hi_source);
+        // Within a hair of a source's critical level a contour closes on its
+        // tip: its ends move as the root of the level's distance there, and the
+        // two readings part by far more than their residuals do.
+        let near_tip = self.critical.iter().flatten().any(|c| (c.0 - level).abs() <= JET_CHECK_TIP * self.scale);
+        jet_check_record(|stats| {
+            stats.levels += 1;
+            stats.relabelled += relabelled as usize;
+            if bad {
+                if near_tip {
+                    stats.near_tip += 1;
+                } else {
+                    stats.mismatches += 1;
+                }
+            }
+            if near_tip && worst.is_finite() {
+                stats.worst_tip = stats.worst_tip.max(worst / self.scale);
+            } else if near_tip {
+                stats.tip_counts += 1;
+            } else if worst.is_finite() {
+                stats.worst_end = stats.worst_end.max(worst / self.scale);
+            }
+        });
+        if bad && std::env::var("BREP_DEBUG_SOLID_SWEEP").is_ok() {
+            eprintln!("extremum jet check: level {level} (near a tip: {near_tip}): {plain:?} vs {exact:?}");
+        }
+        Ok(plain)
     }
 
     fn intervals_uncached(&self, level: f64) -> Result<Vec<Interval>, KernelRefusal> {
@@ -1763,11 +2271,16 @@ impl<'a> Engine<'a> {
             let n = 2048;
             let param = |k: usize| range[0] + (range[1] - range[0]) * k as f64 / n as f64;
             let values: Vec<f64> = (0..=n).map(|k| self.source_reduced(source, param(k), 0.0).0).collect();
-            for k in 1..n {
-                let (a, b, c) = (values[k - 1], values[k], values[k + 1]);
+            // A closed edge (a circle) has no ends: its seam sample is read
+            // between its neighbours across the seam like any other.
+            let periodic = edge_tips_on() && self.edge_periodic(source);
+            let first = if periodic { 0 } else { 1 };
+            for k in first..n {
+                let (a, b, c) = if k == 0 { (values[n - 1], values[0], values[1]) } else { (values[k - 1], values[k], values[k + 1]) };
                 if (b <= a && b <= c) || (b >= a && b >= c) {
                     let sign = if b <= a && b <= c { 1.0 } else { -1.0 };
-                    let (mut lo, mut hi) = (param(k - 1), param(k + 1));
+                    let before = if k == 0 { range[0] - (range[1] - range[0]) / n as f64 } else { param(k - 1) };
+                    let (mut lo, mut hi) = (before, param(k + 1));
                     let ratio = 0.618_033_988_749_894_9;
                     for _ in 0..100 {
                         let c1 = hi - ratio * (hi - lo);
@@ -1778,8 +2291,12 @@ impl<'a> Engine<'a> {
                             lo = c1;
                         }
                     }
-                    out.push(self.source_reduced(source, 0.5 * (lo + hi), 0.0));
-                    params.push((0.5 * (lo + hi), 0.0));
+                    let mut at = 0.5 * (lo + hi);
+                    if periodic {
+                        at = range[0] + (at - range[0]).rem_euclid(range[1] - range[0]);
+                    }
+                    out.push(self.source_reduced(source, at, 0.0));
+                    params.push((at, 0.0));
                 }
             }
         }
@@ -1885,6 +2402,16 @@ pub fn sweep_solid_within(
     motion: &SolidMotion,
     clip: &SweepClip,
 ) -> Result<Vec<BrepSolid>, KernelRefusal> {
+    sweep_solid_within_routes(tool, motion, clip, true)
+}
+
+/// [`sweep_solid_within`]'s routes, the turned shadow tried when `shadow`.
+fn sweep_solid_within_routes(
+    tool: &SweptTool,
+    motion: &SolidMotion,
+    clip: &SweepClip,
+    shadow: bool,
+) -> Result<Vec<BrepSolid>, KernelRefusal> {
     // A convex polygon's prism carried round a closed planar motion (turns
     // about axes along its own, ending where it starts: a planet on its
     // carrier): the plane region its section covers, found exactly and
@@ -1896,6 +2423,31 @@ pub fn sweep_solid_within(
                 return Ok(vec![body]);
             }
         }
+    }
+    // A solid of revolution turned about an axis crossing its own at right
+    // angles, its ends clear of the clip's wedge: its exact turned shadow
+    // (`solid_sweep_turn_shadow`, `BREP_SWEEP_REVOLVED_TURN_SHADOW`, default on).
+    {
+        use crate::solid_sweep_turn_shadow as shadow;
+        let (on, check) = (shadow::revolved_turn_shadow_on(), shadow::revolved_turn_shadow_check_on());
+        if shadow && (on || check) {
+            if let Some(body) = shadow::revolved_turn_shadow(tool, motion, clip)? {
+                if !check {
+                    return Ok(vec![body]);
+                }
+                let shadow_body = body;
+                let parts = sweep_solid_within_routes(tool, motion, clip, false)?;
+                let within = |b: &BrepSolid| crate::solid_mass_properties(&clip_region(b, clip)?).ok().map(|m| m.volume);
+                shadow::record_check(&shadow_body, &parts, within);
+                return Ok(parts);
+            }
+        }
+    }
+    // A disc's prism turned partway about an axis along it, held whole by the
+    // clip: its region of arcs, exactly, extruded (`turned_disc`,
+    // `BREP_SWEEP_TURNED_DISC`, default on); None leaves it to the routes below.
+    if let Some(parts) = crate::turned_disc::turned_disc(tool, motion, clip)? {
+        return Ok(parts);
     }
     // A straight-sided prism turned about axes along it: its exact planar
     // region, extruded (default off).
@@ -1928,7 +2480,7 @@ pub fn sweep_solid_within(
 /// out, built by the level engine directly, without a boolean. At each level
 /// the material is what the sweep leaves; its walls are the sweep's own, and
 /// at the clip's outer radius the boundary is the circle less the sweep's
-/// spans there. Over a crest (`BREP_SWEEP_CLIP_LESS_CREST`, default off) it is
+/// spans there. Over a crest (`BREP_SWEEP_CLIP_LESS_CREST`, on unless =0) it is
 /// what stays below the crest. `None` where this is not built (another class than a screw,
 /// a crest with that switch off, a sweep that never reaches the outer radius or leaves more than
 /// one region, or anything the level engine refuses): the caller subtracts
@@ -1945,11 +2497,197 @@ pub fn clip_less_on() -> bool {
     crate::switch!("BREP_SWEEP_CLIP_LESS", true)
 }
 
+/// Whether a closed loop of curves is shown simple: no two of its pieces meet
+/// but consecutive ones at their shared end. Each span of a spline lies in the
+/// hull of its control points, so within `d` of its chord, `d` the farthest of
+/// them from it; two spans whose chords stand further apart than their two `d`
+/// cannot meet. Spans next to each other (in one curve, or the end spans of
+/// consecutive curves at their shared point) are compared instead by the cones
+/// their points span from the shared point, in the section's plane (`normal`):
+/// cones apart but for it, the pieces meet only there. Each curve is read as
+/// its Bézier pieces, whose points lie close about it and rise along its chord
+/// (so it does not cross itself). `false` where
+/// this does not show it, though the loop may yet be simple.
+pub(crate) fn section_is_simple(profile: &[NurbsCurve], normal: Vec3, scale: f64) -> bool {
+    struct Span {
+        curve: usize,
+        index: usize,
+        last: bool,
+        a: Vec3,
+        b: Vec3,
+        reach: f64,
+        lo: Vec3,
+        hi: Vec3,
+        hull: Vec<Vec3>,
+    }
+    let point = |p: &crate::Vec4| -> Option<Vec3> { (p.w > 0.0).then(|| Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w)) };
+    let mut spans = Vec::new();
+    for (curve, c) in profile.iter().enumerate() {
+        // Its Bézier pieces: each lies in the hull of its own points, and ends on them.
+        let zero = crate::Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+        let blend = |a: crate::Vec4, b: crate::Vec4, alpha: f64| a.scale(alpha).add(b.scale(1.0 - alpha));
+        let Some(pieces) = crate::curve::bezier_decompose_raw(&c.knots, &c.control_points, c.degree, zero, blend) else { return false };
+        // A piece far from its chord (a wide arc) is halved, by de Casteljau, until it lies close.
+        let mut close: Vec<(Vec<Vec3>, Vec3, Vec3, f64)> = Vec::new();
+        let mut stack: Vec<(Vec<crate::Vec4>, usize)> = pieces.into_iter().rev().map(|piece| (piece, 0)).collect();
+        while let Some((piece, depth)) = stack.pop() {
+            let Some(hull) = piece.iter().map(point).collect::<Option<Vec<_>>>() else { return false };
+            let (a, b) = (hull[0], hull[hull.len() - 1]);
+            let reach = hull.iter().map(|&q| segment_distance(q, q, a, b)).fold(0.0, f64::max);
+            // Its points rising strictly along the chord, the piece is a graph over it
+            // (variation diminishing, weights positive): it cannot cross itself.
+            let chord = b.sub(a);
+            let rising = hull.windows(2).all(|w| w[1].sub(w[0]).dot(chord) > 0.0);
+            if (reach > 0.05 * chord.length() || !rising) && depth < 8 {
+                let (mut left, mut right, mut row) = (Vec::new(), Vec::new(), piece);
+                while !row.is_empty() {
+                    left.push(row[0]);
+                    right.push(row[row.len() - 1]);
+                    row = row.windows(2).map(|w| blend(w[0], w[1], 0.5)).collect();
+                }
+                right.reverse();
+                stack.push((right, depth + 1));
+                stack.push((left, depth + 1));
+                continue;
+            }
+            if !rising {
+                return false;
+            }
+            close.push((hull, a, b, reach));
+        }
+        let total = close.len();
+        for (index, (hull, a, b, reach)) in close.into_iter().enumerate() {
+            let lo = hull.iter().fold(Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), |m, q| Vec3::new(m.x.min(q.x), m.y.min(q.y), m.z.min(q.z)));
+            let hi = hull.iter().fold(Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY), |m, q| Vec3::new(m.x.max(q.x), m.y.max(q.y), m.z.max(q.z)));
+            spans.push(Span { curve, index, last: index + 1 == total, a, b, reach, lo, hi, hull });
+        }
+    }
+    let count = profile.len();
+    let margin = 1e-12 * scale;
+    // Directions in the section's plane, for neighbours' cones.
+    let Ok(n) = normal.normalized() else { return false };
+    let Ok(e1) = (if n.x.abs() < 0.9 { n.cross(Vec3::new(1.0, 0.0, 0.0)) } else { n.cross(Vec3::new(0.0, 1.0, 0.0)) }).normalized() else { return false };
+    let e2 = n.cross(e1);
+    let origin = spans.first().map(|s| s.a).unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+    // The arc of directions from `q` its points span (start, width), or None if
+    // it is not shown narrower than a half turn or a point stands off the plane.
+    let cone = |hull: &[Vec3], q: Vec3| -> Option<(f64, f64)> {
+        let mut angles = Vec::new();
+        for p in hull {
+            let d = p.sub(q);
+            if d.dot(n).abs() > 1e-9 * scale {
+                return None;
+            }
+            if d.length() > 1e-12 * scale {
+                angles.push(d.dot(e2).atan2(d.dot(e1)));
+            }
+        }
+        let first = *angles.first()?;
+        let wrap = |x: f64| (x - first + PI).rem_euclid(TAU) - PI;
+        let (lo, hi) = angles.iter().fold((0.0f64, 0.0f64), |(lo, hi), &x| (lo.min(wrap(x)), hi.max(wrap(x))));
+        (hi - lo < PI - 1e-9).then_some((first + lo, hi - lo))
+    };
+    let within = |x: f64, start: f64, width: f64| (x - start).rem_euclid(TAU) <= width + 1e-12;
+    for (k, s) in spans.iter().enumerate() {
+        for t in &spans[k + 1..] {
+            let neighbours = if s.curve == t.curve {
+                t.index == s.index + 1 || (count == 1 && s.index == 0 && t.last)
+            } else {
+                let next = |x: &Span, y: &Span| (x.curve + 1) % count == y.curve && x.last && y.index == 0;
+                next(s, t) || next(t, s)
+            };
+            if neighbours {
+                // Each lies in the cone its points span from the shared end; the
+                // cones apart but for that point, the pieces meet only there.
+                let q = if s.b.sub(t.a).length() <= s.a.sub(t.b).length() { s.b } else { s.a };
+                let (Some((a0, wa)), Some((b0, wb))) = (cone(&s.hull, q), cone(&t.hull, q)) else { return false };
+                if within(a0, b0, wb) || within(a0 + wa, b0, wb) || within(b0, a0, wa) || within(b0 + wb, a0, wa) {
+                    return false;
+                }
+                continue;
+            }
+            // The hulls' boxes apart: they cannot meet.
+            if s.hi.x < t.lo.x || t.hi.x < s.lo.x || s.hi.y < t.lo.y || t.hi.y < s.lo.y || s.hi.z < t.lo.z || t.hi.z < s.lo.z {
+                continue;
+            }
+            let flat = |p: Vec3| [p.sub(origin).dot(e1), p.sub(origin).dot(e2)];
+            if planar_segment_gap(flat(s.a), flat(s.b), flat(t.a), flat(t.b)) <= s.reach + t.reach + margin {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The least distance between the segments `a0 a1` and `b0 b1` of a plane,
+/// zero wherever they may cross or touch: the orientation tests decide that,
+/// a sign within roundoff of zero counted as touching; apart, the least
+/// distance is from an end of one to the other, which nothing cancels in.
+fn planar_segment_gap(a0: [f64; 2], a1: [f64; 2], b0: [f64; 2], b1: [f64; 2]) -> f64 {
+    let sub = |p: [f64; 2], q: [f64; 2]| [p[0] - q[0], p[1] - q[1]];
+    let cross = |u: [f64; 2], v: [f64; 2]| u[0] * v[1] - u[1] * v[0];
+    let norm = |u: [f64; 2]| u[0].hypot(u[1]);
+    // The sign of the turn p q r, None within roundoff of zero.
+    let side = |p: [f64; 2], q: [f64; 2], r: [f64; 2]| -> Option<bool> {
+        let (u, v) = (sub(q, p), sub(r, p));
+        let turn = cross(u, v);
+        (turn.abs() > 1e-12 * norm(u) * norm(v)).then_some(turn > 0.0)
+    };
+    let straddles = |p: Option<bool>, q: Option<bool>| p.is_none() || q.is_none() || p != q;
+    let (o1, o2, o3, o4) = (side(a0, a1, b0), side(a0, a1, b1), side(b0, b1, a0), side(b0, b1, a1));
+    let collinear = o1.is_none() && o2.is_none() && o3.is_none() && o4.is_none();
+    if !collinear && straddles(o1, o2) && straddles(o3, o4) {
+        return 0.0;
+    }
+    let to_segment = |p: [f64; 2], q0: [f64; 2], q1: [f64; 2]| -> f64 {
+        let (d, w) = (sub(q1, q0), sub(p, q0));
+        let length = d[0] * d[0] + d[1] * d[1];
+        let t = if length > 0.0 { ((w[0] * d[0] + w[1] * d[1]) / length).clamp(0.0, 1.0) } else { 0.0 };
+        norm([w[0] - d[0] * t, w[1] - d[1] * t])
+    };
+    to_segment(a0, b0, b1).min(to_segment(a1, b0, b1)).min(to_segment(b0, a0, a1)).min(to_segment(b1, a0, a1))
+}
+
+/// The least distance between the segments `a0 a1` and `b0 b1`.
+fn segment_distance(a0: Vec3, a1: Vec3, b0: Vec3, b1: Vec3) -> f64 {
+    let (u, v, w) = (a1.sub(a0), b1.sub(b0), a0.sub(b0));
+    let (a, b, c, d, e) = (u.dot(u), u.dot(v), v.dot(v), u.dot(w), v.dot(w));
+    let denominator = a * c - b * b;
+    let clamp = |x: f64| x.clamp(0.0, 1.0);
+    let (mut s, mut t);
+    if a <= f64::MIN_POSITIVE && c <= f64::MIN_POSITIVE {
+        return w.length();
+    } else if a <= f64::MIN_POSITIVE {
+        s = 0.0;
+        t = clamp(e / c);
+    } else if c <= f64::MIN_POSITIVE {
+        t = 0.0;
+        s = clamp(-d / a);
+    } else {
+        s = if denominator > 1e-300 { clamp((b * e - c * d) / denominator) } else { 0.0 };
+        t = (b * s + e) / c;
+        if t < 0.0 {
+            t = 0.0;
+            s = clamp(-d / a);
+        } else if t > 1.0 {
+            t = 1.0;
+            s = clamp((b - d) / a);
+        }
+    }
+    a0.add(u.scale(s)).sub(b0.add(v.scale(t))).length()
+}
+
+/// The switch for the screw route's loft without its self-intersection scan
+/// where the walls are carried (default on; `=0` scans as before).
+fn screw_loft_unscanned_on() -> bool {
+    crate::switch!("BREP_SWEEP_SCREW_LOFT_UNSCANNED", true)
+}
+
 /// The switch for [`sweep_clip_less`] over a screw whose turns meet at a crest
-/// (default off): above the crest the sweep takes all the clip holds, so the
+/// (default on; `=0` answers None): above the crest the sweep takes all the clip holds, so the
 /// clip less the sweep is what stays below it, which the engine builds anyway.
 pub fn clip_less_crest_on() -> bool {
-    crate::switch!("BREP_SWEEP_CLIP_LESS_CREST", false)
+    crate::switch!("BREP_SWEEP_CLIP_LESS_CREST", true)
 }
 
 /// The level engine: the sweep within the clip, or (`complement`) the clip
@@ -2135,6 +2873,8 @@ fn level_sweep(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip, complem
                         edge_samples: std::cell::RefCell::new(std::collections::HashMap::new()),
                 wrap: None,
                 counters: std::cell::Cell::new((0, 0, 0, 0.0, 0.0)),
+                jet: std::cell::Cell::new(extremum_jet_on() && !extremum_jet_check_on()),
+                tool_frame: tool_frame(tool),
             };
             let n = normal.normalized_or(*normal);
             let xa = x_axis.normalized_or(*x_axis);
@@ -2232,6 +2972,8 @@ fn level_sweep(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip, complem
         edge_samples: std::cell::RefCell::new(std::collections::HashMap::new()),
         wrap,
         counters: std::cell::Cell::new((0, 0, 0, 0.0, 0.0)),
+        jet: std::cell::Cell::new(extremum_jet_on() && !extremum_jet_check_on()),
+        tool_frame: tool_frame(tool),
     };
     engine.grids = engine
         .sources
@@ -2242,6 +2984,9 @@ fn level_sweep(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip, complem
     engine.critical_params = critical.iter().map(|c| c.1.clone()).collect();
     engine.critical_bands = critical.iter().map(|c| c.2.clone()).collect();
     engine.critical = critical.into_iter().map(|c| c.0).collect();
+    // The levels of the tool's points on its own axis (a cone's apex): the
+    // envelope turns a corner there.
+    let mut apex_levels: Vec<f64> = Vec::new();
     if let (SweptTool::Revolved { axis_origin, axis_direction, meridian, .. }, true) = (tool, apex_tip_on()) {
         let axis = axis_direction.normalized_or(*axis_direction);
         let count = meridian.len();
@@ -2251,6 +2996,7 @@ fn level_sweep(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip, complem
                 continue;
             }
             let apex = engine.reduce(engine.frame.local(axis_origin.add(axis.scale(corner[1]))));
+            apex_levels.push(apex.0);
             // the faces on either side of the corner
             for neighbour in [piece, (piece + count - 1) % count] {
                 if let Some(index) = engine.sources.iter().position(|source| matches!(source, Source::RevolvedFace { piece } if *piece == neighbour)) {
@@ -2278,7 +3024,7 @@ fn level_sweep(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip, complem
 
     // --- A screw whose grooves meet: above a crest level nothing stays. Build
     //     what stays below it, and take that from the clip at the end.
-    //     The clip less the sweep is then what stays itself (default off).
+    //     The clip less the sweep is then what stays itself (on unless =0).
     let mut crest = None;
     let mut kept_only = false;
     if matches!(class, Class::Screw(_)) && clip.radius[0] == 0.0 && clip.angle.is_none() && whole_level_on() {
@@ -2361,26 +3107,77 @@ fn level_sweep(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip, complem
         structure.push(engine.intervals_at(level)?);
     }
     let debug = std::env::var("BREP_DEBUG_SOLID_SWEEP").is_ok();
-    let mut breaks = vec![l0];
-    for k in 0..scan {
-        find_events(&engine, levels[k], &structure[k], levels[k + 1], &structure[k + 1], &mut breaks, 0)?;
-    }
-    breaks.push(l1);
-    // Snap each event to a critical level of a source when one is that close.
-    // A birth or death is found by bisection only to where the seeding first
-    // sees the level's contour, which near a tip is a √ away from it: the
-    // critical level is the exact one.
-    let last = breaks.len() - 1;
-    for level in breaks[1..last].iter_mut() {
-        let mut nearest = *level;
-        let mut distance = 1e-5 * scale;
-        for critical in engine.critical.iter().flatten() {
-            if (critical.0 - *level).abs() < distance {
-                distance = (critical.0 - *level).abs();
-                nearest = critical.0;
+    let scan_events = |shortcut: bool| -> Result<Vec<f64>, KernelRefusal> {
+        let mut breaks = vec![l0];
+        for k in 0..scan {
+            let (a, b) = (levels[k], levels[k + 1]);
+            if shortcut && !compatible(&engine, &structure[k], &structure[k + 1]) {
+                if let Some(c) = lone_critical_inside(&engine, a, b, scale) {
+                    let step = CRITICAL_EVENT_STEP * scale;
+                    let (below, above) = (c - step, c + step);
+                    if below > a && above < b {
+                        let (s_below, s_above) = (engine.intervals_at(below)?, engine.intervals_at(above)?);
+                        // A birth or death: the count of intervals changes
+                        // across the level (an interval merely sliding is
+                        // incompatible too, but subdivision would smooth it
+                        // away and name no event).
+                        if s_below.len() != s_above.len() {
+                            find_events(&engine, a, &structure[k], below, &s_below, &mut breaks, 0)?;
+                            breaks.push(c);
+                            critical_events_record(0, 0, 1);
+                            find_events(&engine, above, &s_above, b, &structure[k + 1], &mut breaks, 0)?;
+                            continue;
+                        }
+                    }
+                }
+            }
+            find_events(&engine, a, &structure[k], b, &structure[k + 1], &mut breaks, 0)?;
+        }
+        breaks.push(l1);
+        // Snap each event to a critical level of a source when one is that close.
+        // A birth or death is found by bisection only to where the seeding first
+        // sees the level's contour, which near a tip is a √ away from it: the
+        // critical level is the exact one.
+        let last = breaks.len() - 1;
+        for level in breaks[1..last].iter_mut() {
+            let mut nearest = *level;
+            let mut distance = 1e-5 * scale;
+            for critical in engine.critical.iter().flatten() {
+                if (critical.0 - *level).abs() < distance {
+                    distance = (critical.0 - *level).abs();
+                    nearest = critical.0;
+                }
+            }
+            *level = nearest;
+        }
+        Ok(breaks)
+    };
+    let mut breaks = if critical_events_check_on() {
+        // The bisection's answer is kept; a shortcut that refuses where it
+        // answered counts as a difference.
+        let plain = scan_events(false)?;
+        let short = scan_events(true);
+        let same = match &short {
+            Ok(short) => plain.len() == short.len() && plain.iter().zip(short).all(|(x, y)| (x - y).abs() <= 1e-12 * scale),
+            Err(_) => false,
+        };
+        critical_events_record(1, u64::from(!same), 0);
+        if !same && debug {
+            eprintln!("critical events check: bisection {plain:?} against shortcut {:?}", short.as_ref().map_err(|e| e.to_string()));
+        }
+        plain
+    } else {
+        scan_events(critical_events_on())?
+    };
+    // An apex's level is a break even where no source hands over there: the
+    // face's own contour turns a corner at the apex, and one band through it
+    // could not be fitted (an upright cone turned in a window was refused).
+    if apex_breaks_on() {
+        for &level in &apex_levels {
+            if level > l0 + 1e-9 * scale && level < l1 - 1e-9 * scale && !breaks.iter().any(|b| (b - level).abs() < 1e-9 * scale) {
+                breaks.push(level);
             }
         }
-        *level = nearest;
     }
     breaks.sort_by(|a, b| a.total_cmp(b));
     // A source handing over to the next one at an edge can flicker over a few
@@ -2673,12 +3470,146 @@ fn level_sweep(tool: &SweptTool, motion: &SolidMotion, clip: &SweepClip, complem
 /// through `segments + 1` sections misses a turn by h⁴; these by h⁶, which is
 /// what lets a long fine thread be built with few spans. Sections, caps and
 /// parameters are the loft's, so the trims stay as they are.
-fn carry_along_screw(body: &mut BrepSolid, engine: &Engine, c: f64, span: f64, segments: usize) -> Result<(), KernelRefusal> {
-    if lean_walls_on() {
-        return carry_along_screw_to_order(body, engine, c, span, segments, lean_carry_order(engine));
+/// What the screw carry reads of its sweep: the screw's axis, the sweep's scale, and the order
+/// of the lean carry.
+struct ScrewAxis {
+    origin: Vec3,
+    ez: Vec3,
+    scale: f64,
+    order: usize,
+    /// A profile drawn in a half-plane through the axis (`screw_profile_brep`): the half-plane's
+    /// radial direction and the profile's heights along the axis, where a row's end sections lie
+    /// (the level engine's sections lie square to the axis instead).
+    meridian: Option<(Vec3, [f64; 2])>,
+}
+
+impl ScrewAxis {
+    fn of(engine: &Engine) -> ScrewAxis {
+        ScrewAxis { origin: engine.clip.axis_origin, ez: engine.frame.ez, scale: engine.scale, order: lean_carry_order(engine), meridian: None }
     }
-    let origin = engine.clip.axis_origin;
-    let ez = engine.frame.ez;
+}
+
+/// The solid a closed profile sweeps when screwed about an axis it lies beside: the profile,
+/// drawn in a plane through the axis, turned right-handed about `axis_direction` through `angle`
+/// (radians, positive) while it rises `rise` along it per radian (a thread; `rise` 0 is the
+/// revolution). The walls are the profile carried along the screw, lofted through its sections and
+/// re-carried to high order (the threads' own construction); a long screw is built a few turns at a
+/// time and stacked. Refused where the profile reaches the axis, leaves the plane through it, or
+/// meets its own next turn (its height along the axis at least the rise of a turn) when the screw
+/// turns more than once.
+pub fn screw_profile_brep(profile: &[NurbsCurve], axis_origin: Vec3, axis_direction: Vec3, rise: f64, angle: f64) -> Result<BrepSolid, KernelRefusal> {
+    let bad = |what: &'static str, message: &str| KernelRefusal::input(KernelStage::Collect, what, format!("screwProfile: {message}"));
+    let ez = axis_direction.normalized().map_err(|_| bad("screw_axis", "the axis has no direction"))?;
+    if !(angle.is_finite() && angle > 0.0 && rise.is_finite()) {
+        return Err(bad("screw_motion", "the angle must be positive and the rise finite"));
+    }
+    if angle > 1e4 * TAU {
+        return Err(bad("screw_motion", "more than ten thousand turns"));
+    }
+    if profile.is_empty() {
+        return Err(bad("screw_profile", "no profile"));
+    }
+    if rise == 0.0 {
+        return revolve_profile_brep(profile, axis_origin, ez, angle).map_err(|e| bad("screw_revolve", &e));
+    }
+    // A profile of one closed curve (a circle) is lofted as its two halves.
+    let halves;
+    let profile = if let [closed] = profile {
+        let [t0, t1] = closed.domain().map_err(|e| bad("screw_profile", &e))?;
+        let (a, b) = closed.split(0.5 * (t0 + t1)).map_err(|e| bad("screw_profile", &e))?;
+        halves = [a, b];
+        &halves[..]
+    } else {
+        profile
+    };
+    // The profile's reach: its distance from the axis, its height along it, its plane.
+    let mut samples = Vec::new();
+    for curve in profile {
+        let [t0, t1] = curve.domain().map_err(|e| bad("screw_profile", &e))?;
+        for k in 0..=64 {
+            samples.push(curve.evaluate(t0 + (t1 - t0) * k as f64 / 64.0).map_err(|e| bad("screw_profile", &e))?);
+        }
+    }
+    let local = |x: Vec3| {
+        let d = x.sub(axis_origin);
+        let h = d.dot(ez);
+        (d.sub(ez.scale(h)), h)
+    };
+    // The scale is the profile's own: its farthest reach from the axis and its height, not
+    // where along the axis its origin was given.
+    let (mut rho_min, mut rho_max, mut h0, mut h1) = (f64::INFINITY, 0.0f64, f64::INFINITY, f64::NEG_INFINITY);
+    for &x in &samples {
+        let (radial, h) = local(x);
+        rho_min = rho_min.min(radial.length());
+        rho_max = rho_max.max(radial.length());
+        h0 = h0.min(h);
+        h1 = h1.max(h);
+    }
+    let scale = rho_max.max(h1 - h0).max(1e-300);
+    let radial_dir = samples.iter().map(|&x| local(x).0).find(|radial| radial.length() > 1e-6 * scale).and_then(|radial| radial.normalized().ok());
+    if !(rho_min > 1e-9 * scale) {
+        return Err(bad("screw_profile_axis", "the profile reaches the screw's axis"));
+    }
+    let normal = ez.cross(radial_dir.ok_or_else(|| bad("screw_profile", "the profile has no extent"))?);
+    if samples.iter().any(|&x| { let (radial, _) = local(x); radial.dot(normal).abs() > 1e-9 * scale || radial.dot(normal.cross(ez)) < 0.0 }) {
+        return Err(bad("screw_profile_plane", "the profile does not lie in one half-plane through the axis"));
+    }
+    if angle > TAU * (1.0 + 1e-12) && (h1 - h0) >= TAU * rise.abs() * (1.0 - 1e-12) {
+        return Err(bad("screw_turns_collide", "the profile meets its own next turn: it is at least as tall as the rise of one turn"));
+    }
+    let axis = ScrewAxis { origin: axis_origin, ez, scale, order: LEAN_CARRY_ORDER, meridian: Some((radial_dir.expect("checked above"), [h0, h1])) };
+    let per_turn = if lean_walls_on() { LEAN_CARRY_PER_TURN } else { 48.0 };
+    let rows = (angle / TAU / TURNS_PER_ROW).round().max(1.0) as usize;
+    let span = angle / rows as f64;
+    let sections = ((span / TAU * per_turn).ceil() as usize).max(8) + 1;
+    let mut lofted = Vec::with_capacity(sections);
+    for k in 0..sections {
+        let turn = span * k as f64 / (sections - 1) as f64;
+        let lift = ez.scale(rise * turn);
+        let moved: Vec<NurbsCurve> = profile.iter().map(|curve| transform_curve(curve, |x| rotate(x, axis_origin, ez, turn).add(lift))).collect::<Result<_, _>>()?;
+        lofted.push(moved);
+    }
+    // (A screw so steep that its sections barely leave their own planes, a lead angle past some
+    // 84°, is refused by the loft's own test of each section's advance, by name.)
+    let mut body = loft_profile_brep(&lofted)?;
+    carry_along_screw(&mut body, &axis, rise, span, sections - 1)?;
+    if rows > 1 {
+        body = stack_screw_rows(&body, &axis, rise, span, sections - 1, rows)?;
+    }
+    if let Some(issue) = body.validate().first() {
+        return Err(KernelRefusal::unsupported(KernelStage::Fragment, "screw_profile_invalid", format!("screwProfile: the screwed profile is not valid: {issue:?}")));
+    }
+    Ok(body)
+}
+
+/// Whether the edge from `from` to `to` of a screw loft is carried along the screw (and then
+/// whether it runs with it), or lies in a cap (`None`). A level section's carried edges rise the
+/// whole height and its caps none; a meridian profile's caps can rise the whole height too, so
+/// there a carried edge is the one whose end is its start carried through the span.
+#[allow(clippy::too_many_arguments)]
+fn carried_edge(axis: &ScrewAxis, c: f64, span: f64, from: Vec3, to: Vec3, rise: f64, height: f64, tolerance: f64) -> Option<bool> {
+    if axis.meridian.is_some() {
+        let carried = |a: Vec3, b: Vec3| rotate(a, axis.origin, axis.ez, span).add(axis.ez.scale(c * span)).sub(b).length() <= tolerance;
+        return if carried(from, to) {
+            Some(true)
+        } else if carried(to, from) {
+            Some(false)
+        } else {
+            None
+        };
+    }
+    if (rise.abs() - height.abs()).abs() > tolerance.min(0.25 * height.abs()) {
+        return None;
+    }
+    Some(rise * height > 0.0)
+}
+
+fn carry_along_screw(body: &mut BrepSolid, axis: &ScrewAxis, c: f64, span: f64, segments: usize) -> Result<(), KernelRefusal> {
+    if lean_walls_on() {
+        return carry_along_screw_to_order(body, axis, c, span, segments, axis.order);
+    }
+    let origin = axis.origin;
+    let ez = axis.ez;
     // The six Bézier points of each span collapse to three a span, C² at the joints.
     let carry = |start: Vec3| -> Vec<Vec3> {
         let h = span / segments as f64;
@@ -2726,7 +3657,7 @@ fn carry_along_screw(body: &mut BrepSolid, engine: &Engine, c: f64, span: f64, s
     let moved = |p: &crate::Vec4, angle: f64| -> Vec3 {
         rotate(point(p), origin, ez, angle).add(ez.scale(c * angle))
     };
-    let tolerance = 1e-7 * engine.scale;
+    let tolerance = 1e-7 * axis.scale;
     for face in body.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
         let rows = &face.surface.control_points;
         if rows[0].len() != segments + 1 {
@@ -2755,11 +3686,12 @@ fn carry_along_screw(body: &mut BrepSolid, engine: &Engine, c: f64, span: f64, s
         let rise = to.sub(from).dot(ez);
         // An edge in a cap rises nothing, a carried one the whole height: told apart
         // well inside the height itself, however short the clip against its radius.
-        if (rise.abs() - height.abs()).abs() > tolerance.min(0.25 * height.abs()) {
+        // A meridian profile's cap can rise the whole height too: there a carried edge is
+        // the one whose end is its start carried the whole span.
+        let Some(forward) = carried_edge(axis, c, span, from, to, rise, height, tolerance) else {
             continue; // lies in a cap
-        }
+        };
         let domain = edge.curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
-        let forward = rise * height > 0.0;
         let mut path = carry(if forward { from } else { to });
         if !forward {
             path.reverse();
@@ -2848,9 +3780,9 @@ fn carry_points_of_order(jet: impl Fn(usize) -> Vec<Vec3>, h: f64, segments: usi
 /// `carry_along_screw` to order `m`: each wall's columns and each carried edge
 /// as the C^m spline of degree 2m + 1 through the exact screw and m of its
 /// derivatives at `segments + 1` turns.
-fn carry_along_screw_to_order(body: &mut BrepSolid, engine: &Engine, c: f64, span: f64, segments: usize, m: usize) -> Result<(), KernelRefusal> {
-    let origin = engine.clip.axis_origin;
-    let ez = engine.frame.ez;
+fn carry_along_screw_to_order(body: &mut BrepSolid, axis: &ScrewAxis, c: f64, span: f64, segments: usize, m: usize) -> Result<(), KernelRefusal> {
+    let origin = axis.origin;
+    let ez = axis.ez;
     let degree = 2 * m + 1;
     let h = span / segments as f64;
     let carry = |start: Vec3| -> Vec<Vec3> {
@@ -2871,7 +3803,7 @@ fn carry_along_screw_to_order(body: &mut BrepSolid, engine: &Engine, c: f64, spa
     };
     let point = |p: &crate::Vec4| Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w);
     let moved = |p: &crate::Vec4, angle: f64| -> Vec3 { rotate(point(p), origin, ez, angle).add(ez.scale(c * angle)) };
-    let tolerance = 1e-7 * engine.scale;
+    let tolerance = 1e-7 * axis.scale;
     for face in body.shells.iter_mut().flat_map(|shell| &mut shell.faces) {
         let rows = &face.surface.control_points;
         if rows[0].len() != segments + 1 {
@@ -2897,11 +3829,10 @@ fn carry_along_screw_to_order(body: &mut BrepSolid, engine: &Engine, c: f64, spa
     for edge in &mut body.edges {
         let (from, to) = (points[&edge.start_vertex_id], points[&edge.end_vertex_id]);
         let rise = to.sub(from).dot(ez);
-        if (rise.abs() - height.abs()).abs() > tolerance.min(0.25 * height.abs()) {
+        let Some(forward) = carried_edge(axis, c, span, from, to, rise, height, tolerance) else {
             continue; // lies in a cap
-        }
+        };
         let domain = edge.curve.domain().or_refuse(KernelStage::Fragment, "domain")?;
-        let forward = rise * height > 0.0;
         let mut path = carry(if forward { from } else { to });
         if !forward {
             path.reverse();
@@ -2917,9 +3848,9 @@ fn carry_along_screw_to_order(body: &mut BrepSolid, engine: &Engine, c: f64, spa
 }
 
 /// Control points a carried wall has along the screw, in `segments` spans.
-fn carried_columns(engine: &Engine, segments: usize) -> usize {
+fn carried_columns(axis: &ScrewAxis, segments: usize) -> usize {
     if lean_walls_on() {
-        (lean_carry_order(engine) + 1) * (segments + 1)
+        (axis.order + 1) * (segments + 1)
     } else {
         3 * segments + 3
     }
@@ -2927,19 +3858,19 @@ fn carried_columns(engine: &Engine, segments: usize) -> usize {
 
 fn stack_screw_rows(
     row: &BrepSolid,
-    engine: &Engine,
+    axis: &ScrewAxis,
     c: f64,
     span: f64,
     segments: usize,
     rows: usize,
 ) -> Result<BrepSolid, KernelRefusal> {
-    let origin = engine.clip.axis_origin;
-    let ez = engine.frame.ez;
+    let origin = axis.origin;
+    let ez = axis.ez;
     let moved = |x: Vec3, copy: usize| -> Vec3 {
         let angle = span * copy as f64;
         rotate(x, origin, ez, angle).add(ez.scale(c * angle))
     };
-    let tolerance = 1e-7 * engine.scale;
+    let tolerance = 1e-7 * axis.scale;
     let height = |x: Vec3| x.sub(origin).dot(ez);
     let points: rustc_hash::FxHashMap<u64, Vec3> = row.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
     let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -2947,9 +3878,24 @@ fn stack_screw_rows(
         low = low.min(height(vertex.point));
         high = high.max(height(vertex.point));
     }
-    let at = |id: u64, level: f64| (height(points[&id]) - level).abs() <= tolerance;
-    let in_level = |edge: &crate::topology::EdgeRecord, level: f64| at(edge.start_vertex_id, level) && at(edge.end_vertex_id, level);
     let (bottom, top) = if c * span > 0.0 { (low, high) } else { (high, low) };
+    // Where a row's end sections lie: at its lowest and highest level, or (a meridian profile)
+    // in the half-plane it starts in and the one it ends in, within the profile's heights there.
+    let on_end = |x: Vec3, level: f64| -> bool {
+        match axis.meridian {
+            None => (height(x) - level).abs() <= tolerance,
+            Some((radial, [h0, h1])) => {
+                let (turn, rise) = if level == bottom { (0.0, 0.0) } else { (span, c * span) };
+                let r = radial.rotate_about(ez, turn);
+                let across = ez.cross(r);
+                let d = x.sub(origin);
+                let h = height(x) - rise;
+                d.dot(across).abs() <= tolerance && d.dot(r) > 0.0 && h >= h0 - tolerance && h <= h1 + tolerance
+            }
+        }
+    };
+    let at = |id: u64, level: f64| on_end(points[&id], level);
+    let in_level = |edge: &crate::topology::EdgeRecord, level: f64| at(edge.start_vertex_id, level) && at(edge.end_vertex_id, level);
     // Each bottom vertex and edge of a copy is a top one of the copy before.
     let mut vertex_below: rustc_hash::FxHashMap<u64, u64> = Default::default();
     for vertex in row.vertices.iter().filter(|vertex| at(vertex.id, bottom)) {
@@ -2985,7 +3931,7 @@ fn stack_screw_rows(
         Some(&below) if copy > 0 => below + stride * (copy as u64 - 1),
         _ => id + stride * copy as u64,
     };
-    let is_cap = |face: &crate::FaceRecord| face.surface.control_points[0].len() != carried_columns(engine, segments);
+    let is_cap = |face: &crate::FaceRecord| face.surface.control_points[0].len() != carried_columns(axis, segments);
     let cap_level = |face: &crate::FaceRecord, level: f64| {
         face.loops.iter().flat_map(|l| &l.coedges).all(|coedge| {
             row.edges.iter().find(|edge| edge.id == coedge.edge_id).is_some_and(|edge| in_level(edge, level))
@@ -3266,6 +4212,21 @@ fn crest_level(engine: &Engine) -> Result<Option<f64>, KernelRefusal> {
         }
     }
     Ok(Some(0.5 * (lo + hi)))
+}
+
+/// The one critical level of any source strictly inside (a, b), when no
+/// other critical lies within twice the snap's reach of it (so the snap would
+/// name it and no other).
+fn lone_critical_inside(engine: &Engine, a: f64, b: f64, scale: f64) -> Option<f64> {
+    let mut inside = engine.critical.iter().flatten().map(|critical| critical.0).filter(|&level| level > a && level < b);
+    let c = inside.next()?;
+    if engine.critical.iter().flatten().any(|critical| critical.0 != c && (critical.0 - c).abs() < 2e-5 * scale) {
+        return None;
+    }
+    if inside.any(|level| level != c) {
+        return None;
+    }
+    Some(c)
 }
 
 fn find_events(
@@ -3963,12 +4924,19 @@ fn build_body(engine: &Engine, pieces: &[Piece]) -> Result<BrepSolid, KernelRefu
                     .collect::<Result<_, _>>()?;
                 lofted.push(moved);
             }
-            let mut body = loft_profile_brep(&lofted)?;
+            // Carried, every level is the section turned (its pieces disjoint,
+            // the engine's intervals), so the loft's self-intersection scan finds
+            // nothing the carry keeps (`BREP_SWEEP_SCREW_LOFT_UNSCANNED`, on unless =0).
+            let mut body = if carried && screw_loft_unscanned_on() && section_is_simple(&profile, engine.frame.ez, engine.scale) {
+                crate::loft_topology::loft_profile_brep_unscanned(&lofted)?
+            } else {
+                loft_profile_brep(&lofted)?
+            };
             if carried {
-                carry_along_screw(&mut body, engine, c, span, sections - 1)?;
+                carry_along_screw(&mut body, &ScrewAxis::of(engine), c, span, sections - 1)?;
             }
             if rows > 1 {
-                body = stack_screw_rows(&body, engine, c, span, sections - 1, rows)?;
+                body = stack_screw_rows(&body, &ScrewAxis::of(engine), c, span, sections - 1, rows)?;
             }
             Ok(body)
         }
@@ -4053,5 +5021,23 @@ fn check_ends_clear(engine: &Engine) -> Result<(), KernelRefusal> {
         }
     }
     Ok(())
+}
+
+
+
+/// `body` within `clip`'s region (its wedge between its radii and heights),
+/// for comparing two answers on what the caller keeps of them.
+fn clip_region(body: &BrepSolid, clip: &SweepClip) -> Option<BrepSolid> {
+    let ez = clip.axis_direction.normalized().ok()?;
+    let ex = clip.reference.sub(ez.scale(clip.reference.dot(ez))).normalized().ok()?;
+    let ey = ez.cross(ex);
+    let wedge = clip.angle?;
+    let ex_w = ex.scale(wedge[0].cos()).add(ey.scale(wedge[0].sin()));
+    let at = |rho: f64, z: f64| clip.axis_origin.add(ez.scale(z)).add(ex_w.scale(rho));
+    let ([r0, r1], [z0, z1]) = (clip.radius, clip.axial);
+    let corners = [at(r0, z0), at(r1, z0), at(r1, z1), at(r0, z1)];
+    let profile: Vec<NurbsCurve> = (0..4).map(|k| crate::make_line(corners[k], corners[(k + 1) % 4]).ok()).collect::<Option<_>>()?;
+    let region = crate::revolve_profile_brep(&profile, clip.axis_origin, ez, wedge[1] - wedge[0]).ok()?;
+    crate::boolean_operation(body, &region, crate::BooleanOperation::Intersect, &crate::BooleanOptions::default()).ok()
 }
 

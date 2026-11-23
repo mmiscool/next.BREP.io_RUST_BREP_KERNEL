@@ -303,7 +303,116 @@ pub fn intersect_ray_surface(
 ) -> Result<Vec<CurveSurfaceIntersection>, String> {
     let _lap = crate::projection_profile::Lap::enter(crate::projection_profile::LANE_INTERSECT_CURVE_SURFACE, surface);
     let seeds = sampled_seeds(curve, surface, tolerance)?;
-    solve_counted(curve, surface, tolerance, &seeds, true)
+    if !ray_hull_seeds_enabled() {
+        return solve_counted(curve, surface, tolerance, &seeds, true);
+    }
+    let Some(kept) = hull_seeds(curve, surface, tolerance, &seeds) else {
+        return solve_counted(curve, surface, tolerance, &seeds, true);
+    };
+    let hits = solve_counted(curve, surface, tolerance, &kept, true)?;
+    if ray_hull_seeds_check() {
+        let every = solve_counted(curve, surface, tolerance, &seeds, true)?;
+        assert!(
+            same_hits(&hits, &every, tolerance),
+            "BREP_RAY_HULL_SEEDS_CHECK: {} of {} seeds read t {:?}, every seed read t {:?}",
+            kept.len(),
+            seeds.len(),
+            hits.iter().map(|hit| hit.t).collect::<Vec<_>>(),
+            every.iter().map(|hit| hit.t).collect::<Vec<_>>()
+        );
+    }
+    Ok(hits)
+}
+
+/// `BREP_RAY_HULL_SEEDS` (default on; `=0` keeps every seed): a straight ray's Newton seeds are kept
+/// only where the ray meets the surface's Bezier hulls. Each knot-span patch is
+/// halved (de Casteljau) while the ray passes through its control box, down to
+/// boxes whose stretch of the ray is under one seed segment; a seed whose
+/// segment meets none of those stretches cannot reach a hit there, since the
+/// surface lies in the hull of each piece's controls (positive weights). A
+/// classifier's ray across a height-field slab took 32 seeds, each a Newton
+/// opened by a point projection, for about one hit.
+/// `BREP_RAY_HULL_SEEDS_CHECK=1` turns it on and also solves from every seed,
+/// stopping where the hits differ.
+fn ray_hull_seeds_enabled() -> bool {
+    ray_hull_seeds_check() || switch!("BREP_RAY_HULL_SEEDS", true)
+}
+
+fn ray_hull_seeds_check() -> bool {
+    switch!("BREP_RAY_HULL_SEEDS_CHECK", false)
+}
+
+/// The seeds of [`intersect_ray_surface`] whose segment meets the stretch of a
+/// straight `curve` inside a hull piece of `surface` ([`ray_hull_seeds_enabled`]);
+/// `None` when the curve is not a straight segment or the patches cannot be
+/// read, and every seed stays.
+fn hull_seeds(curve: &NurbsCurve, surface: &NurbsSurface, tolerance: f64, seeds: &[f64]) -> Option<Vec<f64>> {
+    if seeds.is_empty() || curve.degree != 1 || curve.control_points.len() != 2 {
+        return None;
+    }
+    let [t0, t1] = curve.domain().ok()?;
+    let (start, end) = (curve.control_points[0].point().ok()?, curve.control_points[1].point().ok()?);
+    let (spans_u, spans_v) = crate::curve_clear::patch_span_counts(surface)?;
+    // The seed segments of `sampled_seeds`, in the ray's own parameter s in [0, 1].
+    let sample_count = 32usize.max((interior_knot_count(&curve.knots, curve.degree) + 1) * (curve.degree + 1) * 4);
+    let step = 1.0 / sample_count as f64;
+    let pad = tolerance * 10.0;
+    let direction = end.sub(start);
+    // The ray's stretch [s0, s1] inside a box padded by `pad` (slab clipping).
+    let stretch = |lo: [f64; 3], hi: [f64; 3]| -> Option<[f64; 2]> {
+        let (mut s0, mut s1) = (0.0f64, 1.0f64);
+        for (k, (origin, delta)) in [(start.x, direction.x), (start.y, direction.y), (start.z, direction.z)].into_iter().enumerate() {
+            let (low, high) = (lo[k] - pad, hi[k] + pad);
+            if delta.abs() <= f64::MIN_POSITIVE {
+                if origin < low || origin > high {
+                    return None;
+                }
+                continue;
+            }
+            let (a, b) = ((low - origin) / delta, (high - origin) / delta);
+            s0 = s0.max(a.min(b));
+            s1 = s1.min(a.max(b));
+            if s0 > s1 {
+                return None;
+            }
+        }
+        Some([s0, s1])
+    };
+    let mut stretches: Vec<[f64; 2]> = Vec::new();
+    let mut pending: Vec<(usize, usize, [f64; 2], [f64; 2], u32)> =
+        (0..spans_u).flat_map(|i| (0..spans_v).map(move |j| (i, j, [0.0, 1.0], [0.0, 1.0], 0))).collect();
+    // A ray running along the surface keeps meeting pieces: past this many the
+    // seeds all stay.
+    let mut visits = 0usize;
+    while let Some((i, j, range_u, range_v, depth)) = pending.pop() {
+        visits += 1;
+        if visits > 4096 {
+            return None;
+        }
+        let (lo, hi) = crate::curve_clear::patch_piece_box(surface, i, j, range_u, range_v)?;
+        let Some(along) = stretch(lo, hi) else {
+            continue;
+        };
+        if along[1] - along[0] <= step || depth >= 12 {
+            stretches.push(along);
+            continue;
+        }
+        let (mu, mv) = (0.5 * (range_u[0] + range_u[1]), 0.5 * (range_v[0] + range_v[1]));
+        for (u, v) in [([range_u[0], mu], [range_v[0], mv]), ([mu, range_u[1]], [range_v[0], mv]), ([range_u[0], mu], [mv, range_v[1]]), ([mu, range_u[1]], [mv, range_v[1]])] {
+            pending.push((i, j, u, v, depth + 1));
+        }
+    }
+    let span = t1 - t0;
+    Some(
+        seeds
+            .iter()
+            .copied()
+            .filter(|&seed| {
+                let s = (seed - t0) / span;
+                stretches.iter().any(|&[a, b]| s + step >= a && s - step <= b)
+            })
+            .collect(),
+    )
 }
 
 fn solve_counted(

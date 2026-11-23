@@ -283,6 +283,262 @@ pub fn fillet_edges_conic(
     Ok(result)
 }
 
+/// A conic-section blend of each edge (resolved by a point on it) with its
+/// two contacts set apart: `along_reference` from the edge on the edge's face
+/// nearest `reference` (a point on or by that face), `along_other` on its other
+/// face. The section is the rational quadratic of [`fillet_edge_conic`]
+/// through those contacts, its middle pole the edge's point, weights
+/// `1, rho / (1 − rho), 1`; between faces at a right angle `rho = √2 − 1` makes
+/// it the quarter ellipse of semi-axes `along_reference` and `along_other`
+/// (an unequal round). Built on the edges `fillet_edge_conic` builds on: a
+/// straight edge between planes, and a circular edge between straight-sided
+/// surfaces about its axis. The edges are blended one after another.
+#[allow(clippy::too_many_arguments)]
+pub fn fillet_edges_conic_distances(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    reference: Vec3,
+    along_reference: f64,
+    along_other: f64,
+    rho: f64,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let _operation = crate::blend::BlendOperation::enter();
+    const ENTRY: &str = "fillet_edges_conic_distances";
+    if edge_points.is_empty() {
+        return Err(KernelRefusal::input(KernelStage::Collect, "conic_selection", format!("{ENTRY}: no edges selected")));
+    }
+    if ![along_reference, along_other].iter().all(|d| d.is_finite() && *d > 0.0) {
+        return Err(KernelRefusal::input(KernelStage::Collect, "conic_distances", format!("{ENTRY}: both distances must be positive")));
+    }
+    if !(rho > 0.0 && rho < 1.0) {
+        return Err(KernelRefusal::input(KernelStage::Collect, "conic_rho", format!("{ENTRY}: rho must lie strictly between 0 and 1")));
+    }
+    let mut result = solid.clone();
+    for (index, point) in edge_points.iter().enumerate() {
+        let edge_id = resolve_edge_by_point(&result, *point)?;
+        // The edge's faces in the order `analyze_edge` reads them: the first
+        // distance goes on the face nearest the reference point, read on the
+        // FACE (a foot outside its trims counts only after every foot inside
+        // one), not on its carrier.
+        let reference_first = {
+            let (_, faces) = super::analyze::edge_and_faces(&result, edge_id)?;
+            if faces.len() != 2 {
+                return Err(KernelRefusal::input(KernelStage::Collect, "edge_faces", format!("{ENTRY}: edge {edge_id} borders {} faces (expected 2)", faces.len())));
+            }
+            let rank = |face: &crate::FaceRecord| -> (bool, f64) {
+                let Ok(foot) = crate::project_point_to_surface(&face.surface, reference) else { return (true, f64::INFINITY) };
+                let inside = crate::parameter_point_in_face(face, crate::Vec2 { x: foot.u, y: foot.v }, 1e-9)
+                    .map(|class| class != crate::classification::PolygonClass::Outside)
+                    .unwrap_or(false);
+                (!inside, foot.distance)
+            };
+            let (a, b) = (rank(faces[0]), rank(faces[1]));
+            a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1)
+        };
+        let (d1, d2) = if reference_first { (along_reference, along_other) } else { (along_other, along_reference) };
+        // Each contact must land on its own face (as an unequal chamfer's).
+        super::chamfer_extent::check_chamfer_extent(&result, edge_id, [d1, d2], ENTRY)?;
+        let cross = analyze_edge(&result, edge_id, d1.min(d2)).map_err(|refusal| {
+            KernelRefusal::unsupported(
+                KernelStage::Classify,
+                "conic_edge",
+                format!(
+                    "{ENTRY}: a conic blend is built only on a straight edge between planes or a circular edge \
+                     between straight-sided surfaces about its axis ({})",
+                    refusal.message
+                ),
+            )
+        })?;
+        if matches!(cross.path, EdgePath::Circular { .. }) && !chamfer_asym_curved_on() {
+            return Err(KernelRefusal::unsupported(KernelStage::Classify, "conic_edge", format!("{ENTRY}: circular edges are switched off (BREP_CHAMFER_ASYM_CURVED=0)")));
+        }
+        // Curved faces too: each contact on its own face, inside its trims
+        // (a straight-sided carrier holds the contact exactly; a face that
+        // ends short of it does not).
+        {
+            let (_, faces) = super::analyze::edge_and_faces(&result, edge_id)?;
+            for (face, (into, distance)) in faces.iter().zip([(cross.into_first, d1), (cross.into_second, d2)]) {
+                let contact = cross.start.add(into.scale(distance));
+                let on = crate::project_point_to_surface(&face.surface, contact).ok().filter(|foot| foot.distance <= 1e-7 * (1.0 + distance)).is_some_and(|foot| {
+                    crate::parameter_point_in_face(face, crate::Vec2 { x: foot.u, y: foot.v }, 1e-9).is_ok_and(|class| class != crate::classification::PolygonClass::Outside)
+                });
+                if !on {
+                    return Err(KernelRefusal::input(
+                        KernelStage::Classify,
+                        "support_extent",
+                        format!("{ENTRY}: the contact {distance} from edge {edge_id} runs off face {}", face.id),
+                    ));
+                }
+            }
+        }
+        let profile = super::tool::conic_cross_section_distances(&cross, d1, d2, rho)?;
+        result = apply_chamfer_offsets_profile(&result, &cross, &profile, per_edge_name(edge_names, name, index), edge_id)?;
+        refuse_invalid_result(&result, ENTRY)?;
+    }
+    Ok(result)
+}
+
+/// A curvature-continuous (order 2) fillet of a straight edge between two
+/// planes: its section meets each face where a ball of `offset` would (`offset`
+/// is the tangent offset), as flat as the face there (contact of order 2), and
+/// bends with radius `center` at its middle (where `center` is not positive, the
+/// thumbweight that takes off what the ball's round does). The section is the
+/// order-2 Gⁿ blend of E. Hartmann (2001), exactly, as a rational quintic.
+pub fn fillet_edge_g2(solid: &BrepSolid, edge_id: u64, offset: f64, center: f64, name: Option<&str>) -> Result<BrepSolid, KernelRefusal> {
+    let _operation = crate::blend::BlendOperation::enter();
+    if !(offset > 0.0) || !offset.is_finite() || !center.is_finite() {
+        return Err(KernelRefusal::input(KernelStage::Collect, "g2_size", "fillet_edge_g2: the offset must be positive and the centre radius finite"));
+    }
+    let cross = analyze_edge(solid, edge_id, offset).map_err(|refusal| {
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "g2_edge",
+            format!("fillet_edge_g2: a curvature-continuous blend is built only on a straight edge between planes ({})", refusal.message),
+        )
+    })?;
+    if !matches!(cross.path, EdgePath::Straight { .. }) {
+        return Err(KernelRefusal::unsupported(KernelStage::Classify, "g2_edge", "fillet_edge_g2: a curvature-continuous blend is built only on a straight edge between planes"));
+    }
+    let profile = super::tool::g2_cross_section(&cross, offset, center)?;
+    // A prism's side edge, built on the solid directly (`BREP_FILLET_G2_DIRECT`,
+    // default on; `=0` cuts it as before): the cutter's boolean does not take a
+    // section in contact of order 2 with its faces.
+    if g2_direct_on() {
+        if let Some(result) = super::g2_prism::blend_prism_edge(solid, edge_id, &cross, &profile[1], name) {
+            // Nothing else of the solid in the blend's way (the cutter's guard).
+            if check_blend_interference(solid, &result, &[edge_id], "fillet_edge_g2").is_ok() {
+                refuse_invalid_result(&result, "fillet_edge_g2")?;
+                return Ok(result);
+            }
+        }
+    }
+    let result = apply_chamfer_offsets_profile(solid, &cross, &profile, name, edge_id)?;
+    refuse_invalid_result(&result, "fillet_edge_g2")?;
+    Ok(result)
+}
+
+/// The direct build of a prism side edge's order-2 blend (default on).
+fn g2_direct_on() -> bool {
+    switch!("BREP_FILLET_G2_DIRECT", true)
+}
+
+/// [`fillet_edge_g2`] for the edges the points lie on, one after another.
+pub fn fillet_edges_g2(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    offset: f64,
+    center: f64,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let _operation = crate::blend::BlendOperation::enter();
+    if edge_points.is_empty() {
+        return Err(KernelRefusal::input(KernelStage::Collect, "g2_selection", "fillet_edges_g2: no edges selected"));
+    }
+    let mut result = solid.clone();
+    for (index, point) in edge_points.iter().enumerate() {
+        let edge_id = resolve_edge_by_point(&result, *point)?;
+        result = fillet_edge_g2(&result, edge_id, offset, center, per_edge_name(edge_names, name, index))?;
+    }
+    Ok(result)
+}
+
+/// [`fillet_edges`] of `radius` whose fillets stop `setback` short of the
+/// corner where three of the selected edges meet (measured along each edge),
+/// the corner closed by one smooth patch meeting the three fillets and the
+/// three faces there (see `blend::setback_corner`). The three edges must meet
+/// at one vertex.
+pub fn fillet_edges_setback(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    setback: f64,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let _operation = crate::blend::BlendOperation::enter();
+    if !(setback.is_finite() && setback > 0.0) {
+        return Err(KernelRefusal::input(KernelStage::Collect, "setback_size", "fillet_edges_setback: the setback must be positive"));
+    }
+    if edge_points.len() != 3 {
+        return Err(KernelRefusal::unsupported(KernelStage::Collect, "setback_selection", "fillet_edges_setback: three edges meeting at one corner are set back"));
+    }
+    let mut corner: Option<u64> = None;
+    let mut counts: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for point in edge_points {
+        let id = resolve_edge_by_point(solid, *point)?;
+        let edge = solid.edges.iter().find(|e| e.id == id).ok_or_else(|| KernelRefusal::input(KernelStage::Collect, "setback_edge", "fillet_edges_setback: an edge is missing"))?;
+        for v in [edge.start_vertex_id, edge.end_vertex_id] {
+            *counts.entry(v).or_insert(0) += 1;
+        }
+    }
+    for (v, count) in counts {
+        if count == 3 {
+            corner = Some(v);
+        }
+    }
+    let corner = corner.ok_or_else(|| KernelRefusal::unsupported(KernelStage::Collect, "setback_selection", "fillet_edges_setback: the three edges do not meet at one vertex"))?;
+    let point = solid.vertices.iter().find(|v| v.id == corner).map(|v| v.point).ok_or_else(|| KernelRefusal::input(KernelStage::Collect, "setback_vertex", "fillet_edges_setback: the corner vertex is missing"))?;
+    let rounded = fillet_edges(solid, edge_points, edge_names, radius, false, name)?;
+    let result = crate::blend::setback_corner::set_back_corner(&rounded, point, radius, setback, name)?;
+    refuse_invalid_result(&result, "fillet_edges_setback")?;
+    Ok(result)
+}
+
+/// The conic blend's radius that sets its contacts `setback` from the edge
+/// along both faces: [`fillet_edge_conic`]'s contacts stand `radius / tan(θ/2)`
+/// from the corner, θ the angle between the faces' section lines, so the radius
+/// is `setback · tan(θ/2)`.
+fn conic_radius_for_setback(solid: &BrepSolid, edge_id: u64, setback: f64) -> Result<f64, KernelRefusal> {
+    let cross = analyze_edge(solid, edge_id, setback).map_err(|refusal| {
+        KernelRefusal::unsupported(
+            KernelStage::Classify,
+            "conic_edge",
+            format!("fillet_edges_conic_setback: the edge's section could not be read ({})", refusal.message),
+        )
+    })?;
+    let theta = cross.into_first.dot(cross.into_second).clamp(-1.0, 1.0).acos();
+    if theta <= 1e-6 || theta >= std::f64::consts::PI - 1e-6 {
+        return Err(KernelRefusal::input(
+            KernelStage::Classify,
+            "conic_dihedral_degenerate",
+            "fillet_edges_conic_setback: the faces meet too nearly flat or too nearly folded",
+        ));
+    }
+    Ok(setback * (theta * 0.5).tan())
+}
+
+/// [`fillet_edges_conic`] sized by setback: each edge the points lie on is
+/// rounded by a conic blend meeting both faces `setback` from the edge, its
+/// shoulder `rho` of the way from the contacts' chord to the edge. The edges
+/// are blended one after another and independently, as
+/// [`fillet_edges_conic`] blends them, and on the same edges.
+pub fn fillet_edges_conic_setback(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    setback: f64,
+    rho: f64,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let _operation = crate::blend::BlendOperation::enter();
+    if !(setback > 0.0) || !setback.is_finite() {
+        return Err(KernelRefusal::input(KernelStage::Collect, "conic_setback", "fillet_edges_conic_setback: the setback must be positive"));
+    }
+    if edge_points.is_empty() {
+        return Err(KernelRefusal::input(KernelStage::Collect, "conic_selection", "fillet_edges_conic_setback: no edges selected"));
+    }
+    let mut result = solid.clone();
+    for (index, point) in edge_points.iter().enumerate() {
+        let edge_id = resolve_edge_by_point(&result, *point)?;
+        let radius = conic_radius_for_setback(&result, edge_id, setback)?;
+        result = fillet_edge_conic(&result, edge_id, radius, rho, per_edge_name(edge_names, name, index))?;
+    }
+    Ok(result)
+}
+
 /// The ids of the edge's two faces in `analyze_edge`'s order (face 1 first):
 /// the faces the setbacks `d1` and `d2` are measured on.
 fn setback_faces(solid: &BrepSolid, edge_id: u64) -> Result<[u64; 2], KernelRefusal> {
@@ -438,7 +694,7 @@ pub(super) fn heal_edge_vertex_gaps(
 /// refused by name, never returned.
 ///
 /// Warnings do not refuse; only the issues `validate()` itself calls errors.
-fn refuse_invalid_result(result: &BrepSolid, entry: &str) -> Result<(), KernelRefusal> {
+pub(super) fn refuse_invalid_result(result: &BrepSolid, entry: &str) -> Result<(), KernelRefusal> {
     let errors: Vec<_> = result.validate_memoised().into_iter().filter(|issue| issue.severity == "error").collect();
     let Some(first) = errors.first() else {
         return Ok(());
@@ -559,7 +815,52 @@ pub fn fillet_edges(
     // mate split along a smooth meridian so the network's miter closes the
     // crease — and the walls are merged back afterwards
     // (`blend/creased_rim.rs`). Every other selection takes the body as it
-    // came.
+    // came. One straight edge of a convex polyhedron chamfered: one plane clip
+    // (`planar_clip.rs`, `BREP_CHAMFER_PLANAR_CLIP`).
+    if chamfer && edge_points.len() == 1 && edge_names.is_none() {
+        let mode = super::planar_clip::planar_clip_mode();
+        if mode != crate::env_read::Mode::Off {
+            let clipped = super::planar_clip::chamfer_by_plane_clip(solid, edge_points[0], radius, name);
+            if mode == crate::env_read::Mode::On {
+                if let Some(clipped) = clipped {
+                    return Ok(clipped);
+                }
+            } else {
+                let composed = fillet_edges_composed(solid, edge_points, edge_names, radius, chamfer, name);
+                if let (Some(clipped), Ok(composed)) = (&clipped, &composed) {
+                    let measure = |body: &BrepSolid| crate::solid_mass_properties(body).ok().map(|m| (m.volume, m.surface_area));
+                    // Names, not ids: the composition's ids are its booleans' numbering.
+                    let faces = |body: &BrepSolid| {
+                        let mut faces: Vec<Option<String>> = body.shells.iter().flat_map(|s| &s.faces).map(|f| f.name.clone()).collect();
+                        faces.sort();
+                        faces
+                    };
+                    let agrees = match (measure(clipped), measure(composed)) {
+                        (Some((v1, a1)), Some((v2, a2))) => (v1 - v2).abs() <= 1e-9 * v2.abs() && (a1 - a2).abs() <= 1e-9 * a2.abs(),
+                        _ => false,
+                    };
+                    if !agrees || faces(clipped) != faces(composed) {
+                        eprintln!("chamfer.planar_clip DISAGREES: {:?} {:?} vs {:?} {:?}", measure(clipped), faces(clipped), measure(composed), faces(composed));
+                    }
+                } else if clipped.is_some() {
+                    eprintln!("chamfer.planar_clip DISAGREES: the clip built a body the composition refused");
+                }
+                return composed;
+            }
+        }
+    }
+    fillet_edges_composed(solid, edge_points, edge_names, radius, chamfer, name)
+}
+
+/// [`fillet_edges`] past the plane-clip lane.
+fn fillet_edges_composed(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
     let prepared = crate::blend::creased_rim::split_creased_rims(solid, edge_points, edge_names, &resolve_edge_by_point)?;
     match prepared {
         Some(prepared) => {
@@ -2013,7 +2314,7 @@ fn planar_trims_clear_of(
 /// caller supplied the parallel `edge_names` (feature path — each wall named
 /// after its originating edge, `{fid}:BLEND:{edge}`), else the single base
 /// `name` for every wall (the legacy/test path, byte-identical to before).
-fn per_edge_name<'a>(
+pub(super) fn per_edge_name<'a>(
     edge_names: Option<&'a [String]>,
     base: Option<&'a str>,
     i: usize,
@@ -3680,6 +3981,8 @@ fn fillet_edges_group_lanes(
     //     above), so that was every hole rim chamfered as part of a face
     //     selection.  Try it here too, under the same acceptance the network
     //     result gets, and under the same `BREP_NO_NETWORK` A/B.
+    // Refusals remembered for the rest of this group's lanes.
+    let _closed_refusals = crate::blend::ClosedRefusalScope::enter();
     if std::env::var("BREP_NO_NETWORK").is_err() {
         if selected_edge_ids.len() == 1 {
             let edge_id = selected_edge_ids[0];
@@ -3731,6 +4034,10 @@ fn fillet_edges_group_lanes(
                         if std::env::var("BREP_DEBUG_NETWORK").is_ok() {
                             eprintln!("closed-rim refused: {refusal}");
                         }
+                        // The composition below asks the ladder the same
+                        // question of a clone of this body; it reads this
+                        // answer instead of marching the rim again.
+                        crate::blend::remember_closed_refusal(solid, edge_id, radius, chamfer, rim_name, &refusal);
                     }
                 }
             }
@@ -5379,6 +5686,12 @@ fn resolve_selected_chain(
     Ok(links)
 }
 
+/// `BREP_LAW_STOPS_THIRDS`: on by default; `=0` checks a law's stops at
+/// each interval's middle only.
+fn law_thirds_checked() -> bool {
+    crate::switch!("BREP_LAW_STOPS_THIRDS", true)
+}
+
 /// Sample the law into one edge's `(parameter fraction, radius)` stop list —
 /// the caller-side bridge from chain abscissa into the `radius_at` closure
 /// seam that `blend_edge_variable` builds over its stops.
@@ -5437,8 +5750,15 @@ fn law_stops_for_link(
             refined.push(pair[0]);
             let mid_fraction = 0.5 * (pair[0].0 + pair[1].0);
             let law_mid = radius_at_fraction(mid_fraction);
-            let linear_mid = 0.5 * (pair[0].1 + pair[1].1);
-            if (law_mid - linear_mid).abs() > tol {
+            // The law against the chord at the thirds too: a midpoint alone
+            // can sit on the law where the map is symmetric about it (a
+            // half circle of two rational quarters is so at every dyadic
+            // fraction of its parameter), the thirds off it.
+            let off = |w: f64| {
+                let fraction = pair[0].0 + w * (pair[1].0 - pair[0].0);
+                (radius_at_fraction(fraction) - (pair[0].1 + w * (pair[1].1 - pair[0].1))).abs() > tol
+            };
+            if off(0.5) || (law_thirds_checked() && (off(1.0 / 3.0) || off(2.0 / 3.0))) {
                 refined.push((mid_fraction, law_mid));
                 inserted = true;
             }
@@ -5483,9 +5803,13 @@ pub fn fillet_edges_variable_law(
             format!("{ENTRY}: no edges selected"),
         ));
     }
+    // A linear law that runs to nought at one end of one straight edge: the cone cutter.
+    if let Some(built) = super::vanishing::vanishing_round(solid, edge_points, edge_names, law, chamfer, name, ENTRY) {
+        return built;
+    }
     let tolerances = crate::KernelTolerances::for_solid(solid, 1e-7);
     let chain = resolve_selected_chain(solid, edge_points, ENTRY, tolerances.intersection_fit)?;
-    fillet_variable_law_on_chain(
+    let built = fillet_variable_law_on_chain(
         solid,
         edge_points,
         edge_names,
@@ -5495,7 +5819,69 @@ pub fn fillet_edges_variable_law(
         name,
         ENTRY,
         tolerances.intersection_fit,
-    )
+    );
+    // A law too large for the faces it must lie on is an input error, not a
+    // limit of the build: where the build refuses as unsupported and a round
+    // of the law's largest radius does not fit the faces, that is the
+    // refusal (the class a constant fillet too large for its faces takes).
+    match built {
+        // One edge: the law read station by station, laid either way along
+        // it (which end the law starts at is the chain's choice); too large
+        // only when it overruns its faces both ways.
+        Err(refusal) if edge_points.len() == 1 && matches!(refusal.class, crate::RefusalClass::UnsupportedGeometry { .. }) => {
+            let Ok(edge_id) = resolve_edge_by_point(solid, edge_points[0]) else { return Err(refusal) };
+            let forward = super::chamfer_extent::check_ball_extent(solid, edge_id, &|f| law.radius_at_fraction(f), ENTRY);
+            let backward = super::chamfer_extent::check_ball_extent(solid, edge_id, &|f| law.radius_at_fraction(1.0 - f), ENTRY);
+            match (forward, backward) {
+                (Err(too_large), Err(_)) => Err(too_large),
+                _ => Err(refusal),
+            }
+        }
+        other => other,
+    }
+}
+
+/// Fillets (or, with `chamfer`, symmetric chamfers) of a GROUP of edges in
+/// one operation, each selected edge (resolved by a point on it) at its own
+/// constant size `sizes[i]`: the variable group core with a constant stop list
+/// per edge, so edges of unequal sizes meeting at a vertex are blended
+/// together there rather than one after another: unequal fillets at a
+/// vertex close on the stripe network's ribbon fill, chamfers meet in their
+/// planes.
+pub fn fillet_edges_radii(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    sizes: &[f64],
+    chamfer: bool,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let _operation = crate::blend::BlendOperation::enter();
+    const ENTRY: &str = "fillet_edges_radii";
+    if edge_points.is_empty() {
+        return Err(KernelRefusal::input(KernelStage::Collect, "radii_selection", format!("{ENTRY}: no edges selected")));
+    }
+    if sizes.len() != edge_points.len() {
+        return Err(KernelRefusal::input(
+            KernelStage::Collect,
+            "radii_count",
+            format!("{ENTRY}: {} sizes for {} edges (one size an edge)", sizes.len(), edge_points.len()),
+        ));
+    }
+    if let Some(bad) = sizes.iter().find(|r| !(r.is_finite() && **r > 0.0)) {
+        return Err(KernelRefusal::input(KernelStage::Collect, "radii_value", format!("{ENTRY}: a size must be positive and finite, not {bad}")));
+    }
+    // A chamfer's setbacks within their faces (`fillet/chamfer_extent.rs`):
+    // a symmetric chamfer of `size` sets back `size · cot(φ/2)` on each face,
+    // as the builder lays it.
+    if chamfer && super::chamfer_extent::chamfer_extent_on() {
+        for (point, &d) in edge_points.iter().zip(sizes) {
+            let edge_id = resolve_edge_by_point(solid, *point)?;
+            super::chamfer_extent::check_ball_extent(solid, edge_id, &|_| d, ENTRY)?;
+        }
+    }
+    let per_edge_stops: Vec<Vec<(f64, f64)>> = sizes.iter().map(|&r| vec![(0.0, r), (1.0, r)]).collect();
+    fillet_edges_variable_impl(solid, edge_points, edge_names, &per_edge_stops, chamfer, name, ENTRY, true)
 }
 
 /// The natural per-vertex user model: radius `vertex_radii[i]` at chain
@@ -5594,6 +5980,12 @@ pub fn chamfer_edges_asymmetric(
             "asymmetric_selection",
             "chamfer_edges_asymmetric: no edges selected",
         ));
+    }
+    // Every setback within its faces, read on the input body (two chamfers
+    // sharing a face may push each other's contacts off its remainder).
+    for point in edge_points {
+        let edge_id = resolve_edge_by_point(solid, *point)?;
+        super::chamfer_extent::check_chamfer_extent(solid, edge_id, [d1, d2], "chamfer_edges_asymmetric")?;
     }
     let mut result = solid.clone();
     let mut done = vec![false; edge_points.len()];

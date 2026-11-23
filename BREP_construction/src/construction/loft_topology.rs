@@ -13,6 +13,7 @@ mod guided;
 mod closed;
 
 pub use basic::{loft_profile_brep, loft_profile_brep_broken, loft_profile_brep_tangent};
+pub(crate) use basic::loft_profile_brep_unscanned;
 #[path = "loft_topology/broken.rs"]
 mod broken;
 pub use broken::interpolate_column_broken;

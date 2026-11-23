@@ -52,6 +52,11 @@ fn number(ctx: &FeatureContext, key: &str) -> Result<f64, String> {
                 "GEAR.BEVEL" => bevel::schema(),
                 "GEAR.ELLIPTICAL" => elliptical::schema(),
                 "GEAR.WORM_WHEEL" => worm_wheel::schema(),
+                "GEAR.CROWN" => crown::schema(),
+                "GEAR.LANTERN" => lantern::schema(),
+                "GEAR.STAR" => star::schema(),
+                "GEAR.BEVELOID" => beveloid::schema(),
+                "GEAR.LOBED" => lobed::schema(),
                 _ => spur::schema(),
             };
             let default = schema["inputParamsSchema"][key]["default_value"].as_f64();
@@ -259,12 +264,25 @@ pub mod spur {
 
     fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         let gear = spur_params(ctx)?;
-        let (solid, suffixes, data) = spur_solid(&gear).map_err(|refusal| refusal.to_string())?;
+        let sector = number(ctx, "sectorTeeth")?;
+        let (solid, suffixes, data) = if sector == 0.0 {
+            spur_solid(&gear).map_err(|refusal| refusal.to_string())?
+        } else {
+            if sector.fract() != 0.0 || sector < 0.0 {
+                return Err(format!("The sector's teeth must be a whole number (it is {sector})."));
+            }
+            let locking = ctx.param("lockingArc").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            crate::gears::spur_sector_solid(&gear, sector as usize, locking).map_err(|refusal| refusal.to_string())?
+        };
         finish(ctx, solid, &suffixes, &data)
     }
 
     pub fn hidden_params(values: &serde_json::Value) -> Vec<&'static str> {
-        super::pitch_hidden(values)
+        let mut hidden = super::pitch_hidden(values);
+        if values.get("sectorTeeth").and_then(serde_json::Value::as_f64).unwrap_or(0.0) == 0.0 {
+            hidden.push("lockingArc");
+        }
+        hidden
     }
 
     pub fn schema() -> serde_json::Value {
@@ -276,6 +294,10 @@ pub mod spur {
         for (key, value) in fields {
             ordered.insert(key, value);
         }
+        ordered.insert("sectorTeeth".into(), serde_json::json!({"type": "number", "label": "Sector teeth", "default_value": 0, "minimum": 0,
+            "hint": "An intermittent (mutilated) gear: keep only this many teeth, from tooth 0 on; the rest of the rim is the root circle, or a locking arc. 0 keeps every tooth."}));
+        ordered.insert("lockingArc".into(), serde_json::json!({"type": "boolean", "label": "Locking arc", "default_value": false,
+            "hint": "With a sector: past a root land after the last tooth and before the first, the rim rises to an arc on the tip circle that locks the driven gear between steps."}));
         ordered.insert("phase".into(), super::phase_field());
         ordered.insert("boolean".into(), common::optional_boolean_schema());
         serde_json::json!({
@@ -905,34 +927,18 @@ pub mod timing_pulley {
         let flanges = ctx.string("flanges").unwrap_or_else(|| "NONE".into());
         let mut suffixes = suffixes;
         if flanges != "NONE" {
-            // Name the pulley's faces now; the union keeps them, and the flanges get theirs.
-            for (face, suffix) in solid.shells[0].faces.iter_mut().zip(&suffixes) {
-                face.name = Some(suffix.clone());
+            if !matches!(flanges.as_str(), "ONE" | "BOTH") {
+                return Err(format!("unknown flange option `{flanges}`"));
             }
             let height = number(ctx, "flangeHeight")?;
             let thickness = number(ctx, "flangeThickness")?;
             if !(height > 0.0 && thickness > 0.0) {
                 return Err("The flange height and thickness must be greater than zero.".into());
             }
+            // Built directly with its flanges (named FL1_*, FL2_*), not as a union.
+            let section = crate::gears::timing_pulley_section(&pulley).map_err(|r| r.to_string())?;
             let radius = data.tip_diameter / 2.0 + height;
-            let disc = |z0: f64, name: &str| -> Result<crate::BrepSolid, String> {
-                let mut d = crate::make_cylinder_brep(Vec3::new(0.0, 0.0, z0), Vec3::new(0.0, 0.0, 1.0), radius, thickness)?;
-                for (face, suffix) in d.shells[0].faces.iter_mut().zip(["OD", "F", "B"]) {
-                    face.name = Some(format!("{name}{suffix}"));
-                }
-                Ok(d)
-            };
-            let mut parts = vec![solid];
-            if flanges == "ONE" || flanges == "BOTH" {
-                parts.push(disc(-thickness, "FL1_")?);
-            }
-            if flanges == "BOTH" {
-                parts.push(disc(width, "FL2_")?);
-            }
-            if !matches!(flanges.as_str(), "ONE" | "BOTH") {
-                return Err(format!("unknown flange option `{flanges}`"));
-            }
-            solid = crate::boolean_operation_nary(&parts, crate::BooleanOperation::Union).map_err(|r| r.to_string())?;
+            solid = crate::gears::flanged_prism(&section, width, radius, thickness, flanges == "BOTH").map_err(|r| r.to_string())?;
             suffixes = Vec::new();
         }
         let phase = number(ctx, "phase")?;
@@ -1622,6 +1628,333 @@ pub mod worm_wheel {
         serde_json::json!({
             "type": "GEAR.WORM_WHEEL", "shortName": "GEAR.WORM_WHEEL", "longName": "Worm wheel",
             "ribbonPath": "Gears/Worm/Worm wheel", "commandSize": "Large", "displayBuilder": false,
+            "inputParamsSchema": serde_json::Value::Object(ordered),
+        })
+    }
+}
+
+/// `GEAR.CROWN` — crown (face) gear for a spur pinion at 90°, cut by a shaper with a few teeth more.
+pub mod crown {
+    use super::*;
+    use crate::gears::{crown_sizes, crown_solid, CrownGear};
+
+    pub fn execute(ctx: &FeatureContext) -> FeatureResult {
+        build(ctx).unwrap_or_else(|error| ctx.fail(error))
+    }
+
+    fn whole(ctx: &FeatureContext, key: &str, what: &str, range: std::ops::RangeInclusive<f64>) -> Result<usize, String> {
+        let value = number(ctx, key)?;
+        if value.fract() != 0.0 || !range.contains(&value) {
+            return Err(format!("{what} must be a whole number from {} to {} (it is {value}).", range.start(), range.end()));
+        }
+        Ok(value as usize)
+    }
+
+    fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+        let gear = CrownGear {
+            module: number(ctx, "module")?,
+            teeth: whole(ctx, "teeth", "The crown's tooth count", 20.0..=600.0)?,
+            pinion_teeth: whole(ctx, "pinionTeeth", "The pinion's tooth count", 10.0..=100.0)?,
+            shaper_extra: whole(ctx, "shaperExtra", "The shaper's extra teeth", 1.0..=3.0)?,
+            pressure_angle: number(ctx, "pressureAngle")?.to_radians(),
+            addendum: number(ctx, "addendum")?,
+            dedendum: number(ctx, "dedendum")?,
+            inner_radius: number(ctx, "innerRadius")?,
+            outer_radius: number(ctx, "outerRadius")?,
+            rim: number(ctx, "rim")?,
+        };
+        let (solid, data) = crown_solid(&gear).map_err(|r| r.to_string())?;
+        let [_, inner, outer, pitch, tip, pinion_axis] = crown_sizes(&gear).map_err(|r| r.to_string())?;
+        let mut result = finish(ctx, solid, &[], &data)?;
+        if let Some(persistent) = result.persistent_data.as_mut() {
+            let record = &mut persistent["gearData"];
+            record["innerRadius"] = serde_json::json!(inner);
+            record["outerRadius"] = serde_json::json!(outer);
+            record["pitchPlaneHeight"] = serde_json::json!(pitch);
+            record["tipHeight"] = serde_json::json!(tip);
+            record["pinionAxisHeight"] = serde_json::json!(pinion_axis);
+            record["pinionPitchDiameter"] = serde_json::json!(gear.module * gear.pinion_teeth as f64);
+        }
+        Ok(result)
+    }
+
+    pub fn schema() -> serde_json::Value {
+        let mut ordered = serde_json::Map::new();
+        ordered.insert("id".into(), serde_json::json!({"type": "string", "default_value": null, "hint": "Unique identifier for the feature"}));
+        ordered.insert("placement".into(), super::placement_field());
+        ordered.insert("module".into(), serde_json::json!({"type": "number", "label": "Module", "default_value": 2, "exclusiveMinimum": 0,
+            "hint": "The pinion's module (the crown's pitch diameter / teeth), in model units."}));
+        ordered.insert("teeth".into(), serde_json::json!({"type": "number", "label": "Teeth", "default_value": 60, "minimum": 20,
+            "hint": "Crown teeth, from twice the shaper's teeth to 600."}));
+        ordered.insert("pinionTeeth".into(), serde_json::json!({"type": "number", "label": "Pinion teeth", "default_value": 18, "minimum": 10,
+            "hint": "Teeth of the mating spur pinion (10 to 100)."}));
+        ordered.insert("shaperExtra".into(), serde_json::json!({"type": "number", "label": "Shaper extra teeth", "default_value": 2, "minimum": 1,
+            "hint": "The shaper that cuts the crown has this many teeth more than the pinion (1 to 3), so the pinion touches at a point clear of the tooth ends."}));
+        ordered.insert("pressureAngle".into(), serde_json::json!({"type": "number", "label": "Pressure angle", "default_value": 20,
+            "hint": "The pinion's pressure angle, 14.5° to 30°."}));
+        ordered.insert("addendum".into(), serde_json::json!({"type": "number", "label": "Addendum", "default_value": 1, "exclusiveMinimum": 0,
+            "hint": "× module: the tips above the pitch plane."}));
+        ordered.insert("dedendum".into(), serde_json::json!({"type": "number", "label": "Dedendum", "default_value": 1.25, "exclusiveMinimum": 0,
+            "hint": "× module: the root below the pitch plane (the shaper's addendum, the pinion's plus the clearance)."}));
+        ordered.insert("innerRadius".into(), serde_json::json!({"type": "number", "label": "Inner radius", "default_value": 0, "minimum": 0,
+            "hint": "Inner radius of the toothed ring, in model units; 0 takes the undercut limit (nearer the axis the tips would want the pinion's flank below its base circle)."}));
+        ordered.insert("outerRadius".into(), serde_json::json!({"type": "number", "label": "Outer radius", "default_value": 0, "minimum": 0,
+            "hint": "Outer radius of the toothed ring, in model units; 0 takes the pointed-tooth limit (where the tip land narrows to 0.05 × module)."}));
+        ordered.insert("rim".into(), serde_json::json!({"type": "number", "label": "Rim", "default_value": 4, "exclusiveMinimum": 0,
+            "hint": "Thickness of the disc under the root, in model units."}));
+        ordered.insert("phase".into(), super::phase_field());
+        ordered.insert("boolean".into(), common::optional_boolean_schema());
+        serde_json::json!({
+            "type": "GEAR.CROWN", "shortName": "GEAR.CROWN", "longName": "Crown gear",
+            "ribbonPath": "Gears/Bevel and face/Crown gear", "commandSize": "Large", "displayBuilder": false,
+            "inputParamsSchema": serde_json::Value::Object(ordered),
+        })
+    }
+}
+
+/// `GEAR.LANTERN` — lantern pinion: two discs joined by round pins (exact).
+pub mod lantern {
+    use super::*;
+    use crate::gears::{lantern_solid, LanternPinion};
+
+    pub fn execute(ctx: &FeatureContext) -> FeatureResult {
+        build(ctx).unwrap_or_else(|error| ctx.fail(error))
+    }
+
+    fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+        let pins = number(ctx, "pins")?;
+        if pins.fract() != 0.0 || !(3.0..=200.0).contains(&pins) {
+            return Err(format!("The pin count must be a whole number from 3 to 200 (it is {pins})."));
+        }
+        let pin_circle = number(ctx, "pinCircleDiameter")?;
+        let pin = number(ctx, "pinDiameter")?;
+        let disc = number(ctx, "discDiameter")?;
+        let lantern = LanternPinion {
+            pins: pins as usize,
+            pin_circle_diameter: pin_circle,
+            pin_diameter: pin,
+            // 0: the discs reach a pin's diameter past the pins.
+            disc_diameter: if disc > 0.0 { disc } else { pin_circle + 3.0 * pin },
+            disc_thickness: number(ctx, "discThickness")?,
+            length: number(ctx, "length")?,
+        };
+        let (solid, data) = lantern_solid(&lantern).map_err(|r| r.to_string())?;
+        finish(ctx, solid, &[], &data)
+    }
+
+    pub fn schema() -> serde_json::Value {
+        let mut ordered = serde_json::Map::new();
+        ordered.insert("id".into(), serde_json::json!({"type": "string", "default_value": null, "hint": "Unique identifier for the feature"}));
+        ordered.insert("placement".into(), super::placement_field());
+        ordered.insert("pins".into(), serde_json::json!({"type": "number", "label": "Pins", "default_value": 8, "minimum": 3, "hint": "Number of pins (3 to 200)."}));
+        ordered.insert("pinCircleDiameter".into(), serde_json::json!({"type": "number", "label": "Pin circle diameter", "default_value": 20, "exclusiveMinimum": 0,
+            "hint": "Diameter of the circle the pin centres lie on (the pitch circle), in model units."}));
+        ordered.insert("pinDiameter".into(), serde_json::json!({"type": "number", "label": "Pin diameter", "default_value": 2, "exclusiveMinimum": 0,
+            "hint": "Diameter of each pin, in model units; the pins must not overlap."}));
+        ordered.insert("discDiameter".into(), serde_json::json!({"type": "number", "label": "Disc diameter", "default_value": 0, "minimum": 0,
+            "hint": "Diameter of the two discs, in model units; 0 takes the pin circle plus three pin diameters. It must reach past the pins."}));
+        ordered.insert("discThickness".into(), serde_json::json!({"type": "number", "label": "Disc thickness", "default_value": 2, "exclusiveMinimum": 0, "hint": "Thickness of each disc, in model units."}));
+        ordered.insert("length".into(), serde_json::json!({"type": "number", "label": "Pin length", "default_value": 10, "exclusiveMinimum": 0, "hint": "Length of the pins between the discs, in model units."}));
+        ordered.insert("phase".into(), super::phase_field());
+        ordered.insert("boolean".into(), common::optional_boolean_schema());
+        serde_json::json!({
+            "type": "GEAR.LANTERN", "shortName": "GEAR.LANTERN", "longName": "Lantern pinion",
+            "ribbonPath": "Gears/Cycloidal/Lantern pinion", "commandSize": "Large", "displayBuilder": false,
+            "inputParamsSchema": serde_json::Value::Object(ordered),
+        })
+    }
+}
+
+/// `GEAR.STAR` — star (pin) wheel driving a lantern pinion: cycloidal flanks conjugate to round pins.
+pub mod star {
+    use super::*;
+    use crate::gears::{star_wheel_solid, StarWheel};
+
+    pub fn execute(ctx: &FeatureContext) -> FeatureResult {
+        build(ctx).unwrap_or_else(|error| ctx.fail(error))
+    }
+
+    fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+        let teeth = number(ctx, "teeth")?;
+        if teeth.fract() != 0.0 || !(6.0..=1000.0).contains(&teeth) {
+            return Err(format!("The tooth count must be a whole number from 6 to 1000 (it is {teeth})."));
+        }
+        let pins = number(ctx, "pinionPins")?;
+        if pins.fract() != 0.0 || !(3.0..=200.0).contains(&pins) {
+            return Err(format!("The pinion's pin count must be a whole number from 3 to 200 (it is {pins})."));
+        }
+        let wheel = StarWheel {
+            module: number(ctx, "module")?,
+            teeth: teeth as usize,
+            pinion_pins: pins as usize,
+            pin_diameter: number(ctx, "pinDiameter")?,
+            addendum: number(ctx, "addendum")?,
+            clearance: number(ctx, "clearance")?,
+            backlash: number(ctx, "backlash")?,
+            face_width: number(ctx, "faceWidth")?,
+        };
+        let (solid, suffixes, data) = star_wheel_solid(&wheel).map_err(|r| r.to_string())?;
+        let mut result = finish(ctx, solid, &suffixes, &data)?;
+        if let Some(persistent) = result.persistent_data.as_mut() {
+            persistent["gearData"]["centreDistance"] = serde_json::json!(wheel.module * (teeth + pins) / 2.0);
+            persistent["gearData"]["pinionPinCircleDiameter"] = serde_json::json!(wheel.module * pins);
+        }
+        Ok(result)
+    }
+
+    pub fn schema() -> serde_json::Value {
+        let mut ordered = serde_json::Map::new();
+        ordered.insert("id".into(), serde_json::json!({"type": "string", "default_value": null, "hint": "Unique identifier for the feature"}));
+        ordered.insert("placement".into(), super::placement_field());
+        ordered.insert("module".into(), serde_json::json!({"type": "number", "label": "Module", "default_value": 2.5, "exclusiveMinimum": 0,
+            "hint": "Pitch diameter / teeth, in model units; the lantern pinion's pin circle is module × pins."}));
+        ordered.insert("teeth".into(), serde_json::json!({"type": "number", "label": "Teeth", "default_value": 48, "minimum": 6, "hint": "Wheel teeth (6 to 1000)."}));
+        ordered.insert("pinionPins".into(), serde_json::json!({"type": "number", "label": "Pinion pins", "default_value": 8, "minimum": 3,
+            "hint": "Pins of the mating lantern pinion (3 to 200)."}));
+        ordered.insert("pinDiameter".into(), serde_json::json!({"type": "number", "label": "Pin diameter", "default_value": 2, "exclusiveMinimum": 0,
+            "hint": "Diameter of the pinion's pins, in model units (under 0.9 of the pitch)."}));
+        ordered.insert("addendum".into(), serde_json::json!({"type": "number", "label": "Addendum", "default_value": 0, "minimum": 0,
+            "hint": "× module: the tips above the pitch circle; 0 takes 92% of the height where the flanks meet."}));
+        ordered.insert("clearance".into(), serde_json::json!({"type": "number", "label": "Clearance", "default_value": 0.2, "minimum": 0,
+            "hint": "× module: the root below the pins."}));
+        ordered.insert("backlash".into(), serde_json::json!({"type": "number", "label": "Backlash", "default_value": 0, "minimum": 0,
+            "hint": "The tooth spaces are this much wider than the pins, in model units."}));
+        ordered.insert("faceWidth".into(), serde_json::json!({"type": "number", "label": "Face width", "default_value": 5, "exclusiveMinimum": 0, "hint": "Width along the axis, in model units."}));
+        ordered.insert("phase".into(), super::phase_field());
+        ordered.insert("boolean".into(), common::optional_boolean_schema());
+        serde_json::json!({
+            "type": "GEAR.STAR", "shortName": "GEAR.STAR", "longName": "Star wheel",
+            "ribbonPath": "Gears/Cycloidal/Star wheel", "commandSize": "Large", "displayBuilder": false,
+            "inputParamsSchema": serde_json::Value::Object(ordered),
+        })
+    }
+}
+
+/// `GEAR.BEVELOID` — straight beveloid (conical involute) gear: a spur gear whose profile shift grows across the face.
+pub mod beveloid {
+    use super::*;
+    use crate::gears::{beveloid_solid, BeveloidGear};
+
+    pub fn execute(ctx: &FeatureContext) -> FeatureResult {
+        build(ctx).unwrap_or_else(|error| ctx.fail(error))
+    }
+
+    fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+        let gear = BeveloidGear { spur: spur_params(ctx)?, cone_angle: number(ctx, "coneAngle")?.to_radians() };
+        let (solid, suffixes, data) = beveloid_solid(&gear).map_err(|refusal| refusal.to_string())?;
+        finish(ctx, solid, &suffixes, &data)
+    }
+
+    pub fn hidden_params(values: &serde_json::Value) -> Vec<&'static str> {
+        super::pitch_hidden(values)
+    }
+
+    pub fn schema() -> serde_json::Value {
+        let mut fields = super::involute_fields();
+        let mut ordered = serde_json::Map::new();
+        ordered.insert("id".into(), serde_json::json!({"type": "string", "default_value": null, "hint": "Unique identifier for the feature"}));
+        ordered.insert("placement".into(), super::placement_field());
+        for (key, value) in std::mem::take(&mut fields) {
+            ordered.insert(key, value);
+        }
+        ordered.insert("coneAngle".into(), serde_json::json!({"type": "number", "label": "Cone angle", "default_value": 5,
+            "hint": "Angle of the tip and root cones to the axis, in degrees (over 0, at most 20): the profile shift grows by tan(angle) / module per unit along the axis, from the profile shift at the front face."}));
+        ordered.insert("phase".into(), super::phase_field());
+        ordered.insert("boolean".into(), common::optional_boolean_schema());
+        serde_json::json!({
+            "type": "GEAR.BEVELOID", "shortName": "GEAR.BEVELOID", "longName": "Beveloid gear",
+            "ribbonPath": "Gears/Bevel and face/Beveloid gear", "commandSize": "Large", "displayBuilder": false,
+            "inputParamsSchema": serde_json::Value::Object(ordered),
+        })
+    }
+}
+
+/// `GEAR.LOBED` — non-circular gear on an n-lobe pitch curve r = a(1 − e²)/(1 + e cos nθ) about its centre.
+pub mod lobed {
+    use super::*;
+    use crate::gears::{lobed_sizes, lobed_solid, EllipticalGear};
+
+    pub fn execute(ctx: &FeatureContext) -> FeatureResult {
+        build(ctx).unwrap_or_else(|error| ctx.fail(error))
+    }
+
+    fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
+        let lobes = number(ctx, "lobes")?;
+        if lobes.fract() != 0.0 || !(1.0..=8.0).contains(&lobes) {
+            return Err(format!("The lobe count must be a whole number from 1 to 8 (it is {lobes})."));
+        }
+        let n = lobes as usize;
+        let gear = EllipticalGear {
+            module: module_of(ctx)?,
+            teeth: teeth_of(ctx)?,
+            eccentricity: number(ctx, "eccentricity")?,
+            pressure_angle: number(ctx, "pressureAngle")?.to_radians(),
+            addendum: number(ctx, "addendum")?,
+            dedendum: number(ctx, "dedendum")?,
+            root_fillet: number(ctx, "rootFillet")?,
+            backlash: number(ctx, "backlash")?,
+            face_width: number(ctx, "faceWidth")?,
+        };
+        let (a, e, _, centre_distance) = lobed_sizes(&gear, n);
+        let phase = number(ctx, "phase")?;
+        let (shift, turn) = match ctx.string("position").as_deref().unwrap_or("PIVOT") {
+            "PIVOT" => (0.0, phase),
+            "MATE" => (centre_distance, mate_turn(phase, a, e, n)),
+            other => return Err(format!("unknown position `{other}`")),
+        };
+        let (solid, suffixes, data) = lobed_solid(&gear, n).map_err(|r| r.to_string())?;
+        let mut result = finish_placed(ctx, solid, &suffixes, &data, turn, shift)?;
+        if let Some(persistent) = result.persistent_data.as_mut() {
+            persistent["gearData"]["semiMajorAxis"] = serde_json::json!(a);
+            persistent["gearData"]["centreDistance"] = serde_json::json!(centre_distance);
+        }
+        Ok(result)
+    }
+
+    /// The MATE's turn (degrees) for a gear of `lobes` lobes turned by `phase`. In φ = lobes × θ the pitch curve
+    /// is the elliptical gear's, and rolling (r1 dθ1 = r2 dθ2, r1 + r2 = 2a) is unchanged by scaling every angle,
+    /// so the mate's contact sits at its curve angle (π − ψ) / lobes, ψ the elliptical mate's turn at
+    /// lobes × phase; turned so that point faces back along -x.
+    pub(super) fn mate_turn(phase: f64, a: f64, e: f64, lobes: usize) -> f64 {
+        let n = lobes as f64;
+        let psi = super::elliptical::mate_phase(n * phase, a, e);
+        180.0 - (180.0 - psi) / n
+    }
+
+    pub fn schema() -> serde_json::Value {
+        let mut ordered = serde_json::Map::new();
+        ordered.insert("id".into(), serde_json::json!({"type": "string", "default_value": null, "hint": "Unique identifier for the feature"}));
+        ordered.insert("placement".into(), serde_json::json!({
+            "type": "reference_selection", "label": "Placement",
+            "selectionFilter": ["PLANE", "FACE", "DATUM", "EDGE", "VERTEX"], "multiple": false, "default_value": null,
+            "hint": "Where the gear's PIVOT (the centre of its pitch curve) goes, its axis along the placement's normal; a lobe's near point lies along the placement's X. Empty: pivot at the origin, axis +Y."
+        }));
+        ordered.insert("position".into(), serde_json::json!({"type": "options", "label": "Position", "options": ["PIVOT", "MATE"], "default_value": "PIVOT",
+            "hint": "PIVOT: the pivot on the placement. MATE: the meshing partner of a gear with the same fields (phase included): moved by the centre distance along X and turned to roll with it; teeth an odd multiple of the lobes mesh."}));
+        ordered.insert("lobes".into(), serde_json::json!({"type": "number", "label": "Lobes", "default_value": 2, "minimum": 1,
+            "hint": "Lobes of the pitch curve, 1 to 8 (1 is the elliptical gear about its focus): the speed ratio of a pair swings this many times a turn."}));
+        for (key, value) in super::involute_fields() {
+            if key == "profileShift" {
+                continue;
+            }
+            let value = match key.as_str() {
+                "teeth" => serde_json::json!({"type": "number", "label": "Teeth", "default_value": 30, "minimum": 8,
+                    "hint": "Number of teeth (8 to 1000); the curve is sized so they close. An odd multiple of the lobes lets two equal gears mesh."}),
+                "backlash" => serde_json::json!({"type": "number", "label": "Backlash", "default_value": 0, "minimum": 0,
+                    "hint": "Added to each tooth space along the pitch curve, in model units."}),
+                _ => value,
+            };
+            ordered.insert(key.clone(), value);
+            if key == "teeth" {
+                ordered.insert("eccentricity".into(), serde_json::json!({"type": "number", "label": "Eccentricity", "default_value": 0.15, "minimum": 0,
+                    "hint": "e in r = a(1 − e²)/(1 + e cos nθ): 0 is a round gear; the curve must stay convex (refused otherwise)."}));
+            }
+        }
+        ordered.insert("phase".into(), super::phase_field());
+        ordered.insert("boolean".into(), common::optional_boolean_schema());
+        serde_json::json!({
+            "type": "GEAR.LOBED", "shortName": "GEAR.LOBED", "longName": "Lobed gear",
+            "ribbonPath": "Gears/Non-circular/Lobed gear", "commandSize": "Large", "displayBuilder": false,
             "inputParamsSchema": serde_json::Value::Object(ordered),
         })
     }

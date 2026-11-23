@@ -2216,38 +2216,77 @@ struct CellTreeNode {
 }
 
 /// The cached enclosure of every projection lattice cell (see
-/// [`project_point_to_surface_general`]).
+/// [`project_point_to_surface_general`]). The lattice, boxes and tree are
+/// shared, not copied, when the surface carrying them is cloned: the
+/// assembler clones every face it rebuilds, and copying these was 8% of
+/// brep-bench swept/drum-leaning-to-a-screw.
 #[derive(Clone, Debug)]
 pub struct ProjectionCells {
-    us: Vec<f64>,
-    vs: Vec<f64>,
+    us: std::sync::Arc<[f64]>,
+    vs: std::sync::Arc<[f64]>,
     /// `us.len() × vs.len()` lattice points, row-major in u.
-    nodes: Vec<Vec3>,
+    nodes: std::sync::Arc<[Vec3]>,
     /// `(us.len() - 1) × (vs.len() - 1)` cells, row-major in u.
-    boxes: Vec<CellBox>,
+    boxes: std::sync::Arc<[CellBox]>,
     /// The tree's root is the LAST node.
-    tree: Vec<CellTreeNode>,
+    tree: std::sync::Arc<[CellTreeNode]>,
     /// One box per tree node: a leaf's is its cell's box, an internal node's
     /// holds both children's boxes grown by `node_margin` on every side (see
     /// [`hull_candidates`]). Empty when the surface has no usable scale.
-    node_boxes: Vec<CellBox>,
+    node_boxes: std::sync::Arc<[CellBox]>,
     /// The growth of each internal node's box over its children's.
     node_margin: f64,
     /// The largest control-point coordinate magnitude.
     scale: f64,
     resolution: f64,
+    /// Descents per cell along u and v: 1, or under the coarse lattice the
+    /// default stations' count over the coarse one, rounded up, along a
+    /// thinned direction, so a cell is descended as densely as before.
+    split: [usize; 2],
+    /// Surface points at the sub-rectangle corners of coarse cells, by their
+    /// index on the sub-grid (`row * split_u + i`, `column * split_v + j`),
+    /// filled as descents read them.
+    sub_nodes: std::sync::Arc<std::sync::Mutex<rustc_hash::FxHashMap<(u32, u32), Vec3>>>,
+    /// Under a split: the hull boxes of the cells' sub-rectangles, by index
+    /// `(cell · split_u + i) · split_v + j`, built on first use from the
+    /// carrier's Bézier patches (`curve_clear::patch_piece_box`); `None`
+    /// where a box could not be built.
+    sub_boxes: std::sync::Arc<std::sync::Mutex<rustc_hash::FxHashMap<usize, Option<CellBox>>>>,
+    /// Lattice stations per knot span along u and v.
+    samples: [usize; 2],
 }
 
 /// The projection lattice's parameters along one direction: every knot span
 /// cut into `samples` equal pieces, the seed grid's density, shared span ends
 /// listed once.
 fn lattice_parameters(knots: &[f64], degree: usize, closed: bool) -> Vec<f64> {
-    let [start, end] = crate::curve::knot_domain(knots, degree);
-    let samples = if closed {
+    lattice_parameters_at(knots, degree, closed, false)
+}
+
+/// [`lattice_parameters`], with `coarse` the reading of
+/// [`coarse_lattice_enabled`]: an open direction of degree four or more takes
+/// [`COARSE_SAMPLES`] stations per span instead of `degree + 1`.
+/// Lattice stations per knot span of a direction.
+fn lattice_samples(degree: usize, closed: bool, coarse: bool) -> usize {
+    if closed {
         8usize.max(degree * 4)
+    } else if coarse && degree >= 4 {
+        COARSE_SAMPLES
     } else {
         3usize.max(degree + 1)
-    };
+    }
+}
+
+/// How many descents a coarse cell takes along a direction of `degree`:
+/// the default stations per span over [`COARSE_SAMPLES`], rounded up (1 where
+/// the direction is not thinned).
+fn coarse_split(degree: usize, closed: bool, coarse: bool) -> usize {
+    if coarse && !closed && degree >= 4 { (degree + 1).div_ceil(COARSE_SAMPLES) } else { 1 }
+}
+
+fn lattice_parameters_at(knots: &[f64], degree: usize, closed: bool, coarse: bool) -> Vec<f64> {
+    let [start, end] = crate::curve::knot_domain(knots, degree);
+    let samples = lattice_samples(degree, closed, coarse);
     let mut breaks = vec![start];
     breaks.extend(interior_knots(knots, degree));
     breaks.push(end);
@@ -2389,6 +2428,39 @@ struct NodeBoxInputs<'a> {
     margin: f64,
 }
 
+/// The box of a control grid (`columns` per row, rows along u), framed as a
+/// lattice cell's is (along u, then the normal of its corners) and grown by
+/// `margin` on every side; `None` where a frame or an extent is not finite.
+fn framed_box(points: &[Vec3], columns: usize, margin: f64) -> Option<CellBox> {
+    if columns == 0 || points.len() < columns || points.len() % columns != 0 {
+        return None;
+    }
+    let last = points.len() - columns;
+    let (c00, c01, c10, c11) = (points[0], points[columns - 1], points[last], points[last + columns - 1]);
+    let along_u = c10.sub(c00).add(c11.sub(c01));
+    let along_v = c01.sub(c00).add(c11.sub(c10));
+    let e1 = unit_or(along_u, unit_or(along_v, Vec3::new(1.0, 0.0, 0.0)));
+    let fallback = e1.perpendicular().ok()?;
+    let normal = unit_or(e1.cross(along_v), fallback);
+    let e2 = unit_or(normal.cross(e1), fallback);
+    let e3 = e1.cross(e2);
+    let axes = [e1, e2, e3];
+    let mut low = [f64::INFINITY; 3];
+    let mut high = [f64::NEG_INFINITY; 3];
+    for point in points {
+        for axis in 0..3 {
+            let coordinate = point.dot(axes[axis]);
+            low[axis] = low[axis].min(coordinate);
+            high[axis] = high[axis].max(coordinate);
+        }
+    }
+    for axis in 0..3 {
+        low[axis] -= margin;
+        high[axis] += margin;
+    }
+    low.iter().chain(high.iter()).all(|value| value.is_finite()).then_some(CellBox { axes, low, high })
+}
+
 /// The box of an internal node: framed like a cell's (along u, then the
 /// normal of the region's lattice corners), spanning every corner of both
 /// children's boxes, grown by `margin` on every side. Unbounded when a frame or
@@ -2500,14 +2572,69 @@ fn projection_cells(surface: &NurbsSurface) -> Result<Option<&ProjectionCells>, 
     if let Some(cells) = surface.projection_cells.get() {
         return Ok(cells.as_ref());
     }
-    let cells = build_projection_cells(surface)?;
+    let cells = build_projection_cells_at(surface, coarse_lattice_enabled())?;
     Ok(surface.projection_cells.get_or_init(|| cells).as_ref())
 }
 
+/// Stations per knot span of an open direction of degree four or more under
+/// [`coarse_lattice_enabled`]. The default `degree + 1` cut a quintic sweep
+/// net's 124 spans into 745 stations, and a 745 × 97 lattice (72k cells, a
+/// refined net of 1.8M control points) cost 300 ms to build, a third of
+/// brep-bench swept/ball-on-a-leaning-stem-swung-partway.
+const COARSE_SAMPLES: usize = 3;
+
+/// `BREP_PROJECTION_COARSE_LATTICE` (default on; `=0` restores the default
+/// lattice): the projection lattice of a
+/// direction of degree four or more takes [`COARSE_SAMPLES`] stations per span.
+/// Every cell's box still encloses its piece of the surface (the hull bound
+/// holds at any cell size), so no cell a nearer point could lie in is skipped;
+/// a larger cell is a larger region one descent is seeded in.
+/// `BREP_PROJECTION_COARSE_LATTICE_CHECK=1` turns it on and also runs every
+/// global stage on the default lattice, panicking where the coarse answer is
+/// farther than the default's by more than the bar of [`coarse_check_bar`].
+fn coarse_lattice_enabled() -> bool {
+    coarse_lattice_check() || crate::switch!("BREP_PROJECTION_COARSE_LATTICE", true)
+}
+
+fn coarse_lattice_check() -> bool {
+    crate::switch!("BREP_PROJECTION_COARSE_LATTICE_CHECK", false)
+}
+
+/// How much farther than the default lattice's answer the coarse lattice's may
+/// read before the check stops: the surface's own resolution, the most the
+/// global stage ever leaves on the table, and the on-surface floor.
+fn coarse_check_bar(resolution: f64) -> f64 {
+    LINEAR_TOLERANCE.max(16.0 * resolution)
+}
+
+thread_local! {
+    /// The default lattice's cells for the check, by surface content.
+    static DEFAULT_CELLS_FOR_CHECK: std::cell::RefCell<rustc_hash::FxHashMap<[u64; 2], std::rc::Rc<Option<ProjectionCells>>>> = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+fn default_cells_for_check(surface: &NurbsSurface) -> Result<std::rc::Rc<Option<ProjectionCells>>, String> {
+    let key = surface.content_key();
+    if let Some(cells) = DEFAULT_CELLS_FOR_CHECK.with(|map| map.borrow().get(&key).cloned()) {
+        return Ok(cells);
+    }
+    let cells = std::rc::Rc::new(build_projection_cells_at(surface, false)?);
+    DEFAULT_CELLS_FOR_CHECK.with(|map| {
+        let mut map = map.borrow_mut();
+        // The check holds a bounded set; a test battery meets far more surfaces.
+        if map.len() >= 256 { map.clear(); }
+        map.insert(key, cells.clone());
+    });
+    Ok(cells)
+}
+
 fn build_projection_cells(surface: &NurbsSurface) -> Result<Option<ProjectionCells>, String> {
+    build_projection_cells_at(surface, false)
+}
+
+fn build_projection_cells_at(surface: &NurbsSurface, coarse: bool) -> Result<Option<ProjectionCells>, String> {
     let (closed_u, closed_v) = surface.closed_directions()?;
-    let us = lattice_parameters(&surface.knots_u, surface.degree_u, closed_u);
-    let vs = lattice_parameters(&surface.knots_v, surface.degree_v, closed_v);
+    let us = lattice_parameters_at(&surface.knots_u, surface.degree_u, closed_u, coarse);
+    let vs = lattice_parameters_at(&surface.knots_v, surface.degree_v, closed_v, coarse);
     if us.len() < 2 || vs.len() < 2 {
         return Ok(None);
     }
@@ -2533,6 +2660,7 @@ fn build_projection_cells(surface: &NurbsSurface) -> Result<Option<ProjectionCel
     if rows == 0 || columns == 0 {
         return Ok(None);
     }
+    let split = [coarse_split(surface.degree_u, closed_u, coarse), coarse_split(surface.degree_v, closed_v, coarse)];
     let mut points = vec![Vec3::default(); rows * columns];
     for (column, fibre) in transposed.iter().enumerate() {
         for (row, control) in fibre.iter().enumerate() {
@@ -2612,15 +2740,22 @@ fn build_projection_cells(surface: &NurbsSurface) -> Result<Option<ProjectionCel
         node_boxes = Vec::new();
     }
     Ok(Some(ProjectionCells {
-        us,
-        vs,
-        nodes,
-        boxes,
-        tree,
-        node_boxes,
+        us: us.into(),
+        vs: vs.into(),
+        nodes: nodes.into(),
+        boxes: boxes.into(),
+        tree: tree.into(),
+        node_boxes: node_boxes.into(),
         node_margin,
         scale,
         resolution,
+        split,
+        sub_nodes: Default::default(),
+        sub_boxes: Default::default(),
+        samples: [
+            lattice_samples(surface.degree_u, closed_u, coarse),
+            lattice_samples(surface.degree_v, closed_v, coarse),
+        ],
     }))
 }
 
@@ -2881,6 +3016,33 @@ fn global_minimum(
     let Some(cells) = projection_cells(surface)? else {
         return Ok(());
     };
+    if coarse_lattice_check() {
+        let start = *best;
+        global_minimum_with(surface, cells, point, domains, periodic, best, stats)?;
+        if let Some(default) = default_cells_for_check(surface)?.as_ref() {
+            let mut reference = start;
+            global_minimum_with(surface, default, point, domains, periodic, &mut reference, &mut GlobalStats::default())?;
+            let (coarse, fine) = (best.distance_squared.sqrt(), reference.distance_squared.sqrt());
+            if coarse > fine + coarse_check_bar(default.resolution) {
+                panic!("BREP_PROJECTION_COARSE_LATTICE_CHECK: the coarse lattice reads {coarse:e} where the default reads {fine:e} for {point:?} (degrees {}x{})", surface.degree_u, surface.degree_v);
+            }
+        }
+        return Ok(());
+    }
+    global_minimum_with(surface, cells, point, domains, periodic, best, stats)
+}
+
+/// [`global_minimum`] over the given cells.
+#[allow(clippy::too_many_arguments)]
+fn global_minimum_with(
+    surface: &NurbsSurface,
+    cells: &ProjectionCells,
+    point: Vec3,
+    domains: [f64; 4],
+    periodic: (bool, bool),
+    best: &mut NewtonResult,
+    stats: &mut GlobalStats,
+) -> Result<(), String> {
     let resolution = cells.resolution;
     let columns = cells.vs.len() - 1;
     let columns_u = cells.us.len() - 1;
@@ -2924,45 +3086,137 @@ fn global_minimum(
         if settled.contains(&cell) {
             continue;
         }
-        let mut seed = (rectangle[0], rectangle[2]);
-        let mut seed_distance = f64::INFINITY;
-        for (node_row, node_column) in
-            [(row, column), (row + 1, column), (row, column + 1), (row + 1, column + 1)]
-        {
-            let distance = cells.nodes[node_row * cells.vs.len() + node_column]
-                .sub(point)
-                .length_squared();
-            if distance < seed_distance {
-                seed_distance = distance;
-                seed = (cells.us[node_row], cells.vs[node_column]);
+        if cells.split == [1, 1] {
+            let mut seed = (rectangle[0], rectangle[2]);
+            let mut seed_distance = f64::INFINITY;
+            for (node_row, node_column) in
+                [(row, column), (row + 1, column), (row, column + 1), (row + 1, column + 1)]
+            {
+                let distance = cells.nodes[node_row * cells.vs.len() + node_column]
+                    .sub(point)
+                    .length_squared();
+                if distance < seed_distance {
+                    seed_distance = distance;
+                    seed = (cells.us[node_row], cells.vs[node_column]);
+                }
             }
-        }
-        stats.refinements += 1;
-        let (confined, on_edge) = confined_descent(surface, point, seed, rectangle, (false, false))?;
-        let mut found = confined;
-        if on_edge && confined.distance_squared.sqrt() < bound {
-            // The cell's least point is on its edge and beats the answer:
-            // the basin continues past the cell.
-            stats.continuations += 1;
-            let (continued, _) =
-                confined_descent(surface, point, (confined.u, confined.v), domains, periodic)?;
-            if continued.distance_squared < found.distance_squared {
-                found = continued;
-            }
-            if continued.converged {
-                settled.push(cell_of(continued.u, continued.v));
-            }
-        }
-        if found.distance_squared.sqrt() < bound {
-            *best = found;
-            bound = best.distance_squared.sqrt() - resolution;
-            stats.replaced = true;
-            if best.distance_squared.sqrt() <= LINEAR_TOLERANCE {
+            if descend_cell(surface, point, seed, rectangle, domains, periodic, best, &mut bound, resolution, &mut settled, &cell_of, stats)? {
                 return Ok(());
+            }
+            continue;
+        }
+        // A coarse cell: one descent per sub-rectangle, seeded at its nearest
+        // corner, as the default lattice's cells there would be.
+        let [split_u, split_v] = cells.split;
+        let at = |low: f64, high: f64, index: usize, count: usize| if index == count { high } else { low + (high - low) * index as f64 / count as f64 };
+        for i in 0..split_u {
+            for j in 0..split_v {
+                let sub = [
+                    at(rectangle[0], rectangle[1], i, split_u),
+                    at(rectangle[0], rectangle[1], i + 1, split_u),
+                    at(rectangle[2], rectangle[3], j, split_v),
+                    at(rectangle[2], rectangle[3], j + 1, split_v),
+                ];
+                // A sub-rectangle whose hull box stands farther than the bound
+                // holds no nearer point; the cushion covers the split's and
+                // the division's rounding.
+                let index = (cell * split_u + i) * split_v + j;
+                let cached = cells.sub_boxes.lock().ok().and_then(|boxes| boxes.get(&index).cloned());
+                let hull = match cached {
+                    Some(hull) => hull,
+                    None => {
+                        let [su, sv] = cells.samples;
+                        let piece = |cell_index: usize, samples: usize, split: usize, sub: usize| {
+                            let (span, k) = (cell_index / samples, cell_index % samples);
+                            let steps = (samples * split) as f64;
+                            (span, [(k * split + sub) as f64 / steps, (k * split + sub + 1) as f64 / steps])
+                        };
+                        let (span_u, range_u) = piece(row, su, split_u, i);
+                        let (span_v, range_v) = piece(column, sv, split_v, j);
+                        let hull = crate::curve_clear::patch_piece_controls(surface, span_u, span_v, range_u, range_v)
+                            .and_then(|(controls, columns)| framed_box(&controls, columns, 64.0 * resolution));
+                        if let Ok(mut boxes) = cells.sub_boxes.lock() { boxes.insert(index, hull.clone()); }
+                        hull
+                    }
+                };
+                if let Some(hull) = hull {
+                    if hull.lower_bound(point) >= bound {
+                        continue;
+                    }
+                }
+                let mut seed = (sub[0], sub[2]);
+                let mut seed_distance = f64::INFINITY;
+                for (di, dj) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (u, v) = (sub[di], sub[2 + dj]);
+                    let key = ((row * split_u + i + di) as u32, (column * split_v + j + dj) as u32);
+                    let cached = cells.sub_nodes.lock().ok().and_then(|nodes| nodes.get(&key).copied());
+                    let node = match cached {
+                        Some(node) => node,
+                        None => {
+                            let node = surface.evaluate(u, v)?;
+                            if let Ok(mut nodes) = cells.sub_nodes.lock() { nodes.insert(key, node); }
+                            node
+                        }
+                    };
+                    let distance = node.sub(point).length_squared();
+                    if distance < seed_distance {
+                        seed_distance = distance;
+                        seed = (u, v);
+                    }
+                }
+                if descend_cell(surface, point, seed, sub, domains, periodic, best, &mut bound, resolution, &mut settled, &cell_of, stats)? {
+                    return Ok(());
+                }
             }
         }
     }
     Ok(())
+}
+
+/// One confined descent of [`global_minimum_with`] over `rectangle` from
+/// `seed`, continued over the domain when its least point is on the
+/// rectangle's edge; `best` and `bound` take an answer nearer than `bound`.
+/// True when the answer reaches the on-surface floor.
+#[allow(clippy::too_many_arguments)]
+fn descend_cell(
+    surface: &NurbsSurface,
+    point: Vec3,
+    seed: (f64, f64),
+    rectangle: [f64; 4],
+    domains: [f64; 4],
+    periodic: (bool, bool),
+    best: &mut NewtonResult,
+    bound: &mut f64,
+    resolution: f64,
+    settled: &mut Vec<usize>,
+    cell_of: &dyn Fn(f64, f64) -> usize,
+    stats: &mut GlobalStats,
+) -> Result<bool, String> {
+    stats.refinements += 1;
+    let (confined, on_edge) = confined_descent(surface, point, seed, rectangle, (false, false))?;
+    let mut found = confined;
+    if on_edge && confined.distance_squared.sqrt() < *bound {
+        // The cell's least point is on its edge and beats the answer:
+        // the basin continues past the cell.
+        stats.continuations += 1;
+        let (continued, _) =
+            confined_descent(surface, point, (confined.u, confined.v), domains, periodic)?;
+        if continued.distance_squared < found.distance_squared {
+            found = continued;
+        }
+        if continued.converged {
+            settled.push(cell_of(continued.u, continued.v));
+        }
+    }
+    if found.distance_squared.sqrt() < *bound {
+        *best = found;
+        *bound = best.distance_squared.sqrt() - resolution;
+        stats.replaced = true;
+        if best.distance_squared.sqrt() <= LINEAR_TOLERANCE {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 

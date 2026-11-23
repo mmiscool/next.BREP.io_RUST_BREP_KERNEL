@@ -55,7 +55,7 @@ pub const EMPTY_DOCUMENT: &str = r#"{"expressions":"","configurator":{},"feature
 /// references; assembly, drawing, harness and eCAD workspaces start empty.
 fn is_part_workbench(id: &str) -> bool {
     !matches!(crate::workbench::resolve(id).id,
-        "assembly" | "drawing" | "wireHarness" | "diagram" | "pcb" | "symbol" | "pads")
+        "assembly" | "drawing" | "wireHarness" | "diagram" | "schematic" | "pcb" | "symbol" | "pads")
 }
 
 /// Seed only a feature-empty part when explicitly creating a new part. PLM

@@ -318,6 +318,39 @@ pub fn sweep_profile_twisted_anchored(
     name: Option<&str>,
     anchor: ProfileAnchor,
 ) -> Result<BrepSolid, KernelRefusal> {
+    sweep_profile_twisted_within(profile, path, twist_angle, name, SectionPlacement::Transplant, Some(anchor), None).map(|swept| swept.solid)
+}
+
+/// [`sweep_profile_twisted`] with the section's PLACEMENT, an optional
+/// placement anchor (`None`: the profile's own, its centroid landed on the
+/// path) and the TOLERANCE its stations are refined to (mm; `None` for
+/// [`SWEEP_DEFAULT_TOLERANCE`]), with the build's station report.
+///
+/// The tolerance is the one every station sweep takes: the stations' fit
+/// through the PATH's own points refined to it against the path
+/// (`chain_stations`). Nothing else is driven by it: a section carried off
+/// the path (its centre on a track of its own, a helix under a twist), the
+/// twist and the wall are not refined to it, and the report reads them (its
+/// `spine_deviation` is the carried section's centre track, its
+/// `wall_deviation` the build's sampled measure of the wall's standoff from
+/// the kinematic sweep at each span's quarter points), for the caller to
+/// weigh. A tolerance looser than the default builds as the default (the
+/// build also reads it as its noise floor).
+///
+/// [`SectionPlacement::Rigid`] carries the profile as drawn, square to the
+/// path at its start: a section drawn off the path stays off it by the same
+/// offset in the rotation-minimizing frame, and the twist turns it about the
+/// path itself. [`SectionPlacement::Transplant`] lands it on the path in a
+/// roll of its own choosing (see [`SectionPlacement`]).
+pub fn sweep_profile_twisted_within(
+    profile: &[NurbsCurve],
+    path: &NurbsCurve,
+    twist_angle: f64,
+    name: Option<&str>,
+    placement: SectionPlacement,
+    anchor: Option<ProfileAnchor>,
+    tolerance: Option<f64>,
+) -> Result<SweptChain, KernelRefusal> {
     use std::f64::consts::{FRAC_PI_2, TAU};
 
     if !twist_angle.is_finite() {
@@ -340,21 +373,11 @@ pub fn sweep_profile_twisted_anchored(
             ),
         ));
     }
+    let tolerance = sweep_tolerance(tolerance)?.min(SWEEP_DEFAULT_TOLERANCE);
     let quarter_turns = (twist_angle.abs() / FRAC_PI_2).ceil() as usize;
     let stations = (quarter_turns * 16).clamp(32, 1024).max(path_turning_stations(path));
-    sweep_profile_along_path_stations(
-        profile,
-        path,
-        name,
-        stations,
-        twist_angle,
-        Some(anchor),
-        SectionPlacement::Transplant,
-        SWEEP_DEFAULT_TOLERANCE,
-        true,
-    )
-    .map(|swept| swept.solid)
-    .map_err(|error| error.with_message(|error| format!("sweep_profile_twisted: {error}")))
+    sweep_profile_along_path_stations(profile, path, name, stations, twist_angle, anchor, placement, tolerance, true)
+        .map_err(|error| error.with_message(|error| format!("sweep_profile_twisted: {error}")))
 }
 
 /// Sweep a CLOSED PLANAR profile along a CHAIN of path curves joined

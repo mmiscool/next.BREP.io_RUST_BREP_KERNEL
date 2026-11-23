@@ -811,7 +811,7 @@ pub(crate) fn answer_duplicate_requests(doc: &mut Document) {
 
 pub(crate) fn sync(doc: &mut Document) {
     follow_occurrences(doc);
-    if !matches!(doc.engine.settings.workbench.as_str(), "diagram" | "pcb") { return; }
+    if !matches!(doc.engine.settings.workbench.as_str(), "diagram" | "schematic" | "pcb") { return; }
     let history = &doc.engine.history;
     let revision = history.revision();
     if doc.ecad_parts_revision == Some(revision) { return; }
@@ -829,7 +829,7 @@ pub(crate) fn sync(doc: &mut Document) {
     let missing: Vec<String> = reached.iter().filter(|device| !device.known)
         .map(|device| format!(
             "'{}' is placed from part '{}', which this assembly's library does not \
-             carry — it cannot be offered to Diagram or PCB.", device.reference, device.key))
+             carry — it cannot be offered to Harness diagram, PCB diagram or PCB.", device.reference, device.key))
         .collect();
     let (offered, refused) = offers_and_refusals(reached);
     let missing: Vec<String> = missing.into_iter().chain(refused).collect();
@@ -880,7 +880,7 @@ pub static HIT_KEYS: &[crate::automation::hit_keys::HitKeyDoc] = &[
 pub(crate) fn take_add_part_request(doc: &mut Document) -> bool {
     let active = match doc.engine.settings.workbench.as_str() {
         "diagram" => Some(&doc.ecad.diagram),
-        "pcb" => Some(&doc.ecad.pcb),
+        "schematic" | "pcb" => Some(&doc.ecad.pcb),
         _ => None,
     };
     if crate::automation::registry::enabled() {

@@ -38,16 +38,134 @@ pub(crate) fn step_string(value: &str) -> String {
 }
 
 pub(crate) fn real(value: f64) -> Result<String, String> {
+    let mut out = String::with_capacity(24);
+    real_into(&mut out, value)?;
+    Ok(out)
+}
+
+/// [`real`] appended to `out`, the same bytes, without the formatting
+/// machinery: a value with a fraction below 2^53 is `m · 2^-s` (`m` its 53-bit
+/// significand), so `m · 10^15` fits in 128 bits and one shift with the
+/// remainder against the half gives `{:.15}`'s correctly rounded digits
+/// (ties to even, as the standard formatter rounds them). Anything else (an
+/// integer from 10^15, too large for the shift) takes [`real_formatted`].
+pub(crate) fn real_into(out: &mut String, value: f64) -> Result<(), String> {
     if !value.is_finite() {
         return Err(format!("export_step: non-finite number {value}"));
     }
+    if value == 0.0 {
+        out.push_str("0.");
+        return Ok(());
+    }
+    let magnitude = value.abs();
+    if value.fract() == 0.0 && magnitude < 1e15 {
+        // `{:.0}.` of an integer below 10^15: its decimal digits and a point.
+        use std::fmt::Write;
+        let _ = write!(out, "{}", value as i64);
+        out.push('.');
+        return Ok(());
+    }
+    if !(magnitude < 9_007_199_254_740_992.0) {
+        out.push_str(&real_formatted(value));
+        return Ok(());
+    }
+    let bits = value.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i64;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (significand, power) = if exponent == 0 { (fraction, -1074i64) } else { (fraction | (1u64 << 52), exponent - 1075) };
+    // A value with a fraction below 2^53 has a negative binary exponent.
+    if power >= 0 {
+        out.push_str(&real_formatted(value));
+        return Ok(());
+    }
+    let shift = (-power) as u32;
+    let scaled = significand as u128 * 1_000_000_000_000_000u128;
+    let rounded = if shift >= 128 {
+        0
+    } else {
+        let quotient = scaled >> shift;
+        let remainder = scaled - (quotient << shift);
+        let half = 1u128 << (shift - 1);
+        if remainder > half || (remainder == half && quotient & 1 == 1) { quotient + 1 } else { quotient }
+    };
+    if rounded == 0 {
+        // `0.000…` and `-0.000…` both read back as "0.0".
+        out.push_str("0.0");
+        return Ok(());
+    }
+    if value < 0.0 {
+        out.push('-');
+    }
+    const SCALE: u64 = 1_000_000_000_000_000;
+    let (whole, mut part) = match u64::try_from(rounded) {
+        Ok(small) => ((small / SCALE) as u128, small % SCALE),
+        Err(_) => (rounded / SCALE as u128, (rounded % SCALE as u128) as u64),
+    };
+    // The whole part's digits, most significant first.
+    let mut digits_of_whole = [0u8; 40];
+    let mut at = digits_of_whole.len();
+    let mut rest = whole;
+    loop {
+        at -= 1;
+        digits_of_whole[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    push_ascii(out, &digits_of_whole[at..]);
+    out.push('.');
+    if part == 0 {
+        out.push('0');
+        return Ok(());
+    }
+    let mut digits = 15usize;
+    while part % 10 == 0 {
+        part /= 10;
+        digits -= 1;
+    }
+    let mut buffer = [b'0'; 15];
+    for slot in buffer[..digits].iter_mut().rev() {
+        *slot = b'0' + (part % 10) as u8;
+        part /= 10;
+    }
+    push_ascii(out, &buffer[..digits]);
+    Ok(())
+}
+
+/// Append ASCII digit bytes.
+fn push_ascii(out: &mut String, digits: &[u8]) {
+    out.reserve(digits.len());
+    for &digit in digits {
+        out.push(char::from(digit));
+    }
+}
+
+/// Append `value` in decimal.
+fn push_decimal(out: &mut String, mut value: usize) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    push_ascii(out, &digits[at..]);
+}
+
+/// The reference formatting [`real_into`] reproduces: `{:.15}`, trailing
+/// zeros dropped, a bare point given one zero, `-0.0` read as `0.0`.
+pub(crate) fn real_formatted(value: f64) -> String {
+    if value == 0.0 {
+        return "0.".into();
+    }
     // Analytic frame axes come from cross products that can round to -0.0;
     // normalize so directions never print a negative zero component.
-    if value == 0.0 {
-        return Ok("0.".into());
-    }
     if value.fract() == 0.0 && value.abs() < 1e15 {
-        return Ok(format!("{value:.0}."));
+        return format!("{value:.0}.");
     }
     let mut output = format!("{value:.15}");
     while output.ends_with('0') {
@@ -59,7 +177,7 @@ pub(crate) fn real(value: f64) -> Result<String, String> {
     if output == "-0.0" {
         output = "0.0".into();
     }
-    Ok(output)
+    output
 }
 
 fn knot_runs(knots: &[f64]) -> (Vec<f64>, Vec<usize>) {
@@ -88,9 +206,26 @@ pub(crate) struct StepWriter {
 
 impl StepWriter {
     pub(crate) fn add(&mut self, body: impl Into<String>) -> usize {
+        let body = body.into();
+        self.add_with(body.len(), |line| {
+            line.push_str(&body);
+            Ok(())
+        })
+        .expect("a body that is already built")
+    }
+
+    /// Add the entity whose body `build` writes into the line (after
+    /// `#id=`, before `;`), so no body string is built on its own.
+    pub(crate) fn add_with(&mut self, capacity: usize, build: impl FnOnce(&mut String) -> Result<(), String>) -> Result<usize, String> {
         let id = self.lines.len() + 1;
-        self.lines.push(format!("#{id}={};", body.into()));
-        id
+        let mut line = String::with_capacity(capacity + 12);
+        line.push('#');
+        push_decimal(&mut line, id);
+        line.push('=');
+        build(&mut line)?;
+        line.push(';');
+        self.lines.push(line);
+        Ok(id)
     }
 
     fn data(&self) -> String {
@@ -99,31 +234,43 @@ impl StepWriter {
 }
 
 pub(crate) fn write_point(writer: &mut StepWriter, point: Vec3) -> Result<usize, String> {
-    Ok(writer.add(format!(
-        "CARTESIAN_POINT('',({},{},{}))",
-        real(point.x)?,
-        real(point.y)?,
-        real(point.z)?
-    )))
+    writer.add_with(80, |line| {
+        line.push_str("CARTESIAN_POINT('',(");
+        real_into(line, point.x)?;
+        line.push(',');
+        real_into(line, point.y)?;
+        line.push(',');
+        real_into(line, point.z)?;
+        line.push_str("))");
+        Ok(())
+    })
 }
 
 pub(crate) fn id_list(ids: &[usize]) -> String {
-    format!(
-        "({})",
-        ids.iter()
-            .map(|id| format!("#{id}"))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
+    let mut out = String::with_capacity(2 + 8 * ids.len());
+    out.push('(');
+    for (index, &id) in ids.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('#');
+        push_decimal(&mut out, id);
+    }
+    out.push(')');
+    out
 }
 
 pub(crate) fn write_direction(writer: &mut StepWriter, direction: Vec3) -> Result<usize, String> {
-    Ok(writer.add(format!(
-        "DIRECTION('',({},{},{}))",
-        real(direction.x)?,
-        real(direction.y)?,
-        real(direction.z)?
-    )))
+    writer.add_with(72, |line| {
+        line.push_str("DIRECTION('',(");
+        real_into(line, direction.x)?;
+        line.push(',');
+        real_into(line, direction.y)?;
+        line.push(',');
+        real_into(line, direction.z)?;
+        line.push_str("))");
+        Ok(())
+    })
 }
 
 pub(crate) fn write_placement(
@@ -911,6 +1058,35 @@ fn void_owner(
     best.ok_or_else(|| "export_step: a void shell lies inside no outward shell".into())
 }
 
+/// Whether `shell` of `solid` encloses a negative volume, as
+/// `shell_signed_volume(shell) < 0` reads it, decided where it can be by the
+/// sign readings (the coarse certificate, then the sign reading against bars
+/// just above and below zero, whose verdicts are the exact integral's), and by
+/// the integral itself only where they cannot tell.
+fn shell_is_inward(solid: &BrepSolid, shell: &crate::topology::ShellRecord) -> Result<bool, String> {
+    let alone = BrepSolid {
+        shells: vec![shell.clone()],
+        mass_properties_cache: Default::default(),
+        ..solid.clone()
+    };
+    if let Some(certificate) = crate::mass_properties::solid_sign_coarse_certificate(&alone, crate::mass_properties::COARSE_SIGN_DEPTH) {
+        if certificate.reading - certificate.bound > 0.0 {
+            return Ok(false);
+        }
+        if certificate.reading + certificate.bound < 0.0 {
+            return Ok(true);
+        }
+    }
+    if crate::mass_properties::solid_signed_volume_for_sign(&alone, 0.0)? > 0.0 {
+        return Ok(false);
+    }
+    let below = -f64::MIN_POSITIVE;
+    if !(crate::mass_properties::solid_signed_volume_for_sign(&alone, below)? > below) {
+        return Ok(true);
+    }
+    Ok(crate::mass_properties::shell_signed_volume(shell)? < 0.0)
+}
+
 fn vertex_for(solid: &BrepSolid, id: u64) -> Result<&VertexRecord, String> {
     solid
         .vertices
@@ -1504,12 +1680,10 @@ pub(crate) fn write_product_geometry(
                 face_ids.push(face_step_id);
             }
             let closed_shell = writer.add(format!("CLOSED_SHELL('',{})", id_list(&face_ids)));
-            let signed_volume = if solid.shells.len() > 1 {
-                crate::mass_properties::shell_signed_volume(shell)?
-            } else {
-                1.0
-            };
-            emitted_shells.push((closed_shell, signed_volume < 0.0, signed_volume.abs()));
+            // A void is a shell of negative volume; its size is read only
+            // where a void must choose among outward shells (below).
+            let inward = solid.shells.len() > 1 && shell_is_inward(solid, shell)?;
+            emitted_shells.push((closed_shell, inward, f64::NAN));
         }
         if emitted_shells.iter().any(|&(_, inward, _)| inward) {
             let outer: Vec<usize> = (0..emitted_shells.len()).filter(|&i| !emitted_shells[i].1).collect();
@@ -1520,6 +1694,11 @@ pub(crate) fn write_product_geometry(
             // body per outward shell, its voids those it owns (several bodies
             // nested in each other's hollows are several solids in STEP).
             let mut owned: Vec<Vec<usize>> = vec![Vec::new(); emitted_shells.len()];
+            if outer.len() > 1 {
+                for (index, shell) in solid.shells.iter().enumerate() {
+                    emitted_shells[index].2 = crate::mass_properties::shell_signed_volume(shell)?.abs();
+                }
+            }
             for void in (0..emitted_shells.len()).filter(|&i| emitted_shells[i].1) {
                 let owner = if outer.len() == 1 {
                     outer[0]
@@ -1695,17 +1874,105 @@ fn vertex_step_id(
 
 /// Entity id -> body, for the serialized-text audits.  One entity per line is
 /// this writer's own invariant, so the "parse" is a split.
-fn step_entity_bodies(step: &str) -> HashMap<u64, &str> {
-    step.lines()
-        .filter_map(|line| {
-            let rest = line.strip_prefix('#')?;
-            let (digits, body) = rest.split_once('=')?;
-            Some((
-                digits.parse::<u64>().ok()?,
-                body.trim_end().trim_end_matches(';'),
-            ))
-        })
-        .collect()
+fn step_entity_bodies(step: &str) -> EntityBodies<'_> {
+    let mut dense: Vec<Option<&str>> = Vec::new();
+    let mut sparse: HashMap<u64, &str> = HashMap::default();
+    for (id, body) in step.lines().filter_map(entity_line) {
+        // A writer's ids run 1, 2, 3, ...: a table by id, the last body of an
+        // id kept as a map keeps it; any id far past the lines read so far
+        // goes to the map.
+        match usize::try_from(id).ok().filter(|&index| index <= dense.len() + 1024) {
+            Some(index) if sparse.is_empty() => {
+                if index >= dense.len() {
+                    dense.resize(index + 1, None);
+                }
+                dense[index] = Some(body);
+            }
+            _ => {
+                if sparse.is_empty() {
+                    sparse.extend(dense.drain(..).enumerate().filter_map(|(index, body)| body.map(|body| (index as u64, body))));
+                }
+                sparse.insert(id, body);
+            }
+        }
+    }
+    EntityBodies { dense, sparse }
+}
+
+/// Entity bodies by id ([`step_entity_bodies`]): a table while the ids are
+/// dense, a map once they are not; the same answers either way.
+struct EntityBodies<'a> {
+    dense: Vec<Option<&'a str>>,
+    sparse: HashMap<u64, &'a str>,
+}
+
+impl<'a> EntityBodies<'a> {
+    fn get(&self, id: &u64) -> Option<&&'a str> {
+        if !self.sparse.is_empty() {
+            return self.sparse.get(id);
+        }
+        usize::try_from(*id).ok().and_then(|index| self.dense.get(index)).and_then(Option::as_ref)
+    }
+
+    fn iter(&self) -> Box<dyn Iterator<Item = (u64, &'a str)> + '_> {
+        if self.sparse.is_empty() {
+            Box::new(self.dense.iter().enumerate().filter_map(|(index, body)| body.map(|body| (index as u64, body))))
+        } else {
+            Box::new(self.sparse.iter().map(|(id, body)| (*id, *body)))
+        }
+    }
+}
+
+impl<'a> std::ops::Index<&u64> for EntityBodies<'a> {
+    type Output = &'a str;
+    fn index(&self, id: &u64) -> &&'a str {
+        self.get(id).expect("an entity with that id")
+    }
+}
+
+/// `#N=body;` read as `(N, body)`, as `strip_prefix('#')`, `split_once('=')`
+/// and `parse::<u64>` read it (an optional `+`, then digits up to the first
+/// `=`), without a searcher per line.
+fn entity_line(line: &str) -> Option<(u64, &str)> {
+    let bytes = line.as_bytes();
+    if bytes.first() != Some(&b'#') {
+        return None;
+    }
+    let mut index = 1;
+    if bytes.get(index) == Some(&b'+') {
+        index += 1;
+    }
+    let start = index;
+    let mut id: u64 = 0;
+    while let Some(&byte) = bytes.get(index) {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        id = id.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+        index += 1;
+    }
+    if index == start || bytes.get(index) != Some(&b'=') {
+        return None;
+    }
+    Some((id, line[index + 1..].trim_end().trim_end_matches(';')))
+}
+
+/// The first position of `needle` in `haystack`, as `str::find` gives it,
+/// scanning for its first byte (no searcher to set up per line).
+fn find_bytes(haystack: &str, needle: &str) -> Option<usize> {
+    let first = needle.chars().next()?;
+    let rest = &needle.as_bytes()[first.len_utf8()..];
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = haystack.get(from..)?.find(first) {
+        let at = from + offset;
+        let after = at + first.len_utf8();
+        if bytes.get(after..after + rest.len()) == Some(rest) {
+            return Some(at);
+        }
+        from = after;
+    }
+    None
 }
 
 /// Every `#N` reference in an entity body, in order.  For the entities audited
@@ -1750,7 +2017,7 @@ fn step_entity_refs(body: &str) -> Vec<u64> {
 pub fn audit_step_pcurves(step: &str) -> Vec<String> {
     let bodies = step_entity_bodies(step);
     let mut issues = Vec::new();
-    for (id, body) in &bodies {
+    for (id, body) in bodies.iter() {
         if !body.starts_with("EDGE_CURVE(") {
             continue;
         }
@@ -1818,18 +2085,15 @@ pub fn audit_step_manifold(step: &str) -> Vec<String> {
     let marker = "ORIENTED_EDGE('',*,*,#";
     let mut uses = HashMap::<u64, Vec<bool>>::default();
     for line in step.lines() {
-        let Some(offset) = line.find(marker) else {
+        let Some(offset) = find_bytes(line, marker) else {
             continue;
         };
         let rest = &line[offset + marker.len()..];
-        let digits = rest
-            .chars()
-            .take_while(|character| character.is_ascii_digit())
-            .collect::<String>();
-        let Ok(edge_id) = digits.parse::<u64>() else {
+        let length = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let Ok(edge_id) = rest[..length].parse::<u64>() else {
             continue;
         };
-        let suffix = &rest[digits.len()..];
+        let suffix = &rest[length..];
         let sense = suffix.starts_with(",.T.");
         uses.entry(edge_id).or_default().push(sense);
     }

@@ -953,38 +953,27 @@ fn draft_convex_polyhedron(
             }
         }
     }
-    let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
-    let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
-    for v in &solid.vertices {
-        low = Vec3::new(low.x.min(v.point.x), low.y.min(v.point.y), low.z.min(v.point.z));
-        high = Vec3::new(high.x.max(v.point.x), high.y.max(v.point.y), high.z.max(v.point.z));
-    }
-    let extent = high.sub(low).length();
-    let margin = extent * (1.0 + angle_radians.tan().abs()) + 1.0;
-    let corner = low.sub(Vec3::new(margin, margin, margin));
-    let size = high.sub(low).add(Vec3::new(2.0 * margin, 2.0 * margin, 2.0 * margin));
-    let mut body = crate::make_box_brep(corner, size.x, size.y, size.z)?;
+    // The polyhedron the half-spaces bound, its corners where three planes
+    // meet and a face per plane that bounds it, each on a plane patch the
+    // size of the face (a patch the size of a box round the body would carry
+    // its area and moments at the box's precision, not the face's).
+    // The planes are read about the body's own centre (the corners' bars then
+    // scale with the body, not with where it stands), and a plane that repeats
+    // another (a face split in two on one carrier) is kept once.
+    let centre = solid.vertices.iter().fold(Vec3::new(0.0, 0.0, 0.0), |s, v| s.add(v.point)).scale(1.0 / solid.vertices.len().max(1) as f64);
+    let mut planes: Vec<(Vec3, f64)> = Vec::new();
     for (origin, normal) in &half_spaces {
-        match crate::split_solid_by_plane(&body, *origin, *normal) {
-            Ok((inside, _)) => body = inside,
-            Err(error) if error.contains("does not intersect") => {
-                if body.vertices.iter().all(|v| v.point.sub(*origin).dot(*normal) >= -plane_tolerance) {
-                    return Err("the drafted half-spaces leave nothing".into());
-                }
-            }
-            Err(error) => return Err(error),
+        let offset = normal.dot(origin.sub(centre));
+        if !planes.iter().any(|(n, d)| n.dot(*normal) > 1.0 - 1e-12 && (d - offset).abs() <= plane_tolerance) {
+            planes.push((*normal, offset));
         }
     }
-    // The enclosing box must not be part of the answer: an unbounded draft
-    // would leave one of its faces standing.
-    let inner_low = corner.add(Vec3::new(plane_tolerance, plane_tolerance, plane_tolerance).scale(1e3));
-    let inner_high = corner.add(size).sub(Vec3::new(plane_tolerance, plane_tolerance, plane_tolerance).scale(1e3));
-    if body.vertices.iter().any(|v| {
-        v.point.x <= inner_low.x || v.point.y <= inner_low.y || v.point.z <= inner_low.z
-            || v.point.x >= inner_high.x || v.point.y >= inner_high.y || v.point.z >= inner_high.z
-    }) {
-        return Err("the drafted half-spaces do not bound a solid".into());
+    let (corners, loops) = brep_construction::solid_sweep_caps::polyhedron_of_planes(&planes).map_err(|e| e.to_string())?;
+    if corners.len() < 4 || loops.len() < 4 {
+        return Err("the drafted half-spaces leave nothing".into());
     }
+    let corners: Vec<Vec3> = corners.iter().map(|p| p.add(centre)).collect();
+    let body = brep_construction::make_polyhedron_brep(&corners, &loops).map_err(|e| format!("the drafted half-spaces do not bound a solid ({e})"))?;
     accept_result(solid, &body).map_err(|e| e.to_string())?;
     Ok(body)
 }

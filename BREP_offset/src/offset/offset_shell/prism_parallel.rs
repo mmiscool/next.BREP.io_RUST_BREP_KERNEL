@@ -149,7 +149,7 @@ fn prism_parallel_impl(source: &BrepSolid, depth: f64) -> Result<Option<OffsetSh
     let tolerance = 1e-7 * scale;
     let prism = recognize(source, tolerance)?;
     if prism.height <= 2.0 * depth + tolerance {
-        return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_solid_shrinks_to_nothing", format!(
+        return Err(KernelRefusal::ill_posed(KernelStage::Refine, "offset_solid_shrinks_to_nothing", format!(
             "offset_solid: the shrink by {depth:.6} leaves nothing: the prism is {:.6} high, so its moved caps meet or cross",
             prism.height
         )));
@@ -220,7 +220,7 @@ fn prism_parallel_impl(source: &BrepSolid, depth: f64) -> Result<Option<OffsetSh
         kept.push(distance_to_profile(point)? >= depth - 1e-6 * diameter.max(1.0));
     }
     if kept.iter().all(|keep| !keep) {
-        return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_solid_shrinks_to_nothing", format!(
+        return Err(KernelRefusal::ill_posed(KernelStage::Refine, "offset_solid_shrinks_to_nothing", format!(
             "offset_solid: the shrink by {depth:.6} leaves nothing: no point of the profile's inward offset lies that far from the profile"
         )));
     }
@@ -264,7 +264,7 @@ fn prism_parallel_impl(source: &BrepSolid, depth: f64) -> Result<Option<OffsetSh
             .abs()
             * 0.5;
         if enclosed <= 1e-9 * diameter * diameter {
-            return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_solid_shrinks_to_nothing", format!(
+            return Err(KernelRefusal::ill_posed(KernelStage::Refine, "offset_solid_shrinks_to_nothing", format!(
                 "offset_solid: the shrink by {depth:.6} leaves nothing: the points of the profile's inward offset that far from it enclose no area ({enclosed:.3e})"
             )));
         }

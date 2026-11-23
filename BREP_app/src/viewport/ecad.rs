@@ -509,15 +509,24 @@ fn store(
     Ok(None)
 }
 
-/// The workbench's name as the strip starts its line; PCB's own sheet is its
-/// schematic.
+/// The workbench's name as the strip starts its line: its label in the
+/// switcher.
 fn strip_name(target: Target, editors: &Editors) -> &'static str {
+    match workbench_of(target, editors) {
+        "diagram" => "Harness diagram",
+        "schematic" => "PCB diagram",
+        "pcb" => "PCB",
+        "symbol" => "Symbol",
+        _ => "Pads",
+    }
+}
+
+/// The workbench showing `target`'s editor. The sheet-and-board editor has two
+/// (`workbench::ecad::BENCHES`), and the view it is held in says which.
+pub(crate) fn workbench_of(target: Target, editors: &Editors) -> &'static str {
     match target {
-        Target::Diagram => "Diagram",
-        Target::Pcb if editors.pcb.view == brep_ecad_egui::View::Board => "PCB",
-        Target::Pcb => "Schematic",
-        Target::Symbol => "Symbol",
-        Target::Pads => "Pads",
+        Target::Pcb if editors.pcb.view == brep_ecad_egui::View::Schematic => "schematic",
+        _ => target.workbench_id(),
     }
 }
 
@@ -553,7 +562,7 @@ fn status_of(
     let percent = zoom / 0.012 * 100.0;
     let Some((canvas, p)) = canvas.zip(pointer).filter(|(canvas, p)| canvas.contains(*p)) else {
         let text = match name {
-            "Diagram" | "Schematic" => {
+            "Harness diagram" | "PCB diagram" => {
                 let editor = if target == Target::Diagram { &editors.diagram } else { &editors.pcb };
                 format!("{name} · {:?} · {percent:.0}%", editor.tool)
             }
@@ -959,7 +968,7 @@ pub(crate) fn host_frame(
     let opened = match store(target, ecad, sync, engine, opening) {
         Ok(opened) => opened,
         Err(reason) => {
-            engine.push_notice(format!("{}: edit not saved: {reason}", target.workbench_id()));
+            engine.push_notice(format!("{}: edit not saved: {reason}", strip_name(target, ecad)));
             None
         }
     };
@@ -1417,7 +1426,7 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
     use serde_json::json;
     let (pan, zoom) = pan_zoom(target, editors);
     let mut state = json!({
-        "target": target.workbench_id(),
+        "target": workbench_of(target, editors),
         "inStep": in_step(target, editors, history),
         "revision": history.revision(),
         "pan": [pan.x, pan.y],

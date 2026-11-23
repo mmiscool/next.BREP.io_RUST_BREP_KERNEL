@@ -57,21 +57,53 @@ pub use brep_boolean::*;
 #[doc(hidden)]
 pub mod solid_sweep;
 pub use solid_sweep::{
-    clip_less_on, sweep_clip_less, sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
+    clip_less_on, screw_profile_brep, sweep_clip_less, sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
 };
 pub use planar_region::{cut_planar_sweep_from_prism, region_cut_on, swept_region_holds, target_outline_holds};
 #[path = "construction/turn_window.rs"]
 mod turn_window;
+#[path = "construction/turned_disc.rs"]
+mod turned_disc;
 #[path = "construction/slide_prism.rs"]
 mod slide_prism;
 #[path = "construction/solid_sweep_bar.rs"]
 mod solid_sweep_bar;
+#[path = "construction/solid_sweep_turn_shadow.rs"]
+pub mod solid_sweep_turn_shadow;
 #[path = "construction/solid_sweep_caps.rs"]
 #[doc(hidden)]
 pub mod solid_sweep_caps;
+#[path = "construction/solid_sweep_one_pass.rs"]
+mod solid_sweep_one_pass;
 #[path = "construction/solid_sweep_trim.rs"]
 #[doc(hidden)]
 pub mod solid_sweep_trim;
+#[path = "construction/solid_sweep_thread.rs"]
+#[doc(hidden)]
+pub mod solid_sweep_thread;
+#[path = "construction/solid_sweep_tube.rs"]
+#[doc(hidden)]
+pub mod solid_sweep_tube;
+#[path = "construction/mill_envelope.rs"]
+pub mod mill_envelope;
+#[path = "construction/mill_plan.rs"]
+pub mod mill_plan;
+#[path = "construction/mill_faces.rs"]
+pub mod mill_faces;
+#[path = "construction/mill_dome.rs"]
+pub mod mill_dome;
+#[path = "construction/solid_sweep_apex.rs"]
+pub mod solid_sweep_apex;
+pub use solid_sweep_apex::{sweep_pyramid_within, Pyramid, APEX_SWEEP_REFUSAL};
+#[path = "construction/solid_sweep_upright.rs"]
+pub mod solid_sweep_upright;
+#[path = "construction/solid_sweep_planar_ring.rs"]
+pub mod solid_sweep_planar_ring;
+pub use solid_sweep_upright::sweep_upright_along;
+#[path = "construction/solid_sweep_notch.rs"]
+#[doc(hidden)]
+pub mod solid_sweep_notch;
+pub use solid_sweep_notch::{notch_less, notch_less_on};
 #[path = "construction/planar_region.rs"]
 #[doc(hidden)]
 pub mod planar_region;
@@ -87,6 +119,12 @@ pub use closed_curves::{make_ellipse, make_ellipse_arc, make_ellipsoid_brep, mak
 #[doc(hidden)]
 pub mod surface_faces;
 pub use surface_faces::{face_from_surface, face_from_surface_trimmed, sheet_from_sheets, solid_from_sheets, SURFACE_FACE_REFUSAL};
+#[path = "construction/slab.rs"]
+pub mod slab;
+pub use slab::{make_slab_brep, SLAB_REFUSAL};
+#[path = "construction/polyhedron.rs"]
+pub mod polyhedron;
+pub use polyhedron::{make_polyhedron_brep, POLYHEDRON_REFUSAL};
 #[path = "construction/polygon_solids.rs"]
 #[doc(hidden)]
 pub mod polygon_solids;
@@ -128,14 +166,17 @@ pub use sweep_topology::{
     sweep_profile_along_path,
     sweep_profile_along_path_anchored,
     sweep_profile_helix,
-    sweep_profile_twisted, sweep_profile_twisted_anchored, sweep_profile_twisted_scaled,
+    sweep_profile_twisted, sweep_profile_twisted_anchored, sweep_profile_twisted_within, sweep_profile_twisted_scaled,
     ProfileAnchor, SectionPlacement,
     StationBudget, SweepStationReport, SweptChain, SWEEP_DEFAULT_TOLERANCE, SWEEP_MAX_STATIONS,
     SWEEP_REFINEMENT_ROUNDS,
 };
 #[path = "construction/gears.rs"]
 pub mod gears;
-pub use gears::{worm_wheel_sizes, worm_wheel_solid, WormWheel, elliptical_section, elliptical_sizes, elliptical_solid, EllipticalGear, bevel_cones, bevel_section, bevel_solid, prism_by_rows, BevelGear, cycloidal_gear_section, cycloidal_gear_solid, CycloidalGear, cycloidal_disc_section, cycloidal_disc_solid, cycloidal_pin_ring, CycloidalDisc, worm_section, worm_solid, Worm, geneva_section, geneva_sizes, geneva_solid, GenevaWheel, ratchet_section, ratchet_solid, Ratchet, timing_pulley_section, timing_pulley_solid, TimingPulley, hub_from_section, straight_spline_hub, straight_spline_section, straight_spline_shaft, StraightSpline, helical_solid, helical_transverse, twisted_prism, Hand, HelicalGear, Twist, rack_section, rack_solid, ring_section, ring_solid, ring_solid_helical, sprocket_section, sprocket_solid, spur_section, spur_solid, GearData, GearSection, Rack, RingGear, SectionCurve, Sprocket, SprocketForm, SpurGear, GEAR_FIT_TOLERANCE};
+#[path = "construction/profile_holes.rs"]
+pub mod profile_holes;
+pub use profile_holes::{extrude_profile_with_holes, revolve_profile_with_holes};
+pub use gears::{spur_sector_solid, lobed_section, lobed_sizes, lobed_solid, beveloid_solid, BeveloidGear, star_wheel_section, star_wheel_solid, StarWheel, lantern_solid, LanternPinion, flanged_prism, hollow_prism, crown_limits, crown_sizes, crown_solid, CrownGear, worm_wheel_sizes, worm_wheel_solid, WormWheel, elliptical_section, elliptical_sizes, elliptical_solid, EllipticalGear, bevel_cones, bevel_section, bevel_solid, prism_by_rows, BevelGear, cycloidal_gear_section, cycloidal_gear_solid, CycloidalGear, cycloidal_disc_section, cycloidal_disc_solid, cycloidal_pin_ring, CycloidalDisc, worm_section, worm_solid, Worm, geneva_section, geneva_sizes, geneva_solid, GenevaWheel, ratchet_section, ratchet_solid, Ratchet, timing_pulley_section, timing_pulley_solid, TimingPulley, hub_from_section, straight_spline_hub, straight_spline_section, straight_spline_shaft, StraightSpline, helical_solid, helical_transverse, twisted_prism, Hand, HelicalGear, Twist, rack_section, rack_solid, ring_section, ring_solid, ring_solid_helical, sprocket_section, sprocket_solid, spur_section, spur_solid, GearData, GearSection, Rack, RingGear, SectionCurve, Sprocket, SprocketForm, SpurGear, GEAR_FIT_TOLERANCE};
 #[path = "construction/revolve_topology.rs"]
 #[doc(hidden)]
 pub mod revolve_topology;

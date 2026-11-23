@@ -80,6 +80,12 @@ const RAMP_SLOPE: [f64; ATTEMPTS] = [0.25, 0.15, 0.1, 0.1];
 /// How many plans a relief tries before it gives up.
 pub const ATTEMPTS: usize = 4;
 
+/// `BREP_RELIEF_RAMP_WITHIN_2R` (on by default; `=0` restores the ramps' own
+/// lengths): see the ramp in the plan.
+pub fn relief_ramp_within_2r_on() -> bool {
+    crate::switch!("BREP_RELIEF_RAMP_WITHIN_2R", true)
+}
+
 /// Ceiling stations per edge, at the midpoints of equal parameter intervals.
 const CEILING_STATIONS: usize = 48;
 
@@ -712,7 +718,20 @@ pub fn plan_relief(
         return Ok(None);
     }
     let plateau = |members: &[usize]| members.iter().map(|&n| target[n]).fold(f64::INFINITY, f64::min);
-    let ramp = |level: f64| (radius - level) / RAMP_SLOPE[attempt];
+    // `BREP_RELIEF_RAMP_WITHIN_2R`: the first plan's ramps end within 2R of
+    // their zones (0.9 of it), so a run that far from a relieved round has
+    // the requested radius, the ordinary fillet there (brep-conformance's
+    // tight chains bound the result by that); a plan that folds is planned
+    // again with the longer ramps as before.
+    // Only where the law's samples are fine enough to carry it: stops at
+    // most R/10 apart (an edge up to about a hundred R long), else the
+    // interpolated law would stretch the ramp past 2R again.
+    let finest = graph.adjacency.iter().flatten().map(|&(_, span)| span).fold(0.0f64, f64::max);
+    let within = relief_ramp_within_2r_on() && attempt == 0 && finest <= 0.1 * radius;
+    let ramp = |level: f64| {
+        let length = (radius - level) / RAMP_SLOPE[attempt];
+        if within { length.min(1.8 * radius) } else { length }
+    };
     // Merge zones whose ramps would meet.
     loop {
         let fields: Vec<Vec<f64>> = zones.iter().map(|members| distances(&graph, members)).collect();

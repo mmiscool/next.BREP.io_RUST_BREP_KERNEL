@@ -272,12 +272,78 @@ pub fn n_sided_fill_shortening_reach_spokes_off_sides(
     fill(sides, Some(tangents), true, true)
 }
 
+/// [`n_sided_fill`] with the centre's height chosen to make the centre
+/// twists agree. The centre lies on the line from the midpoints' mean to the
+/// mean of the midpoints shot along their spokes' directions. The plain fill
+/// takes the middle of that line. Here the point is chosen where the
+/// least-squares misfit of the centre-twist system is least: a coarse scan,
+/// then golden sections. With an even number of sides that system has an
+/// exact solution only for one height, and anywhere else its misfit is a
+/// crease along the spokes. This is the fill for a set-back corner, whose
+/// six sides alternate between round sections and flat curves.
+pub fn n_sided_fill_centre_solved(
+    sides: &[NurbsCurve],
+    tangents: &[NurbsCurve],
+) -> Result<(Vec<NurbsSurface>, NSidedReport), NSidedRefusal> {
+    let misfit = |f: f64| fill_at(sides, Some(tangents), false, false, f, true).map(|(_, _, r)| r * r).unwrap_or(f64::INFINITY);
+    // A coarse scan, then parabolas through the three best points on the
+    // squared misfit (near its least, a quadratic in the height).
+    let mut seen: Vec<(f64, f64)> = (0..=15).map(|k| 0.1 * k as f64).map(|f| (f, misfit(f))).collect();
+    let Some(&(start, least)) = seen.iter().min_by(|a, b| a.1.total_cmp(&b.1)) else {
+        return fill(sides, Some(tangents), false, false);
+    };
+    if !least.is_finite() {
+        return fill(sides, Some(tangents), false, false);
+    }
+    seen.retain(|(f, _)| (f - start).abs() <= 0.1 + 1e-12);
+    let mut f = start;
+    for _ in 0..12 {
+        seen.sort_by(|a, b| a.1.total_cmp(&b.1));
+        seen.truncate(3);
+        if seen.len() < 3 {
+            break;
+        }
+        let [(a, fa), (b, fb), (c, fc)] = [seen[0], seen[1], seen[2]];
+        let num = (b - a).powi(2) * (fb - fc) - (b - c).powi(2) * (fb - fa);
+        let den = (b - a) * (fb - fc) - (b - c) * (fb - fa);
+        if !(den.abs() > 0.0) {
+            break;
+        }
+        let next = b - 0.5 * num / den;
+        let lo = seen.iter().map(|p| p.0).fold(f64::INFINITY, f64::min) - 0.1;
+        let hi = seen.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max) + 0.1;
+        if !(next > lo && next < hi) || seen.iter().any(|p| (p.0 - next).abs() <= 1e-12) {
+            break;
+        }
+        let value = misfit(next);
+        seen.push((next, value));
+        f = seen.iter().min_by(|x, y| x.1.total_cmp(&y.1)).map(|p| p.0).unwrap_or(f);
+    }
+    let f = seen.iter().min_by(|x, y| x.1.total_cmp(&y.1)).map(|p| p.0).unwrap_or(f);
+    fill_at(sides, Some(tangents), false, false, f, false).map(|(patches, report, _)| (patches, report.expect("a full fill reports")))
+}
+
 fn fill(
     sides: &[NurbsCurve],
     tangents: Option<&[NurbsCurve]>,
     shorten_reach: bool,
     spokes_off_sides: bool,
 ) -> Result<(Vec<NurbsSurface>, NSidedReport), NSidedRefusal> {
+    fill_at(sides, tangents, shorten_reach, spokes_off_sides, 0.5, false).map(|(patches, report, _)| (patches, report.expect("a full fill reports")))
+}
+
+/// The fill with its centre `centre_at` of the way from the midpoints' mean
+/// to their shot mean (0.5: the plain fill). Also returns the misfit of its
+/// centre-twist system. With `misfit_only`, it returns once that is known,
+/// with no patches and no report.
+fn fill_at(
+    sides: &[NurbsCurve],
+    tangents: Option<&[NurbsCurve]>,
+    shorten_reach: bool,
+    spokes_off_sides: bool,
+    centre_at: f64,
+    misfit_only: bool,
+) -> Result<(Vec<NurbsSurface>, Option<NSidedReport>, f64), NSidedRefusal> {
     let count = sides.len();
     if !(3..=12).contains(&count) {
         return Err(NSidedRefusal::SideCount { sides: count });
@@ -604,7 +670,8 @@ fn fill(
         shot = shot.add(middle[index].add(across[index].scale(reach[index] / pace)));
     }
     let shot = shot.scale(1.0 / count as f64);
-    let centre = mean.add(shot).scale(0.5);
+    // (the plain fill's middle written as before, to the bit)
+    let centre = if centre_at == 0.5 { mean.add(shot).scale(0.5) } else { mean.add(shot.sub(mean).scale(centre_at)) };
     let normal = (0..count)
         .fold(Vec3::new(0.0, 0.0, 0.0), |sum, index| {
             let along = slope(&first[index], 1.0).unwrap_or(Vec3::new(0.0, 0.0, 0.0));
@@ -861,6 +928,10 @@ fn fill(
         normal_rhs[i] += regular * plain[i];
     }
     let solved = crate::solve_dense(normal_matrix, normal_rhs).map_err(geometry)?;
+    let centre_misfit = rows.iter().zip(&rhs).map(|(row, value)| (row.iter().zip(&solved).map(|(a, b)| a * b).sum::<f64>() - value).powi(2)).sum::<f64>().sqrt();
+    if misfit_only {
+        return Ok((Vec::new(), None, centre_misfit));
+    }
     let centre_twist = |k: usize| Vec3::new(solved[3 * k], solved[3 * k + 1], solved[3 * k + 2]);
     let lambda_slope = |k: usize| solved[3 * count + k];
     let mu_slope = |k: usize| solved[4 * count + k];
@@ -1004,7 +1075,7 @@ fn fill(
 
     Ok((
         patches,
-        NSidedReport {
+        Some(NSidedReport {
             sides: count,
             reversed,
             corner_gap,
@@ -1017,7 +1088,8 @@ fn fill(
             twist_discrepancy,
             cross_derivative_residual,
             split_parameters,
-        },
+        }),
+        centre_misfit,
     ))
 }
 

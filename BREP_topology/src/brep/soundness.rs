@@ -151,6 +151,8 @@ pub mod analytic_body;
 pub mod torus_face;
 #[path = "soundness/concentric_balls.rs"]
 pub mod concentric_balls;
+#[path = "soundness/disjoint_balls.rs"]
+pub mod disjoint_balls;
 #[path = "soundness/coaxial_revolution.rs"]
 pub mod coaxial_revolution;
 #[path = "soundness/tube_grid.rs"]
@@ -892,6 +894,22 @@ pub fn solid_self_intersections(
         }
         return Ok(SelfIntersectionReport {
             certificate: Some("concentric_balls"),
+            ..empty_intersection_report(options)
+        });
+    }
+    if disjoint_balls::enabled() && disjoint_balls::certifies(solid, options) {
+        if disjoint_balls::check_mode() {
+            let full = solid_self_intersections_full(solid, options)?;
+            if full.is_flagged() {
+                eprintln!("soundness.disjoint_balls DISAGREES: the full scan flags a body the certificate passed: {:?}", full.summary());
+            }
+            return Ok(full);
+        }
+        if let Some(started) = started {
+            profile_line!("soundness.profile ms={:.2} faces={} certificate=disjoint_balls triangles=0 confirmed=0 folds=0", started.elapsed().as_secs_f64()*1000.0, solid.shells.iter().map(|shell| shell.faces.len()).sum::<usize>());
+        }
+        return Ok(SelfIntersectionReport {
+            certificate: Some("disjoint_balls"),
             ..empty_intersection_report(options)
         });
     }

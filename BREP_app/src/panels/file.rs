@@ -2050,10 +2050,10 @@ impl FileDialog {
                     ("export:fabrication", "Fabrication (zip)", "Gerber X2 layers, Excellon drills, pick and place, the parts BOM and a README of the layers, in one zip for the board house", Output::Bundle),
                     ("export:pickplace", "Pick & place (CSV)", "One row per placed part: Designator, Val, Package, Mid X, Mid Y, Rotation, Layer (JLCPCB's columns), in mm from the board's lower-left corner", Output::PickPlace),
                     ("export:ecadbom", "Parts BOM (CSV)", "The electronic parts: Comment (the value), Designator, Footprint, Quantity (JLCPCB's columns), one line per value and footprint", Output::Bom),
-                    ("export:kicadnet", "Netlist (KiCad)", "The PCB schematic's nets as a KiCad .net file, the netlist Pcbnew and other tools read: every part with its value and footprint, every net with its pins, under the names the Connectivity panel lists", Output::Netlist),
+                    ("export:kicadnet", "Netlist (KiCad)", "The PCB diagram's nets as a KiCad .net file, the netlist Pcbnew and other tools read: every part with its value and footprint, every net with its pins, under the names the Connectivity panel lists", Output::Netlist),
                 ] {
                     let (enabled, why) = match output {
-                        Output::Netlist => (has_schematic, "Put parts on the PCB schematic first"),
+                        Output::Netlist => (has_schematic, "Put parts on the PCB diagram first"),
                         _ => (has_board, no_board),
                     };
                     let button = ui

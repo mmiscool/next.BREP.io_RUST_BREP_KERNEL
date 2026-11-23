@@ -32,6 +32,8 @@ pub(super) fn blend_open_smooth_chain(
     chamfer: bool,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // Dense contacts are kept for this ladder only (`BREP_CHAIN_DENSE_REUSE`).
+    let _dense_contacts = dense_contact_scope();
     // The open chain climbs the closed chain's ladder, from the same first
     // rung to the same top: a rung is MEASURED before it is built (its rails
     // against the rolling ball's exact contacts on a dense stencil, a fillet's

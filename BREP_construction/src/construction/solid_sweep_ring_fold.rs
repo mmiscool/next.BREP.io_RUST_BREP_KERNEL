@@ -419,6 +419,17 @@ pub(super) fn ring_slid_past_fold(screw: &Screw, origin: Vec3, w: Vec3, u1: Vec3
                 let [d0, d1] = frag(tool.domain(), "domain")?;
                 let ts: Vec<f64> = (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect();
                 let uv = ts.iter().map(|&t| frag(tool.evaluate(t), "point").map(uv_of)).collect::<Result<Vec<_>, _>>()?;
+                // Broken at the band's span joints and the edge's own (`BREP_SWEEP_PCURVE_JOINTS`).
+                if super::pcurve_joints_on() {
+                    let joints = |spans: usize| (1..spans).map(|k| k as f64 / spans as f64).collect::<Vec<f64>>();
+                    let at = |t: f64| -> Result<[f64; 2], KernelRefusal> {
+                        let p = uv_of(frag(tool.evaluate(t), "point")?);
+                        Ok([p.x, p.y])
+                    };
+                    if let Some(curve) = super::jointed_pcurve(&ts, &uv, at, &joints(spans_u), &joints(spans_v), tool)? {
+                        return if forward { Ok(curve) } else { frag(curve.reversed(), "reversed") };
+                    }
+                }
                 let curve = frag(crate::interpolate_curve(&uv, 5, &ts), "ring_fold_pcurve")?;
                 if forward { Ok(curve) } else { frag(curve.reversed(), "reversed") }
             };

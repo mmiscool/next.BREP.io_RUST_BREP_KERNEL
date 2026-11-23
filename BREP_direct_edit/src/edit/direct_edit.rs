@@ -191,6 +191,10 @@ mod conical_cap;
 mod prism_ring;
 #[path = "direct_edit/fill_gap.rs"]
 pub mod fill_gap;
+#[path = "direct_edit/flat_on_round.rs"]
+mod flat_on_round;
+#[path = "direct_edit/turned_heal.rs"]
+mod turned_heal;
 #[path = "direct_edit/blend_network_heal.rs"]
 mod blend_network_heal;
 

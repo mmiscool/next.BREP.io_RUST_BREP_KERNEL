@@ -25,7 +25,7 @@ use collect::{ChainSegment, SmoothChain};
 pub use march::{march_chain, ChainBudget, ChainSample, FoldPolicy, CHAIN_PER_SEGMENT};
 pub use march::{march_chain_typed, ChainMarchError};
 pub use march::{assign_chain_parameters, chain_dense_contacts, insert_chain_stations, DenseContacts};
-use march::{ladder_trend, ChainStationFailure, CHAIN_CARVE_MAX_PER_SEGMENT};
+use march::{dense_contact_scope, ladder_trend, ChainStationFailure, CHAIN_CARVE_MAX_PER_SEGMENT};
 use open::blend_open_smooth_chain;
 
 /// The edges of the smooth (G1) chain through `edge_id`, in chain order, and

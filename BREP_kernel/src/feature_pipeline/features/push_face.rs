@@ -119,8 +119,44 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // Chain the pushes off a clone of the resident target. The outward normal is
     // recomputed from the CURRENT solid each pass (face ids are stable across
     // `move_faces`), so multiple faces push along their own up-to-date normals.
-    let mut solid = crate::with_registered_solid_str(target_handle, |solid| Ok(solid.clone()))?;
+    let solid = crate::with_registered_solid_str(target_handle, |solid| Ok(solid.clone()))?;
 
+    let solid = push_faces(solid, &face_ids, distance, &mut result.notes, true)?;
+
+    // `move_faces` preserves every face name — collect, never re-stamp.
+    let face_names = common::collect_face_names(&solid);
+    let edge_names = common::collect_edge_names(&solid);
+    let handle = crate::register_solid_value(solid);
+    result.added.push(AddedSolid {
+        handle,
+        name: target_name.clone(),
+        face_names,
+        edge_names,
+        ..AddedSolid::default()
+    });
+    // The target is consumed; the loop reuses its name for the result.
+    result.removed.push(target_name);
+    Ok(result)
+}
+
+/// The push itself, shared with the public [`crate::offset_faces`]: each of
+/// `face_ids` moved `distance` along its outward normal onto its offset
+/// carrier (by carrier, as `build` documents), then the body's acceptance.
+/// Notes the roads leave go to `notes_out`.
+///
+/// `past_neighbours`: whether a planar face carried BEYOND a neighbour (an
+/// edge between them turned over) takes the re-cut road, the boolean the push
+/// defines (the feature's answer), or is refused as ill-posed (the public
+/// call's: the face pushed past the face it was to meet). A face landed
+/// exactly ON a neighbour (an edge collapsed: two tops merged, a slot closed)
+/// takes the re-cut road either way.
+pub(crate) fn push_faces(
+    mut solid: BrepSolid,
+    face_ids: &[u64],
+    distance: f64,
+    notes_out: &mut Vec<String>,
+    past_neighbours: bool,
+) -> Result<BrepSolid, FeatureRefusal> {
     // A selected cylinder or cone written as SEVERAL faces (an imported bore
     // whose wall the exporter split into two half cylinders, its countersink
     // into two half cones) is one carrier the user picked whole. A half pushed
@@ -129,8 +165,13 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // that face is pushed once. Only faces of the selection join, only with
     // each other; a face that joins nothing is pushed as it was. The joined
     // face keeps the first piece's id and name.
-    let face_ids = merge_selected_ruled_pieces(&mut solid, &face_ids)?;
-    for face_id in &face_ids {
+    let mut face_ids = merge_selected_ruled_pieces(&mut solid, face_ids)?;
+    for index in 0..face_ids.len() {
+        let id = face_ids[index];
+        let face_id = &id;
+        // The faces still to push, followed into a re-cut body (which
+        // numbers its faces afresh) where one is taken below.
+        let mut followed: Option<Vec<u64>> = None;
         // Route by the pushed face's CARRIER (a face is a trimmed surface):
         // - PLANAR → translate the plane + re-intersect neighbours (`move_faces`,
         //   SM0–SM1c): the surface keeps its size.
@@ -152,6 +193,57 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                     // the body without the fillet, which is then re-made on the
                     // edge the push leaves, under its radius law. Only past a
                     // refusal, and only where such a fillet borders the face.
+                    // A push that lands the face exactly on a neighbour, or
+                    // carries it past one (a slot's wall pushed across the
+                    // slot, closing it), has no re-solve: an edge collapses
+                    // or turns over. Its answer is the boolean the push
+                    // defines, so the RE-CUT road Transform Face takes is
+                    // offered it (the body grown or cut by the face's swept
+                    // slab, checked by the same acceptance); the re-solve's
+                    // refusal stays the primary one if the re-cut declines.
+                    Err(refusal) if !past_neighbours && is_inversion(&refusal) => {
+                        return Err(crate::KernelRefusal::ill_posed(
+                            crate::KernelStage::Refine,
+                            "pushed_past_a_neighbour",
+                            format!("offset_faces: the face is carried past a neighbour it was to meet ({refusal})"),
+                        )
+                        .into())
+                    }
+                    // Landed exactly on one neighbour, the push may still
+                    // pass another (the move names the first edge it meets,
+                    // in storage order): read short of the landing until a
+                    // read lands on none, where only a face carried past a
+                    // neighbour still turns an edge over.
+                    Err(refusal)
+                        if !past_neighbours
+                            && is_collapse_or_inversion(&refusal)
+                            && passes_a_neighbour_short_of(&solid, *face_id, normal, distance) =>
+                    {
+                        return Err(crate::KernelRefusal::ill_posed(
+                            crate::KernelStage::Refine,
+                            "pushed_past_a_neighbour",
+                            format!("offset_faces: the face is carried past a neighbour it was to meet, landing on another ({refusal})"),
+                        )
+                        .into())
+                    }
+                    Err(refusal) if is_collapse_or_inversion(&refusal) => {
+                        match super::transform_face::recut_past_a_refusal(&solid, &[*face_id], None, normal.scale(distance)) {
+                            Ok((body, lost)) => {
+                                notes_out.push(format!(
+                                    "pushFace: the pushed face could not be re-solved ({refusal}), so it was \
+                                     RE-CUT from the body instead: the boolean this push defines"
+                                ));
+                                notes_out.extend(lost);
+                                followed = Some(follow_by_name(&solid, &body, &face_ids[index + 1..])?);
+                                body
+                            }
+                            Err(reason) => {
+                                let combined = refusal
+                                    .with_message(|refusal| format!("{refusal}. The re-cut road was offered it too and declined: {reason}"));
+                                return Err(super::transform_face::with_declines_class(combined, &[&reason]).into())
+                            }
+                        }
+                    }
                     Err(refusal) => {
                         let without = crate::rebuild_displaced_blends(&solid, &[*face_id], "pushFace", |sharp| {
                             let pushed = move_faces_unchecked(sharp, &[*face_id], normal.scale(distance))?;
@@ -163,7 +255,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                                 return Err(crate::with_blend_rebuild_decline(refusal, &decline).into())
                             }
                             Some(Ok((pushed, notes))) => {
-                                result.notes.extend(notes);
+                                notes_out.extend(notes);
                                 pushed
                             }
                         }
@@ -189,6 +281,10 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
                 solid = crate::offset_freeform_face_unchecked(&solid, *face_id, distance)?;
             }
         }
+        if let Some(rest) = followed {
+            face_ids.truncate(index + 1);
+            face_ids.extend(rest);
+        }
     }
 
     // Pushing a carrier past a neighbour's own extent leaves the moved face
@@ -199,20 +295,123 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // routes to, including the planar `move_faces` lane.
     let solid = crate::accept_sound(solid, "pushFace")?;
 
-    // `move_faces` preserves every face name — collect, never re-stamp.
-    let face_names = common::collect_face_names(&solid);
-    let edge_names = common::collect_edge_names(&solid);
-    let handle = crate::register_solid_value(solid);
-    result.added.push(AddedSolid {
-        handle,
-        name: target_name.clone(),
-        face_names,
-        edge_names,
-        ..AddedSolid::default()
-    });
-    // The target is consumed; the loop reuses its name for the result.
-    result.removed.push(target_name);
-    Ok(result)
+    Ok(solid)
+}
+
+/// The faces `ids` of `before` in `after`, a re-cut of it that numbers its
+/// faces afresh. Each is found by its name where that is one face's in both;
+/// otherwise as the one face of `after` on the same carrier (through three of
+/// its points), of the same sense, the same trimmed area (to 1e-9: a face
+/// the re-cut split or trimmed is not it) and the same corners; a named match
+/// must keep its corners too. A face found neither way cannot be
+/// followed, and the push refuses by name rather than push some other face.
+fn follow_by_name(before: &BrepSolid, after: &BrepSolid, ids: &[u64]) -> Result<Vec<u64>, crate::KernelRefusal> {
+    fn faces(solid: &BrepSolid) -> Vec<&crate::FaceRecord> {
+        solid.shells.iter().flat_map(|shell| &shell.faces).collect()
+    }
+    let (old, new) = (faces(before), faces(after));
+    let scale = crate::solid_model_scale(before).max(1.0);
+    let lost = |id: u64| {
+        crate::KernelRefusal::unsupported(
+            crate::KernelStage::Collect,
+            "recut_lost_selection",
+            format!("pushFace: a push was re-cut, which numbers the body's faces afresh, and face {id} still to push cannot be found in it"),
+        )
+    };
+    let area = |face: &crate::FaceRecord| crate::face_area(face).ok();
+    // A face's corners, sorted: an untouched face keeps them exactly where
+    // they were, and two faces apart never share them all.
+    let corners = |solid: &BrepSolid, face: &crate::FaceRecord| -> Vec<[f64; 3]> {
+        let mut ids: Vec<u64> = face
+            .loops
+            .iter()
+            .flat_map(|lp| &lp.coedges)
+            .filter_map(|coedge| solid.edges.iter().find(|edge| edge.id == coedge.edge_id))
+            .flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id])
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut points: Vec<[f64; 3]> = ids.iter().filter_map(|id| solid.vertices.iter().find(|v| v.id == *id)).map(|v| [v.point.x, v.point.y, v.point.z]).collect();
+        points.sort_by(|a, b| a.iter().zip(b).map(|(x, y)| x.total_cmp(y)).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal));
+        points
+    };
+    let same_corners = |a: &[[f64; 3]], b: &[[f64; 3]]| a.len() == b.len() && a.iter().zip(b).all(|(p, q)| (0..3).all(|k| (p[k] - q[k]).abs() <= 1e-9 * scale));
+    ids.iter()
+        .map(|&id| {
+            let face = old.iter().find(|face| face.id == id).ok_or_else(|| lost(id))?;
+            let was = corners(before, face);
+            let kept = |other: &crate::FaceRecord| same_corners(&was, &corners(after, other));
+            if let Some(name) = face.name.as_deref() {
+                let named_old: Vec<&crate::FaceRecord> = old.iter().filter(|f| f.name.as_deref() == Some(name)).copied().collect();
+                let named_new: Vec<&crate::FaceRecord> = new.iter().filter(|f| f.name.as_deref() == Some(name)).copied().collect();
+                if let ([_], [found]) = (named_old.as_slice(), named_new.as_slice()) {
+                    if kept(found) {
+                        return Ok(found.id);
+                    }
+                }
+            }
+            let (Ok([u0, u1]), Ok([v0, v1])) = (face.surface.domain_u(), face.surface.domain_v()) else { return Err(lost(id)) };
+            let probes: Vec<crate::Vec3> = [(0.25, 0.25), (0.75, 0.3), (0.4, 0.8)]
+                .iter()
+                .filter_map(|&(a, b)| face.surface.evaluate(u0 + a * (u1 - u0), v0 + b * (v1 - v0)).ok())
+                .collect();
+            let want = area(face).ok_or_else(|| lost(id))?;
+            let matches: Vec<u64> = new
+                .iter()
+                .filter(|other| other.same_sense == face.same_sense)
+                .filter(|other| probes.len() == 3 && probes.iter().all(|&p| crate::project_point_to_surface(&other.surface, p).map_or(false, |hit| hit.distance <= 1e-9 * scale)))
+                .filter(|other| area(other).is_some_and(|got| (got - want).abs() <= 1e-9 * want.abs().max(1e-300)))
+                .filter(|other| kept(other))
+                .map(|other| other.id)
+                .collect();
+            match matches.as_slice() {
+                [found] => Ok(*found),
+                _ => Err(lost(id)),
+            }
+        })
+        .collect()
+}
+
+/// Whether the planar push of `face_id` by `distance` along `normal` carries
+/// the face past a neighbour before it lands on another: read short of the
+/// landing by twice the move's own tolerance (its max(1e-7 of the model's
+/// scale, 1e-9)), stepping back again while that read still lands on a
+/// neighbour (another terrace at its height), until a read either builds (no
+/// edge turned over there: nothing passed) or turns an edge over (a neighbour
+/// passed). The move checks every edge, so the first read that does not land
+/// answers whatever order the edges are stored in. A neighbour crossed by
+/// less than three times the tolerance (its edge no longer than the move's
+/// tolerance at the first read short of the landing, which the move reads as
+/// landed) is within the move's resolution and is not read; past 16 landings
+/// in a row it is answered as not passed.
+fn passes_a_neighbour_short_of(solid: &BrepSolid, face_id: u64, normal: Vec3, distance: f64) -> bool {
+    let step = 2.0 * (crate::solid_model_scale(solid) * 1e-7).max(1e-9);
+    let mut short = distance;
+    for _ in 0..16 {
+        short -= step.copysign(distance);
+        if short * distance <= 0.0 {
+            return false;
+        }
+        match move_faces_unchecked(solid, &[face_id], normal.scale(short)) {
+            Err(refusal) if is_inversion(&refusal) => return true,
+            Err(refusal) if is_collapse_or_inversion(&refusal) => continue,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The planar push's refusal for an edge it turns over: the face carried
+/// past a neighbour.
+fn is_inversion(refusal: &crate::KernelRefusal) -> bool {
+    matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what } if what == crate::face_refusal_slugs::EDGE_INVERSION)
+}
+
+/// The planar push's refusal for an edge it collapses to nothing or turns
+/// over: the face landed on, or carried past, a neighbour.
+fn is_collapse_or_inversion(refusal: &crate::KernelRefusal) -> bool {
+    matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what }
+        if what == "edge_collapse" || what == crate::face_refusal_slugs::EDGE_INVERSION)
 }
 
 /// Join the selected cylinder/cone faces that are pieces of one carrier

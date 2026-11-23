@@ -885,6 +885,91 @@ pub fn curve_lies_on_surface(
 /// helper then answers `None`, which is the pre-snap behaviour.
 const HUG_PIECE_CAP: usize = 64;
 
+/// [`HUG_PIECE_CAP`], or four times it under [`near_end_snap_enabled`]: each
+/// certified piece lies within `limit` of ONE foot, so it is at most about
+/// `2 * limit` long, and 64 pieces close a window of about `64 * limit` while
+/// [`hug_could_reach`] admits endpoints `256 * limit` away. A coplanar floor's
+/// offset edge touching a disk's rim at its end hit the rim 1.3e-3 (130 floors)
+/// before the vertex, inside the reach and outside the 64-piece certificate.
+fn hug_piece_cap() -> usize {
+    if near_end_snap_enabled() {
+        4 * HUG_PIECE_CAP
+    } else {
+        HUG_PIECE_CAP
+    }
+}
+
+/// `BREP_IMPRINT_NEAR_END_SNAP` (default off): the tangent-hit endpoint snap
+/// ([`tangent_hit_endpoint`]) is offered to every curve-edge hit, not only one
+/// the finder flags tangential, and its certificate may use
+/// [`hug_piece_cap`]'s wider budget. Two curves that touch at a vertex cross at
+/// a milliradian a millimetre from it, above the tangential flag, and the
+/// finder's hit lands in the tangency band: a coplanar floor's offset edge
+/// touching a disk's rim at the sweep's end vertex split 1.3e-3 before the
+/// vertex, and the sliver piece left open loops. The snap still takes the
+/// endpoint only when the whole span from the hit to it is certified within
+/// the overlap floor of the other curve, where no distinct topology fits.
+pub(super) fn boundary_touch_enabled() -> bool {
+    crate::switch!("BREP_IMPRINT_BOUNDARY_TOUCH", false)
+}
+
+/// Whether `curved` meets the plane of the flat `flat` only along one of its
+/// own boundary iso-curves: every control point of `flat` lies on one plane,
+/// every control point of `curved` lies on one side of it, and those of
+/// `curved` on the plane (within ten tolerances) all sit in one boundary row
+/// or column while every other stands clear of it, and no control stands on
+/// the other side by more than round-off (a boundary row a band below the
+/// plane under rows above it crosses the plane, and is marched). With positive weights a
+/// point of `curved` off that boundary mixes in controls strictly off the
+/// plane, so it is off the plane too: the two surfaces share only that
+/// boundary curve (a bull-nose tool's wall meeting its own top cap's plane
+/// along the rim, the floor's plane along its foot).
+pub(super) fn touches_plane_only_on_boundary(curved: &NurbsSurface, flat: &NurbsSurface, tolerance: f64) -> bool {
+    let band = tolerance.max(1e-12) * 10.0;
+    let point = |c: &Vec4| (c.w > 0.0 && c.w.is_finite()).then(|| Vec3::new(c.x / c.w, c.y / c.w, c.z / c.w));
+    let flat_points: Option<Vec<Vec3>> = flat.control_points.iter().flatten().map(point).collect();
+    let Some(flat_points) = flat_points else { return false };
+    let (Ok([u0, u1]), Ok([v0, v1])) = (flat.domain_u(), flat.domain_v()) else { return false };
+    let (um, vm) = (0.5 * (u0 + u1), 0.5 * (v0 + v1));
+    let (Ok(origin), Ok(normal)) = (flat.evaluate(um, vm), flat.normal(um, vm)) else { return false };
+    if flat_points.iter().any(|p| p.sub(origin).dot(normal).abs() > band) {
+        return false;
+    }
+    let rows = curved.control_points.len();
+    let columns = curved.control_points.first().map_or(0, |row| row.len());
+    if rows < 2 || columns < 2 || curved.control_points.iter().any(|row| row.len() != columns) {
+        return false;
+    }
+    let mut readings: Vec<(usize, usize, f64)> = Vec::new();
+    let mut scale = 1.0f64;
+    for (i, row) in curved.control_points.iter().enumerate() {
+        for (j, control) in row.iter().enumerate() {
+            let Some(p) = point(control) else { return false };
+            scale = scale.max(p.length());
+            readings.push((i, j, p.sub(origin).dot(normal)));
+        }
+    }
+    // The side every control clear of the band stands on; one standing on the
+    // other, by more than round-off, makes the surface cross the plane.
+    let side = readings.iter().find(|(_, _, d)| d.abs() > band).map(|(_, _, d)| d.signum());
+    let Some(side) = side else { return false };
+    let round_off = 1e-12 * scale;
+    if readings.iter().any(|(_, _, d)| side * d < -round_off) {
+        return false;
+    }
+    let on: Vec<(usize, usize)> = readings.iter().filter(|(_, _, d)| d.abs() <= band).map(|(i, j, _)| (*i, *j)).collect();
+    if on.is_empty() {
+        return false;
+    }
+    // One boundary line holds every control on the plane.
+    [Some(0usize), Some(rows - 1)].iter().any(|row| on.iter().all(|(i, _)| Some(*i) == *row))
+        || [Some(0usize), Some(columns - 1)].iter().any(|column| on.iter().all(|(_, j)| Some(*j) == *column))
+}
+
+pub(super) fn near_end_snap_enabled() -> bool {
+    crate::switch!("BREP_IMPRINT_NEAR_END_SNAP", false)
+}
+
 /// Whether every control point of `curve` is finite with a finite, positive
 /// weight: the premise of the convex-hull certificate and of every evaluation
 /// the snap relies on. `NurbsCurve::new` enforces this at construction, but the
@@ -969,6 +1054,67 @@ fn span_hull_within(
     }
     Ok(span_hull_within(along, lo, mid, other, other_low, other_high, limit, budget)?
         && span_hull_within(along, mid, hi, other, other_low, other_high, limit, budget)?)
+}
+
+/// Whether every point of `along` over `[lo, hi]` lies within `limit` of
+/// `surface`, certified over the whole window as [`span_hull_within`] is for a
+/// curve: each piece's control points within `limit` of ONE point of the
+/// surface (the foot of the piece's midpoint) puts the whole piece there, by
+/// the convex hull and the convexity of the distance to a point; a piece that
+/// fails is bisected, up to `budget` pieces in all.
+pub(super) fn span_hull_within_surface(
+    along: &NurbsCurve,
+    lo: f64,
+    hi: f64,
+    surface: &NurbsSurface,
+    limit: f64,
+    budget: &mut usize,
+) -> Result<bool, KernelRefusal> {
+    if *budget == 0 || !(lo < hi) || !lo.is_finite() || !hi.is_finite() || !controls_are_finite(along) {
+        return Ok(false);
+    }
+    *budget -= 1;
+    let [d0, d1] = along.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let mut piece = along.clone();
+    if lo > d0 {
+        piece = match piece.split(lo) {
+            Ok((_, right)) => right,
+            Err(_) => return Ok(false),
+        };
+    }
+    if hi < d1 {
+        piece = match piece.split(hi) {
+            Ok((left, _)) => left,
+            Err(_) => return Ok(false),
+        };
+    }
+    let mid = 0.5 * (lo + hi);
+    let midpoint = along.evaluate(mid).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let foot = project_point_to_surface(surface, midpoint).or_refuse(KernelStage::Intersect, "project_point_to_surface")?.point;
+    if !controls_are_finite(&piece) || !(foot.x.is_finite() && foot.y.is_finite() && foot.z.is_finite()) {
+        return Ok(false);
+    }
+    let mut worst = 0.0f64;
+    for control in &piece.control_points {
+        let distance = control.point().or_refuse(KernelStage::Intersect, "control point")?.sub(foot).length();
+        if !distance.is_finite() {
+            return Ok(false);
+        }
+        worst = worst.max(distance);
+    }
+    if worst <= limit {
+        return Ok(true);
+    }
+    if !(lo < mid && mid < hi) {
+        return Ok(false);
+    }
+    Ok(span_hull_within_surface(along, lo, mid, surface, limit, budget)?
+        && span_hull_within_surface(along, mid, hi, surface, limit, budget)?)
+}
+
+/// [`hug_piece_cap`] for the imprint's other certificates.
+pub(super) fn hug_budget() -> usize {
+    hug_piece_cap()
 }
 
 /// The endpoint of `along` (live over `[along_low, along_high]`) that a
@@ -1068,7 +1214,7 @@ pub fn tangent_hit_endpoint(
         } else {
             (hit_parameter, end_parameter)
         };
-        let mut budget = HUG_PIECE_CAP;
+        let mut budget = hug_piece_cap();
         if span_hull_within(along, lo, hi, other, other_low, other_high, limit, &mut budget)? {
             reached.push((end_parameter, u));
         }
@@ -1094,7 +1240,7 @@ fn hug_could_reach(along: &NurbsCurve, hit_point: Vec3, end_parameter: f64, limi
     let end_point = along.evaluate(end_parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
     let distance = end_point.sub(hit_point).length();
     // A non-finite distance is left to the certificate, which refuses it itself.
-    Ok(!(distance > 4.0 * limit * HUG_PIECE_CAP as f64))
+    Ok(!(distance > 4.0 * limit * hug_piece_cap() as f64))
 }
 
 /// `BREP_HUG_REACH_BOUND` (default on since 2026-11-19; `=0` restores the
@@ -1930,6 +2076,9 @@ pub(super) struct IsoSection {
     /// either could not be built (an affine plane whose inverse is not
     /// determined), which leaves the fit lane to say so as it always has.
     pub(super) pcurves: Option<[NurbsCurve; 2]>,
+    /// The section's own lane hands its pcurves over whatever
+    /// `BREP_EXACT_ISO_PCURVES` says ([`plane_cone_section_mode`]).
+    pub(super) own_lane: bool,
 }
 
 /// `BREP_IMPRINT_PLANE_POINT_SKIP` (lane X row 5): two exact parallelogram
@@ -2026,9 +2175,12 @@ pub(super) fn planar_iso_section(
                     (Some(on_plane), Some(on_ruled)) => Some([on_ruled, on_plane]),
                     _ => None,
                 };
-                return Ok(Some(IsoSection { curve, pcurves }));
+                return Ok(Some(IsoSection { curve, pcurves, own_lane: false }));
             }
         }
+    }
+    if let Some(section) = plane_cone_section(first, second, tolerance)? {
+        return Ok(Some(section));
     }
     if plane_pair_section_enabled() {
         return plane_pair_section(first, second, tolerance);
@@ -2169,7 +2321,7 @@ fn plane_pair_section(first: &NurbsSurface, second: &NurbsSurface, tolerance: f6
         (Some(on_first), Some(on_second)) => Some([on_first, on_second]),
         _ => None,
     };
-    Ok(Some(IsoSection { curve, pcurves }))
+    Ok(Some(IsoSection { curve, pcurves, own_lane: false }))
 }
 
 /// The straight pcurve of an iso-curve on its own carrier, on the curve's
@@ -2301,6 +2453,276 @@ pub(super) fn cosurface_pair(
         }
     }
     Ok(true)
+}
+
+/// PLANE x CONE-RULED SECTION (`BREP_PLANE_CONE_SECTION`, default on; `0` leaves
+/// such pairs to the marcher; `check` builds it, compares it with the marcher's
+/// curves and keeps the marcher's).
+/// A ruled carrier of degree 1 in v whose far row is its near row scaled from
+/// one apex, `B = P + lambda (A - P)` with equal weights (a straight bevel
+/// gear's flank, a cone over any curve), meets a plane along the central
+/// projection of its near row `A(u)` from `P`: the point of the ruling
+/// `A(u) -> P` where `n . X = c` is `(f_A P - f_P A) / (f_A - f_P)` with
+/// `f_X = n . X - c`. That is linear in `A`'s homogeneous controls, so the
+/// section is exactly the B-spline on `A`'s own knots with controls
+/// `Q_i = (f_A,i P - f_P A_i ; f_A,i - f_P w_i)`, the same degree as the
+/// flank, with no marching or projection. Its pcurve on the plane is the
+/// affine image of the same controls; on the ruled carrier it is
+/// `(u, v0 + (v1 - v0) s(u))` with `s = f_A / ((1 - lambda)(f_A - f_P))`, built
+/// span by span (one degree up, for the `u` factor) and joined at the knots.
+///
+/// It answers only where every control proves the plane crosses every ruling
+/// strictly inside its segment (`0 < s < 1` over the whole `u` domain) with the
+/// apex off the plane's side of every row point (one sign of weight), and
+/// where the curve runs through the bounded plane patch; anything else goes
+/// to the paths below as before.
+pub(super) fn plane_cone_section_mode() -> crate::env_read::Mode {
+    crate::mode_switch!("BREP_PLANE_CONE_SECTION", true)
+}
+
+thread_local! {
+    /// Check mode: sections compared with the marcher, and those that
+    /// disagreed (a marched point farther than ten tolerances from the exact
+    /// curve, or a branch count other than one).
+    pub static PLANE_CONE_CHECKED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The apex `P` and ratio `lambda` of a ruled carrier whose far row is its near
+/// row scaled towards one point (equal weights) to within a thousandth of
+/// `tolerance` at every row, or `None`. The bar is absolute: a row off the cone
+/// by more moves the section and its pcurve by about as much, so a carrier far
+/// from the origin, whose rounding alone exceeds it, is left to the marcher.
+fn cone_rows(ruled: &NurbsSurface, tolerance: f64) -> Option<(Vec3, f64)> {
+    if ruled.degree_v != 1 || ruled.knots_v.len() != 4 || ruled.control_points.iter().any(|row| row.len() != 2) {
+        return None;
+    }
+    let rows = &ruled.control_points;
+    let mut near = Vec::with_capacity(rows.len());
+    let mut far = Vec::with_capacity(rows.len());
+    let mut scale = 1.0f64;
+    for row in rows {
+        let (a, b) = (row[0], row[1]);
+        // Equal weights exactly: the section and the ruled pcurve read the
+        // ruling parameter as the plain blend of the two rows.
+        if !(a.w > 0.0) || a.w.to_bits() != b.w.to_bits() {
+            return None;
+        }
+        let (a, b) = (a.point().ok()?, b.point().ok()?);
+        scale = scale.max(a.x.abs()).max(a.y.abs()).max(a.z.abs()).max(b.x.abs()).max(b.y.abs()).max(b.z.abs());
+        near.push(a);
+        far.push(b);
+    }
+    let reach = (1..near.len()).max_by(|&i, &j| near[i].sub(near[0]).length().total_cmp(&near[j].sub(near[0]).length()))?;
+    let chord = near[reach].sub(near[0]);
+    if chord.length() <= 1e-9 * scale {
+        return None;
+    }
+    let lambda = far[reach].sub(far[0]).dot(chord) / chord.dot(chord);
+    if !lambda.is_finite() || (1.0 - lambda).abs() <= 1e-9 {
+        return None;
+    }
+    let apex = far[0].sub(near[0].scale(lambda)).scale(1.0 / (1.0 - lambda));
+    let bar = 1e-3 * tolerance;
+    if !(bar > 0.0) {
+        return None;
+    }
+    near.iter().zip(&far).all(|(a, b)| b.sub(apex.add(a.sub(apex).scale(lambda))).length() <= bar).then_some((apex, lambda))
+}
+
+/// The exact section of an affine `plane` patch with a cone-ruled carrier and
+/// its two pcurves, `[on_plane, on_ruled]`, or `None` (see
+/// [`plane_cone_section_mode`]).
+fn plane_cone_section_of(plane: &NurbsSurface, ruled: &NurbsSurface, tolerance: f64) -> Result<Option<[NurbsCurve; 3]>, KernelRefusal> {
+    let Some(patch) = AffinePatch::read(plane) else { return Ok(None) };
+    let Some((apex, lambda)) = cone_rows(ruled, tolerance) else { return Ok(None) };
+    let p = ruled.degree_u;
+    let knots = ruled.knots_u.clone();
+    let [v0, v1] = [ruled.knots_v[1], ruled.knots_v[2]];
+    let normal = patch.normal;
+    let offset = normal.dot(patch.origin);
+    let apex_distance = normal.dot(apex) - offset;
+    // Per control: the homogeneous plane distance of the near row, and the
+    // section's weight `f_A - f_P w` (one sign, or no answer).
+    let mut controls = Vec::with_capacity(ruled.control_points.len());
+    let mut distance = Vec::with_capacity(ruled.control_points.len());
+    let mut weights = Vec::with_capacity(ruled.control_points.len());
+    for row in &ruled.control_points {
+        let a = row[0];
+        let f = normal.dot(Vec3::new(a.x, a.y, a.z)) - offset * a.w;
+        let w = f - apex_distance * a.w;
+        controls.push(Vec4 { x: apex.x * f - a.x * apex_distance, y: apex.y * f - a.y * apex_distance, z: apex.z * f - a.z * apex_distance, w });
+        distance.push(f);
+        weights.push(w);
+    }
+    let sign = if weights.iter().all(|w| *w > 0.0) {
+        1.0
+    } else if weights.iter().all(|w| *w < 0.0) {
+        -1.0
+    } else {
+        return Ok(None);
+    };
+    // Normalized so the largest weight is one (a common homogeneous factor
+    // moves no point, and the controls stay clear of the weight floor).
+    let largest = weights.iter().fold(0.0f64, |m, w| m.max(w.abs()));
+    if !(largest > 0.0 && largest.is_finite()) || weights.iter().any(|w| w.abs() <= 1e-9 * largest) {
+        return Ok(None);
+    }
+    let unit = sign / largest;
+    for ((control, f), w) in controls.iter_mut().zip(&mut distance).zip(&mut weights) {
+        *control = Vec4 { x: control.x * unit, y: control.y * unit, z: control.z * unit, w: control.w * unit };
+        *f *= unit;
+        *w *= unit;
+    }
+    // s = N / D with D the weight and N = f_A / (1 - lambda): strictly inside
+    // (0, 1) when every control of N and of D - N is positive.
+    let numerator: Vec<f64> = distance.iter().map(|f| f / (1.0 - lambda)).collect();
+    let denominator = weights;
+    if numerator.iter().zip(&denominator).any(|(n, d)| !(*n > 0.0 && d - n > 0.0)) {
+        return Ok(None);
+    }
+    // Any construction this route cannot make is left to the paths below.
+    let Ok(curve) = NurbsCurve::new(p, knots.clone(), controls.clone()) else { return Ok(None) };
+    let Ok(anchor) = curve.domain().and_then(|[start, _]| curve.evaluate(start)) else { return Ok(None) };
+    if controls.iter().all(|control| control.point().is_ok_and(|point| point.sub(anchor).length() <= tolerance)) {
+        return Ok(None);
+    }
+    if !runs_through_patch(&curve, plane, tolerance)? {
+        return Ok(None);
+    }
+    // On the plane: the affine chart of the same homogeneous controls.
+    let mut on_plane = Vec::with_capacity(controls.len());
+    for control in &controls {
+        let Ok(point) = control.point() else { return Ok(None) };
+        let (s, t) = patch.square(point);
+        let (u, v) = (patch.u[0] + s * (patch.u[1] - patch.u[0]), patch.v[0] + t * (patch.v[1] - patch.v[0]));
+        on_plane.push(Vec4 { x: u * control.w, y: v * control.w, z: 0.0, w: control.w });
+    }
+    let Ok(on_plane) = NurbsCurve::new(p, knots.clone(), on_plane) else { return Ok(None) };
+    // On the ruled carrier, span by span: (u D, v0 D + (v1 - v0) N, D), the
+    // u factor one degree up.
+    let homogeneous: Vec<Vec4> = numerator.iter().zip(&denominator)
+        .map(|(n, d)| Vec4 { x: 0.0, y: v0 * d + (v1 - v0) * n, z: 0.0, w: *d })
+        .collect();
+    // `bezier_decompose_raw` reads `blend(a, b, t)` as `t a + (1 - t) b`.
+    let blend = |a: Vec4, b: Vec4, t: f64| Vec4 { x: t * a.x + (1.0 - t) * b.x, y: t * a.y + (1.0 - t) * b.y, z: 0.0, w: t * a.w + (1.0 - t) * b.w };
+    let zero = Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 };
+    let Some(spans) = crate::curve::bezier_decompose_raw(&knots, &homogeneous, p, zero, blend) else { return Ok(None) };
+    let mut breaks: Vec<f64> = vec![knots[p]];
+    for &knot in &knots[p + 1..knots.len() - p] {
+        if knot > *breaks.last().unwrap() {
+            breaks.push(knot);
+        }
+    }
+    if breaks.len() != spans.len() + 1 {
+        return Ok(None);
+    }
+    let q = p + 1;
+    let mut on_ruled: Vec<Vec4> = Vec::with_capacity(spans.len() * q + 1);
+    let mut ruled_knots = vec![breaks[0]; q + 1];
+    for (index, span) in spans.iter().enumerate() {
+        let (ua, ub) = (breaks[index], breaks[index + 1]);
+        let at = |j: isize| if j < 0 || j > p as isize { zero } else { span[j as usize] };
+        for j in 0..=q {
+            let (left, right) = (at(j as isize - 1), at(j as isize));
+            let (l, r) = (j as f64 / q as f64, (q - j) as f64 / q as f64);
+            let elevated = Vec4 { x: 0.0, y: l * left.y + r * right.y, z: 0.0, w: l * left.w + r * right.w };
+            let x = r * ua * right.w + l * ub * left.w;
+            if j == 0 && index > 0 {
+                continue;
+            }
+            on_ruled.push(Vec4 { x, y: elevated.y, z: 0.0, w: elevated.w });
+        }
+        ruled_knots.extend(std::iter::repeat(ub).take(if index + 1 == spans.len() { q + 1 } else { q }));
+    }
+    let Ok(on_ruled) = NurbsCurve::new(q, ruled_knots, on_ruled) else { return Ok(None) };
+    Ok(Some([curve, on_plane, on_ruled]))
+}
+
+/// [`plane_cone_section_of`] in either order of the pair, pcurves on `first`
+/// and `second` in that order. In check mode the section is compared with the
+/// marcher's ([`crate::intersect_surfaces`]) and `None` is returned, so the
+/// pair goes the way it always has.
+fn plane_cone_section(first: &NurbsSurface, second: &NurbsSurface, tolerance: f64) -> Result<Option<IsoSection>, KernelRefusal> {
+    let mode = plane_cone_section_mode();
+    if mode == crate::env_read::Mode::Off {
+        return Ok(None);
+    }
+    for (plane, ruled, plane_first) in [(first, second, true), (second, first, false)] {
+        let Some([curve, on_plane, on_ruled]) = plane_cone_section_of(plane, ruled, tolerance)? else { continue };
+        if mode == crate::env_read::Mode::Check {
+            plane_cone_check(first, second, &curve, tolerance)?;
+            return Ok(None);
+        }
+        let pcurves = if plane_first { [on_plane, on_ruled] } else { [on_ruled, on_plane] };
+        return Ok(Some(IsoSection { curve, pcurves: Some(pcurves), own_lane: true }));
+    }
+    Ok(None)
+}
+
+/// Check mode: every marched point within ten tolerances of the exact curve,
+/// and every sample of the exact curve inside the plane's bounded patch
+/// within a hundredth of the curve's extent of a marched chord, so no part of
+/// the section the marcher found is missed and none it missed is added. The
+/// marcher clips at the bounded patch, so a closed section the patch's edge
+/// cuts comes back as several open branches of the one exact curve.
+fn plane_cone_check(first: &NurbsSurface, second: &NurbsSurface, exact: &NurbsCurve, tolerance: f64) -> Result<(), KernelRefusal> {
+    let options = crate::SurfaceIntersectionOptions { tolerance, ..Default::default() };
+    let marched = crate::intersect_surfaces(first, second, &options).or_refuse(KernelStage::Intersect, "intersect_surfaces")?;
+    let bar = 10.0 * tolerance;
+    let mut worst = 0.0f64;
+    for branch in &marched {
+        for point in &branch.points {
+            let foot = crate::project_point_to_curve(exact, *point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+            worst = worst.max(foot.distance);
+        }
+    }
+    let plane = [first, second].into_iter().find_map(AffinePatch::read);
+    let points: Vec<Vec3> = exact.control_points.iter().filter_map(|c| c.point().ok()).collect();
+    let (mut low, mut high) = (Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY));
+    for p in &points {
+        low = Vec3::new(low.x.min(p.x), low.y.min(p.y), low.z.min(p.z));
+        high = Vec3::new(high.x.max(p.x), high.y.max(p.y), high.z.max(p.z));
+    }
+    let extent = high.sub(low).length();
+    let chord = |point: Vec3, a: Vec3, b: Vec3| {
+        let d = b.sub(a);
+        let t = if d.dot(d) > 0.0 { (point.sub(a).dot(d) / d.dot(d)).clamp(0.0, 1.0) } else { 0.0 };
+        point.sub(a.add(d.scale(t))).length()
+    };
+    let [t0, t1] = exact.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let mut uncovered = 0usize;
+    for i in 0..=64 {
+        let point = exact.evaluate(t0 + (t1 - t0) * i as f64 / 64.0).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let inside = plane.as_ref().is_some_and(|patch| {
+            let (s, t) = patch.square(point);
+            (0.0..=1.0).contains(&s) && (0.0..=1.0).contains(&t)
+        });
+        if !inside {
+            continue;
+        }
+        let near = marched.iter().any(|branch| {
+            branch.points.windows(2).any(|segment| chord(point, segment[0], segment[1]) <= 1e-2 * extent)
+                || branch.points.iter().any(|p| p.sub(point).length() <= 1e-2 * extent)
+        });
+        uncovered += usize::from(!near);
+    }
+    let agrees = !marched.is_empty() && worst <= bar && uncovered == 0;
+    PLANE_CONE_CHECKED.with(|cell| {
+        let (checked, disagreed) = cell.get();
+        cell.set((checked + 1, disagreed + u64::from(!agrees)));
+    });
+    if !agrees {
+        let [t0, t1] = exact.domain().unwrap_or([0.0, 0.0]);
+        let ends = |t: f64| exact.evaluate(t).map(|p| format!("({:.6},{:.6},{:.6})", p.x, p.y, p.z)).unwrap_or_default();
+        let branches: Vec<String> = marched.iter().map(|b| {
+            let (first, last) = (b.points.first().copied().unwrap_or_default(), b.points.last().copied().unwrap_or_default());
+            format!("[{} pts closed {} ({:.6},{:.6},{:.6})..({:.6},{:.6},{:.6})]", b.points.len(), b.closed, first.x, first.y, first.z, last.x, last.y, last.z)
+        }).collect();
+        eprintln!("PLANE-CONE CHECK DISAGREE [{}] uncovered {uncovered} branches {} worst {worst:.3e} bar {bar:.3e} exact {}..{} marched {}", std::thread::current().name().unwrap_or("?"), marched.len(), ends(t0), ends(t1), branches.join(" "));
+    } else if crate::debug_flag!("BREP_PLANE_CONE_SECTION_TRACE") {
+        eprintln!("PLANE-CONE CHECK agree worst {worst:.3e} points {}", marched.iter().map(|b| b.points.len()).sum::<usize>());
+    }
+    Ok(())
 }
 
 

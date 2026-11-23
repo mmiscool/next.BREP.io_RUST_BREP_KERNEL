@@ -151,6 +151,19 @@ impl RadiusLaw {
             evals.push(eval);
         }
         let total = cursor;
+        // A nought radius only at the law's own ends: a round may vanish at an
+        // edge's end, never inside it.
+        for (index, eval) in evals.iter().enumerate() {
+            if let SegmentEval::Linear { r0, r1, .. } = eval {
+                if (*r0 == 0.0 && index != 0) || (*r1 == 0.0 && index + 1 != evals.len()) {
+                    return Err(KernelRefusal::input(
+                        KernelStage::Collect,
+                        "radius",
+                        "radius_law: a radius may be nought only at the law's start or end",
+                    ));
+                }
+            }
+        }
 
         // 2. Decide which junctions need a smooth transition: exact value AND
         //    slope agreement passes through untouched (already C1); any
@@ -191,6 +204,22 @@ impl RadiusLaw {
             .windows(2)
             .all(|pair| (pair[0].s1 - pair[1].s0).abs() == 0.0));
         Ok(Self { pieces, total })
+    }
+
+    /// `(radius at the start, radius at the end)` when the law is one straight
+    /// ramp over its whole length: every piece of degree at most one, and every
+    /// piece's ends on the chord between the law's own ends. `None` for any
+    /// other law (a bulge between linear pieces included).
+    pub fn linear_ends(&self) -> Option<(f64, f64)> {
+        let (r0, r1) = (self.radius_at(0.0), self.radius_at(self.total));
+        let scale = r0.abs().max(r1.abs());
+        let chord = |s: f64| r0 + (r1 - r0) * (s / self.total);
+        let straight = self.pieces.iter().all(|piece| {
+            piece.coeffs[2..].iter().all(|c| *c == 0.0)
+                && (self.radius_at(piece.s0) - chord(piece.s0)).abs() <= 1e-12 * scale
+                && (self.radius_at(piece.s1) - chord(piece.s1)).abs() <= 1e-12 * scale
+        });
+        (self.total > 0.0 && straight).then_some((r0, r1))
     }
 
     /// Total abscissa length of the law's domain.
@@ -315,8 +344,14 @@ impl SegmentEval {
                 if !(length.is_finite() && *length > 0.0) {
                     return Err(segment_length_refusal());
                 }
-                check_radius(*start_radius)?;
-                check_radius(*end_radius)?;
+                // One end may be nought (a round that vanishes there); the
+                // law as a whole must still start or end there (below).
+                if *start_radius == 0.0 || *end_radius == 0.0 {
+                    check_radius(start_radius.max(*end_radius))?;
+                } else {
+                    check_radius(*start_radius)?;
+                    check_radius(*end_radius)?;
+                }
                 Ok(Self::Linear {
                     s0,
                     length: *length,

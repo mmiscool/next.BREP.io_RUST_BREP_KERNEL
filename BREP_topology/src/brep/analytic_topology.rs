@@ -280,6 +280,12 @@ pub fn make_cone_brep(
     radius_top: f64,
     height: f64,
 ) -> Result<BrepSolid, String> {
+    // Pointed at the base (radius 0 there, the rim at the top): the same solid as the apex cone built from
+    // the top with the axis reversed, which is the form this builder makes (its apex at the far end).
+    if (0.0..=1e-7).contains(&radius_bottom) && radius_top > 1e-7 && height > 0.0 {
+        let axis = axis_direction.normalized()?;
+        return make_cone_brep(base.add(axis.scale(height)), axis.scale(-1.0), radius_top, 0.0, height);
+    }
     if radius_bottom <= 0.0 || radius_top < 0.0 || height <= 0.0 {
         return Err("makeConeSolid: invalid radius or height".into());
     }

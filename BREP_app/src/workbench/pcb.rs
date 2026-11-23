@@ -1,13 +1,12 @@
-//! The "PCB" workbench — the electronics flow: schematic capture and board
-//! layout, in eCAD's sheet-and-board editor on a schematic document, with the
-//! schematic and the board as two views of the one workbench.
+//! The "PCB" workbench — board layout, in eCAD's sheet-and-board editor on the
+//! schematic document, held on its board view ([`super::ecad::BENCHES`]). The
+//! schematic of the same document is the PCB diagram workbench's
+//! ([`super::schematic`]).
 //!
-//! Its OWN buttons are eCAD's actions ([`super::ecad`]): the view switch, the
-//! schematic's four tools and the board's two, the copper-layer menu, and the
-//! Context commands of the tool in hand. Each is offered, lit, greyed and
-//! captioned by eCAD's own predicate, so the row shows exactly what eCAD's
-//! toolbar would: the schematic's tools in the schematic, the board's on the
-//! board.
+//! Its OWN buttons are eCAD's actions ([`super::ecad`]): the board's tools, the
+//! copper-layer menu, and the Context commands of the tool in hand. Each is
+//! offered, lit, greyed and captioned by eCAD's own predicate, so the row shows
+//! exactly what eCAD's toolbar shows on the board.
 //!
 //! It declares no feature of its own — `includes` is still `no_features`, so
 //! the creation palette offers nothing here — but it is no longer true that
@@ -42,17 +41,9 @@ pub static LAYERS: &[WorkbenchButton] = &[
     ecad_button!("pcb.board.layer.6", "\u{E08C}", "Copper layer 6", "Home/PCB/Copper layer 6", toggle),
 ];
 
-/// In eCAD's own toolbar order: View, Tool, the layer menu, Context.
+/// In eCAD's own toolbar order: Tool, the layer menu, Context — the board's
+/// half of each; the schematic's is PCB diagram's row.
 static BUTTONS: &[WorkbenchButton] = &[
-    ecad_button!("pcb.view.schematic", "\u{E07D}", "Schematic", "Home/View/Schematic", toggle),
-    ecad_button!("pcb.view.board", "\u{E07E}", "PCB", "Home/View/PCB", toggle),
-    ecad_button!("pcb.sheet.tool.select", "\u{1F446}", "Select", "Home/PCB/Select", toggle),
-    ecad_button!("pcb.sheet.tool.wire", "\u{E07F}", "Draw wire", "Home/PCB/Draw wire", toggle),
-    ecad_button!("pcb.sheet.tool.junction", "\u{E080}", "Junction", "Home/PCB/Junction", toggle),
-    ecad_button!("pcb.sheet.tool.label", "\u{E081}", "Net label", "Home/PCB/Net label", toggle),
-    ecad_button!("pcb.sheet.tool.no_connect", "\u{E0C0}", "No-connect", "Home/PCB/No-connect", toggle),
-    ecad_button!("pcb.sheet.tool.power_flag", "\u{E0C1}", "Power flag", "Home/PCB/Power flag", toggle),
-    ecad_button!("pcb.sheet.tool.power", "\u{E0C2}", "Power symbol", "Home/PCB/Power symbol", toggle),
     ecad_button!("pcb.board.tool.select", "\u{1F446}", "Select", "Home/PCB/Select", toggle),
     ecad_button!("pcb.board.tool.route", "\u{E082}", "Route track", "Home/PCB/Route track", toggle),
     ecad_button!("pcb.board.tool.zone", "\u{E0B0}", "Draw zone", "Home/PCB/Draw zone", toggle),
@@ -69,9 +60,6 @@ static BUTTONS: &[WorkbenchButton] = &[
         caption: Some(super::ecad::layer_menu_caption),
         menu: LAYERS,
     },
-    ecad_button!("pcb.sheet.place.rotate", "\u{E083}", "Rotate 90°", "Home/PCB/Rotate 90°", command),
-    ecad_button!("pcb.sheet.wire.bend", "\u{E084}", "Bend direction", "Home/PCB/Bend direction", command),
-    ecad_button!("pcb.sheet.wire.finish", "\u{E087}", "Finish wire", "Home/PCB/Finish wire", command),
     ecad_button!("pcb.board.route.corner", "\u{E085}", "Corner direction", "Home/PCB/Corner direction", command),
     ecad_button!("pcb.board.route.via", "\u{E086}", "Place via", "Home/PCB/Place via", command),
     ecad_button!("pcb.board.route.finish", "\u{E087}", "Finish track", "Home/PCB/Finish track", command),

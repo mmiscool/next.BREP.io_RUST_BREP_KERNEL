@@ -212,7 +212,14 @@ fn cap_face(
 /// and the ruled skins retain both boundaries' rational weights. Multi-section
 /// interpolation requires matching degrees, knots and weights.
 pub fn loft_profile_brep(input_sections: &[Vec<NurbsCurve>]) -> Result<BrepSolid, KernelRefusal> {
-    loft_profile_brep_core(input_sections, None, &[])
+    loft_profile_brep_core(input_sections, None, &[], true)
+}
+
+/// [`loft_profile_brep`] without the self-intersection scan at its exit, for a
+/// caller whose body is sound by construction (a planar region carried along a
+/// screw, every level a turned copy of it); the incidence checks still run.
+pub(crate) fn loft_profile_brep_unscanned(input_sections: &[Vec<NurbsCurve>]) -> Result<BrepSolid, KernelRefusal> {
+    loft_profile_brep_core(input_sections, None, &[], false)
 }
 
 /// [`loft_profile_brep`] with every column BROKEN at the section indices
@@ -224,7 +231,7 @@ pub fn loft_profile_brep_broken(
     input_sections: &[Vec<NurbsCurve>],
     breaks: &[usize],
 ) -> Result<BrepSolid, KernelRefusal> {
-    loft_profile_brep_core(input_sections, None, breaks)
+    loft_profile_brep_core(input_sections, None, breaks, true)
 }
 
 /// §5.8 loft with END TANGENCY: the skin leaves the first section along
@@ -252,13 +259,14 @@ pub fn loft_profile_brep_tangent(
             "loftSolid: end tangent must be a nonzero direction",
         )
     })?;
-    loft_profile_brep_core(input_sections, Some((start, end)), &[])
+    loft_profile_brep_core(input_sections, Some((start, end)), &[], true)
 }
 
 fn loft_profile_brep_core(
     input_sections: &[Vec<NurbsCurve>],
     end_tangents: Option<(Vec3, Vec3)>,
     breaks: &[usize],
+    scan: bool,
 ) -> Result<BrepSolid, KernelRefusal> {
     let mut profile = super::ConstructionProfile::new("loft");
     let tolerance = 1e-6;
@@ -284,6 +292,8 @@ fn loft_profile_brep_core(
     let curve_count = if ruled {
         super::validation::validate_section_loops(&sections, tolerance, "loftSolid")?
     } else {
+        // Sections round the same outline that only start their loops elsewhere are turned to match.
+        super::validation::align_section_starts(&mut sections);
         validate_sections(&sections, tolerance, "loftSolid", true)?
     };
 
@@ -748,6 +758,9 @@ fn loft_profile_brep_core(
     // half-width — satisfies every one of its checks. This is the soundness
     // question asked at the lane's single exit, repaired where it can be and
     // refused by name where it cannot. Every path sweep ends here too.
+    if !scan {
+        return Ok(solid);
+    }
     let accepted = crate::accept_sound(solid, "loftSolid");
     profile.lap("acceptance");
     accepted

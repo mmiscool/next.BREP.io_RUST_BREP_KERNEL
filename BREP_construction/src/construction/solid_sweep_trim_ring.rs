@@ -288,8 +288,78 @@ impl<'a> ConvexSweep<'a> {
     ///   ring's size;
     /// - a band: the end pose's ring over the half's ψ and the band's tube
     ///   angles (with a margin), exact (rational).
+    /// A ring envelope's carrier through its exact points at stations refined
+    /// only where it misses: as the uniform fit (rows through the stations in
+    /// u, columns through the rows' controls in τ, the same parameters (u, τ)),
+    /// but each u or τ interval whose own midpoint misses exceed the target
+    /// (1e-8 of the size, read on every station of the other direction) is
+    /// halved, and neighbours kept within twice each other's length; up to
+    /// 1024 intervals a direction, past which a carrier within 1e-7 is kept
+    /// and any other refused, as the uniform fit does.
+    fn ring_envelope_adaptive(&self, sheet: SheetId, lo: f64, hi: f64) -> Result<SheetSurface, KernelRefusal> {
+        const CAP: usize = 1024;
+        let exact = |u: f64, tau: f64| -> Result<Vec3, KernelRefusal> {
+            self.ring_point(sheet, [u, tau]).map(|q| q.world).ok_or_else(|| refuse("trim_ring_rows", "a ring envelope's rows are undefined in its span".into()))
+        };
+        let mut us: Vec<f64> = (0..=32).map(|i| i as f64 / 32.0).collect();
+        let mut taus: Vec<f64> = (0..=16).map(|k| lo + (hi - lo) * k as f64 / 16.0).collect();
+        let target = 1e-8 * self.size;
+        loop {
+            let mut rows: Vec<Vec<Vec3>> = Vec::with_capacity(taus.len());
+            let mut knots_u = Vec::new();
+            for &tau in &taus {
+                let points = us.iter().map(|&u| exact(u, tau)).collect::<Result<Vec<_>, _>>()?;
+                let curve = frag(crate::interpolate_curve(&points, 5, &us), "trim_ring_row")?;
+                knots_u = curve.knots.clone();
+                rows.push(curve.control_points.iter().map(|c| c.point().unwrap_or(Vec3::ZERO)).collect());
+            }
+            let count = rows[0].len();
+            let mut net: Vec<Vec<Vec4>> = Vec::with_capacity(count);
+            let mut knots_v = Vec::new();
+            for i in 0..count {
+                let column: Vec<Vec3> = rows.iter().map(|r| r[i]).collect();
+                let curve = frag(crate::interpolate_curve(&column, 5, &taus), "trim_ring_column")?;
+                knots_v = curve.knots.clone();
+                net.push(curve.control_points.clone());
+            }
+            let surface = frag(NurbsSurface::new(5, 5, knots_u, knots_v, net), "trim_ring_envelope")?;
+            // Each interval's own misses: at its midpoint, on every station of
+            // the other direction.
+            let mut miss_u = vec![0.0f64; us.len() - 1];
+            for i in 0..us.len() - 1 {
+                let u = 0.5 * (us[i] + us[i + 1]);
+                for &tau in &taus {
+                    miss_u[i] = miss_u[i].max(frag(surface.evaluate(u, tau), "trim_ring_envelope")?.sub(exact(u, tau)?).length());
+                }
+            }
+            let mut miss_t = vec![0.0f64; taus.len() - 1];
+            for k in 0..taus.len() - 1 {
+                let tau = 0.5 * (taus[k] + taus[k + 1]);
+                for &u in &us {
+                    miss_t[k] = miss_t[k].max(frag(surface.evaluate(u, tau), "trim_ring_envelope")?.sub(exact(u, tau)?).length());
+                }
+            }
+            let worst = miss_u.iter().chain(&miss_t).fold(0.0f64, |a, &b| a.max(b));
+            let grow_u = miss_u.iter().any(|&m| m > target) && us.len() - 1 < CAP;
+            let grow_t = miss_t.iter().any(|&m| m > target) && taus.len() - 1 < CAP;
+            if !grow_u && !grow_t {
+                if !(worst <= 1e-7 * self.size) {
+                    return Err(refuse("trim_sheet_fit", format!("a ring envelope misses by {worst:.2e}")));
+                }
+                return Ok(SheetSurface { surface, strip: None, band: None, cap: None });
+            }
+            if grow_u {
+                us = refined_stations(&us, &miss_u, target, CAP);
+            }
+            if grow_t {
+                taus = refined_stations(&taus, &miss_t, target, CAP);
+            }
+        }
+    }
+
     pub(super) fn ring_sheet_surface(&self, sheet: SheetId, lo: f64, hi: f64) -> Result<SheetSurface, KernelRefusal> {
         match sheet {
+            SheetId::Envelope(..) if ring_adaptive_on() => self.ring_envelope_adaptive(sheet, lo, hi),
             SheetId::Envelope(..) => {
                 let (mut nu, mut nt) = (32usize, 16usize);
                 loop {
@@ -470,7 +540,14 @@ pub fn sweep_ring_tumbled(centre: Vec3, axis: Vec3, major: f64, minor: f64, moti
         }
         let refined = sweep.refine_arcs(&arrangement, &closure);
         let solved = sweep.solve_vertices(&arrangement, &closure, &refined);
-        let body = sweep.build(&arrangement, &closure, &refined, &solved)?;
+        // The trims' flux at 400 scanlines, read once: its sign orients the
+        // faces (as build's own 200-scanline reading would; that reading is
+        // kept where the flux is too small to trust its sign,
+        // `BREP_SWEEP_RING_ONE_FLUX=0` keeps it always), its size checks the
+        // built volume below.
+        let raw = sweep.flux_volume_raw(&arrangement, &closure, 400);
+        let given = (ring_one_flux_on() && raw.abs() > 1e-3 * size.powi(3)).then_some(raw);
+        let body = sweep.build_with_sign(&arrangement, &closure, &refined, &solved, given)?;
         let problems = body.validate();
         if !problems.is_empty() {
             let first: Vec<String> = problems.iter().take(3).map(|p| p.message.clone()).collect();
@@ -480,13 +557,70 @@ pub fn sweep_ring_tumbled(centre: Vec3, axis: Vec3, major: f64, minor: f64, moti
         // The trims' flux as a check against a region missed or taken twice
         // (those miss by 1e-3 and more): to 1e-4, which 400 scanlines hold
         // even on a thin ring's many faces.
-        let (flux, _, _) = sweep.flux_volume(&arrangement, &closure, 400);
+        let flux = raw.abs();
         if (built - flux).abs() > 1e-4 * flux.abs().max(size.powi(3)) {
             return Err(refuse("trim_volume", format!("the ring's built sweep's volume {built:.7} disagrees with its trims' {flux:.7}")));
         }
         return Ok(body);
     }
     Err(last.expect("tried"))
+}
+
+/// `BREP_SWEEP_RING_ONE_FLUX` (default on; `=0` restores build's own sign
+/// reading): the ring route reads its trims' flux once, for the faces'
+/// orientation and the volume check both.
+pub fn ring_one_flux_on() -> bool {
+    crate::switch!("BREP_SWEEP_RING_ONE_FLUX", true)
+}
+
+/// `BREP_SWEEP_RING_ADAPTIVE` (default on; `=0` restores the uniform fit): a ring envelope's carrier
+/// refined only where it misses ([`ConvexSweep::ring_envelope_adaptive`])
+/// instead of doubling every interval.
+pub fn ring_adaptive_on() -> bool {
+    crate::switch!("BREP_SWEEP_RING_ADAPTIVE", true)
+}
+
+/// The stations with each interval whose miss exceeds `target` halved, the
+/// worst first, each with the halvings it then needs so that no interval is
+/// more than twice a neighbour's length (graded, so the interpolant through
+/// them does not ripple); a halving whose grading would take the stations
+/// past `cap` intervals is not made, so the result is always graded (given
+/// graded stations).
+#[doc(hidden)]
+pub fn refined_stations(stations: &[f64], misses: &[f64], target: f64, cap: usize) -> Vec<f64> {
+    let n = stations.len() - 1;
+    let mut order: Vec<usize> = (0..n).filter(|&i| misses[i] > target).collect();
+    order.sort_by(|&a, &b| misses[b].total_cmp(&misses[a]));
+    let mut out = stations.to_vec();
+    for i in order {
+        if out.len() - 1 >= cap {
+            break;
+        }
+        let middle = 0.5 * (stations[i] + stations[i + 1]);
+        let Err(at) = out.binary_search_by(|x| x.total_cmp(&middle)) else { continue };
+        let mut candidate = out.clone();
+        candidate.insert(at, middle);
+        let candidate = graded(candidate);
+        if candidate.len() - 1 <= cap {
+            out = candidate;
+        }
+    }
+    out
+}
+
+/// `stations` with any interval more than twice a neighbour's length halved
+/// until none is.
+fn graded(mut out: Vec<f64>) -> Vec<f64> {
+    loop {
+        let lengths: Vec<f64> = out.windows(2).map(|w| w[1] - w[0]).collect();
+        let wide = (0..lengths.len()).find(|&i| {
+            (i > 0 && lengths[i] > 2.0 * lengths[i - 1] * (1.0 + 1e-12)) || (i + 1 < lengths.len() && lengths[i] > 2.0 * lengths[i + 1] * (1.0 + 1e-12))
+        });
+        match wide {
+            Some(i) => out.insert(i + 1, 0.5 * (out[i] + out[i + 1])),
+            None => return out,
+        }
+    }
 }
 
 /// The envelope fit's next sample counts (u, τ): each direction whose misses
@@ -502,3 +636,4 @@ pub fn next_fit_counts(nu: usize, nt: usize, along_u: f64, along_t: f64, target:
     }
     Some((if grow_u { 2 * nu } else { nu }, if grow_t { 2 * nt } else { nt }))
 }
+

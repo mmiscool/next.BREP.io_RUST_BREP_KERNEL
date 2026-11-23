@@ -85,7 +85,7 @@ pub(in crate::watertight_tessellation) fn seed_interior_grid(
     face: &FaceRecord,
     vertices: &mut Vec<FaceVertex>,
     triangles: &mut Vec<[usize; 3]>,
-    boundary_pairs: &HashSet<(usize, usize)>,
+    boundary_pairs: &rustc_hash::FxHashSet<(usize, usize)>,
     chord_tolerance: f64,
     domains: [f64; 4],
     scale: [f64; 2],
@@ -382,7 +382,7 @@ pub(in crate::watertight_tessellation) fn refine_interior(
     face: &FaceRecord,
     vertices: &mut Vec<FaceVertex>,
     triangles: &mut Vec<[usize; 3]>,
-    boundary_pairs: &HashSet<(usize, usize)>,
+    boundary_pairs: &rustc_hash::FxHashSet<(usize, usize)>,
     chord_tolerance: f64,
     scale: [f64; 2],
     // An UNWRAPPED periodic ribbon (helical thread) carries interior vertices
@@ -435,7 +435,7 @@ pub(in crate::watertight_tessellation) fn refine_interior(
             }
         }
         corners.sort_unstable();
-        let mut splits: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut splits: rustc_hash::FxHashMap<(usize, usize), usize> = rustc_hash::FxHashMap::default();
         // Iterate the candidate edges in SORTED order, not `HashMap` order. The
         // midpoint vertices are pushed as they are accepted, so the iteration
         // order decides their INDICES — and `lawson_flips` breaks cocircular
@@ -604,7 +604,7 @@ fn refine_interior_bounded(
     face: &FaceRecord,
     vertices: &mut Vec<FaceVertex>,
     triangles: &mut Vec<[usize; 3]>,
-    boundary_pairs: &HashSet<(usize, usize)>,
+    boundary_pairs: &rustc_hash::FxHashSet<(usize, usize)>,
     chord_tolerance: f64,
     scale: [f64; 2],
     periodic: bool,
@@ -690,7 +690,7 @@ fn refine_interior_bounded(
     let mut stall_from = f64::INFINITY;
     for _ in 0..SCAN_REFINE_PASSES {
         tess_profile(|p| p.refine_passes += 1);
-        let mut users: HashMap<(usize, usize), u32> = HashMap::with_capacity(triangles.len() * 2);
+        let mut users: rustc_hash::FxHashMap<(usize, usize), u32> = rustc_hash::FxHashMap::with_capacity_and_hasher(triangles.len() * 2, Default::default());
         for triangle in triangles.iter() {
             for corner in 0..3 {
                 let (a, b) = (triangle[corner], triangle[(corner + 1) % 3]);
@@ -767,7 +767,7 @@ fn refine_interior_bounded(
         // tie-break) do not depend on hash order.
         chosen.sort_unstable();
         chosen.dedup();
-        let mut splits: HashMap<(usize, usize), usize> = HashMap::with_capacity(chosen.len());
+        let mut splits: rustc_hash::FxHashMap<(usize, usize), usize> = rustc_hash::FxHashMap::with_capacity_and_hasher(chosen.len(), Default::default());
         for (a, b) in chosen {
             let uv = [
                 (vertices[a].uv[0] + vertices[b].uv[0]) * 0.5,

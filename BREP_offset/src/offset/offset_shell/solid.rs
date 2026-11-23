@@ -109,6 +109,42 @@ fn offset_solid_joined(
             return Ok(grown);
         }
     }
+    // A convex body of planes, cylinders and spheres whose sharp edges are
+    // closed loops grows exactly by its moved faces and the pipe about each
+    // source edge (`pipe_parallel`), ahead of the pipeline whose blend marches
+    // those same rounds (`BREP_OFFSET_PIPE_FIRST`).
+    let pipe_mode = pipe_first_mode();
+    let pipe_first = (corners == OffsetCorners::Rounded && distance > 0.0 && pipe_mode != crate::env_read::Mode::Off)
+        .then(|| super::pipe_parallel::pipe_parallel(source, distance))
+        .flatten();
+    if pipe_mode == crate::env_read::Mode::On {
+        if let Some(grown) = pipe_first {
+            return Ok(grown);
+        }
+    }
+    let checked = |result: Result<OffsetShellResultRecord, KernelRefusal>| {
+        if let (Some(pipe), Ok(built)) = (&pipe_first, &result) {
+            let volume = |solid: &BrepSolid| crate::solid_mass_properties(solid).map(|m| m.volume).ok();
+            let (a, b) = (volume(&pipe.solid), volume(&built.solid));
+            let agrees = matches!((a, b), (Some(a), Some(b)) if (a - b).abs() <= 1e-6 * a.abs().max(b.abs()));
+            if !agrees {
+                eprintln!("offset.pipe_first DISAGREES: pipe volume {a:?}, pipeline volume {b:?}");
+            }
+        }
+        result
+    };
+    if pipe_first.is_some() {
+        return checked(offset_solid_joined_rest(source, distance, corners));
+    }
+    offset_solid_joined_rest(source, distance, corners)
+}
+
+/// [`offset_solid_joined`] after the pipe-first lane.
+fn offset_solid_joined_rest(
+    source: &BrepSolid,
+    distance: f64,
+    corners: OffsetCorners,
+) -> Result<OffsetShellResultRecord, KernelRefusal> {
     if corners == OffsetCorners::Rounded && distance > 0.0 {
         if let Some(grown) = grown_across_reflex_edges(source, distance) {
             return Ok(grown);
@@ -151,6 +187,11 @@ fn offset_solid_joined(
                     if let Some(eroded) = super::revolved_erosion::revolved_erosion(source, distance, false) {
                         return Ok(eroded);
                     }
+                    // Curved sides the polygon eroder does not read
+                    // (`BREP_OFFSET_REVOLVED_CURVED_EROSION`).
+                    if let Some(eroded) = super::revolved_curved_erosion::revolved_curved_erosion(source, distance) {
+                        return Ok(eroded);
+                    }
                 }
                 if let Some(grown) = grown_by_pieces(source, distance)? {
                     return Ok(grown);
@@ -175,7 +216,7 @@ fn offset_solid_joined(
     };
     match corners {
         OffsetCorners::Sharp => Ok(sharp),
-        OffsetCorners::Rounded => match round_offset_joins(sharp, distance) {
+        OffsetCorners::Rounded => match round_offset_joins(sharp, distance, Some(source)) {
             Ok(rounded) => Ok(rounded),
             // A mitred body cannot carry the ball over a vertex of degree four
             // or more; a convex polyhedron's parallel body is built directly.
@@ -193,6 +234,13 @@ fn offset_solid_joined(
             },
         },
     }
+}
+
+/// `BREP_OFFSET_PIPE_FIRST` (default off; `=1` turns it on; `check` builds both and
+/// compares their volumes): the pipe-parallel lane answers a rounded growth
+/// before the pipeline, not only after its refusal.
+fn pipe_first_mode() -> crate::env_read::Mode {
+    crate::mode_switch!("BREP_OFFSET_PIPE_FIRST", false)
 }
 
 /// `BREP_OFFSET_REVOLVED_FIRST` (default on; `=0` restores): the revolved-parallel lane
@@ -239,7 +287,7 @@ fn grown_by_pieces(source: &BrepSolid, distance: f64) -> Result<Option<OffsetShe
     }
     match grown_by_pieces_impl(source, distance) {
         Ok(result) => Ok(result),
-        Err(error) if matches!(&error.class, crate::RefusalClass::UnsupportedGeometry { what } if what == "offset_solid_shrinks_to_nothing") => Err(error),
+        Err(error) if matches!(&error.class, crate::RefusalClass::IllPosed { what } if what == "offset_solid_shrinks_to_nothing") => Err(error),
         Err(error) => {
             os_debug!("grow by pieces declined: {error}");
             Ok(None)
@@ -284,16 +332,47 @@ fn grown_by_pieces_impl(source: &BrepSolid, distance: f64) -> Result<Option<Offs
 /// image; a cap (a cylinder, torus or corner ball the blend built, which lies
 /// on no offset face) is an `Offset` image with `source_face_id` 0, because it
 /// rounds a JOIN between source faces and has no single source face.
+///
+/// Every join is rounded at `|distance|` exactly, or the body is refused: the
+/// fillet's radius relief (a locally reduced radius where the ball folds) is
+/// held off, since a relieved join is not the parallel body. The rims of
+/// bores wider than the growth (`source` given) are left sharp and their
+/// cusps carved instead ([`super::bore_dimples::carve_wide_rims`]): the
+/// rim's ball there runs round a circle smaller than itself, which the
+/// blend's march reads as a fold.
 fn round_offset_joins(
     sharp: OffsetShellResultRecord,
     distance: f64,
+    source: Option<&BrepSolid>,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
     let wanted_convex = distance > 0.0;
-    let midpoints = sharp_join_midpoints(&sharp.solid, wanted_convex)?;
-    if midpoints.is_empty() {
+    let rims = match source {
+        Some(source) if wanted_convex => super::bore_dimples::wide_bore_rims(source, distance),
+        _ => Vec::new(),
+    };
+    let tolerance = 1e-7 * crate::solid_scale(&sharp.solid).max(1.0);
+    let midpoints: Vec<Vec3> = sharp_join_midpoints(&sharp.solid, wanted_convex)?
+        .into_iter()
+        .filter(|point| !rims.iter().any(|rim| rim.holds(*point, distance, tolerance)))
+        .collect();
+    if midpoints.is_empty() && rims.is_empty() {
         return Ok(sharp);
     }
-    let solid = fillet_edges(&sharp.solid, &midpoints, None, distance.abs(), false, None)
+    let rounded = if midpoints.is_empty() {
+        Ok(sharp.solid.clone())
+    } else {
+        let _no_relief = crate::blend::relief::Relieving::enter();
+        fillet_edges(&sharp.solid, &midpoints, None, distance.abs(), false, None)
+    };
+    let solid = rounded
+        .and_then(|rounded| {
+            if rims.is_empty() {
+                return Ok(rounded);
+            }
+            super::bore_dimples::carve_wide_rims(&rounded, &rims, distance).map_err(|reason| {
+                KernelRefusal::unsupported(KernelStage::Refine, "offset_wide_bore_rim", format!("offset_solid: a bore rim's cusp could not be carved: {reason}"))
+            })
+        })
         .map_err(|error| {
             error.with_message(|message| {
                 format!(
@@ -769,7 +848,7 @@ fn shrunk_by_pieces(source: &BrepSolid, amount: f64) -> Result<Option<OffsetShel
     // returned as a body (the elliptic cylinder shrunk by 6 once read as a
     // solid of no faces).
     if solid.shells.iter().all(|shell| shell.faces.is_empty()) {
-        return Err(KernelRefusal::unsupported(KernelStage::Refine, "offset_solid_shrinks_to_nothing", format!(
+        return Err(KernelRefusal::ill_posed(KernelStage::Refine, "offset_solid_shrinks_to_nothing", format!(
             "offset_solid: the shrink by {amount:.6} leaves nothing: the complement grown by that much covers the whole body"
         )));
     }
@@ -810,7 +889,7 @@ fn grown_pieces(solid: &BrepSolid, planes: &[(Vec3, Vec3)], amount: f64) -> Resu
     for (index, piece) in pieces.iter().enumerate() {
         let sharp = offset_body(piece, &[], -amount, Body::Whole, "offset_solid_piece")
             .map_err(|error| error.with_message(|message| format!("piece {index}: {message}")))?;
-        grown.push(round_offset_joins(sharp, amount)?.solid);
+        grown.push(round_offset_joins(sharp, amount, None)?.solid);
     }
     Ok(Some(grown))
 }

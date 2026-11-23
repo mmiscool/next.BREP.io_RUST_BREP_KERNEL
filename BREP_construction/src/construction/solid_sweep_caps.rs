@@ -50,7 +50,7 @@ use crate::solid_sweep::outline_signed_distance;
 use crate::topology::{CoedgeRecord, EdgeRecord, FaceRecord, LoopRecord, ShellRecord, VertexRecord};
 pub use crate::{make_line, make_revolution, BrepSolid, KernelRefusal, KernelStage, NurbsCurve, NurbsSurface, OrRefuse, OutlinePiece, SolidMotion, Vec3, Vec4};
 use std::collections::HashMap;
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 /// A tool the whole sweep takes.
 #[derive(Clone, Debug)]
@@ -452,6 +452,23 @@ impl Chart {
                 let r = x.sub(origin);
                 r.sub(w.scale(r.dot(w))).length() <= 1e-6 * r.length()
             }
+        }
+    }
+
+    /// The chart's span joints in each parameter (`make_revolution`'s arcs
+    /// in equal spans of [0, 1]), where its parameter's second derivative
+    /// jumps along the surface.
+    fn joints(&self) -> (Vec<f64>, Vec<f64>) {
+        let inner = |spans: usize| (1..spans).map(|k| k as f64 / spans as f64).collect::<Vec<f64>>();
+        match *self {
+            Chart::Plane { .. } => (Vec::new(), Vec::new()),
+            Chart::Revolution { spans_u, meridian, .. } => (
+                inner(spans_u),
+                match meridian {
+                    MeridianChart::Arc { spans, .. } => inner(spans),
+                    MeridianChart::Line { .. } => Vec::new(),
+                },
+            ),
         }
     }
 
@@ -1439,7 +1456,7 @@ fn split_revolved(
                         .collect();
                     exact[0] = points[start];
                     exact[LOFT_SAMPLES] = points[end];
-                    curves.push(ToolCurve { curve: frag(crate::interpolate_curve(&samples, 5, &params), "branch")?, start, end, degenerate: false, samples: Some(exact) });
+                    curves.push(ToolCurve { curve: frag(fit_tool_curve(&samples, &params), "branch")?, start, end, degenerate: false, samples: Some(exact) });
                     branch_curves[which] = curves.len() - 1;
                 }
                 // Front between lower and upper; back from upper to lower + 2π.
@@ -1465,13 +1482,20 @@ fn split_revolved(
                     let rim_pcurve = |arc: usize, v: f64| -> Result<NurbsCurve, KernelRefusal> {
                         let curve = &curves[arc].curve;
                         let [d0, d1] = frag(curve.domain(), "domain")?;
-                        let ts: Vec<f64> = (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect();
+                        let ts: Vec<f64> = pcurve_stations(d0, d1);
                         let mut uv = Vec::with_capacity(ts.len());
                         for &t in &ts {
                             let x = frag(curve.evaluate(t), "rim")?;
                             uv.push(Vec3::new(u_of(angle_near(x, alpha + 0.5 * theta)), v, 0.0));
                         }
-                        frag(crate::interpolate_curve(&uv, 5, &ts), "rim_pcurve")
+                        if pcurve_joints_on() {
+                            let (ju, jv) = surface_joints(&surface);
+                            let at = |t: f64| -> Result<[f64; 2], KernelRefusal> { Ok([u_of(angle_near(frag(curve.evaluate(t), "rim")?, alpha + 0.5 * theta)), v]) };
+                            if let Some(fitted) = jointed_pcurve(&ts, &uv, at, &ju, &jv, curve)? {
+                                return Ok(fitted);
+                            }
+                        }
+                        frag(fit_pcurve(&uv, &ts), "rim_pcurve")
                     };
                     // A grazing branch's pcurve: the image of the built edge,
                     // through its own parameter (angle about the axis; place
@@ -1481,17 +1505,27 @@ fn split_revolved(
                         let [d0, d1] = frag(curve.domain(), "domain")?;
                         let (span_rho, span_z) = (m1[0] - m0[0], m1[1] - m0[1]);
                         let length2 = span_rho * span_rho + span_z * span_z;
-                        let ts: Vec<f64> = (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect();
+                        let ts: Vec<f64> = pcurve_stations(d0, d1);
                         let mut uv = Vec::with_capacity(ts.len());
-                        for &t in &ts {
-                            let x = frag(curve.evaluate(t), "branch")?;
+                        let read = |x: Vec3| -> [f64; 2] {
                             let r = x.sub(origin);
                             let z = r.dot(w);
                             let rho = r.sub(w.scale(z)).length();
                             let along = ((rho - m0[0]) * span_rho + (z - m0[1]) * span_z) / length2;
-                            uv.push(Vec3::new(u_of(angle_near(x, alpha + 0.5 * theta)), along, 0.0));
+                            [u_of(angle_near(x, alpha + 0.5 * theta)), along]
+                        };
+                        for &t in &ts {
+                            let [u, along] = read(frag(curve.evaluate(t), "branch")?);
+                            uv.push(Vec3::new(u, along, 0.0));
                         }
-                        frag(crate::interpolate_curve(&uv, 5, &ts), "branch_pcurve")
+                        if pcurve_joints_on() {
+                            let (ju, jv) = surface_joints(&surface);
+                            let at = |t: f64| -> Result<[f64; 2], KernelRefusal> { Ok(read(frag(curve.evaluate(t), "branch")?)) };
+                            if let Some(fitted) = jointed_pcurve(&ts, &uv, at, &ju, &jv, curve)? {
+                                return Ok(fitted);
+                            }
+                        }
+                        frag(fit_pcurve(&uv, &ts), "branch_pcurve")
                     };
                     let bottom = rim_arcs[&(below, arc_index(below, lo(0))?)];
                     let top = rim_arcs[&(above, arc_index(above, lo(n))?)];
@@ -1558,7 +1592,7 @@ fn split_revolved(
                 }
                 exact[0] = points[ka];
                 exact[LOFT_SAMPLES] = points[kb];
-                curves.push(ToolCurve { curve: frag(crate::interpolate_curve(&xyz, 5, &params), "torus_k")?, start: ka, end: kb, degenerate: false, samples: Some(exact) });
+                curves.push(ToolCurve { curve: frag(fit_tool_curve(&xyz, &params), "torus_k")?, start: ka, end: kb, degenerate: false, samples: Some(exact) });
                 let k_curve = curves.len() - 1;
                 // Cut meridians at ψa and ψb, from the start rim to the end rim.
                 let mut cut = [0usize; 2];
@@ -1578,10 +1612,9 @@ fn split_revolved(
                 };
                 let inverse_pcurve = |curve: &NurbsCurve, alpha: f64, beta: f64, spans_u: usize, spans_v: usize, forward: bool| -> Result<NurbsCurve, KernelRefusal> {
                     let [d0, d1] = frag(curve.domain(), "domain")?;
-                    let ts: Vec<f64> = (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect();
+                    let ts: Vec<f64> = pcurve_stations(d0, d1);
                     let mut uv = Vec::with_capacity(ts.len());
-                    for &t in &ts {
-                        let x = frag(curve.evaluate(t), "point")?;
+                    let read = |x: Vec3| -> [f64; 2] {
                         let r = x.sub(origin);
                         let mid = 0.5 * (alpha + beta);
                         let psi = mid + (r.dot(u2).atan2(r.dot(u1)) - mid + PI).rem_euclid(TAU) - PI;
@@ -1589,13 +1622,20 @@ fn split_revolved(
                         let radial = u1.scale(psi.cos()).add(u2.scale(psi.sin()));
                         let vmid = 0.5 * (start + end);
                         let v = vmid + (q.dot(w).atan2(q.dot(radial)) - vmid + PI).rem_euclid(TAU) - PI;
-                        uv.push(Vec3::new(
-                            crate::circle_angle_to_parameter(spans_u, beta - alpha, psi - alpha),
-                            crate::circle_angle_to_parameter(spans_v, end - start, v - start),
-                            0.0,
-                        ));
+                        [crate::circle_angle_to_parameter(spans_u, beta - alpha, psi - alpha), crate::circle_angle_to_parameter(spans_v, end - start, v - start)]
+                    };
+                    for &t in &ts {
+                        let [u, v] = read(frag(curve.evaluate(t), "point")?);
+                        uv.push(Vec3::new(u, v, 0.0));
                     }
-                    let fitted = frag(crate::interpolate_curve(&uv, 5, &ts), "torus_pcurve")?;
+                    if pcurve_joints_on() {
+                        let joints = |spans: usize| (1..spans).map(|k| k as f64 / spans as f64).collect::<Vec<f64>>();
+                        let at = |t: f64| -> Result<[f64; 2], KernelRefusal> { Ok(read(frag(curve.evaluate(t), "point")?)) };
+                        if let Some(fitted) = jointed_pcurve(&ts, &uv, at, &joints(spans_u), &joints(spans_v), curve)? {
+                            return if forward { Ok(fitted) } else { frag(fitted.reversed(), "reversed") };
+                        }
+                    }
+                    let fitted = frag(fit_pcurve(&uv, &ts), "torus_pcurve")?;
                     if forward { Ok(fitted) } else { frag(fitted.reversed(), "reversed") }
                 };
                 // The band away from K: a natural patch over [ψb, ψa + 2π].
@@ -1878,7 +1918,7 @@ fn split_torus_wound(
             let (start, end) = (corner[&(piece, branch)], corner[&((piece + 1) % PIECES, branch)]);
             xyz[0] = points[start];
             xyz[n] = points[end];
-            curves.push(ToolCurve { curve: frag(crate::interpolate_curve(&xyz, 5, &params), "ring_branch")?, start, end, degenerate: false, samples: Some(xyz.clone()) });
+            curves.push(ToolCurve { curve: frag(fit_tool_curve(&xyz, &params), "ring_branch")?, start, end, degenerate: false, samples: Some(xyz.clone()) });
             branch_curve.insert((piece, branch), curves.len() - 1);
         }
     }
@@ -1936,13 +1976,25 @@ fn split_torus_wound(
             };
             let inverse_pcurve = |curve: &NurbsCurve| -> Result<NurbsCurve, KernelRefusal> {
                 let [d0, d1] = frag(curve.domain(), "domain")?;
-                let ts: Vec<f64> = (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect();
+                let ts: Vec<f64> = pcurve_stations(d0, d1);
                 let mut uv = Vec::with_capacity(ts.len());
                 for &t in &ts {
                     let (psi, v) = angles_of(frag(curve.evaluate(t), "point")?);
                     uv.push(uv_of(psi, v));
                 }
-                frag(crate::interpolate_curve(&uv, 5, &ts), "ring_pcurve")
+                // Broken at the band's span joints (`BREP_SWEEP_PCURVE_JOINTS`).
+                if pcurve_joints_on() {
+                    let joints = |spans: usize| (1..spans).map(|k| k as f64 / spans as f64).collect::<Vec<f64>>();
+                    let at = |t: f64| -> Result<[f64; 2], KernelRefusal> {
+                        let (psi, v) = angles_of(frag(curve.evaluate(t), "point")?);
+                        let p = uv_of(psi, v);
+                        Ok([p.x, p.y])
+                    };
+                    if let Some(fitted) = jointed_pcurve(&ts, &uv, at, &joints(spans_u), &joints(spans_v), curve)? {
+                        return Ok(fitted);
+                    }
+                }
+                frag(fit_pcurve(&uv, &ts), "ring_pcurve")
             };
             let lower_edge = branch_curve[&(piece, lo_branch)];
             let upper_edge = branch_curve[&(piece, hi_branch)];
@@ -2052,7 +2104,7 @@ fn split_torus(
             let (start, end) = (corner[&(seam_of_end(half, false), branch)], corner[&(seam_of_end(half, true), branch)]);
             xyz[0] = points[start];
             xyz[n] = points[end];
-            curves.push(ToolCurve { curve: frag(crate::interpolate_curve(&xyz, 5, &params), "ring_branch")?, start, end, degenerate: false, samples: Some(xyz.clone()) });
+            curves.push(ToolCurve { curve: frag(fit_tool_curve(&xyz, &params), "ring_branch")?, start, end, degenerate: false, samples: Some(xyz.clone()) });
             branch_curve.insert((half, branch), curves.len() - 1);
         }
     }
@@ -2114,13 +2166,25 @@ fn split_torus(
             };
             let inverse_pcurve = |curve: &NurbsCurve| -> Result<NurbsCurve, KernelRefusal> {
                 let [d0, d1] = frag(curve.domain(), "domain")?;
-                let ts: Vec<f64> = (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect();
+                let ts: Vec<f64> = pcurve_stations(d0, d1);
                 let mut uv = Vec::with_capacity(ts.len());
                 for &t in &ts {
                     let (psi, v) = angles_of(frag(curve.evaluate(t), "point")?);
                     uv.push(uv_of(psi, v));
                 }
-                frag(crate::interpolate_curve(&uv, 5, &ts), "ring_pcurve")
+                // Broken at the band's span joints (`BREP_SWEEP_PCURVE_JOINTS`).
+                if pcurve_joints_on() {
+                    let joints = |spans: usize| (1..spans).map(|k| k as f64 / spans as f64).collect::<Vec<f64>>();
+                    let at = |t: f64| -> Result<[f64; 2], KernelRefusal> {
+                        let (psi, v) = angles_of(frag(curve.evaluate(t), "point")?);
+                        let p = uv_of(psi, v);
+                        Ok([p.x, p.y])
+                    };
+                    if let Some(fitted) = jointed_pcurve(&ts, &uv, at, &joints(spans_u), &joints(spans_v), curve)? {
+                        return Ok(fitted);
+                    }
+                }
+                frag(fit_pcurve(&uv, &ts), "ring_pcurve")
             };
             let branch_pcurve = |b: usize, _turn: f64| -> Result<NurbsCurve, KernelRefusal> { inverse_pcurve(&curves[branch_curve[&(half, b)]].curve) };
             let lower_edge = branch_curve[&(half, lo_branch)];
@@ -2250,6 +2314,17 @@ fn sweep_with(screw: &Screw, tool: &SolidTool) -> Result<BrepSolid, KernelRefusa
     if let SolidTool::Revolved { axis_origin, axis_direction, meridian, .. } = tool {
         if let Some(body) = ball_across_axis(&screw, *axis_origin, *axis_direction, meridian)? {
             return Ok(body);
+        }
+        // (A tool whose radial direction lies along its axis is left to the
+        // refusal below.)
+        let radial_holds = match (tool, axis_direction.normalized()) {
+            (SolidTool::Revolved { radial, .. }, Ok(w)) => radial.sub(w.scale(radial.dot(w))).normalized().is_ok(),
+            _ => false,
+        };
+        if radial_holds && ball_screw::ball_screw_on() {
+            if let Some(body) = ball_screw::ball_screwed_past_fold(&screw, *axis_origin, *axis_direction, meridian)? {
+                return Ok(body);
+            }
         }
     }
     if let SolidTool::Revolved { axis_origin, axis_direction, radial, meridian } = tool {
@@ -2459,7 +2534,11 @@ fn sweep_with(screw: &Screw, tool: &SolidTool) -> Result<BrepSolid, KernelRefusa
     if !issues.is_empty() {
         return Err(refuse("assembly", format!("the assembled sweep is not valid: {:?}", issues.first())));
     }
-    check_single_pass(&screw, &split, &body, &sliding)?;
+    // A ball under one screw is proved one pass from its centre's helix
+    // (`BREP_SWEEP_BALL_ONE_PASS`, default on): nothing for the walk to find.
+    if !crate::solid_sweep_one_pass::ball_screw_one_pass(&screw, tool) {
+        check_single_pass(&screw, &split, &body, &sliding)?;
+    }
     Ok(body)
 }
 
@@ -2559,6 +2638,312 @@ fn rod_across_axis(screw: &Screw, origin: Vec3, axis: Vec3, meridian: &[OutlineP
     };
     let parts = [filled_at(screw.t0)?, filled_at(screw.t1)?, section(x, arms[0])?, section(x.scale(-1.0), arms[1])?];
     crate::boolean_operation_nary(&parts, crate::BooleanOperation::Union).map(Some)
+}
+
+/// `BREP_SWEEP_RING_LENS_SEWN` (on by default; `=0` restores the booleans): a
+/// ring slid flat short of its
+/// hole's width is the filled ring's sweep less the lens its hole leaves open
+/// at both ends. That lens is built here and sewn into the sweep's top and
+/// bottom faces in place of the two booleans (the lens intersect and the
+/// subtract): its caps are the two holes' top and bottom discs in common,
+/// whose outlines become inner loops of the sweep's flat faces, and its walls
+/// are the two holes' own tube surfaces, meeting in the slide's bisector
+/// plane along `y(ψ) = √(ρ(ψ)² − D²/4)`, `ρ = R − r cos ψ`, `z = r sin ψ`
+/// (the tube's section by that plane, interpolated through exact points and
+/// read back against them). A lens that pinches at the tube's middle (`D ≥
+/// 2 (R − r)`) or anything that does not validate is left to the booleans.
+pub(crate) fn ring_lens_sewn_on() -> bool {
+    crate::switch!("BREP_SWEEP_RING_LENS_SEWN", true)
+}
+
+/// `BREP_SWEEP_RING_LENS_SEWN_CHECK` (default off): both built, the booleans'
+/// body kept; the sewn one's volume and area compared with it
+/// ([`ring_lens_check_take`]).
+fn ring_lens_sewn_check_on() -> bool {
+    crate::switch!("BREP_SWEEP_RING_LENS_SEWN_CHECK", false)
+}
+
+thread_local! {
+    static RING_LENS_CHECK: std::cell::Cell<(u64, u64, f64)> = const { std::cell::Cell::new((0, 0, 0.0)) };
+}
+
+/// (bodies compared, sewn bodies missing or differing past `1e-7` relative
+/// in volume or area, the worst relative difference) on this thread since the
+/// last call. The bar is the booleans' own error, the bench's tier: the sewn
+/// body reads the closed form to `1e-10` where the booleans' body reads it
+/// `2.9e-9` off (tube 2 round 6, slid 6) and `3.8e-8` off (tube 1 round 5,
+/// slid 3).
+pub fn ring_lens_check_take() -> (u64, u64, f64) {
+    RING_LENS_CHECK.with(|cell| cell.replace((0, 0, 0.0)))
+}
+
+fn ring_lens_check_record(cut: &BrepSolid, sewn: Option<&BrepSolid>) {
+    let worst = match (crate::solid_mass_properties(cut), sewn.map(crate::solid_mass_properties)) {
+        (Ok(a), Some(Ok(b))) => ((a.volume - b.volume) / a.volume).abs().max(((a.surface_area - b.surface_area) / a.surface_area).abs()),
+        _ => f64::INFINITY,
+    };
+    RING_LENS_CHECK.with(|cell| {
+        let (n, bad, w) = cell.get();
+        cell.set((n + 1, bad + u64::from(!(worst <= 1e-7)), w.max(worst)));
+    });
+}
+
+/// The filled ring's sweep `whole` (a slide of the ring's centre from `c0` to
+/// `c1`, square to its axis `w`, its tube `tube` round the circle of radius
+/// `big`) less the lens both holes share, built directly. `None` where it
+/// does not apply or does not validate.
+fn sewn_lens(whole: &BrepSolid, c0: Vec3, c1: Vec3, w: Vec3, big: f64, tube: f64) -> Option<BrepSolid> {
+    let slide = c1.sub(c0);
+    let d = slide.length();
+    let scale = (big + tube + d).max(1e-300);
+    if !(slide.dot(w).abs() <= 1e-12 * scale && d > 1e-9 * scale && d < 2.0 * (big - tube) * (1.0 - 1e-9)) {
+        return None;
+    }
+    let ed = slide.scale(1.0 / d);
+    let ey = w.cross(ed);
+    let mid = c0.add(ed.scale(0.5 * d));
+    let half = 0.5 * d;
+    let alpha = (half / big).acos();
+    let y_top = (big * big - half * half).sqrt();
+    let corner = |side: f64, z: f64| mid.add(ey.scale(side * y_top)).add(w.scale(z));
+    let (t_plus, t_minus, b_plus, b_minus) = (corner(1.0, tube), corner(-1.0, tube), corner(1.0, -tube), corner(-1.0, -tube));
+    // The flat faces the caps sit in.
+    let shell = whole.shells.first()?;
+    let flat_at = |z: f64| -> Option<usize> {
+        shell.faces.iter().position(|f| {
+            f.loops.len() == 1
+                && f.surface.degree_u == 1
+                && f.surface.degree_v == 1
+                && f.surface.control_points.iter().flatten().all(|c| c.point().map(|p| (p.sub(c0).dot(w) - z).abs() <= 1e-12 * scale).unwrap_or(false))
+        })
+    };
+    let (top, bottom) = (flat_at(tube)?, flat_at(-tube)?);
+    // Edges. Arcs: A on the circle about c0 (the lens's side away from c0's
+    // far rim: angles −α..α from ed), B about c1 (π−α..π+α).
+    let arc = |centre: Vec3, from: f64, to: f64| crate::make_arc(centre, ed, ey, big, from, to).ok();
+    let a_top = arc(c0.add(w.scale(tube)), -alpha, alpha)?; // t_minus -> t_plus
+    let b_top = arc(c1.add(w.scale(tube)), PI - alpha, PI + alpha)?; // t_plus -> t_minus
+    let a_bot = arc(c0.add(w.scale(-tube)), -alpha, alpha)?; // b_minus -> b_plus
+    let b_bot = arc(c1.add(w.scale(-tube)), PI - alpha, PI + alpha)?; // b_plus -> b_minus
+    // The walls' carriers: each hole's inner tube half turned a whole turn
+    // about its axis, its generatrix drawn opposite the lens (the turn's seam
+    // away from the wall).
+    let wall_surface = |centre: Vec3, away: Vec3| -> Option<NurbsSurface> {
+        let n = w.cross(away);
+        let at = |rho: f64, z: f64| centre.add(away.scale(rho)).add(w.scale(z));
+        let from = at(big, -tube);
+        let half_round = crate::make_revolution(at(big, 0.0), n, &crate::make_line(from, from.add(n)).ok()?, PI).ok()?.iso_curve_v(0.0).ok()?;
+        crate::make_revolution(centre, w, &half_round, TAU).ok()
+    };
+    let (wall_a, wall_b) = (wall_surface(c0, ed.scale(-1.0))?, wall_surface(c1, ed)?);
+    // Seams, bottom to top, through exact points of the bisector section, with
+    // their pcurves on both walls interpolated through the same points' feet
+    // at the same parameters; all three read back at the mid-samples.
+    // (Each seam in two halves, split at the tube's waist ψ = 0: the walls'
+    // half-round generatrix is two quarter arcs, its parameter speed jumps
+    // there, and a pcurve through it would kink.)
+    let seam = |side: f64, from: f64, to: f64| -> Option<(NurbsCurve, NurbsCurve, NurbsCurve)> {
+        let at = |psi: f64| {
+            let rho = big - tube * psi.cos();
+            mid.add(ey.scale(side * (rho * rho - half * half).max(0.0).sqrt())).add(w.scale(tube * psi.sin()))
+        };
+        let feet = |surface: &NurbsSurface, points: &[Vec3]| -> Option<Vec<Vec3>> {
+            let mut out: Vec<Vec3> = Vec::with_capacity(points.len());
+            for point in points {
+                // From the last foot; where that lands off the point (the tube
+                // turning fast near its top and bottom), the global reading.
+                let seeded = out.last().and_then(|last| crate::project_point_to_surface_seeded(surface, *point, last.x, last.y).ok());
+                let q = match seeded {
+                    Some(q) if q.distance <= 1e-7 * scale => q,
+                    _ => crate::project_point_to_surface(surface, *point).ok()?,
+                };
+                // The projector stops near 1e-9; the point is on the carrier
+                // exactly, so Gauss-Newton on |S(u, v) − p|² takes the foot to
+                // rounding.
+                let (mut u, mut v) = (q.u, q.v);
+                for _ in 0..4 {
+                    let d = surface.derivatives(u, v, 1).ok()?;
+                    let (f, su, sv) = (d[0][0].sub(*point), d[1][0], d[0][1]);
+                    let (a, b, c) = (su.dot(su), su.dot(sv), sv.dot(sv));
+                    let (g0, g1) = (su.dot(f), sv.dot(f));
+                    let det = a * c - b * b;
+                    if !(det > 0.0) {
+                        return None;
+                    }
+                    u -= (c * g0 - b * g1) / det;
+                    v -= (a * g1 - b * g0) / det;
+                }
+                if !(surface.evaluate(u, v).ok()?.sub(*point).length() <= 1e-11 * scale) {
+                    return None;
+                }
+                out.push(Vec3::new(u, v, 0.0));
+            }
+            Some(out)
+        };
+        let mut n = 16usize;
+        loop {
+            let psis: Vec<f64> = (0..=n).map(|k| from + (to - from) * k as f64 / n as f64).collect();
+            let points: Vec<Vec3> = psis.iter().map(|&psi| at(psi)).collect();
+            let params: Vec<f64> = psis.iter().map(|psi| (psi - from) / (to - from)).collect();
+            let curve = crate::interpolate_curve(&points, 3, &params).ok()?;
+            let on_a = crate::interpolate_curve(&feet(&wall_a, &points)?, 3, &params).ok()?;
+            let on_b = crate::interpolate_curve(&feet(&wall_b, &points)?, 3, &params).ok()?;
+            let mut worst = 0.0f64;
+            for k in 0..n {
+                let psi = 0.5 * (psis[k] + psis[k + 1]);
+                let t = (psi - from) / (to - from);
+                let p = curve.evaluate(t).ok()?;
+                worst = worst.max(p.sub(at(psi)).length());
+                for (surface, pcurve) in [(&wall_a, &on_a), (&wall_b, &on_b)] {
+                    let uv = pcurve.evaluate(t).ok()?;
+                    worst = worst.max(surface.evaluate(uv.x, uv.y).ok()?.sub(p).length());
+                }
+            }
+            if worst <= 1e-10 * scale {
+                return Some((curve, on_a, on_b));
+            }
+            if n >= 4096 {
+                return None;
+            }
+            n *= 2;
+        }
+    };
+    let (lower_plus, upper_plus) = (seam(1.0, -0.5 * PI, 0.0)?, seam(1.0, 0.0, 0.5 * PI)?);
+    let (lower_minus, upper_minus) = (seam(-1.0, -0.5 * PI, 0.0)?, seam(-1.0, 0.0, 0.5 * PI)?);
+    let waist = |side: f64| mid.add(ey.scale(side * ((big - tube).powi(2) - half * half).sqrt()));
+    let (m_plus, m_minus) = (waist(1.0), waist(-1.0));
+    // Ids past every existing one.
+    let mut next = whole.vertices.iter().map(|v| v.id).chain(whole.edges.iter().map(|e| e.id)).chain(shell.faces.iter().flat_map(|f| std::iter::once(f.id).chain(f.loops.iter().flat_map(|l| std::iter::once(l.id).chain(l.coedges.iter().map(|c| c.id)))))).max().unwrap_or(0) + 1;
+    let mut id = || {
+        next += 1;
+        next
+    };
+    let mut body = whole.clone();
+    let vertex = |body: &mut BrepSolid, id: u64, point: Vec3| body.vertices.push(VertexRecord { id, point });
+    let (vt_plus, vt_minus, vb_plus, vb_minus, vm_plus, vm_minus) = (id(), id(), id(), id(), id(), id());
+    vertex(&mut body, vm_plus, m_plus);
+    vertex(&mut body, vm_minus, m_minus);
+    vertex(&mut body, vt_plus, t_plus);
+    vertex(&mut body, vt_minus, t_minus);
+    vertex(&mut body, vb_plus, b_plus);
+    vertex(&mut body, vb_minus, b_minus);
+    let mut edge = |body: &mut BrepSolid, curve: NurbsCurve, start: u64, end: u64| -> Option<u64> {
+        let [t0, t1] = curve.domain().ok()?;
+        let e = id();
+        body.edges.push(EdgeRecord { id: e, curve, t0, t1, start_vertex_id: start, end_vertex_id: end, degenerate: false, name: None });
+        Some(e)
+    };
+    // The arcs' ends must be the corners they are named for.
+    for (curve, a, b) in [(&a_top, t_minus, t_plus), (&b_top, t_plus, t_minus), (&a_bot, b_minus, b_plus), (&b_bot, b_plus, b_minus), (&lower_plus.0, b_plus, m_plus), (&upper_plus.0, m_plus, t_plus), (&lower_minus.0, b_minus, m_minus), (&upper_minus.0, m_minus, t_minus)] {
+        let [t0, t1] = curve.domain().ok()?;
+        if curve.evaluate(t0).ok()?.sub(a).length() > 1e-9 * scale || curve.evaluate(t1).ok()?.sub(b).length() > 1e-9 * scale {
+            return None;
+        }
+    }
+    // The seams' pcurves, built with them: (edge, wall, pcurve along the edge).
+    let mut given: Vec<(u64, usize, NurbsCurve)> = Vec::new();
+    let e_a_top = edge(&mut body, a_top, vt_minus, vt_plus)?;
+    let e_b_top = edge(&mut body, b_top, vt_plus, vt_minus)?;
+    let e_a_bot = edge(&mut body, a_bot, vb_minus, vb_plus)?;
+    let e_b_bot = edge(&mut body, b_bot, vb_plus, vb_minus)?;
+    let mut seam_edge = |body: &mut BrepSolid, piece: (NurbsCurve, NurbsCurve, NurbsCurve), start: u64, end: u64, given: &mut Vec<(u64, usize, NurbsCurve)>| -> Option<u64> {
+        let (curve, on_a, on_b) = piece;
+        let e = edge(body, curve, start, end)?;
+        given.extend([(e, 1, on_a), (e, 2, on_b)]);
+        Some(e)
+    };
+    let e_lp = seam_edge(&mut body, lower_plus, vb_plus, vm_plus, &mut given)?;
+    let e_up = seam_edge(&mut body, upper_plus, vm_plus, vt_plus, &mut given)?;
+    let e_lm = seam_edge(&mut body, lower_minus, vb_minus, vm_minus, &mut given)?;
+    let e_um = seam_edge(&mut body, upper_minus, vm_minus, vt_minus, &mut given)?;
+    let curve_of = |body: &BrepSolid, e: u64| body.edges.iter().find(|x| x.id == e).map(|x| x.curve.clone());
+    // A coedge of edge `e` on `surface`, forward or reversed, with its pcurve
+    // fitted along the coedge.
+    let coedge = |body: &BrepSolid, id: u64, surface: &NurbsSurface, e: u64, forward: bool, given: &[(u64, usize, NurbsCurve)], wall: usize| -> Option<CoedgeRecord> {
+        if let Some((_, _, pcurve)) = given.iter().find(|(edge, on, _)| *edge == e && *on == wall) {
+            let pcurve = if forward { pcurve.clone() } else { pcurve.reversed().ok()? };
+            return Some(CoedgeRecord { id, edge_id: e, forward, pcurve });
+        }
+        let fit = crate::fit_pcurve_on_surface(surface, &curve_of(body, e)?).ok()?;
+        if !(fit.report.residual <= 1e-7 * scale) {
+            return None;
+        }
+        let pcurve = if forward { fit.curve } else { fit.curve.reversed().ok()? };
+        Some(CoedgeRecord { id, edge_id: e, forward, pcurve })
+    };
+    // The loop's signed area in its face's parameters.
+    let uv_area = |coedges: &[CoedgeRecord]| -> f64 {
+        let mut area = 0.0;
+        for c in coedges {
+            let Ok([p0, p1]) = c.pcurve.domain() else { return f64::NAN };
+            let samples = 64;
+            let mut last = match c.pcurve.evaluate(p0) { Ok(p) => p, Err(_) => return f64::NAN };
+            for k in 1..=samples {
+                let Ok(p) = c.pcurve.evaluate(p0 + (p1 - p0) * k as f64 / samples as f64) else { return f64::NAN };
+                area += last.x * p.y - p.x * last.y;
+                last = p;
+            }
+        }
+        0.5 * area
+    };
+    // Caps: the top's hole runs clockwise seen from outside (from +w), the
+    // bottom's clockwise seen from −w.
+    for (face_index, loop_edges) in [(top, [(e_a_top, false), (e_b_top, false)]), (bottom, [(e_a_bot, true), (e_b_bot, true)])] {
+        let surface = body.shells[0].faces[face_index].surface.clone();
+        let mut coedges = Vec::new();
+        for (e, forward) in loop_edges {
+            let c = id();
+            coedges.push(coedge(&body, c, &surface, e, forward, &given, 0)?);
+        }
+        // An inner loop runs opposite its face's outer loop in the parameters.
+        let outer = uv_area(&body.shells[0].faces[face_index].loops[0].coedges);
+        let inner = uv_area(&coedges);
+        if !(outer.is_finite() && inner.is_finite() && outer * inner < 0.0) {
+            return None;
+        }
+        let loop_id = id();
+        body.shells[0].faces[face_index].loops.push(LoopRecord { id: loop_id, coedges });
+    }
+    // Walls: A uses the arcs the caps reversed and B likewise, the seams once each way.
+    for (wall, surface, centre, loop_edges) in [
+        (1usize, wall_a, c0, vec![(e_a_top, true), (e_up, false), (e_lp, false), (e_a_bot, false), (e_lm, true), (e_um, true)]),
+        (2usize, wall_b, c1, vec![(e_b_top, true), (e_um, false), (e_lm, false), (e_b_bot, false), (e_lp, true), (e_up, true)]),
+    ] {
+        let mut coedges = Vec::new();
+        for (e, forward) in loop_edges {
+            let c = id();
+            coedges.push(coedge(&body, c, &surface, e, forward, &given, wall)?);
+        }
+        let area = uv_area(&coedges);
+        if !(area.is_finite() && area != 0.0) {
+            return None;
+        }
+        // Counter-clockwise in the parameters: the loop's outward is the
+        // surface's normal side; it must face into the lens (towards the
+        // hole's own axis).
+        let same_sense = area > 0.0;
+        let face_id = id();
+        let loop_id = id();
+        let face = FaceRecord { id: face_id, surface, same_sense, loops: vec![LoopRecord { id: loop_id, coedges }], name: None };
+        // Sense check at the wall's middle: towards the hole's axis.
+        let middle = mid.add(ed.scale(if centre.sub(c0).length() == 0.0 { big - tube - half } else { -(big - tube - half) }));
+        let q = crate::project_point_to_surface(&face.surface, middle).ok()?;
+        let n = face.surface.normal(q.u, q.v).ok()?;
+        let n = if face.same_sense { n } else { n.scale(-1.0) };
+        let toward_axis = centre.sub(middle);
+        let toward_axis = toward_axis.sub(w.scale(toward_axis.dot(w)));
+        if !(n.dot(toward_axis) > 0.0) {
+            return None;
+        }
+        body.shells[0].faces.push(face);
+    }
+    // The lens runs through from the top face to the bottom: one handle more.
+    body.genus = whole.genus + 1;
+    body.mass_properties_cache = Default::default();
+    if body.validate().iter().any(|issue| issue.severity == "error") {
+        return None;
+    }
+    Some(body)
 }
 
 /// A ring (or another tool with a hole about its axis walled straight
@@ -2661,6 +3046,22 @@ fn flat_ring(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[
                 ];
                 frag(crate::revolve_profile_brep(&profile, o, w, TAU), "ring_flat")
             };
+            let (sewn_on, sewn_check) = (ring_lens_sewn_on(), ring_lens_sewn_check_on());
+            if sewn_on || sewn_check {
+                let whole = sweep_with(screw, &filled)?;
+                let c0 = screw.apply(screw.t0, centre0);
+                let c1 = screw.apply(screw.t1, centre0);
+                let sewn = sewn_lens(&whole, c0, c1, w, big, tube);
+                if sewn_check {
+                    let lens = crate::boolean_operation_nary(&[hole(screw.t0)?, hole(screw.t1)?], crate::BooleanOperation::Intersect)?;
+                    let cut = crate::boolean_operation_nary(&[whole, lens], crate::BooleanOperation::Subtract)?;
+                    ring_lens_check_record(&cut, sewn.as_ref());
+                    return Ok(Some(cut));
+                }
+                if let Some(body) = sewn {
+                    return Ok(Some(body));
+                }
+            }
             let lens = crate::boolean_operation_nary(&[hole(screw.t0)?, hole(screw.t1)?], crate::BooleanOperation::Intersect)?;
             let whole = sweep_with(screw, &filled)?;
             return crate::boolean_operation_nary(&[whole, lens], crate::BooleanOperation::Subtract).map(Some);
@@ -3407,10 +3808,23 @@ fn ball_across_axis(screw: &Screw, origin: Vec3, axis: Vec3, meridian: &[Outline
     // the front cap at the end.
     let (back, back_inverse) = cap(c0, h0.scale(-1.0), moving0.scale(1.0), c1)?;
     let (front, front_inverse) = cap(c1, h1.scale(-1.0), moving1.scale(-1.0), c0)?;
+    let (back_joints, front_joints) = (surface_joints(&back), surface_joints(&front));
     let pcurve = |inverse: &dyn Fn(Vec3) -> Vec3, curve: &NurbsCurve, forward: bool| -> Result<NurbsCurve, KernelRefusal> {
         let [d0, d1] = frag(curve.domain(), "domain")?;
         let ts: Vec<f64> = (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect();
         let uv: Vec<Vec3> = ts.iter().map(|&t| curve.evaluate(t).map(|x| inverse(x))).collect::<Result<_, _>>().map_err(|e| refuse("pcurve", e))?;
+        if pcurve_joints_on() {
+            // The two caps share their structure (one make_revolution each).
+            let (ju, jv) = (&back_joints.0, &back_joints.1);
+            debug_assert_eq!(back_joints, front_joints);
+            let at = |t: f64| -> Result<[f64; 2], KernelRefusal> {
+                let p = inverse(frag(curve.evaluate(t), "point")?);
+                Ok([p.x, p.y])
+            };
+            if let Some(fitted) = jointed_pcurve(&ts, &uv, at, ju, jv, curve)? {
+                return if forward { Ok(fitted) } else { frag(fitted.reversed(), "reversed") };
+            }
+        }
         let fitted = frag(crate::interpolate_curve(&uv, 5, &ts), "cap_pcurve")?;
         if forward { Ok(fitted) } else { frag(fitted.reversed(), "reversed") }
     };
@@ -3486,6 +3900,18 @@ pub struct FrameCurve {
 /// within `LOFT_TARGET` of the exact loop at the times between). Caps are the tool's
 /// back at the start and front at the end.
 pub fn sweep_solid_along(tool: &SolidTool, path: &FrameCurve) -> Result<BrepSolid, KernelRefusal> {
+    // An upright solid of revolution on a planar curve is translated by it:
+    // its sweep is built from the planar distance to the curve, folds and
+    // crossings included (`BREP_SWEEP_UPRIGHT_SLOT`, default off).
+    if crate::solid_sweep_upright::upright_slot_on() {
+        if let Some(slot) = crate::solid_sweep_upright::upright_slot(tool, path) {
+            return slot.solid();
+        }
+    }
+    // A ring on a planar curve, from its slices (`BREP_SWEEP_PLANAR_RING`).
+    if let Some(ring) = crate::solid_sweep_planar_ring::planar_ring_on().then(|| crate::solid_sweep_planar_ring::planar_ring_sweep(tool, path)).flatten() {
+        return ring;
+    }
     let up = path.up.normalized().map_err(|_| input("up", "the frame's up direction is zero".into()))?;
     let base = path.control[0];
     if path.control.iter().any(|p| p.sub(base).dot(up).abs() > 1e-9 * (1.0 + p.sub(base).length())) {
@@ -3903,6 +4329,14 @@ pub fn sweep_tube_slid_across(
     )
 }
 
+/// The crossing search's box culling in [`region_from_paths`]
+/// (`BREP_SWEEP_REGION_CROSS_BOXES`, default on; `=0` visits every segment
+/// pair, the same crossings found more slowly: square-on-a-planet-carrier
+/// tests 74.4M pairs without it, 0.75M with it, for the same 74 Newton runs).
+fn region_cross_boxes_on() -> bool {
+    crate::switch!("BREP_SWEEP_REGION_CROSS_BOXES", true)
+}
+
 /// The plane region bounded by pieces of the candidate `count` paths (each
 /// `eval(index, t)`, t ∈ [0, 1]), extruded along `up` from `heights.0` to
 /// `heights.1`: the paths are split where they cross each other or
@@ -3931,27 +4365,57 @@ fn region_from_paths(
     let polylines: Vec<Vec<[f64; 2]>> = (0..count).map(|p| (0..=m).map(|i| eval(p, i as f64 / m as f64)).collect()).collect();
     let mut cuts: Vec<Vec<f64>> = vec![vec![0.0, 1.0]; count];
     let tol = 1e-10 * scale;
+    // Under `BREP_SWEEP_REGION_CROSS_BOXES` the segment pairs are visited
+    // chunk by chunk (16 segments each), a chunk pair only where their boxes,
+    // grown by 1e-6 of the scale and by the pair test's own reach past a
+    // segment's ends, overlap: a crossing the test takes lies in both boxes,
+    // and none is missed. The cuts are
+    // sorted after, so the order they are found in does not matter.
+    const CHUNK: usize = 16;
+    let boxed = region_cross_boxes_on();
+    let chunks = (m + CHUNK - 1) / CHUNK;
+    let grow = 1e-6 * scale;
+    let boxes: Vec<Vec<[f64; 4]>> = polylines
+        .iter()
+        .filter(|_| boxed)
+        .map(|line| {
+            (0..chunks)
+                .map(|c| {
+                    let (lo, hi) = (c * CHUNK, ((c + 1) * CHUNK).min(m));
+                    let b = line[lo..=hi].iter().fold([f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY], |b, p| [b[0].min(p[0]), b[1].min(p[1]), b[2].max(p[0]), b[3].max(p[1])]);
+                    // The pair test takes a crossing up to 1e-9 of a segment's
+                    // length past its end: grow by twice that of the chunk's
+                    // longest segment, so every crossing it takes lies in both
+                    // segments' boxes.
+                    let longest = line[lo..=hi].windows(2).map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1])).fold(0.0f64, f64::max);
+                    let g = grow + 2e-9 * longest;
+                    [b[0] - g, b[1] - g, b[2] + g, b[3] + g]
+                })
+                .collect()
+        })
+        .collect();
+    let overlap = |a: &[f64; 4], b: &[f64; 4]| a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3];
     for a in 0..count {
         for b in a..count {
-            for i in 0..m {
-                for j in 0..m {
+            // One segment pair: a crossing of the polylines, polished by Newton on the exact paths.
+            let mut test = |i: usize, j: usize| {
                     // A path against itself: only where it crosses over
                     // (stretches apart along it; a closed path's ends are
                     // neighbours too).
                     if a == b && (j < i + 3 || (closed_path(a) && i < 3 && j + 3 > m)) {
-                        continue;
+                        return;
                     }
                     let (p0, p1, q0, q1) = (polylines[a][i], polylines[a][i + 1], polylines[b][j], polylines[b][j + 1]);
                     let d1 = [p1[0] - p0[0], p1[1] - p0[1]];
                     let d2 = [q1[0] - q0[0], q1[1] - q0[1]];
                     let det = d1[0] * d2[1] - d1[1] * d2[0];
                     if det.abs() < 1e-300 {
-                        continue;
+                        return;
                     }
                     let r = [q0[0] - p0[0], q0[1] - p0[1]];
                     let (x, y) = ((r[0] * d2[1] - r[1] * d2[0]) / det, (r[0] * d1[1] - r[1] * d1[0]) / det);
                     if !(-1e-9..=1.0 + 1e-9).contains(&x) || !(-1e-9..=1.0 + 1e-9).contains(&y) {
-                        continue;
+                        return;
                     }
                     // Newton on the exact paths.
                     let (mut ta, mut tb) = ((i as f64 + x) / m as f64, (j as f64 + y) / m as f64);
@@ -3977,6 +4441,26 @@ fn region_from_paths(
                     if (pa[0] - pb[0]).hypot(pa[1] - pb[1]) < tol && !(a == b && (ta - tb).abs() < 1.0 / m as f64) {
                         cuts[a].push(ta);
                         cuts[b].push(tb);
+                    }
+            };
+            if boxed {
+                // Only the segment pairs of chunks whose boxes overlap.
+                for ca in 0..chunks {
+                    for cb in 0..chunks {
+                        if !overlap(&boxes[a][ca], &boxes[b][cb]) {
+                            continue;
+                        }
+                        for i in ca * CHUNK..((ca + 1) * CHUNK).min(m) {
+                            for j in cb * CHUNK..((cb + 1) * CHUNK).min(m) {
+                                test(i, j);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for i in 0..m {
+                    for j in 0..m {
+                        test(i, j);
                     }
                 }
             }
@@ -4264,11 +4748,27 @@ pub struct TwoTurns {
 /// spans each passing once, and the spans' sweeps are joined (consecutive
 /// spans meet along a grazing loop; distant ones overlap).
 pub fn sweep_solid_tumbled(tool: &SolidTool, motion: &TwoTurns) -> Result<BrepSolid, KernelRefusal> {
+    // A ring whose swept tube K bounds the solid outright, by the tube route
+    // (BREP_SWEEP_TORUS_TUBE, default off); it declines anything else.
+    if crate::solid_sweep_tube::torus_tube_on() {
+        if let Some(tube) = ring_tube(tool, motion) {
+            if let Ok(solid) = crate::solid_sweep_tube::sweep_torus_tube(&tube) {
+                return Ok(solid);
+            }
+        }
+    }
     let lofted = sweep_solid_tumbled_lofted(tool, motion);
     // A ring (a whole circle off its axis) the lofted walls refuse, by the
     // trim engine (BREP_SWEEP_RING_TRIM); the lofted refusal stands where it
     // refuses too. Rows the walls build are left to them.
-    let Err(refusal) = lofted else { return lofted };
+    let Err(refusal) = lofted else {
+        return lofted.map(|mut solid| {
+            if cusp_first_on() {
+                start_loops_at_cusps(&mut solid);
+            }
+            solid
+        });
+    };
     // A wall whose double curve reaches a corner: the trim route meets that
     // double curve's tip, which it does not yet write so a reader integrates
     // round it, and refuses after the work; declined before it.
@@ -4284,6 +4784,73 @@ pub fn sweep_solid_tumbled(tool: &SolidTool, motion: &TwoTurns) -> Result<BrepSo
     let two = crate::solid_sweep_trim::TwoTurnMotion { points: [motion.axes[0].0, motion.axes[1].0], directions: [d0, d1], rates: motion.rates };
     let ring_centre = axis_origin.add(axis.scale(centre[1]));
     crate::solid_sweep_trim::sweep_ring_tumbled(ring_centre, axis, centre[0], *radius, &two, motion.from, motion.to).or(Err(refusal))
+}
+
+/// `BREP_SWEEP_CUSP_FIRST` (on unless =0): each loop of a tumbled sweep starts
+/// at its cusp corner, where it has one.
+fn cusp_first_on() -> bool {
+    crate::switch!("BREP_SWEEP_CUSP_FIRST", true)
+}
+
+/// Each loop rotated to start at its cusp corner (a zero-angle corner: the
+/// edge leaving it runs back along the edge arriving, within 0.05 rad), where
+/// it has one; the sharpest such corner where it has several. Topology and
+/// geometry are unchanged. A reader that places a loop on its surface by
+/// inverting the edges' points, each edge seeded from the last one's end,
+/// mislays a corner where an edge creeps into a cusp (its point all but still
+/// while its parameters still move): from the cusp it starts clean.
+pub(crate) fn start_loops_at_cusps(solid: &mut BrepSolid) {
+    let ends: HashMap<u64, [(Vec3, Vec3); 2]> = solid
+        .edges
+        .iter()
+        .filter_map(|e| {
+            let span = e.t1 - e.t0;
+            let at = |t: f64| e.curve.evaluate(t).ok();
+            let (p0, p1) = (at(e.t0)?, at(e.t1)?);
+            let (q0, q1) = (at(e.t0 + 1e-2 * span)?, at(e.t1 - 1e-2 * span)?);
+            // (point, direction into the edge) at its start and at its end
+            Some((e.id, [(p0, q0.sub(p0)), (p1, q1.sub(p1))]))
+        })
+        .collect();
+    for face in solid.shells.iter_mut().flat_map(|s| s.faces.iter_mut()) {
+        for l in face.loops.iter_mut() {
+            let n = l.coedges.len();
+            if n < 2 {
+                continue;
+            }
+            let mut best: Option<(f64, usize)> = None;
+            for k in 0..n {
+                let (before, after) = (&l.coedges[(k + n - 1) % n], &l.coedges[k]);
+                let (Some(b), Some(a)) = (ends.get(&before.edge_id), ends.get(&after.edge_id)) else { continue };
+                // into the corner back along the edge arriving, and out along the edge leaving
+                let back = if before.forward { b[1].1 } else { b[0].1 };
+                let out = if after.forward { a[0].1 } else { a[1].1 };
+                let (lb, lo) = (back.length(), out.length());
+                if !(lb > 0.0 && lo > 0.0) {
+                    continue;
+                }
+                let along = back.dot(out) / (lb * lo);
+                if along > (0.05f64).cos() && best.map_or(true, |(x, _)| along > x) {
+                    best = Some((along, k));
+                }
+            }
+            if let Some((_, k)) = best {
+                l.coedges.rotate_left(k);
+            }
+        }
+    }
+}
+
+/// The tube route's reading of a ring tool (a whole circle off its axis) under two turns.
+fn ring_tube(tool: &SolidTool, motion: &TwoTurns) -> Option<crate::solid_sweep_tube::Tube> {
+    let SolidTool::Revolved { axis_origin, axis_direction, meridian, .. } = tool else { return None };
+    let [OutlinePiece::Arc { centre, radius, start, end }] = meridian.as_slice() else { return None };
+    if !(((end - start).abs() - TAU).abs() < 1e-12 && centre[0] > *radius && motion.from.is_finite() && motion.to > motion.from) {
+        return None;
+    }
+    let (axis, d0, d1) = (axis_direction.normalized().ok()?, motion.axes[0].1.normalized().ok()?, motion.axes[1].1.normalized().ok()?);
+    let two = crate::solid_sweep_trim::TwoTurnMotion { points: [motion.axes[0].0, motion.axes[1].0], directions: [d0, d1], rates: motion.rates };
+    crate::solid_sweep_tube::Tube::new(axis_origin.add(axis.scale(centre[1])), axis, centre[0], *radius, two, motion.from, motion.to)
 }
 
 /// The lofted walls' refusal where a wall's double curve reaches a corner of
@@ -4389,9 +4956,200 @@ fn charted_pcurve(chart: &Chart, screw: &Screw, t: f64, curve: &NurbsCurve, forw
         uv.push(Vec3::new(u, v, 0.0));
         poles.push(chart.at_pole(x));
     }
+    // Where the path crosses a span joint of the chart, one quintic through
+    // it rings between samples (the parameter's second derivative jumps
+    // there): by the run between joints instead (`BREP_SWEEP_PCURVE_JOINTS`).
+    if pcurve_joints_on() && !poles.iter().any(|&p| p) {
+        let (joints_u, joints_v) = chart.joints();
+        let at = |tt: f64| -> Result<[f64; 2], KernelRefusal> { Ok(chart.invert(screw.invert(t, frag(curve.evaluate(tt), "point")?))) };
+        if let Some(fitted) = jointed_pcurve(&ts, &uv, at, &joints_u, &joints_v, curve)? {
+            return if forward { Ok(fitted) } else { frag(fitted.reversed(), "reversed") };
+        }
+    }
     continue_pole_angles(&mut uv, &ts, &poles)?;
     let fitted = frag(crate::interpolate_curve(&uv, 5, &ts), "charted_pcurve")?;
     if forward { Ok(fitted) } else { frag(fitted.reversed(), "reversed") }
+}
+
+/// A surface's joints in each parameter: its interior knots that leave it C1
+/// or less (a rational circle's spans meet at double knots), where a chart's
+/// parameter bends.
+fn surface_joints(surface: &NurbsSurface) -> (Vec<f64>, Vec<f64>) {
+    let joints = |knots: &[f64], degree: usize| -> Vec<f64> {
+        let (first, last) = (knots[0], knots[knots.len() - 1]);
+        let mut out: Vec<f64> = Vec::new();
+        for (i, &k) in knots.iter().enumerate() {
+            if k > first && k < last && (i == 0 || knots[i - 1] != k) && knots.iter().filter(|&&x| x == k).count() + 1 >= degree {
+                out.push(k);
+            }
+        }
+        out
+    };
+    (joints(&surface.knots_u, surface.degree_u), joints(&surface.knots_v, surface.degree_v))
+}
+
+thread_local! {
+    /// Set while a split is read only for its curves and structure (a loft's
+    /// interior times): its caps' pcurves are then never used.
+    static PCURVES_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The switch for skipping the cap pcurves of a loft's interior splits
+/// (default on, `=0` fits them all; the body is the same either way).
+fn loft_splits_lean_on() -> bool {
+    crate::switch!("BREP_SWEEP_LOFT_SPLITS_LEAN", true)
+}
+
+/// `action` with the split's cap pcurves read at their ends only: a split at
+/// a loft's interior time is read for its curves, samples and structure, its
+/// caps' pcurves never (only the end poses' caps are built).
+fn with_pcurves_skipped<T>(action: impl FnOnce() -> T) -> T {
+    // Restored on the way out, an unwind too, so a caught panic leaves no
+    // later sweep on this thread building its end caps' pcurves as lines.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PCURVES_SKIPPED.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(PCURVES_SKIPPED.with(|cell| cell.replace(true)));
+    action()
+}
+
+/// A grazing curve through its exact samples (quintic); in a split read only
+/// for its curves' samples and structure ([`with_pcurves_skipped`]: a loft's
+/// interior times), the line between its ends, never read as a curve.
+fn fit_tool_curve(points: &[Vec3], params: &[f64]) -> Result<NurbsCurve, String> {
+    if PCURVES_SKIPPED.with(|cell| cell.get()) && points.len() >= 2 && params.len() == points.len() {
+        let (a, b) = (params[0], params[params.len() - 1]);
+        return NurbsCurve::new(1, vec![a, a, b, b], vec![Vec4::from_point(points[0], 1.0), Vec4::from_point(points[points.len() - 1], 1.0)]);
+    }
+    crate::interpolate_curve(points, 5, params)
+}
+
+/// A cap pcurve's stations: the whole set, or its two ends where the pcurve
+/// is never used ([`with_pcurves_skipped`]).
+fn pcurve_stations(d0: f64, d1: f64) -> Vec<f64> {
+    if PCURVES_SKIPPED.with(|cell| cell.get()) {
+        return vec![d0, d1];
+    }
+    (0..=PCURVE_SAMPLES).map(|j| d0 + (d1 - d0) * j as f64 / PCURVE_SAMPLES as f64).collect()
+}
+
+/// The quintic through a cap pcurve's stations; through two (a skipped
+/// pcurve), the line between its ends.
+fn fit_pcurve(uv: &[Vec3], ts: &[f64]) -> Result<NurbsCurve, String> {
+    if ts.len() == 2 {
+        return NurbsCurve::new(1, vec![ts[0], ts[0], ts[1], ts[1]], uv.iter().map(|&p| Vec4::from_point(p, 1.0)).collect());
+    }
+    crate::interpolate_curve(uv, 5, ts)
+}
+
+/// The switch for [`jointed_pcurve`] (default on; `=0` fits one quintic as before).
+fn pcurve_joints_on() -> bool {
+    crate::switch!("BREP_SWEEP_PCURVE_JOINTS", true)
+}
+
+/// A cap's pcurve broken where its path crosses a span joint of its chart:
+/// the edge's parameter at each crossing found by bisection (`at` reads the
+/// path's chart parameters at an edge parameter), each run between them
+/// sampled as densely as the whole and interpolated (quintic) on its own, the
+/// runs joined C0 at the crossings, so each run interpolates a smooth function
+/// and the trim keeps to its edge at the same parameter, not only at the
+/// samples. `ts`, `uv`: the whole's samples; `edge`: the curve the path
+/// reads (its own C1-or-less knots are cut too). None where the path crosses
+/// no joint (the one quintic is smooth there).
+fn jointed_pcurve(ts: &[f64], uv: &[Vec3], at: impl Fn(f64) -> Result<[f64; 2], KernelRefusal>, joints_u: &[f64], joints_v: &[f64], edge: &NurbsCurve) -> Result<Option<NurbsCurve>, KernelRefusal> {
+    if ts.len() < 3 || ts.len() != uv.len() {
+        return Ok(None);
+    }
+    let (d0, d1) = (ts[0], ts[ts.len() - 1]);
+    // The edge's own joints: an interior knot that leaves it C1 or less (a
+    // rational arc's spans) kinks its parameter, so the path's too.
+    let mut cuts: Vec<f64> = Vec::new();
+    for (index, &k) in edge.knots.iter().enumerate() {
+        if k > d0 && k < d1 && (index == 0 || edge.knots[index - 1] != k) {
+            let multiplicity = edge.knots.iter().filter(|&&x| x == k).count();
+            if multiplicity + 1 >= edge.degree {
+                cuts.push(k);
+            }
+        }
+    }
+    for j in 0..ts.len() - 1 {
+        let (a, b) = (uv[j], uv[j + 1]);
+        for (coord, joints) in [(0usize, joints_u), (1, joints_v)] {
+            let (ca, cb) = if coord == 0 { (a.x, b.x) } else { (a.y, b.y) };
+            for &k in joints {
+                // A sample on the joint itself is the cut (a path that only
+                // touches it is cut there too, harmlessly).
+                if ca == k && j > 0 {
+                    cuts.push(ts[j]);
+                    continue;
+                }
+                if (ca - k) * (cb - k) < 0.0 {
+                    // Bisect the edge's parameter for the crossing.
+                    let (mut lo, mut hi) = (ts[j], ts[j + 1]);
+                    let side = ca < k;
+                    for _ in 0..80 {
+                        let mid = 0.5 * (lo + hi);
+                        if mid <= lo || mid >= hi {
+                            break;
+                        }
+                        if (at(mid)?[coord] < k) == side { lo = mid } else { hi = mid }
+                    }
+                    cuts.push(0.5 * (lo + hi));
+                }
+            }
+        }
+    }
+    if cuts.is_empty() {
+        return Ok(None);
+    }
+    // Each run at least a millionth of the whole: a cut nearer an end or
+    // another than that is dropped (its run would be too short to fit).
+    let least = 1e-6 * (d1 - d0);
+    cuts.sort_by(f64::total_cmp);
+    let mut bounds = vec![d0];
+    for c in cuts {
+        if c - bounds[bounds.len() - 1] >= least && d1 - c >= least {
+            bounds.push(c);
+        }
+    }
+    if bounds.len() == 1 {
+        return Ok(None);
+    }
+    bounds.push(d1);
+    let samples = ts.len() - 1;
+    let degree = 5;
+    let mut knots: Vec<f64> = Vec::new();
+    let mut poles: Vec<Vec4> = Vec::new();
+    let runs = bounds.len() - 1;
+    for (index, run) in bounds.windows(2).enumerate() {
+        let (a, b) = (run[0], run[1]);
+        let count = ((samples as f64 * (b - a) / (d1 - d0)).ceil() as usize).max(degree + 1);
+        let params: Vec<f64> = (0..=count).map(|i| if i == count { b } else { a + (b - a) * i as f64 / count as f64 }).collect();
+        let points: Vec<Vec3> = params.iter().map(|&tt| at(tt).map(|[u, v]| Vec3::new(u, v, 0.0))).collect::<Result<_, _>>()?;
+        // A run that does not fit falls back to the one quintic, never a refusal.
+        let Ok(piece) = crate::interpolate_curve(&points, degree, &params) else { return Ok(None) };
+        if piece.degree != degree {
+            return Ok(None);
+        }
+        let n = piece.knots.len();
+        if index == 0 {
+            knots.extend_from_slice(&piece.knots[..n - (degree + 1)]);
+            poles.extend_from_slice(&piece.control_points);
+        } else {
+            // The joint: its parameter `degree` times (C0), this run's interior
+            // knots; its first pole is the previous run's last.
+            knots.extend(std::iter::repeat_n(a, degree));
+            knots.extend_from_slice(&piece.knots[degree + 1..n - (degree + 1)]);
+            poles.extend_from_slice(&piece.control_points[1..]);
+        }
+        if index + 1 == runs {
+            knots.extend(std::iter::repeat_n(b, degree + 1));
+        }
+    }
+    Ok(NurbsCurve::new(degree, knots, poles).ok())
 }
 
 /// An edge through its surface's pole (a ball carried square to its own
@@ -4478,7 +5236,15 @@ fn lofted(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[Out
         let count = fractions.len() - 1;
         // The walls' second parameter runs 0 -> 1 over the motion.
         let times: Vec<f64> = fractions.iter().map(|&f| if f == 1.0 { screw.t1 } else { screw.t0 + (screw.t1 - screw.t0) * f }).collect();
-        let splits: Vec<Split> = times.iter().map(|&t| split_at(t)).collect::<Result<_, _>>()?;
+        // Only the end poses' caps are built: the interior splits are read
+        // for their curves and structure, their caps' pcurves skipped
+        // (`BREP_SWEEP_LOFT_SPLITS_LEAN`).
+        let lean = loft_splits_lean_on();
+        let splits: Vec<Split> = times
+            .iter()
+            .enumerate()
+            .map(|(j, &t)| if lean && j != 0 && j != count { with_pcurves_skipped(|| split_at(t)) } else { split_at(t) })
+            .collect::<Result<_, _>>()?;
         if splits.iter().any(|split| !split.slides.is_empty() || !split.slide_sides.is_empty()) {
             return Err(refuse("loft_structure", "a flat end that slides within its own plane is not lofted".into()));
         }
@@ -4599,7 +5365,7 @@ fn lofted(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[Out
         for j in 0..count {
             let t = 0.5 * (times[j] + times[j + 1]);
             let fraction = 0.5 * (fractions[j] + fractions[j + 1]);
-            let split = split_at(t)?;
+            let split = if lean { with_pcurves_skipped(|| split_at(t))? } else { split_at(t)? };
             if signature(&split)? != shape {
                 return Err(refuse("loft_structure", "the grazing loop changes its structure along the curve".into()));
             }
@@ -4670,13 +5436,32 @@ fn wall_regular(surface: &NurbsSurface, fractions: &[f64], removed: &[&[[f64; 2]
         }
         Ok(cross.normalized().ok())
     };
+    // Each trimmed-away ring's box, grown by the reach of `near_ring` and a hair: a point
+    // outside it is neither inside the ring (a closed polygon) nor that near it, so the box
+    // answers for it as the ring's own tests would.
+    let reach = 4.0 / COLUMNS as f64;
+    let boxes: Vec<[f64; 4]> = removed
+        .iter()
+        .map(|ring| {
+            let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+            for p in ring.iter() {
+                lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+                hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+            }
+            let pad = reach * (1.0 + 1e-9) + 1e-12;
+            [lo[0] - pad, hi[0] + pad, lo[1] - pad, hi[1] + pad]
+        })
+        .collect();
     let mut previous: Option<Vec<Option<Vec3>>> = None;
     for &v in &rows {
         // What a trim takes away is not part of the body.
         let row: Vec<Option<Vec3>> = (0..=COLUMNS)
             .map(|i| {
                 let u = i as f64 / COLUMNS as f64;
-                if removed.iter().any(|ring| inside_ring(ring, [u, v]) || near_ring(ring, [u, v], 4.0 / COLUMNS as f64)) { Ok(None) } else { normal(u, v) }
+                let taken = removed.iter().zip(&boxes).any(|(ring, b)| {
+                    !(u < b[0] || u > b[1] || v < b[2] || v > b[3]) && (inside_ring(ring, [u, v]) || near_ring(ring, [u, v], reach))
+                });
+                if taken { Ok(None) } else { normal(u, v) }
             })
             .collect::<Result<_, _>>()?;
         for i in 0..COLUMNS {
@@ -5785,6 +6570,28 @@ fn assemble_lofted(
 /// Is the world point y inside the moving tool at some time of the motion?
 /// Steps t by the distance over a bound on the speed of any tool point near y.
 fn covered(screw: &Screw, split: &Split, reach: Option<&ToolReach>, y: Vec3, normal: Vec3, margin: f64) -> Result<bool, KernelRefusal> {
+    // A ball carried by a frame along a cubic: the question read off the cubic
+    // (`BREP_SWEEP_BALL_COVER`, default on; its check mode walks as well).
+    if crate::solid_sweep_one_pass::ball_cover_on() {
+        if let (Some(frame), None, Shape::Revolved { origin, axis, meridian }) = (&screw.frame, &screw.turns, &split.shape) {
+            if let Some((centre, r)) = crate::solid_sweep_one_pass::ball_of_revolved(*origin, *axis, meridian) {
+                let offset = centre.sub(screw.a).length();
+                if let Some(answer) = crate::solid_sweep_one_pass::ball_on_cubic_covered(frame.control, screw.t0, screw.t1, offset, r, y, margin) {
+                    if !crate::solid_sweep_one_pass::ball_cover_check_on() {
+                        return Ok(answer);
+                    }
+                    let walked = covered_walk(screw, split, reach, y, normal, margin)?;
+                    crate::solid_sweep_one_pass::ball_cover_check_record(walked == answer);
+                    return Ok(walked);
+                }
+            }
+        }
+    }
+    covered_walk(screw, split, reach, y, normal, margin)
+}
+
+/// [`covered`] by walking the motion.
+fn covered_walk(screw: &Screw, split: &Split, reach: Option<&ToolReach>, y: Vec3, normal: Vec3, margin: f64) -> Result<bool, KernelRefusal> {
     if reach.is_some_and(|reach| reach.never_inside(screw, y, normal, margin)) {
         return Ok(false);
     }
@@ -5841,6 +6648,25 @@ struct Glide {
     /// Under `frame_glide_on`, a frame riding a curve: the probe's preimage
     /// `a + R(−θ(t))(y − P(t))` read through the frame (frame, y).
     riding: Option<(Frame, Vec3)>,
+    /// Under `turns_glide_on`, two turns about fixed axes: the probe's preimage under them (turns, y).
+    turning: Option<(Turns, Vec3)>,
+    /// Under `frame_windows_on`, the bound on |p''| over each of equal windows
+    /// of the motion (start, width, bounds), each no looser than `curve`.
+    windows: Option<(f64, f64, Vec<f64>)>,
+}
+
+/// The riding frame's |p''| bound read window by window (default on; `=0`
+/// keeps one bound over the whole motion). Either is a bound; a window's is
+/// read where the step stays within it, so steps lengthen where the curve
+/// bends gently.
+fn frame_windows_on() -> bool {
+    crate::switch!("BREP_SWEEP_FRAME_WINDOWS", true)
+}
+
+/// The second-order step for two turns about fixed axes (`BREP_SWEEP_TURNS_GLIDE`, default on;
+/// `=0` restores the first-order walk).
+fn turns_glide_on() -> bool {
+    crate::switch!("BREP_SWEEP_TURNS_GLIDE", true)
 }
 
 /// The second-order step for frames riding a curve (default on; `=0` restores the first-order walk).
@@ -5852,6 +6678,9 @@ impl Glide {
     fn of(screw: &Screw, y: Vec3) -> Option<Glide> {
         if let (Some(frame), None, true) = (&screw.frame, &screw.turns, frame_glide_on()) {
             return Glide::riding(screw, frame, y);
+        }
+        if let (Some(turns), true) = (&screw.turns, turns_glide_on()) {
+            return Glide::turning(turns, y);
         }
         if screw.frame.is_some() || screw.turns.is_some() {
             return None;
@@ -5865,7 +6694,7 @@ impl Glide {
         if !straight && !(curve >= f64::MIN_POSITIVE && curve.is_finite()) {
             return None;
         }
-        Some(Glide { e: screw.e, u, v: screw.e.cross(u), omega: screw.omega, c: screw.c, c2: screw.c2, curve, riding: None })
+        Some(Glide { e: screw.e, u, v: screw.e.cross(u), omega: screw.omega, c: screw.c, c2: screw.c2, curve, riding: None, turning: None, windows: None })
     }
 
     /// A frame riding a planar cubic: the preimage `p = a + R(−θ) q`,
@@ -5895,12 +6724,82 @@ impl Glide {
         if !(curve.is_finite() && curve >= f64::MIN_POSITIVE) {
             return None;
         }
+        // Window by window: |P'| by the hull of its quadratic over the window,
+        // |P''| (linear) at the window's ends, the floor on |P'| from eight
+        // samples less |P''| times half their spacing, |q| from the window's
+        // start; each bound kept no looser than the whole motion's.
+        let windows = frame_windows_on().then(|| {
+            let count = 32usize;
+            let width = (t1 - t0) / count as f64;
+            let bounds = (0..count)
+                .map(|i| {
+                    let (a, b) = (t0 + width * i as f64, t0 + width * (i + 1) as f64);
+                    let (da, db) = (frame.first(a), frame.first(b));
+                    let middle = da.add(frame.second(a).scale(0.5 * (b - a)));
+                    let first_w = da.length().max(db.length()).max(middle.length());
+                    let second_w = frame.second(a).length().max(frame.second(b).length());
+                    let m = 8;
+                    let slow = (0..=m).map(|j| frame.first(a + (b - a) * j as f64 / m as f64).length()).fold(f64::INFINITY, f64::min);
+                    let floor_w = slow - second_w * 0.5 * (b - a) / m as f64;
+                    if !(floor_w > 0.0) {
+                        return curve;
+                    }
+                    let w1 = first_w * second_w / (floor_w * floor_w);
+                    let w2 = third * first_w / (floor_w * floor_w) + 2.0 * first_w * first_w * second_w * second_w / floor_w.powi(4);
+                    let q_w = y.sub(frame.point(a)).length() + first_w * (b - a);
+                    let c = (w1 * w1 + w2) * q_w + 2.0 * w1 * first_w + second_w;
+                    if c.is_finite() && c >= f64::MIN_POSITIVE { c.min(curve) } else { curve }
+                })
+                .collect::<Vec<f64>>();
+            (t0, width, bounds)
+        });
         let zero = Vec3::new(0.0, 0.0, 0.0);
-        Some(Glide { e: frame.up, u: zero, v: zero, omega: 0.0, c: 0.0, c2: 0.0, curve, riding: Some((*frame, y)) })
+        Some(Glide { e: frame.up, u: zero, v: zero, omega: 0.0, c: 0.0, c2: 0.0, curve, riding: Some((*frame, y)), turning: None, windows })
+    }
+
+    /// Two turns about fixed axes (unit `d₀`, `d₁` through `P₀`, `P₁` at rates `r₀`, `r₁`): the
+    /// preimage `p = P₀ + R₀(−r₀t)(x − P₀)`, `x = P₁ + R₁(−r₁t)(y − P₁)`. With `x' = −r₁ d₁×(x − P₁)`
+    /// and `x'' = −r₁ d₁×x'`, `p'' = R₀(x'') − 2r₀ d₀×R₀(x') + r₀² d₀×(d₀×(p − P₀))`, so
+    /// `|p''| ≤ (r₁² + 2|r₀ r₁|)·|y − P₁| + r₀²·(|y − P₁| + |P₁ − P₀|)` (rotations keep lengths).
+    fn turning(turns: &Turns, y: Vec3) -> Option<Glide> {
+        let a = y.sub(turns.points[1]).length();
+        let d = a + turns.points[1].sub(turns.points[0]).length();
+        let (r0, r1) = (turns.rates[0].abs(), turns.rates[1].abs());
+        let curve = (r1 * r1 + 2.0 * r0 * r1) * a + r0 * r0 * d;
+        if !(curve.is_finite() && curve >= f64::MIN_POSITIVE) {
+            return None;
+        }
+        let zero = Vec3::new(0.0, 0.0, 0.0);
+        Some(Glide { e: zero, u: zero, v: zero, omega: 0.0, c: 0.0, c2: 0.0, curve, riding: None, turning: Some((*turns, y)), windows: None })
+    }
+
+    /// The bound on |p''| over [t, t + h]: the most of the windows it meets,
+    /// or the whole motion's.
+    fn curve_over(&self, t: f64, h: f64) -> f64 {
+        match &self.windows {
+            Some((t0, width, bounds)) => {
+                let last = bounds.len() - 1;
+                let index = |x: f64| -> usize {
+                    let k = ((x - t0) / width).floor();
+                    if k.is_nan() || k <= 0.0 { 0 } else { (k as usize).min(last) }
+                };
+                bounds[index(t)..=index(t + h)].iter().fold(0.0f64, |a, &b| a.max(b))
+            }
+            None => self.curve,
+        }
     }
 
     /// `p'(t)`.
     fn velocity(&self, t: f64) -> Vec3 {
+        if let Some((turns, y)) = &self.turning {
+            let (p0, p1) = (turns.points[0], turns.points[1]);
+            let (d0, d1) = (turns.directions[0], turns.directions[1]);
+            let (r0, r1) = (turns.rates[0], turns.rates[1]);
+            let arm1 = y.sub(p1).rotate_about(d1, -r1 * t);
+            let x_rate = d1.cross(arm1).scale(-r1);
+            let arm0 = p1.add(arm1).sub(p0).rotate_about(d0, -r0 * t);
+            return x_rate.rotate_about(d0, -r0 * t).sub(d0.cross(arm0).scale(r0));
+        }
         if let Some((frame, y)) = &self.riding {
             // p' = R(−θ)(−θ' up×q − P'), q = y − P(t).
             let q = y.sub(frame.point(t));
@@ -5919,7 +6818,9 @@ impl Glide {
     #[allow(clippy::too_many_arguments)]
     fn step(&self, split: &Split, p: Vec3, t: f64, d: f64, margin: f64, speed: f64, left: f64) -> f64 {
         let velocity = self.velocity(t);
-        let m = self.curve;
+        // (the planes' root is read in closed form under one bound: the
+        // windows' over the rest of the motion)
+        let m = if self.windows.is_some() { self.curve_over(t, left) } else { self.curve };
         match &split.shape {
             // Each face's plane alone bounds the distance from below:
             // g(t + h) ≥ g + g'·h − m·h²/2, held above −margin up to the root.
@@ -5965,6 +6866,7 @@ impl Glide {
                 let dflat = velocity.sub(axis.scale(dz));
                 let drho = flat.dot(dflat) / rho;
                 let q = [rho, z];
+                let walk_sqrt = walk_sqrt_on();
                 let mut best = 0.0f64;
                 let mut h = (d + margin) / speed;
                 for _ in 0..64 {
@@ -5972,13 +6874,25 @@ impl Glide {
                     if h > left {
                         h = left;
                     }
+                    // Under the windows, the speed over [t, t + h] by the
+                    // step's own: |p'| ≤ |p'(t)| + m·h, no more than `speed`.
+                    let (m, speed) = if self.windows.is_some() {
+                        let m = self.curve_over(t, h);
+                        (m, (velocity.length() + m * h).min(speed))
+                    } else {
+                        (m, speed)
+                    };
                     let low = rho - speed * h;
                     if low <= 0.0 {
                         break;
                     }
                     let bend = 2.0 * m + speed * speed / low;
                     let end = [rho + drho * h, z + dz * h];
-                    let clear = meridian.iter().map(|piece| segment_clearance(piece, q, end)).fold(f64::INFINITY, f64::min);
+                    let clear = if walk_sqrt {
+                        meridian.iter().map(|piece| segment_clearance_sqrt(piece, q, end)).fold(f64::INFINITY, f64::min)
+                    } else {
+                        meridian.iter().map(|piece| segment_clearance(piece, q, end)).fold(f64::INFINITY, f64::min)
+                    };
                     // A segment that touches the outline may enter the tool: no bound.
                     let held = clear - 0.5 * bend * h * h;
                     if !held.is_finite() || clear <= 0.0 || held < -margin {
@@ -6029,6 +6943,62 @@ fn segment_clearance(piece: &OutlinePiece, a: [f64; 2], b: [f64; 2]) -> f64 {
             (near - radius).max(radius - far).max(0.0)
         }
         // no bound read for an ellipse: zero is one
+        OutlinePiece::Ellipse { .. } => 0.0,
+    }
+}
+
+/// The switch for [`segment_clearance_sqrt`] in the walk's second-order step
+/// (default on; `=0` reads `segment_clearance`).
+fn walk_sqrt_on() -> bool {
+    crate::switch!("BREP_SWEEP_WALK_SQRT", true)
+}
+
+/// [`segment_clearance`] without `hypot`: a line piece's least squared gap,
+/// one square root; an arc's lengths by `sqrt` (within a rounding of `hypot`).
+/// A square outside the range where squaring is exact to a rounding (below
+/// 1e-290, which takes in an underflow to zero, or above 1e290) reads the
+/// piece by `segment_clearance` instead.
+fn segment_clearance_sqrt(piece: &OutlinePiece, a: [f64; 2], b: [f64; 2]) -> f64 {
+    let in_range = |x: f64| (1e-290..=1e290).contains(&x);
+    let sub = |p: [f64; 2], q: [f64; 2]| [p[0] - q[0], p[1] - q[1]];
+    let dot = |p: [f64; 2], q: [f64; 2]| p[0] * q[0] + p[1] * q[1];
+    let cross = |p: [f64; 2], q: [f64; 2]| p[0] * q[1] - p[1] * q[0];
+    let to_segment_squared = |x: [f64; 2], s: [f64; 2], e: [f64; 2]| -> f64 {
+        let d = sub(e, s);
+        let len2 = dot(d, d);
+        let w = if len2 > 0.0 { (dot(sub(x, s), d) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let gap = sub(x, [s[0] + d[0] * w, s[1] + d[1] * w]);
+        dot(gap, gap)
+    };
+    match *piece {
+        OutlinePiece::Line { from, to } => {
+            let (d1, d2) = (sub(b, a), sub(to, from));
+            let denom = cross(d1, d2);
+            if denom != 0.0 {
+                let w = sub(from, a);
+                let (s, t) = (cross(w, d2) / denom, cross(w, d1) / denom);
+                if (0.0..=1.0).contains(&s) && (0.0..=1.0).contains(&t) {
+                    return 0.0;
+                }
+            }
+            let least = to_segment_squared(a, from, to)
+                .min(to_segment_squared(b, from, to))
+                .min(to_segment_squared(from, a, b))
+                .min(to_segment_squared(to, a, b));
+            if !in_range(least) {
+                return segment_clearance(piece, a, b);
+            }
+            least.sqrt()
+        }
+        OutlinePiece::Arc { centre, radius, .. } => {
+            let near = to_segment_squared(centre, a, b);
+            let (x, y) = (sub(a, centre), sub(b, centre));
+            let far = dot(x, x).max(dot(y, y));
+            if !(in_range(near) && in_range(far)) {
+                return segment_clearance(piece, a, b);
+            }
+            (near.sqrt() - radius).max(radius - far.sqrt()).max(0.0)
+        }
         OutlinePiece::Ellipse { .. } => 0.0,
     }
 }
@@ -6258,6 +7228,135 @@ impl ToolReach {
 /// is that distance: it stands a thousand times further off them (whatever
 /// of the tool rides higher than that over such a face is still found).
 fn check_single_pass(screw: &Screw, split: &Split, body: &BrepSolid, sliding: &std::collections::HashSet<u64>) -> Result<(), KernelRefusal> {
+    let (on, check) = (parallel_turn_one_pass_on(), parallel_turn_one_pass_check_on());
+    if (on || check) && parallel_turn_one_pass(screw, split) {
+        if !check {
+            return Ok(());
+        }
+        let walked = walk_single_pass(screw, split, body, sliding);
+        PARALLEL_TURN_CHECK.with(|cell| {
+            let (n, bad) = cell.get();
+            cell.set((n + 1, bad + u64::from(walked.is_err())));
+        });
+        return walked;
+    }
+    walk_single_pass(screw, split, body, sliding)
+}
+
+/// `BREP_SWEEP_PARALLEL_TURN_ONE_PASS` (default on, `=0` walks): the one-pass check
+/// answered in closed form for a solid of revolution turned (no advance)
+/// about an axis parallel to its own, `D` from it, whose every section square
+/// to the axes is one disc of radius `r(z) <= r_max < D`. A point's
+/// distance from the turn's axis stays fixed; the disc at its height covers,
+/// of the circle it runs on, one arc of half-angle at most `asin(r_max / D)`
+/// centred on the tool's axis, and that arc moves round with the turn. The
+/// point is inside over one interval of the turn unless the arc comes round
+/// to it again: never while the turn is short of `2π − 2 asin(r_max / D)`.
+/// The sampled walk is then not needed.
+pub(crate) fn parallel_turn_one_pass_on() -> bool {
+    crate::switch!("BREP_SWEEP_PARALLEL_TURN_ONE_PASS", true)
+}
+
+/// `BREP_SWEEP_PARALLEL_TURN_ONE_PASS_CHECK` (default off): where the closed
+/// form says one pass, the walk runs too and decides; the tally counts the
+/// walks that refused ([`parallel_turn_one_pass_check_take`]).
+fn parallel_turn_one_pass_check_on() -> bool {
+    crate::switch!("BREP_SWEEP_PARALLEL_TURN_ONE_PASS_CHECK", false)
+}
+
+thread_local! {
+    static PARALLEL_TURN_CHECK: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// (closed-form one-pass answers walked, walks that refused) on this thread
+/// since the last call.
+pub fn parallel_turn_one_pass_check_take() -> (u64, u64) {
+    PARALLEL_TURN_CHECK.with(|cell| cell.replace((0, 0)))
+}
+
+/// Whether the closed form above proves the sweep one pass.
+fn parallel_turn_one_pass(screw: &Screw, split: &Split) -> bool {
+    if screw.frame.is_some() || screw.turns.is_some() || screw.c != 0.0 || screw.c2 != 0.0 || screw.omega == 0.0 {
+        return false;
+    }
+    let Shape::Revolved { origin, axis, meridian } = &split.shape else { return false };
+    if axis.cross(screw.e).length() > 1e-12 {
+        return false;
+    }
+    let apart = origin.sub(screw.a);
+    let d = apart.sub(screw.e.scale(apart.dot(screw.e))).length();
+    // Every section one disc: the outline less its pieces on the axis is one
+    // run whose axial coordinate never turns back (lines; arcs without a
+    // turning point inside), and its largest radius.
+    // On the axis exactly: a wall any way off it is a bore, however thin.
+    let on_axis = |p: [f64; 2]| p[0] == 0.0;
+    let axial: Vec<bool> = meridian.iter().map(|piece| matches!(*piece, OutlinePiece::Line { from, to } if on_axis(from) && on_axis(to))).collect();
+    let changes = (0..axial.len()).filter(|&k| axial[k] != axial[(k + 1) % axial.len()]).count();
+    if changes != 2 {
+        return false; // the pieces on the axis are not one run of them
+    }
+    let mut direction = 0i32;
+    let mut r_max = 0.0f64;
+    let mut agree = |sign: i32| -> bool {
+        if sign == 0 {
+            return true;
+        }
+        if direction == 0 {
+            direction = sign;
+        }
+        direction == sign
+    };
+    for piece in meridian {
+        match *piece {
+            OutlinePiece::Line { from, to } => {
+                if on_axis(from) && on_axis(to) {
+                    continue;
+                }
+                if from[0] < -1e-12 || to[0] < -1e-12 {
+                    return false;
+                }
+                r_max = r_max.max(from[0]).max(to[0]);
+                let rise = to[1] - from[1];
+                if !agree(if rise > 0.0 { 1 } else if rise < 0.0 { -1 } else { 0 }) {
+                    return false;
+                }
+            }
+            OutlinePiece::Arc { centre, radius, start, end } => {
+                let (lo, hi) = (start.min(end), start.max(end));
+                if !(hi > lo) || !(radius > 0.0) {
+                    return false;
+                }
+                // Turning points of the axial coordinate (cos a = 0) strictly inside.
+                let first = ((lo - FRAC_PI_2) / PI).floor() as i64 + 1;
+                if FRAC_PI_2 + first as f64 * PI < hi - 1e-12 {
+                    return false;
+                }
+                // Its radial reach: the ends, and a = 0 (mod 2π) inside.
+                let reach = |a: f64| centre[0] + radius * a.cos();
+                r_max = r_max.max(reach(start)).max(reach(end));
+                if (lo / TAU).ceil() * TAU < hi {
+                    r_max = r_max.max(centre[0] + radius);
+                }
+                if centre[0] - radius < -1e-12 && (lo..hi).contains(&PI) {
+                    return false;
+                }
+                let mid = 0.5 * (start + end);
+                let rise = radius * mid.cos() * (end - start).signum();
+                if !agree(if rise > 0.0 { 1 } else if rise < 0.0 { -1 } else { 0 }) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    if !(r_max > 0.0 && r_max < d * (1.0 - 1e-9)) {
+        return false;
+    }
+    let turn = (screw.omega * (screw.t1 - screw.t0)).abs();
+    turn + 2.0 * (r_max / d).asin() < TAU * (1.0 - 1e-9)
+}
+
+fn walk_single_pass(screw: &Screw, split: &Split, body: &BrepSolid, sliding: &std::collections::HashSet<u64>) -> Result<(), KernelRefusal> {
     let margin = 1e-9 * split.scale;
     let reach = ToolReach::of(screw, split);
     for face in body.shells.iter().flat_map(|s| &s.faces) {
@@ -6338,3 +7437,8 @@ fn check_single_pass(screw: &Screw, split: &Split, body: &BrepSolid, sliding: &s
 
 #[path = "solid_sweep_ring_fold.rs"]
 mod ring_fold;
+
+#[path = "solid_sweep_ball_screw.rs"]
+mod ball_screw;
+
+

@@ -82,7 +82,7 @@ pub use thicken::{thicken_face_sheet, thicken_trimmed_sheet};
 #[doc(hidden)]
 pub mod offset_shell;
 pub use offset_shell::{
-    offset_shell, offset_shell_by_boolean, offset_shell_closed, offset_shell_with_diagnostics, offset_solid, OffsetCorners,
+    offset_shell, offset_shell_by_boolean, offset_shell_closed, offset_shell_with_diagnostics, offset_shell_with_options, offset_solid, OffsetCorners, ShellOptions,
     OffsetFaceRole, OffsetShellFaceImageRecord, OffsetShellResultRecord,
 };
 pub use offset_shell::{is_offset_shell_no_retained_face, is_offset_shell_open_curved_rim};

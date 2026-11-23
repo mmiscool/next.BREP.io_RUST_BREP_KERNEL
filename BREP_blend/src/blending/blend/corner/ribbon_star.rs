@@ -377,6 +377,19 @@ pub(in crate::blend) fn build_n_sided_star(
     name: Option<&str>,
     next_id: &mut dyn FnMut() -> u64,
 ) -> Result<NSidedStar, KernelRefusal> {
+    build_n_sided_star_with(ribs, center, outward, name, next_id, false)
+}
+
+/// [`build_n_sided_star`], with `centre_solved` filling by
+/// [`crate::n_sided_fill_centre_solved`] (the set-back corner's fill).
+pub(in crate::blend) fn build_n_sided_star_with(
+    ribs: &[RibbonRib<'_>],
+    center: Vec3,
+    outward: bool,
+    name: Option<&str>,
+    next_id: &mut dyn FnMut() -> u64,
+    centre_solved: bool,
+) -> Result<NSidedStar, KernelRefusal> {
     let n = ribs.len();
     // Chain the ribs into the loop the fill walks, opposite to their stored
     // direction (as the four-sided fill does).
@@ -452,7 +465,8 @@ pub(in crate::blend) fn build_n_sided_star(
             );
         }
     }
-    let (patches, report) = match crate::n_sided_fill(&sides, Some(&fields)) {
+    let filled = if centre_solved { crate::n_sided_fill_centre_solved(&sides, &fields) } else { crate::n_sided_fill(&sides, Some(&fields)) };
+    let (patches, report) = match filled {
         Ok(filled) => filled,
         Err(refusal) => {
             // A loop the fill reads as folded (a re-entrant corner, a side
@@ -487,7 +501,8 @@ pub(in crate::blend) fn build_n_sided_star(
     // The spokes are moved off their sides only when the shortened bumps
     // alone do not fill it: that moves the fill further (a 1 -> 3 star's by
     // about 0.02 in volume, against 0.002 for the bumps alone).
-    let (patches, report) = if n_sided_fold_reach_on() && !(meets_bars(&report) && regular(&patches)) {
+    // (the centre-solved fill is not retried: the retries take the plain centre)
+    let (patches, report) = if !centre_solved && n_sided_fold_reach_on() && !(meets_bars(&report) && regular(&patches)) {
         let retries: [fn(&[crate::NurbsCurve], &[crate::NurbsCurve]) -> Result<(Vec<crate::NurbsSurface>, crate::NSidedReport), crate::NSidedRefusal>; 2] =
             [crate::n_sided_fill_shortening_reach, crate::n_sided_fill_shortening_reach_spokes_off_sides];
         let refilled = retries.into_iter().find_map(|retry| {

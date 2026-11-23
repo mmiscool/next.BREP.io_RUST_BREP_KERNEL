@@ -1802,7 +1802,7 @@ fn build_imprints_with_carrier_seeds(
             } else {
                 None
             };
-            if let Some(IsoSection { curve, pcurves }) = planar_iso {
+            if let Some(IsoSection { curve, pcurves, own_lane }) = planar_iso {
                 if debug_pairs {
                     eprintln!("pair {}x{}: planar_iso", first.face.id, second.face.id);
                 }
@@ -1810,6 +1810,7 @@ fn build_imprints_with_carrier_seeds(
                 // the lane is on (or checked). A face read in a lifted chart
                 // declines: the iso line is in the carrier's own frame, and
                 // the lifted chart's period is not the carrier's.
+                let exact_iso = if own_lane { ExactIsoPcurves::On } else { exact_iso };
                 let exact_pcurves = match (exact_iso, pcurves) {
                     (ExactIsoPcurves::Off, _) => None,
                     (_, Some(pcurves)) if first.lifted.is_none() && second.lifted.is_none() => {
@@ -2311,6 +2312,20 @@ fn build_imprints_with_carrier_seeds(
                 }
                 continue;
             }
+            // BOUNDARY TOUCH (`BREP_IMPRINT_BOUNDARY_TOUCH`, default off): a carrier
+            // that meets a flat face's plane only along one of its own boundary
+            // iso-curves ([`super::support::touches_plane_only_on_boundary`]) has
+            // no section but that boundary, which the edge exchange imprints; the
+            // march along it traced the rim in short branches a ULP decided.
+            if super::support::boundary_touch_enabled()
+                && (super::support::touches_plane_only_on_boundary(&first.face.surface, &second.face.surface, options.tolerance)
+                    || super::support::touches_plane_only_on_boundary(&second.face.surface, &first.face.surface, options.tolerance))
+            {
+                if debug_pairs {
+                    eprintln!("pair {}x{}: boundary touch on a flat face, march skipped", first.face.id, second.face.id);
+                }
+                continue;
+            }
             profile.marched_pairs += 1;
             if debug_pairs {
                 eprintln!(
@@ -2614,7 +2629,8 @@ fn build_imprints_with_carrier_seeds(
                     let Some(edge) = face_edge_lists[&owner.key()].iter().find(|edge| edge.id == edge_id) else {
                         continue;
                     };
-                    let crosses = edge_crosses_carrier(edge, &face_edge_lists[&owner.key()], t, other_march, options.tolerance)?;
+                    let crosses = edge_crosses_carrier(edge, &face_edge_lists[&owner.key()], t, other_march, options.tolerance)?
+                        && !(super::support::near_end_snap_enabled() && pierce_is_end_contact(edge, t, point, other_march, options.tolerance)?);
                     // The two halves of a split edge report one pierce at
                     // their shared vertex: it is one section point, once.
                     if crosses && inside.iter().any(|(seen, ..)| seen.sub(point).length() <= options.tolerance) {
@@ -3800,6 +3816,43 @@ fn pierce_near_end_step_enabled() -> bool {
 /// A CLOSED edge (a cap's rim circle) has no end: a hit within a step of its
 /// seam reads its far side across the seam (the G1 elbow's arm cap pierces
 /// the lower torus half at t = 0.0037 of its rim circle).
+/// A grazing pierce of `edge` near one of its end vertices that is the vertex
+/// touching `carrier`, not a crossing (`BREP_IMPRINT_NEAR_END_SNAP`): the end
+/// lies on the carrier and the edge from the pierce to it stays within the
+/// overlap floor of it, inside the tangency band where a touch reads as a dip
+/// through the carrier and back (a sweep's top edge leaving a disk's rim at the
+/// sweep's end corner pierced the tool's wall 1.5e-3 from the corner and set
+/// off a march along the contact). The end must be a true vertex of an open
+/// edge lying on the carrier, and the stretch is certified over its whole
+/// length ([`super::support::span_hull_within_surface`]), not sampled.
+fn pierce_is_end_contact(edge: &EdgeRecord, t: f64, point: Vec3, carrier: &NurbsSurface, tolerance: f64) -> Result<bool, KernelRefusal> {
+    let floor = tolerance.max(1e-5);
+    let reach = 256.0 * floor;
+    let (start, end) = (
+        edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Intersect, "evaluate")?,
+        edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Intersect, "evaluate")?,
+    );
+    // A closed edge's seam is no vertex the edge touches anything at.
+    if edge.degenerate || start.sub(end).length() <= floor {
+        return Ok(false);
+    }
+    for (parameter, end_point) in [(edge.t0, start), (edge.t1, end)] {
+        if parameter == t || end_point.sub(point).length() > reach {
+            continue;
+        }
+        // The end itself lies on the carrier, as the corner a touch is at does.
+        let on = project_point_to_surface(carrier, end_point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
+        if !(on.distance <= tolerance * 10.0) {
+            continue;
+        }
+        let mut budget = super::support::hug_budget();
+        if super::support::span_hull_within_surface(&edge.curve, t.min(parameter), t.max(parameter), carrier, floor, &mut budget)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn edge_crosses_carrier(
     edge: &EdgeRecord,
     siblings: &[&EdgeRecord],

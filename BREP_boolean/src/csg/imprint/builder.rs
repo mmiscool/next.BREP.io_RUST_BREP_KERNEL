@@ -889,7 +889,7 @@ impl<'a> ImprintBuilder<'a> {
                     // split while the curve split lands on the vertex. The
                     // band is the imprint's own overlap floor, below which no
                     // distinct topology can survive; no weld band moved.
-                    if hit.tangential {
+                    if hit.tangential || super::support::near_end_snap_enabled() {
                         // Edge side first: the edge's own vertex is the
                         // junction (the slab corner the cap circle touches).
                         // Then the section side: the section ends ON the edge

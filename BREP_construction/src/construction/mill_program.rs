@@ -455,7 +455,16 @@ pub fn flat_mill_region_prisms(moves: &[MillMove], radius: f64, bottom: f64, top
     for &outer in &outers {
         let mut part = vec![loops[outer].clone()];
         part.extend(holes_of[outer].iter().map(|&h| loops[h].clone()));
-        solids.push(prism(&carriers, &pieces, &part, bottom, top, origin)?);
+        // Consecutive pieces of one carrier, running on from where the last ended, are one piece:
+        // the prism then has one face per stretch of a line or circle, not one per crossing a
+        // covered move left on it (`BREP_MILL_MERGE_PIECES`, default on; `=0` keeps every piece).
+        // Joined only here, after the nesting above read the loops piece by piece.
+        if merge_pieces_on() {
+            let (joined, part) = merged_pieces(&carriers, pieces.clone(), part);
+            solids.push(prism(&carriers, &joined, &part, bottom, top, origin)?);
+        } else {
+            solids.push(prism(&carriers, &pieces, &part, bottom, top, origin)?);
+        }
     }
     Ok(solids)
 }
@@ -555,6 +564,60 @@ fn merge_carriers(carriers: Vec<Carrier>, tol: f64) -> Vec<Carrier> {
         }
     }
     out
+}
+
+/// `BREP_MILL_MERGE_PIECES` (default on; `=0` off): see [`merged_pieces`].
+fn merge_pieces_on() -> bool {
+    crate::switch!("BREP_MILL_MERGE_PIECES", true)
+}
+
+/// Each loop with its consecutive pieces of one carrier joined where the next starts exactly
+/// where the last ended, in the same direction (on a whole circle, across its seam too). A loop is
+/// left at least two pieces long (a loop of one piece would close on a single vertex).
+fn merged_pieces(carriers: &[Carrier], pieces: Vec<Piece>, loops: Vec<Vec<usize>>) -> (Vec<Piece>, Vec<Vec<usize>>) {
+    let whole = |c: usize| matches!(carriers[c], Carrier::Arc { span, .. } if (span.abs() - TAU).abs() <= 1e-12);
+    // `b` continues `a` exactly: the parameter where `a` ends is where `b` starts (a whole circle's
+    // parameters may differ by whole turns), and the shift that takes `b` into `a`'s turn.
+    let join = |a: &Piece, b: &Piece| -> Option<Piece> {
+        if a.carrier != b.carrier || a.forward != b.forward {
+            return None;
+        }
+        let (end, start) = if a.forward { (a.t1, b.t0) } else { (a.t0, b.t1) };
+        let shift = if whole(a.carrier) { (end - start).round() } else { 0.0 };
+        if start + shift != end {
+            return None;
+        }
+        Some(if a.forward {
+            Piece { carrier: a.carrier, t0: a.t0, t1: b.t1 + shift, forward: true }
+        } else {
+            Piece { carrier: a.carrier, t0: b.t0 + shift, t1: a.t1, forward: false }
+        })
+    };
+    let mut out = Vec::new();
+    let mut new_loops = Vec::with_capacity(loops.len());
+    for order in loops {
+        let mut run: Vec<Piece> = order.iter().map(|&k| pieces[k]).collect();
+        // Join forward round the loop, the last piece onto the first included.
+        let mut k = 0;
+        while run.len() > 2 && k < run.len() {
+            let next = (k + 1) % run.len();
+            match join(&run[k], &run[next]) {
+                Some(piece) => {
+                    run[k] = piece;
+                    run.remove(next);
+                    if next < k {
+                        // The first piece was taken into the last, which moves down one place.
+                        k -= 1;
+                    }
+                }
+                None => k += 1,
+            }
+        }
+        let start = out.len();
+        new_loops.push((start..start + run.len()).collect());
+        out.extend(run);
+    }
+    (out, new_loops)
 }
 
 /// One prism: `loops` (the outer loop first) of pieces, from `bottom` to `top`.

@@ -1810,6 +1810,14 @@ pub(super) fn connected_components(solid: &BrepSolid, face_ids: &[u64]) -> Vec<V
 /// patch never reaches that split, so every set the gate already accepted is
 /// answered by exactly the code it was answered by before.
 pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<BrepSolid, KernelRefusal> {
+    // A turned part (`turned_heal.rs`): its meridian healed and revolved
+    // again, exact, the kept faces' ids and names kept. Parts it does not read
+    // (not wholly turned) go on to the lanes below unchanged.
+    if turned_heal_on() {
+        if let Some(Ok(healed)) = super::turned_heal::heal_turned(solid, face_ids) {
+            return crate::accept_sound(healed, "deleteFace");
+        }
+    }
     // The soundness floor, once, on the finished body. `validate()` is an
     // incidence test and says nothing about a shell passing through itself;
     // a re-intersected rim is exactly what can produce one, and a fold is
@@ -1830,13 +1838,63 @@ pub fn delete_faces_and_heal(solid: &BrepSolid, face_ids: &[u64]) -> Result<Brep
             },
             // Last of all, the gap filled back to its bordering planes
             // (`fill_gap.rs`): a step, a notch through a side, an open slot.
-            None => match super::fill_gap::heal_by_filling_the_gap(solid, face_ids) {
+            // Flats on a round (`flat_on_round.rs`, `BREP_DELETE_FLAT_ON_ROUND`):
+            // the primitive the flats were cut from, built directly, ahead of the
+            // gap fill that unites it back.
+            None => match flat_on_round_or_fill(solid, face_ids) {
                 Some(healed) => healed,
                 None => return Err(refusal),
             },
         },
     };
     crate::accept_sound(healed, "deleteFace")
+}
+
+/// The turned-part lane ahead of the others (`BREP_DELETE_TURNED_HEAL`,
+/// default on; `=0` restores the lanes as they were).
+fn turned_heal_on() -> bool {
+    crate::switch!("BREP_DELETE_TURNED_HEAL", true)
+}
+
+/// The flats-on-a-round lane where its mode asks for it, else the gap fill
+/// (`check`: the gap fill's answer, compared with the lane's).
+fn flat_on_round_or_fill(solid: &BrepSolid, face_ids: &[u64]) -> Option<BrepSolid> {
+    let mode = super::flat_on_round::flat_on_round_mode();
+    if mode == crate::env_read::Mode::Off {
+        return super::fill_gap::heal_by_filling_the_gap(solid, face_ids);
+    }
+    let direct = super::flat_on_round::heal_flats_on_a_round(solid, face_ids);
+    if mode == crate::env_read::Mode::On {
+        if let Some(direct) = direct {
+            return Some(direct);
+        }
+        return super::fill_gap::heal_by_filling_the_gap(solid, face_ids);
+    }
+    let filled = super::fill_gap::heal_by_filling_the_gap(solid, face_ids);
+    if let (Some(direct), Some(filled)) = (&direct, &filled) {
+        let measure = |body: &BrepSolid| crate::solid_mass_properties(body).ok().map(|m| (m.volume, m.surface_area));
+        let ids = |body: &BrepSolid| {
+            let mut ids: Vec<u64> = body.shells.iter().flat_map(|s| &s.faces).map(|f| f.id).collect();
+            ids.sort_unstable();
+            ids
+        };
+        let agrees = match (measure(direct), measure(filled)) {
+            (Some((v1, a1)), Some((v2, a2))) => (v1 - v2).abs() <= 1e-9 * v1.abs().max(v2.abs()) && (a1 - a2).abs() <= 1e-9 * a1.abs().max(a2.abs()),
+            _ => false,
+        };
+        if !agrees {
+            eprintln!("delete.flat_on_round DISAGREES: measures {:?} vs {:?}", measure(direct), measure(filled));
+        }
+        // The lane keeps every kept face's id (the delete's contract); the
+        // gap fill's booleans can renumber a re-trimmed cap. Reported, not a
+        // disagreement in the body.
+        if ids(direct) != ids(filled) {
+            eprintln!("delete.flat_on_round face ids {:?} (kept) vs the gap fill's {:?}", ids(direct), ids(filled));
+        }
+    } else if direct.is_some() {
+        eprintln!("delete.flat_on_round DISAGREES: the lane built a body the gap fill refused");
+    }
+    filled
 }
 
 /// The whole selection's heal, without the soundness floor: see

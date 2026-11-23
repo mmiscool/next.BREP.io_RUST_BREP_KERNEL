@@ -434,6 +434,42 @@ impl Bar {
         self.lift(q, h)
     }
 
+    /// [`Self::side`] and its derivatives along `s` and `h`: the point as `side` writes it (to
+    /// the bit), with a curved piece's offset normal differentiated through the piece's second
+    /// derivative. `None` off the piece (its readings clamp there) or for a piece read as chords.
+    pub fn side_jet(&self, index: usize, s: f64, h: f64) -> Option<(Vec3, Vec3, Vec3)> {
+        if !(0.0..=1.0).contains(&s) {
+            return None;
+        }
+        let (q, dq_ds, dq_dh) = if self.pieces[index].straight {
+            let (a, b) = (self.joint_in_plane(index, h), self.joint_in_plane(index + 1, h));
+            let (ma, mb) = (self.joints[index % self.joints.len()].mitre, self.joints[(index + 1) % self.joints.len()].mitre);
+            let q = [a[0] + (b[0] - a[0]) * s, a[1] + (b[1] - a[1]) * s];
+            let dh = [-self.taper * (ma[0] + (mb[0] - ma[0]) * s), -self.taper * (ma[1] + (mb[1] - ma[1]) * s)];
+            (q, [b[0] - a[0], b[1] - a[1]], dh)
+        } else {
+            let piece = &self.pieces[index];
+            let (point, tangent, second) = self.derivatives(index, s);
+            // A piece read as chords has no second derivative to differentiate its normal by.
+            let t = piece.domain[0] + (piece.domain[1] - piece.domain[0]) * s;
+            if !piece.curve.derivatives(t, 2).is_ok_and(|values| values.len() >= 2) {
+                return None;
+            }
+            let normal = self.outward(tangent);
+            let d = self.taper * h;
+            let q = [point[0] - d * normal[0], point[1] - d * normal[1]];
+            let length = length2(tangent).max(1e-300);
+            // N = turn·(t₁, −t₀)/|t|: N' = turn·(s₁, −s₀)/|t| − N·(t·s)/|t|².
+            let along = (tangent[0] * second[0] + tangent[1] * second[1]) / (length * length);
+            let dn = [self.turn * second[1] / length - normal[0] * along, -self.turn * second[0] / length - normal[1] * along];
+            (q, [tangent[0] - d * dn[0], tangent[1] - d * dn[1]], [-self.taper * normal[0], -self.taper * normal[1]])
+        };
+        let point = self.lift(q, h);
+        let du = self.xa.scale(dq_ds[0]).add(self.ya.scale(dq_ds[1]));
+        let dv = self.xa.scale(dq_dh[0]).add(self.ya.scale(dq_dh[1])).add(self.n);
+        Some((point, du, dv))
+    }
+
     /// Is `q` inside the polyline through the section (even-odd)?
     fn inside_chords(&self, q: [f64; 2]) -> bool {
         let crosses = |a: [f64; 2], b: [f64; 2]| -> bool {

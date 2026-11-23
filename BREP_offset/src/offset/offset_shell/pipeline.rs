@@ -234,6 +234,66 @@ fn wall_inside_source_lane_on() -> bool {
     crate::switch!("BREP_OFFSET_WALL_INSIDE_SOURCE_LANE", true)
 }
 
+/// How [`offset_shell_with_options`] answers what [`offset_shell`] decides
+/// by convention. The default is [`offset_shell`]'s answer throughout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShellOptions {
+    /// Refuse (IllPosed `offset_shell_no_cavity`) an inward shell whose walls
+    /// meet across the whole part, so that no cavity fits. By default the
+    /// kernel answers that with the part itself (the brepbench convention,
+    /// shell/box-walls-meeting); a caller whose shell must leave a cavity asks
+    /// for the refusal.
+    pub refuse_no_cavity: bool,
+}
+
+/// Whether `shelled` is `source` itself: as many faces, each carried on one
+/// of the source's own surfaces (every control point within 1e-12 of the
+/// model's scale of the source face's).
+fn is_the_part_itself(source: &BrepSolid, shelled: &BrepSolid) -> bool {
+    fn faces(solid: &BrepSolid) -> Vec<&FaceRecord> {
+        solid.shells.iter().flat_map(|shell| &shell.faces).collect()
+    }
+    let (before, after) = (faces(source), faces(shelled));
+    if before.len() != after.len() {
+        return false;
+    }
+    let tolerance = 1e-12 * crate::solid_model_scale(source).max(1.0);
+    let same = |a: &crate::NurbsSurface, b: &crate::NurbsSurface| {
+        a.degree_u == b.degree_u
+            && a.degree_v == b.degree_v
+            && a.control_points.len() == b.control_points.len()
+            && a.control_points.iter().zip(&b.control_points).all(|(ra, rb)| {
+                ra.len() == rb.len()
+                    && ra.iter().zip(rb).all(|(p, q)| (p.x - q.x).abs() <= tolerance && (p.y - q.y).abs() <= tolerance && (p.z - q.z).abs() <= tolerance && (p.w - q.w).abs() <= 1e-12)
+            })
+    };
+    after.iter().all(|face| before.iter().any(|original| same(&face.surface, &original.surface)))
+}
+
+/// [`offset_shell`] read with `options`.
+pub fn offset_shell_with_options(
+    source: &BrepSolid,
+    opening_face_ids: &[u64],
+    distance: f64,
+    options: ShellOptions,
+) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    let shelled = offset_shell(source, opening_face_ids, distance)?;
+    // Walls that meet across the whole part answer with the part itself: as
+    // many faces as it has, each on one of its own carriers (a cavity however
+    // thin adds a face or moves one onto a carrier of its own), and its whole
+    // volume. That answer this caller refuses.
+    if options.refuse_no_cavity && distance > 0.0 && is_the_part_itself(source, &shelled.solid) {
+        let before = crate::solid_mass_properties(source).or_refuse(KernelStage::Validate, "solid_mass_properties")?.volume;
+        let after = crate::solid_mass_properties(&shelled.solid).or_refuse(KernelStage::Validate, "solid_mass_properties")?.volume;
+        if before > 0.0 && after >= before * (1.0 - 1e-9) {
+            return Err(KernelRefusal::ill_posed(KernelStage::Validate, "offset_shell_no_cavity", format!(
+                "offset_shell: walls {distance} thick meet across the whole part, leaving no cavity"
+            )));
+        }
+    }
+    Ok(shelled)
+}
+
 pub fn offset_shell(
     source: &BrepSolid,
     opening_face_ids: &[u64],

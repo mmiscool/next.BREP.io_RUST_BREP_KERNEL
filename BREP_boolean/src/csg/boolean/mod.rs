@@ -208,6 +208,7 @@ mod rim;
 mod coincident;
 mod touch;
 pub(crate) mod reseat;
+mod ball_align;
 mod rejoin;
 
 pub use rim::*;
@@ -280,6 +281,12 @@ pub fn boolean_operation(
                 && !matches!(operation, BooleanOperation::Union)
             {
                 if let Some(refusal) = below_tolerance_refusal(first, second, None) {
+                    if let Some(answer) = below_tolerance_answer(first, second, operation) {
+                        return Ok(answer);
+                    }
+                    if let Some(answer) = below_tolerance_rescaled(first, second, operation, options) {
+                        return Ok(answer);
+                    }
                     return Err(refusal);
                 }
             }
@@ -288,11 +295,28 @@ pub fn boolean_operation(
                     return Err(refusal);
                 }
             }
+            // A union or common part the exact lane did write over a near pair
+            // welds the slivers between the pair partly; the inclusion is exact.
+            if below_tolerance_slivers_enabled()
+                && !matches!(operation, BooleanOperation::Subtract)
+                && [first, second].iter().all(|solid| face_count(solid) <= SLIVER_ANSWER_FACES)
+                && near_coincident_planar_faces(first, second).is_some()
+            {
+                if let Some(answer) = below_tolerance_answer(first, second, operation) {
+                    return Ok(answer);
+                }
+            }
             Ok(outcome.value)
         }
         Err(error) => {
             if below_tolerance_refusal_enabled() {
                 if let Some(refusal) = below_tolerance_refusal(first, second, Some(&error)) {
+                    if let Some(answer) = below_tolerance_answer(first, second, operation) {
+                        return Ok(answer);
+                    }
+                    if let Some(answer) = below_tolerance_rescaled(first, second, operation, options) {
+                        return Ok(answer);
+                    }
                     return Err(refusal);
                 }
             }
@@ -1190,6 +1214,327 @@ pub fn below_tolerance_refusal_enabled() -> bool {
     crate::switch!("BREP_BELOW_TOLERANCE_REFUSAL", true)
 }
 
+/// `BREP_BELOW_TOLERANCE_SLIVERS` (default on; `=0` refuses or keeps the exact
+/// lane's answer as before): where the below-tolerance
+/// refusal would name a pair, an operand whose difference from the other is
+/// all sliver ([`difference_all_sliver`]) is read as lying inside it, and the
+/// boolean answers by that inclusion: `first - second` is empty when it is all
+/// sliver; `first ∪ second` is the operand the other lies inside; `first ∩
+/// second` is the operand lying inside the other. A box less a copy of itself
+/// moved 5.4e-6 and turned 8e-7 rad holds 1.1e-4 against a bar of 1.6e-4 and
+/// was refused (the exact lane had no boundary face left to write); a box
+/// united with a copy whose top stands 1e-5 under its own and whose other
+/// faces stand within 2e-7 of its own came back with open loops where the
+/// 1e-5 strips of the side faces welded shut. A union or common part the
+/// exact lane did write over such a pair takes the inclusion's answer too: the
+/// common part of that box and copy read 8e-5 apart in the two orders, both
+/// above the copy's own volume. Anything else still refuses by name, or keeps
+/// the exact lane's answer.
+pub fn below_tolerance_slivers_enabled() -> bool {
+    crate::switch!("BREP_BELOW_TOLERANCE_SLIVERS", true)
+}
+
+/// The most faces an operand of [`below_tolerance_answer`] may have: the
+/// polyhedral reads are quadratic in the faces.
+const SLIVER_ANSWER_FACES: usize = 64;
+
+fn face_count(solid: &BrepSolid) -> usize {
+    solid.shells.iter().map(|shell| shell.faces.len()).sum()
+}
+
+/// The answer [`below_tolerance_slivers_enabled`] gives `operation`, if any.
+fn below_tolerance_answer(first: &BrepSolid, second: &BrepSolid, operation: BooleanOperation) -> Option<BrepSolid> {
+    if !below_tolerance_slivers_enabled() || [first, second].iter().any(|solid| face_count(solid) > SLIVER_ANSWER_FACES) {
+        return None;
+    }
+    if ![first, second].iter().all(|solid| closed_single_shell(solid)) {
+        return None;
+    }
+    let inside = |x: &BrepSolid, y: &BrepSolid| difference_all_sliver(x, y);
+    if matches!(operation, BooleanOperation::Subtract) {
+        return inside(first, second).then(empty_solid);
+    }
+    let (first_in, second_in) = (inside(first, second), inside(second, first));
+    // Each inside the other: both answers hold at the tolerance; the union
+    // takes the larger and the common part the smaller, whichever comes first.
+    let first_larger = || match (body_volume(first), body_volume(second)) {
+        (Some(a), Some(b)) => a >= b,
+        _ => true,
+    };
+    let outer_is_first = match (first_in, second_in) {
+        (false, false) => return None,
+        (true, false) => false,
+        (false, true) => true,
+        (true, true) => first_larger(),
+    };
+    let (outer, inner) = if outer_is_first { (first, second) } else { (second, first) };
+    Some(match operation {
+        BooleanOperation::Union => outer.clone(),
+        _ => inner.clone(),
+    })
+}
+
+/// One shell of a solid, every proper edge used by exactly two coedges.
+fn closed_single_shell(solid: &BrepSolid) -> bool {
+    if !solid.kind.is_solid() || solid.shells.len() != 1 {
+        return false;
+    }
+    let mut uses: HashMap<u64, usize> = HashMap::default();
+    for coedge in solid.shells[0].faces.iter().flat_map(|face| &face.loops).flat_map(|lp| &lp.coedges) {
+        *uses.entry(coedge.edge_id).or_default() += 1;
+    }
+    !uses.is_empty() && uses.values().all(|&count| count == 2) && solid.edges.iter().all(|edge| uses.contains_key(&edge.id))
+}
+
+/// Whether `first - second` is all sliver: `second` a convex polyhedron and
+/// `first` a polyhedron (planar faces, straight edges) standing past no face
+/// plane of `second` by more than [`BELOW_TOLERANCE_BAND`], and the part of
+/// `first` beyond `second`'s face planes, summed plane by plane (an upper bound
+/// on V(first - second), since `second` is the intersection of their inner
+/// half-spaces), at most `first`'s area times the coincidence distance
+/// (1e-6): spread over the boundary, the material is thinner than two faces
+/// the kernel reads as one surface. Each plane's part is exact: `first`'s face
+/// polygons clipped to the plane's outer side, their volume read about a
+/// point of the plane, where the cut's own cap adds nothing.
+fn difference_all_sliver(first: &BrepSolid, second: &BrepSolid) -> bool {
+    let Some(bounds) = difference_bounds(first, second) else {
+        return false;
+    };
+    let Ok(properties) = crate::solid_mass_properties(first) else {
+        return false;
+    };
+    bounds.out <= BELOW_TOLERANCE_BAND
+        && bounds.upper.is_finite()
+        && bounds.upper <= crate::tolerance::COINCIDENCE_DISTANCE_FLOOR * properties.surface_area
+}
+
+/// Bounds on V(first - second) for a polyhedral `first` and a convex
+/// polyhedral `second`, from `first`'s parts beyond each face plane of
+/// `second` (exact, see [`difference_all_sliver`]): each part lies in the
+/// difference, so the largest is a lower bound, and the difference is their
+/// union, so their sum is an upper one.
+struct DifferenceBounds {
+    lower: f64,
+    upper: f64,
+    /// How far `first` stands past `second`'s face planes at most.
+    out: f64,
+}
+
+fn difference_bounds(first: &BrepSolid, second: &BrepSolid) -> Option<DifferenceBounds> {
+    let scale = crate::solid_tolerance::solid_scale(first).max(crate::solid_tolerance::solid_scale(second)).max(1.0);
+    let (polygons_a, polygons_b) = (face_polygons(first, scale)?, face_polygons(second, scale)?);
+    let vertices_b: Vec<Vec3> = second.vertices.iter().map(|vertex| vertex.point).collect();
+    let vertices_a: Vec<Vec3> = first.vertices.iter().map(|vertex| vertex.point).collect();
+    let flat = 1e-9 * scale;
+    let mut bounds = DifferenceBounds { lower: 0.0, upper: 0.0, out: 0.0 };
+    for polygon in &polygons_b {
+        let (origin, normal) = polygon_plane(polygon)?;
+        // Convex: every vertex of `second` on the inner side of its face plane.
+        if vertices_b.iter().any(|vertex| vertex.sub(origin).dot(normal) > flat) {
+            return None;
+        }
+        let out = vertices_a.iter().map(|vertex| vertex.sub(origin).dot(normal)).fold(0.0f64, f64::max);
+        bounds.out = bounds.out.max(out);
+        if out <= 0.0 {
+            continue;
+        }
+        let part: f64 = polygons_a.iter().map(|face| clipped_cone_volume(face, origin, normal)).sum();
+        bounds.lower = bounds.lower.max(part);
+        bounds.upper += part;
+    }
+    Some(bounds)
+}
+
+/// `BREP_BELOW_TOLERANCE_RESCALE` (default off): a
+/// boolean the below-tolerance refusal would name, over two closed convex
+/// polyhedra, is run again on both operands scaled up 100 (then 1000) times, so that faces a
+/// weld floor apart (1e-5) stand clear of it, and the answer scaled back is
+/// kept when its volume and area are the exact ones of the two convex
+/// polyhedra ([`convex_pair_measures`]) to a part in 1e9: a cube less a copy
+/// turned 1e-4 degrees came back right in volume but 1e-3 over in area (a
+/// sliver's face too many), and refuses. A box less a copy whose top stands 1e-5 under its own
+/// leaves a slab 1e-5 thick, a valid body: refused, it came back exact.
+pub fn below_tolerance_rescale_enabled() -> bool {
+    crate::switch!("BREP_BELOW_TOLERANCE_RESCALE", false)
+}
+
+fn below_tolerance_rescaled(first: &BrepSolid, second: &BrepSolid, operation: BooleanOperation, options: &BooleanOptions) -> Option<BrepSolid> {
+    if !below_tolerance_rescale_enabled()
+        || options.tolerances.is_some()
+        || [first, second].iter().any(|solid| face_count(solid) > SLIVER_ANSWER_FACES || !closed_single_shell(solid))
+    {
+        return None;
+    }
+    let (volume_exact, area_exact) = convex_pair_measures(first, second, operation)?;
+    let volume_slack = 1e-9 * body_volume(first)?.max(body_volume(second)?);
+    let area_slack = 1e-9 * area_exact.max(1.0);
+    for factor in [100.0, 1000.0] {
+        let scaled = |solid: &BrepSolid| crate::rescale::scale_operand(solid, factor, "boolean").ok();
+        let (Some(a), Some(b)) = (scaled(first), scaled(second)) else {
+            continue;
+        };
+        let mut scaled_options = options.clone();
+        scaled_options.imprint.maximum_ssi_step = scaled_options.imprint.maximum_ssi_step.map(|step| step * factor);
+        let Ok(outcome) = boolean_operation_with_diagnostics(&a, &b, operation, &scaled_options) else {
+            continue;
+        };
+        let Ok(answer) = crate::rescale::scale_operand(&outcome.value, 1.0 / factor, "boolean") else {
+            continue;
+        };
+        let Ok(properties) = crate::solid_mass_properties(&answer) else {
+            continue;
+        };
+        if (properties.volume.abs() - volume_exact).abs() <= volume_slack
+            && (properties.surface_area - area_exact).abs() <= area_slack
+            && !answer.validate().iter().any(|issue| issue.severity == "error")
+        {
+            return Some(answer);
+        }
+    }
+    None
+}
+
+/// The exact volume and area of `operation` on two convex polyhedra: each
+/// face polygon clipped to the other's inner half-spaces is the part of it
+/// inside the other, the common part is closed by those parts of both, and
+/// the union and difference follow from the parts inside and the rest. `None`
+/// unless both are convex polyhedra.
+fn convex_pair_measures(first: &BrepSolid, second: &BrepSolid, operation: BooleanOperation) -> Option<(f64, f64)> {
+    let scale = crate::solid_tolerance::solid_scale(first).max(crate::solid_tolerance::solid_scale(second)).max(1.0);
+    let (polygons_a, polygons_b) = (face_polygons(first, scale)?, face_polygons(second, scale)?);
+    let (planes_a, planes_b) = (convex_planes(&polygons_a, scale)?, convex_planes(&polygons_b, scale)?);
+    let zero = Vec3::new(0.0, 0.0, 0.0);
+    // (volume of the cones over the parts inside, area of the polygons, area of the parts inside)
+    let read = |polygons: &[Vec<Vec3>], planes: &[(Vec3, Vec3)]| {
+        let (mut cone, mut area, mut inside_area) = (0.0, 0.0, 0.0);
+        for polygon in polygons {
+            area += vector_area(polygon, zero).length();
+            let mut inside = polygon.clone();
+            for &(origin, normal) in planes {
+                inside = clip_polygon(&inside, origin, normal.scale(-1.0));
+                if inside.len() < 3 {
+                    break;
+                }
+            }
+            if inside.len() >= 3 {
+                let vector = vector_area(&inside, zero);
+                cone += inside[0].dot(vector) / 3.0;
+                inside_area += vector.length();
+            }
+        }
+        (cone, area, inside_area)
+    };
+    let (cone_a, area_a, inside_a) = read(&polygons_a, &planes_b);
+    let (cone_b, area_b, inside_b) = read(&polygons_b, &planes_a);
+    let (volume_a, volume_b) = (body_volume(first)?, body_volume(second)?);
+    let common = cone_a + cone_b;
+    Some(match operation {
+        BooleanOperation::Intersect => (common, inside_a + inside_b),
+        BooleanOperation::Union => (volume_a + volume_b - common, (area_a - inside_a) + (area_b - inside_b)),
+        BooleanOperation::Subtract => (volume_a - common, (area_a - inside_a) + inside_b),
+    })
+}
+
+/// A convex polyhedron's face planes (a point and the outward unit normal),
+/// `None` when some vertex stands outside one of them.
+fn convex_planes(polygons: &[Vec<Vec3>], scale: f64) -> Option<Vec<(Vec3, Vec3)>> {
+    let planes = polygons.iter().map(|polygon| polygon_plane(polygon)).collect::<Option<Vec<_>>>()?;
+    let flat = 1e-9 * scale;
+    let convex = planes.iter().all(|&(origin, normal)| polygons.iter().flatten().all(|vertex| vertex.sub(origin).dot(normal) <= flat));
+    convex.then_some(planes)
+}
+
+/// The part of `polygon` on the side of the plane through `origin` that
+/// `normal` points to (Sutherland-Hodgman).
+fn clip_polygon(polygon: &[Vec3], origin: Vec3, normal: Vec3) -> Vec<Vec3> {
+    let side = |point: Vec3| point.sub(origin).dot(normal);
+    let mut kept = Vec::with_capacity(polygon.len() + 2);
+    for (index, &point) in polygon.iter().enumerate() {
+        let next = polygon[(index + 1) % polygon.len()];
+        let (here, there) = (side(point), side(next));
+        if here >= 0.0 {
+            kept.push(point);
+        }
+        if (here >= 0.0) != (there >= 0.0) {
+            let t = here / (here - there);
+            kept.push(point.add(next.sub(point).scale(t)));
+        }
+    }
+    kept
+}
+
+/// Every loop of `solid` as a polygon of its vertices, ordered so the
+/// polygons' vector areas point out of the solid; `None` unless every face is
+/// a plane and every edge a straight segment.
+fn face_polygons(solid: &BrepSolid, scale: f64) -> Option<Vec<Vec<Vec3>>> {
+    let vertex = |id: u64| solid.vertices.iter().find(|vertex| vertex.id == id).map(|vertex| vertex.point);
+    let mut polygons = Vec::new();
+    for face in solid.shells.iter().flat_map(|shell| &shell.faces) {
+        if !face.surface.is_affine().ok()? {
+            return None;
+        }
+        for lp in &face.loops {
+            let mut polygon = Vec::with_capacity(lp.coedges.len());
+            for coedge in &lp.coedges {
+                let edge = solid.edges.iter().find(|edge| edge.id == coedge.edge_id)?;
+                let (start, end) = (vertex(edge.start_vertex_id)?, vertex(edge.end_vertex_id)?);
+                let chord = end.sub(start);
+                let length = chord.length();
+                if edge.degenerate || length <= 1e-12 * scale {
+                    return None;
+                }
+                for control in &edge.curve.control_points {
+                    let offset = control.point().ok()?.sub(start);
+                    if offset.cross(chord).length() / length > 1e-9 * scale {
+                        return None;
+                    }
+                }
+                polygon.push(if coedge.forward { start } else { end });
+            }
+            polygons.push(polygon);
+        }
+    }
+    // Orient by the enclosed volume's sign.
+    let volume: f64 = polygons.iter().map(|polygon| clipped_cone_volume(polygon, Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 0.0))).sum();
+    if !(volume.abs() > 0.0) {
+        return None;
+    }
+    if volume < 0.0 {
+        for polygon in &mut polygons {
+            polygon.reverse();
+        }
+    }
+    Some(polygons)
+}
+
+/// A polygon's plane: a point of it and its unit outward normal.
+fn polygon_plane(polygon: &[Vec3]) -> Option<(Vec3, Vec3)> {
+    let origin = *polygon.first()?;
+    Some((origin, vector_area(polygon, origin).normalized().ok()?))
+}
+
+fn vector_area(polygon: &[Vec3], origin: Vec3) -> Vec3 {
+    let mut area = Vec3::new(0.0, 0.0, 0.0);
+    for (index, point) in polygon.iter().enumerate() {
+        let next = polygon[(index + 1) % polygon.len()];
+        area = area.add(point.sub(origin).cross(next.sub(origin)));
+    }
+    area.scale(0.5)
+}
+
+/// The volume of the cone from `origin` over the part of `polygon` on the
+/// outer side of the plane through `origin` with `normal` (all of it for a
+/// zero normal). Summed over a closed polyhedron's polygons, it is the volume
+/// of the polyhedron beyond that plane: the cut's cap lies in the plane and
+/// adds nothing about a point of it.
+fn clipped_cone_volume(polygon: &[Vec3], origin: Vec3, normal: Vec3) -> f64 {
+    let clipped: Vec<Vec3> = if normal.length() == 0.0 { polygon.to_vec() } else { clip_polygon(polygon, origin, normal) };
+    if clipped.len() < 3 {
+        return 0.0;
+    }
+    clipped[0].sub(origin).dot(vector_area(&clipped, origin)) / 3.0
+}
+
 /// Ten weld floors: the separation under which two near-coincident planar faces
 /// are read as below the modelling tolerance.
 const BELOW_TOLERANCE_BAND: f64 = 10.0 * crate::tolerance::WELD_FLOOR;
@@ -1228,6 +1573,135 @@ pub fn sliver_shell_drop_enabled() -> bool {
 /// slab 1e-7 thick beside a unit cube is material and stays.
 const SLIVER_SHELL_THICKNESS: f64 = 1e-12;
 
+/// `BREP_SLIVER_SHELL_FAST` (on by default; `=0` reads every shell in full):
+/// a shell is kept without its full
+/// mass properties when its volume, read for its sign against the floor
+/// times an upper bound on its area ([`face_area_upper_bound`]), proves it
+/// thicker than the floor (only where every face's trim lies within its
+/// carrier's knot domain). The reading's verdict is the exact check's, and
+/// an area above the shell's makes the bar higher than the exact one, so a
+/// shell kept this way is one the exact reading keeps. Everything else (a void,
+/// whose volume is negative, a real sliver, a face without a bound) is read
+/// in full as before. The reading reuses the face terms the assembly's sign
+/// check retained: on a screw wall crossed by a box, the check of four shells
+/// fell from about 300 ms to a few. `BREP_SLIVER_SHELL_FAST_CHECK` reads both
+/// and counts the shells whose verdicts differ
+/// ([`sliver_shell_fast_check_take`]), keeping the full reading's.
+pub fn sliver_shell_fast_on() -> bool {
+    crate::switch!("BREP_SLIVER_SHELL_FAST", true)
+}
+
+fn sliver_shell_fast_check_on() -> bool {
+    crate::switch!("BREP_SLIVER_SHELL_FAST_CHECK", false)
+}
+
+thread_local! {
+    static SLIVER_FAST_CHECK: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// (shells read both ways, verdicts that differed, shells the fast reading
+/// kept) on this thread since the last call.
+pub fn sliver_shell_fast_check_take() -> (u64, u64, u64) {
+    SLIVER_FAST_CHECK.with(|cell| cell.replace((0, 0, 0)))
+}
+
+fn sliver_fast_record(compared: u64, differed: u64, kept: u64) {
+    SLIVER_FAST_CHECK.with(|cell| {
+        let (a, b, c) = cell.get();
+        cell.set((a + compared, b + differed, c + kept));
+    });
+}
+
+/// An upper bound on the area of `surface` over its whole parameter domain
+/// (so on any face trimmed from it). `|S_u × S_v| ≤ |S_u| |S_v|`, and with
+/// `S = P / w` (homogeneous `P`, weight `w`) `|S_u| ≤ (|P_u| w_max + |P|
+/// |w_u|) / w_min²`. Each factor is bounded by the convex hull of its control
+/// net: `|P|` and the weights by the control points, `P_u` and `w_u` by the
+/// hodograph's points `p (Q_{i+1} − Q_i) / (u_{i+p+1} − u_{i+1})`. `None`
+/// for a weight that is not positive or a bound that is not finite.
+fn face_area_upper_bound(surface: &crate::NurbsSurface) -> Option<f64> {
+    let net = &surface.control_points;
+    let rows = net.len();
+    let columns = net.first()?.len();
+    if rows < 2 || columns < 2 || net.iter().any(|row| row.len() != columns) {
+        return None;
+    }
+    let (p, q) = (surface.degree_u, surface.degree_v);
+    let (us, vs) = (&surface.knots_u, &surface.knots_v);
+    if us.len() != rows + p + 1 || vs.len() != columns + q + 1 {
+        return None;
+    }
+    let mut w_min = f64::INFINITY;
+    let mut w_max = 0.0f64;
+    let mut point_max = 0.0f64;
+    for c in net.iter().flatten() {
+        if !(c.w > 0.0) {
+            return None;
+        }
+        w_min = w_min.min(c.w);
+        w_max = w_max.max(c.w);
+        point_max = point_max.max((c.x * c.x + c.y * c.y + c.z * c.z).sqrt());
+    }
+    // (max |P_u|, max |w_u|) over the hodograph in one direction.
+    let hodograph = |along_u: bool| -> Option<(f64, f64)> {
+        let (count, degree, knots) = if along_u { (rows, p, us) } else { (columns, q, vs) };
+        let (mut dp, mut dw) = (0.0f64, 0.0f64);
+        for i in 0..count - 1 {
+            let span = knots[i + degree + 1] - knots[i + 1];
+            if !(span > 0.0) {
+                continue;
+            }
+            let scale = degree as f64 / span;
+            let others = if along_u { columns } else { rows };
+            for j in 0..others {
+                let (a, b) = if along_u { (net[i][j], net[i + 1][j]) } else { (net[j][i], net[j][i + 1]) };
+                let (x, y, z) = (b.x - a.x, b.y - a.y, b.z - a.z);
+                dp = dp.max(scale * (x * x + y * y + z * z).sqrt());
+                dw = dw.max(scale * (b.w - a.w).abs());
+            }
+        }
+        Some((dp, dw))
+    };
+    let (pu, wu) = hodograph(true)?;
+    let (pv, wv) = hodograph(false)?;
+    let su = (pu * w_max + point_max * wu) / (w_min * w_min);
+    let sv = (pv * w_max + point_max * wv) / (w_min * w_min);
+    let extent_u = us[us.len() - 1] - us[0];
+    let extent_v = vs[vs.len() - 1] - vs[0];
+    let bound = su * sv * extent_u * extent_v;
+    bound.is_finite().then_some(bound)
+}
+
+/// [`face_area_upper_bound`] of `face`'s carrier, when its trim lies within
+/// the carrier's knot domain: every pcurve control point (whose convex hull
+/// holds the pcurve) inside it, to `1e-12` of the domain's own extent (a circle's
+/// corner points land a rounding outside). A trim reaching further is
+/// measured on the carrier's extension, which the control net does not
+/// bound: `None`. The bound is doubled to cover that rounding's sliver of
+/// extension (the carrier's own polynomial continued).
+pub fn trimmed_face_area_upper_bound(face: &crate::topology::FaceRecord) -> Option<f64> {
+    let s = &face.surface;
+    let (u0, u1) = (*s.knots_u.first()?, *s.knots_u.last()?);
+    let (v0, v1) = (*s.knots_v.first()?, *s.knots_v.last()?);
+    // (relative to the domain alone: a tiny chart's allowance stays tiny)
+    let (du, dv) = (1e-12 * (u1 - u0).abs(), 1e-12 * (v1 - v0).abs());
+    if !(du > 0.0 && dv > 0.0) {
+        return None;
+    }
+    for coedge in face.loops.iter().flat_map(|lp| &lp.coedges) {
+        for c in &coedge.pcurve.control_points {
+            if !(c.w > 0.0) {
+                return None;
+            }
+            let (u, v) = (c.x / c.w, c.y / c.w);
+            if !(u >= u0 - du && u <= u1 + du && v >= v0 - dv && v <= v1 + dv) {
+                return None;
+            }
+        }
+    }
+    face_area_upper_bound(s).map(|bound| 2.0 * bound)
+}
+
 /// Drops the sliver shells of `solid` (see [`sliver_shell_drop_enabled`]) and
 /// returns how many went.
 fn drop_sliver_shells(solid: &mut BrepSolid) -> usize {
@@ -1252,6 +1726,21 @@ fn drop_sliver_shells(solid: &mut BrepSolid) -> usize {
             continue;
         }
         let alone = BrepSolid { shells: vec![shell.clone()], mass_properties_cache: Default::default(), ..solid.clone() };
+        let (fast, check) = (sliver_shell_fast_on(), sliver_shell_fast_check_on());
+        let kept_fast = (fast || check)
+            && shell
+                .faces
+                .iter()
+                .map(trimmed_face_area_upper_bound)
+                .sum::<Option<f64>>()
+                .map(|area| floor * area)
+                .filter(|bar| bar.is_finite() && *bar > 0.0)
+                .and_then(|bar| crate::solid_signed_volume_for_sign(&alone, bar).ok().map(|volume| volume > bar))
+                .unwrap_or(false);
+        if kept_fast && !check {
+            sliver_fast_record(0, 0, 1);
+            continue;
+        }
         let Ok(mass) = crate::solid_mass_properties(&alone) else {
             continue;
         };
@@ -1265,6 +1754,9 @@ fn drop_sliver_shells(solid: &mut BrepSolid) -> usize {
             );
         }
         drop[index] = thickness < floor;
+        if check {
+            sliver_fast_record(1, u64::from(kept_fast && drop[index]), u64::from(kept_fast));
+        }
     }
     let dropped = drop.iter().filter(|&&d| d).count();
     if dropped == 0 || dropped == solid.shells.len() {
@@ -1794,6 +2286,11 @@ pub fn boolean_operation_nary_with_options(
     if operands.len() > 255 {
         return Err(KernelRefusal::input(KernelStage::Collect, "operands", "boolean_operation_nary: at most 255 operands supported"));
     }
+    // Each whole ball turned onto the one line the others cut it about
+    // (`ball_align`); the turned set runs once more and is then left as it is.
+    if let Some(aligned) = ball_align::align_balls_nary(operands, operation, options.tolerance) {
+        return boolean_operation_nary_with_options(&aligned, operation, options);
+    }
     let debug = std::env::var("BREP_DEBUG_BOOL").is_ok();
 
     // One tolerance policy for the whole set: the largest-scale operand's policy
@@ -2112,6 +2609,10 @@ pub fn boolean_operation_with_diagnostics(
         return Ok(outcome);
     }
     let _account = profile::Scope::new("boolean.other");
+    // A whole ball turned onto the line the other operand cuts it about
+    // (`ball_align`): its sections become latitudes.
+    let (first_aligned, second_aligned) = ball_align::align_balls(first, second, operation, options.tolerance);
+    let (first, second) = (first_aligned.as_ref(), second_aligned.as_ref());
     let closed_inputs = matches!(std::env::var("BREP_CLOSED_OPERAND_INPUT").as_deref(), Err(_) | Ok("1") | Ok("on"));
     if let (true, Some(later)) = (reseat::seam_reseat_enabled(), &options.seam_reseat_later_references) {
         let started = Instant::now();
@@ -2544,6 +3045,97 @@ fn soundness_candidates(
     candidates
 }
 
+
+/// `BREP_TOUCHING_EMPTY` (default on; =0 refuses as before): an intersection
+/// or difference of operands that only touch, which selects no fragment,
+/// returns the empty solid on the sample witnesses and an inclusion-exclusion
+/// volume of zero (`boolean_pipeline`). brep-conformance's touching families
+/// (boxes face to face, flush pockets, contact along a line) refused with
+/// "operation produced no boundary faces" where the regularized result is
+/// empty.
+fn touching_empty_enabled() -> bool {
+    switch!("BREP_TOUCHING_EMPTY", true)
+}
+
+thread_local! {
+    /// Set while a touching-empty proof reads another boolean of its pair, so
+    /// that reading cannot itself be rescued as empty.
+    static TOUCHING_PROOF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a cylinder face of `first` and one of `second`, or a ball of each,
+/// reach into each other by more than `tolerance`: the closed-form depth of
+/// their lens (radii against the closest distance of the axes, at any angle,
+/// or of the centres; outer or nested), counted only where the two faces'
+/// boxes overlap by more than `tolerance` along every axis (two cylinders
+/// meeting end to end through their caps do not count).
+fn hair_deep_overlap(first: &BrepSolid, second: &BrepSolid, tolerance: f64) -> bool {
+    use crate::AnalyticSurface as A;
+    fn faces(solid: &BrepSolid) -> Vec<(&crate::AnalyticSurface, crate::spatial::Aabb, &crate::NurbsSurface)> {
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter_map(|face| Some((face.surface.analytic()?, crate::Aabb::from_surface_controls(&face.surface).ok()?, &face.surface)))
+            .collect()
+    }
+    // A face's extent along `axis`: its control points' (the hull holds it).
+    let along = |surface: &crate::NurbsSurface, axis: Vec3| {
+        surface.control_points.iter().flatten().filter_map(|control| control.point().ok()).fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), point| {
+            let at = point.dot(axis);
+            (low.min(at), high.max(at))
+        })
+    };
+    let crossing = |distance: f64, ra: f64, rb: f64| {
+        let outer = ra + rb - distance;
+        let nested = distance - (ra - rb).abs();
+        outer > tolerance && nested > tolerance
+    };
+    let boxes_overlap = |a: &crate::spatial::Aabb, b: &crate::spatial::Aabb| {
+        (a.maximum.x.min(b.maximum.x) - a.minimum.x.max(b.minimum.x)) > tolerance
+            && (a.maximum.y.min(b.maximum.y) - a.minimum.y.max(b.minimum.y)) > tolerance
+            && (a.maximum.z.min(b.maximum.z) - a.minimum.z.max(b.minimum.z)) > tolerance
+    };
+    for (a, box_a, surface_a) in faces(first) {
+        for (b, box_b, surface_b) in faces(second) {
+            if !boxes_overlap(&box_a, &box_b) {
+                continue;
+            }
+            match (a, b) {
+                (A::RuledRevolution { frame: fa, rho0: a0, rho1: a1, .. }, A::RuledRevolution { frame: fb, rho0: b0, rho1: b1, .. })
+                    if (a0 - a1).abs() <= tolerance && (b0 - b1).abs() <= tolerance =>
+                {
+                    let offset = fb.origin.sub(fa.origin);
+                    let normal = fa.axis.cross(fb.axis);
+                    // Parallel walls meet only where their extents along the
+                    // axis overlap (two cylinders end to end touch at a cap).
+                    if normal.length() <= 1e-12 {
+                        let (low_a, high_a) = along(surface_a, fa.axis);
+                        let (low_b, high_b) = along(surface_b, fa.axis);
+                        if high_a.min(high_b) - low_a.max(low_b) <= tolerance {
+                            continue;
+                        }
+                    }
+                    let apart = if normal.length() <= 1e-12 {
+                        offset.sub(fa.axis.scale(offset.dot(fa.axis))).length()
+                    } else {
+                        offset.dot(normal).abs() / normal.length()
+                    };
+                    if crossing(apart, a0.abs(), b0.abs()) {
+                        return true;
+                    }
+                }
+                (A::Sphere { frame: fa, radius: ra }, A::Sphere { frame: fb, radius: rb }) => {
+                    if crossing(fb.origin.sub(fa.origin).length(), *ra, *rb) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
 
 /// The empty solid a legitimately empty boolean returns.
 fn empty_solid() -> BrepSolid {
@@ -2988,6 +3580,68 @@ fn boolean_pipeline(
                 },
                 None,
             ));
+        }
+    }
+    // TOUCHING-EMPTY RESULTS (`BREP_TOUCHING_EMPTY`): operands that only
+    // touch (faces in contact, a flush pocket's tool inside its block) leave
+    // section evidence, so the legitimate-empty proof above does not apply,
+    // and the regularized intersection or difference is empty all the same.
+    // Empty is blessed here on two independent proofs: the same surface-sample
+    // witnesses as above, and inclusion-exclusion over another exact-lane
+    // boolean of the same pair, which must put this one's volume at zero to
+    // a billionth of the larger operand's.
+    if selected.is_empty()
+        && imprint.section_evidence
+        && !matches!(operation, BooleanOperation::Union)
+        && touching_empty_enabled()
+        && !TOUCHING_PROOF.with(std::cell::Cell::get)
+    {
+        let strict = |samples: &[Vec3], other: &BrepSolid, class: PointClass| -> Result<bool, KernelRefusal> {
+            for &sample in samples {
+                if classify_point(sample, other, tolerance).or_refuse(KernelStage::Validate, "classify_point")?.class == class {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let witnessed = match operation {
+            BooleanOperation::Intersect => {
+                !strict(&a_surface_samples, second, PointClass::In)? && !strict(&b_surface_samples, first, PointClass::In)?
+            }
+            BooleanOperation::Subtract => !strict(&a_surface_samples, second, PointClass::Out)?,
+            BooleanOperation::Union => false,
+        };
+        // Two cylinders, or two balls, can meet in a lens a hair deep
+        // (parallel cylinders 1.8e-6 into each other) that the
+        // imprint misses and every other boolean of the pair also reads as a
+        // touch. Their depth is closed form; one beyond the model tolerance
+        // is a real body, which is not empty.
+        let overlap_free = !hair_deep_overlap(first, second, tolerance);
+        if witnessed && overlap_free {
+            TOUCHING_PROOF.with(|flag| flag.set(true));
+            let proof = inclusion_exclusion_volume(first, second, operation, options, body_volume(first), body_volume(second), false);
+            TOUCHING_PROOF.with(|flag| flag.set(false));
+            // Touching operands read zero to rounding (about 1e-13 here); a
+            // band in model tolerances over the area would also bless a
+            // genuine overlap by a hair (parallel cylinders a few microns
+            // deep), so it is a billionth of the larger operand's volume.
+            let volume = |solid: &BrepSolid| body_volume(solid).unwrap_or(f64::INFINITY);
+            let band = 1e-9 * volume(first).max(volume(second));
+            if let Some(proof) = proof.filter(|proof| proof.expected.is_finite() && proof.expected.abs() <= band) {
+                diagnostics.event(
+                    DiagnosticSeverity::Info,
+                    KernelStage::Select,
+                    "boolean.empty_touching",
+                    format!(
+                        "{operation:?} of touching operands is empty: {} reads {:.3e} by {} (band {band:.3e})",
+                        proof.formula, proof.expected, proof.reading
+                    ),
+                );
+                fit_scope.close().report_into(&mut diagnostics);
+                polyline_scope.close().report_into(&mut diagnostics);
+                diagnostics.measure_max("timing.total_ms", operation_started.elapsed().as_secs_f64() * 1_000.0);
+                return Ok((KernelOutcome { value: empty_solid(), diagnostics }, None));
+            }
         }
     }
     let solids = [(0, &split_first), (1, &split_second)]

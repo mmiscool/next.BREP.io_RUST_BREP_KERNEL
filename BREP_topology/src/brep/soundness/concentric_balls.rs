@@ -53,7 +53,15 @@ pub(super) fn check_mode() -> bool {
 /// exactly, and every control and weight the canonical unit net's mapped
 /// through the frame the net's own poles and equator give. Its chart is then
 /// the native one's up to the slack, and injective as that one is.
-fn rebuilt_ball(s: &NurbsSurface) -> Option<(Vec3, f64)> {
+pub(super) fn rebuilt_ball(s: &NurbsSurface) -> Option<(Vec3, f64)> {
+    rebuilt_ball_with(s, false)
+}
+
+/// [`rebuilt_ball`], with `pole_slack` letting each pole row's points differ
+/// by the recognition slack instead of agreeing bit for bit (a ball framed
+/// about an arbitrary axis rounds its pole row): every control is held to
+/// the canonical net's mapped one within that slack all the same.
+pub(super) fn rebuilt_ball_with(s: &NurbsSurface, pole_slack: bool) -> Option<(Vec3, f64)> {
     if s.degree_u != 2 || s.degree_v != 2 || s.control_points.len() != 9 || s.control_points.iter().any(|row| row.len() != 5) {
         return None;
     }
@@ -63,7 +71,14 @@ fn rebuilt_ball(s: &NurbsSurface) -> Option<(Vec3, f64)> {
     }
     for pole in [0, 4] {
         let first = s.control_points[0][pole].point().ok()?;
-        if s.control_points.iter().any(|row| row[pole].point().map_or(true, |p| p.x.to_bits() != first.x.to_bits() || p.y.to_bits() != first.y.to_bits() || p.z.to_bits() != first.z.to_bits())) {
+        let reach = if pole_slack { DELTA * (first.length() + 1.0) * 1e3 } else { 0.0 };
+        if s.control_points.iter().any(|row| row[pole].point().map_or(true, |p| {
+            if pole_slack {
+                !(p.sub(first).length() <= reach)
+            } else {
+                p.x.to_bits() != first.x.to_bits() || p.y.to_bits() != first.y.to_bits() || p.z.to_bits() != first.z.to_bits()
+            }
+        })) {
             return None;
         }
     }
@@ -170,7 +185,7 @@ fn ball_face_on_one_side(face: &FaceRecord, centre: Vec3, radius: f64, normal: V
 }
 
 /// Every trim control of `face` inside its carrier's parameter domain.
-fn trims_inside_domain(face: &FaceRecord) -> bool {
+pub(super) fn trims_inside_domain(face: &FaceRecord) -> bool {
     let (Ok([u0, u1]), Ok([v0, v1])) = (face.surface.domain_u(), face.surface.domain_v()) else { return false };
     let band = 1e-12 * (u1 - u0).abs().max(v1 - v0).max(1.0);
     face.loops.iter().flat_map(|loop_record| &loop_record.coedges).all(|coedge| {

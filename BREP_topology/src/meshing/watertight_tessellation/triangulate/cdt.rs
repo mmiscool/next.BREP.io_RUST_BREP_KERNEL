@@ -346,7 +346,7 @@ pub fn direct_planar_cdt(
         vertices.extend_from_slice(h);
         ranges.push(s..vertices.len());
     }
-    let mut seen = HashSet::new();
+    let mut seen = rustc_hash::FxHashSet::default();
     if vertices
         .iter()
         .any(|p| !seen.insert((p.uv[0].to_bits(), p.uv[1].to_bits())))
@@ -426,8 +426,8 @@ pub fn direct_planar_cdt(
     if cdt.num_vertices() != vertices.len() {
         return None;
     }
-    let mut boundary = HashSet::new();
-    let mut directed_boundary = HashSet::new();
+    let mut boundary = rustc_hash::FxHashSet::default();
+    let mut directed_boundary = rustc_hash::FxHashSet::default();
     for range in &ranges {
         for i in range.clone() {
             let n = if i + 1 == range.end {
@@ -451,7 +451,7 @@ pub fn direct_planar_cdt(
             let (a, b) = (a.data().authored, b.data().authored);
             (a.min(b), a.max(b))
         })
-        .collect::<HashSet<_>>();
+        .collect::<rustc_hash::FxHashSet<_>>();
     if actual != boundary {
         return None;
     }
@@ -483,8 +483,8 @@ pub fn direct_planar_cdt(
         return None;
     }
     let mut used = vec![false; vertices.len()];
-    let mut dir = HashMap::new();
-    let mut uniq = HashSet::new();
+    let mut dir = rustc_hash::FxHashMap::default();
+    let mut uniq = rustc_hash::FxHashSet::default();
     for &[a, b, c] in &triangles {
         for i in [a, b, c] {
             used[i] = true;
@@ -525,7 +525,7 @@ pub fn direct_planar_cdt(
 pub(in crate::watertight_tessellation) struct CdtMesh {
     pub(in crate::watertight_tessellation) vertices: Vec<FaceVertex>,
     pub(in crate::watertight_tessellation) triangles: Vec<[usize; 3]>,
-    pub(in crate::watertight_tessellation) boundary_pairs: HashSet<(usize, usize)>,
+    pub(in crate::watertight_tessellation) boundary_pairs: rustc_hash::FxHashSet<(usize, usize)>,
 }
 
 /// Constrained-Delaunay triangulation of ANY (planar or curved) face's trim
@@ -560,6 +560,11 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
         return decline("degenerate loop");
     }
     if !valid_planar_pslg(outer, holes) {
+        if holes.is_empty() && pinch_cdt_enabled() {
+            if let Some(mesh) = pinched_cdt(outer, scale) {
+                return Some(mesh);
+            }
+        }
         return decline("not a simple PSLG");
     }
     // Concatenate loops into one vertex list; record each loop's index range so
@@ -608,7 +613,7 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
     }
     drop(insert_timer);
     let constraint_timer = stage_timer(Stage::CdtConstraint);
-    let mut boundary_pairs: HashSet<(usize, usize)> = HashSet::new();
+    let mut boundary_pairs: rustc_hash::FxHashSet<(usize, usize)> = rustc_hash::FxHashSet::default();
     let mut directed_boundary: FxHashSet<(usize, usize)> = FxHashSet::default();
     for range in &ranges {
         for i in range.clone() {
@@ -631,7 +636,7 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
             let (a, b) = (a.data().authored, b.data().authored);
             (a.min(b), a.max(b))
         })
-        .collect::<HashSet<_>>();
+        .collect::<rustc_hash::FxHashSet<_>>();
     if actual != boundary_pairs {
         return decline("constraint set mismatch");
     }
@@ -741,6 +746,265 @@ pub(in crate::watertight_tessellation) fn surface_cdt(outer: &[FaceVertex], hole
         triangles,
         boundary_pairs,
     })
+}
+
+
+/// `BREP_TESS_PINCH_CDT` (default on; `=0` leaves a pinched loop to the ear
+/// clip): an outer loop that is simple but for touching itself at vertices it
+/// visits twice (a wall pinched to a point, as where a tee's branch touches
+/// the main pipe's crown) goes to the constrained Delaunay
+/// ([`pinched_cdt`]) instead of the ear clip, whose fan the flipper then
+/// spends hundreds of rounds converting.
+fn pinch_cdt_enabled() -> bool {
+    crate::switch!("BREP_TESS_PINCH_CDT", true)
+}
+
+/// The constrained Delaunay triangulation of an outer loop `outer` (no holes)
+/// that visits some uv points twice, touching itself there and nowhere else:
+/// each such point is inserted once, and the loop's constraint edges join the
+/// shared vertex on both of its visits. `None` declines (the ear clip
+/// answers) unless:
+///
+/// - every repeated point is an exact uv duplicate, visited exactly twice, not
+///   on consecutive stations, and its two visits KISS rather than cross: the
+///   rays there (each visit's outgoing direction and its incoming one
+///   reversed) do not alternate around the point;
+/// - no two segments cross, and none touches another except at a shared
+///   endpoint (a pair sharing one must not overlap along a line);
+/// - the triangulation reproduces every constraint edge unsplit, its kept
+///   triangles use every boundary edge once from one side and every interior
+///   edge twice, once each way, and their uv area is the loop's own.
+fn pinched_cdt(outer: &[FaceVertex], scale: [f64; 2]) -> Option<CdtMesh> {
+    use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
+    let n = outer.len();
+    if n < 4 || signed_area(outer) <= 0.0 {
+        return None;
+    }
+    // Canonical vertex of every station: the first station at its uv bits.
+    let mut first_at: FxHashMap<(u64, u64), usize> = FxHashMap::default();
+    let mut vertices: Vec<FaceVertex> = Vec::with_capacity(n);
+    let mut canonical = Vec::with_capacity(n);
+    let mut visits: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for (station, vertex) in outer.iter().enumerate() {
+        if !(vertex.uv[0].is_finite() && vertex.uv[1].is_finite()) {
+            return None;
+        }
+        let key = (vertex.uv[0].to_bits(), vertex.uv[1].to_bits());
+        let index = *first_at.entry(key).or_insert_with(|| {
+            vertices.push(*vertex);
+            vertices.len() - 1
+        });
+        canonical.push(index);
+        visits.entry(index).or_default().push(station);
+    }
+    let repeated: Vec<(usize, Vec<usize>)> = visits.into_iter().filter(|(_, at)| at.len() > 1).collect();
+    if repeated.is_empty() || repeated.len() > 16 || repeated.iter().any(|(_, at)| at.len() != 2) {
+        return None;
+    }
+    let uv = |station: usize| outer[station % n].uv;
+    let angle = |from: [f64; 2], to: [f64; 2]| (to[1] - from[1]).atan2(to[0] - from[0]);
+    // Counterclockwise sweep from `start` to `x`, in [0, 2π).
+    let sweep = |start: f64, x: f64| (x - start).rem_euclid(std::f64::consts::TAU);
+    for (_, at) in &repeated {
+        let (i, j) = (at[0], at[1]);
+        if (i + 1) % n == j || (j + 1) % n == i {
+            return None;
+        }
+        let wedge = |k: usize| {
+            let here = uv(k);
+            (angle(here, uv(k + 1)), angle(here, uv(k + n - 1)))
+        };
+        let ((out_i, in_i), (out_j, in_j)) = (wedge(i), wedge(j));
+        let inside = |out: f64, back: f64, x: f64| {
+            let width = sweep(out, back);
+            let at = sweep(out, x);
+            at > 0.0 && at < width
+        };
+        // Kissing: the second visit's two rays lie in the same arc of the
+        // first's (both inside its wedge, where the region is the two wedges'
+        // overlap, or both outside, where it is their union). Alternating
+        // rays are a crossing; a ray along another is neither and declines.
+        let rays = [out_j, in_j];
+        if rays.iter().any(|&x| [out_i, in_i].iter().any(|&y| sweep(y, x) == 0.0)) {
+            return None;
+        }
+        let count = rays.iter().filter(|&&x| inside(out_i, in_i, x)).count();
+        if count == 1 {
+            return None;
+        }
+    }
+    // No crossing, and a touch only at a shared endpoint.
+    let (lo, hi) = outer.iter().fold(([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]), |(mut lo, mut hi), v| {
+        for axis in 0..2 {
+            lo[axis] = lo[axis].min(v.uv[axis]);
+            hi[axis] = hi[axis].max(v.uv[axis]);
+        }
+        (lo, hi)
+    });
+    let span = (hi[0] - lo[0]).abs().max((hi[1] - lo[1]).abs()).max(1e-12);
+    let epsilon = 256.0 * f64::EPSILON * span * span;
+    let margin = epsilon + 4.0 * f64::EPSILON * span;
+    let on_segment = |point: [f64; 2], a: [f64; 2], b: [f64; 2]| {
+        triangle_area(a, b, point).abs() <= epsilon
+            && point[0] >= a[0].min(b[0]) - epsilon
+            && point[0] <= a[0].max(b[0]) + epsilon
+            && point[1] >= a[1].min(b[1]) - epsilon
+            && point[1] <= a[1].max(b[1]) + epsilon
+    };
+    let boxes: Vec<[f64; 4]> = (0..n)
+        .map(|k| {
+            let (a, b) = (uv(k), uv(k + 1));
+            [a[0].min(b[0]), a[0].max(b[0]), a[1].min(b[1]), a[1].max(b[1])]
+        })
+        .collect();
+    let index = BoxIndex::new(&boxes);
+    for e in 0..n {
+        if canonical[e] == canonical[(e + 1) % n] {
+            return None;
+        }
+        let (a0, a1) = (uv(e), uv(e + 1));
+        let (ca0, ca1) = (canonical[e], canonical[(e + 1) % n]);
+        let mut bad = false;
+        index.visit(boxes[e], margin, |f| {
+            if f <= e {
+                return false;
+            }
+            let (b0, b1) = (uv(f), uv(f + 1));
+            let (cb0, cb1) = (canonical[f], canonical[(f + 1) % n]);
+            tess_profile(|p| p.pslg_segment_tests += 1);
+            if segments_properly_cross(a0, a1, b0, b1, epsilon) {
+                bad = true;
+                return true;
+            }
+            let shared = [ca0, ca1].iter().filter(|c| **c == cb0 || **c == cb1).count();
+            let touch = match shared {
+                // Disjoint segments: no touch at all.
+                0 => on_segment(a0, b0, b1) || on_segment(a1, b0, b1) || on_segment(b0, a0, a1) || on_segment(b1, a0, a1),
+                // One shared endpoint: neither segment's other end on the other.
+                1 => {
+                    let a_other = if ca0 == cb0 || ca0 == cb1 { a1 } else { a0 };
+                    let b_other = if cb0 == ca0 || cb0 == ca1 { b1 } else { b0 };
+                    on_segment(a_other, b0, b1) || on_segment(b_other, a0, a1)
+                }
+                // The same segment twice.
+                _ => true,
+            };
+            if touch {
+                bad = true;
+            }
+            bad
+        });
+        if bad {
+            return None;
+        }
+    }
+    let [su, sv] = [scale[0].max(1e-12), scale[1].max(1e-12)];
+    let mut cdt = ConstrainedDelaunayTriangulation::<IndexedPoint>::new();
+    let mut handles = Vec::with_capacity(vertices.len());
+    for (i, p) in vertices.iter().enumerate() {
+        let position = spade::mitigate_underflow(Point2::new(p.uv[0] * su, p.uv[1] * sv));
+        let h = cdt.insert(IndexedPoint { position, authored: i }).ok()?;
+        if h.index() != i {
+            return None;
+        }
+        handles.push(h);
+    }
+    if cdt.num_vertices() != vertices.len() {
+        return None;
+    }
+    let mut boundary_pairs: rustc_hash::FxHashSet<(usize, usize)> = rustc_hash::FxHashSet::default();
+    let mut directed_boundary: FxHashSet<(usize, usize)> = FxHashSet::default();
+    for e in 0..n {
+        let (a, b) = (canonical[e], canonical[(e + 1) % n]);
+        let made = cdt.try_add_constraint(handles[a], handles[b]);
+        if made.len() > 1 || !cdt.exists_constraint(handles[a], handles[b]) {
+            return None;
+        }
+        if !boundary_pairs.insert((a.min(b), a.max(b))) {
+            return None;
+        }
+        directed_boundary.insert((a, b));
+    }
+    let actual = cdt
+        .undirected_edges()
+        .filter(|e| e.data().is_constraint_edge())
+        .map(|e| {
+            let [a, b] = e.vertices();
+            let (a, b) = (a.data().authored, b.data().authored);
+            (a.min(b), a.max(b))
+        })
+        .collect::<rustc_hash::FxHashSet<_>>();
+    if actual != boundary_pairs {
+        return None;
+    }
+    // Inside by constraint-crossing parity from the outer face, as above.
+    let mut adjacency = vec![[(None, false); 3]; cdt.num_all_faces()];
+    let mut queue: std::collections::VecDeque<(usize, bool)> = std::collections::VecDeque::new();
+    for face in cdt.inner_faces() {
+        let face_index = face.fix().index();
+        let mut entry = [(None, false); 3];
+        for (slot, edge) in face.adjacent_edges().into_iter().enumerate() {
+            let is_constraint = edge.is_constraint_edge();
+            let neighbor = edge.rev().face();
+            if neighbor.is_outer() {
+                queue.push_back((face_index, is_constraint));
+            } else if let Some(inner) = neighbor.as_inner() {
+                entry[slot] = (Some(inner.index()), is_constraint);
+            }
+        }
+        adjacency[face_index] = entry;
+    }
+    let mut inside = vec![None; cdt.num_all_faces()];
+    while let Some((face_index, parity)) = queue.pop_front() {
+        if inside[face_index].is_some() {
+            continue;
+        }
+        inside[face_index] = Some(parity);
+        for &(neighbor, is_constraint) in &adjacency[face_index] {
+            if let Some(neighbor) = neighbor {
+                if inside[neighbor].is_none() {
+                    queue.push_back((neighbor, parity ^ is_constraint));
+                }
+            }
+        }
+    }
+    let mut triangles: Vec<[usize; 3]> = Vec::new();
+    let mut area = 0.0f64;
+    for f in cdt.inner_faces() {
+        if !inside[f.fix().index()].unwrap_or(false) {
+            continue;
+        }
+        let mut t = f.vertices().map(|x| x.data().authored);
+        let corners = t.map(|i| vertices[i].uv);
+        let signed = triangle_area(corners[0], corners[1], corners[2]);
+        if signed < 0.0 {
+            t.swap(1, 2);
+        }
+        area += signed.abs();
+        triangles.push(t);
+    }
+    let expected = signed_area(outer);
+    let roundoff = 64.0 * f64::EPSILON * span * span * (triangles.len() + n) as f64;
+    if !((area - expected).abs() <= roundoff.max(expected * 1e-10)) {
+        return None;
+    }
+    let mut dir: FxHashMap<(usize, usize), usize> = FxHashMap::default();
+    for &[a, b, c] in &triangles {
+        for e in [(a, b), (b, c), (c, a)] {
+            *dir.entry(e).or_insert(0) += 1;
+        }
+    }
+    for (&(a, b), &count) in &dir {
+        let opposite = dir.get(&(b, a)).copied().unwrap_or(0);
+        let fine = count == 1 && if directed_boundary.contains(&(a, b)) { opposite == 0 } else { opposite == 1 };
+        if !fine {
+            return None;
+        }
+    }
+    if !directed_boundary.iter().all(|edge| dir.get(edge) == Some(&1)) {
+        return None;
+    }
+    Some(CdtMesh { vertices, triangles, boundary_pairs })
 }
 
 

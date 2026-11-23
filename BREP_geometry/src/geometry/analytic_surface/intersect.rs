@@ -211,6 +211,11 @@ pub fn intersect_analytic_pair_with(
     tolerance: f64,
     gate: RuledGate,
 ) -> Option<Vec<NurbsCurve>> {
+    // A ball and a cylinder tangent inside it: Viviani's curve, exact
+    // (`BREP_SPHERE_CYLINDER_TANGENT_SECTION`).
+    if let Some(curves) = super::sphere_cylinder_tangent::intersect_sphere_cylinder_tangent(first, second, tolerance) {
+        return Some(curves);
+    }
     if let Some(curves) = intersect_recognized_pair(first, second, tolerance, gate) {
         return Some(curves);
     }
@@ -1036,6 +1041,9 @@ fn intersect_equal_cylinders_meeting_axes(
         }
     }
     let on_b = |point: Vec3| off_axis(point, frame_b.origin, db, radius_b);
+    // Where the surfaces are tangent and the two ellipses cross.
+    let across = cross.scale(radius / sine);
+    let tangent_points = [centre.add(across), centre.sub(across)];
     let mut curves = Vec::new();
     for normal in [da.sub(db), da.add(db)] {
         let normal = normal.normalized().ok()?;
@@ -1048,10 +1056,65 @@ fn intersect_equal_cylinders_meeting_axes(
                     return None;
                 }
             }
-            curves.push(curve);
+            if equal_cylinder_tangent_split_enabled() {
+                curves.extend(split_at_points(curve, &tangent_points, band * 10.0)?);
+            } else {
+                curves.push(curve);
+            }
         }
     }
     Some(curves)
+}
+
+/// `BREP_EQUAL_CYLINDER_TANGENT_SPLIT` (default on; `=0` keeps them whole): each ellipse of
+/// [`intersect_equal_cylinders_meeting_axes`] is split at the two points where
+/// the surfaces are tangent, where it crosses the other ellipse, so the four
+/// arcs meet at shared vertices. Whole, the two closed ellipses of a Steinmetz
+/// pair at the origin crossed without a junction: every boolean of the pair
+/// left open loops, and the perturbation ladder then marched for minutes.
+fn equal_cylinder_tangent_split_enabled() -> bool {
+    crate::switch!(live "BREP_EQUAL_CYLINDER_TANGENT_SPLIT", true)
+}
+
+/// `curve` cut at each of `points` it passes within `reach` of (by its nearest
+/// parameter), pieces in order; the curve whole when it passes none. A point
+/// an end of the curve already stands on needs no cut (that end is the
+/// junction). `None`, so the caller declines to the march, when a cut cannot
+/// be made where the point is: the split refuses a parameter at an end, and
+/// it snaps one near a knot, so every cut's junction is read again after it.
+fn split_at_points(curve: NurbsCurve, points: &[Vec3], reach: f64) -> Option<Vec<NurbsCurve>> {
+    let [t0, t1] = curve.domain().ok()?;
+    let (start, end) = (curve.evaluate(t0).ok()?, curve.evaluate(t1).ok()?);
+    let mut cuts: Vec<(f64, Vec3)> = Vec::new();
+    for &point in points {
+        if start.sub(point).length() <= reach || end.sub(point).length() <= reach {
+            continue;
+        }
+        let foot = crate::project_point_to_curve(&curve, point).ok()?;
+        if foot.distance <= reach {
+            if !(foot.u > t0 && foot.u < t1) {
+                return None;
+            }
+            cuts.push((foot.u, point));
+        }
+    }
+    cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    cuts.dedup_by(|a, b| (a.0 - b.0).abs() <= 1e-12 * (t1 - t0));
+    let mut pieces = Vec::new();
+    let mut rest = curve;
+    for (cut, point) in cuts.into_iter().rev() {
+        let (left, right) = rest.split(cut).ok()?;
+        let [_, left_end] = left.domain().ok()?;
+        let [right_start, _] = right.domain().ok()?;
+        if left.evaluate(left_end).ok()?.sub(point).length() > reach || right.evaluate(right_start).ok()?.sub(point).length() > reach {
+            return None;
+        }
+        pieces.push(right);
+        rest = left;
+    }
+    pieces.push(rest);
+    pieces.reverse();
+    Some(pieces)
 }
 
 /// Frame/meridian data for any revolution with a straight-line generatrix:

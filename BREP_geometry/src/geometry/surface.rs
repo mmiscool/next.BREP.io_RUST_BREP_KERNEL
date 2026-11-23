@@ -72,6 +72,11 @@ pub struct NurbsSurface {
     /// (`BREP_EXTRUSION_HELD_PROFILE`); built from `linear_extrusion` on first use.
     #[serde(skip, default)]
     extrusion_profile: std::cell::OnceCell<Option<crate::analytic_surface::ReducedProfile>>,
+    /// A general revolution's generatrix with its seed samples, when it lies on
+    /// a meridional half-plane (`BREP_REVOLUTION_HELD_GENERATRIX`); built from
+    /// `analytic` on first use.
+    #[serde(skip, default)]
+    revolution_generatrix: std::cell::OnceCell<Option<crate::projection::HeldCurve>>,
     /// Lazily recognized affine sphere (`geometry/affine_sphere.rs`), read
     /// only under `BREP_AFFINE_SPHERE` and only when no analytic carrier was
     /// recognized; an acceleration cache like `analytic`.
@@ -141,6 +146,7 @@ impl NurbsSurface {
             analytic: std::cell::OnceCell::new(),
             linear_extrusion: std::cell::OnceCell::new(),
             extrusion_profile: std::cell::OnceCell::new(),
+            revolution_generatrix: std::cell::OnceCell::new(),
             affine_sphere: std::cell::OnceCell::new(),
             validated: std::cell::Cell::new(false),
             closed_directions: std::cell::OnceCell::new(),
@@ -265,6 +271,23 @@ impl NurbsSurface {
         own.then(|| self.extrusion_profile.get_or_init(|| extrusion.reduce(true)).as_ref())
     }
 
+    /// The held generatrix of `analytic` when it is this surface's own recognized
+    /// general revolution: `Some(Some(_))` when the generatrix lies on a meridional
+    /// half-plane (the closed form applies), `Some(None)` when it does not; `None`
+    /// for any other carrier, which the caller reads afresh.
+    pub(crate) fn held_revolution_generatrix(&self, analytic: &crate::AnalyticSurface) -> Option<Option<&crate::projection::HeldCurve>> {
+        let own = self.analytic.get().and_then(Option::as_ref).is_some_and(|a| std::ptr::eq(a, analytic));
+        let crate::AnalyticSurface::Revolution { frame, generatrix, .. } = analytic else { return None };
+        own.then(|| {
+            self.revolution_generatrix
+                .get_or_init(|| {
+                    crate::analytic_surface::generatrix_is_meridional_half_ray(generatrix, frame)
+                        .then(|| crate::projection::HeldCurve::new(generatrix.clone()))
+                })
+                .as_ref()
+        })
+    }
+
     /// The recognized analytic carrier, if this exact rational patch is a
     /// plane or a full revolution quadric/torus. Computed once per instance.
     pub fn analytic(&self) -> Option<&crate::AnalyticSurface> {
@@ -296,6 +319,7 @@ impl NurbsSurface {
             ("analytic", self.analytic.get().is_some()),
             ("linear_extrusion", self.linear_extrusion.get().is_some()),
             ("extrusion_profile", self.extrusion_profile.get().is_some()),
+            ("revolution_generatrix", self.revolution_generatrix.get().is_some()),
             ("affine_sphere", self.affine_sphere.get().is_some()),
             ("validated", self.validated.get()),
             ("closed", self.closed_directions.get().is_some()),
@@ -319,8 +343,10 @@ impl NurbsSurface {
     /// is how the bisect finds it.
     pub fn exchange_caches(&mut self, names: &[&str], from: Option<&Self>) {
         let wants = |name: &str| names.iter().any(|&n| n == name || n == "all");
-        if wants("analytic") {
+        // the held generatrix is built from the analytic carrier, so it goes wherever that goes
+        if wants("analytic") || wants("revolution_generatrix") {
             self.analytic = from.map(|f| f.analytic.clone()).unwrap_or_default();
+            self.revolution_generatrix = from.map(|f| f.revolution_generatrix.clone()).unwrap_or_default();
         }
         // the held profile is built from the structure, so it goes wherever the structure goes
         if wants("linear_extrusion") || wants("extrusion_profile") {

@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use super::schema_dsl::{closed_object_optional, array, nullable};
 
 pub(super) fn ecad_action() -> Value {
-    closed_object_optional(json!({"id":{"type":"string"},"workbench":{"enum":["diagram","pcb","symbol","pads"]}}), &[])
+    closed_object_optional(json!({"id":{"type":"string"},"workbench":{"enum":["diagram","schematic","pcb","symbol","pads"]}}), &[])
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn plm_follow_now() -> Value {
@@ -103,7 +103,7 @@ pub(super) fn ecad_state() -> Value {
     pads["selection"]=nullable(json!({"oneOf":[
         closed_object_optional(json!({"kind":{"const":"pad"},"number":text}),&[]),closed_object_optional(json!({"kind":{"const":"silk"},"index":count}),&[]),
         closed_object_optional(json!({"kind":{"const":"graphic"},"index":count}),&[])]}));
-    let mut sheet=common;sheet["target"]=json!({"enum":["diagram","pcb"]});
+    let mut sheet=common;sheet["target"]=json!({"enum":["diagram","schematic","pcb"]});
     for key in ["view","kind","labelText","powerNetText","stockPartNumber"] { sheet[key]=text.clone(); }
     sheet["selection"]=nullable(json!({"oneOf":[
         closed_object_optional(json!({"kind":{"const":"component"},"id":text,"reference":maybe}),&[]),

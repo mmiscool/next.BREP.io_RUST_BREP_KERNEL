@@ -35,6 +35,7 @@ mod restrict;
 pub mod rollover;
 pub mod rollover_surgery;
 pub mod setback;
+pub mod setback_corner;
 pub mod runout;
 pub mod split_rim;
 pub mod turned_rim;
@@ -454,6 +455,7 @@ pub use corner::round_concave_chain_corner;
 pub use corner::round_convex_corner;
 pub use corner::{is_n_sided_undercut_refusal, N_SIDED_FOLD_WHAT, N_SIDED_UNDERCUT_WHAT};
 pub use edge::{blend_closed_edge, blend_closed_edge_knot_aware, blend_edge_variable, blend_open_edge, is_pcurve_floor_refusal, with_pcurve_knot_retry};
+pub(crate) use edge::{blend_closed_edge_reusing, remember_closed_refusal, ClosedRefusalScope};
 pub use collapse::is_full_width_collapse;
 pub use planar_chart::{
     chart_fitted_for_gate, fit_planar_charts_to_trims, is_planar_chart_refusal, planar_chart_overrun,

@@ -113,7 +113,7 @@ pub use brep_surface_offset::offset::{
     MeasuredOffsetSurface, OffsetFaceCarrier, OffsetSurfaceLane,
 };
 pub use brep_boolean::split::{
-    split_solid_by_face_surface, split_solid_by_plane, split_solid_by_surface, SplitSurface,
+    split_solid_by_face_surface, solid_piece_by_plane, split_solid_by_plane, split_solid_by_surface, SplitSurface,
 };
 pub use brep_boolean::imprint::{
     build_imprints, EdgeSplitRecord, FaceImprints, FaceKey, FacePcurve, ImprintOptions,
@@ -140,28 +140,36 @@ pub use brep_boolean::accept::{
 pub use brep_boolean::coalesce::{concatenate_exact_curve_pieces, merge_curve_continuation_edges};
 pub use brep_boolean::face_merge::{merge_faces_within, merge_same_surface_faces, merge_same_surface_faces_excluding, merge_same_surface_faces_scoped};
 pub use brep_boolean::faceted_repair::{mesh_to_faceted_brep, repair_triangle_soup, MeshRepairReport};
-pub use brep_boolean::sew::{sew_solid, split_pinched_vertices, SewReport};
+pub use brep_boolean::sew::{sew_rotated_copies, sew_solid, split_pinched_vertices, SewReport};
 pub use brep_boolean::mesh_segment::{
     mesh_regions_to_brep, segment_mesh_faces, MeshRegion, MeshSegmentation, RegionCarrier,
     SegmentOptions, UNASSIGNED_REGION,
 };
 pub use brep_boolean::spherical_union::reconstruct_spherical_mesh_union;
 pub use brep_construction::solid_sweep::{
-    clip_less_on, sweep_clip_less, sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
+    clip_less_on, screw_profile_brep, sweep_clip_less, sweep_solid_within, OutlinePiece, ScrewStep, SolidMotion, SweepClip, SweptTool, SOLID_SWEEP_REFUSAL,
 };
+pub use brep_construction::solid_sweep_notch::{notch_less, notch_less_on};
+pub use brep_construction::solid_sweep_upright::sweep_upright_along;
 pub use brep_construction::gears;
 pub use brep_construction::gears::{helical_solid, Hand, HelicalGear, rack_section, rack_solid, ring_section, ring_solid, sprocket_section, sprocket_solid, spur_section, spur_solid, GearData, GearSection, Rack, RingGear, Sprocket, SprocketForm, SpurGear};
 pub use brep_construction::mill_program::{flat_mill_region_prisms, MillMove, MILL_REGION_REFUSAL};
+pub use brep_construction::{mill_dome, mill_envelope, mill_faces, mill_plan};
+pub use brep_construction::solid_sweep_thread;
+pub use brep_construction::solid_sweep_apex::{sweep_pyramid_within, Pyramid, APEX_SWEEP_REFUSAL};
 pub use brep_construction::solid_sweep_caps::{sweep_solid, sweep_prism_along, sweep_solid_along, sweep_solid_clipped, sweep_solid_parts, sweep_solid_rising, sweep_solid_tumbled, sweep_tube_slid_across, FrameCurve, RisingTurn, TwoTurns, SolidTool, SOLID_SWEEP_WHOLE_REFUSAL};
 pub use brep_construction::closed_curves::{make_ellipse, make_ellipse_arc, make_ellipsoid_brep, make_periodic_bspline};
 pub use brep_construction::planar_region::{cut_planar_sweep_from_prism, region_cut_on, swept_region_holds, target_outline_holds};
 pub use brep_construction::surface_faces::{face_from_surface, face_from_surface_trimmed, sheet_from_sheets, solid_from_sheets, SURFACE_FACE_REFUSAL};
+pub use brep_construction::slab::{make_slab_brep, SLAB_REFUSAL};
+pub use brep_construction::polyhedron::{make_polyhedron_brep, POLYHEDRON_REFUSAL};
 pub use brep_construction::polygon_solids::{make_pyramid_on_polygon, solid_from_polygons};
 pub use brep_construction::loft_guide_chain::loft_profile_brep_guided_chain;
 pub use brep_construction::loft_guides::{loft_profile_brep_on_guide_chains, loft_profile_brep_on_guides, loft_profile_brep_on_loose_guide_chains, GuideLoftWall, LOFT_ON_GUIDES_REFUSAL};
 pub use brep_construction::extrude_up_to::{extrude_profile_up_to_face, solid_pieces, EXTRUDE_UP_TO_REFUSAL};
 pub use brep_construction::sweep_round_corners::{sweep_profile_round_corners, SWEEP_ROUND_CORNERS_REFUSAL};
 pub use brep_construction::sweep_ellipsoid::sweep_ellipsoid_along_line;
+pub use brep_construction::profile_holes::{extrude_profile_with_holes, revolve_profile_with_holes};
 pub use brep_construction::sweep_topology::{
     extrude_profile_brep, extrude_profile_brep_draft, fit_helix_curve, helix_sample_points,
     profile_anchor, rib_from_profile, sweep_bend_profile, sweep_closure, BendStation,
@@ -175,7 +183,7 @@ pub use brep_construction::sweep_topology::{
     sweep_profile_along_path,
     sweep_profile_along_path_anchored,
     sweep_profile_helix,
-    sweep_profile_twisted, sweep_profile_twisted_anchored, sweep_profile_twisted_scaled,
+    sweep_profile_twisted, sweep_profile_twisted_anchored, sweep_profile_twisted_within, sweep_profile_twisted_scaled,
     ProfileAnchor, SectionPlacement,
     StationBudget, SweepStationReport, SweptChain, SWEEP_DEFAULT_TOLERANCE, SWEEP_MAX_STATIONS,
     SWEEP_REFINEMENT_ROUNDS,
@@ -193,8 +201,8 @@ pub use brep_blend::blend::{
 };
 pub use brep_blend::fillet::{
     chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,
-    chamfer_edges_asymmetric, fillet_edge, fillet_edge_conic, fillet_edges, fillet_edges_conic, fillet_edges_reported, fillet_edges_reported_at_offset,
-    fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
+    chamfer_edges_asymmetric, chamfer_edges_asymmetric_linear, fillet_edge, fillet_edge_conic, fillet_edges, fillet_edges_conic, fillet_edges_conic_distances, fillet_edges_conic_setback, fillet_edges_reported, fillet_edges_reported_at_offset,
+    fillet_edge_g2, fillet_edges_g2, fillet_faces, full_round, fillet_edges_radii, fillet_edges_setback, fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
     BlendSelection,
 };
 pub use brep_blend::law::{LawSegment, RadiusLaw};
@@ -202,7 +210,7 @@ pub use brep_offset::thicken_faces::{extrude_curves_to_sheet, thicken_sheet_face
 pub use brep_offset::shell_rounded::{offset_shell_rounded, SHELL_ROUNDED_REFUSAL};
 pub use brep_offset::thicken::{thicken_face_sheet, thicken_trimmed_sheet};
 pub use brep_offset::offset_shell::{
-    offset_shell, offset_shell_by_boolean, offset_shell_closed, offset_shell_with_diagnostics, offset_solid, OffsetCorners,
+    offset_shell, offset_shell_by_boolean, offset_shell_closed, offset_shell_with_diagnostics, offset_shell_with_options, offset_solid, OffsetCorners, ShellOptions,
     OffsetFaceRole, OffsetShellFaceImageRecord, OffsetShellResultRecord,
 };
 pub use brep_direct_edit::direct_edit::{
@@ -233,6 +241,10 @@ use brep_topology::*;
 
 // The public root API of the kernel, from the crates below.
 pub use brep_topology::{display_chord_tolerance, solid_model_scale, solid_scale};
+pub use brep_topology::{
+    nearest_boundary_point, solid_closest_points, solid_gap, solid_least_box, solid_outward_normals, solid_principal_curvatures, BoundaryFoot,
+    BoundaryPlace,
+};
 pub use brep_geometry::switch;
 pub use brep_geometry::debug_flag;
 pub use brep_geometry::mode_switch;
@@ -417,6 +429,9 @@ static RUSTY_ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 static RUSTY_ALLOC: wall_profile::Allocator<rusty_alloc_api::RustyAlloc> = wall_profile::Allocator(rusty_alloc_api::RustyAlloc);
 #[path = "construction/draft_roof.rs"]
 mod draft_roof;
+#[path = "blending/fillet_tangent_chains.rs"]
+mod fillet_tangent_chains;
+pub use fillet_tangent_chains::{fillet_edges_tangent_chains, fillet_edges_with_options, FilletOptions};
 pub use draft_roof::{extrude_profile_brep_draft_roof, DRAFT_ROOF_REFUSAL};
 // The Rust feature-history execution engine (migration-plan Stage 4/5 foundation).
 // Deserializes the serialized `{ type, inputParams, ... }` descriptor shape, runs
@@ -602,10 +617,18 @@ pub use step::{
 #[path = "io/appearance.rs"]
 mod appearance;
 pub use appearance::{BodyAppearance, ImportedColor, COLOR_METADATA_KEY};
+#[path = "solid_face_calls.rs"]
+mod solid_face_calls;
+pub use solid_face_calls::{offset_faces, solid_interference, thicken_faces, transform_faces, Interference};
+mod solid_display;
+pub use solid_display::{solid_display, DisplayEdge, DisplayFace, SolidDisplay};
+#[path = "plane_section.rs"]
+mod plane_section;
+pub use plane_section::{solid_section, solid_section_area};
 #[path = "io/step_import/mod.rs"]
 mod step_import;
 pub use step_import::{
-    import_step, import_step_bodies, import_step_report, import_step_trim_readings, import_step_with_appearance,
+    import_step, import_step_bodies, import_step_report, sew_step, import_step_trim_readings, import_step_with_appearance,
     occurrence_ref_parts, read_step_assembly, read_step_pmi, rewrite_occurrence_refs,
     ImportedStep, StepAssembly, StepBodyError, StepBodyTrimReadings, StepEdgeReading, StepFaceReading, StepImportReport,
     StepOccurrence, StepProduct, StepSuppliedTrim, StepTrimReadings, OCCURRENCE_REF_PREFIX,

@@ -146,6 +146,8 @@ pub fn circle_angle_to_parameter(spans: usize, sweep: f64, angle: f64) -> f64 {
 mod recognition;
 #[path = "analytic_surface/intersect.rs"]
 mod intersect;
+#[path = "analytic_surface/sphere_cylinder_tangent.rs"]
+mod sphere_cylinder_tangent;
 #[path = "analytic_surface/revolution.rs"]
 mod revolution;
 
@@ -159,6 +161,16 @@ pub(crate) use extrusion::ReducedProfile;
 pub use revolution::{revolution_structure, RevolutionStructure};
 pub use revolution::circumcenter;
 pub use recognition::generatrix_is_meridional_half_ray;
+
+/// `BREP_REVOLUTION_HELD_GENERATRIX` (default on; `=0` reads the generatrix
+/// afresh every call): a general revolution's closed form projects onto the
+/// generatrix held on its surface ([`NurbsSurface::held_revolution_generatrix`])
+/// with its seed samples, for the same answer, bit for bit, as projecting onto
+/// the bare curve, which hashes the curve's content into the seed cache on
+/// every call. The meridional test the closed form needs is held with it.
+fn held_generatrix_enabled() -> bool {
+    crate::switch!("BREP_REVOLUTION_HELD_GENERATRIX", true)
+}
 
 impl AnalyticSurface {
     /// Closed-form point projection in the surface's own parameterization.
@@ -240,9 +252,14 @@ impl AnalyticSurface {
                 sweep,
                 generatrix,
             } => {
-                if !generatrix_is_meridional_half_ray(generatrix, frame) {
-                    return None;
-                }
+                // The surface's own revolution projects through its held generatrix:
+                // the same seed samples, read without hashing the curve on every call.
+                let held = if held_generatrix_enabled() { surface.held_revolution_generatrix(self) } else { None };
+                let held = match held {
+                    Some(held) => Some(held?),
+                    None if !generatrix_is_meridional_half_ray(generatrix, frame) => return None,
+                    None => None,
+                };
                 let (theta, rho, z) = frame.cylindrical(point);
                 let full = *sweep >= std::f64::consts::TAU - 1e-9;
                 // Rotating the query rigidly about the axis to a meridian
@@ -277,7 +294,11 @@ impl AnalyticSurface {
                 }
                 let mut best: Option<(f64, f64, f64)> = None;
                 for (u, query) in candidates {
-                    let Ok(projection) = crate::project_point_to_curve(generatrix, query) else {
+                    let projection = match held {
+                        Some(held) => held.project(query),
+                        None => crate::project_point_to_curve(generatrix, query),
+                    };
+                    let Ok(projection) = projection else {
                         return None;
                     };
                     if best

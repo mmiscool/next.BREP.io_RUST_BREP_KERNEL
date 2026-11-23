@@ -1,9 +1,10 @@
 //! The eCAD editors, and their actions as workbench buttons.
 //!
-//! Four workbenches host eCAD (`brep_ecad_egui`): **Diagram** and **PCB** run its
-//! sheet-and-board [`Editor`] — on a wiring document and on a schematic
-//! document — while **Symbol** and **Pads** run its [`SymbolEditor`] and
-//! [`FootprintEditor`]. eCAD keeps every toolbar command as data
+//! Five workbenches host eCAD (`brep_ecad_egui`): **Harness diagram** runs its
+//! sheet [`Editor`] on a wiring document; **PCB diagram** and **PCB** run ONE
+//! sheet-and-board editor on a schematic document, each pinned to one of its two
+//! views (the schematic, the board: [`BENCHES`]); **Symbol** and **Pads** run its
+//! [`SymbolEditor`] and [`FootprintEditor`]. eCAD keeps every toolbar command as data
 //! ([`brep_ecad_egui::Action`]), with predicates over the editor saying whether it is
 //! offered, enabled and pressed, and what its button says. The workbench
 //! buttons here are those actions: each button asks eCAD's own predicate about
@@ -13,11 +14,11 @@
 //!
 //! # Ids
 //!
-//! A button id leads with its workbench ([`super::button_prefix`]). Diagram
-//! and PCB take their buttons from ONE eCAD table, whose ids lead with a group
-//! (`view.`, `sheet.`, `board.`), so each puts its own workbench in front —
-//! `diagram.sheet.tool.select`, `pcb.sheet.tool.select` — and [`split`] takes
-//! it off again. The symbol and pads editors' ids already lead with `symbol.`
+//! A button id leads with its workbench ([`super::button_prefix`]). Harness
+//! diagram, PCB diagram and PCB take their buttons from ONE eCAD table, whose ids
+//! lead with a group (`sheet.`, `board.`), so each puts its own workbench in
+//! front — `diagram.sheet.tool.select`, `schematic.sheet.tool.select`,
+//! `pcb.board.tool.select` — and [`split`] takes it off again. The symbol and pads editors' ids already lead with `symbol.`
 //! and `pads.`, which ARE their workbenches' ids, so their buttons are eCAD's
 //! ids verbatim. Two workbenches sharing a table is what made the prefix law
 //! necessary: see `a_duplicate_id_names_the_first_workbench_s_button_everywhere`.
@@ -92,6 +93,22 @@ impl Editors {
         }
     }
 
+    /// Hold the sheet-and-board editor in the view the active workbench `id`
+    /// shows: the schematic on PCB diagram, the board on PCB. Run every frame
+    /// before the row is drawn, since the workbench also changes by a settings
+    /// write, an open and a restored session, not only by the switcher; a view
+    /// already held costs nothing (`Editor::set_view` returns at once). An
+    /// autorouter run survives the switch: `set_view` puts down only the
+    /// gesture in hand, and the run goes on whenever the board is drawn again.
+    pub fn pin_view(&mut self, id: &str) {
+        let Some(Bench { target, view: Some(view), .. }) = bench(id).copied() else { return };
+        match target {
+            Target::Diagram => self.diagram.set_view(view),
+            Target::Pcb => self.pcb.set_view(view),
+            Target::Symbol | Target::Pads => {}
+        }
+    }
+
     /// Ask `target`'s editor to select the pin or pad numbered `number` the
     /// next time it draws. The Qualify panel's jump: a connection point, its
     /// pin and its pad all carry ONE name, so the number is the whole ask.
@@ -139,7 +156,9 @@ impl Default for Editors {
     }
 }
 
-/// Which of the four editors a button acts on.
+/// Which of the four editors a button acts on. Each is one editor over one
+/// document block; a workbench reaches one through [`BENCHES`], and two
+/// workbenches (PCB diagram and PCB) reach the same one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     Diagram,
@@ -151,9 +170,11 @@ pub enum Target {
 impl Target {
     pub const ALL: [Target; 4] = [Target::Diagram, Target::Pcb, Target::Symbol, Target::Pads];
 
-    /// The workbench that draws this editor. It is also the key of the
-    /// document block the editor's document is kept in (`diagram`, `pcb`,
-    /// `symbol`, `pads`): the two namings agree by construction.
+    /// The key of the document block this editor's document is kept in
+    /// (`diagram`, `pcb`, `symbol`, `pads`), which is also the workbench a jump
+    /// to this editor opens. The pcb block has two workbenches; this names the
+    /// board's. Where the ACTIVE workbench is what is meant — a button id's
+    /// prefix, the target `ecad_state` reports — read the workbench id itself.
     pub fn workbench_id(self) -> &'static str {
         match self {
             Target::Diagram => "diagram",
@@ -168,12 +189,37 @@ impl Target {
     /// nothing about editors or sketch mode, so the host can ask it at the
     /// moment it must END a sketch because an eCAD workbench became active.
     pub fn of_workbench(id: &str) -> Option<Target> {
-        Target::ALL.into_iter().find(|target| target.workbench_id() == id)
+        bench(id).map(|bench| bench.target)
     }
 }
 
+/// One eCAD workbench: the editor it draws and, for the sheet-and-board editor,
+/// the view it holds that editor in ([`Editors::pin_view`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bench {
+    pub workbench: &'static str,
+    pub target: Target,
+    pub view: Option<brep_ecad_egui::View>,
+}
+
+/// Every eCAD workbench. PCB diagram (`schematic`) and PCB (`pcb`) are the one
+/// schematic document's two views, each its own workbench: the schematic's
+/// tools on one row, the board's on the other.
+pub const BENCHES: [Bench; 5] = [
+    Bench { workbench: "diagram", target: Target::Diagram, view: None },
+    Bench { workbench: "schematic", target: Target::Pcb, view: Some(brep_ecad_egui::View::Schematic) },
+    Bench { workbench: "pcb", target: Target::Pcb, view: Some(brep_ecad_egui::View::Board) },
+    Bench { workbench: "symbol", target: Target::Symbol, view: None },
+    Bench { workbench: "pads", target: Target::Pads, view: None },
+];
+
+/// The eCAD workbench `id` names, or `None` for any other workbench.
+pub fn bench(id: &str) -> Option<&'static Bench> {
+    BENCHES.iter().find(|bench| bench.workbench == id)
+}
+
 /// The dock pane that draws the active editor's parts library
-/// (`Editor::library_panel`): Diagram's and PCB's.
+/// (`Editor::library_panel`): the sheet-and-board editor's workbenches'.
 pub const LIBRARY_PANEL_ID: &str = "ecadLibrary";
 
 /// The dock pane that draws the active editor's inspector — `Editor::inspector`
@@ -183,11 +229,13 @@ pub const INSPECTOR_PANEL_ID: &str = "ecadInspector";
 
 /// The editor a button id acts on and the eCAD action id it runs there, or
 /// `None` for an id that is no eCAD button's. The inverse of how the tables
-/// spell their ids: `diagram.` and `pcb.` come off, `symbol.*` and `pads.*`
-/// are eCAD's own.
+/// spell their ids: `diagram.`, `schematic.` and `pcb.` come off, `symbol.*`
+/// and `pads.*` are eCAD's own.
 pub fn split(id: &str) -> Option<(Target, &str)> {
     if let Some(action) = id.strip_prefix("diagram.") {
         Some((Target::Diagram, action))
+    } else if let Some(action) = id.strip_prefix("schematic.") {
+        Some((Target::Pcb, action))
     } else if let Some(action) = id.strip_prefix("pcb.") {
         Some((Target::Pcb, action))
     } else if id.starts_with("symbol.") {
@@ -239,8 +287,6 @@ pub const PUT_DOWN: &[&str] = &[
 /// answers `enabled` with a bare bool, so the words are BREP's, one per action,
 /// read from the predicate it declares.
 const DISABLED_BECAUSE: &[(&str, &str)] = &[
-    ("view.schematic", "the autorouter is running"),
-    ("view.board", "the autorouter is running"),
     ("sheet.wire.finish", "no wire is being drawn"),
     ("board.route.via", "a via needs a track being drawn on a board with more than one copper layer"),
     ("board.route.finish", "no track is being drawn"),
@@ -303,10 +349,12 @@ fn read(editors: &Editors, target: Target, action: &str) -> Option<Reading> {
 }
 
 /// eCAD's reading of the action button `id` names, but only while that
-/// button's editor is the one on screen ([`active_target`]).
+/// button's editor is the one on screen ([`active_target`]) and its OWN
+/// workbench is the active one: PCB diagram and PCB draw one editor, and each
+/// offers only its own row.
 fn reading(state: &ButtonState, id: &str) -> Option<Reading> {
     let (target, action) = split(id)?;
-    if active_target(state) != Some(target) {
+    if active_target(state) != Some(target) || id.split('.').next() != Some(state.engine.settings.workbench.as_str()) {
         return None;
     }
     read(state.ecad?, target, action)

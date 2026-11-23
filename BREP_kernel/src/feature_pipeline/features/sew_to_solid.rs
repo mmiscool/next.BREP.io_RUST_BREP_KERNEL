@@ -447,7 +447,7 @@ fn rename(piece: &mut BrepSolid, suffix: &str) {
 
 /// The faces `faces` of `solid` as one sheet, with only the edges and
 /// vertices they use.
-fn extract(solid: &BrepSolid, faces: &BTreeSet<u64>) -> BrepSolid {
+pub(crate) fn extract(solid: &BrepSolid, faces: &BTreeSet<u64>) -> BrepSolid {
     let shells: Vec<ShellRecord> = solid
         .shells
         .iter()

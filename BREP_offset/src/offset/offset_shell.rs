@@ -119,6 +119,8 @@ pub mod prism_parallel;
 pub mod prism_erosion;
 #[path = "offset_shell/revolved_erosion.rs"]
 pub mod revolved_erosion;
+#[path = "offset_shell/revolved_curved_erosion.rs"]
+pub mod revolved_curved_erosion;
 #[path = "offset_shell/prism_growth.rs"]
 pub mod prism_growth;
 #[path = "offset_shell/full_turn.rs"]
@@ -145,7 +147,7 @@ pub use vacated_rim::*;
 pub use rim_welds::*;
 pub use smooth_sync::*;
 
-pub use pipeline::{offset_shell, offset_shell_with_diagnostics};
+pub use pipeline::{offset_shell, offset_shell_with_diagnostics, offset_shell_with_options, ShellOptions};
 pub use solid::{offset_shell_by_boolean, offset_shell_closed, offset_solid, OffsetCorners};
 pub use refusals::{is_offset_shell_no_retained_face, is_offset_shell_open_curved_rim};
 pub use orientation::{flip_all_faces, flip_shell_faces, orient_open_solid_faces};

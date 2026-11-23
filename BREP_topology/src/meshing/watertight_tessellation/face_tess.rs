@@ -759,7 +759,7 @@ pub(super) fn tessellate_face_watertight(
         // (and bridge) segments are the consecutive index pairs of the bridged
         // polygon; refinement must never split these.
         let vertices = bridged.into_polygon();
-        let mut boundary_pairs = HashSet::new();
+        let mut boundary_pairs = rustc_hash::FxHashSet::default();
         for index in 0..vertices.len() {
             let next = (index + 1) % vertices.len();
             boundary_pairs.insert((index.min(next), index.max(next)));

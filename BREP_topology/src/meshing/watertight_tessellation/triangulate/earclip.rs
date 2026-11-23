@@ -341,7 +341,7 @@ pub fn ear_clip(
 pub(super) fn lawson_flips(
     vertices: &[FaceVertex],
     triangles: &mut [[usize; 3]],
-    boundary_pairs: &HashSet<(usize, usize)>,
+    boundary_pairs: &rustc_hash::FxHashSet<(usize, usize)>,
     scale: [f64; 2],
 ) -> bool {
     lawson_flips_guarded(vertices, triangles, boundary_pairs, scale, None)
@@ -365,7 +365,7 @@ pub(super) fn lawson_flips(
 pub(super) fn lawson_flips_guarded(
     vertices: &[FaceVertex],
     triangles: &mut [[usize; 3]],
-    boundary_pairs: &HashSet<(usize, usize)>,
+    boundary_pairs: &rustc_hash::FxHashSet<(usize, usize)>,
     scale: [f64; 2],
     chord_guard: Option<(&FaceRecord, f64, bool)>,
 ) -> bool {
@@ -379,7 +379,7 @@ pub(super) fn lawson_flips_guarded(
 pub(super) fn lawson_flips_guarded_with_memo(
     vertices: &[FaceVertex],
     triangles: &mut [[usize; 3]],
-    boundary_pairs: &HashSet<(usize, usize)>,
+    boundary_pairs: &rustc_hash::FxHashSet<(usize, usize)>,
     scale: [f64; 2],
     chord_guard: Option<(&FaceRecord, f64, bool)>,
     memo: &mut FaceMemo,
@@ -588,7 +588,7 @@ impl TriangleCornerAngles {
 fn lawson_flips_incremental(
     vertices: &[FaceVertex],
     triangles: &mut [[usize; 3]],
-    boundary_pairs: &HashSet<(usize, usize)>,
+    boundary_pairs: &rustc_hash::FxHashSet<(usize, usize)>,
     scale: [f64; 2],
     chord_guard: Option<(&FaceRecord, f64, bool)>,
     memo: &mut FaceMemo,

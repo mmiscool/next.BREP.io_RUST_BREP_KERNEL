@@ -155,6 +155,113 @@ pub fn blend_closed_edge(
     blend_closed_edge_impl(solid, edge_id, &|_| radius, Some(radius), chamfer, name)
 }
 
+/// `BREP_BLEND_CLOSED_REFUSAL_REUSE` (on unless `=0`/`off`; `check` reruns and
+/// compares): inside a fillet's group lane, the refusal its closed-rim attempt
+/// got is handed to the single-edge ladder's own closed-rim rungs, which ask
+/// the same question of the same body (the composition's first step is a
+/// clone of it), instead of marching the same rim again. Matched on the edge,
+/// the radius's bits, chamfer, name and the body's serialized content, byte
+/// for byte, so a hit is the call it replaces.
+pub(crate) fn closed_refusal_reuse_mode() -> crate::env_read::Mode {
+    crate::mode_switch!("BREP_BLEND_CLOSED_REFUSAL_REUSE", true)
+}
+
+struct KnownClosedRefusal {
+    edge_id: u64,
+    radius: u64,
+    chamfer: bool,
+    name: Option<String>,
+    body: Vec<u8>,
+    refusal: KernelRefusal,
+}
+
+thread_local! {
+    static KNOWN_CLOSED_REFUSALS: std::cell::RefCell<Vec<KnownClosedRefusal>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Holds the refusals remembered inside it ([`remember_closed_refusal`]) for
+/// as long as it lives; dropping it forgets them (nested scopes stack).
+pub(crate) struct ClosedRefusalScope(usize);
+
+impl ClosedRefusalScope {
+    pub(crate) fn enter() -> Self {
+        Self(KNOWN_CLOSED_REFUSALS.with(|known| known.borrow().len()))
+    }
+}
+
+impl Drop for ClosedRefusalScope {
+    fn drop(&mut self) {
+        KNOWN_CLOSED_REFUSALS.with(|known| known.borrow_mut().truncate(self.0));
+    }
+}
+
+/// Remember that [`blend_closed_edge`] refused `solid`'s `edge_id` so, inside
+/// the innermost open [`ClosedRefusalScope`].
+pub(crate) fn remember_closed_refusal(solid: &BrepSolid, edge_id: u64, radius: f64, chamfer: bool, name: Option<&str>, refusal: &KernelRefusal) {
+    if closed_refusal_reuse_mode() == crate::env_read::Mode::Off {
+        return;
+    }
+    let Ok(body) = serde_json::to_vec(solid) else { return };
+    KNOWN_CLOSED_REFUSALS.with(|known| {
+        known.borrow_mut().push(KnownClosedRefusal {
+            edge_id,
+            radius: radius.to_bits(),
+            chamfer,
+            name: name.map(str::to_string),
+            body,
+            refusal: refusal.clone(),
+        })
+    });
+}
+
+/// [`blend_closed_edge`], answered by a remembered refusal of the same call
+/// when one is held ([`remember_closed_refusal`]).
+pub(crate) fn blend_closed_edge_reusing(
+    solid: &BrepSolid,
+    edge_id: u64,
+    radius: f64,
+    chamfer: bool,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let mode = closed_refusal_reuse_mode();
+    let candidates = KNOWN_CLOSED_REFUSALS.with(|known| {
+        known.borrow().iter().any(|entry| {
+            entry.edge_id == edge_id && entry.radius == radius.to_bits() && entry.chamfer == chamfer && entry.name.as_deref() == name
+        })
+    });
+    if mode != crate::env_read::Mode::Off && candidates {
+        if let Ok(body) = serde_json::to_vec(solid) {
+            let known = KNOWN_CLOSED_REFUSALS.with(|known| {
+                known
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|entry| {
+                        entry.edge_id == edge_id
+                            && entry.radius == radius.to_bits()
+                            && entry.chamfer == chamfer
+                            && entry.name.as_deref() == name
+                            && entry.body == body
+                    })
+                    .map(|entry| entry.refusal.clone())
+            });
+            if let Some(refusal) = known {
+                crate::blend::record_count("count.closed.refusal_reused", 1);
+                if mode == crate::env_read::Mode::Check {
+                    let fresh = blend_closed_edge(solid, edge_id, radius, chamfer, name);
+                    let agrees = matches!(&fresh, Err(error) if error.to_string() == refusal.to_string());
+                    if !agrees {
+                        eprintln!("blend.closed_refusal_reuse DISAGREES: edge {edge_id} remembered {refusal} fresh {:?}", fresh.as_ref().map(|_| "built").map_err(|error| error.to_string()));
+                    }
+                    return fresh;
+                }
+                return Err(refusal);
+            }
+        }
+    }
+    blend_closed_edge(solid, edge_id, radius, chamfer, name)
+}
+
 /// [`blend_closed_edge`] with the closed-rim support refit's KNOT-AWARE retry
 /// (lane L, 2026-10-16): where a support pcurve's uniform track misses the floor,
 /// the fit is retried on a track that also samples the rail's own knots

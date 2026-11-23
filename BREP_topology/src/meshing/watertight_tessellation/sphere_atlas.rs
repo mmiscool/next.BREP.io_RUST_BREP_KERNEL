@@ -314,7 +314,7 @@ pub(super) fn tessellate_spherical_face_watertight(
 
     // 5. Trim segments, grouped per chart into chains, and the set of vertex
     //    pairs that a mesh edge may not cross (the material boundary).
-    let mut blocking: HashSet<(usize, usize)> = HashSet::new();
+    let mut blocking: rustc_hash::FxHashSet<(usize, usize)> = rustc_hash::FxHashSet::default();
     let mut chains: Vec<Vec<ChartChain>> = (0..CHART_COUNT).map(|_| Vec::new()).collect();
     for segment in &segments {
         let start = trim_vertex[&key(segment.start)];
@@ -569,7 +569,7 @@ fn block_edge_span(
     points: &[EdgePoint],
     start: usize,
     end: usize,
-    blocking: &mut HashSet<(usize, usize)>,
+    blocking: &mut rustc_hash::FxHashSet<(usize, usize)>,
 ) -> bool {
     let position = |vertex: usize| points.iter().position(|point| point.vertex == vertex);
     let (Some(first), Some(last)) = (position(start), position(end)) else {
@@ -905,7 +905,7 @@ fn distance_to_segment(point: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
 /// triangle instead of trusting a vote.
 fn material_regions(
     triangles: &[[usize; 3]],
-    blocking: &HashSet<(usize, usize)>,
+    blocking: &rustc_hash::FxHashSet<(usize, usize)>,
     vertices: &AtlasVertices,
     atlas: &SphereAtlas,
     region: &SphericalRegion,
@@ -913,7 +913,7 @@ fn material_regions(
     if region.is_whole_sphere() {
         return vec![true; triangles.len()];
     }
-    let mut adjacency: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    let mut adjacency: rustc_hash::FxHashMap<(usize, usize), Vec<usize>> = rustc_hash::FxHashMap::default();
     for (index, triangle) in triangles.iter().enumerate() {
         for (a, b) in [(0, 1), (1, 2), (2, 0)] {
             let pair = ordered(triangle[a], triangle[b]);
@@ -957,7 +957,7 @@ fn material_regions(
         regions.push(members);
     }
     if std::env::var("BREP_DEBUG_SPHERE_CHARTS").is_ok() {
-        let mut present: HashSet<(usize, usize)> = HashSet::new();
+        let mut present: rustc_hash::FxHashSet<(usize, usize)> = rustc_hash::FxHashSet::default();
         for triangle in triangles {
             for (a, b) in [(0, 1), (1, 2), (2, 0)] {
                 present.insert(ordered(triangle[a], triangle[b]));

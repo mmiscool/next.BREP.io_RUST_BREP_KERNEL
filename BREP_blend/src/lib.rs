@@ -76,8 +76,8 @@ pub use blend::{
 pub mod fillet;
 pub use fillet::{
     chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,
-    chamfer_edges_asymmetric, fillet_edge, fillet_edge_conic, fillet_edges, fillet_edges_conic, fillet_edges_reported, fillet_edges_reported_at_offset,
-    fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
+    chamfer_edges_asymmetric, chamfer_edges_asymmetric_linear, fillet_edge, fillet_edge_conic, fillet_edges, fillet_edges_conic, fillet_edges_conic_distances, fillet_edges_conic_setback, fillet_edges_reported, fillet_edges_reported_at_offset,
+    fillet_edge_g2, fillet_edges_g2, fillet_faces, full_round, fillet_edges_radii, fillet_edges_setback, fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
     BlendSelection,
 };
 #[path = "blending/law.rs"]

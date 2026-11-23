@@ -460,24 +460,14 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     // under its radius law (`edit/direct_edit/blend_rebuild.rs`). Offered
     // first, and only where such a fillet borders the selection: without one
     // it reads the selection's neighbours and steps aside.
-    let without = crate::rebuild_displaced_blends(&solid, &face_ids, "transformFace", |sharp| {
-        solve_motion(sharp, &face_ids, turn, translates, translation).map_err(|(error, _)| error)
-    });
-    let (moved, notes) = match without {
-        Some(Ok(solved)) => solved,
-        declined => match solve_motion(&solid, &face_ids, turn, translates, translation) {
-            Ok(solved) => solved,
-            Err((refusal, step)) => {
-                let refusal = match &declined {
-                    Some(Err(decline)) => crate::with_blend_rebuild_decline(refusal, decline),
-                    _ => refusal,
-                };
-                return match step {
-                    Some(step) => Ok(refused_at(refusal, step)),
-                    None => Err(refusal.into()),
-                };
-            }
-        },
+    let (moved, notes) = match move_faces_road(&solid, &face_ids, turn, translates, translation) {
+        Ok(solved) => solved,
+        Err((refusal, step)) => {
+            return match step {
+                Some(step) => Ok(refused_at(refusal, step)),
+                None => Err(refusal.into()),
+            };
+        }
     };
     result.notes.extend(notes);
 
@@ -494,6 +484,32 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, FeatureRefusal> {
     });
     result.removed.push(target_name);
     Ok(result)
+}
+
+/// The motion's road with the variable-radius fillet rebuild offered first
+/// (see `build`), shared with the public [`crate::transform_faces`]: `Ok` is
+/// the edited body and its notes, `Err` the refusal (the rebuild's decline
+/// appended) and the motion's step it names.
+pub(crate) fn move_faces_road(
+    solid: &BrepSolid,
+    face_ids: &[u64],
+    turn: Option<(Vec3, Vec3, f64)>,
+    translates: bool,
+    translation: Vec3,
+) -> Result<(BrepSolid, Vec<String>), (KernelRefusal, Option<&'static str>)> {
+    let without = crate::rebuild_displaced_blends(solid, face_ids, "transformFace", |sharp| {
+        solve_motion(sharp, face_ids, turn, translates, translation).map_err(|(error, _)| error)
+    });
+    match without {
+        Some(Ok(solved)) => Ok(solved),
+        declined => solve_motion(solid, face_ids, turn, translates, translation).map_err(|(refusal, step)| {
+            let refusal = match &declined {
+                Some(Err(decline)) => crate::with_blend_rebuild_decline(refusal, decline),
+                _ => refusal,
+            };
+            (refusal, step)
+        }),
+    }
 }
 
 /// The motion's whole road on one body: the direct re-solve, its acceptance,
@@ -534,7 +550,7 @@ fn solve_motion(
                         let error = error.with_message(|error| {
                             format!("{error}. The re-cut road was offered it too and declined: {reason}")
                         });
-                        return Err((error, Some(REFUSED_STEP_TRANSLATION)));
+                        return Err((with_declines_class(error, &[&reason]), Some(REFUSED_STEP_TRANSLATION)));
                     }
                 }
             }
@@ -589,7 +605,7 @@ fn solve_motion(
                                     "{error}. The re-cut road was offered it too and declined: {reason}"
                                 )
                             });
-                            return Err((error, Some(REFUSED_STEP_ROTATION)));
+                            return Err((with_declines_class(error, &[&reason]), Some(REFUSED_STEP_ROTATION)));
                         }
                     }
                 }
@@ -666,24 +682,36 @@ fn solve_motion(
                         body
                     }
                     // The acceptance's refusal stays the primary one — its
-                    // class is what the boundary reports — and the other
-                    // roads' declines are appended as context.
+                    // class is what the boundary reports, unless a road's
+                    // decline names the input (`with_declines_class`) — and
+                    // the other roads' declines are appended as context.
                     Err(redrill) => {
-                        return Err((
-                            refusal.with_message(|refusal| {
-                                format!(
-                                    "{refusal}. The re-cut road was offered it too and declined: \
-                                     {reason}. The re-drill road declined: {redrill}"
-                                )
-                            }),
-                            None,
-                        ))
+                        let combined = refusal.with_message(|refusal| {
+                            format!(
+                                "{refusal}. The re-cut road was offered it too and declined: \
+                                 {reason}. The re-drill road declined: {redrill}"
+                            )
+                        });
+                        return Err((with_declines_class(combined, &[&reason, &redrill]), None))
                     }
                 },
             }
         }
     };
     Ok((moved, notes))
+}
+
+/// A refusal whose other roads declined too, their declines appended to its
+/// message by the caller: where a decline names the INPUT (ill-posed or
+/// invalid: the re-cut finding the motion takes away all of the body's
+/// material, or splits it), that is the act's answer and its class is the
+/// refusal's; otherwise the primary refusal's class stands.
+pub(crate) fn with_declines_class(mut refusal: KernelRefusal, declines: &[&KernelRefusal]) -> KernelRefusal {
+    use crate::RefusalClass::{IllPosed, InvalidInput};
+    if let Some(decline) = declines.iter().find(|d| matches!(d.class, IllPosed { .. } | InvalidInput { .. })) {
+        refusal.class = decline.class.clone();
+    }
+    refusal
 }
 
 /// The re-cut offered after the acceptance refused the moved body.
@@ -693,7 +721,7 @@ fn solve_motion(
 /// body it refuses is refused by name rather than returned. Fillets the re-cut
 /// filled in are then re-made one by one, and the second value names any that
 /// could not be.
-fn recut_past_a_refusal(
+pub(crate) fn recut_past_a_refusal(
     solid: &BrepSolid,
     face_ids: &[u64],
     turn: Option<(Vec3, Vec3, f64)>,
@@ -762,6 +790,10 @@ fn is_no_route_refusal(error: &KernelRefusal) -> bool {
         "sphere_mixed_neighbours",
         "sphere_open_rim",
         "sphere_group",
+        // A moved ruled or revolved wall whose corner touches two fixed flats
+        // (no one image for the corner on the re-solve): a through bore slid
+        // across its plate, answered by the re-drill.
+        "mirror_corner_flats",
     ];
     matches!(&error.class, crate::RefusalClass::UnsupportedGeometry { what } if NO_ROUTE.contains(&what.as_str()))
 }

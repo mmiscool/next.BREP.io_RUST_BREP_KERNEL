@@ -3025,7 +3025,8 @@ thread_local! {
     pub static CLAIM_HINT_DISAGREEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// `BREP_HEAL_CLAIM_REPLAY_NEAR` (default off): with the hint-first read on,
+/// `BREP_HEAL_CLAIM_REPLAY_NEAR` (default on; `0` sends such a station to a
+/// search): with the hint-first read on,
 /// a final-claim station whose fraction the old claim read, but whose
 /// incoming hint differs from the old read's (a station the new trims
 /// inserted earlier moved it), takes the old claim's foot when that foot lies
@@ -3035,7 +3036,7 @@ thread_local! {
 /// step and exact replay resumes. On the swept bull-nose cut and torus union,
 /// over nine in ten such stations had a recorded foot within the bar.
 fn claim_replay_near() -> bool {
-    crate::switch!(live "BREP_HEAL_CLAIM_REPLAY_NEAR", false)
+    crate::switch!(live "BREP_HEAL_CLAIM_REPLAY_NEAR", true)
 }
 
 /// `BREP_HEAL_CLAIM_REPLAY_CHECK` (default off): every foot
@@ -3104,7 +3105,8 @@ fn hint_newton_foot(surface: &crate::NurbsSurface, point: Vec3, seed: [f64; 2]) 
     Some(best)
 }
 
-/// `BREP_HEAL_NEWTON_IMAGE_REUSE` (default off, `1` on): the claim's foot
+/// `BREP_HEAL_NEWTON_IMAGE_REUSE` (default on; `0` evaluates every station
+/// again): the claim's foot
 /// Newton ([`newton_descent`]) reads the distance at each new station from
 /// the next step's own first partials, whose point `deriv1_extended` computes
 /// anyway, instead of evaluating the station a second time. The two points
@@ -3114,7 +3116,7 @@ fn hint_newton_foot(surface: &crate::NurbsSurface, point: Vec3, seed: [f64; 2]) 
 /// the evaluation. Over the swept bull-nose cut's 840k hinted feet each took
 /// three steps, so this is one surface read in two.
 fn newton_image_reuse() -> bool {
-    crate::switch!(live "BREP_HEAL_NEWTON_IMAGE_REUSE", false)
+    crate::switch!(live "BREP_HEAL_NEWTON_IMAGE_REUSE", true)
 }
 
 /// `BREP_HEAL_NEWTON_IMAGE_REUSE_CHECK` (default off): run both readings,
