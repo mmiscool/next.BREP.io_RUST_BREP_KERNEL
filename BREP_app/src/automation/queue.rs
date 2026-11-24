@@ -715,6 +715,7 @@ pub const ENGINE_ONLY: &[&str] = &[
     "doc_export",
     "model_inspect",
     "mass_properties",
+    "volume",
     "weld_list",
     "history_listing",
     "frame_info",

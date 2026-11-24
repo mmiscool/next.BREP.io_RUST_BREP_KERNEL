@@ -108,6 +108,7 @@ pub(super) fn trim_detector_bar(report: &crate::PcurveFitReport) -> f64 {
 /// (and an upper bound on the standoff) elsewhere. The 8193-fraction census
 /// (`examples/import_miss_census.rs`) found no corpus row whose uniform read
 /// exceeded this one by more than the quarter-point grid's own aliasing.
+#[derive(Clone, Copy, Debug)]
 pub(super) struct TrimReading {
     pub(super) residual: f64,
     pub(super) standoff: f64,
@@ -1384,6 +1385,23 @@ pub(super) fn build_conic_edge(
     let theta_start = angle(p_start);
     let theta_end = angle(p_end);
     let tau = std::f64::consts::TAU;
+    // COINCIDENT ENDS (`BREP_STEP_COINCIDENT_CONIC_ENDS`, default on, =0
+    // restores the refusal): a conic edge between two DISTINCT vertices at
+    // one point of the conic is a zero-length edge at that point, built as a
+    // degenerate line like a pole's. abc_00017798's threaded bore starts both
+    // thread helices at one point of its r 2.51 mm end circle and writes that
+    // circle between two vertex entities there: the wall's loop winds zero
+    // only with the circle of no length (helices -3.5 and +4.5 turns, far rim
+    // -1), and the end face's hole is the thread's cam profile alone. Read as
+    // an arc of zero angle the face was refused (`makeArc: endAngle must
+    // exceed startAngle`).
+    if !closed
+        && theta_start == theta_end
+        && p_start.sub(p_end).length() <= crate::VERTEX_MATCH_FLOOR
+        && crate::switch!("BREP_STEP_COINCIDENT_CONIC_ENDS", true)
+    {
+        return crate::make_line(p_start, p_end).map_err(|error| error.to_string());
+    }
 
     let curve = if closed {
         let arc = build_ellipse_arc(frame, a, b, theta_start, theta_start + tau)?;

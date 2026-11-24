@@ -1,14 +1,14 @@
 [package]
 name = "BREP_STL2STEP"
-version = "0.2.23"
+version = "0.2.24"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-homepage = "https://v2.brep.io"
+homepage = "https://next.brep.io"
 readme = "README.md"
-keywords = ["cad", "stl", "step", "brep", "mesh"]
+keywords = ["cad", "stl", "step", "brep", "b-rep"]
 categories = ["algorithms", "graphics"]
-description = "BREP-family STL-to-STEP reconstruction command"
+description = "STL-to-STEP reconstruction command of the next.BREP.io Rust B-rep CAD kernel."
 # The `!` entries are a backstop: test code never ships. The publish snapshot
 # `cargo package` of this manifest from shipping test files.
 include = [
@@ -28,6 +28,6 @@ name = "stl2step"
 path = "src/main.rs"
 
 [dependencies]
-BREP_reconstruction = { version = "0.24.0", path = "../BREP_reconstruction" }
+BREP_reconstruction = { version = "0.25.0", path = "../BREP_reconstruction" }
 serde_json = "1"
 

@@ -123,6 +123,55 @@ fn image_to_foot(
     Ok((worst, worst_global))
 }
 
+/// The readings of one derived trim (`build_loop`'s report block): the
+/// band-free floor reading on every trim, and, for a trim off its bar, the
+/// image-to-foot reading and the file curve's standoff between the stations.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TrimRead {
+    pub(super) floor: TrimReading,
+    /// The fit's residual folded with the floor reading's (NaN-preserving).
+    pub(super) residual: f64,
+    /// Set only when the residual is off the fit's detector bar.
+    pub(super) off: Option<OffBarRead>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct OffBarRead {
+    pub(super) image_to_foot: f64,
+    pub(super) image_to_global_foot: f64,
+    pub(super) between: TrimReading,
+}
+
+/// Read `fit` as the trim of `edge` (in sense `forward`) on `surface`: a pure
+/// function of those inputs, so a prefit helper can read it ahead of the loop.
+pub(super) fn read_trim(
+    surface: &NurbsSurface,
+    curve: &NurbsCurve,
+    t0: f64,
+    t1: f64,
+    forward: bool,
+    fit: &crate::PcurveFit,
+) -> Result<TrimRead, String> {
+    let floor = trim_floor_reading(surface, &fit.curve, curve, t0, t1, forward, false)?;
+    // NaN-preserving: an unread reading is reported, never folded into a
+    // clean maximum.
+    let residual = fold_reading(fit.report.residual, floor.residual);
+    // A non-finite bar (an unread station standoff) is no bar: `x <= inf`
+    // would suppress an unread trim.
+    let bar = trim_detector_bar(&fit.report);
+    let off = if !(bar.is_finite() && residual <= bar) {
+        let (image_to_foot, image_to_global_foot) = image_to_foot(surface, &fit.curve, curve, t0, t1, forward)?;
+        // The file curve's standoff BETWEEN the stations, on the same grid
+        // the residual was read on; the bar's standoff term is the larger of
+        // it and the nodes'.
+        let between = trim_floor_reading(surface, &fit.curve, curve, t0, t1, forward, true)?;
+        Some(OffBarRead { image_to_foot, image_to_global_foot, between })
+    } else {
+        None
+    };
+    Ok(TrimRead { floor, residual, off })
+}
+
 /// Construct the projected locus independently of the source edge's normal
 /// standoff. Analytic inversion supports a tighter construction contract than
 /// the general fit floor; source-knot probes also check spans that uniform
@@ -407,23 +456,14 @@ impl<'a> SolidBuilder<'a> {
                         // as the band it is. The refit trigger above stays on the
                         // fit's own residual: this read reports, it does not yet
                         // act (2026-10-03).
-                        let floor = trim_floor_reading(surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward, false)?;
-                        // NaN-preserving: an unread reading is reported, never
-                        // folded into a clean maximum.
-                        let residual = fold_reading(fit.report.residual, floor.residual);
-                        // A non-finite bar (an unread station standoff) is no bar:
-                        // `x <= inf` would suppress an unread trim.
-                        let bar = trim_detector_bar(&fit.report);
-                        if !(bar.is_finite() && residual <= bar) {
+                        // Read by [`read_trim`], or taken from the face's prefit
+                        // helper when it read this very fit (`builder/prefit.rs`).
+                        let read = super::prefit::read_trim_range(surface, &edge, *forward, &fit)?;
+                        let floor = read.floor;
+                        let residual = read.residual;
+                        if let Some(off) = read.off {
                             let report = fit.report;
-                            let (image_to_foot, image_to_global_foot) =
-                                image_to_foot(surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward)?;
-                            // The file curve's standoff BETWEEN the stations, on
-                            // the same grid the residual was read on; the bar's
-                            // standoff term is the larger of it and the nodes'.
-                            let between = trim_floor_reading(
-                                surface, &fit.curve, &edge.curve, edge.t0, edge.t1, *forward, true,
-                            )?;
+                            let (image_to_foot, image_to_global_foot, between) = (off.image_to_foot, off.image_to_global_foot, off.between);
                             let standoff = fold_reading(report.off_surface, between.standoff);
                             // Whose miss: the residual is within the floor of the
                             // file curve's own standoff (the file's), or over it
@@ -1133,24 +1173,60 @@ impl<'a> SolidBuilder<'a> {
             .max(crate::VERTEX_MATCH_FLOOR);
         // Worst excursion of the bridged row (endpoints included) away from the
         // shared vertex it is supposed to collapse onto.
-        let vertex_row_deviation = bridge_vertex.map(|vertex_id| {
-            let vertex = self.vertex_point(vertex_id);
-            (0..=8)
-                .filter_map(|index| {
-                    let fraction = index as f64 / 8.0;
-                    let mid = (
-                        from.0 + (to.0 - from.0) * fraction,
-                        from.1 + (to.1 - from.1) * fraction,
-                    );
-                    surface
-                        .evaluate(mid.0, mid.1)
-                        .ok()
-                        .map(|point| point.sub(vertex).length())
-                })
-                .fold(0.0_f64, f64::max)
+        //
+        // VERTEX FOOT (`BREP_STEP_BRIDGE_VERTEX_FOOT`, default on, =0 restores):
+        // the row lies on the surface, so it is measured against the vertex's
+        // FOOT on the surface, and the vertex itself must lie within the same
+        // band of the surface. Measured against the vertex, a vertex the vendor
+        // left a few microns off this face adds its whole offset to every row
+        // point: abc_00000088's cylinder face #165 has one vertex 4.998e-3 mm
+        // radially off its 9.25 mm cylinder (every other on it to 1e-9), so a
+        // 4.6e-4 mm artefact row read 5.009e-3 against a 5e-3 band and the
+        // part was refused. Both conditions are within the band, as before.
+        let foot = bridge_vertex.and_then(|vertex_id| {
+            if !switch!("BREP_STEP_BRIDGE_VERTEX_FOOT", true) {
+                return None;
+            }
+            crate::project_point_to_surface(surface, self.vertex_point(vertex_id)).ok()
         });
-        let bridge_seam_artefact = bridge_artefact_ok
+        // The row's worst excursion from what stands for the vertex at `band`:
+        // its foot when the vertex lies within `band` of the face, else itself.
+        let row_from_vertex = |band: f64| {
+            bridge_vertex.map(|vertex_id| {
+                let vertex = foot
+                    .as_ref()
+                    .filter(|foot| foot.distance <= band)
+                    .map_or_else(|| self.vertex_point(vertex_id), |foot| foot.point);
+                (0..=8)
+                    .filter_map(|index| {
+                        let fraction = index as f64 / 8.0;
+                        let mid = (
+                            from.0 + (to.0 - from.0) * fraction,
+                            from.1 + (to.1 - from.1) * fraction,
+                        );
+                        surface
+                            .evaluate(mid.0, mid.1)
+                            .ok()
+                            .map(|point| point.sub(vertex).length())
+                    })
+                    .fold(0.0_f64, f64::max)
+            })
+        };
+        let mut vertex_row_deviation = row_from_vertex(coincidence_band);
+        let mut bridge_seam_artefact = bridge_artefact_ok
             && vertex_row_deviation.is_some_and(|deviation| deviation <= coincidence_band);
+        // UNSTATED PRECISION (`Resolver::unstated_identity_band`): a file that
+        // states no usable precision is read at its model-size band, here only
+        // where the importer's own band would refuse the bridge.
+        if bridge_artefact_ok && !bridge_seam_artefact && !row_collapsed {
+            if let Some(band) = self.resolver.unstated_identity_band().filter(|band| *band > coincidence_band) {
+                let deviation = row_from_vertex(band);
+                if deviation.is_some_and(|deviation| deviation <= band) {
+                    vertex_row_deviation = deviation;
+                    bridge_seam_artefact = true;
+                }
+            }
+        }
         if std::env::var("BREP_DEBUG_STEP_LOOP").is_ok() {
             eprintln!(
                 "BRIDGE from={from:?} to={to:?} |a-b|={:.9} row_dev={row_deviation:.9} vertex_row_dev={vertex_row_deviation:?} tol={tolerance:.9} band={coincidence_band:.9} scale={scale:.4} bridge_vertex={bridge_vertex:?} artefact_ok={bridge_artefact_ok}",
@@ -1160,9 +1236,22 @@ impl<'a> SolidBuilder<'a> {
         if (!row_collapsed && !bridge_seam_artefact)
             || (bridge_vertex.is_none() && a.sub(b).length() > tolerance)
         {
+            // Say why in model terms: how far apart the loop's ends are, how far
+            // the gap strays from the shared vertex, the band it had to meet,
+            // and the precision the file states.
+            let band = self.resolver.unstated_identity_band().map_or(coincidence_band, |band| band.max(coincidence_band));
+            let from_vertex = vertex_row_deviation
+                .map(|deviation| format!(", straying up to {deviation:.4} mm from their shared vertex"))
+                .unwrap_or_default();
+            let stated = self.resolver.stated_precision_mm().map_or_else(
+                || "the file states no length precision".to_string(),
+                |precision| format!("the file states a precision of {precision:.1e} mm"),
+            );
             return Err(format!(
                 "step_import: open parameter loop (uv gap {from:?}->{to:?} is not a collapsed \
-                 pole; unsupported non-pole seam)"
+                 pole; unsupported non-pole seam): the loop's ends are {:.4} mm apart{from_vertex}, \
+                 against an identity band of {band:.4} mm; {stated}",
+                a.sub(b).length()
             ));
         }
         // Reuse the neighbours' shared vertex when they meet there topologically;

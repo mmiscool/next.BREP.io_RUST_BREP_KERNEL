@@ -114,7 +114,7 @@ pub enum FaceBound {
     Spline(std::sync::Arc<SplineBound>),
 }
 
-/// `BREP_SCAN_MESH_SPLINE` (default on since the 2026-11-20 tier-P
+/// `BREP_SCAN_MESH_SPLINE` (default on since the 2026-11-20
 /// promotion, after the boundary sag gate made the Utah teapot neutral; `=0`
 /// restores the display refinement): the scan meshes a polynomial
 /// spline face with a SOUND deviation bound ([`SplineBound::triangle`]) in

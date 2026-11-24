@@ -1,13 +1,13 @@
 [package]
 name = "BREP_reconstruction"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-homepage = "https://v2.brep.io"
-description = "Kernel integration for neutral BREP_RANSAC recognition results"
+homepage = "https://next.brep.io"
+description = "Rust B-rep CAD kernel (next.BREP.io): kernel integration for neutral BREP_RANSAC recognition results (mesh to B-rep reconstruction)."
 readme = "README.md"
-keywords = ["cad", "brep", "reconstruction", "mesh", "step"]
+keywords = ["cad", "brep", "b-rep", "reconstruction", "step"]
 categories = ["algorithms", "graphics", "mathematics"]
 # The `!` entries are a backstop: test code never ships. The publish snapshot
 # `cargo package` of this manifest from shipping test files.
@@ -29,7 +29,7 @@ name = "brep_reconstruction"
 [dependencies]
 # Monotonic timing on native targets and in browser workers.
 web-time = "1"
-BREP_RANSAC = { version = "0.2.2", path = "../BREP_RANSAC" }
-BREP_kernel = { version = "=0.27.0", path = "../BREP_kernel" }
+BREP_RANSAC = { version = "0.2.3", path = "../BREP_RANSAC" }
+BREP_kernel = { version = "=0.28.0", path = "../BREP_kernel" }
 serde = { version = "1", features = ["derive"] }
 

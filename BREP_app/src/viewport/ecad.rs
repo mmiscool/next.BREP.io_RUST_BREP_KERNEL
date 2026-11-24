@@ -50,7 +50,6 @@ use std::collections::HashMap;
 /// The block of the document an editor keeps its document in.
 pub(crate) fn block_of(target: Target) -> Block {
     match target {
-        Target::Diagram => Block::Diagram,
         Target::Pcb => Block::Pcb,
         Target::Symbol => Block::Symbol,
         Target::Pads => Block::Pads,
@@ -165,39 +164,22 @@ pub(crate) fn pin_points(history: &History) -> Option<brep_ecad_egui::PinPoints>
 /// A block the editor cannot read (a newer eCAD's, or the wrong kind of
 /// document) is refused: the editor shows an empty stand-in and
 /// [`BlockSync::store`] will not write over the block. Returns the refusal.
-fn pull(target: Target, editors: &mut Editors, sync: &mut BlockSync, history: &brep_render::history::History) -> Option<String> {
+///
+/// The sheet-and-board editor's sheet is TWO blocks, `pcb` and `diagram`
+/// ([`pull_sheet`]); `diagram` is its second sync.
+fn pull(
+    target: Target,
+    editors: &mut Editors,
+    sync: &mut BlockSync,
+    diagram: Option<&mut BlockSync>,
+    history: &brep_render::history::History,
+) -> Option<String> {
+    if target == Target::Pcb {
+        return pull_sheet(editors, sync, diagram.expect("the sheet keeps a sync for its diagram block"), history);
+    }
     let block = sync.pull(history)?;
     let loaded: Result<(), String> = match target {
-        Target::Diagram | Target::Pcb => {
-            let (editor, kind) = match target {
-                Target::Diagram => (&mut editors.diagram, brep_ecad_core::DocumentKind::Wiring),
-                _ => (&mut editors.pcb, brep_ecad_core::DocumentKind::Schematic),
-            };
-            let document = match block {
-                None => Ok(brep_ecad_core::Document::new(kind)),
-                Some(value) => brep_ecad_core::Document::from_value(value).and_then(|document| {
-                    if document.kind == kind {
-                        Ok(document)
-                    } else {
-                        Err(format!(
-                            "the {} block holds a {:?} document, not a {kind:?} one",
-                            target.workbench_id(),
-                            document.kind
-                        ))
-                    }
-                }),
-            };
-            match document {
-                Ok(document) => {
-                    editor.set_document(document);
-                    Ok(())
-                }
-                Err(reason) => {
-                    editor.set_document(brep_ecad_core::Document::new(kind));
-                    Err(reason)
-                }
-            }
-        }
+        Target::Pcb => unreachable!("the sheet is pulled by pull_sheet"),
         Target::Symbol => {
             let symbol = match block {
                 None => Ok(brep_ecad_egui::SymbolEditor::blank().symbol),
@@ -234,6 +216,66 @@ fn pull(target: Target, editors: &mut Editors, sync: &mut BlockSync, history: &b
     let reason = loaded.err()?;
     sync.refuse(reason.clone());
     Some(reason)
+}
+
+/// [`pull`] for the sheet: when either of its blocks moved, read both and merge
+/// them into the one sheet the editor draws (`brep_ecad_core::sheet`). A block
+/// that cannot be read refuses the sheet, and neither block is written over.
+fn pull_sheet(
+    editors: &mut Editors,
+    pcb: &mut BlockSync,
+    diagram: &mut BlockSync,
+    history: &brep_render::history::History,
+) -> Option<String> {
+    use brep_ecad_core::{Document as Sheet, DocumentKind};
+    // Both asked, every frame: each keeps its own revision.
+    let pcb_moved = pcb.pull(history).is_some();
+    let diagram_moved = diagram.pull(history).is_some();
+    // The boards of its own the assembly places are zones of the sheet; read again
+    // on a new revision, and merged again only when one of them changed.
+    let mut boards_moved = false;
+    if editors.sheet.boards_revision != Some(history.revision()) {
+        let boards = crate::panels::ecad_parts::sub_boards(history);
+        boards_moved = editors.sheet.boards_revision.is_some() && boards != editors.sheet.boards;
+        editors.sheet.boards = boards;
+        editors.sheet.boards_revision = Some(history.revision());
+    }
+    if !pcb_moved && !diagram_moved && !boards_moved {
+        return None;
+    }
+    let read = |block: Block, kind: DocumentKind| -> Result<Option<Sheet>, String> {
+        match block.read(history) {
+            None => Ok(None),
+            Some(value) => Sheet::from_value(value.clone()).and_then(|document| {
+                if document.kind == kind {
+                    Ok(Some(document))
+                } else {
+                    Err(format!("the {} block holds a {:?} document, not a {kind:?} one", block.key(), document.kind))
+                }
+            }),
+        }
+    };
+    let merged = read(Block::Pcb, DocumentKind::Schematic).and_then(|board| {
+        let wiring = read(Block::Diagram, DocumentKind::Wiring)?;
+        Sheet::merge_sheet_with(board, wiring, editors.sheet.offset, editors.sheet.boards.clone())
+    });
+    match merged {
+        Ok((sheet, source)) => {
+            pcb.clear_refusal();
+            diagram.clear_refusal();
+            editors.sheet.offset = Some(source.offset);
+            editors.sheet.source = Some(source);
+            editors.pcb.set_document(sheet);
+            None
+        }
+        Err(reason) => {
+            editors.sheet.source = None;
+            editors.pcb.set_document(Sheet::new(DocumentKind::Sheet));
+            pcb.refuse(reason.clone());
+            diagram.refuse(reason.clone());
+            Some(reason)
+        }
+    }
 }
 
 /// A block the editor refused, read for what the user can do about it: the
@@ -351,11 +393,10 @@ pub(crate) fn repaired(block: &serde_json::Value, renames: &[(usize, String, Str
     value
 }
 
-/// What the unreadable card and its toast call the block: `The PCB sheet`.
+/// What the unreadable card and its toast call the block: `The sheet`.
 fn block_words(target: Target) -> &'static str {
     match target {
-        Target::Diagram => "The wiring diagram",
-        Target::Pcb => "The PCB sheet",
+        Target::Pcb => "The sheet",
         Target::Symbol => "The symbol",
         Target::Pads => "The pads",
     }
@@ -386,21 +427,23 @@ fn unreadable_notice(target: Target, reason: &str, diagnosis: &Diagnosis) -> Str
 /// left it stale (round seven's lane U, measured on `ecad-sheet.nbrep`).
 /// Returns the saved document before and after such a write, for the host to
 /// move the clean baseline with it (`Document::absorb_open_write`).
+///
+/// The sheet is stored by [`store_sheet`], into its two blocks.
 fn store(
     target: Target,
     editors: &mut Editors,
     sync: &mut BlockSync,
+    diagram: Option<&mut BlockSync>,
     engine: &mut brep_render::engine_state::EngineState,
     opening: bool,
 ) -> Result<Option<(serde_json::Value, serde_json::Value)>, String> {
+    if target == Target::Pcb {
+        return store_sheet(editors, sync, diagram.expect("the sheet keeps a sync for its diagram block"), engine, opening);
+    }
     // Nothing to write unless the editor reports a change; only then is its
     // document serialized.
     let taken = (|| Some(match target {
-        Target::Diagram => (editors.diagram.take_change()?, editors.diagram.document.to_value()),
-        // A part the board seats lands at a free spot of its own
-        // (`board_view`'s `follow`, `Document::open_spot`), so the host no
-        // longer spreads parts stacked at the origin after the fact.
-        Target::Pcb => (editors.pcb.take_change()?, editors.pcb.document.to_value()),
+        Target::Pcb => unreachable!("the sheet is stored by store_sheet"),
         Target::Symbol => (
             editors.symbol.take_change()?,
             serde_json::to_value(&editors.symbol.symbol).map_err(|e| e.to_string()),
@@ -411,28 +454,7 @@ fn store(
         ),
     }))();
     let Some((change, value)) = taken else { return Ok(None) };
-    let value = match value {
-        Ok(value) => value,
-        Err(error) => {
-            // The sheet the editor holds breaks a rule a stored sheet keeps, so it
-            // cannot be written. Keeping it on screen would show an edit the
-            // document does not have — and Save would then write the old block
-            // with nothing marked dirty (the eCAD workflow audit, issue 3). Put the
-            // stored sheet back, so what the canvas shows is what Save writes.
-            if let Some(editor) = match target {
-                Target::Diagram => Some(&mut editors.diagram),
-                Target::Pcb => Some(&mut editors.pcb),
-                _ => None,
-            } {
-                let previous = block_of(target).read(&engine.history).cloned()
-                    .and_then(|v| brep_ecad_core::Document::from_value(v).ok())
-                    .unwrap_or_else(|| brep_ecad_core::Document::new(editor.document.kind));
-                editor.set_document(previous);
-                return Err(format!("{error} The edit was taken back."));
-            }
-            return Err(error);
-        }
-    };
+    let value = value?;
     // A read-only document (a PLM revision not checked out, or released)
     // writes nothing. What the editor did on opening is kept on screen, as an
     // unlocked open shows it; a user's edit is taken back, and said once.
@@ -443,7 +465,7 @@ fn store(
         }
         let again = sync.refused_again(&value);
         sync.reload();
-        let _ = pull(target, editors, sync, &engine.history);
+        let _ = pull(target, editors, sync, None, &engine.history);
         return match again {
             true => Ok(None),
             false => Err(format!("the document is read-only: {reason}. The edit was taken back.")),
@@ -451,60 +473,162 @@ fn store(
     }
     let Ok(mut draft) = serde_json::from_str::<serde_json::Value>(&engine.history.request_json()) else { return Ok(None) };
     let before = draft.clone();
-    let mut notes: Vec<String> = Vec::new();
-    if matches!(target, Target::Diagram | Target::Pcb) {
-        let editor = if target == Target::Diagram { &mut editors.diagram } else { &mut editors.pcb };
-        // A board is an assembly: a component deleted on either sheet is the
-        // assembly component deleted, in this edit's own undo step. The other
-        // sheet, the board and the harness follow the frame after
-        // (`ecad_parts::follow_occurrences`). A device inside a sub-assembly
-        // is refused, and the sheet put back.
-        let stored = block_of(target).read(&engine.history);
-        if let Err(error) = crate::panels::ecad_parts::delete_gone_occurrences(&mut draft, stored, &editor.document) {
-            let previous = stored.cloned()
-                .and_then(|v| brep_ecad_core::Document::from_value(v).ok())
-                .unwrap_or_else(|| brep_ecad_core::Document::new(editor.document.kind));
-            editor.set_document(previous);
+    if opening {
+        draft[block_of(target).key()] = value.clone();
+        sync.adopt(&mut engine.history, &draft, value)?;
+        return Ok(Some((before, draft)));
+    }
+    sync.store(&mut engine.history, value, change.coalesce.as_deref())?;
+    Ok(None)
+}
+
+/// [`store`] for the sheet: split it into its `pcb` and `diagram` blocks
+/// (`brep_ecad_core::sheet`) and write the ones that moved as ONE undo step —
+/// the first under the step's checkpoint, the second inside it — with what the
+/// sheet moved in the assembly (a deleted part, a board pose, harness
+/// connections) folded into the same step.
+fn store_sheet(
+    editors: &mut Editors,
+    pcb: &mut BlockSync,
+    diagram: &mut BlockSync,
+    engine: &mut brep_render::engine_state::EngineState,
+    opening: bool,
+) -> Result<Option<(serde_json::Value, serde_json::Value)>, String> {
+    use brep_ecad_core::sheet::SheetSource;
+    let Some(change) = editors.pcb.take_change() else { return Ok(None) };
+    // Put the stored sheet back, so what the canvas shows is what Save writes.
+    fn restore(editors: &mut Editors, pcb: &mut BlockSync, diagram: &mut BlockSync, history: &History) {
+        pcb.reload();
+        diagram.reload();
+        let _ = pull_sheet(editors, pcb, diagram, history);
+    }
+    if let Some(reason) = pcb.unreadable().or(diagram.unreadable()) {
+        return Err(format!("the sheet was not written: {reason}"));
+    }
+    let Some(source) = editors.sheet.source.clone() else {
+        restore(editors, pcb, diagram, &engine.history);
+        return Err("the sheet was not read from the document. The edit was taken back.".into());
+    };
+    // The sheet the editor holds may break a rule a stored sheet keeps; then it
+    // cannot be written, and keeping it on screen would show an edit the document
+    // does not have (the eCAD workflow audit, issue 3).
+    let split = editors.pcb.document.validate().and_then(|()| editors.pcb.document.split_sheet(&source));
+    let values = split.and_then(|split| {
+        let value = |document: &Option<brep_ecad_core::Document>| document.as_ref().map(|d| d.to_value()).transpose();
+        Ok((value(&split.pcb)?, value(&split.diagram)?, split))
+    });
+    let (pcb_value, diagram_value, split) = match values {
+        Ok(values) => values,
+        Err(error) => {
+            restore(editors, pcb, diagram, &engine.history);
+            return Err(format!("{error} The edit was taken back."));
+        }
+    };
+    let pcb_moved = split.pcb != source.pcb;
+    let diagram_moved = split.diagram != source.diagram;
+    let after = SheetSource::after(&editors.pcb.document, &split, source.offset);
+    if let Some(reason) = engine.history.locked().map(str::to_string) {
+        if opening {
+            if let Some(value) = pcb_value.filter(|_| pcb_moved) {
+                pcb.hold_unwritten(&engine.history, value);
+            }
+            if let Some(value) = diagram_value.filter(|_| diagram_moved) {
+                diagram.hold_unwritten(&engine.history, value);
+            }
+            editors.sheet.source = Some(after);
+            return Ok(None);
+        }
+        let again = pcb.refused_again(&serde_json::json!([pcb_value, diagram_value]));
+        restore(editors, pcb, diagram, &engine.history);
+        return match again {
+            true => Ok(None),
+            false => Err(format!("the document is read-only: {reason}. The edit was taken back.")),
+        };
+    }
+    if !pcb_moved && !diagram_moved {
+        editors.sheet.source = Some(after);
+        return Ok(None);
+    }
+    let Ok(mut draft) = serde_json::from_str::<serde_json::Value>(&engine.history.request_json()) else { return Ok(None) };
+    let before = draft.clone();
+    // A board is an assembly: a component deleted from the sheet is the assembly
+    // component deleted, in this edit's own undo step; the harness follows the
+    // frame after (`ecad_parts::follow_occurrences`). Read against BOTH stored
+    // blocks, so a part that only moved from one to the other is not deleted. A
+    // device inside a sub-assembly is refused, and the sheet put back.
+    for block in [Block::Pcb, Block::Diagram] {
+        if let Err(error) = crate::panels::ecad_parts::delete_gone_occurrences(&mut draft, block.read(&engine.history), &editors.pcb.document) {
+            restore(editors, pcb, diagram, &engine.history);
             return Err(error);
         }
-        let endpoints = engine.wire_harness_report().map(|report| report.endpoints.as_slice()).unwrap_or(&[]);
-        match crate::panels::ecad_parts::follow_sheet(&mut draft, block_of(target).key(), &editor.document, endpoints) {
+    }
+    let endpoints = engine.wire_harness_report().map(|report| report.endpoints.as_slice()).unwrap_or(&[]).to_vec();
+    let mut unlinked = Vec::new();
+    for (block, document) in [(Block::Pcb, &split.pcb), (Block::Diagram, &split.diagram)] {
+        let Some(document) = document else { continue };
+        match crate::panels::ecad_parts::follow_sheet(&mut draft, block.key(), document, &endpoints) {
             // A component the assembly cannot place is UNLINKED, not a refusal:
             // the edit stands and the user is told which one and why.
-            Ok(unlinked) => notes = sync.unreported(unlinked),
+            Ok(lines) => {
+                for line in lines {
+                    if !unlinked.contains(&line) {
+                        unlinked.push(line);
+                    }
+                }
+            }
             Err(error) => {
-                // A refused edit restores the stored sheet immediately, so the editor
-                // never advertises a placement the assembly could not accept.
-                let previous = block_of(target).read(&engine.history).cloned()
-                    .and_then(|v| brep_ecad_core::Document::from_value(v).ok())
-                    .unwrap_or_else(|| brep_ecad_core::Document::new(editor.document.kind));
-                editor.set_document(previous);
+                restore(editors, pcb, diagram, &engine.history);
                 return Err(error);
             }
         }
     }
+    let notes = pcb.unreported(unlinked);
+    let moved = draft != before;
+    let set_blocks = |draft: &mut serde_json::Value| {
+        if let Some(value) = &pcb_value { draft[Block::Pcb.key()] = value.clone(); }
+        if let Some(value) = &diagram_value { draft[Block::Diagram.key()] = value.clone(); }
+    };
     if opening {
         // The sheet and what it moved in the assembly, adopted together as the
         // document, with no checkpoint.
-        let moved = draft != before;
-        draft[block_of(target).key()] = value.clone();
-        sync.adopt(&mut engine.history, &draft, value)?;
-        engine.refresh_board_geometry();
+        set_blocks(&mut draft);
+        engine.history.adopt_document(&draft.to_string())?;
+        pcb.hold(&engine.history);
+        diagram.hold(&engine.history);
+        editors.sheet.source = Some(after);
+        if pcb_moved {
+            engine.refresh_board_geometry();
+        }
         if moved { engine.rebuild_current_history(); }
         for note in notes { engine.push_notice_as(NoticeSeverity::Warning, note); }
         return Ok(Some((before, draft)));
     }
-    sync.store(&mut engine.history, value.clone(), change.coalesce.as_deref())?;
+    let mut checkpointed = false;
+    for (moved_block, sync, value) in [(pcb_moved, &mut *pcb, &pcb_value), (diagram_moved, &mut *diagram, &diagram_value)] {
+        let Some(value) = value.clone().filter(|_| moved_block) else { continue };
+        if checkpointed {
+            sync.store_no_undo(&mut engine.history, value)?;
+        } else {
+            sync.store(&mut engine.history, value, change.coalesce.as_deref())?;
+            checkpointed = true;
+        }
+    }
     // The board's 3D bodies follow the block that was just written. A run would
     // rebuild them anyway, and one happens below whenever a PLACEMENT moved —
     // but routing a track moves no placement and runs nothing, and that is
-    // exactly the edit a user watches the 3D board for.
-    engine.refresh_board_geometry();
-    if draft != before {
-        draft[block_of(target).key()] = value;
+    // exactly the edit a user watches the 3D board for. Only when the board's
+    // block moved: a harness edit leaves the board's bodies as they were.
+    if pcb_moved {
+        engine.refresh_board_geometry();
+    }
+    if moved {
+        set_blocks(&mut draft);
         engine.history.adopt_document(&draft.to_string())?;
         engine.rebuild_current_history();
     }
+    pcb.hold(&engine.history);
+    diagram.hold(&engine.history);
+    editors.sheet.source = Some(after);
     for note in notes { engine.push_notice_as(NoticeSeverity::Warning, note); }
     Ok(None)
 }
@@ -525,6 +649,7 @@ fn strip_name(target: Target, editors: &Editors) -> &'static str {
 /// (`workbench::ecad::BENCHES`), and the view it is held in says which.
 pub(crate) fn workbench_of(target: Target, editors: &Editors) -> &'static str {
     match target {
+        Target::Pcb if editors.pcb.view == brep_ecad_egui::View::Schematic && editors.pcb.harness_tools => "diagram",
         Target::Pcb if editors.pcb.view == brep_ecad_egui::View::Schematic => "schematic",
         _ => target.workbench_id(),
     }
@@ -563,7 +688,7 @@ fn status_of(
     let Some((canvas, p)) = canvas.zip(pointer).filter(|(canvas, p)| canvas.contains(*p)) else {
         let text = match name {
             "Harness diagram" | "PCB diagram" => {
-                let editor = if target == Target::Diagram { &editors.diagram } else { &editors.pcb };
+                let editor = &editors.pcb;
                 format!("{name} · {:?} · {percent:.0}%", editor.tool)
             }
             "PCB" => format!("{name} · {percent:.0}%"),
@@ -579,8 +704,8 @@ fn status_of(
         .min_by(|a, b| a.1.area().total_cmp(&b.1.area()))
         .map(|(key, _)| key.clone());
     let text = match target {
-        Target::Diagram | Target::Pcb => {
-            let editor = if target == Target::Diagram { &editors.diagram } else { &editors.pcb };
+        Target::Pcb => {
+            let editor = &editors.pcb;
             // The sheet spaces its separators wider than the board does; the
             // strip gives both one spacing.
             let words: Vec<&str> = editor.status.split('·').map(str::trim).collect();
@@ -710,7 +835,6 @@ fn handle_words(handle: &str) -> String {
 /// Where `target`'s editor is looking, as `(pan, zoom)`.
 fn pan_zoom(target: Target, editors: &Editors) -> (egui::Vec2, f32) {
     match target {
-        Target::Diagram => editors.diagram.pan_zoom(),
         Target::Pcb => editors.pcb.pan_zoom(),
         Target::Symbol => editors.symbol.pan_zoom(),
         Target::Pads => editors.pads.pan_zoom(),
@@ -794,6 +918,22 @@ fn keys_hidden<R>(ctx: &egui::Context, hide: bool, draw: impl FnOnce() -> R) -> 
     drawn
 }
 
+/// The sync of `target`'s block in `blocks` and, for the sheet, its second
+/// block's (`diagram`).
+pub(crate) fn syncs_of(blocks: &mut [BlockSync], target: Target) -> (&mut BlockSync, Option<&mut BlockSync>) {
+    let block = block_of(target);
+    let mut main = None;
+    let mut second = None;
+    for sync in blocks.iter_mut() {
+        if sync.block() == block {
+            main = Some(sync);
+        } else if target == Target::Pcb && sync.block() == Block::Diagram {
+            second = Some(sync);
+        }
+    }
+    (main.expect("a document keeps one BlockSync per block"), second)
+}
+
 pub(crate) fn host_frame(
     host: &mut EcadViewport,
     last_rect: &mut Option<egui::Rect>,
@@ -807,10 +947,7 @@ pub(crate) fn host_frame(
     let opening = !doc.ecad_blocks.iter().any(|sync| sync.block() == block && sync.pulled());
     let key = doc.edit_key();
     let Document { engine, ecad, ecad_blocks, ecad_outdated, ecad_update_requested, .. } = &mut *doc;
-    let sync = ecad_blocks
-        .iter_mut()
-        .find(|sync| sync.block() == block)
-        .expect("a document keeps one BlockSync per block");
+    let (sync, mut diagram_sync) = syncs_of(ecad_blocks, target);
     // eCAD reports typing in a field on every keystroke, under one key per
     // field and object, and says nothing when the field loses the keyboard.
     // So a run ends HERE, when the focus moves: typing in R1's reference,
@@ -823,7 +960,7 @@ pub(crate) fn host_frame(
         host.focus = focus;
     }
     let was_unreadable = sync.unreadable().is_some();
-    let refused = pull(target, ecad, sync, &engine.history);
+    let refused = pull(target, ecad, sync, diagram_sync.as_deref_mut(), &engine.history);
     // The frame a block first READS is its open: the document's first frame,
     // or the frame a repair (the unreadable card's rename) made a refused
     // block readable. What the editor brings up to date then — a board seating
@@ -845,7 +982,6 @@ pub(crate) fn host_frame(
         // shape as part of opening, with no undo step (`store`), and silently:
         // nothing the user drew moves, and no action would follow a toast.
         match target {
-            Target::Diagram => drop(ecad.diagram.adopt_legacy_units()),
             Target::Pcb => drop(ecad.pcb.adopt_legacy_units()),
             Target::Symbol => drop(ecad.symbol.adopt_legacy_units()),
             Target::Pads => {}
@@ -894,7 +1030,6 @@ pub(crate) fn host_frame(
             // egui takes that field's focus away.
             let ctx = ui.ctx().clone();
             keys_hidden(&ctx, super::modal_open_last_pass(&ctx), || match target {
-                Target::Diagram => ecad.diagram.show(ui),
                 Target::Pcb => ecad.pcb.show(ui),
                 Target::Symbol | Target::Pads => {
                     // These two leave their keys to their host, and the host
@@ -926,7 +1061,6 @@ pub(crate) fn host_frame(
     let drawn = match (target, tile) {
         (_, None) => vec![],
         _ if unreadable.is_some() => vec![],
-        (Target::Diagram, Some(canvas)) => ecad.diagram.hits(canvas),
         (Target::Pcb, Some(canvas)) => ecad.pcb.hits(canvas),
         (Target::Symbol, Some(canvas)) => ecad.symbol.hits(canvas),
         (Target::Pads, Some(canvas)) => ecad.pads.hits(canvas),
@@ -938,14 +1072,12 @@ pub(crate) fn host_frame(
     };
     host.outdated = match target {
         _ if unreadable.is_some() => Vec::new(),
-        Target::Diagram => outdated_components(&ecad.diagram, &engine.history, ecad_outdated),
         Target::Pcb => outdated_components(&ecad.pcb, &engine.history, ecad_outdated),
         Target::Symbol | Target::Pads => Vec::new(),
     };
     if let Some(tile) = tile {
         let board = target == Target::Pcb && ecad.pcb.view == brep_ecad_egui::View::Board;
         let sheet = match target {
-            Target::Diagram => Some(&ecad.diagram.document),
             Target::Pcb => Some(&ecad.pcb.document),
             Target::Symbol | Target::Pads => None,
         };
@@ -961,11 +1093,10 @@ pub(crate) fn host_frame(
     }
     match target {
         _ if unreadable.is_some() => host.label_armed = false,
-        Target::Diagram => host.card(ui.ctx(), tile, &mut ecad.diagram),
         Target::Pcb => host.card(ui.ctx(), tile, &mut ecad.pcb),
         Target::Symbol | Target::Pads => host.label_armed = false,
     }
-    let opened = match store(target, ecad, sync, engine, opening) {
+    let opened = match store(target, ecad, sync, diagram_sync.as_deref_mut(), engine, opening) {
         Ok(opened) => opened,
         Err(reason) => {
             engine.push_notice(format!("{}: edit not saved: {reason}", strip_name(target, ecad)));
@@ -1231,7 +1362,7 @@ impl EcadViewport {
         let power = on_sheet && editor.tool == brep_ecad_egui::Tool::Power;
         let stock = on_sheet
             && editor.tool == brep_ecad_egui::Tool::Select
-            && editor.document.kind == brep_ecad_core::DocumentKind::Wiring;
+            && editor.harness_tools_up();
         let armed = label && !self.label_armed;
         self.label_armed = label;
         let Some(tile) = tile.filter(|_| label || stock || power) else {
@@ -1386,7 +1517,7 @@ fn graphic_json(g: &brep_ecad_core::graphic::LayerGraphic) -> serde_json::Value 
     item
 }
 /// What `__brepEcad` and the `ecad_state` command say about an editor.
-pub(crate) const STATE_DOC: &str = "the eCAD editor drawn in the central tile: target (diagram|pcb|symbol|pads, null when none); inStep, true when the editor's document is exactly its block of the document (or the empty document when there is no block) — false after ANY edit that did not reach the document or any document change that did not reach the editor; the history revision; pan [x,y] in points and zoom in points per micrometre; why its block is not being edited (unreadable), and while it is not, the parts at fault by name (offender, null when the host cannot name them) and the unreadable card's one-click repair (repair, its button's words, null when there is none); for the sheet editors the view, tool, selection, components, wires (connections, by terminal name), labels, nets (the Connectivity panel's, each net's name and pins), erc (the Connectivity panel's electrical rule check: run, whether its button has been pressed; findings, each with severity, kind, message, at in micrometres, pins and the fix it offers; noConnects and powerFlags, the pins its fixes marked) and board (counts; each placement's pads with their centres on the board; each track's net, layer, width and points in micrometres as trackPaths; each copper zone as zones — its net, layer, outline, and its fill's pieces, holes, vertices, area in mm² and, once filled in this session, the spokes each relieved pad got — with zonesStale, true when copper has changed since the fill on show was made, and selectedZone, the selected zone's index or null; drawings, what is drawn on the board itself on F/B.SilkS or F/B.Fab, each reported as a Pads drawn item is (layer, kind, width, filled, points, radius/text/height/angle), and selectedDrawing, the selected one's index or null; cutouts, the holes milled through the board inside its outline, each its corners in micrometres, and selectedCutout, the selected one's index or null; the board's selected pad by reference and number, its selected silkscreen line or drawn item by reference and index (the part's silkscreen lines first, then its drawn items), and its message, the Inspector's line from the last sync, autoroute or refused board edit, \"\" once spent); for Symbol its tool (select|line|rectangle|circle|pin|text), pins, graphics (each drawn item by index: kind path|circle|text and points — a path's points, a circle's centre with radius, a text's top-left anchor with text, size and angle in whole degrees counter-clockwise) and the selection (a pin by number, a drawn item by index); for Pads its tool (select|smd|through_hole|line|rectangle|circle|arc|text), pads (each its number, at and size in micrometres, shape and layers), its silkscreen lines, its graphics (each drawn item on F/B.SilkS, F/B.Fab or F/B.CrtYd: layer, kind polyline|arc|circle|text, width in micrometres, filled, points — a polyline's points, an arc's start, through and end, a circle's centre with radius, a text's anchor with text, height and angle, whole degrees counter-clockwise) and the selection (a pad by number, a silk line or drawn item by index); popupOpen, a menu or combo box open as the frame ends (the popup clause of the editors' key rule); modalOpen, a modal up last pass; keysReachEditor, the key rule's answer (no text field focused, no popup, no modal); status, the status strip under the editor: its text, the pointer's place in the editor's micrometres and the hit key under it (both null off the canvas); and outdated, for the sheet editors the components placed from a part whose saved version changed after they were placed, each as its reference and part (what the Update parts card lists and the canvas rings; empty when none)";
+pub(crate) const STATE_DOC: &str = "the eCAD editor drawn in the central tile: target (diagram|pcb|symbol|pads, null when none); inStep, true when the editor's document is exactly its block of the document (or the empty document when there is no block) — false after ANY edit that did not reach the document or any document change that did not reach the editor; the history revision; pan [x,y] in points and zoom in points per micrometre; why its block is not being edited (unreadable), and while it is not, the parts at fault by name (offender, null when the host cannot name them) and the unreadable card's one-click repair (repair, its button's words, null when there is none); for the sheet editors the view, tool, kind (sheet for the assembly's one sheet), harnessTools (the harness tools are up: Harness diagram), boardZone (the board zone's two corners in micrometres, null with no part on the board), subBoards (each board of its own the assembly places, drawn read-only as a zone of the sheet: its occurrence, reference, zone corners, parts by reference and declared, the pins of them a harness wire may end on), selection, components (each with offBoard, outside the board zone, and subBoard, the reference of the board of its own it is drawn from or null), wires (connections, by terminal name, each with harness: a harness wire rather than a net), labels, nets (the Connectivity panel's, each net's name and pins), erc (the Connectivity panel's electrical rule check: run, whether its button has been pressed; findings, each with severity, kind, message, at in micrometres, pins and the fix it offers; noConnects and powerFlags, the pins its fixes marked) and board (counts; each placement's pads with their centres on the board; each track's net, layer, width and points in micrometres as trackPaths; each copper zone as zones — its net, layer, outline, and its fill's pieces, holes, vertices, area in mm² and, once filled in this session, the spokes each relieved pad got — with zonesStale, true when copper has changed since the fill on show was made, and selectedZone, the selected zone's index or null; drawings, what is drawn on the board itself on F/B.SilkS or F/B.Fab, each reported as a Pads drawn item is (layer, kind, width, filled, points, radius/text/height/angle), and selectedDrawing, the selected one's index or null; cutouts, the holes milled through the board inside its outline, each its corners in micrometres, and selectedCutout, the selected one's index or null; the board's selected pad by reference and number, its selected silkscreen line or drawn item by reference and index (the part's silkscreen lines first, then its drawn items), and its message, the Inspector's line from the last sync, autoroute or refused board edit, \"\" once spent); for Symbol its tool (select|line|rectangle|circle|pin|text), pins, graphics (each drawn item by index: kind path|circle|text and points — a path's points, a circle's centre with radius, a text's top-left anchor with text, size and angle in whole degrees counter-clockwise) and the selection (a pin by number, a drawn item by index); for Pads its tool (select|smd|through_hole|line|rectangle|circle|arc|text), pads (each its number, at and size in micrometres, shape and layers), its silkscreen lines, its graphics (each drawn item on F/B.SilkS, F/B.Fab or F/B.CrtYd: layer, kind polyline|arc|circle|text, width in micrometres, filled, points — a polyline's points, an arc's start, through and end, a circle's centre with radius, a text's anchor with text, height and angle, whole degrees counter-clockwise) and the selection (a pad by number, a silk line or drawn item by index); popupOpen, a menu or combo box open as the frame ends (the popup clause of the editors' key rule); modalOpen, a modal up last pass; keysReachEditor, the key rule's answer (no text field focused, no popup, no modal); status, the status strip under the editor: its text, the pointer's place in the editor's micrometres and the hit key under it (both null off the canvas); and outdated, for the sheet editors the components placed from a part whose saved version changed after they were placed, each as its reference and part (what the Update parts card lists and the canvas rings; empty when none)";
 
 /// Whether the editor's document is exactly its block of `history` — the empty
 /// document when there is no block. One comparison that fails whatever the
@@ -1394,16 +1525,20 @@ pub(crate) const STATE_DOC: &str = "the eCAD editor drawn in the central tile: t
 /// refused, an action that changed the document without reporting it, a store
 /// into the wrong block, a second undo history.
 pub(crate) fn in_step(target: Target, editors: &Editors, history: &History) -> bool {
+    if target == Target::Pcb {
+        // The sheet is in step when it splits into exactly its two blocks.
+        let Some(source) = &editors.sheet.source else { return false };
+        let Ok(split) = editors.pcb.document.split_sheet(source) else { return false };
+        let same = |document: &Option<brep_ecad_core::Document>, block: Block| match (document, block.read(history)) {
+            (None, None) => true,
+            (Some(document), Some(stored)) => document.to_value().ok().as_ref() == Some(stored),
+            _ => false,
+        };
+        return same(&split.pcb, Block::Pcb) && same(&split.diagram, Block::Diagram);
+    }
     let block = block_of(target).read(history);
     let (held, empty) = match target {
-        Target::Diagram => (
-            editors.diagram.document.to_value().ok(),
-            brep_ecad_core::Document::new(brep_ecad_core::DocumentKind::Wiring).to_value().ok(),
-        ),
-        Target::Pcb => (
-            editors.pcb.document.to_value().ok(),
-            brep_ecad_core::Document::new(brep_ecad_core::DocumentKind::Schematic).to_value().ok(),
-        ),
+        Target::Pcb => unreachable!("the sheet is answered above"),
         Target::Symbol => (
             serde_json::to_value(&editors.symbol.symbol).ok(),
             serde_json::to_value(brep_ecad_egui::SymbolEditor::blank().symbol).ok(),
@@ -1440,8 +1575,8 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
     state["repair"] = diagnosis.repair_label().into();
     let point = |p: brep_ecad_core::Point| json!([p.x, p.y]);
     match target {
-        Target::Diagram | Target::Pcb => {
-            let editor = if target == Target::Diagram { &editors.diagram } else { &editors.pcb };
+        Target::Pcb => {
+            let editor = &editors.pcb;
             let document = &editor.document;
             let reference = |id: &brep_ecad_core::Uuid| {
                 document.components.iter().find(|c| &c.id == id).map(|c| c.reference.clone())
@@ -1450,6 +1585,26 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
             state["view"] = format!("{:?}", editor.view).to_lowercase().into();
             state["tool"] = format!("{:?}", editor.tool).to_lowercase().into();
             state["kind"] = format!("{:?}", document.kind).to_lowercase().into();
+            // The tools up: the sheet's harness tools (Harness diagram) or its net
+            // tools; and the board zone, round the parts on the board.
+            state["harnessTools"] = editor.harness_tools.into();
+            state["boardZone"] = editor.board_zone().map(|(lo, hi)| json!([point(lo), point(hi)])).into();
+            // The boards of their own the assembly places, each a read-only zone.
+            state["subBoards"] = document
+                .zones
+                .iter()
+                .map(|z| {
+                    let name = |id: &brep_ecad_core::Uuid| document.components.iter().find(|c| c.id == *id).map(|c| c.reference.clone());
+                    json!({
+                        "occurrence": z.occurrence,
+                        "reference": z.reference,
+                        "zone": document.sub_zone_extent(&z.occurrence).map(|(lo, hi)| json!([point(lo), point(hi)])),
+                        "parts": z.members.iter().filter_map(name).collect::<Vec<_>>(),
+                        "declared": z.declared.iter().map(|t| document.terminal_name(t)).collect::<Vec<_>>(),
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into();
             state["labelText"] = editor.label_text.clone().into();
             state["powerNetText"] = editor.power_net_text.clone().into();
             state["stockPartNumber"] = editor.stock_part_number.clone().into();
@@ -1474,6 +1629,16 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
                         "at": point(c.at),
                         "rotation": c.rotation,
                         "pins": c.symbol.pins.len(),
+                        // The name the sheet shows for each pin that serves
+                        // more than one function (`Pin::alternates`): the one
+                        // chosen for this part, else the pin's main name.
+                        "pinFunctions": c.symbol.pins.iter().filter(|p| !p.alternates.is_empty())
+                            .map(|p| (p.number.clone(), json!(c.pin_label(p))))
+                            .collect::<serde_json::Map<_, _>>(),
+                        // On the board, or off it (outside the board zone).
+                        "offBoard": c.off_board,
+                        // The board of its own it is drawn from, read-only; null for this document's own parts.
+                        "subBoard": document.zone_member(c.id).map(|z| z.reference.clone()),
                         // A part split into gates: each gate by the name the
                         // sheet gives it, where it sits and how it is turned.
                         // Empty for a part drawn whole.
@@ -1497,6 +1662,8 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
                         "to": terminal(&w.end),
                         "connectionId": w.connection_id,
                         "stockPartNumber": w.stock_part_number,
+                        // A harness wire, or a net.
+                        "harness": w.harness,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -1640,9 +1807,9 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
                 "netClassAssigned": document.board.rules.net_class_of,
                 "netClassNet": editor.net_class_subject(),
                 // The design rule check's findings as the Inspector lists them
-                // ({kind, message}), `null` until the check has run.
+                // ({kind, message, at}), `null` until the check has run.
                 "findings": editor.board_findings().map(|findings| {
-                    findings.into_iter().map(|(kind, message)| json!({ "kind": kind, "message": message })).collect::<Vec<_>>()
+                    findings.into_iter().map(|(kind, message, at)| json!({ "kind": kind, "message": message, "at": [at.x, at.y] })).collect::<Vec<_>>()
                 }),
                 "selectedZone": editor.selected_board_zone(),
                 // What is drawn on the board itself, owned by no part, each as a
@@ -1683,7 +1850,7 @@ pub(crate) fn state_json(target: Target, editors: &Editors, sync: &BlockSync, hi
                 .symbol
                 .pins
                 .iter()
-                .map(|pin| json!({ "number": pin.number, "name": pin.name, "at": point(pin.at), "end": point(pin.end), "unit": pin.unit, "gate": pin.gate }))
+                .map(|pin| json!({ "number": pin.number, "name": pin.name, "alternates": pin.alternates, "at": point(pin.at), "end": point(pin.end), "unit": pin.unit, "gate": pin.gate }))
                 .collect::<Vec<_>>()
                 .into();
             // Each drawn item, by its index (`row:graphic:<index>`), and what

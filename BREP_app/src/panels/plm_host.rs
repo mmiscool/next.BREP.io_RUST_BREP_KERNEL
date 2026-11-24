@@ -536,6 +536,12 @@ impl PlmHost {
         self.follower.ask_now();
     }
 
+    /// Hold (or release) the follower's interval: while held it asks the feed only at
+    /// [`Self::follow_now`] (scripts).
+    pub fn set_follow_hold(&mut self, hold: bool) {
+        self.follower.held = hold;
+    }
+
     /// The follower, for the state blob and tests.
     pub fn follower(&self) -> &crate::panels::plm_follow::Follower {
         &self.follower

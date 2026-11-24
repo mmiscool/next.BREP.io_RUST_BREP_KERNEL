@@ -904,7 +904,7 @@ impl DockState {
     /// a choice.
     fn surface_ecad_pane(&mut self, document: u64, wb: &str) {
         let own = |wb: &str| match workbench::ecad::Target::of_workbench(wb) {
-            Some(workbench::ecad::Target::Diagram | workbench::ecad::Target::Pcb) => Some(PaneKind::EcadLibrary),
+            Some(workbench::ecad::Target::Pcb) => Some(PaneKind::EcadLibrary),
             Some(workbench::ecad::Target::Symbol | workbench::ecad::Target::Pads) => Some(PaneKind::EcadInspector),
             None => None,
         };
@@ -1643,7 +1643,6 @@ impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
             PaneKind::EcadLibrary => {
                 let doc = self.docs.view_mut();
                 match workbench::ecad::Target::of_workbench(&doc.engine.settings.workbench) {
-                    Some(workbench::ecad::Target::Diagram) => doc.ecad.diagram.library_panel(ui),
                     Some(workbench::ecad::Target::Pcb) => doc.ecad.pcb.library_panel(ui),
                     // Claimed by Diagram and PCB only, so never drawn elsewhere.
                     _ => {}
@@ -1652,7 +1651,6 @@ impl<'a> Behavior<PaneKind> for DockBehavior<'a> {
             PaneKind::EcadInspector => {
                 let doc = self.docs.view_mut();
                 match workbench::ecad::Target::of_workbench(&doc.engine.settings.workbench) {
-                    Some(workbench::ecad::Target::Diagram) => doc.ecad.diagram.inspector(ui),
                     Some(workbench::ecad::Target::Pcb) => doc.ecad.pcb.inspector(ui),
                     Some(workbench::ecad::Target::Symbol) => doc.ecad.symbol.properties(ui),
                     Some(workbench::ecad::Target::Pads) => doc.ecad.pads.properties(ui),

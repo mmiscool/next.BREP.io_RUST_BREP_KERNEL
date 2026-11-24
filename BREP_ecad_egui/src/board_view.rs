@@ -624,6 +624,9 @@ pub(crate) struct BoardView {
     job: Option<RouteJob>,
     pub message: String,
     pub(crate) violations: Option<Vec<Violation>>,
+    /// Set when the check ran, for the host to take ([`Editor::take_drc_run`])
+    /// and answer with what only it can measure ([`Editor::add_board_findings`]).
+    pub(crate) drc_ran: bool,
     /// The finding last clicked in the list, by its index in [`Self::violations`]:
     /// its row stays selected and its mark on the board is drawn larger.
     focused_violation: Option<usize>,
@@ -691,6 +694,7 @@ impl Default for BoardView {
             job: None,
             message: String::new(),
             violations: None,
+            drc_ran: false,
             focused_violation: None,
             rules: None,
             outline: None,
@@ -780,7 +784,7 @@ const FOCUS_SPAN: f32 = 8000.;
 /// red (the eCAD workflow audit's item 16).
 fn finding_row(style: &egui::Style, v: &Violation) -> egui::text::LayoutJob {
     let body = egui::TextStyle::Body.resolve(style);
-    let color = if matches!(v.kind, ViolationKind::Unrouted | ViolationKind::Stitching) {
+    let color = if matches!(v.kind, ViolationKind::Unrouted | ViolationKind::Stitching | ViolationKind::PinSeat) {
         style.visuals.warn_fg_color
     } else {
         style.visuals.error_fg_color
@@ -804,6 +808,7 @@ fn violation_kind(kind: ViolationKind) -> &'static str {
         ViolationKind::Hole => "Hole",
         ViolationKind::Stitching => "Stitching",
         ViolationKind::Unrouted => "Unrouted",
+        ViolationKind::PinSeat => "Seat",
     }
 }
 
@@ -1233,9 +1238,40 @@ fn corner(a: Point, b: Point, diagonal_first: bool) -> Vec<Point> {
 }
 
 impl Editor {
+    /// Run the design rule check, as its button does: the zones refilled first
+    /// (the check is of the copper the board would be made with, and that is a
+    /// fresh fill), then the board's findings listed. The host adds its own on
+    /// the next frame ([`Self::take_drc_run`]).
+    pub fn run_design_rule_check(&mut self) {
+        if !self.document.board.zones.is_empty() {
+            let mut reports = vec![];
+            self.transaction(|d| reports = d.fill_zones());
+            self.note_filled();
+            self.zone_reports_words(&reports);
+        }
+        self.board_view.violations = Some(self.document.board_drc());
+        self.board_view.focused_violation = None;
+        self.board_view.drc_ran = true;
+    }
+
+    /// Whether the design rule check ran since the host last asked. The host
+    /// answers with the findings it measures itself ([`Self::add_board_findings`]),
+    /// such as where a placed part's pins land on its pads.
+    pub fn take_drc_run(&mut self) -> bool {
+        std::mem::take(&mut self.board_view.drc_ran)
+    }
+
+    /// Add the host's findings to the check's list, after the board's own. Nothing
+    /// happens while no check has run: a finding is only shown in its list.
+    pub fn add_board_findings(&mut self, findings: Vec<Violation>) {
+        if let Some(violations) = self.board_view.violations.as_mut() {
+            violations.extend(findings);
+        }
+    }
+
     pub fn set_view(&mut self, view: View) {
         // A wiring diagram has no nets, so it has no board.
-        if self.view == view || view == View::Board && self.wiring() {
+        if self.view == view || view == View::Board && self.boardless() {
             return;
         }
         self.cancel();
@@ -1277,12 +1313,18 @@ impl Editor {
     /// the edit it follows is the host's Add Component, which is in the host's history
     /// and not in this one.
     pub(crate) fn follow_parts(&mut self) {
-        if self.wiring() {
+        if self.boardless() {
             return;
         }
         let mark = self.offered_mark();
-        let offer_moved = self.followed_parts != Some(mark);
-        self.followed_parts = Some(mark);
+        // A sheet's harness tools seat nothing: a part the user adds there is
+        // placed by hand, off the board. The offer is read again once the board's
+        // tools are up, so a part left unplaced is seated then.
+        let seat = !(self.document.kind == DocumentKind::Sheet && self.harness_tools);
+        let offer_moved = seat && self.followed_parts != Some(mark);
+        if seat {
+            self.followed_parts = Some(mark);
+        }
         // A state already healed once is not healed again, and that is what keeps this
         // out of BREP's undo. Undo in the app is `pull` → `set_document` → `show`, not a
         // key this editor sees, so an undo that lands on a stale board arrives here as a
@@ -1384,7 +1426,7 @@ impl Editor {
     /// from running a second sweep inside the first.
     fn stale_mark(&self) -> Option<u64> {
         use std::hash::{Hash, Hasher};
-        if self.wiring() {
+        if self.boardless() {
             return None;
         }
         let mut wanted: Vec<Uuid> = self
@@ -2069,13 +2111,14 @@ impl Editor {
     /// opened so, or copper has moved since it was made, and the fill may cross it
     /// or leave a pad cut off.
     /// The design rule check's findings as the Inspector lists them, each by the
-    /// word it is listed under and its message; `None` until the check has run
-    /// (and again once an edit has hidden them).
-    pub fn board_findings(&self) -> Option<Vec<(&'static str, String)>> {
+    /// word it is listed under, its message and where on the board it is (what a
+    /// click on its row zooms to); `None` until the check has run (and again once
+    /// an edit has hidden them).
+    pub fn board_findings(&self) -> Option<Vec<(&'static str, String, Point)>> {
         self.board_view
             .violations
             .as_ref()
-            .map(|v| v.iter().map(|v| (violation_kind(v.kind), v.message.clone())).collect())
+            .map(|v| v.iter().map(|v| (violation_kind(v.kind), v.message.clone(), v.at)).collect())
     }
     pub fn zones_stale(&self) -> bool {
         !self.document.board.zones.is_empty()
@@ -3116,16 +3159,7 @@ impl Editor {
         let run = ui.button("Run design rule check");
         self.board_view.inspector.mark("run_drc", &run);
         if run.clicked() {
-            // The zones are refilled first: the check is of the copper the board
-            // would be made with, and that is a fresh fill.
-            if !self.document.board.zones.is_empty() {
-                let mut reports = vec![];
-                self.transaction(|d| reports = d.fill_zones());
-                self.note_filled();
-                self.zone_reports_words(&reports);
-            }
-            self.board_view.violations = Some(self.document.board_drc());
-            self.board_view.focused_violation = None;
+            self.run_design_rule_check();
         }
         let Some(violations) = &self.board_view.violations else {
             return;

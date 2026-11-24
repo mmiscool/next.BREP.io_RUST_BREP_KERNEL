@@ -45,6 +45,7 @@ fn build_shell_faces_in_namespace(
                 .map_err(|error| format!("step_import: face #{face_ref}: {error}"))?,
         );
     }
+    builder.close_vertex_loop_tori(&mut pending)?;
     builder.relocate_periodic_rim_seams(&pending)?;
     builder.split_seam_crossing_edges(&mut pending)?;
     // Phase 1.75: a planar face whose straight boundary sits off its plane
@@ -664,6 +665,7 @@ pub(in crate::step_import) fn build_solid_from_shell_captured(
         );
     }
     lap("collect_faces", &mut lap_started, &mut laps);
+    builder.close_vertex_loop_tori(&mut pending)?;
     builder.relocate_periodic_rim_seams(&pending)?;
     builder.split_seam_crossing_edges(&mut pending)?;
     lap("seams", &mut lap_started, &mut laps);

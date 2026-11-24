@@ -1,13 +1,14 @@
 [package]
 name = "BREP_mcp_core"
-version = "0.11.14"
+version = "0.11.15"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-homepage = "https://v2.brep.io"
+homepage = "https://next.brep.io"
 readme = "README.md"
 rust-version = "1.92"
-description = "The BREP MCP server core: the Model Context Protocol surface generated from the CAD app's own registries, its sessions, script runner and transports (stdio and streamable HTTP). Embedded in the app behind `brep-app --mcp`; hosted headlessly by BREP_mcp."
+description = "The next.BREP.io MCP server core for the Rust B-rep CAD app: the Model Context Protocol surface generated from the app's own registries, its sessions, script runner and transports (stdio and streamable HTTP). Embedded in the app behind `brep-app --mcp`; hosted headlessly by BREP_mcp."
+keywords = ["mcp", "cad", "b-rep", "automation", "agent"]
 # The `!` entries are a backstop: test code never ships. The publish snapshot
 # `cargo package` of this manifest from shipping test files.
 include = [
@@ -77,10 +78,10 @@ base64 = "0.22"
 sha2 = { version = "0.10", optional = true }
 # Code mode's worker (Boa, unchanged): a host binary runs it when started
 # with the hidden worker flag (`cad::code::worker_entry`).
-brep-script-core = { package = "BREP_script_core", version = "0.1.5", path = "../BREP_script_core", optional = true }
+brep-script-core = { package = "BREP_script_core", version = "0.1.6", path = "../BREP_script_core", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 # The feature catalogue (schema.rs) is read straight from the engine.
-brep-render = { package = "BREP_render", version = "0.26.0", path = "../BREP_render" }
+brep-render = { package = "BREP_render", version = "0.27.0", path = "../BREP_render" }
 # The streamable-HTTP transport is a tower service; hyper serves it on a
 # loopback listener (http.rs). hyper-util's `service` bridges tower to hyper.
 hyper = { version = "1", features = ["server", "http1"], optional = true }

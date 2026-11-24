@@ -1,15 +1,15 @@
 [package]
 name = "BREP_mcp"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 rust-version = "1.92"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-homepage = "https://v2.brep.io"
+homepage = "https://next.brep.io"
 readme = "README.md"
-keywords = ["mcp", "cad", "automation", "headless", "agent"]
+keywords = ["mcp", "cad", "b-rep", "automation", "agent"]
 categories = ["command-line-utilities", "development-tools::testing", "graphics"]
-description = "The BREP MCP automation server: hosts the BREP CAD app headlessly under egui_kittest and serves the BREP_mcp_core Model Context Protocol surface over stdio or streamable HTTP, so an agent can drive the CAD app with no display attached. The same server the app embeds behind `brep-app --mcp`."
+description = "The next.BREP.io MCP automation server for the Rust B-rep CAD app: hosts the app headlessly under egui_kittest and serves the BREP_mcp_core Model Context Protocol surface over stdio or streamable HTTP, so an agent can drive the CAD app with no display attached."
 # The server's sources only: tests/ (the test-mcp scripts, fixtures,
 # baselines and videos) is test material and never ships.
 include = [
@@ -35,13 +35,13 @@ path = "src/main.rs"
 
 [dependencies]
 # The server: tools, sessions, transports. Host-agnostic, so the app can embed it too.
-brep-mcp-core = { package = "BREP_mcp_core", version = "0.11.14", path = "../BREP_mcp_core" }
+brep-mcp-core = { package = "BREP_mcp_core", version = "0.11.15", path = "../BREP_mcp_core" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "net"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 clap = { version = "4", features = ["derive"] }
 # The app with its automation layer, for the headless host. Default features
 # off: the app's own embedded server (`mcp`) is not needed under the harness.
-brep-app = { package = "BREP_app", version = "0.28.0", path = "../BREP_app", default-features = false, features = ["automation"] }
+brep-app = { package = "BREP_app", version = "0.29.0", path = "../BREP_app", default-features = false, features = ["automation"] }
 egui = "0.35"
 egui_kittest = { version = "0.35", features = ["wgpu", "eframe"] }
 # The harness's app state is an `eframe::App` — `crate::annotate::Annotated`,

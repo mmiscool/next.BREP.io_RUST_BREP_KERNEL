@@ -52,6 +52,14 @@ fn surface_model_shell_refs(resolver: &Resolver, model_ref: usize) -> Option<Vec
     Some(refs)
 }
 
+/// The number of faces a CLOSED_SHELL or OPEN_SHELL lists, read from the entity
+/// without building anything.
+fn shell_face_count(resolver: &Resolver, shell_ref: usize) -> Option<usize> {
+    let entity = resolver.get(shell_ref).ok()?;
+    let args = entity.find("CLOSED_SHELL").or_else(|| entity.find("OPEN_SHELL"))?;
+    Some(args.get(1)?.as_list().ok()?.len())
+}
+
 /// Append every solid body an entity contributes. Most bodies map 1→1 via
 /// [`step_body_for_entity`]; a SHELL_BASED_SURFACE_MODEL fans out 1→many, one
 /// [`StepBody::SurfaceModelShell`] per wrapped shell (a closed shell reconstructs
@@ -326,6 +334,10 @@ pub(super) struct ImportedBodies {
     /// stated-precision consistency check; parsed here because the entity
     /// table does not outlive this function.
     pub(super) stated_precisions_mm: Vec<f64>,
+    /// The vertex identity band the file was read at when it states no usable
+    /// precision (`Resolver::unstated_identity_band`); `None` when it states
+    /// one or the switch is off. Named in the report's diagnostics.
+    pub(super) unstated_identity_band_mm: Option<f64>,
     /// Parallel to `solids` on the flat lane: the trims each body accepted at
     /// a residual over the fit's bar because the file's curve is not on their
     /// carriers. EMPTY on the assembly-occurrence lane, which does not carry
@@ -412,6 +424,7 @@ pub(super) fn collect_step_solids_with(text: &str, sheets: bool, readings: bool)
     // table empty and every appearance lookup short-circuits.
     let styles = StyleTable::read(&entities);
     let stated_precisions_mm = stated_precisions_mm(&entities);
+    let unstated_identity_band_mm = resolver.unstated_identity_band();
 
     // A file that carries a product structure (NEXT_ASSEMBLY_USAGE_OCCURRENCE
     // edges, MAPPED_ITEM edges, or both) is resolved into positioned leaf
@@ -454,6 +467,7 @@ pub(super) fn collect_step_solids_with(text: &str, sheets: bool, readings: bool)
                 failed: occurrences.failed,
                 first_error: occurrences.first_error,
                 stated_precisions_mm,
+                unstated_identity_band_mm,
                 sheets_skipped: occurrences.sheets_skipped,
             });
         }
@@ -463,7 +477,25 @@ pub(super) fn collect_step_solids_with(text: &str, sheets: bool, readings: bool)
     // Flat import: a single part, or several solids already sharing one frame. A
     // body is a MANIFOLD_SOLID_BREP (analytic/NURBS shell) or a FACETED_BREP
     // (planar polygon closed-shell); both wrap a CLOSED_SHELL as their shell arg.
-    let bodies = flat_step_bodies(&resolver, &entities);
+    let mut bodies = flat_step_bodies(&resolver, &entities);
+    // ONE-FACE SURFACE MODELS (`BREP_STEP_SKIP_ONE_FACE_SURFACE_MODELS`, default
+    // on, =0 restores): a SHELL_BASED_SURFACE_MODEL shell of a single face is
+    // reference geometry, never a part. Closed, it was dropped after it built
+    // (the one-face arm below); open, it failed as a sheet. Either way the
+    // build was thrown away, so where sheets are not asked for it is now not
+    // built, and counted as a skipped sheet. abc_00006483 carries 11413 of them
+    // beside its 210 solids, and building them took most of its 19-minute
+    // import.
+    let mut sheets_skipped = 0usize;
+    if !resolver.sheets && crate::switch!("BREP_STEP_SKIP_ONE_FACE_SURFACE_MODELS", true) {
+        bodies.retain(|body| match *body {
+            StepBody::SurfaceModelShell { shell_ref, .. } if shell_face_count(&resolver, shell_ref).is_some_and(|faces| faces <= 1) => {
+                sheets_skipped += 1;
+                false
+            }
+            _ => true,
+        });
+    }
     // Each body reconstructs an independent `BrepSolid` from the shared read-only
     // `Resolver` (its own `SolidBuilder`/id space, no cross-body state), so the
     // bodies fan out across a rayon pool under the `parallel` feature. `collect`
@@ -522,7 +554,6 @@ pub(super) fn collect_step_solids_with(text: &str, sheets: bool, readings: bool)
     let mut closure_notes = Vec::new();
     let mut refused_bodies = Vec::new();
     let mut failed_refusals = Vec::new();
-    let mut sheets_skipped = 0usize;
     // A mapping the structure lane refused, on a file whose structure yielded no
     // positioned solid at all: the bodies below come in UNPLACED, and the refusal
     // is what says why one of them is not where the file put it.
@@ -582,6 +613,7 @@ pub(super) fn collect_step_solids_with(text: &str, sheets: bool, readings: bool)
         failed,
         first_error,
         stated_precisions_mm,
+        unstated_identity_band_mm,
         bounded_trims,
         closure_notes,
         refused_bodies,

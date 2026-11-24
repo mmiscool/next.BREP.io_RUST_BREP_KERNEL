@@ -755,6 +755,26 @@ impl<'a> SolidBuilder<'a> {
                 surface, edge_id, forward, &parameters, c, pcurve_tol, 1e-2 * extent, &norm_step,
             )?);
         }
+        // Every trim the loop keeps must pass the same-parameter check the
+        // solid's validation applies (`BREP_JOINT_CHAIN_HULL_GUARD`): a curve
+        // whose refinement stopped early, or whose plain interpolation already
+        // strays from its edge between stations, sends the whole loop to the
+        // per-coedge fit instead of into the solid.
+        if joint_chain_hull_guard() {
+            let scale = solid_like_scale(&self.vertices);
+            let limit = crate::KernelTolerances::for_scale(1.0 + scale, 1e-7).pcurve_acceptance(2.0 * scale);
+            for (ci, pcurve) in pcurves.iter().enumerate() {
+                let (edge_id, forward) = specs[ci];
+                let edge = self.edge_record(edge_id);
+                let error = brep_topology::topology::coedge_error_floored(surface, pcurve, &edge.curve, edge, forward, limit);
+                if !matches!(error, Ok(error) if error.is_finite() && error <= limit) {
+                    if dbg {
+                        eprintln!("joint-branch: REFUSED adopt m={m}: coedge {ci} (edge {edge_id}) reads {error:?} against the same-parameter limit {limit:.3e}");
+                    }
+                    return Ok(None);
+                }
+            }
+        }
         if std::env::var("BREP_DEBUG_PCURVE").is_ok() {
             eprintln!(
                 "joint-branch: adopted loop m={m} anchor=ce{anchor_ci} anchorRes={best_res:.2e} worstRes={worst_res_all:.2e} closure={closure:.2e}"
@@ -886,13 +906,52 @@ impl<'a> SolidBuilder<'a> {
                 feet.insert(index, at);
             }
             // A refined net that cannot be interpolated keeps the last curve.
+            // So does one whose interpolant swings away from its own feet
+            // (`BREP_JOINT_CHAIN_HULL_GUARD`, default on): a cubic through
+            // dense, uneven stations can oscillate between them, where nothing
+            // above reads it. ABC 00000647 refined a coedge along a bicubic's
+            // u = 1 side to 213 stations whose interpolant reached v = 4e5 on
+            // the unit chart between them (3.2e7 off its edge) and lost the
+            // solid at validation. Its control points must stay within the
+            // feet's box grown by that box's own size.
             match interpolate(&fractions, &feet) {
-                Ok(refined) => curve = refined,
+                Ok(refined) if !joint_chain_hull_guard() || controls_hug_feet(&refined, &feet) => curve = refined,
+                Ok(_) => {
+                    if debug {
+                        eprintln!("joint-chain refine: edge {edge_id} round {round}: the refined interpolant leaves its feet; keeping the last curve");
+                    }
+                    break;
+                }
                 Err(_) => break,
             }
         }
         Ok(curve)
     }
+}
+
+/// `BREP_JOINT_CHAIN_HULL_GUARD` (default on, `=0` off): see
+/// [`SolidBuilder::refined_chain_pcurve`].
+fn joint_chain_hull_guard() -> bool {
+    switch!("BREP_JOINT_CHAIN_HULL_GUARD", true)
+}
+
+/// Whether every control point of `curve` lies within the box of `feet` grown
+/// on each side by the box's own extent (and at least by 1e-9): a cubic
+/// through its stations that keeps its control polygon near them cannot
+/// swing far between them.
+fn controls_hug_feet(curve: &NurbsCurve, feet: &[(f64, f64)]) -> bool {
+    let (mut lo_u, mut hi_u, mut lo_v, mut hi_v) = (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY);
+    for &(u, v) in feet {
+        lo_u = lo_u.min(u);
+        hi_u = hi_u.max(u);
+        lo_v = lo_v.min(v);
+        hi_v = hi_v.max(v);
+    }
+    let extent = (hi_u - lo_u).max(hi_v - lo_v).max(1e-9);
+    curve.control_points.iter().all(|point| {
+        let (u, v) = (point.x / point.w, point.y / point.w);
+        u.is_finite() && v.is_finite() && u >= lo_u - extent && u <= hi_u + extent && v >= lo_v - extent && v <= hi_v + extent
+    })
 }
 
 /// Refinement rounds [`SolidBuilder::refined_chain_pcurve`] may spend; each
@@ -903,3 +962,4 @@ const JOINT_REFINE_ROUNDS: usize = 8;
 /// The most stations a refined joint-chain pcurve may carry, the station
 /// fitter's own sample ceiling.
 const JOINT_STATION_CAP: usize = 513;
+

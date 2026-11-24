@@ -255,8 +255,22 @@ fn thin_boundary_resolution(
     piece_ids: &[u64],
     index: &FragmentIndex,
     search: f64,
-) -> (Option<(f64, f64)>, bool) {
+) -> (Option<(f64, f64)>, bool, Option<(f64, f64)>, bool) {
     let mut resolution: Option<(f64, f64)> = None;
+    // The wedges' resolution, kept apart: it narrows the arrangement and the
+    // sampling but not the bands a chain end is matched in. Whether a lens
+    // asked for it ([`lens_enabled`]).
+    let mut wedged: Option<(f64, f64)> = None;
+    let mut lens_found = false;
+    let mut take_wedge = |found: Option<(f64, f64, bool)>| {
+        if let Some((arrangement, sampling, lens)) = found {
+            lens_found |= lens;
+            wedged = Some(match wedged {
+                Some((a, s)) => (a.min(arrangement), s.min(sampling)),
+                None => (arrangement, sampling),
+            });
+        }
+    };
     // Whether a feature-scale measure (a near touch, or a strip between two
     // cuts) found a strip: only then are the image bands narrowed.
     let mut feature_found = false;
@@ -291,6 +305,13 @@ fn thin_boundary_resolution(
                 }
                 strip => strip,
             });
+            if wedge_enabled() {
+                let found = wedge(face, &cut, &boundary.pcurve, search);
+                if found.is_some() && env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
+                    eprintln!("feature_scale: face {} wedge cut p{piece_id} / boundary e{} -> {found:?}", face.id, boundary.edge_id);
+                }
+                take_wedge(found);
+            }
             if end_gap_enabled() {
                 let gap = end_gap(face, &cut, &boundary.pcurve, search);
                 if gap.is_some() && env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
@@ -306,6 +327,16 @@ fn thin_boundary_resolution(
             for other in &cuts[i + 1..] {
                 let strip = strip_between(face, cut, other, search);
                 let found = strip.or_else(|| near_touch(face, cut, other, search));
+                if wedge_enabled() {
+                    let found = match (wedge(face, cut, other, search), wedge(face, other, cut, search)) {
+                        (Some(x), Some(y)) => Some((x.0.min(y.0), x.1.min(y.1), x.2 || y.2)),
+                        (x, y) => x.or(y),
+                    };
+                    if found.is_some() && env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
+                        eprintln!("feature_scale: face {} wedge cut pair {i} -> {found:?}", face.id);
+                    }
+                    take_wedge(found);
+                }
                 if found.is_some() && env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
                     eprintln!("feature_scale: face {} cut pair {i} {} -> {} {found:?}", face.id, if strip.is_some() { "strip" } else { "near touch" }, i);
                 }
@@ -314,7 +345,173 @@ fn thin_boundary_resolution(
             }
         }
     }
-    (resolution, feature_found)
+    // A lens of the face's own boundary (`BREP_FEATURE_SCALE_LENS`): two
+    // coedges leaving both of their ends together, a cap 1.8e-6 deep between
+    // two crossing circles, which no cut touches. Only pairs whose ends meet
+    // are read.
+    if lens_enabled() {
+        let coedges: Vec<&NurbsCurve> = face.loops.iter().flat_map(|lp| &lp.coedges).map(|coedge| &coedge.pcurve).collect();
+        let ends = |curve: &NurbsCurve| -> Option<[Vec3; 2]> {
+            let [lo, hi] = curve.domain().ok()?;
+            Some([curve.evaluate(lo).ok()?, curve.evaluate(hi).ok()?])
+        };
+        let ends: Vec<Option<[Vec3; 2]>> = coedges.iter().map(|curve| ends(curve)).collect();
+        for i in 0..coedges.len() {
+            for j in (i + 1)..coedges.len() {
+                let (Some(a), Some(b)) = (ends[i], ends[j]) else { continue };
+                let near = |p: Vec3, q: Vec3| p.sub(q).length() <= search;
+                let shared = (near(a[0], b[0]) && near(a[1], b[1])) || (near(a[0], b[1]) && near(a[1], b[0]));
+                if !shared || near(a[0], a[1]) {
+                    continue;
+                }
+                let found = match (wedge(face, coedges[i], coedges[j], search), wedge(face, coedges[j], coedges[i], search)) {
+                    (Some(x), Some(y)) => Some((x.0.min(y.0), x.1.min(y.1), x.2 || y.2)),
+                    (x, y) => x.or(y),
+                };
+                let found = found.filter(|found| found.2);
+                if found.is_some() && env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
+                    eprintln!("feature_scale: face {} boundary lens {i}/{j} -> {found:?}", face.id);
+                }
+                take_wedge(found);
+            }
+        }
+    }
+    (resolution, feature_found, wedged, lens_found)
+}
+
+/// FEATURE SCALE, wedge (`BREP_FEATURE_SCALE_WEDGE`, default on; `=0` leaves
+/// wedges to the bands as before): see [`wedge`].
+fn wedge_enabled() -> bool {
+    crate::switch!("BREP_FEATURE_SCALE_WEDGE", true)
+}
+
+/// The arrangement and sampling resolutions a WEDGE needs: `cut` and `other`
+/// leave one end point together at a small angle in the chart and part in
+/// space. Within `resolution / angle` of the shared point the two polylines
+/// stand inside the arrangement's band, and there their chords cross and
+/// re-cross on round-off: a tool's wall (|Su| 11, |Sv| 5e-3) held the cut of a
+/// sweep's side wall and its own split edge leaving one vertex 8e-5 apart in
+/// the chart over its whole height (10° in space); at the 1.4e-6 resolution
+/// the first 1e-2 of the cut read as crossing the edge, minting slivers of
+/// 1e-9 whose loops missed each other by 1e-5. The resolution asked for keeps
+/// that stretch within 1e-3 of the cut's chart length. `None` unless the two
+/// leave a common end (within `search` in the chart) at under 0.2 rad, part
+/// by more than 8e-7 in model space a tenth of the way along the cut, and need
+/// a resolution finer than `search` yet no finer than the identity band along
+/// the chart's stiffer direction (the isotropic band takes the softer one,
+/// which on such a chart is wider than the wedge): a narrower wedge, or a
+/// tangent departure, is left to the bands as before.
+fn wedge(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f64) -> Option<(f64, f64, bool)> {
+    let [lo, hi] = cut.domain().ok()?;
+    let [other_lo, other_hi] = other.domain().ok()?;
+    // The cut's length in the chart, along a 16-chord polyline; a closed cut
+    // (its ends together) has no wedge end.
+    let mut chart_length = 0.0;
+    let mut previous = cut.evaluate(lo).ok()?;
+    for step in 1..=16 {
+        let point = cut.evaluate(lo + (hi - lo) * step as f64 / 16.0).ok()?;
+        chart_length += point.sub(previous).length();
+        previous = point;
+    }
+    if !(chart_length > 0.0) || cut.evaluate(lo).ok()?.sub(cut.evaluate(hi).ok()?).length() <= search {
+        return None;
+    }
+    let mut found: Option<(f64, f64, bool)> = None;
+    for (end, inward) in [(lo, 1.0), (hi, -1.0)] {
+        let Ok(cut_sample) = cut.derivatives(end, 1) else { continue };
+        for (other_end, other_inward) in [(other_lo, 1.0), (other_hi, -1.0)] {
+            let Ok(other_sample) = other.derivatives(other_end, 1) else { continue };
+            if cut_sample[0].sub(other_sample[0]).length() > search {
+                continue;
+            }
+            let a = cut_sample[1].scale(inward);
+            let b = other_sample[1].scale(other_inward);
+            if !(a.length() * b.length() > 1e-30) {
+                continue;
+            }
+            // A narrow wedge only: at a wider angle the curves part within
+            // the band at once, and narrowing a face for an ordinary junction
+            // (a spout's cut leaving a dome's pole) changed answers that were
+            // right.
+            let angle = a.cross(b).length().atan2(a.dot(b));
+            if !(angle.is_finite()) || angle > 0.2 {
+                continue;
+            }
+            let resolution = angle * chart_length * 1e-3;
+            if resolution >= search {
+                continue;
+            }
+            // How far the two part in model space and in the chart, a tenth of
+            // the way along the cut and (`BREP_FEATURE_SCALE_LENS`) halfway:
+            // a LENS, the cut and the other leaving both of its ends together
+            // (a cap's rim and the crossing circle 1.8e-6 inside it), parts
+            // most at its middle, by less than 8e-7 at a tenth.
+            let parting = |fraction: f64| -> Option<(f64, f64)> {
+                let parameter = if inward > 0.0 { lo + fraction * (hi - lo) } else { hi - fraction * (hi - lo) };
+                let probe = cut.evaluate(parameter).ok()?;
+                let foot = project_point_to_curve(other, probe).ok()?;
+                let here = face.surface.evaluate(probe.x, probe.y).ok()?;
+                let there = face.surface.evaluate(foot.point.x, foot.point.y).ok()?;
+                Some((here.sub(there).length(), probe.sub(foot.point).length()))
+            };
+            let Some((space, _)) = parting(0.1) else { continue };
+            let Ok(probe) = cut.evaluate(if inward > 0.0 { lo + 0.1 * (hi - lo) } else { hi - 0.1 * (hi - lo) }) else { continue };
+            let Ok(derivatives) = face.surface.derivatives(probe.x, probe.y, 1) else { continue };
+            let stiff = derivatives[1][0].length().max(derivatives[0][1].length());
+            let identity = crate::tolerance::parametric_tolerance(1e-7, stiff);
+            // A lens leaves the other's far end too: the cut's other end lies
+            // on one of the other's ends.
+            let far_end = if inward > 0.0 { hi } else { lo };
+            let two_ended = cut.evaluate(far_end).ok().is_some_and(|far| {
+                [other_lo, other_hi].iter().any(|&end| other.evaluate(end).ok().is_some_and(|point| point.sub(far).length() <= search))
+            });
+            // Where the ordinary reading declines (parting under 8e-7 a tenth
+            // along, or a resolution under the identity band), a lens is read
+            // halfway instead.
+            let lens = if two_ended && lens_enabled() && (space <= 8e-7 || resolution < identity) {
+                parting(0.5).filter(|(space, _)| *space > 8e-7)
+            } else {
+                None
+            };
+            if space <= 8e-7 && lens.is_none() {
+                continue;
+            }
+            // A lens is resolved no finer than the identity band, its chains
+            // sampled to an eighth of its parting.
+            let (resolution, sampling) = match lens {
+                Some((_, chart)) => (resolution.max(identity), Some(chart / 8.0)),
+                None if resolution < identity => continue,
+                None => (resolution, None),
+            };
+            // Never more than 64 times finer than the face's own resolution:
+            // the sampling follows the arrangement down, and a dome's pole
+            // wedge asking for 2e-9 ran its chains out of points. A lens's
+            // chains are as short as the lens, and it may go 1024 times finer
+            // (a plane cutting a lens 1.8e-6 deep, on a cap 40 wide).
+            let resolution = resolution.max(search / if lens.is_some() { 1024.0 } else { 64.0 });
+            // A lens is resolved only where it parts by eight resolutions in
+            // the chart; a narrower one is left to the bands as before.
+            if lens.is_some_and(|(_, chart)| chart < 8.0 * resolution) {
+                continue;
+            }
+            let wanted = (resolution, search.min(resolution * 16.0).min(sampling.unwrap_or(f64::INFINITY)), lens.is_some());
+            found = Some(match found {
+                Some((x, y, l)) => (x.min(wanted.0), y.min(wanted.1), l || wanted.2),
+                None => wanted,
+            });
+        }
+    }
+    found
+}
+
+/// FEATURE SCALE, lens (`BREP_FEATURE_SCALE_LENS`, default off, `=1` on): a
+/// [`wedge`] whose two curves share both ends, which the ordinary reading
+/// declines (parting under 8e-7 a tenth of the way along the cut, or asking a
+/// resolution under the identity band), is read again halfway, and one
+/// parting by eight resolutions there is resolved no finer than the identity
+/// band.
+fn lens_enabled() -> bool {
+    crate::switch!("BREP_FEATURE_SCALE_LENS", false)
 }
 
 /// FEATURE SCALE, end gap (`BREP_FEATURE_SCALE_END_GAP`, default on, `=0` off): an
@@ -779,9 +976,17 @@ fn fragment_face_arranged(
     let diagonal =
         ((u_domain[1] - u_domain[0]).powi(2) + (v_domain[1] - v_domain[0]).powi(2)).sqrt();
     let original_resolution = 1e-7f64.max(diagonal * 1e-6);
-    let (strip_resolution, feature_strip) = thin_boundary_resolution(solid, face, face_key, piece_ids, index, original_resolution);
-    let (arrangement_tolerance, sampling_bound) = strip_resolution
+    let (strip_resolution, feature_strip, wedge_resolution, lens_face) = thin_boundary_resolution(solid, face, face_key, piece_ids, index, original_resolution);
+    let (band_tolerance, band_sampling) = strip_resolution
         .unwrap_or((original_resolution, original_resolution));
+    // A wedge narrows the arrangement and the sampling only; the bands a chain
+    // end is matched in stay the face's own (a marched cut stops a few 1e-6
+    // short of the boundary it ends on, and a dome's pole wedge that narrowed
+    // them kept that end from its junction).
+    let (arrangement_tolerance, sampling_bound) = match wedge_resolution {
+        Some((arrangement, sampling)) => (band_tolerance.min(arrangement), band_sampling.min(sampling)),
+        None => (band_tolerance, band_sampling),
+    };
     // FEATURE SCALE B4 (`BREP_FEATURE_SCALE_FRAGMENT`): with a thin strip
     // between two cuts or a near touch on the face, a chain end is matched to another vertex's image only within
     // the strip's own sampling bound in the chart and 1e-7 in model space
@@ -795,10 +1000,10 @@ fn fragment_face_arranged(
     let (image_band, image_band_3d) = if strip_snap {
         (sampling_bound, 1e-7)
     } else {
-        (arrangement_tolerance * 100.0, 1e-5)
+        (band_tolerance * 100.0, 1e-5)
     };
     let snap_threshold = 0.1 * diagonal;
-    let junction_radius = (arrangement_tolerance * 50.0).max(diagonal * 1.5e-3);
+    let junction_radius = (band_tolerance * 50.0).max(diagonal * 1.5e-3);
     // WRAPPED-BAND RE-BASE: a face on a closed direction whose material is the
     // wrapped COMPLEMENT of its trim hull (two full-wrap rims at the hull
     // edges, material crossing the seam between them — trial 35's torus face:
@@ -1210,7 +1415,9 @@ fn fragment_face_arranged(
                         }
                     })
                     .fold(0.0, f64::max);
-                if bulge > arrangement_tolerance * 10.0 {
+                // On a lens's face the arcs bound a strip eight resolutions
+                // wide, at least one of them bulging by four.
+                if bulge > arrangement_tolerance * if lens_face { 4.0 } else { 10.0 } {
                     kept = thin(bulge * 0.1);
                 }
             }
@@ -1347,7 +1554,7 @@ fn fragment_face_arranged(
                 .unwrap_or([0.0, 0.0]);
             // Adaptive samples are not uniformly spaced in parameter. Do not
             // feed them to refine_near_hints, which assumes uniform input.
-            let boundary_points = if strip_resolution.is_some() {
+            let boundary_points = if strip_resolution.is_some() || wedge_resolution.is_some() {
                 let initial = sample_chain(&coedge.pcurve)?;
                 sag_refine_chain(&coedge.pcurve, initial, sampling_bound)?.0
             } else {

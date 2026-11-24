@@ -2002,6 +2002,11 @@ pub enum ViolationKind {
     /// neither ([`Board::contested_vias`]).
     Stitching,
     Unrouted,
+    /// A placed part's pin whose 3D seat misses the pad of its number
+    /// ([`crate::seat_check`]). The host measures it from the part's solids and
+    /// adds it to the check's findings; [`Board::drc`] never reports it, so the
+    /// board's own check and fabrication do not depend on 3D models.
+    PinSeat,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Violation {
@@ -3158,9 +3163,10 @@ pub struct BoardSync {
 /// Explicit native pads always belong on the board. Pin-bearing symbols without
 /// pads are reported as missing pads; standalone power symbols and flags are not.
 pub fn needs_footprint(component: &crate::Component) -> bool {
-    component.pads.is_some() || (component.symbol.power_net.is_none()
+    // A part off the board (a sheet's fan or switch) is not seated, pads or not.
+    !component.off_board && (component.pads.is_some() || (component.symbol.power_net.is_none()
         && !component.reference.starts_with('#')
-        && !component.symbol.pins.is_empty())
+        && !component.symbol.pins.is_empty()))
 }
 
 impl Document {

@@ -34,6 +34,10 @@ pub struct StlImportPreview {
     hits: BTreeMap<String, [f32; 4]>,
     /// The interactive phases: the mesh at once, its regions, per-region refits.
     pub regions: crate::panels::stl_import_regions::RegionView,
+    /// Automation only (`import_preview_hold`): the runner's replies are left
+    /// undelivered while set, so the preview stays in flight however fast the
+    /// reconstruction finishes, and a script can act on it in flight.
+    pub hold: bool,
 }
 
 impl StlImportPreview {
@@ -59,6 +63,7 @@ impl StlImportPreview {
             scene_changed: true,
             hits: BTreeMap::new(),
             regions: Default::default(),
+            hold: false,
         };
         preview.rebuild();
         preview
@@ -159,6 +164,9 @@ impl StlImportPreview {
 
     pub(crate) fn pump(&mut self) {
         self.engine.pump();
+        if self.hold {
+            return;
+        }
         // The phases come before the final reply: the mesh, then its regions.
         while let Some(phase) = self.engine.take_mesh_preview_phase() {
             if self.pending.is_some_and(|(id, _)| id == phase.id)

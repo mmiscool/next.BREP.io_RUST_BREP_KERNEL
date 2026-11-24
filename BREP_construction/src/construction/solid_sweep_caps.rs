@@ -3901,13 +3901,33 @@ pub struct FrameCurve {
 /// back at the start and front at the end.
 pub fn sweep_solid_along(tool: &SolidTool, path: &FrameCurve) -> Result<BrepSolid, KernelRefusal> {
     // An upright solid of revolution on a planar curve is translated by it:
-    // its sweep is built from the planar distance to the curve, folds and
-    // crossings included (`BREP_SWEEP_UPRIGHT_SLOT`, default off).
+    // its sweep is the planar distance to the curve within the tool's radius,
+    // folds and crossings included (`BREP_SWEEP_UPRIGHT_SLOT`). With the
+    // direct build on (`BREP_SWEEP_UPRIGHT_DIRECT`) the route answers only
+    // where the general routes refuse and the curve may turn tighter than the
+    // tool, built face by face; every sweep the general routes build is theirs
+    // as before, and where the direct build declines their refusal stands.
+    // With the direct build off the route takes every upright sweep.
     if crate::solid_sweep_upright::upright_slot_on() {
         if let Some(slot) = crate::solid_sweep_upright::upright_slot(tool, path) {
-            return slot.solid();
+            if !crate::solid_sweep_upright::upright_direct_on() {
+                return slot.solid();
+            }
+            let general = sweep_solid_along_general(tool, path);
+            if general.is_err() && slot.turns_tighter() {
+                if let Ok(solid) = slot.direct_solid() {
+                    return Ok(solid);
+                }
+            }
+            return general;
         }
     }
+    sweep_solid_along_general(tool, path)
+}
+
+/// [`sweep_solid_along`] by its general routes (the planar ring, the lofted
+/// grazing loop), without the upright route.
+fn sweep_solid_along_general(tool: &SolidTool, path: &FrameCurve) -> Result<BrepSolid, KernelRefusal> {
     // A ring on a planar curve, from its slices (`BREP_SWEEP_PLANAR_RING`).
     if let Some(ring) = crate::solid_sweep_planar_ring::planar_ring_on().then(|| crate::solid_sweep_planar_ring::planar_ring_sweep(tool, path)).flatten() {
         return ring;
@@ -4772,7 +4792,7 @@ pub fn sweep_solid_tumbled(tool: &SolidTool, motion: &TwoTurns) -> Result<BrepSo
     // A wall whose double curve reaches a corner: the trim route meets that
     // double curve's tip, which it does not yet write so a reader integrates
     // round it, and refuses after the work; declined before it.
-    if !crate::solid_sweep_trim::ring_trim_on() || refusal.to_string().contains(DOUBLE_CURVE_CORNER) {
+    if !crate::solid_sweep_trim::ring_trim_on() || (refusal.to_string().contains(DOUBLE_CURVE_CORNER) && !crate::solid_sweep_trim::tip_splice_on()) {
         return Err(refusal);
     }
     let SolidTool::Revolved { axis_origin, axis_direction, meridian, .. } = tool else { return Err(refusal) };

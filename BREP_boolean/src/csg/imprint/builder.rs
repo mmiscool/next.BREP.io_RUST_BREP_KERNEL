@@ -84,7 +84,7 @@ struct PendingSplit<'a> {
 }
 
 /// Whether the pierce recovery projects each pierce onto the section once
-/// and reuses the reading (2026-11-05): ON unless
+/// and reuses the reading: ON unless
 /// `BREP_PIERCE_PROJECTION_CACHE=0`.
 pub(super) fn pierce_projection_cache_enabled() -> bool {
     switch!("BREP_PIERCE_PROJECTION_CACHE", true)
@@ -133,6 +133,72 @@ pub(super) fn push_edge_split(
     Ok(())
 }
 
+
+fn section_lies_in_plane(curve: &NurbsCurve, first: TaggedFace<'_>, second: TaggedFace<'_>, tolerance: f64) -> bool {
+    [first, second].into_iter().any(|face| {
+        let Some(crate::AnalyticSurface::Plane { origin, u_dir, v_dir, .. }) = face.face.surface.analytic() else { return false };
+        let Ok(normal) = u_dir.cross(*v_dir).normalized() else { return false };
+        curve.control_points.iter().all(|control| control.w > 0.0
+            && control.point().ok().is_some_and(|point| point.sub(*origin).dot(normal).abs() <= tolerance))
+    })
+}
+
+fn section_endpoint_parameters<'p>(curve: &NurbsCurve, supports: [FaceKey; 2],
+    pieces: impl Iterator<Item = &'p ImprintPieceRecord>, tolerance: f64) -> Result<Vec<f64>, KernelRefusal>
+{
+    let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let start_point = curve.evaluate(start).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let end_point = curve.evaluate(end).or_refuse(KernelStage::Intersect, "evaluate")?;
+    let mut parameters = Vec::new();
+    for piece in pieces {
+        if piece.start_vertex_id == piece.end_vertex_id || piece.shared_edge.is_some()
+            || piece.curve.degree != 1 || piece.curve.control_points.len() != 2
+            || piece.support_faces.iter().filter(|face| supports.contains(face)).count() != 1 { continue; }
+        for parameter in [piece.t0, piece.t1] {
+            let Ok(point) = piece.curve.evaluate(parameter) else { continue };
+            let Ok(foot) = project_point_to_curve(curve, point) else { continue };
+            if foot.distance <= tolerance && foot.distance.is_finite() && foot.u > start && foot.u < end
+                && point.sub(start_point).length() > tolerance && point.sub(end_point).length() > tolerance {
+                parameters.push(foot.u);
+            }
+        }
+    }
+    Ok(parameters)
+}
+
+fn missing_section_parameters(curve: &NurbsCurve, accepted: &[f64], candidates: Vec<f64>, tolerance: f64)
+    -> Result<Vec<f64>, KernelRefusal>
+{
+    let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+    let parameter_tolerance = 2e-9f64.max((end - start) * KNOT_IDENTITY_TOL);
+    let mut missing = Vec::new();
+    for parameter in candidates {
+        let point = curve.evaluate(parameter).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let represented = accepted.iter().chain(&missing).any(|existing| {
+            (*existing - parameter).abs() <= parameter_tolerance
+                || curve.evaluate(*existing).is_ok_and(|p| p.sub(point).length() <= tolerance)
+        });
+        if !represented { missing.push(parameter); }
+    }
+    Ok(missing)
+}
+
+#[derive(Clone)]
+pub(super) struct PlanarSectionReplay {
+    curve: NurbsCurve,
+    supports: [FaceKey; 2],
+    test_faces: Vec<FaceKey>,
+    target_faces: Vec<FaceKey>,
+    refine: bool,
+    exact_pcurves: Option<[NurbsCurve; 2]>,
+    exact_section: bool,
+    external_touch_only: bool,
+    marched: bool,
+    accepted: Vec<f64>,
+    pieces: Vec<u64>,
+}
+
+#[derive(Clone)]
 pub(super) struct ImprintBuilder<'a> {
     pub(super) open_carriers: bool,
     pub(super) edges: HashMap<(u8, u64), &'a EdgeRecord>,
@@ -147,6 +213,11 @@ pub(super) struct ImprintBuilder<'a> {
     /// dimension any mint reported wins.
     pub(super) vertex_sources: HashMap<u64, JunctionSource>,
     pub(super) pieces: Vec<ImprintPieceRecord>,
+    /// Accepted straight sections from the discovery pass, before junction merging.
+    pub(super) section_end_seeds: Vec<ImprintPieceRecord>,
+    pub(super) record_planar_sections: bool,
+    pub(super) planar_sections: Vec<PlanarSectionReplay>,
+    pub(super) marched_section: bool,
     pub(super) by_face: HashMap<FaceKey, Vec<u64>>,
     pub(super) edge_splits: HashMap<(u8, u64), Vec<f64>>,
     pub(super) barrier_edges: HashSet<(u8, u64)>,
@@ -167,6 +238,11 @@ pub(super) struct ImprintBuilder<'a> {
     /// `BREP_EXACT_TANGENT_TOUCH`, its tangential hits on an edge it touches in
     /// passing are junctions, not grazes. See TANGENT TOUCH in `process_curve`.
     pub(super) exact_section: bool,
+    /// Set with `exact_section` around a plane's exact iso circle
+    /// (`BREP_PLANAR_ISO_TANGENT_TOUCH`): its touch is a junction only where
+    /// it is EXTERNAL, the section and a curved edge bending away from each
+    /// other. See TANGENT TOUCH in `process_curve`.
+    pub(super) external_touch_only: bool,
     /// The operands' local feature sizes (`BREP_FEATURE_SCALE_IMPRINT`; empty
     /// without it): see `crate::feature_scale`.
     pub(super) feature_scale: crate::feature_scale::FeatureScale,
@@ -619,10 +695,94 @@ impl<'a> ImprintBuilder<'a> {
         refine: bool,
         exact_pcurves: Option<[NurbsCurve; 2]>,
     ) -> Result<(), KernelRefusal> {
+        let mut record = (self.record_planar_sections
+            && section_lies_in_plane(&curve, first, second, self.tolerance)).then(|| PlanarSectionReplay {
+                curve: curve.clone(), supports: [first.key(), second.key()],
+                test_faces: test_faces.iter().map(|face| face.key()).collect(),
+                target_faces: target_faces.iter().map(|face| face.key()).collect(),
+                refine, exact_pcurves: exact_pcurves.clone(),
+                exact_section: self.exact_section, external_touch_only: self.external_touch_only,
+                marched: self.marched_section, accepted: Vec::new(), pieces: Vec::new(),
+            });
+        let before = self.pieces.len();
+        self.process_curve_impl(curve, first, second, test_faces, target_faces, refine,
+            exact_pcurves, record.as_mut().map(|record| &mut record.accepted))?;
+        if let Some(mut record) = record {
+            record.pieces.extend(self.pieces[before..].iter().map(|piece| piece.id));
+            self.planar_sections.push(record);
+        }
+        Ok(())
+    }
+
+    /// Reclassify only planar sections that acquire a previously absent junction.
+    /// Ordinary pairs, sections and their IDs are left in their original order.
+    pub(super) fn replay_planar_sections(&mut self, faces: &[TaggedFace<'_>], check: bool) -> Result<(), KernelRefusal> {
+        self.record_planar_sections = false;
+        let records = std::mem::take(&mut self.planar_sections);
+        self.section_end_seeds = self.pieces.iter().filter(|piece| {
+            piece.start_vertex_id != piece.end_vertex_id && piece.shared_edge.is_none()
+                && piece.curve.degree == 1 && piece.curve.control_points.len() == 2
+        }).cloned().collect();
+        let resolve = |key: FaceKey| faces.iter().copied().find(|face| face.key() == key)
+            .expect("recorded section carrier remains available");
+        let mut replayed = 0;
+        let recorded = records.len();
+        for record in records {
+            let candidates = section_endpoint_parameters(&record.curve, record.supports,
+                self.section_end_seeds.iter(), self.tolerance)?;
+            let missing = missing_section_parameters(&record.curve, &record.accepted, candidates, self.tolerance)?;
+            if missing.is_empty() { continue; }
+            if check {
+                eprintln!("planar local discovery: pair={:?} missing={} replaced={}",
+                    record.supports, missing.len(), record.pieces.len());
+            }
+            let removed: HashSet<_> = record.pieces.iter().copied().collect();
+            self.pieces.retain(|piece| !removed.contains(&piece.id));
+            self.by_face.retain(|_, ids| { ids.retain(|id| !removed.contains(id)); !ids.is_empty() });
+            self.marched_pieces.retain(|id| !removed.contains(id));
+            self.emitted_pcurves.retain(|(id, _)| !removed.contains(id));
+            let first = resolve(record.supports[0]);
+            let second = resolve(record.supports[1]);
+            let test_faces = record.test_faces.into_iter().map(&resolve).collect::<Vec<_>>();
+            let target_faces = record.target_faces.into_iter().map(&resolve).collect::<Vec<_>>();
+            let exact = self.exact_section;
+            let external = self.external_touch_only;
+            self.exact_section = record.exact_section;
+            self.external_touch_only = record.external_touch_only;
+            let before = self.pieces.len();
+            let result = self.process_curve_impl(record.curve, first, second, &test_faces,
+                &target_faces, record.refine, record.exact_pcurves, None);
+            self.exact_section = exact;
+            self.external_touch_only = external;
+            result?;
+            if record.marched {
+                self.marched_pieces.extend(self.pieces[before..].iter().map(|piece| piece.id));
+            }
+            replayed += 1;
+        }
+        if check {
+            eprintln!("planar local discovery: recorded={recorded} replayed={replayed} witnesses={}", self.section_end_seeds.len());
+        }
+        self.section_end_seeds.clear();
+        Ok(())
+    }
+
+    fn process_curve_impl(
+        &mut self,
+        curve: NurbsCurve,
+        first: TaggedFace<'_>,
+        second: TaggedFace<'_>,
+        test_faces: &[TaggedFace<'_>],
+        target_faces: &[TaggedFace<'_>],
+        refine: bool,
+        exact_pcurves: Option<[NurbsCurve; 2]>,
+        accepted: Option<&mut Vec<f64>>,
+    ) -> Result<(), KernelRefusal> {
         super::work_profile::add(|c| c.sections += 1);
         let profile = profile_enabled();
         let began = profile.then(Instant::now);
         let mut split_parameters = Vec::new();
+        let mut discovered_end_parameters = Vec::new();
         let mut fuzzy_junctions: Vec<(Vec3, f64)> = Vec::new();
         // Operand edges the section curve geometrically RIDES (the overlap
         // branch below): junctions minted on the section must be exchanged
@@ -650,6 +810,27 @@ impl<'a> ImprintBuilder<'a> {
             point.sub(whole_start_point).length() <= overlap_limit
                 || point.sub(whole_end_point).length() <= overlap_limit
         };
+        // A section ending on a later planar section is already a junction
+        // of three carriers. Seed it before interval classification, which
+        // otherwise may drop an unsplit closed cap from one midpoint reading.
+        let seed_section_ends = switch!("BREP_PLANAR_SECTION_END_JUNCTIONS", false)
+            || !self.section_end_seeds.is_empty();
+        let check_section_ends = switch!("BREP_PLANAR_SECTION_END_JUNCTIONS_CHECK", false)
+            || switch!("BREP_PLANAR_SECTION_END_DISCOVERY_CHECK", false);
+        if seed_section_ends || check_section_ends {
+            let on_plane = section_lies_in_plane(&curve, first, second, self.tolerance);
+            if on_plane {
+                let supports = [first.key(), second.key()];
+                let parameters = section_endpoint_parameters(&curve, supports,
+                    self.pieces.iter().filter(|_| self.section_end_seeds.is_empty())
+                        .chain(self.section_end_seeds.iter()), self.tolerance)?;
+                if seed_section_ends {
+                    if self.section_end_seeds.is_empty() { split_parameters.extend(parameters); }
+                    else { discovered_end_parameters.extend(parameters); }
+                }
+
+            }
+        }
         let split_faces = if refine {
             vec![first, second]
         } else {
@@ -699,7 +880,7 @@ impl<'a> ImprintBuilder<'a> {
             };
             for edge in face_edges(face, &self.edges)? {
                 if edge.degenerate {
-                    // POLE SPLIT (2026-11-06;
+                    // POLE SPLIT (
                     // `BREP_SECTION_POLE_SPLIT`, default on, `=0` off). A section through
                     // a face's pole meets no edge there that has length: the
                     // pole is a degenerate edge, which no crossing or pierce
@@ -961,8 +1142,18 @@ impl<'a> ImprintBuilder<'a> {
                     // boundary, so it is dropped (midsphere-common refused and was
                     // answered by perturbation). The touch is kept as a junction
                     // only where the curve and the edge meet to round-off.
+                    // A plane's iso circle (`external_touch_only`) takes the
+                    // touch only where it is EXTERNAL: a hole cut beside two
+                    // holes it is tangent to meets their rims curving the other
+                    // way. Inside a rim it curves the same way (a cylinder
+                    // tangent inside another), and along a straight edge the
+                    // side is not read (a bore flush with a wall); those grazes
+                    // stay grazes as before.
+                    let external = !self.external_touch_only
+                        || external_touch(&curve, curve_parameter, &edge.curve, edge_parameter).unwrap_or(false);
                     let exact_touch = hit.tangential
                         && self.exact_section
+                        && external
                         && interior
                         && exact_tangent_touch_enabled()
                         && edge.curve.evaluate(edge_parameter).ok().is_some_and(|on_edge| {
@@ -1063,8 +1254,8 @@ impl<'a> ImprintBuilder<'a> {
                     imprint_split_add(|split| split.recover_pierces += pierces.len() as u64);
                 }
                 if refine {
-                    // PIERCE PROJECTION CACHE (2026-11-05): the projector is
-                    // a pure function of the section and the point, and the
+                    // PIERCE PROJECTION CACHE: the projector is a pure
+                    // function of the section and the point, and the
                     // ambiguity read below projects every pierce within
                     // `4e-3 * scale` of each pierce again. An edge that runs
                     // along the other carrier yields a dense cluster of
@@ -1408,8 +1599,17 @@ impl<'a> ImprintBuilder<'a> {
         }
         let [curve_start, curve_end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
         let split_tolerance = 2e-9f64.max((curve_end - curve_start) * KNOT_IDENTITY_TOL);
+        // Discovery supplies missing junctions, not alternate numerical
+        // readings of crossings the ordinary finders already accepted. Keep
+        // those parameters exactly; a nearby witness must not replace them.
+        let missing = missing_section_parameters(&curve, &split_parameters, discovered_end_parameters, self.tolerance)?;
+        if check_section_ends && !missing.is_empty() {
+            eprintln!("planar section discovered parameters: {:?}x{:?} added={}", first.key(), second.key(), missing.len());
+        }
+        split_parameters.extend(missing);
         split_parameters.sort_by(f64::total_cmp);
         split_parameters.dedup_by(|a, b| (*a - *b).abs() <= split_tolerance);
+        if let Some(accepted) = accepted { *accepted = split_parameters.clone(); }
         // OVERLAP-JUNCTION EXCHANGE (rotated equator-tangency): when the
         // section curve RIDES an operand edge (the overlap branch above —
         // the tangency circle IS the cylinder's cap ring), every junction
@@ -1859,8 +2059,28 @@ fn grazing_crossing_enabled() -> bool {
 
 /// `BREP_EXACT_TANGENT_TOUCH` (default on; `=0` restores skipping every
 /// tangential hit): see TANGENT TOUCH in [`ImprintBuilder::process_curve`].
-/// Promoted once the watertight tessellation meshes a face whose arcs meet at
-/// zero angle: midsphere-common's exact body meshes closed.
 fn exact_tangent_touch_enabled() -> bool {
     crate::switch!("BREP_EXACT_TANGENT_TOUCH", true)
+}
+
+/// Whether `section` at `s` and `edge` at `t` (a tangential touch) curve away
+/// from each other: both bend there and their curvature vectors point to
+/// opposite sides. A straight edge says nothing about which side the section
+/// lies on (a bore flush with a box wall touches it from inside the face), so
+/// it is not external here. `None` when either cannot be read.
+fn external_touch(section: &NurbsCurve, s: f64, edge: &NurbsCurve, t: f64) -> Option<bool> {
+    let bend = |curve: &NurbsCurve, parameter: f64| -> Option<Vec3> {
+        let d = curve.derivatives(parameter, 2).ok()?;
+        let speed2 = d[1].dot(d[1]);
+        if !(speed2 > 0.0) {
+            return None;
+        }
+        // The curvature vector: the second derivative's part across the tangent, per speed².
+        Some(d[2].sub(d[1].scale(d[2].dot(d[1]) / speed2)).scale(1.0 / speed2))
+    };
+    let (a, b) = (bend(section, s)?, bend(edge, t)?);
+    if b.length() <= 1e-9 * (1.0 + a.length()) || a.length() <= 1e-9 * (1.0 + b.length()) {
+        return Some(false);
+    }
+    Some(a.dot(b) < 0.0)
 }

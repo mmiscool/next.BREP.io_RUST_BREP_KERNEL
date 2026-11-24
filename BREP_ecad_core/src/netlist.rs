@@ -47,7 +47,7 @@ impl Document {
         // whose reference starts with `#`: they name a net and are not parts. The
         // net keeps their name and its other pins.
         let virtual_part = |reference: &str| reference.starts_with('#');
-        let mut components: Vec<_> = self.components.iter().filter(|c| !virtual_part(&c.reference)).collect();
+        let mut components: Vec<_> = self.components.iter().filter(|c| !virtual_part(&c.reference) && self.on_board(c)).collect();
         components.sort_by(|a, b| natural(&a.reference).cmp(&natural(&b.reference)));
         s += "  (components";
         for c in &components {

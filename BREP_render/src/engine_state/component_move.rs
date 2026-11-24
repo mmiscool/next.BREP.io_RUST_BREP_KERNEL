@@ -141,7 +141,9 @@ impl Default for ComponentMoveArm {
             live_originals: std::collections::HashMap::new(),
             live_applied: std::collections::HashMap::new(),
             budget_ms: DRAG_SOLVE_BUDGET_MS,
-            solve_cost_override_ms: None,
+            // The crate's unit tests charge every drag solve nothing, so a loaded machine's wall time never
+            // skips a frame a test then reads (a test of the over-budget path sets its own cost).
+            solve_cost_override_ms: if cfg!(test) { Some(0.0) } else { None },
             typed: None,
         }
     }

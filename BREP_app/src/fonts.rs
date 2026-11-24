@@ -51,6 +51,7 @@ pub fn install_matching(ctx: &egui::Context, pattern: &str) -> Option<String> {
         None => (egui::FontDefinitions::default(), None),
     };
     ctx.set_fonts(fonts);
+    ctx.add_plugin(RestoreAtlasAfterHiddenPass::default());
     path
 }
 
@@ -95,3 +96,42 @@ fn font_matching(pattern: &str) -> Option<(Vec<u8>, u32, String)> {
 fn font_matching(_pattern: &str) -> Option<(Vec<u8>, u32, String)> {
     None
 }
+
+/// eframe 0.35 runs egui for hidden native windows but skips
+/// `paint_and_update_textures`, consuming (and losing) that pass's atlas delta.
+/// Atlas recycling in such a pass leaves the GPU sampling an
+/// older atlas. Restore the current image once visibility returns, after all
+/// layout has finished. This also covers a hidden pass run by another host;
+/// ordinary visible passes retain egui's incremental uploads.
+#[derive(Default)]
+struct RestoreAtlasAfterHiddenPass {
+    hidden: bool,
+    restore: bool,
+}
+
+impl egui::Plugin for RestoreAtlasAfterHiddenPass {
+    fn debug_name(&self) -> &'static str {
+        "brep-restore-font-atlas"
+    }
+
+    fn input_hook(&mut self, _ctx: &egui::Context, input: &mut egui::RawInput) {
+        self.hidden = input.viewport().visible() == Some(false);
+        self.restore |= self.hidden;
+    }
+
+    fn output_hook(&mut self, ctx: &egui::Context, output: &mut egui::FullOutput) {
+        if self.hidden || !self.restore {
+            return;
+        }
+        self.restore = false;
+        let image = ctx.fonts(|fonts| fonts.image());
+        // Replace this pass's partial updates too: the full image already
+        // includes them, and it establishes the correct GPU texture dimensions.
+        output.textures_delta.set.retain(|(id, _)| *id != egui::TextureId::default());
+        output.textures_delta.set.push((
+            egui::TextureId::default(),
+            egui::epaint::ImageDelta::full(image, egui::TextureOptions::LINEAR),
+        ));
+    }
+}
+

@@ -236,11 +236,11 @@ fn offset_solid_joined_rest(
     }
 }
 
-/// `BREP_OFFSET_PIPE_FIRST` (default off; `=1` turns it on; `check` builds both and
+/// `BREP_OFFSET_PIPE_FIRST` (default on; `=0` restores; `check` builds both and
 /// compares their volumes): the pipe-parallel lane answers a rounded growth
 /// before the pipeline, not only after its refusal.
 fn pipe_first_mode() -> crate::env_read::Mode {
-    crate::mode_switch!("BREP_OFFSET_PIPE_FIRST", false)
+    crate::mode_switch!("BREP_OFFSET_PIPE_FIRST", true)
 }
 
 /// `BREP_OFFSET_REVOLVED_FIRST` (default on; `=0` restores): the revolved-parallel lane

@@ -1,16 +1,16 @@
 [package]
 name = "BREP_plm"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 # The floor the rest of the family builds on, and the compiler
 # rust-toolchain.toml pins. Nothing here needs more.
 rust-version = "1.92"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-homepage = "https://v2.brep.io"
-description = "The BREP PLM server: parts, revisions, lifecycle, checkout, BOMs and configurable workflows over an embedded SQLite store, with a browser UI and the document API the BREP CAD app stores through."
+homepage = "https://next.brep.io"
+description = "The next.BREP.io PLM server for the Rust B-rep CAD kernel: parts, revisions, lifecycle, checkout, BOMs and configurable workflows over an embedded SQLite store, with a browser UI and the document API the CAD app stores through."
 readme = "README.md"
-keywords = ["plm", "cad", "bom", "engineering", "server"]
+keywords = ["plm", "cad", "b-rep", "bom", "engineering"]
 categories = ["web-programming::http-server", "database", "command-line-utilities"]
 # The frontend and reviewed vendor bundles are embedded by src/api/frontend.rs.
 # The long operator guide (GUIDE.md) stays in the repository.
@@ -97,13 +97,13 @@ boa_engine = { version = "0.22", default-features = false }
 # The interpreter core (call / describe / console), split out so the CAD app
 # builds the same one. host.rs still names Boa's types through the line above;
 # both resolve to the one boa_engine in this lockfile.
-brep-script-core = { package = "BREP_script_core", version = "0.1.5", path = "../BREP_script_core" }
+brep-script-core = { package = "BREP_script_core", version = "0.1.6", path = "../BREP_script_core" }
 # Scripts' synchronous `http.request`. Sync on purpose: a Boa host function
 # cannot await, and every call carries its own timeout.
 ureq = "2"
-brep-kernel = { package = "BREP_kernel", version = "0.27.0", path = "../BREP_kernel" }
-brep-ecad-core = { package = "BREP_ecad_core", version = "0.7.1", path = "../BREP_ecad_core" }
-brep-instructions = { package = "BREP_instructions", version = "0.4.0", path = "../BREP_instructions" }
+brep-kernel = { package = "BREP_kernel", version = "0.28.0", path = "../BREP_kernel" }
+brep-ecad-core = { package = "BREP_ecad_core", version = "0.8.0", path = "../BREP_ecad_core" }
+brep-instructions = { package = "BREP_instructions", version = "0.4.1", path = "../BREP_instructions" }
 # Optional native TLS (`--tls-cert` / `--tls-key`). rustls and ring are
 # already in the tree through ureq; ring, not aws-lc, so no cmake. Plain
 # HTTP/1.1 over the TLS stream, through hyper directly, because axum 0.7's

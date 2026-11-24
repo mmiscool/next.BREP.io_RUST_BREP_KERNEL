@@ -1,12 +1,12 @@
 [package]
 name = "BREP_ecad_core"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.92"
 license-file = "LICENSE.md"
-description = "Schematic, wiring diagram, and board documents, symbol import, and connectivity, with no UI."
+description = "Schematic, wiring diagram, and board documents, symbol import, and connectivity for next.BREP.io (Rust B-rep CAD), with no UI."
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-homepage = "https://v2.brep.io"
+homepage = "https://next.brep.io"
 readme = "README.md"
 keywords = ["ecad", "schematic", "pcb", "kicad", "netlist"]
 categories = ["science", "data-structures", "parser-implementations"]

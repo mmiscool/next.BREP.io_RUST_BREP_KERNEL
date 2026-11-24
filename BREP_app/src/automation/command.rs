@@ -210,6 +210,7 @@ pub fn registry() -> Vec<&'static CommandSpec> {
     let sets: &[&[CommandSpec]] = &[
         cmd_frame::COMMANDS,
         cmd_files::COMMANDS,
+        cmd_import_preview::COMMANDS,
         cmd_perf::COMMANDS,
         cmd_input::COMMANDS,
         cmd_capture::COMMANDS,

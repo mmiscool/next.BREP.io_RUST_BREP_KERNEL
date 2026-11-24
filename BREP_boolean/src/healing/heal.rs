@@ -699,6 +699,12 @@ pub struct ScopeProfile {
     /// vectors), and final claims read again.
     pub final_claims_reused: usize,
     pub final_claims_read: usize,
+    /// Old claims served with their record by `BREP_REFIT_CLAIM_RECORD_MEMO`,
+    /// and the recorded feet they carried (not read).
+    pub old_claims_served: usize,
+    pub served_feet: usize,
+    /// Final claims served by `BREP_REFIT_CLAIM_RECORD_MEMO`.
+    pub final_claims_served: usize,
     /// Feet rebuilt from a recorded foot (same carrier, fraction and incoming
     /// hint bits) instead of searched.
     pub replayed_feet: usize,
@@ -736,8 +742,8 @@ enum ScopePhase {
 impl ScopeProfile {
     pub fn summary(&self) -> String {
         format!(
-            "final claims reused {} read {}; replayed feet {} near {}; repeated feet {:?}; feet candidacy {} old-claim {} final-claim {} (distinct keys {}); scope projector calls {} in {:.3}s; newton iterations {}; grid fallbacks {}; witnesses {}; hint-only sample {}: agrees {} smaller {} larger {} unreadable {}",
-            self.final_claims_reused, self.final_claims_read, self.replayed_feet, self.near_replayed_feet, self.repeated_feet,
+            "final claims reused {} read {} served {}; old claims served {} ({} feet); replayed feet {} near {}; repeated feet {:?}; feet candidacy {} old-claim {} final-claim {} (distinct keys {}); scope projector calls {} in {:.3}s; newton iterations {}; grid fallbacks {}; witnesses {}; hint-only sample {}: agrees {} smaller {} larger {} unreadable {}",
+            self.final_claims_reused, self.final_claims_read, self.final_claims_served, self.old_claims_served, self.served_feet, self.replayed_feet, self.near_replayed_feet, self.repeated_feet,
             self.candidacy_feet, self.old_claim_feet, self.final_claim_feet, self.keys.len(),
             self.projector_calls, self.projector_seconds, self.newton_iterations, self.grid_fallbacks,
             self.witness_evaluations, self.sampled, self.hint_agrees, self.hint_smaller, self.hint_larger,
@@ -924,6 +930,7 @@ fn refit_memo_key(solid: &BrepSolid, policy: &KernelTolerances) -> [u64; 2] {
     lane.bool(crate::env_read::read_once_enabled());
     // The hint-first foot's setting as the switch reads it (default or forced).
     lane.bool(claim_hint_first());
+    lane.bool(claim_hint_floor());
     lane.bool(claim_hint_boundary());
     lane.bool(claim_replay_near());
     lane.usize(environment.len());
@@ -1081,7 +1088,7 @@ pub fn refit_memo_counts_served_stored() -> (u64, u64) {
 
 /// `BREP_TRIM_REFIT_UNSPLIT`: read split halves through [`UnsplitView`].
 /// Default on since 2026-11-05, promoted together with
-/// `BREP_TRIM_REFIT_GATE_ERROR_BAR` (owner decision, tier P): either alone
+/// `BREP_TRIM_REFIT_GATE_ERROR_BAR` (owner decision): either alone
 /// leaves a boolean reading differently on its own split operands (fixture
 /// 21 without this one, fixture 26's union without the other). `=0` restores
 /// the earlier reading.
@@ -1625,17 +1632,31 @@ pub fn refit_inherited_trims_gated(
                         let key = claim_memo_key(solid, uses, edge, policy.model);
                         let claim = match claim_memo_get(key, solid, uses) {
                             Some(claim) => claim,
-                            None => {
-                                let old_trims = trims_of(solid, uses);
-                                report.claims_read += 1;
-                                let (claim, record) = edge_claim_with(solid, uses, edge, &old_trims, policy.model, None, replay_on);
-                                if replay_on {
-                                    records.insert(edge.id, record);
+                            None => match claim_record_memo_serve(key, solid, uses, edge, policy.model) {
+                                // A passing claim kept with its record
+                                // (`BREP_REFIT_CLAIM_RECORD_MEMO`).
+                                Some((claim, record)) => {
+                                    if replay_on {
+                                        records.insert(edge.id, record);
+                                    }
+                                    claim
                                 }
-                                claim_memo_insert(key, &claim);
-                                read_keys.insert(edge.id, key);
-                                claim
-                            }
+                                None => {
+                                    let old_trims = trims_of(solid, uses);
+                                    report.claims_read += 1;
+                                    let (claim, record) = edge_claim_with(solid, uses, edge, &old_trims, policy.model, None, replay_on);
+                                    if replay_on {
+                                        let mut faces: Vec<(usize, usize)> = uses.iter().map(|&(s, f, _, _)| (s, f)).collect();
+                                        faces.sort_unstable();
+                                        faces.dedup();
+                                        claim_record_memo_insert(key, &claim, &record, faces.len());
+                                        records.insert(edge.id, record);
+                                    }
+                                    claim_memo_insert(key, &claim);
+                                    read_keys.insert(edge.id, key);
+                                    claim
+                                }
+                            },
                         };
                         report.seconds.scope += started.elapsed().as_secs_f64();
                         claims.insert(edge.id, claim);
@@ -1681,7 +1702,7 @@ pub fn refit_inherited_trims_gated(
                     trims.push((pcurve, solid.shells[*s].faces[*f].loops[*l].coedges[*c].forward));
                 }
             }
-            final_claim(solid, uses, edge, &old_trims, &trims, claims.get(&edge_id), records.get(&edge_id), policy.model).0
+            final_claim_reused(solid, uses, edge, &old_trims, &trims, claims.get(&edge_id), records.get(&edge_id), policy.model)
         };
         let on_edge: Vec<(CoedgeIndex, usize)> = replacements
             .iter()
@@ -1802,6 +1823,8 @@ thread_local! {
 /// Drop every memoised claim (`reading_memo::clear`).
 pub fn clear_claim_memo() {
     CLAIM_MEMO.with(|memo| memo.borrow_mut().clear());
+    CLAIM_RECORD_MEMO.with(|memo| *memo.borrow_mut() = ClaimRecordMemo::default());
+    FINAL_CLAIM_MEMO.with(|memo| memo.borrow_mut().clear());
 }
 
 /// The identity of the claim [`edge_claim_with`] reads for `edge` over
@@ -1830,11 +1853,12 @@ fn claim_memo_key(solid: &BrepSolid, uses: &[CoedgeIndex], edge: &crate::topolog
 
 /// The salt the candidacy and claim memo keys take from the hint-first
 /// settings (`BREP_HEAL_CLAIM_HINT_FIRST`, `BREP_HEAL_CLAIM_HINT_BOUNDARY`,
-/// `BREP_HEAL_CLAIM_REPLAY_NEAR`): none with all off, a hash of the bits otherwise, so a reading taken
+/// `BREP_HEAL_CLAIM_REPLAY_NEAR`, `BREP_HEAL_CLAIM_HINT_FLOOR`): none with all off, a hash of the bits otherwise, so a reading taken
 /// under one setting is never served under another and no tolerance can
 /// stand in for a setting.
 fn memo_salt() -> [u64; 2] {
-    let bits = u64::from(claim_hint_first()) | (u64::from(claim_hint_boundary()) << 1) | (u64::from(claim_replay_near()) << 2);
+    let bits = u64::from(claim_hint_first()) | (u64::from(claim_hint_boundary()) << 1) | (u64::from(claim_replay_near()) << 2)
+        | (u64::from(claim_hint_floor()) << 3);
     if bits == 0 {
         [0, 0]
     } else {
@@ -1902,6 +1926,165 @@ fn claim_memo_insert_passing(key: [u64; 2], claim: &EdgeClaim) {
         }
         memo.insert(key, (claim.clone(), None));
     });
+}
+
+/// `BREP_REFIT_CLAIM_RECORD_MEMO` (default on; `=0` restores): a PASSING edge claim
+/// is kept WITH its record of feet ([`ClaimRecord`]), under the same content
+/// key as [`CLAIM_MEMO`] ([`claim_memo_key`]: every use's carrier, trim, edge
+/// and sense, the carrier order, the model tolerance and the hint-first
+/// salt), and served to a later refit that reads the same edge on the same
+/// uses. [`CLAIM_MEMO`] keeps only claims whose record is never needed, so an
+/// edge whose claim feeds a refit was read again by every refit of an equal
+/// operand that the solid memo could not serve: a boolean's split operand
+/// (`boolean_split_operands`) differs from the raw operand only on the edges
+/// the split cut, yet re-read every claim. On the helmet idempotence fixture
+/// (`20_helmet_merge_stage`) that is most of the split operand's ~15 s refit.
+/// The claim and its record are a pure function of the key's inputs
+/// ([`edge_claim_with`] with no replay), so a served claim is the claim the
+/// read would return; the record's rows are relabelled to this body's
+/// carriers by their sorted position, as [`claim_memo_get`] relabels the
+/// standoff ids. The same switch keeps each final claim that was READ (not
+/// taken whole from the old claim) under its own key ([`final_claim_reused`]),
+/// so the refit edges the split left unchanged skip their final read too.
+/// `=check` keeps and looks up as `=1` does, but reads every
+/// served claim again, keeps the read one and counts and prints each that
+/// differs in any bit ([`claim_record_memo_counts`]).
+fn claim_record_memo_mode() -> crate::env_read::Mode {
+    crate::mode_switch!(live "BREP_REFIT_CLAIM_RECORD_MEMO", true)
+}
+
+/// Whether [`CLAIM_RECORD_MEMO`] keeps and looks up claims (`=1` or `=check`).
+pub fn claim_record_memo_enabled() -> bool {
+    claim_record_memo_mode() != crate::env_read::Mode::Off
+}
+
+fn claim_record_memo_check() -> bool {
+    claim_record_memo_mode() == crate::env_read::Mode::Check
+}
+
+/// Most recorded feet [`CLAIM_RECORD_MEMO`] holds on one thread (24 bytes
+/// each, ~96 MB); the oldest claims are dropped first. The helmet operand's
+/// passing claims record ~3.3M.
+const CLAIM_RECORD_MEMO_FEET: usize = 4_000_000;
+
+/// A passing claim and its feet per carrier, in the claim's carrier order.
+struct ClaimRecordEntry {
+    claim: EdgeClaim,
+    feet: std::rc::Rc<Vec<StationRecord>>,
+    count: usize,
+}
+
+#[derive(Default)]
+struct ClaimRecordMemo {
+    entries: HashMap<[u64; 2], ClaimRecordEntry>,
+    order: std::collections::VecDeque<[u64; 2]>,
+    feet: usize,
+}
+
+thread_local! {
+    static CLAIM_RECORD_MEMO: std::cell::RefCell<ClaimRecordMemo> = std::cell::RefCell::new(ClaimRecordMemo::default());
+    /// (served, stored, check-mode mismatches) since the thread started.
+    static CLAIM_RECORD_MEMO_COUNTS: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// [`CLAIM_RECORD_MEMO`]'s (served, stored, check-mode mismatches) on this thread.
+pub fn claim_record_memo_counts() -> (u64, u64, u64) {
+    CLAIM_RECORD_MEMO_COUNTS.with(|counts| counts.get())
+}
+
+fn claim_record_memo_count(served: u64, stored: u64, mismatches: u64) {
+    CLAIM_RECORD_MEMO_COUNTS.with(|counts| {
+        let (a, b, c) = counts.get();
+        counts.set((a + served, b + stored, c + mismatches));
+    });
+}
+
+/// Keep a passing `claim` read with its `record` for `key`.
+fn claim_record_memo_insert(key: [u64; 2], claim: &(EdgeClaim, Option<TrimRefitDecline>), record: &ClaimRecord, faces: usize) {
+    if !claim_record_memo_enabled() || !crate::reading_memo::memo_on() || claim.1.is_some() || record.len() != faces {
+        return;
+    }
+    let feet: Vec<StationRecord> = record.iter().map(|(_, feet)| feet.clone()).collect();
+    let count: usize = feet.iter().map(Vec::len).sum();
+    if count > CLAIM_RECORD_MEMO_FEET {
+        return;
+    }
+    CLAIM_RECORD_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if let Some(old) = memo.entries.remove(&key) {
+            memo.feet -= old.count;
+            memo.order.retain(|held| *held != key);
+        }
+        while memo.feet + count > CLAIM_RECORD_MEMO_FEET {
+            let Some(oldest) = memo.order.pop_front() else { break };
+            if let Some(old) = memo.entries.remove(&oldest) {
+                memo.feet -= old.count;
+            }
+        }
+        memo.entries.insert(key, ClaimRecordEntry { claim: claim.0.clone(), feet: std::rc::Rc::new(feet), count });
+        memo.order.push_back(key);
+        memo.feet += count;
+    });
+    claim_record_memo_count(0, 1, 0);
+}
+
+/// The passing claim and record [`CLAIM_RECORD_MEMO`] holds for `key`,
+/// relabelled to `solid`'s carriers of `uses`. Under the check switch the
+/// claim is read again ([`edge_claim_with`], no replay, recording) and the
+/// read one is returned; a served one that differs in any bit is counted
+/// and printed.
+fn claim_record_memo_serve(
+    key: [u64; 2],
+    solid: &BrepSolid,
+    uses: &[CoedgeIndex],
+    edge: &crate::topology::EdgeRecord,
+    model: f64,
+) -> Option<((EdgeClaim, Option<TrimRefitDecline>), ClaimRecord)> {
+    if !claim_record_memo_enabled() || !crate::reading_memo::memo_on() {
+        return None;
+    }
+    let (mut claim, feet) = CLAIM_RECORD_MEMO.with(|memo| {
+        memo.borrow().entries.get(&key).map(|entry| (entry.claim.clone(), entry.feet.clone()))
+    })?;
+    let mut faces: Vec<(usize, usize)> = uses.iter().map(|&(s, f, _, _)| (s, f)).collect();
+    faces.sort_unstable();
+    faces.dedup();
+    if faces.len() != feet.len() || faces.len() != claim.standoff.len() {
+        return None;
+    }
+    for ((id, _), &(s, f)) in claim.standoff.iter_mut().zip(&faces) {
+        *id = solid.shells[s].faces[f].id;
+    }
+    let record: ClaimRecord = faces.iter().copied().zip(feet.iter().cloned()).collect();
+    claim_record_memo_count(1, 0, 0);
+    profiling(|profile| {
+        profile.old_claims_served += 1;
+        profile.served_feet += record.iter().map(|(_, feet)| feet.len()).sum::<usize>();
+    });
+    if !claim_record_memo_check() {
+        return Some(((claim, None), record));
+    }
+    let old_trims = trims_of(solid, uses);
+    let (read, read_record) = edge_claim_with(solid, uses, edge, &old_trims, model, None, true);
+    let same_claim = read.1.is_none()
+        && read.0.outside == claim.outside
+        && read.0.witnessed == claim.witnessed
+        && read.0.standoff.len() == claim.standoff.len()
+        && read.0.standoff.iter().zip(&claim.standoff).all(|(a, b)| a.0 == b.0 && a.1.to_bits() == b.1.to_bits());
+    let same_record = read_record.len() == record.len()
+        && read_record.iter().zip(&record).all(|((at_a, a), (at_b, b))| {
+            at_a == at_b
+                && a.len() == b.len()
+                && a.iter().zip(b).all(|(x, y)| x.0 == y.0 && x.1[0].to_bits() == y.1[0].to_bits() && x.1[1].to_bits() == y.1[1].to_bits())
+        });
+    if !(same_claim && same_record) {
+        claim_record_memo_count(0, 0, 1);
+        eprintln!(
+            "REFIT-CLAIM-RECORD-MEMO MISS edge {}: claim same {same_claim}, record same {same_record} (served {:?}, read {:?})",
+            edge.id, claim, read
+        );
+    }
+    Some((read, read_record))
 }
 
 /// The binding scope claim for one EDGE: its unchanged curve against every
@@ -2110,6 +2293,130 @@ pub fn final_claim(
         None => {
             profiling(|profile| profile.final_claims_read += 1);
             (edge_claim_with(solid, uses, edge, trims, model, record, false).0, false)
+        }
+    }
+}
+
+thread_local! {
+    /// Final claims READ (not taken whole from the old claim) under
+    /// `BREP_REFIT_CLAIM_RECORD_MEMO`, by [`final_claim_memo_key`].
+    static FINAL_CLAIM_MEMO: std::cell::RefCell<HashMap<[u64; 2], (EdgeClaim, Option<TrimRefitDecline>)>> =
+        std::cell::RefCell::new(HashMap::default());
+}
+
+/// The identity of a final claim: the old claim's key ([`claim_memo_key`]:
+/// the uses' content, carrier order, model tolerance and hint-first salt),
+/// every trim the claim reads (bits and sense, in order), the old claim it
+/// may be taken from, whether a record is replayed and, when one is, the
+/// record's every foot. Everything [`final_claim`] reads.
+fn final_claim_memo_key(
+    solid: &BrepSolid,
+    uses: &[CoedgeIndex],
+    edge: &crate::topology::EdgeRecord,
+    trims: &[(&crate::NurbsCurve, bool)],
+    old: Option<&(EdgeClaim, Option<TrimRefitDecline>)>,
+    record: Option<&ClaimRecord>,
+    model: f64,
+) -> [u64; 2] {
+    let mut lane = brep_geometry::identity_hash::TwoLane::new();
+    let base = claim_memo_key(solid, uses, edge, model);
+    lane.u64(base[0]);
+    lane.u64(base[1]);
+    lane.usize(trims.len());
+    for &(trim, forward) in trims {
+        brep_geometry::identity_hash::hash_curve(&mut lane, trim);
+        lane.bool(forward);
+    }
+    lane.bool(old.is_some());
+    if let Some((claim, decline)) = old {
+        lane.usize(claim.standoff.len());
+        for &(_, standoff) in &claim.standoff {
+            lane.f64(standoff);
+        }
+        lane.usize(claim.outside);
+        lane.usize(claim.witnessed);
+        lane.u64(format!("{decline:?}").len() as u64);
+        format!("{decline:?}").bytes().for_each(|byte| lane.u64(byte as u64));
+    }
+    lane.bool(record.is_some());
+    if let Some(record) = record {
+        lane.usize(record.len());
+        for ((s, f), feet) in record {
+            lane.usize(*s);
+            lane.usize(*f);
+            lane.usize(feet.len());
+            for &(bits, uv) in feet {
+                lane.u64(bits);
+                lane.f64(uv[0]);
+                lane.f64(uv[1]);
+            }
+        }
+    }
+    lane.finish()
+}
+
+/// [`final_claim`], served under `BREP_REFIT_CLAIM_RECORD_MEMO` when an equal
+/// final claim was read before ([`final_claim_memo_key`]); under `=check`
+/// read again, compared bit for bit, and the read one kept.
+#[allow(clippy::too_many_arguments)]
+fn final_claim_reused(
+    solid: &BrepSolid,
+    uses: &[CoedgeIndex],
+    edge: &crate::topology::EdgeRecord,
+    old_trims: &[(&crate::NurbsCurve, bool)],
+    trims: &[(&crate::NurbsCurve, bool)],
+    old: Option<&(EdgeClaim, Option<TrimRefitDecline>)>,
+    record: Option<&ClaimRecord>,
+    model: f64,
+) -> (EdgeClaim, Option<TrimRefitDecline>) {
+    if !claim_record_memo_enabled() || !crate::reading_memo::memo_on() {
+        return final_claim(solid, uses, edge, old_trims, trims, old, record, model).0;
+    }
+    let key = final_claim_memo_key(solid, uses, edge, trims, old, record, model);
+    let held = FINAL_CLAIM_MEMO.with(|memo| memo.borrow().get(&key).cloned());
+    let relabel = |(mut claim, decline): (EdgeClaim, Option<TrimRefitDecline>)| {
+        let mut faces: Vec<(usize, usize)> = uses.iter().map(|&(s, f, _, _)| (s, f)).collect();
+        faces.sort_unstable();
+        faces.dedup();
+        for ((id, _), (s, f)) in claim.standoff.iter_mut().zip(faces) {
+            *id = solid.shells[s].faces[f].id;
+        }
+        (claim, decline)
+    };
+    match held {
+        Some(held) => {
+            let served = relabel(held);
+            claim_record_memo_count(1, 0, 0);
+            profiling(|profile| profile.final_claims_served += 1);
+            if !claim_record_memo_check() {
+                return served;
+            }
+            let read = final_claim(solid, uses, edge, old_trims, trims, old, record, model).0;
+            let same = read.1 == served.1
+                && read.0.outside == served.0.outside
+                && read.0.witnessed == served.0.witnessed
+                && read.0.standoff.len() == served.0.standoff.len()
+                && read.0.standoff.iter().zip(&served.0.standoff).all(|(a, b)| a.0 == b.0 && a.1.to_bits() == b.1.to_bits());
+            if !same {
+                claim_record_memo_count(0, 0, 1);
+                eprintln!("REFIT-CLAIM-RECORD-MEMO MISS final claim of edge {}: served {served:?}, read {read:?}", edge.id);
+            }
+            read
+        }
+        None => {
+            let (claim, taken) = final_claim(solid, uses, edge, old_trims, trims, old, record, model);
+            // A final claim taken whole from the old claim costs nothing.
+            if !taken {
+                FINAL_CLAIM_MEMO.with(|memo| {
+                    let mut memo = memo.borrow_mut();
+                    if memo.len() >= crate::reading_memo::capacity() {
+                        memo.clear();
+                    }
+                    memo.insert(key, claim.clone());
+                });
+                claim_record_memo_count(0, 1, 0);
+            }
+            claim
         }
     }
 }
@@ -3008,6 +3315,28 @@ fn claim_hint_boundary() -> bool {
     crate::switch!(live "BREP_HEAL_CLAIM_HINT_BOUNDARY", true)
 }
 
+/// `BREP_HEAL_CLAIM_HINT_FLOOR` (default on since 2026-11-23, `0` off): with the hint-first read on,
+/// a hint foot is admitted within the smaller of the model tolerance and the
+/// refit floor, not a thousandth of it. That is the general projector's own
+/// on-surface floor (`LINEAR_TOLERANCE`, the model default): a query whose
+/// local answer lies within it is settled and searched no further, so for
+/// such a station the full read is itself a local Newton answer, seeded from
+/// the projector's nearest lattice sample and from the hint. An imported body
+/// whose edges stand 1e-8 off their carriers never met the 1e-10 bar, and every
+/// one of its stations took the full read (the helmet operand's refit: 2.03M
+/// projector calls, 72 of its 75 s in the scope reads). The two reads differ
+/// only where a second basin lies nearer than the hint's foot, which
+/// `BREP_HEAL_CLAIM_HINT_CHECK` counts, still at twice the strict bar.
+fn claim_hint_floor() -> bool {
+    crate::switch!(live "BREP_HEAL_CLAIM_HINT_FLOOR", true)
+}
+
+/// Whether `(u, v)` lies in the surface's domain as it stands, unwrapped.
+fn in_raw_domain(surface: &crate::NurbsSurface, u: f64, v: f64) -> bool {
+    let (Ok([u0, u1]), Ok([v0, v1])) = (surface.domain_u(), surface.domain_v()) else { return false };
+    (u0..=u1).contains(&u) && (v0..=v1).contains(&v)
+}
+
 /// `BREP_HEAL_CLAIM_HINT_CHECK` (default off): with the hint-first read on,
 /// every foot it takes is also read in full, and a full read whose reading
 /// (its distance, or past the domain its standoff through a point on the
@@ -3224,8 +3553,17 @@ pub fn scope_foot(surface: &crate::NurbsSurface, point: Vec3, hint: Option<[f64;
         // model, a trim's miss against the floor plus its own standoff) then
         // moves by at most this much from the full read's.
         let bar = 1e-3 * model.min(crate::PCURVE_REFINEMENT_TOLERANCE);
+        // `BREP_HEAL_CLAIM_HINT_FLOOR`: a hint foot within the on-surface
+        // floor itself is admitted (see [`claim_hint_floor`]); the check mode
+        // still holds it to the strict bar.
+        let admit = if claim_hint_floor() { model.min(crate::PCURVE_REFINEMENT_TOLERANCE) } else { bar };
         let fast = hint_newton_foot(surface, point, seed)
-            .filter(|(d, _)| *d <= bar)
+            .filter(|(d, _)| *d <= admit)
+            // Past the strict bar, only a foot whose raw parameters lie in the
+            // domain: near a pole a near-singular step throws a closed
+            // direction's parameter out by 1e10, where it wraps at a lost
+            // precision and stalls nanometres off the true foot.
+            .filter(|&(d, [u, v])| d <= bar || in_raw_domain(surface, u, v))
             .and_then(|(d, [u, v])| finish_foot(surface, d, u, v))
             .filter(|foot| {
                 // A foot a rounding past a boundary edge (a station on the

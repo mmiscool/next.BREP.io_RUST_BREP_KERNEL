@@ -22,6 +22,10 @@
 
 use crate::{FrameCurve, OutlinePiece, SolidTool, Vec3};
 
+#[path = "solid_sweep_upright_direct.rs"]
+mod direct;
+pub use direct::upright_direct_on;
+
 /// The envelope the reads hold in, checked by the gate before any arithmetic:
 /// the tool's height within `ENVELOPE` of its widest radius either way, the
 /// curve's extent within `ENVELOPE` of that radius, all three between 1e-60
@@ -32,9 +36,13 @@ use crate::{FrameCurve, OutlinePiece, SolidTool, Vec3};
 pub const ENVELOPE: f64 = 1e6;
 
 /// The switch for the upright route in [`crate::sweep_solid_along`] (default
-/// off until promoted).
+/// on; `=0` restores the general routes for every upright tool). With the
+/// direct build on ([`upright_direct_on`]) the route answers only a curve that
+/// turns tighter than the tool, which the general routes refuse, and leaves
+/// every other upright sweep to them; with it off, every upright sweep takes
+/// this route as before.
 pub fn upright_slot_on() -> bool {
-    crate::switch!("BREP_SWEEP_UPRIGHT_SLOT", false)
+    crate::switch!("BREP_SWEEP_UPRIGHT_SLOT", true)
 }
 
 /// What an upright solid of revolution passes through carried along a planar
@@ -89,6 +97,61 @@ fn piece_extent(piece: &OutlinePiece) -> (f64, f64) {
         }
         OutlinePiece::Ellipse { .. } => (f64::INFINITY, f64::INFINITY),
     }
+}
+
+/// `BREP_UPRIGHT_SIGN_BOUND` (on unless =0): an upright slot's outline grid
+/// reads a node's sign from bounds where they decide it (see
+/// [`UprightSlot::level_loops`]).
+fn sign_bound_on() -> bool {
+    crate::switch!("BREP_UPRIGHT_SIGN_BOUND", true)
+}
+
+/// The convex hull of the points, counter-clockwise (monotone chain).
+fn convex_hull(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let mut p: Vec<[f64; 2]> = points.to_vec();
+    p.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    p.dedup();
+    if p.len() < 3 {
+        return p;
+    }
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut hull: Vec<[f64; 2]> = Vec::new();
+    for pass in 0..2 {
+        let start = hull.len();
+        let ordered: Vec<[f64; 2]> = if pass == 0 { p.clone() } else { p.iter().rev().copied().collect() };
+        for q in ordered {
+            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], q) <= 0.0 {
+                hull.pop();
+            }
+            hull.push(q);
+        }
+        hull.pop();
+    }
+    hull
+}
+
+/// The distance from `q` to a convex polygon (0 inside it); a lower bound on
+/// its distance to any curve the polygon holds.
+fn hull_distance(hull: &[[f64; 2]], q: [f64; 2]) -> f64 {
+    let n = hull.len();
+    let segment = |a: [f64; 2], b: [f64; 2]| -> f64 {
+        let (d, r) = (sub(b, a), sub(q, a));
+        let len2 = dot(d, d);
+        let s = if len2 > 0.0 { (dot(r, d) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let e = [r[0] - s * d[0], r[1] - s * d[1]];
+        dot(e, e).sqrt()
+    };
+    if n == 1 {
+        return segment(hull[0], hull[0]);
+    }
+    let inside = n >= 3 && (0..n).all(|k| {
+        let (a, b) = (hull[k], hull[(k + 1) % n]);
+        (b[0] - a[0]) * (q[1] - a[1]) - (b[1] - a[1]) * (q[0] - a[0]) >= 0.0
+    });
+    if inside {
+        return 0.0;
+    }
+    (0..n).map(|k| segment(hull[k], hull[(k + 1) % n])).fold(f64::INFINITY, f64::min)
 }
 
 fn sub(a: [f64; 2], b: [f64; 2]) -> [f64; 2] {
@@ -602,7 +665,33 @@ impl UprightSlot {
         let (nx, ny) = (wx as usize + 1, wy as usize + 1);
         let node = |i: usize, j: usize| [x0 + cell * i as f64, y0 + cell * j as f64];
         let f = |p: [f64; 2]| self.distance(p).0 - rho;
-        let values: Vec<f64> = (0..ny).flat_map(|j| (0..nx).map(move |i| (i, j))).map(|(i, j)| f(node(i, j))).collect();
+        // Only a node's sign is read from the grid (the level points and the
+        // saddles' middles are read exactly): where the curve's control hull
+        // stands farther than `rho` from the node, or one of its points
+        // nearer, the sign is that bound's, and the closest point is not
+        // solved (`BREP_UPRIGHT_SIGN_BOUND`; a margin of 1e-9 of the scale
+        // leaves every node near the level to the exact distance).
+        let bound = sign_bound_on().then(|| {
+            let samples: Vec<[f64; 2]> = (0..=32).map(|k| self.point(k as f64 / 32.0)).collect();
+            let hull = convex_hull(&self.curve);
+            let scale = rho + (hi[0] - lo[0]).abs() + (hi[1] - lo[1]).abs();
+            (samples, hull, 1e-9 * scale)
+        });
+        let sign = |p: [f64; 2]| -> f64 {
+            if let Some((samples, hull, margin)) = &bound {
+                if hull_distance(hull, p) > rho + margin {
+                    return 1.0;
+                }
+                if samples.iter().any(|&c| {
+                    let r = sub(c, p);
+                    dot(r, r).sqrt() < rho - margin
+                }) {
+                    return -1.0;
+                }
+            }
+            f(p)
+        };
+        let values: Vec<f64> = (0..ny).flat_map(|j| (0..nx).map(move |i| (i, j))).map(|(i, j)| sign(node(i, j))).collect();
         let value = |i: usize, j: usize| values[j * nx + i];
         // The level point on the grid edge between two nodes (inside first).
         let crossing = |a: [f64; 2], b: [f64; 2]| -> [f64; 2] {
@@ -1029,6 +1118,23 @@ impl UprightSlot {
         pieces
     }
 
+    /// Whether the curve may turn anywhere tighter than the tool reaches
+    /// ([`Self::pieces`]: conservative, 1% to spare, so a curve turning just
+    /// short of the tool also reads true).
+    pub fn turns_tighter(&self) -> bool {
+        self.pieces().iter().any(|p| p.2)
+    }
+
+    /// The solid built face by face (the direct build, no boolean), refused
+    /// where the build declines or its solid does not validate.
+    pub fn direct_solid(&self) -> Result<crate::BrepSolid, crate::KernelRefusal> {
+        let solid = direct::direct_solid(self)?;
+        if let Some(issue) = solid.validate().first() {
+            return Err(crate::KernelRefusal::unsupported(crate::KernelStage::Collect, "upright_direct_invalid", format!("uprightDirect: the solid does not validate: {}", issue.message)));
+        }
+        Ok(solid)
+    }
+
     /// Everything the tool passes through along the whole curve, where it
     /// turns nowhere tighter than the tool reaches: the tool at every break
     /// and each piece's section sweep, united (the union also answers the
@@ -1047,13 +1153,23 @@ impl UprightSlot {
             ));
         }
         let pieces = self.pieces();
-        // A turn tighter than the tool folds its concave wall; the trimmed
-        // fold is not built yet (the route refuses rather than guess it).
+        // A turn tighter than the tool folds its concave wall: with the
+        // switch on, the solid is built face by face (direct, no boolean);
+        // where that build declines, or with it off, the route refuses
+        // rather than guess the folded wall.
         if let Some(&(a, b, _)) = pieces.iter().find(|p| p.2) {
+            let declined = if direct::upright_direct_on() {
+                match self.direct_solid() {
+                    Ok(solid) => return Ok(solid),
+                    Err(e) => format!(" (the direct build declined: {})", e.message),
+                }
+            } else {
+                String::new()
+            };
             return Err(crate::KernelRefusal::unsupported(
                 crate::KernelStage::Collect,
                 "upright_tight_turn",
-                format!("uprightStroke: the curve turns tighter than the tool reaches over [{a:.4}, {b:.4}]; its folded concave wall is not built"),
+                format!("uprightStroke: the curve turns tighter than the tool reaches over [{a:.4}, {b:.4}]; its folded concave wall is not built{declined}"),
             ));
         }
         // The tools at every break first, one after another (overlapping

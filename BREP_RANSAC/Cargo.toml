@@ -1,12 +1,13 @@
 [package]
 name = "BREP_RANSAC"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-description = "Topology-aware analytic surface recognition for CAD triangle meshes"
+homepage = "https://next.brep.io"
+description = "Topology-aware analytic surface recognition for CAD triangle meshes, from the next.BREP.io Rust B-rep CAD kernel family."
 readme = "README.md"
-keywords = ["cad", "ransac", "mesh", "recognition", "geometry"]
+keywords = ["cad", "ransac", "mesh", "recognition", "b-rep"]
 categories = ["algorithms", "graphics", "mathematics"]
 # The `!` entries are a backstop: test code never ships. The publish snapshot
 # `cargo package` of this manifest from shipping test files.

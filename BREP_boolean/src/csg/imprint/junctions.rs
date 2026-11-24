@@ -771,6 +771,48 @@ pub(super) fn merge_residual_coincident_vertices(
             .copied()
     };
     let operand_guard = std::env::var("BREP_RESIDUAL_MERGE_OPERAND_GUARD").as_deref() != Ok("0");
+    // OPERAND-EDGE GUARD (`BREP_RESIDUAL_MERGE_EDGE_GUARD`, default off, `=1`
+    // on): the operand edges each junction lies on (within its evidence
+    // radius, inside the edge's span). Two junctions on edges of one operand,
+    // neither within the band of an edge the other lies on, are where a
+    // section crosses two different edges: two points, whatever the union of
+    // their surfaces reads. A plane across a lens 1.8e-6 thick crosses its two
+    // rulings 0.098 apart, every point between them within the band of the
+    // plane and both near-tangent walls; merging them sent each half of the
+    // cut onto the other's ends.
+    let edge_guard = crate::switch!("BREP_RESIDUAL_MERGE_EDGE_GUARD", false);
+    let on_edges = |point: Vec3, radius: f64| -> Vec<(u8, u64)> {
+        let mut found = Vec::new();
+        for (&(operand, edge_id), edge) in edge_curves.iter() {
+            if edge.degenerate {
+                continue;
+            }
+            let Ok(foot) = project_point_to_curve(&edge.curve, point) else { continue };
+            let (low, high) = (edge.t0.min(edge.t1), edge.t0.max(edge.t1));
+            if foot.distance <= radius && foot.u >= low - 1e-9 && foot.u <= high + 1e-9 {
+                found.push((operand, edge_id));
+            }
+        }
+        found
+    };
+    let edge_distance = |edge: (u8, u64), point: Vec3| -> f64 {
+        edge_curves.get(&edge).and_then(|edge| project_point_to_curve(&edge.curve, point).ok()).map_or(0.0, |foot| foot.distance)
+    };
+    // Whether the junctions stand on two different operand edges (see above).
+    let on_different_edges = |id_a: u64, p_a: Vec3, id_b: u64, p_b: Vec3| -> bool {
+        if !edge_guard {
+            return false;
+        }
+        let (on_a, on_b) = (on_edges(p_a, radius_of(id_a)), on_edges(p_b, radius_of(id_b)));
+        [0u8, 1u8].iter().any(|&operand| {
+            let a: Vec<_> = on_a.iter().filter(|edge| edge.0 == operand).copied().collect();
+            let b: Vec<_> = on_b.iter().filter(|edge| edge.0 == operand).copied().collect();
+            !a.is_empty()
+                && !b.is_empty()
+                && a.iter().all(|&edge| edge_distance(edge, p_b) > band)
+                && b.iter().all(|&edge| edge_distance(edge, p_a) > band)
+        })
+    };
 
     let verts: Vec<(u64, Vec3)> = result.vertices.iter().map(|v| (v.id, v.point)).collect();
     let mut parent: HashMap<u64, u64> = verts.iter().map(|(id, _)| (*id, *id)).collect();
@@ -828,6 +870,12 @@ pub(super) fn merge_residual_coincident_vertices(
                         continue;
                     }
                 }
+            }
+            if on_different_edges(id_a, p_a, id_b, p_b) {
+                if debug_junction {
+                    eprintln!("residual-merge v{id_a}/v{id_b} sep={sep:.4e}: REFUSED on two different operand edges");
+                }
+                continue;
             }
             let mut union_keys: HashSet<FaceKey> = HashSet::default();
             for id in [id_a, id_b] {
@@ -917,6 +965,20 @@ pub(super) fn merge_residual_coincident_vertices(
             if ra == rb {
                 continue;
             }
+            // The guard holds for the groups the two join, not the pair alone:
+            // a third junction on neither edge would join both into one.
+            if edge_guard {
+                let members = |parent: &mut HashMap<u64, u64>, root: u64| -> Vec<(u64, Vec3)> {
+                    verts.iter().copied().filter(|&(id, _)| junction_find(parent, id) == root).collect()
+                };
+                let (group_a, group_b) = (members(&mut parent, ra), members(&mut parent, rb));
+                if group_a.iter().any(|&(x, px)| group_b.iter().any(|&(y, py)| on_different_edges(x, px, y, py))) {
+                    if debug_junction {
+                        eprintln!("residual-merge v{id_a}/v{id_b}: REFUSED, their groups hold junctions on two different operand edges");
+                    }
+                    continue;
+                }
+            }
             if std::env::var("BREP_DEBUG_JUNCTION").is_ok() {
                 eprintln!(
                     "[merge] v{id_a} <- v{id_b} sep={sep:.3e} band={band:.3e} sep_cap={sep_cap:.3e} best_res={best_res:.3e} to=({:.7},{:.7},{:.7})",
@@ -939,7 +1001,7 @@ pub(super) fn merge_residual_coincident_vertices(
         relocate_junctions(result, &mut parent, &merged_point, face_map, charts, emitted_pcurves, (4.0 * sep_cap).max(1e-3), false)?;
         return Ok(true);
     }
-    absorb_junctions_enclosed_by_merged_groups(result, face_map, incident_faces, &verts, &mut parent, band, sep_cap)?;
+    absorb_junctions_enclosed_by_merged_groups(result, face_map, incident_faces, &verts, &mut parent, band, sep_cap, &on_different_edges)?;
     let retracted = place_merged_groups_on_operand_edges(result, edge_curves, operand_vertices, &verts, &mut parent, &mut merged_point, tolerance, band, evidence)?;
     // Only a merged group's representative counts as moved: the pieces that
     // reference it are snapped to the group's position, every other piece is
@@ -985,6 +1047,7 @@ fn segment_on_surfaces(surfaces: &[&NurbsSurface], a: Vec3, b: Vec3, band: f64) 
 /// residual proof on the union of their incident surfaces; the loop's pieces
 /// then drop as spurs in `relocate_junctions`. Repeats until no junction
 /// qualifies, so a chain of such vertices folds in too.
+#[allow(clippy::too_many_arguments)]
 fn absorb_junctions_enclosed_by_merged_groups(
     result: &ImprintResultRecord,
     face_map: &HashMap<FaceKey, &FaceRecord>,
@@ -993,6 +1056,7 @@ fn absorb_junctions_enclosed_by_merged_groups(
     parent: &mut HashMap<u64, u64>,
     band: f64,
     sep_cap: f64,
+    on_different_edges: &dyn Fn(u64, Vec3, u64, Vec3) -> bool,
 ) -> Result<(), KernelRefusal> {
     let debug = std::env::var("BREP_DEBUG_JUNCTION").is_ok();
     let empty = HashSet::default();
@@ -1056,6 +1120,13 @@ fn absorb_junctions_enclosed_by_merged_groups(
             let Some((member_id, sep)) = proven else {
                 continue;
             };
+            // Not into a group holding a junction on another operand edge
+            // than this one's (`BREP_RESIDUAL_MERGE_EDGE_GUARD`), the group as
+            // it stands now: a junction absorbed earlier in this pass is in it.
+            let now: Vec<(u64, Vec3)> = verts.iter().copied().filter(|&(other, _)| junction_find(parent, other) == rep).collect();
+            if now.iter().any(|&(other, other_point)| on_different_edges(id, point, other, other_point)) {
+                continue;
+            }
             if debug {
                 eprintln!("[merge] v{rep} <- v{id} enclosed: {pieces} pieces lead into the group, {sep:.3e} from member v{member_id}, band={band:.3e}");
             }

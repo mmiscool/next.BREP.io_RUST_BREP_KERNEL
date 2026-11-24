@@ -525,6 +525,9 @@ fn import_step_report_with(text: &str, sheets: bool, readings: bool) -> Result<S
     bounded_trim_diagnostics(&imported.bounded_trims, &mut diagnostics);
     closure_diagnostics(&imported.closure_notes, &imported.refused_bodies, &mut diagnostics);
     diagnostics.count_n(SHEETS_SKIPPED, imported.sheets_skipped as u64);
+    if let Some(band) = imported.unstated_identity_band_mm {
+        diagnostics.measure_max(precision::UNSTATED_IDENTITY_BAND_MM, band);
+    }
     Ok(StepImportReport {
         solids: imported.solids,
         appearances: imported.appearances,

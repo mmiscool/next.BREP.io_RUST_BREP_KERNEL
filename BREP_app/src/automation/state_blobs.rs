@@ -34,7 +34,7 @@ pub const STATE_BLOBS: &[(&str, &str)] = &[
     ("__brepSimulation", "Simulation state {available: the document is an assembly a study can drive, block: the simulation block or null, mates: [{id, kind: distance|angle, value, enabled}] a motor can drive, pane: {notice, error}}"),
     ("__brepCamSim", "CAM simulation player state {loaded, speed, stopAtCollision, cell, showDeviation, notice, error, session: {setup, multiAxis, playing, motion, fraction, time, totalSeconds, progress, motions, completed, applied, caughtUp, removedVolume, stockVolume, unsupported, operation, operations, marks, collisionMotions, deviation, stockVersion}}"),
     ("__brepPorts", "the part's declared connection points (the `ports` block) and the ports tail's report of the last run"),
-    ("__brepQualify", "Qualify panel state {selected: the connection-point address it has selected}"),
+    ("__brepQualify", "Qualify panel state {selected: the connection-point address it has selected; pinSeats: each seated pcb point's pin seat check, {address, pin, by (seat|body), passes, message}}"),
     ("__brepFamily", "Family table pane state {table, expressions, notColumns, selected, editing, problems, columnProblems, values, generateCalls, report, status, preview: {row, partNumber, applied, showing, message, featureErrors} or null, runsReplied}"),
     ("__brepPmi", "PMI block, report, active view, open annotation or view dialog, and the selected annotation or view"),
     ("__brepSheets", "drawing sheets, the open sheet and its projection, the open and the selected sheet object"),

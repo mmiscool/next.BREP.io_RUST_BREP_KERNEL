@@ -9,7 +9,26 @@
 //! an edge curve, so it lies on the plane and on the boundary to the accuracy
 //! the boolean built those edges to.
 
-use crate::{face_area, solid_piece_by_plane, BrepSolid, FaceRecord, KernelRefusal, KernelStage, NurbsCurve, Vec3};
+use crate::{face_area, shell_vector_areas, solid_piece_by_plane, BrepSolid, FaceRecord, KernelRefusal, KernelStage, NurbsCurve, Vec3};
+
+/// `BREP_SECTION_SUB_BAND_AREA` (default on, `=0` restores the refusal): a
+/// cut whose regions are thinner than the boolean's weld band is measured by
+/// [`sub_band_area`] instead of refused.
+fn sub_band_area_enabled() -> bool {
+    crate::switch!("BREP_SECTION_SUB_BAND_AREA", true)
+}
+
+/// What [`caps`] found.
+enum Cut {
+    /// The plane does not cut the solid.
+    Miss,
+    /// The piece on one side, and the indices of its faces on the plane.
+    Caps(BrepSolid, Vec<usize>),
+    /// The solid lies on both sides, but every region of the cut is thinner
+    /// than the boolean's weld band, so neither piece carries a face on the
+    /// plane; the cut's area, read by [`sub_band_area`].
+    SubBand(f64),
+}
 
 /// The covers [`caps`] cuts with, tightest first: a box just over the solid
 /// keeps the boolean's tolerances to the solid's own size.
@@ -27,7 +46,7 @@ const COVERS: [f64; 4] = [1.2, 1.5, 2.0, 3.0];
 /// the other side is empty, or when the plane passes between the solid's lumps
 /// ([`lumps_part`]); a cut that declines at every box, or a solid on both
 /// sides with no face on the plane otherwise, is refused, never read as a miss.
-fn caps(solid: &BrepSolid, origin: Vec3, normal: Vec3) -> Result<Option<(BrepSolid, Vec<usize>)>, KernelRefusal> {
+fn caps(solid: &BrepSolid, origin: Vec3, normal: Vec3) -> Result<Cut, KernelRefusal> {
     let unit = normal
         .normalized()
         .map_err(|_| KernelRefusal::input(KernelStage::Collect, "section_normal", "section: the plane normal has no direction"))?;
@@ -41,7 +60,7 @@ fn caps(solid: &BrepSolid, origin: Vec3, normal: Vec3) -> Result<Option<(BrepSol
         high = high.max(height);
     }
     if !(low < 0.0 && high > 0.0) {
-        return Ok(None);
+        return Ok(Cut::Miss);
     }
     let mut declined = Vec::new();
     let mut found = None;
@@ -49,19 +68,19 @@ fn caps(solid: &BrepSolid, origin: Vec3, normal: Vec3) -> Result<Option<(BrepSol
         for above in [false, true] {
             match solid_piece_by_plane(solid, origin, unit, above, cover) {
                 Ok(piece) => {
-                    found = Some(piece);
+                    found = Some((piece, above));
                     break 'covers;
                 }
                 Err(message) => declined.push(message),
             }
         }
     }
-    let Some(piece) = found else {
+    let Some((piece, piece_above)) = found else {
         return Err(refuse(declined.join("; ")));
     };
     // The control points straddle the plane, but the solid itself may not.
     let Some(piece) = piece else {
-        return Ok(None);
+        return Ok(Cut::Miss);
     };
     let extent = piece.vertices.iter().fold(0.0f64, |extent, vertex| {
         extent.max(vertex.point.x.abs()).max(vertex.point.y.abs()).max(vertex.point.z.abs())
@@ -84,14 +103,19 @@ fn caps(solid: &BrepSolid, origin: Vec3, normal: Vec3) -> Result<Option<(BrepSol
         // share out the solid's faces without cutting any, their volumes sum
         // to the solid's, and every vertex of each lies clear of the plane on
         // its own side.
-        let other = declined.len() % 2 == 0;
+        let other = !piece_above;
         let mut other_declined = Vec::new();
         for cover in COVERS {
             match solid_piece_by_plane(solid, origin, unit, other, cover) {
-                Ok(None) => return Ok(None),
+                Ok(None) => return Ok(Cut::Miss),
                 Ok(Some(other_piece)) => {
                     if lumps_part(solid, &piece, &other_piece, origin, unit, other, tolerance) {
-                        return Ok(None);
+                        return Ok(Cut::Miss);
+                    }
+                    if sub_band_area_enabled() {
+                        if let Some(area) = sub_band_area(solid, &piece, &other_piece, unit, piece_above) {
+                            return Ok(Cut::SubBand(area));
+                        }
                     }
                     return Err(refuse("the solid lies on both sides of the plane but the cut left no face on it".into()));
                 }
@@ -103,7 +127,58 @@ fn caps(solid: &BrepSolid, origin: Vec3, normal: Vec3) -> Result<Option<(BrepSol
             other_declined.join("; ")
         )));
     }
-    Ok(Some((piece, faces)))
+    Ok(Cut::Caps(piece, faces))
+}
+
+/// The area of a cut that left no face on the plane although the solid lies
+/// on both sides of it: every region of the cut is thinner than the weld band
+/// (a ring a few micrometres thick around a rod), so the boolean sewed the
+/// faces either side straight across the plane. Each piece is then a closed
+/// shell short of its caps, and `∫ n dA = 0` over the whole boundary makes
+/// the caps' area the piece's own trim residual ([`shell_vector_areas`]):
+/// `−A n` for the piece below, `+A n` for the one above. It is read only when
+/// it is a measurement: every shell of both pieces closed and read to the
+/// end, each residual along the normal with its side's sign, the two areas
+/// agreeing, and the area clear of the noise (the solid's own residual, the
+/// residuals' components off the normal, the two pieces' disagreement, and
+/// every quadrature error) by a factor of ten. `None` otherwise, and the cut
+/// is refused as before.
+fn sub_band_area(solid: &BrepSolid, piece: &BrepSolid, other: &BrepSolid, unit: Vec3, piece_above: bool) -> Option<f64> {
+    // The summed residual of every shell, its quadrature error, or `None`
+    // when a shell is open, unread or abandoned.
+    let residual = |body: &BrepSolid| -> Option<(Vec3, f64)> {
+        let report = shell_vector_areas(body);
+        if !report.unreadable.is_empty() || report.shells.is_empty() {
+            return None;
+        }
+        let mut sum = Vec3::new(0.0, 0.0, 0.0);
+        let mut error = 0.0;
+        for shell in &report.shells {
+            if !shell.closed || shell.gave_up || !shell.trim_residual.length().is_finite() {
+                return None;
+            }
+            sum = sum.add(shell.trim_residual);
+            error += shell.quadrature_error;
+        }
+        Some((sum, error))
+    };
+    let (whole, whole_error) = residual(solid)?;
+    let (first, first_error) = residual(piece)?;
+    let (second, second_error) = residual(other)?;
+    // The piece above lacks caps facing −n, so its faces sum to +A n.
+    let (above, below) = if piece_above { (first, second) } else { (second, first) };
+    let (area_above, area_below) = (above.dot(unit), -below.dot(unit));
+    if !(area_above > 0.0 && area_below > 0.0) {
+        return None;
+    }
+    let off = |vector: Vec3, along: f64| vector.sub(unit.scale(along)).length();
+    let noise = whole.length()
+        + off(above, area_above)
+        + off(below, -area_below)
+        + (area_above - area_below).abs()
+        + 10.0 * (whole_error + first_error + second_error);
+    let area = 0.5 * (area_above + area_below);
+    (area > 10.0 * noise).then_some(area)
 }
 
 /// Whether `first` and `second`, the pieces of `solid` on the two sides of the
@@ -194,8 +269,19 @@ pub fn solid_section(
     if !(chord_tolerance > 0.0 && chord_tolerance.is_finite()) {
         return Err(KernelRefusal::input(KernelStage::Collect, "section_tolerance", "section: the chord tolerance must be positive"));
     }
-    let Some((below, faces)) = caps(solid, origin, normal)? else {
-        return Ok(Vec::new());
+    let (below, faces) = match caps(solid, origin, normal)? {
+        Cut::Miss => return Ok(Vec::new()),
+        Cut::Caps(below, faces) => (below, faces),
+        Cut::SubBand(area) => {
+            return Err(KernelRefusal::internal(
+                KernelStage::Fragment,
+                "section_split",
+                format!(
+                    "section: every region of the cut is thinner than the boolean's weld band (area {area:.3e}), \
+                     so no face on the plane holds its curves"
+                ),
+            ))
+        }
     };
     let all: Vec<&FaceRecord> = below.shells.iter().flat_map(|shell| &shell.faces).collect();
     let mut pieces = Vec::new();
@@ -219,8 +305,10 @@ pub fn solid_section(
 /// `normal`: the area of the faces the split leaves on that plane. Zero when
 /// the plane misses the solid.
 pub fn solid_section_area(solid: &BrepSolid, origin: Vec3, normal: Vec3) -> Result<f64, KernelRefusal> {
-    let Some((below, faces)) = caps(solid, origin, normal)? else {
-        return Ok(0.0);
+    let (below, faces) = match caps(solid, origin, normal)? {
+        Cut::Miss => return Ok(0.0),
+        Cut::Caps(below, faces) => (below, faces),
+        Cut::SubBand(area) => return Ok(area),
     };
     let all: Vec<&FaceRecord> = below.shells.iter().flat_map(|shell| &shell.faces).collect();
     let mut area = 0.0;

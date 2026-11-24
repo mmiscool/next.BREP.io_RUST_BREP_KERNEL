@@ -1,6 +1,6 @@
 use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass, MAX_FIT_STATIONS};
 
-// Fit-split instrumentation (2026-11-02): where the section
+// Fit-split instrumentation: where the section
 // fit's time goes, read only under BREP_PROFILE and printed once per
 // `build_imprints` as `imprint.fit_split`. Zero behaviour: timers only.
 #[derive(Clone, Copy)]
@@ -121,8 +121,14 @@ pub fn fast_path_carrier_readings(fit: &PolylineFit, run: &[Vec3], first: &Nurbs
     (station, midspan_carrier_upper(fit, first, second))
 }
 
-/// SECTION-REFINE READ MEMO (`BREP_SECTION_REFINE_READ_MEMO`, default on, =0 restores;
-/// 2026-11-03). One section refine reads the carrier distance of
+/// `BREP_PLANAR_ISO_TANGENT_TOUCH` (default on; `=0` restores): see
+/// PLANAR-ISO TANGENT TOUCH in the pair loop.
+fn planar_iso_tangent_touch_enabled() -> bool {
+    switch!("BREP_PLANAR_ISO_TANGENT_TOUCH", true)
+}
+
+/// SECTION-REFINE READ MEMO (`BREP_SECTION_REFINE_READ_MEMO`, default on, =0 restores).
+/// One section refine reads the carrier distance of
 /// the SAME points several times: a representative round reads every mid-span
 /// in [`midspan_misses`], again in [`midspan_carrier_upper`], and, once a
 /// representative has run, the mid-spans and knot interiors a second time on
@@ -1355,6 +1361,27 @@ fn refine_section_against_carriers_inner(
 use super::*;
 use super::gate_census::{census_pair, fit_census_enabled};
 
+fn preserves_branch_prefix(
+    original: &[crate::SurfaceIntersectionCurve],
+    completed: &[crate::SurfaceIntersectionCurve],
+) -> bool {
+    let same_points = |a: &[Vec3], b: &[Vec3]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| {
+            a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits() && a.z.to_bits() == b.z.to_bits()
+        })
+    };
+    completed.len() >= original.len() && original.iter().zip(completed).all(|(a, b)| {
+        let same_tangents = match (&a.tangents, &b.tangents) {
+            (Some(a), Some(b)) => same_points(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        same_points(&a.points, &b.points) && a.params_a == b.params_a && a.params_b == b.params_b
+            && a.closed == b.closed && same_tangents
+            && a.span_deviation == b.span_deviation && a.tangent == b.tangent
+    })
+}
+
 pub fn build_imprints(
     solid_a: &BrepSolid,
     solid_b: &BrepSolid,
@@ -1484,10 +1511,17 @@ fn build_imprints_with_carrier_seeds(
         vertex_radii: HashMap::default(),
         vertex_sources: HashMap::default(),
         pieces: Vec::new(),
+        section_end_seeds: Vec::new(),
+        // Open offset carriers do not have a closed solid's wall/cap incidence.
+        record_planar_sections: !open_carriers && (switch!("BREP_PLANAR_SECTION_END_DISCOVERY", false)
+            || switch!("BREP_PLANAR_SECTION_END_DISCOVERY_CHECK", false)),
+        planar_sections: Vec::new(),
+        marched_section: false,
         by_face: HashMap::default(),
         edge_splits: HashMap::default(),
         marched_pieces: HashSet::default(),
         exact_section: false,
+        external_touch_only: false,
         emitted_pcurves: HashSet::default(),
         exact_pcurve_check: false,
         next_id: 1,
@@ -1623,8 +1657,28 @@ fn build_imprints_with_carrier_seeds(
     // imprint PROVED apart (`ImprintResultRecord::faces_in_unproved_pairs`).
     let mut visited_pairs: Vec<(usize, usize)> = Vec::new();
     let mut proved_apart_pairs: HashSet<(usize, usize)> = HashSet::default();
-    for (first_index, first) in first_faces.iter().enumerate() {
-        let first = *first;
+    // Sections between nonplanar walls supply the endpoints that split a
+    // later planar section. Keep face storage and admission indices intact;
+    // only visit the planar pairs after their incident wall pairs.
+    let section_end_order = switch!("BREP_PLANAR_SECTION_END_JUNCTIONS", false);
+    let check_section_end_order = switch!("BREP_PLANAR_SECTION_END_JUNCTIONS_CHECK", false);
+    let order_sections = |indices: &mut Vec<usize>, faces: &[TaggedFace<'_>], side: &str| {
+        if !(section_end_order || check_section_end_order) { return; }
+        let mut ordered = indices.clone();
+        ordered.sort_by_key(|&index| matches!(faces[index].face.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. })));
+        if check_section_end_order && ordered != *indices {
+            eprintln!("planar section end order {side}: {:?} -> {:?}, enabled={section_end_order}", indices, ordered);
+        }
+        if section_end_order { *indices = ordered; }
+    };
+    let first_order = if section_end_order || check_section_end_order {
+        let mut indices: Vec<_> = (0..first_faces.len()).collect();
+        order_sections(&mut indices, &first_faces, "first");
+        Some(indices)
+    } else { None };
+    for position in 0..first_faces.len() {
+        let first_index = first_order.as_ref().map_or(position, |order| order[position]);
+        let first = first_faces[first_index];
         paired.clear();
         second_bvh.overlapping(
             first_bounds[first_index],
@@ -1632,6 +1686,7 @@ fn build_imprints_with_carrier_seeds(
             &mut paired,
         );
         paired.sort_unstable();
+        order_sections(&mut paired, &second_faces, "second");
         let debug_pairs = std::env::var("BREP_DEBUG_PAIRS").is_ok();
         if debug_pairs {
             eprintln!(
@@ -1678,7 +1733,8 @@ fn build_imprints_with_carrier_seeds(
             // A proof recorded, not acted on (the pair is imprinted as
             // before): two exact concentric analytic carriers whose surfaces
             // cannot meet (the walls of a closed hollow of a revolved solid).
-            if concentric_carriers_apart(&first.face.surface, &second.face.surface, options.tolerance * 10.0) {
+            let concentric_apart = concentric_carriers_apart(&first.face.surface, &second.face.surface, options.tolerance * 10.0);
+            if concentric_apart {
                 proved_apart_pairs.insert((first_index, second_index));
             }
             if pair_classification.relation == SurfacePairRelation::Disjoint {
@@ -1700,8 +1756,13 @@ fn build_imprints_with_carrier_seeds(
             // the strict reconstruction test misses (partial overlaps,
             // differing parameterizations); both route to the boundary-curve
             // exchange below.
-            let is_cosurface = pair_classification.relation == SurfacePairRelation::Cosurface
-                || cosurface_pair(&first.face.surface, &second.face.surface, options.tolerance)?;
+            // `BREP_COSURFACE_EXACT_APART` (default off, `=1` on): two exact
+            // concentric carriers proved apart by more than the On band
+            // (coaxial cylinders 2.1e-6 apart in radius) are two surfaces,
+            // whatever the sampled reading's band (1e-5) says.
+            let is_cosurface = !(concentric_apart && crate::switch!("BREP_COSURFACE_EXACT_APART", false))
+                && (pair_classification.relation == SurfacePairRelation::Cosurface
+                    || cosurface_pair(&first.face.surface, &second.face.surface, options.tolerance)?);
             profile.cosurface += profile.lap(&mut lap_start);
             if is_cosurface {
                 if debug_pairs {
@@ -1823,7 +1884,18 @@ fn build_imprints_with_carrier_seeds(
                     }
                 };
                 let lane_fits = profile.enabled.then(crate::PcurveFitScope::open);
-                builder.process_curve(
+                // PLANAR-ISO TANGENT TOUCH (`BREP_PLANAR_ISO_TANGENT_TOUCH`,
+                // default on, =0 restores): the plane's iso circle is as exact
+                // as the analytic lane's, so it is processed as an exact
+                // section and an EXTERNAL touch of an edge in passing becomes
+                // a junction (TANGENT TOUCH in `process_curve`). A plate already holding
+                // two holes, less a third tangent to both: the third circle
+                // touched the two hole rims and stayed one piece, whose
+                // midpoint lay on one of the touches and read On the boundary,
+                // so the circle was dropped and the disc kept.
+                builder.exact_section = planar_iso_tangent_touch_enabled();
+                builder.external_touch_only = true;
+                let processed = builder.process_curve(
                     curve,
                     first,
                     second,
@@ -1831,7 +1903,10 @@ fn build_imprints_with_carrier_seeds(
                     &[first, second],
                     true,
                     exact_pcurves,
-                )?;
+                );
+                builder.exact_section = false;
+                builder.external_touch_only = false;
+                processed?;
                 if let Some(scope) = lane_fits {
                     profile.exact_lane_fits += scope.close().fits;
                 }
@@ -2556,6 +2631,74 @@ fn build_imprints_with_carrier_seeds(
             if let Some(started) = rescue_started {
                 profile.rescue_march += started.elapsed();
             }
+            // A surviving grid branch does not establish completeness. Append
+            // proven trim pierces after the ordinary starts, retaining their
+            // admission bound and every branch already returned by the march.
+            // Seed ordering and consumption can alter earlier branches, so
+            // those modes retain their existing behavior here.
+            let complete_grazing = switch!("BREP_GRAZING_BRANCH_COMPLETION", true);
+            let check_completion = switch!("BREP_GRAZING_BRANCH_COMPLETION_CHECK", false);
+            if (complete_grazing || check_completion)
+                && !branches.is_empty() && seed_points.is_empty() && !grazing_hits.is_empty()
+                && options.tangent_curve_lane && !ordered_starts && !consume_starts
+            {
+                let completed = (|| -> Result<_, KernelRefusal> {
+                    let mut pierces: Vec<Vec3> = Vec::new();
+                    for &(point, _, _, edge_id, t, on_first) in &grazing_hits {
+                        let (owner, other_march) = if on_first { (first, second_march) } else { (second, first_march) };
+                        let Some(edge) = face_edge_lists[&owner.key()].iter().find(|edge| edge.id == edge_id) else {
+                            continue;
+                        };
+                        if edge_crosses_carrier(edge, &face_edge_lists[&owner.key()], t, other_march, options.tolerance)?
+                            && !(super::support::near_end_snap_enabled()
+                                && pierce_is_end_contact(edge, t, point, other_march, options.tolerance)?)
+                            && !pierces.iter().any(|seen| seen.sub(point).length() <= options.tolerance)
+                            && inside_both_trims(point, first, second)?
+                        {
+                            pierces.push(point);
+                        }
+                    }
+                    if pierces.is_empty() { return Ok(None); }
+                    let bound = (options.tolerance / (2.0 * builder.scale.max(options.tolerance))).sqrt();
+                    let extended = super::work_profile::trace(
+                        first_march, second_march,
+                        &SurfaceIntersectionOptions {
+                            tolerance: options.tolerance,
+                            maximum_step: march_maximum_step(&pair_classification, options.maximum_ssi_step, builder.scale),
+                            seed_points: pierces.clone(),
+                            seed_only: false,
+                            seed_start_cross: Some(bound),
+                            span_budget: march_span_budget,
+                            ordered_starts,
+                            consume_starts,
+                            tree_seeds,
+                            ..Default::default()
+                        },
+                    ).or_refuse(KernelStage::Intersect, "grazing branch completion")?;
+                    Ok(Some((pierces, extended)))
+                })();
+                match completed {
+                    Ok(Some((pierces, extended))) => {
+                        let preserved = preserves_branch_prefix(&branches, &extended);
+                        let added = extended.len().saturating_sub(branches.len());
+                        if check_completion || debug_pairs {
+                            eprintln!("grazing completion {}x{}: pierces={} branches={}->{} prefix_preserved={preserved} added={added} enabled={complete_grazing}",
+                                first.face.id, second.face.id, pierces.len(), branches.len(), extended.len());
+                        }
+                        if complete_grazing && preserved && added > 0 {
+                            branches = extended;
+                            seed_points.extend(pierces);
+                            grazing_march = true;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if check_completion || debug_pairs {
+                            eprintln!("grazing completion {}x{}: retained original branches after {error}", first.face.id, second.face.id);
+                        }
+                    }
+                }
+            }
             // CROSSING-NODE SPLIT (`BREP_SSI_NODE_SPLIT`, default on, `=0` off;
             // `intersect/crossing_node.rs`): a branch the marcher carried
             // through a saddle tangent node is cut at every passage, so the
@@ -3202,6 +3345,7 @@ fn build_imprints_with_carrier_seeds(
                             }
                         };
                         let process_started = profile.enabled.then(Instant::now);
+                        builder.marched_section = true;
                         builder.process_curve(
                             section_curve,
                             first,
@@ -3211,6 +3355,7 @@ fn build_imprints_with_carrier_seeds(
                             true,
                             exact_pcurves,
                         )?;
+                        builder.marched_section = false;
                         if let Some(started) = process_started {
                             profile.process += started.elapsed();
                         }
@@ -3234,6 +3379,19 @@ fn build_imprints_with_carrier_seeds(
     }
     for (span, first, second, target) in deferred_boundary_spans {
         builder.process_curve(span, first, second, &[target], &[target], false, None)?;
+    }
+    let discover = switch!("BREP_PLANAR_SECTION_END_DISCOVERY", false);
+    let check_discovery = switch!("BREP_PLANAR_SECTION_END_DISCOVERY_CHECK", false);
+    if !open_carriers && (discover || check_discovery) {
+        let all_faces: Vec<_> = first_faces.iter().chain(&second_faces).copied().collect();
+        if discover {
+            builder.replay_planar_sections(&all_faces, check_discovery)?;
+        } else {
+            let mut probe = builder.clone();
+            if let Err(error) = probe.replay_planar_sections(&all_faces, true) {
+                eprintln!("planar local discovery: replay refused: {error}");
+            }
+        }
     }
     if let Some(scope) = pairs_fits {
         profile.pairs_fits = scope.close().fits;
@@ -3468,7 +3626,8 @@ fn build_imprints_with_carrier_seeds(
                         } else {
                             tail_feature_scale.cap(ends[index][0], weld).min(tail_feature_scale.cap(ends[index][1], weld))
                         };
-                        max_curve_deviation(&a.curve, &b.curve)? <= weld
+                        !distinct_exact_circles(&a.curve, &b.curve)?
+                            && max_curve_deviation(&a.curve, &b.curve)? <= weld
                             && max_curve_deviation(&b.curve, &a.curve)? <= weld
                     };
                 if coincide {
@@ -3519,6 +3678,7 @@ fn build_imprints_with_carrier_seeds(
     // bridge pieces' endpoints (existing crossing/stub vertices) fold into the
     // same junction merges as every other section.
     lap("coincident_merge", &mut tail_lap, &mut tail_fits, &mut tail_ms);
+
     extend_truncated_sections(
         &mut result,
         &face_edge_lists,
@@ -3528,6 +3688,7 @@ fn build_imprints_with_carrier_seeds(
         options.tolerance,
     )?;
     lap("extend_truncated", &mut tail_lap, &mut tail_fits, &mut tail_ms);
+
     canonicalize_imprint_junctions(
         &mut result,
         solid_a,
@@ -3544,6 +3705,7 @@ fn build_imprints_with_carrier_seeds(
         self_pairs.is_none(),
     )?;
     lap("canonicalize", &mut tail_lap, &mut tail_fits, &mut tail_ms);
+
     // ONE RIM, ONE EDGE: with vertex identity final, dissolve the section
     // vertices that no operand edge passes through — the marcher's own
     // parameterization origin, which `process_curve` cannot tell from a
@@ -4822,4 +4984,131 @@ fn concentric_carriers_apart(first: &NurbsSurface, second: &NurbsSurface, band: 
         }
         _ => false,
     }
+}
+
+/// Whether two pieces are two different exact curves (`BREP_COINCIDENT_MERGE_EXACT_CIRCLES`,
+/// default off, `=1` on): each recognized as a circle to round-off (its
+/// sampled residual within 1e-9 of its chord, at least 1, and 1e-13 of its
+/// distance from the origin: an analytic lane's section, not a fit), and a point of one
+/// standing off the other's whole circle by more than round-off (1e-8 of the
+/// larger chord, at least 1, and 1e-12 of that distance). Exact pieces of one locus lie on
+/// one circle to round-off, wherever each arc ends; arcs within the weld of
+/// each other but off each other's circles are two curves however close they
+/// run: a lens 1.8e-6 deep between two crossing circles is bounded by two of
+/// them. The recognized centres are not compared with each other (a short
+/// arc's fitted centre moves by far more than its residual); each circle is
+/// read only where its own arc runs. Pieces that are not both exact circles
+/// are left to the weld.
+
+fn distinct_exact_circles(a: &NurbsCurve, b: &NurbsCurve) -> Result<bool, KernelRefusal> {
+    if !crate::switch!("BREP_COINCIDENT_MERGE_EXACT_CIRCLES", false) {
+        return Ok(false);
+    }
+    // The acceptance residual follows the arc's chord as the band below
+    // does: a conic that is no circle but sits within a radius-scaled
+    // residual of one would then read off its own fitted circle.
+    let circle = |curve: &NurbsCurve| -> Option<(crate::RecognizedCircle, f64)> {
+        let [t0, t1] = curve.domain().ok()?;
+        let (start, end) = (curve.evaluate(t0).ok()?, curve.evaluate(t1).ok()?);
+        let reach = start.length().max(end.length());
+        let found = crate::recognize_circle(curve, t0, t1, f64::INFINITY)?;
+        let residual = 1e-9 * start.sub(end).length().max(1.0) + 1e-13 * reach;
+        (found.worst <= residual).then_some((found, reach))
+    };
+    let (Some((first, reach_a)), Some((second, reach_b))) = (circle(a), circle(b)) else { return distinct_exact_conics(a, b) };
+    // The band follows the arcs' own size, not their radius: the flat end of
+    // a long ellipse (a plane nearly along a cylinder) reads as an arc of a
+    // circle hundreds across, and a band of its radius would swallow a lens.
+    let chord = |curve: &NurbsCurve| -> f64 {
+        curve.domain().ok().and_then(|[t0, t1]| Some(curve.evaluate(t0).ok()?.sub(curve.evaluate(t1).ok()?).length())).unwrap_or(0.0)
+    };
+    let band = 1e-8 * chord(a).max(chord(b)).max(1.0) + 1e-12 * reach_a.max(reach_b);
+    // How far `curve`'s points stand off `circle` (the whole circle).
+    let off = |curve: &NurbsCurve, circle: &crate::RecognizedCircle| -> f64 {
+        let Ok([t0, t1]) = curve.domain() else { return 0.0 };
+        (0..=32)
+            .filter_map(|i| curve.evaluate(t0 + (t1 - t0) * i as f64 / 32.0).ok())
+            .map(|point| {
+                let offset = point.sub(circle.centre);
+                let height = offset.dot(circle.axis);
+                let radial = offset.sub(circle.axis.scale(height)).length();
+                ((radial - circle.radius).powi(2) + height * height).sqrt()
+            })
+            .fold(0.0, f64::max)
+    };
+    Ok(off(b, &first) > band || off(a, &second) > band)
+}
+
+/// [`distinct_exact_circles`] for pieces that are not both circles: each a
+/// planar rational quadratic (or a line), as an analytic lane writes a plane's
+/// section of a quadric (a fitted or marched section is cubic), and a point of
+/// one standing off the other by more than round-off (1e-8 of the larger span
+/// and 1e-12 of the distance from the origin) where its foot falls inside the
+/// other's span (an overhang past the other's end is no second curve). A plane
+/// nearly along a lens 2.3e-6 thick cuts its two walls in two ellipse arcs
+/// within the weld of each other.
+fn distinct_exact_conics(a: &NurbsCurve, b: &NurbsCurve) -> Result<bool, KernelRefusal> {
+    let shape = |curve: &NurbsCurve| -> Option<(f64, f64)> {
+        if curve.degree > 2 {
+            return None;
+        }
+        let points: Vec<Vec3> = curve.control_points.iter().filter_map(|p| p.point().ok()).collect();
+        if points.len() != curve.control_points.len() || points.len() < 2 {
+            return None;
+        }
+        let reach = points.iter().fold(0.0f64, |m, p| m.max(p.length()));
+        let span = points.iter().fold(0.0f64, |m, p| m.max(p.sub(points[0]).length()));
+        // Planar: every control point on the plane of the first and the two
+        // farthest from it (a line is planar).
+        let mut normal = Vec3::new(0.0, 0.0, 0.0);
+        for i in 1..points.len() {
+            for j in (i + 1)..points.len() {
+                let candidate = points[i].sub(points[0]).cross(points[j].sub(points[0]));
+                if candidate.length() > normal.length() {
+                    normal = candidate;
+                }
+            }
+        }
+        if let Ok(unit) = normal.normalized() {
+            let flat = 1e-12 * reach + 1e-10 * span;
+            if points.iter().any(|p| p.sub(points[0]).dot(unit).abs() > flat) {
+                return None;
+            }
+        }
+        Some((span, reach))
+    };
+    let (Some((span_a, reach_a)), Some((span_b, reach_b))) = (shape(a), shape(b)) else { return Ok(false) };
+    let band = 1e-8 * span_a.max(span_b).max(1.0) + 1e-12 * reach_a.max(reach_b);
+    let off = |curve: &NurbsCurve, other: &NurbsCurve| -> Result<f64, KernelRefusal> {
+        let [t0, t1] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+        let [o0, o1] = other.domain().or_refuse(KernelStage::Intersect, "domain")?;
+        let margin = 1e-9 * (o1 - o0).abs();
+        let mut worst = 0.0f64;
+        for i in 1..32 {
+            let point = curve.evaluate(t0 + (t1 - t0) * i as f64 / 32.0).or_refuse(KernelStage::Intersect, "evaluate")?;
+            let Ok(foot) = crate::project_point_to_curve(other, point) else { continue };
+            // The projector stops near 1e-7; Newton on (C(u) - p)·C'(u) takes
+            // the foot to round-off before its distance is read.
+            let mut u = foot.u;
+            for _ in 0..8 {
+                let Ok(d) = other.derivatives(u, 2) else { break };
+                let gap = d[0].sub(point);
+                let slope = d[1].dot(d[1]) + gap.dot(d[2]);
+                if !(slope.abs() > 0.0) {
+                    break;
+                }
+                let step = gap.dot(d[1]) / slope;
+                u = (u - step).clamp(o0.min(o1), o0.max(o1));
+                if step.abs() <= 1e-15 * (o1 - o0).abs() {
+                    break;
+                }
+            }
+            let Ok(at) = other.evaluate(u) else { continue };
+            if u > o0.min(o1) + margin && u < o0.max(o1) - margin {
+                worst = worst.max(at.sub(point).length().min(foot.distance));
+            }
+        }
+        Ok(worst)
+    };
+    Ok(off(b, a)? > band || off(a, b)? > band)
 }

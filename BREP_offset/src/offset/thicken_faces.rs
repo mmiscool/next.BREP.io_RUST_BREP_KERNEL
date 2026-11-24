@@ -293,7 +293,7 @@ pub fn thicken_sheet_faces(faces: &[BrepSolid], thickness: f64, corners: OffsetC
     boolean_operation_nary(&operands, BooleanOperation::Subtract)
 }
 
-/// `BREP_THICKEN_GLUE` (default on since the tier P promotion of
+/// `BREP_THICKEN_GLUE` (default on since the promotion of
 /// 2026-11-20; `=0` restores the union): the parts of a sheet thickened across
 /// open creases only (slabs, crease fills, corner fills; no closing or smooth
 /// crease, no cut, no wedge past an axis) touch only along whole faces, a

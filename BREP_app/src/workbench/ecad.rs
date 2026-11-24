@@ -1,10 +1,11 @@
 //! The eCAD editors, and their actions as workbench buttons.
 //!
-//! Five workbenches host eCAD (`brep_ecad_egui`): **Harness diagram** runs its
-//! sheet [`Editor`] on a wiring document; **PCB diagram** and **PCB** run ONE
-//! sheet-and-board editor on a schematic document, each pinned to one of its two
-//! views (the schematic, the board: [`BENCHES`]); **Symbol** and **Pads** run its
-//! [`SymbolEditor`] and [`FootprintEditor`]. eCAD keeps every toolbar command as data
+//! Five workbenches host eCAD (`brep_ecad_egui`): **Harness diagram**, **PCB
+//! diagram** and **PCB** run ONE sheet-and-board [`Editor`] on the assembly's one
+//! sheet (`brep_ecad_core::sheet`: the board's schematic and the harness wiring
+//! round it), each holding it in its own view and tools ([`BENCHES`]: the harness
+//! tools on the sheet, the net tools on the sheet, the board); **Symbol** and
+//! **Pads** run its [`SymbolEditor`] and [`FootprintEditor`]. eCAD keeps every toolbar command as data
 //! ([`brep_ecad_egui::Action`]), with predicates over the editor saying whether it is
 //! offered, enabled and pressed, and what its button says. The workbench
 //! buttons here are those actions: each button asks eCAD's own predicate about
@@ -54,10 +55,12 @@ use brep_ecad_egui::{Action, Editor, FootprintEditor, SymbolEditor};
 /// runs on. The app keeps one per document, beside its engine, so each tab has
 /// its own diagram and board and a tab switch keeps them.
 pub struct Editors {
-    /// The Diagram workbench's editor, on a wiring document.
-    pub diagram: Editor,
-    /// The PCB workbench's editor, on a schematic document with its board.
+    /// The sheet-and-board editor of Harness diagram, PCB diagram and PCB, on the
+    /// assembly's sheet (`DocumentKind::Sheet`), which the host keeps as its `pcb`
+    /// and `diagram` blocks.
     pub pcb: Editor,
+    /// What joins the `pcb` and `diagram` blocks into the sheet `pcb` edits.
+    pub sheet: crate::document::ecad::SheetState,
     /// The Symbol workbench's editor: the part's schematic symbol.
     pub symbol: SymbolEditor,
     /// The Pads workbench's editor: the part's footprint pads.
@@ -80,13 +83,11 @@ impl Editors {
     /// document's assembly places (`panels::ecad_parts`); no symbols ship with
     /// the editors.
     pub fn new() -> Self {
-        let mut diagram = Editor::default();
-        diagram.set_document(brep_ecad_core::Document::new(brep_ecad_core::DocumentKind::Wiring));
         let mut pcb = Editor::default();
-        pcb.set_document(brep_ecad_core::Document::new(brep_ecad_core::DocumentKind::Schematic));
+        pcb.set_document(brep_ecad_core::Document::new(brep_ecad_core::DocumentKind::Sheet));
         Self {
-            diagram,
             pcb,
+            sheet: Default::default(),
             symbol: SymbolEditor::blank(),
             pads: FootprintEditor::new(Default::default(), None, Vec::new()),
             focus: None,
@@ -100,13 +101,17 @@ impl Editors {
     /// already held costs nothing (`Editor::set_view` returns at once). An
     /// autorouter run survives the switch: `set_view` puts down only the
     /// gesture in hand, and the run goes on whenever the board is drawn again.
+    ///
+    /// The tools follow too: Harness diagram holds the sheet's harness tools up,
+    /// PCB diagram its net tools. A change of tools puts down the gesture in hand,
+    /// since a wire half drawn as one kind cannot finish as the other.
     pub fn pin_view(&mut self, id: &str) {
-        let Some(Bench { target, view: Some(view), .. }) = bench(id).copied() else { return };
-        match target {
-            Target::Diagram => self.diagram.set_view(view),
-            Target::Pcb => self.pcb.set_view(view),
-            Target::Symbol | Target::Pads => {}
+        let Some(Bench { target: Target::Pcb, view: Some(view), harness, .. }) = bench(id).copied() else { return };
+        if self.pcb.harness_tools != harness {
+            self.pcb.run_action("sheet.cancel");
+            self.pcb.harness_tools = harness;
         }
+        self.pcb.set_view(view);
     }
 
     /// Ask `target`'s editor to select the pin or pad numbered `number` the
@@ -133,8 +138,8 @@ impl Editors {
     /// Route selection keys to the visible editor even when the pointer is in a dock.
     pub fn selection_key(&mut self, target: Target, delete: bool) {
         match target {
-            Target::Diagram | Target::Pcb => {
-                let editor = if target == Target::Diagram { &mut self.diagram } else { &mut self.pcb };
+            Target::Pcb => {
+                let editor = &mut self.pcb;
                 let action = match (editor.view, delete) {
                     (brep_ecad_egui::View::Board, true) => "board.delete",
                     (brep_ecad_egui::View::Board, false) => "board.cancel",
@@ -156,28 +161,27 @@ impl Default for Editors {
     }
 }
 
-/// Which of the four editors a button acts on. Each is one editor over one
-/// document block; a workbench reaches one through [`BENCHES`], and two
-/// workbenches (PCB diagram and PCB) reach the same one.
+/// Which of the three editors a button acts on. A workbench reaches one through
+/// [`BENCHES`], and three workbenches (Harness diagram, PCB diagram and PCB)
+/// reach the sheet-and-board one, [`Target::Pcb`], which keeps its sheet in the
+/// `pcb` and `diagram` blocks; the other two keep theirs in one block each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
-    Diagram,
     Pcb,
     Symbol,
     Pads,
 }
 
 impl Target {
-    pub const ALL: [Target; 4] = [Target::Diagram, Target::Pcb, Target::Symbol, Target::Pads];
+    pub const ALL: [Target; 3] = [Target::Pcb, Target::Symbol, Target::Pads];
 
     /// The key of the document block this editor's document is kept in
-    /// (`diagram`, `pcb`, `symbol`, `pads`), which is also the workbench a jump
-    /// to this editor opens. The pcb block has two workbenches; this names the
-    /// board's. Where the ACTIVE workbench is what is meant — a button id's
+    /// (`pcb`, `symbol`, `pads`), which is also the workbench a jump to this
+    /// editor opens. The sheet has three workbenches and a second block
+    /// (`diagram`); this names the board's. Where the ACTIVE workbench is what is meant — a button id's
     /// prefix, the target `ecad_state` reports — read the workbench id itself.
     pub fn workbench_id(self) -> &'static str {
         match self {
-            Target::Diagram => "diagram",
             Target::Pcb => "pcb",
             Target::Symbol => "symbol",
             Target::Pads => "pads",
@@ -200,17 +204,19 @@ pub struct Bench {
     pub workbench: &'static str,
     pub target: Target,
     pub view: Option<brep_ecad_egui::View>,
+    /// The sheet's harness tools rather than its net tools (`Editor::harness_tools`).
+    pub harness: bool,
 }
 
-/// Every eCAD workbench. PCB diagram (`schematic`) and PCB (`pcb`) are the one
-/// schematic document's two views, each its own workbench: the schematic's
-/// tools on one row, the board's on the other.
+/// Every eCAD workbench. Harness diagram (`diagram`), PCB diagram (`schematic`)
+/// and PCB (`pcb`) are the one sheet's three ways in, each its own workbench:
+/// the harness tools on the sheet, the net tools on the sheet, and the board.
 pub const BENCHES: [Bench; 5] = [
-    Bench { workbench: "diagram", target: Target::Diagram, view: None },
-    Bench { workbench: "schematic", target: Target::Pcb, view: Some(brep_ecad_egui::View::Schematic) },
-    Bench { workbench: "pcb", target: Target::Pcb, view: Some(brep_ecad_egui::View::Board) },
-    Bench { workbench: "symbol", target: Target::Symbol, view: None },
-    Bench { workbench: "pads", target: Target::Pads, view: None },
+    Bench { workbench: "diagram", target: Target::Pcb, view: Some(brep_ecad_egui::View::Schematic), harness: true },
+    Bench { workbench: "schematic", target: Target::Pcb, view: Some(brep_ecad_egui::View::Schematic), harness: false },
+    Bench { workbench: "pcb", target: Target::Pcb, view: Some(brep_ecad_egui::View::Board), harness: false },
+    Bench { workbench: "symbol", target: Target::Symbol, view: None, harness: false },
+    Bench { workbench: "pads", target: Target::Pads, view: None, harness: false },
 ];
 
 /// The eCAD workbench `id` names, or `None` for any other workbench.
@@ -233,7 +239,7 @@ pub const INSPECTOR_PANEL_ID: &str = "ecadInspector";
 /// and `pads.*` are eCAD's own.
 pub fn split(id: &str) -> Option<(Target, &str)> {
     if let Some(action) = id.strip_prefix("diagram.") {
-        Some((Target::Diagram, action))
+        Some((Target::Pcb, action))
     } else if let Some(action) = id.strip_prefix("schematic.") {
         Some((Target::Pcb, action))
     } else if let Some(action) = id.strip_prefix("pcb.") {
@@ -259,7 +265,7 @@ pub const BREP_OWN: &[&str] = &[];
 pub fn ecad_action(id: &str) -> Option<(Target, &str)> {
     let (target, action) = split(id)?;
     let known = match target {
-        Target::Diagram | Target::Pcb => brep_ecad_egui::actions().any(|a| a.id == action),
+        Target::Pcb => brep_ecad_egui::actions().any(|a| a.id == action),
         Target::Symbol => brep_ecad_egui::symbol_actions().iter().any(|a| a.id == action),
         Target::Pads => brep_ecad_egui::pad_actions().iter().any(|a| a.id == action),
     };
@@ -341,7 +347,6 @@ fn read_in<T: 'static>(
 /// eCAD's reading of `action` on `target`'s editor in `editors`.
 fn read(editors: &Editors, target: Target, action: &str) -> Option<Reading> {
     match target {
-        Target::Diagram => read_in(brep_ecad_egui::actions(), &editors.diagram, action),
         Target::Pcb => read_in(brep_ecad_egui::actions(), &editors.pcb, action),
         Target::Symbol => read_in(brep_ecad_egui::symbol_actions().iter(), &editors.symbol, action),
         Target::Pads => read_in(brep_ecad_egui::pad_actions().iter(), &editors.pads, action),
@@ -427,7 +432,6 @@ fn dispatch_in(registry: &[&'static super::Workbench], editors: &mut Editors, id
     }
     let (target, action) = ecad_action(id)?;
     Some(match target {
-        Target::Diagram => editors.diagram.run_action(action),
         Target::Pcb => editors.pcb.run_action(action),
         Target::Symbol => editors.symbol.run_action(action),
         Target::Pads => editors.pads.run_action(action),

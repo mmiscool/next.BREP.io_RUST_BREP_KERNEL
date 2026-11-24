@@ -202,7 +202,7 @@ pub use brep_blend::blend::{
 pub use brep_blend::fillet::{
     chamfer_edge, chamfer_edge_angle, chamfer_edge_asymmetric, chamfer_edges_angle,
     chamfer_edges_asymmetric, chamfer_edges_asymmetric_linear, fillet_edge, fillet_edge_conic, fillet_edges, fillet_edges_conic, fillet_edges_conic_distances, fillet_edges_conic_setback, fillet_edges_reported, fillet_edges_reported_at_offset,
-    fillet_edge_g2, fillet_edges_g2, fillet_faces, full_round, fillet_edges_radii, fillet_edges_setback, fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
+    fillet_edge_g2, fillet_edges_g2, fillet_faces, full_round, fillet_edges_radii, fillet_edges_setback, fillet_edges_setback_g2, fillet_edges_variable, fillet_edges_variable_law, fillet_edges_variable_vertex_radii,
     BlendSelection,
 };
 pub use brep_blend::law::{LawSegment, RadiusLaw};
@@ -431,7 +431,7 @@ static RUSTY_ALLOC: wall_profile::Allocator<rusty_alloc_api::RustyAlloc> = wall_
 mod draft_roof;
 #[path = "blending/fillet_tangent_chains.rs"]
 mod fillet_tangent_chains;
-pub use fillet_tangent_chains::{fillet_edges_tangent_chains, fillet_edges_with_options, FilletOptions};
+pub use fillet_tangent_chains::{chamfer_edges_with_options, fillet_edges_tangent_chains, fillet_edges_with_options, ChamferOptions, FilletOptions};
 pub use draft_roof::{extrude_profile_brep_draft_roof, DRAFT_ROOF_REFUSAL};
 // The Rust feature-history execution engine (migration-plan Stage 4/5 foundation).
 // Deserializes the serialized `{ type, inputParams, ... }` descriptor shape, runs
@@ -481,7 +481,8 @@ pub use feature_pipeline::part_pins::{
 // SEAT, the frame a point's placement is an offset in, with the two mappings
 // an editor needs to put a gizmo on one and write the drag back.
 pub use feature_pipeline::ports::{
-    address as port_address, document_is_boundary, seat_of as port_seat_of, seat_point,
+    address as port_address, contact_body_axis, contact_body_end, contact_body_solid, document_is_boundary,
+    seat_of as port_seat_of, seat_point, ContactAxis as PortContactAxis, ContactRule as PortContactRule, PortContactRow,
     seat_vector, seated_direction, split_address, unit_map, unseat_point, unseat_vector,
     world_seat, PortDeclaration, PortPoint, PortPointRow, PortSeat, PortsReport, UnitProblem,
     BOUNDARY_KEY, PORTS_BLOCK, PORTS_FEATURE_ID, PORTS_FEATURE_TYPE,
@@ -536,6 +537,7 @@ pub use feature_pipeline::{
     add_part_to_library, add_part_to_library_impl, install_parts_library, missing_library_parts,
     parts_library_json, parts_library_map, parts_library_revision, refresh_library_entry,
     refresh_library_entry_impl, same_build, follow_saved_rows, follow_saved_rows_known, kernel_source_stamp, stable_json_hash, PartsLibraryEntry, PartsLibraryMap,
+    part_pin_geometry, PartPinGeometry,
 };
 // Assembly constraint state + exported ABI (state/statuses/DOF/overlay reads,
 // constraint CRUD with auto-solve, the document pose/isFixed write-back fold).
@@ -718,5 +720,3 @@ pub(crate) fn clear_reading_memos() {
     crate::imprint::clear_window_memo();
     crate::imprint::clear_touch_memo();
 }
-
-

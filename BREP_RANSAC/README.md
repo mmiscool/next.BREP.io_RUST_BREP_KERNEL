@@ -1,5 +1,7 @@
 # BREP_RANSAC
 
+Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_RANSAC` · [licence summary](#licence)
+
 `BREP_RANSAC` is the kernel-free analytic surface recognizer of the BREP crate
 family. Its Rust library target is `brep_ransac`.
 
@@ -43,3 +45,14 @@ angle, sampling mode, thread count and an optional deterministic seed.
 
 The public package contains production sources, the manifest, README, and license.
 Runtime dependencies are `serde` and `web-time`.
+
+## Licence
+
+In plain words: the crates are free to use as they are, including in a commercial project. If you
+fix or change something in the kernel, send the change back as a pull request to
+[github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL). If you do not want to share your
+changes, buy a commercial licence from [Autodrop3d LLC](https://autodrop3d.com); with it you never
+have to share your code back.
+
+The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the manifest) and at
+[LICENSE.md](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL/blob/master/LICENSE.md); if this summary and the file ever differ, the file wins.

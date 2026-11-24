@@ -46,6 +46,9 @@ pub const STATED_PRECISION_INCONSISTENCY_RATIO: f64 = 10.0;
 /// Measurement keys the report always carries when the file states a
 /// precision, so a caller can read the comparison whether or not it fired.
 pub const STATED_PRECISION_MM: &str = "import.stated_precision_mm";
+/// The vertex identity band, in mm, a file that states no usable precision
+/// was read at (`Resolver::unstated_identity_band`, `BREP_STEP_UNSTATED_PRECISION_BAND`).
+pub const UNSTATED_IDENTITY_BAND_MM: &str = "import.unstated_identity_band_mm";
 pub const STATED_PRECISION_TIGHTEST_MM: &str = "import.stated_precision_tightest_mm";
 pub const MEASURED_EDGE_DEVIATION_MM: &str = "import.measured_edge_deviation_mm";
 pub const MEASURED_VERTEX_GAP_MM: &str = "import.measured_vertex_gap_mm";

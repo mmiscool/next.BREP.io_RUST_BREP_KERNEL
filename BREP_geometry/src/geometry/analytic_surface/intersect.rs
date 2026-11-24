@@ -1484,7 +1484,10 @@ fn intersect_plane_quadric(
             let circle = frame_circle(frame, reference_rho, reference_z)?;
             let k = plane.origin.sub(apex).dot(plane.normal);
             if k.abs() <= tolerance {
-                // Plane through the apex: line pair; leave to the marcher.
+                // Plane through the apex: none, one (tangent) or two rulings.
+                if cone_apex_plane_rulings_enabled() {
+                    return cone_apex_plane_rulings(plane, frame, *rho0, *rho1, *height, apex, apex_t, tolerance);
+                }
                 return None;
             }
             let normal = plane.normal;
@@ -1636,6 +1639,80 @@ fn section_within_band(
     max_z >= band_low - margin && min_z <= band_high + margin
 }
 
+/// `BREP_CONE_APEX_PLANE_RULINGS` (default on, `=0` restores the marcher): a
+/// plane through a cone's apex is answered by [`cone_apex_plane_rulings`].
+fn cone_apex_plane_rulings_enabled() -> bool {
+    crate::switch!(live "BREP_CONE_APEX_PLANE_RULINGS", true)
+}
+
+/// A plane through the apex of a cone or frustum meets its double cone in
+/// rulings, in closed form. Measured from the apex along the axis toward the
+/// band, the cone's cross-section at distance `z` is a circle of radius
+/// `z tan α`, and the plane's trace there stands `z cot β` from the axis, `β`
+/// the angle between the axis and the plane's normal. The plane dips into the
+/// cone by `z (tan α − cot β)` at most, at the band's far end: within the
+/// tolerance it is a tangent plane resting on one ruling, or touching only
+/// the apex, and no section is returned, as
+/// [`cylinder_parallel_plane_lines`] does for a plane resting on a cylinder.
+/// Marching that tangency instead traces a ruling a square root of round-off
+/// off the true one, which reads as a crossing of a few micro-radians and
+/// classifies one side of the resting cone inside the plane's solid. Deeper,
+/// the two rulings making the cone's half-angle with the axis inside the
+/// plane are returned over the band.
+#[allow(clippy::too_many_arguments)]
+fn cone_apex_plane_rulings(
+    plane: &PlaneData,
+    frame: &RevolutionFrame,
+    rho0: f64,
+    rho1: f64,
+    height: f64,
+    apex: Vec3,
+    apex_t: f64,
+    tolerance: f64,
+) -> Option<Vec<NurbsCurve>> {
+    if !(apex_t.is_finite() && height.is_finite()) || height == 0.0 {
+        return None;
+    }
+    let normal = plane.normal.normalized().ok()?;
+    // The axial distances of the band's ends from the apex, and the axis
+    // turned to point from the apex into the band.
+    let apex_z = height * apex_t;
+    let (end_a, end_b) = ((0.0 - apex_z).abs(), (height - apex_z).abs());
+    let (near, far) = (end_a.min(end_b), end_a.max(end_b));
+    let toward = if 0.5 * height - apex_z >= 0.0 { 1.0 } else { -1.0 };
+    let axis = frame.axis.normalized().ok()?.scale(toward);
+    let tan_alpha = (rho1 - rho0).abs() / height.abs();
+    let cos_alpha = 1.0 / (1.0 + tan_alpha * tan_alpha).sqrt();
+    let along = axis.dot(normal);
+    let in_plane = axis.sub(normal.scale(along));
+    let sin_beta = in_plane.length();
+    if sin_beta <= 1e-12 {
+        // The plane is perpendicular to the axis: it meets the cone at the
+        // apex only (the perpendicular branch above takes the usual case).
+        return Some(Vec::new());
+    }
+    let depth = far * (tan_alpha - along.abs() / sin_beta);
+    if depth <= tolerance {
+        return Some(Vec::new());
+    }
+    // A ruling direction d in the plane with d·axis = cos α: d = cos φ e1 ±
+    // sin φ e2, e1 the axis's in-plane direction, e2 = n × e1.
+    let e1 = in_plane.scale(1.0 / sin_beta);
+    let e2 = normal.cross(e1);
+    let cos_phi = (cos_alpha / sin_beta).min(1.0);
+    let sin_phi = (1.0 - cos_phi * cos_phi).max(0.0).sqrt();
+    // The apex projected onto the plane, so the rulings lie on it exactly.
+    let foot = apex.sub(normal.scale(apex.sub(plane.origin).dot(normal)));
+    let mut lines = Vec::new();
+    for sign in [1.0, -1.0] {
+        let direction = e1.scale(cos_phi).add(e2.scale(sign * sin_phi));
+        let start = foot.add(direction.scale(near / cos_alpha));
+        let end = foot.add(direction.scale(far / cos_alpha));
+        lines.push(crate::make_line(start, end).ok()?);
+    }
+    Some(lines)
+}
+
 fn cylinder_parallel_plane_lines(
     plane: &PlaneData,
     frame: &RevolutionFrame,
@@ -1704,6 +1781,7 @@ fn intersect_sphere_sphere(
     )
     .ok()?])
 }
+
 
 
 

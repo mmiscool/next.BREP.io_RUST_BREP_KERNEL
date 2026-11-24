@@ -134,6 +134,7 @@ pub mod reader_profile;
 #[doc(hidden)]
 pub mod env_read;
 
+
 /// The wasm panic hook every `#[wasm_bindgen]` entry point installs. Replaces
 /// the `console_error_panic_hook` crate for the whole BREP family — reached as
 /// `brep_kernel::panic_hook` and, through the render engine's re-export, as

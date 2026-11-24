@@ -47,7 +47,7 @@ fn finalize_exact_iso_enabled() -> bool {
 /// A reversed pcurve covers the same point pairs in the opposite order. A
 /// reversed edge reflects its range and flips its traversal sense.
 /// `BREP_FINALIZE_REVERSED_ISO`; on by default since
-/// 2026-11-02 (lane O batch 21), `0`/`off` restores the unreversed read only.
+/// 2026-11-02, `0`/`off` restores the unreversed read only.
 fn reversed_iso_image_error(
     surface: &crate::NurbsSurface,
     pcurve: &crate::NurbsCurve,

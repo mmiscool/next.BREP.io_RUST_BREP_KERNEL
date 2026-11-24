@@ -25,6 +25,11 @@ use std::cell::Cell;
 /// census in the tessellator-cost record (2026-10-11): `BREP_TESS_RULING_SEED=0`
 /// is the off lever, unset or anything else on.
 const RULING_SEED_DEFAULT: bool = true;
+/// The most triangles one face's refinement may reach. Each pass can split every interior edge, so
+/// the passes could multiply a face's triangles by millions; a face that needs more than this at the
+/// asked chord is refused with a named error, where it would otherwise exhaust memory. The largest
+/// whole solid the conformance suite's scaled cases mesh within the chord takes about 2.0 million.
+pub(in crate::watertight_tessellation) const MAX_FACE_TRIANGLES: usize = 4_000_000;
 
 /// The relative margin the diagonal must exceed its target by before the
 /// correction fires under the ruling-seed rule.
@@ -533,6 +538,14 @@ pub(in crate::watertight_tessellation) fn refine_interior(
             }
             return Ok(());
         }
+        // Each split adds about two triangles (one in each triangle sharing the edge). A face that
+        // would pass the budget is refused by name rather than refined until memory runs out.
+        let projected = triangles.len() + 2 * splits.len();
+        if projected > MAX_FACE_TRIANGLES {
+            return Err(format!(
+                "tessellation budget: refining this face would take more than {MAX_FACE_TRIANGLES} triangles ({projected} after this pass)"
+            ));
+        }
         let mut next_triangles = Vec::with_capacity(triangles.len() + splits.len() * 2);
         for triangle in triangles.iter() {
             // Split each triangle at every split midpoint on its edges
@@ -777,6 +790,14 @@ fn refine_interior_bounded(
             splits.insert((a, b), vertices.len());
             vertices.push(FaceVertex { uv, position });
             tess_profile(|p| p.splits += 1);
+        }
+        // Each split adds about two triangles (one in each triangle sharing the edge). A face that
+        // would pass the budget is refused by name rather than refined until memory runs out.
+        let projected = triangles.len() + 2 * splits.len();
+        if projected > MAX_FACE_TRIANGLES {
+            return Err(format!(
+                "tessellation budget: refining this face would take more than {MAX_FACE_TRIANGLES} triangles ({projected} after this pass)"
+            ));
         }
         let mut next_triangles = Vec::with_capacity(triangles.len() + splits.len() * 2);
         for triangle in triangles.iter() {

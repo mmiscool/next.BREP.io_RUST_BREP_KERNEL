@@ -159,11 +159,28 @@ fn build(motion: &Motion, ring: &Ring) -> Result<BrepSolid, KernelRefusal> {
     let off = ring.centre.sub(base);
     let reach = off.sub(up.scale(off.dot(up))).length() + ring.core + ring.tube;
     let window = 2.0 * reach;
-    let to_circles = |q: Vec3, near: f64| -> f64 {
+    // The window's sample times about `near` (the same for every point of
+    // one ray).
+    let times = |near: f64| -> Vec<f64> {
         let (a, b) = ((near - window).max(0.0), (near + window).min(length));
         let steps = 64;
-        let ts: Vec<f64> = (0..=steps).map(|k| motion.at_length(a + (b - a) * k as f64 / steps as f64)).collect();
-        let values: Vec<f64> = ts.iter().map(|&t| ring.to_core(motion.to_start(q, t))).collect();
+        (0..=steps).map(|k| motion.at_length(a + (b - a) * k as f64 / steps as f64)).collect()
+    };
+    // Whether q is within the tube of the ring's core circle at some time of
+    // the window: the least distance over the samples, refined about the
+    // nearest by golden section. Only its comparison with the tube is read,
+    // and the refined least is no larger than any sample: a sample within
+    // the tube answers at once.
+    let in_tube = |q: Vec3, ts: &[f64]| -> bool {
+        let steps = ts.len() - 1;
+        let mut values: Vec<f64> = Vec::with_capacity(ts.len());
+        for &t in ts {
+            let value = ring.to_core(motion.to_start(q, t));
+            if value <= ring.tube {
+                return true;
+            }
+            values.push(value);
+        }
         let best = (0..=steps).min_by(|&i, &j| values[i].total_cmp(&values[j])).unwrap_or(0);
         let (mut lo, mut hi) = (ts[best.saturating_sub(1)], ts[(best + 1).min(steps)]);
         let g = 0.5 * (5f64.sqrt() - 1.0);
@@ -185,13 +202,14 @@ fn build(motion: &Motion, ring: &Ring) -> Result<BrepSolid, KernelRefusal> {
                 f2 = at(x2);
             }
         }
-        values[best].min(f1).min(f2)
+        values[best].min(f1).min(f2) <= ring.tube
     };
     let far = reach + ring.tube;
     // Where a ray leaves the slice, to `steps` halvings; `checked`, that it
     // leaves exactly once.
     let leave = |from: Vec3, direction: Vec3, near: f64, steps: usize, checked: bool| -> Result<Vec3, KernelRefusal> {
-        let inside = |r: f64| to_circles(from.add(direction.scale(r)), near) <= ring.tube;
+        let ts = times(near);
+        let inside = |r: f64| in_tube(from.add(direction.scale(r)), &ts);
         if !inside(0.0) || inside(far) {
             return Err(refuse("planar_ring_ray", "a slice does not hold the curve's point, or reaches past the ring"));
         }

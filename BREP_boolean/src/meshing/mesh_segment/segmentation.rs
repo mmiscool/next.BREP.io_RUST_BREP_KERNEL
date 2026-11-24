@@ -429,6 +429,36 @@ const PEEL_KINDS: [(&str, usize); 4] =
 /// the ordinary cascade at the user tolerance.  Cylinders are peeled
 /// first, then cones, then spheres.  Returns the pieces and the triangles
 /// no carrier claimed.
+/// `BREP_SEG_PEEL_DECLINED_SKIP` (default off; PARKED, NOT EXACT): within one
+/// peel pass, a seed facet that lies in a group the pass already grew and
+/// declined (since its last claim) is not grown again; a claim clears the
+/// marks. The premise that such a seed's own growth would be declined too
+/// does not hold: a seed grows its OWN group (its own seed fit and gates), and
+/// on a noisy mesh that group can be claimable. The promotion census
+/// (2026-11-23) found such seeds in check mode on 14 meshes
+/// (jittered and T-junction crossed cylinders, countersunk hole and torus, and
+/// the real fixtures gearbox-keychain and a filleted bracket), the final
+/// conversion changing on 11; marking only groups the cascade accepted as a
+/// plane still missed on the two real fixtures. Do not promote without an
+/// exact formulation. On a gridded fillet band's
+/// compound (30 374 triangles, 15 413 facets) the cone and sphere passes each
+/// regrew the same planar annulus from 438 seeds and declined it every time:
+/// 99 of the segmentation's 103 s. `BREP_SEG_PEEL_DECLINED_SKIP_CHECK` grows
+/// every skipped seed anyway, keeps the full answer, and counts and prints
+/// each skipped seed that would have been claimed ([`PEEL_SKIP_MISSES`]).
+fn peel_declined_skip() -> bool {
+    crate::switch!(live "BREP_SEG_PEEL_DECLINED_SKIP", false)
+}
+
+fn peel_declined_skip_check() -> bool {
+    crate::switch!(live "BREP_SEG_PEEL_DECLINED_SKIP_CHECK", false)
+}
+
+thread_local! {
+    /// Skipped peel seeds whose growth would have been claimed (check mode).
+    pub static PEEL_SKIP_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn peel_carriers(
     data: &MeshData,
     tri_ids: &[u32],
@@ -618,6 +648,7 @@ fn peel_carriers(
         );
     }
     let mut assigned = vec![false; facets.len()];
+    let (skip_declined, skip_check) = (peel_declined_skip(), peel_declined_skip_check());
     let mut pieces: Vec<(Vec<u32>, RegionOutcome)> = Vec::new();
     // A torus seed is tried once across all rounds: the rounds exist for a
     // one-strip wall whose seed neighbourhood clears once its dome is
@@ -630,6 +661,9 @@ fn peel_carriers(
     let claimed = pieces.len();
     for (kind, min_vertices) in PEEL_KINDS {
     let mut tried = vec![false; facets.len()];
+    // `BREP_SEG_PEEL_DECLINED_SKIP`: facets of the groups this pass grew and
+    // declined since its last claim ([`peel_declined_skip`]).
+    let mut declined = vec![false; facets.len()];
     // Seed-stage accounting for the trace: how many seeds the pass tried,
     // how many seed fits it got at the bar, the best seed residual it saw
     // refused, and how many grown groups fell under the support floor.
@@ -642,6 +676,10 @@ fn peel_carriers(
         tried[seed] = true;
         if kind == "torus" {
             torus_tried[seed] = true;
+        }
+        let skipped = skip_declined && declined[seed];
+        if skipped && !skip_check {
+            continue;
         }
         let mut group = vec![seed];
         let mut in_group = vec![false; facets.len()];
@@ -789,6 +827,11 @@ fn peel_carriers(
             || region_vertices(data, &tris).len() < min_vertices
         {
             small_groups += 1;
+            if skip_declined {
+                for &facet in &group {
+                    declined[facet] = true;
+                }
+            }
             continue;
         }
         tris.sort_unstable();
@@ -826,19 +869,31 @@ fn peel_carriers(
                 low.x, low.y, low.z, high.x, high.y, high.z
             );
         }
-        if !outcome.accepted || outcome.fit.carrier.kind() != kind {
-            continue;
-        }
         // A torus is claimed only as a FULL band around its axis — the
         // shape a mesh rebuild can bound by closed rings. A partial torus
         // (a fillet running along an arc of an outline) stays with the
         // planar strips it has always been read as.
-        if kind == "torus" && !covers_full_azimuth(data, &tris, &outcome.fit.carrier) {
+        if !outcome.accepted
+            || outcome.fit.carrier.kind() != kind
+            || (kind == "torus" && !covers_full_azimuth(data, &tris, &outcome.fit.carrier))
+        {
+            if skip_declined {
+                for &facet in &group {
+                    declined[facet] = true;
+                }
+            }
             continue;
+        }
+        if skipped {
+            // Check mode: a seed the skip would have passed over is claimed.
+            PEEL_SKIP_MISSES.with(|count| count.set(count.get() + 1));
+            eprintln!("SEG-PEEL-SKIP MISS {kind}: seed facet {seed} grows a claimed {} of {} tris", outcome.fit.carrier.kind(), tris.len());
         }
         for &facet in &group {
             assigned[facet] = true;
         }
+        // A claim changes what every later seed can grow into.
+        declined.iter_mut().for_each(|mark| *mark = false);
         pieces.push((tris, outcome));
     }
     if debug {

@@ -1,12 +1,13 @@
 [package]
 name = "BREP_instructions"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-description = "Manufacturing instructions for BREP assemblies: the instructions document model, the step-order wizard, step editing, re-targeting to a new assembly revision, page layout and the self-contained HTML player"
+homepage = "https://next.brep.io"
+description = "Manufacturing instructions for next.BREP.io (Rust B-rep CAD) assemblies: the instructions document model, the step-order wizard, step editing, re-targeting to a new assembly revision, page layout and the self-contained HTML player."
 readme = "README.md"
-keywords = ["cad", "assembly", "instructions", "manufacturing"]
+keywords = ["cad", "b-rep", "assembly", "instructions", "manufacturing"]
 categories = ["data-structures", "visualization"]
 # The `!` entries are a backstop: test code never ships.
 include = [

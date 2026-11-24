@@ -141,6 +141,10 @@ pub struct QualifyPanel {
     /// handles back off a feature dialog on the frame after it armed them, and
     /// it would re-ask (and re-notice) a refusal once a frame.
     gizmo_armed_for: Option<String>,
+    /// The pin seat check of the open part (`pin_seats`), with the run and
+    /// history revision it was read at: it cuts meshes, so not once a frame.
+    pin_seats: Vec<super::pin_seats::PinSeat>,
+    pin_seats_at: Option<(u64, u64)>,
 }
 
 impl Default for QualifyPanel {
@@ -151,7 +155,7 @@ impl Default for QualifyPanel {
 
 impl QualifyPanel {
     pub fn new() -> Self {
-        Self { hits: HashMap::new(), selected: None, adopted: None, gizmo_armed_for: None }
+        Self { hits: HashMap::new(), selected: None, adopted: None, gizmo_armed_for: None, pin_seats: Vec::new(), pin_seats_at: None }
     }
 
     pub fn hits_json(&self) -> String {
@@ -170,6 +174,7 @@ impl QualifyPanel {
         serde_json::json!({
             "selected": self.selected,
             "gizmoArmedFor": self.gizmo_armed_for,
+            "pinSeats": self.pin_seats,
         })
         .to_string()
     }
@@ -192,6 +197,12 @@ impl QualifyPanel {
             .cloned()
             .and_then(|block| serde_json::from_value(block).ok())
             .unwrap_or_default();
+
+        let at = (engine.applied_generation(), engine.history.revision());
+        if self.pin_seats_at != Some(at) {
+            self.pin_seats = super::pin_seats::pin_seats(engine);
+            self.pin_seats_at = Some(at);
+        }
 
         // An eCAD pick is a pick of the same thing: adopt it, once.
         self.adopt_editor_selection(engine, ecad, target);
@@ -267,6 +278,9 @@ impl QualifyPanel {
                             .point_row(ui, engine, gi, pi, point, &address, selected, &mut pick)
                         {
                             edit = Some(asked);
+                        }
+                        if let Some(seat) = self.pin_seats.iter().find(|seat| seat.address == address).cloned() {
+                            self.pin_seat_line(ui, &seat);
                         }
                         if selected {
                             if let Some(asked) = self
@@ -588,11 +602,15 @@ impl QualifyPanel {
                 return;
             }
             // --- seat ---------------------------------------------------------
-            self.section(ui, "Seated on");
-            for (field, caption, hover) in [
+            // Every purpose offers it. On a `pcb` group the seat is checked
+            // against the pin's pad (`pin_seats`, the line under the point).
+            let seat_fields: &[(PortRefField, &str, &str)] = &[
                 (PortRefField::Point, "Point", "The geometry this point SITS on: a face, an edge, a circle's centre, a vertex, a datum frame. Pick it in the 3D view with \u{2316}. Empty places the point by the offset below alone."),
                 (PortRefField::Direction, "Direction", "The geometry it FACES along: a face's normal, a bore's axis, an edge, a datum frame. Empty takes the direction the point reference implies, or +X. Seat the POINT first where you can: a direction on its own still re-reads the offset in its own axes, so a placement you typed is zeroed rather than turned."),
-            ] {
+                (PortRefField::Body, "Body", "The SOLID that is this point's contact, when a pin is a whole body (an XLR pin, a jack sleeve, a crimp). It seats what Point and Direction leave empty: the point at the body's wire end, facing out along its axis. Pick it in the 3D view with \u{2316}."),
+            ];
+            self.section(ui, "Seated on");
+            for &(field, caption, hover) in seat_fields {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(caption).weak());
                     let key = field.key();
@@ -636,10 +654,15 @@ impl QualifyPanel {
                 });
             }
             self.seat_line(ui, engine, address, point);
+            if let Some(flip) = self.contact_line(ui, engine, gi, pi, address, point) {
+                asked = Some(flip);
+            }
 
             // --- placement ----------------------------------------------------
             self.section(ui, "Placement");
-            let seated = point.point_ref.is_some() || point.direction_ref.is_some();
+            let seated = point.point_ref.is_some()
+                || point.direction_ref.is_some()
+                || point.contact_body.is_some();
             for (key, caption, hover) in [
                 ("position", "Offset", if seated {
                     "Where the point sits RELATIVE TO ITS SEAT, in millimetres: x runs along the direction the reference gives, y and z across it. A component that is not a number is kept as an EXPRESSION."
@@ -752,6 +775,17 @@ impl QualifyPanel {
     /// What the last run made of the point's seat, in words: where it sits and
     /// which way it faces. This is the answer to "did my pick take?", and
     /// without it a reference field is a string the user must trust.
+    /// Whether the point's 3D seat lands on its pin's pad (`pin_seats`): the
+    /// finding in amber, or a quiet line when it does.
+    fn pin_seat_line(&mut self, ui: &mut egui::Ui, seat: &super::pin_seats::PinSeat) {
+        let text = match &seat.message {
+            Some(message) => egui::RichText::new(message).color(WARN_COLOR).small(),
+            None => egui::RichText::new(format!("Pin {} is on pad {}", seat.pin, seat.pin)).color(OK_COLOR).small(),
+        };
+        let label = ui.label(text);
+        self.hits.insert(format!("qualify:pinseat:{}", seat.address), label.rect);
+    }
+
     fn seat_line(
         &mut self,
         ui: &mut egui::Ui,
@@ -760,7 +794,8 @@ impl QualifyPanel {
         point: &brep_kernel::PortPoint,
     ) {
         let seated = !optional_text(point, "pointRef").trim().is_empty()
-            || !optional_text(point, "directionRef").trim().is_empty();
+            || !optional_text(point, "directionRef").trim().is_empty()
+            || !optional_text(point, "contactBody").trim().is_empty();
         let text = match engine.port_point_row(address) {
             Some(row) if seated => format!(
                 "seated at ({}), facing ({})",
@@ -774,6 +809,48 @@ impl QualifyPanel {
         };
         let label = ui.label(egui::RichText::new(text).weak().small());
         self.hits.insert("qualify:seat".into(), label.rect);
+    }
+
+    /// Which end of its contact body the point took, with the one-click flip
+    /// beside it: the default wire end is a geometric rule (the end farther
+    /// from the rest of the part), and on a connector whose pins protrude
+    /// forward it picks the mating end, so the choice is shown, not hidden.
+    /// Drawn only when the last run derived the body's axis.
+    fn contact_line(
+        &mut self,
+        ui: &mut egui::Ui,
+        engine: &EngineState,
+        gi: usize,
+        pi: usize,
+        address: &str,
+        point: &brep_kernel::PortPoint,
+    ) -> Option<(Edit, Option<String>)> {
+        let contact = engine.port_point_row(address)?.contact.clone()?;
+        let mut asked = None;
+        ui.horizontal(|ui| {
+            let text = if contact.seats_origin {
+                format!(
+                    "wire end: the {} end of {} at ({})",
+                    contact.end,
+                    contact.body,
+                    triple(contact.wire_end)
+                )
+            } else {
+                format!("axis of {} ({}); the point is seated above", contact.body, triple(contact.axis))
+            };
+            let label = ui.label(egui::RichText::new(text).weak().small());
+            self.hits.insert("qualify:contact".into(), label.rect);
+            if contact.seats_origin {
+                let flip = ui
+                    .small_button("Other end")
+                    .on_hover_text("Attach the wire at the body's other end (Leaves the other way)");
+                self.hits.insert(format!("qualify:point:{gi}:{pi}:contact:flip"), flip.rect);
+                if flip.clicked() {
+                    asked = Some((Edit::PointReverse(gi, pi, !point.reverse_direction), None));
+                }
+            }
+        });
+        asked
     }
 
     /// Whether the handles are on this point, and why not when they are not.
@@ -1046,7 +1123,15 @@ impl QualifyPanel {
             }
             Edit::PointText(gi, pi, key, text) => match text.trim().is_empty() {
                 true => remove_point_key(&mut block, gi, pi, key),
-                false => set_point(&mut block, gi, pi, key, scalar(&text)),
+                // A reference names geometry or a point: it is TEXT even when
+                // it reads as a number. `scalar` stored `0` as `0.0`, which the
+                // kernel's block read refused whole (a reported bug).
+                false => set_point(&mut block, gi, pi, key, match key {
+                    "pointRef" | "directionRef" | "contactBody" | "mapsTo" => {
+                        Value::String(text.trim().to_string())
+                    }
+                    _ => scalar(&text),
+                }),
             },
             Edit::PointTransform(gi, pi, key, axis, text) => {
                 set_transform_component(&mut block, gi, pi, key, axis, scalar(&text));
@@ -1188,7 +1273,7 @@ fn editor_selection(ecad: &Editors, target: Target) -> Option<String> {
     match target {
         Target::Symbol => ecad.symbol.selected_pin().map(str::to_string),
         Target::Pads => ecad.pads.selected_pad().map(str::to_string),
-        Target::Diagram | Target::Pcb => None,
+        Target::Pcb => None,
     }
 }
 
@@ -1200,7 +1285,6 @@ fn surface_of(target: Target) -> &'static str {
     match target {
         Target::Symbol => "symbol",
         Target::Pads => "pads",
-        Target::Diagram => "diagram",
         Target::Pcb => "pcb",
     }
 }
@@ -1318,6 +1402,7 @@ fn optional_text(point: &brep_kernel::PortPoint, key: &str) -> String {
     match key {
         "pointRef" => point.point_ref.clone().unwrap_or_default(),
         "directionRef" => point.direction_ref.clone().unwrap_or_default(),
+        "contactBody" => point.contact_body.clone().unwrap_or_default(),
         "mapsTo" => point.maps_to.clone().unwrap_or_default(),
         "extension" => point.extension.map(|v| v.to_string()).unwrap_or_default(),
         "displayLength" => point.display_length.map(|v| v.to_string()).unwrap_or_default(),
@@ -1392,6 +1477,7 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "qualify", prefix: "qualify:jump:", meaning: "carry the selected point to the symbol, the pads or the 3D model", command: None },
     HitKeyDoc { panel: "qualify", prefix: "qualify:hint", meaning: "what selecting a point is for, shown while none is", command: None },
     HitKeyDoc { panel: "qualify", prefix: "qualify:seat", meaning: "what the last run made of the selected point's seat", command: None },
+    HitKeyDoc { panel: "qualify", prefix: "qualify:pinseat:", meaning: "a pcb point's pin seat check, by address: whether its 3D seat lands on its pin's pad", command: None },
     HitKeyDoc { panel: "qualify", prefix: "qualify:gizmo", meaning: "whether the move/rotate handles are on the selected point", command: None },
     HitKeyDoc { panel: "qualify", prefix: "qualify:problem:", meaning: "one line of the pin/point or ports report", command: None },
 ];

@@ -1,5 +1,7 @@
 # BREP
 
+Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP` · [licence summary](#licence)
+
 Umbrella crate for the **BREP** CAD kernel family. One dependency that
 re-exports the geometry kernel and, behind feature flags, the higher layers of
 the stack — so downstream code says `use brep::kernel::…` / `use brep::render::…`
@@ -18,9 +20,9 @@ geometry consumer never compiles `wgpu` / `eframe`.
 
 ```toml
 [dependencies]
-BREP = "0.29"                                     # kernel only (headless)
-BREP = { version = "0.29", features = ["render"] } # + the wgpu render engine
-BREP = { version = "0.29", features = ["full"] }  # app + render + gizmos
+BREP = "0.30"                                     # kernel only (headless)
+BREP = { version = "0.30", features = ["render"] } # + the wgpu render engine
+BREP = { version = "0.30", features = ["full"] }  # app + render + gizmos
 ```
 
 Additional features: `reconstruction` (opt-in recognition integration), `full`
@@ -32,8 +34,19 @@ Additional features: `reconstruction` (opt-in recognition integration), `full`
 > `brep` (lowercase, lint-clean). This mirrors the whole family — package
 > `BREP_render` / lib `brep_render`, etc.
 
-This is version 0.29.0. The optional reconstruction feature re-exports the
+This is version 0.30.0. The optional reconstruction feature re-exports the
 reconstruction library directly; rendering also consumes it transitively.
 
 Licence: the Autodrop3d licence in `LICENSE.md`, shipped in the crate
 (`license-file` in the manifest).
+
+## Licence
+
+In plain words: the crates are free to use as they are, including in a commercial project. If you
+fix or change something in the kernel, send the change back as a pull request to
+[github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL). If you do not want to share your
+changes, buy a commercial licence from [Autodrop3d LLC](https://autodrop3d.com); with it you never
+have to share your code back.
+
+The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the manifest) and at
+[LICENSE.md](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL/blob/master/LICENSE.md); if this summary and the file ever differ, the file wins.

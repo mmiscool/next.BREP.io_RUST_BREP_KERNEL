@@ -1,13 +1,13 @@
 [package]
 name = "BREP_kernel"
-version = "0.27.0"
+version = "0.28.0"
 edition = "2021"
 license-file = "LICENSE.md"
-description = "A boundary representation (BREP) geometry kernel for building CAD applications."
+description = "Rust B-rep CAD kernel (next.BREP.io): a boundary representation (B-rep) geometry kernel for building CAD applications, native and WebAssembly."
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-homepage = "https://v2.brep.io"
+homepage = "https://next.brep.io"
 readme = "README.md"
-keywords = ["cad", "brep", "geometry", "nurbs", "kernel"]
+keywords = ["cad", "brep", "b-rep", "nurbs", "kernel"]
 categories = ["mathematics", "graphics", "algorithms"]
 # Only production sources and package metadata are published.
 # The `!` entries are a backstop: test code never ships. The publish snapshot
@@ -40,18 +40,18 @@ panic = "abort"         # drop unwinding code (wasm can't unwind anyway) — sma
 overflow-checks = false # no arithmetic overflow checks in hot paths
 
 [dependencies]
-BREP_solvers = { version = "0.27.0", path = "../BREP_solvers" }
-BREP_surface_offset = { version = "0.27.0", path = "../BREP_surface_offset" }
-BREP_boolean = { version = "0.27.0", path = "../BREP_boolean" }
-BREP_construction = { version = "0.27.0", path = "../BREP_construction" }
-BREP_blend = { version = "0.27.0", path = "../BREP_blend" }
-BREP_offset = { version = "0.27.0", path = "../BREP_offset" }
-BREP_direct_edit = { version = "0.27.0", path = "../BREP_direct_edit" }
-BREP_geometry = { version = "0.27.0", path = "../BREP_geometry" }
-BREP_topology = { version = "0.27.0", path = "../BREP_topology" }
+BREP_solvers = { version = "0.28.0", path = "../BREP_solvers" }
+BREP_surface_offset = { version = "0.28.0", path = "../BREP_surface_offset" }
+BREP_boolean = { version = "0.28.0", path = "../BREP_boolean" }
+BREP_construction = { version = "0.28.0", path = "../BREP_construction" }
+BREP_blend = { version = "0.28.0", path = "../BREP_blend" }
+BREP_offset = { version = "0.28.0", path = "../BREP_offset" }
+BREP_direct_edit = { version = "0.28.0", path = "../BREP_direct_edit" }
+BREP_geometry = { version = "0.28.0", path = "../BREP_geometry" }
+BREP_topology = { version = "0.28.0", path = "../BREP_topology" }
 # Robust single-region surface fitting for the Refit Faces edit (the same
 # RANSAC + least-squares pass the mesh import runs). A geometry leaf: no cycle.
-BREP_RANSAC = { version = "0.2.2", path = "../BREP_RANSAC" }
+BREP_RANSAC = { version = "0.2.3", path = "../BREP_RANSAC" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 slotmap = "1"

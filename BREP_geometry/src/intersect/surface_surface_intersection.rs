@@ -1212,6 +1212,8 @@ struct TraceSwitches {
     /// `BREP_SSI_FIRST_STEP_BUDGET=0` lets the first step skip the §4.12
     /// ceiling, as every trace did before 2026-09-15.
     first_step_ceiling: bool,
+    /// Use orientation changes to trigger a geometric continuation check.
+    oriented_continuation: bool,
     /// `BREP_DEBUG_SSI_TRACE=1`: every start and every accepted station.
     debug: bool,
 }
@@ -1220,9 +1222,27 @@ impl TraceSwitches {
     fn from_env() -> Self {
         Self {
             first_step_ceiling: std::env::var("BREP_SSI_FIRST_STEP_BUDGET").as_deref() != Ok("0"),
+            oriented_continuation: crate::switch!(live "BREP_SSI_ORIENTED_CONTINUATION", true),
             debug: std::env::var_os("BREP_DEBUG_SSI_TRACE").is_some(),
         }
     }
+}
+
+/// Membership of both endpoints does not establish continuation. Read the
+/// chord interior only when orientation suggests a possible branch jump;
+/// through a true tangent node the oriented field may reverse legitimately.
+fn chord_in_carrier_bands(
+    first: SurfaceInfo<'_>, second: SurfaceInfo<'_>,
+    start: Vec3, end: Vec3, tolerance: f64,
+) -> Result<bool, String> {
+    for fraction in [0.25, 0.5, 0.75] {
+        let point = start.add(end.sub(start).scale(fraction));
+        for surface in [first.surface, second.surface] {
+            let foot = project_point_to_surface(surface, point)?;
+            if !foot.distance.is_finite() || foot.distance > tolerance { return Ok(false); }
+        }
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1250,6 +1270,7 @@ fn trace(
         });
     };
     tangent = tangent.scale(direction);
+    let mut field_direction = direction;
     let mut tangents = vec![tangent];
     let mut deviation: f64 = 0.0;
     // The FIRST step is held to the same §4.12 normal-turn ceiling as every
@@ -1271,12 +1292,36 @@ fn trace(
     let mut terminated = false;
     for _ in 0..maximum_steps {
         let mut accepted = None;
+        let mut rejected_continuation = false;
         while step_size >= minimum_step {
             let predicted = current.point.add(tangent.scale(step_size));
             if let Some((corrected, boundary)) =
                 correct(first, second, current, predicted, tangent, tolerance)?
             {
-                if corrected.point.sub(current.point).length() <= 2.5 * step_size {
+                let chord = corrected.point.sub(current.point);
+                // A small residual proves membership of both carriers, not
+                // continuation of this branch. At a narrow neck a corrector
+                // can land on the opposite arc with its cross-normal reversed.
+                // Preserve that evidence instead of aligning away the reversal.
+                if switches.oriented_continuation && !boundary {
+                    let next = tangent_at(first, second, corrected)?.map(|t| t.scale(field_direction));
+                    // Polished parameter-boundary stops terminate the trace;
+                    // they do not request continuation past a tangent rim.
+                    // A singular endpoint also retains its termination. For
+                    // an interior step, orientation only triggers the chord
+                    // test: it may reverse legitimately at a tangent node.
+                    let suspect = next.is_some_and(|next| next.dot(tangent) <= 0.0 || chord.dot(next) <= 0.0);
+                    if suspect && !chord_in_carrier_bands(first, second, current.point, corrected.point, tolerance)? {
+                        if switches.debug {
+                            eprintln!("SSI-REJECT boundary={boundary} step={step_size:.8e} field_dot={:?} chord_dot={:?} from={:?} to={:?}",
+                                next.map(|n| n.dot(tangent)), next.map(|n| chord.dot(n)), current.point, corrected.point);
+                        }
+                        rejected_continuation = true;
+                        step_size /= 2.0;
+                        continue;
+                    }
+                }
+                if chord.length() <= 2.5 * step_size {
                     accepted = Some((corrected, boundary));
                     break;
                 }
@@ -1284,6 +1329,9 @@ fn trace(
             step_size /= 2.0;
         }
         let Some((candidate, boundary)) = accepted else {
+            if rejected_continuation {
+                return Err(format!("surface intersection continuation unresolved at minimum step {minimum_step:.3e}"));
+            }
             terminated = true;
             break;
         };
@@ -1310,7 +1358,8 @@ fn trace(
         // A station that ends the trace still gets a tangent (its own where
         // one exists, else the previous one carried forward), so the tangent
         // list stays parallel to the stations.
-        let next = tangent_at(first, second, candidate)?.map(|next| {
+        let raw_next = tangent_at(first, second, candidate)?;
+        let next = raw_next.map(|next| {
             if next.dot(tangent) < 0.0 { next.scale(-1.0) } else { next }
         });
         if boundary {
@@ -1349,6 +1398,9 @@ fn trace(
             span_fine = measured < budget / 8.0;
         }
         tangents.push(next_tangent);
+        if let Some(raw) = raw_next {
+            field_direction = if raw.dot(next_tangent) < 0.0 { -1.0 } else { 1.0 };
+        }
         // §4.12 normal-turn budget on BOTH surfaces as a hard CEILING on
         // the reactive controller: growth stays reactive (accelerating
         // into under-sampled flats regressed downstream curve fits), but
@@ -1367,7 +1419,14 @@ fn trace(
         .clamp(minimum_step, maximum_step);
         if points.len() > 4 && candidate.point.sub(start.point).length() <= step_size * 1.2 {
             let to_start = start.point.sub(candidate.point);
-            if to_start.length() <= EPSILON || to_start.dot(next_tangent) >= 0.0 {
+            // Closure is another span, not permission to jump across a
+            // nearby neck to the start on the opposite continuation.
+            let follows_start = next_tangent.dot(tangents[0]) > 0.0
+                && (to_start.length() <= tolerance || to_start.dot(tangents[0]) > 0.0);
+            if (to_start.length() <= EPSILON || to_start.dot(next_tangent) >= 0.0)
+                && (!switches.oriented_continuation || follows_start
+                    || chord_in_carrier_bands(first, second, candidate.point, start.point, tolerance)?)
+            {
                 points.push(start);
                 tangents.push(tangents[0]);
                 return Ok(Trace {
@@ -1666,6 +1725,41 @@ pub fn intersect_surfaces(
     second_surface: &NurbsSurface,
     options: &SurfaceIntersectionOptions,
 ) -> Result<Vec<SurfaceIntersectionCurve>, String> {
+    let check = crate::switch!(live "BREP_SSI_ORIENTED_CONTINUATION_CHECK", false);
+    let mut switches = TraceSwitches::from_env();
+    if check { switches.oriented_continuation = true; }
+    let result = intersect_surfaces_with_switches(first_surface, second_surface, options, switches);
+    if check {
+        switches.oriented_continuation = false;
+        let old = intersect_surfaces_with_switches(first_surface, second_surface, options, switches);
+        match (&old, &result) {
+            (Ok(before), Ok(after)) => {
+                eprintln!("ssi.continuation_check branches {} -> {}", before.len(), after.len());
+                for i in 0..before.len().max(after.len()) {
+                    match (before.get(i), after.get(i)) {
+                        (Some(a), Some(b)) => {
+                            let changed = a.points.iter().zip(&b.points).position(|(p, q)| p.sub(*q).length() > options.tolerance);
+                            if changed.is_some() || a.points.len() != b.points.len() || a.closed != b.closed {
+                                eprintln!("ssi.continuation_check branch={i} stations={}->{} closed={}->{} first_changed={changed:?}", a.points.len(), b.points.len(), a.closed, b.closed);
+
+                            }
+                        }
+                        _ => eprintln!("ssi.continuation_check branch={i} added_or_removed"),
+                    }
+                }
+            }
+            _ => eprintln!("ssi.continuation_check old_error={:?} guarded_error={:?}", old.as_ref().err(), result.as_ref().err()),
+        }
+    }
+    result
+}
+
+fn intersect_surfaces_with_switches(
+    first_surface: &NurbsSurface,
+    second_surface: &NurbsSurface,
+    options: &SurfaceIntersectionOptions,
+    switches: TraceSwitches,
+) -> Result<Vec<SurfaceIntersectionCurve>, String> {
     let _wall = crate::wall_profile::Scope::enter(crate::wall_profile::MARCH);
     let _lap = crate::projection_profile::Lap::enter_pair(first_surface, second_surface);
     let first_box = Bounds::from_surface_controls(first_surface)?;
@@ -1752,7 +1846,6 @@ pub fn intersect_surfaces(
         starts = seeds;
     }
 
-    let switches = TraceSwitches::from_env();
     let mut curves: Vec<SurfaceIntersectionCurve> = Vec::new();
     for start in starts {
         let mut claimed = false;

@@ -27,6 +27,7 @@ mod board_view;
 mod erc_panel;
 mod footprint_editor;
 mod grips;
+mod pin_functions;
 mod symbol_editor;
 pub use actions::{Action, ActionGroup, actions};
 pub use board_view::{BoardSelection, BoardTool, View};
@@ -227,6 +228,7 @@ pub fn power_symbol(name: &str) -> Symbol {
             gate: 0,
             number: "1".into(),
             name: name.to_owned(),
+            alternates: vec![],
             electrical_type: "power_in".into(),
             at: Point::default(),
             end: Point::default(),
@@ -351,6 +353,15 @@ pub struct Editor {
     label_placed: bool,
     /// Stock part number given to new connections in a wiring diagram.
     pub stock_part_number: String,
+    /// Boards of their own the user asked to edit (by occurrence), for the host to
+    /// open as the Work part ([`Editor::take_enter_requests`]).
+    enter_requests: Vec<String>,
+    /// On a [`DocumentKind::Sheet`]: the HARNESS tools are up (a host's Harness
+    /// diagram workbench) rather than the net tools (its PCB diagram). A connection
+    /// drawn is then a harness wire, a part placed goes off the board, and the
+    /// sheet's net tools are not offered. A wiring diagram has only these and a
+    /// schematic none, whatever this says.
+    pub harness_tools: bool,
     pub status: String,
     /// Why the last edit on the sheet was refused, or what it could not do; shown until
     /// the next press there.
@@ -403,6 +414,9 @@ pub struct Editor {
     /// The Properties section's rects (`inspector:value`, `inspector:value_siblings`).
     properties_hits: symbol_editor::InspectorHits,
 }
+/// How far the board zone on a sheet reaches past the parts on the board: 5.08 mm.
+pub const ZONE_MARGIN: i32 = 5080;
+
 impl Default for Editor {
     fn default() -> Self {
         Self {
@@ -425,6 +439,8 @@ impl Default for Editor {
             power_net_text: "GND".into(),
             label_placed: false,
             stock_part_number: String::new(),
+            enter_requests: vec![],
+            harness_tools: false,
             status: "Choose a part to begin".into(),
             notice: None,
             note: None,
@@ -538,7 +554,14 @@ impl Editor {
         Change::record(&mut self.pending_change, coalesce);
     }
     /// Record a finished edit that started from `before`, for undo and for the host.
-    fn commit(&mut self, before: Document, coalesce: Option<String>) {
+    fn commit(&mut self, before: Document, coalesce: Option<String>) -> bool {
+        // A sub-board's parts and nets are its own document's: an edit that changes
+        // them other than by moving the whole zone is taken back, and says why.
+        if let Some(refusal) = self.document.zone_edit_refusal(&before) {
+            self.document = before;
+            self.notice = Some(refusal);
+            return false;
+        }
         // The board follows the sheet INSIDE the edit that moved it: recorded below as
         // one undo step and reported to the host as one change, with the edit's own
         // coalesce key, so a part placed on the schematic lands on the board without a
@@ -555,6 +578,7 @@ impl Editor {
             self.note_change(coalesce);
         }
         self.history.record(before, &self.document);
+        true
     }
     /// Apply one undoable edit. Returns false when the edit was refused because it would
     /// break a wiring diagram's rules; the document is then unchanged.
@@ -577,11 +601,81 @@ impl Editor {
             self.notice = Some(e);
             return false;
         }
-        self.commit(before, coalesce);
+        self.commit(before, coalesce)
+    }
+    /// Whether the tools up are the harness tools: a wiring diagram's, or a sheet's
+    /// with [`Editor::harness_tools`].
+    fn wiring(&self) -> bool {
+        match self.document.kind {
+            DocumentKind::Wiring => true,
+            DocumentKind::Sheet => self.harness_tools,
+            DocumentKind::Schematic => false,
+        }
+    }
+    /// Whether the harness tools are up, for a host: true for a wiring document, and for a
+    /// sheet while its harness tools are shown.
+    pub fn harness_tools_up(&self) -> bool {
+        self.wiring()
+    }
+    /// Whether the document has no board at all: a wiring diagram. A sheet has one
+    /// whichever tools are up, so the board follows its parts in either.
+    pub(crate) fn boardless(&self) -> bool {
+        self.document.kind == DocumentKind::Wiring
+    }
+    /// Put the selected part of a sheet on the board or take it off, as one edit;
+    /// what refused it is the notice. The action table's `sheet.part.on_board` and
+    /// `sheet.part.off_board`, and the drop of a drag across the board zone's edge.
+    pub fn set_selected_off_board(&mut self, off_board: bool) -> bool {
+        let Some(Selection::Component(id)) = self.selected else { return false };
+        self.set_component_off_board(id, off_board)
+    }
+    fn set_component_off_board(&mut self, id: Uuid, off_board: bool) -> bool {
+        let mut refused = None;
+        let moved = self.transaction(|d| refused = d.set_off_board(id, off_board).err());
+        if let Some(refusal) = refused {
+            self.notice = Some(refusal);
+            return false;
+        }
+        if let Some(c) = self.document.components.iter().find(|c| c.id == id) {
+            self.note = Some(match off_board {
+                true => format!("{} is off the board: its nets let go, and its harness wires stay.", c.reference),
+                false => format!("{} is on the board.", c.reference),
+            });
+        }
+        moved
+    }
+    /// Whether the selection is a part of a sheet that is off the board (`Some(true)`),
+    /// on it (`Some(false)`), or neither.
+    pub fn selected_off_board(&self) -> Option<bool> {
+        let Some(Selection::Component(id)) = self.selected else { return None };
+        (self.document.kind == DocumentKind::Sheet && self.document.zone_member(id).is_none())
+            .then(|| self.document.components.iter().find(|c| c.id == id).map(|c| c.off_board))
+            .flatten()
+    }
+    /// Ask the host to edit the board of its own the selected part is drawn from:
+    /// it becomes the Work part, and the sheet shows the board's own document.
+    pub fn enter_selected_zone(&mut self) -> bool {
+        let Some(Selection::Component(id)) = self.selected else { return false };
+        let Some(z) = self.document.zone_member(id) else { return false };
+        self.enter_requests.push(z.occurrence.clone());
         true
     }
-    fn wiring(&self) -> bool {
-        self.document.kind == DocumentKind::Wiring
+    /// The boards the user asked to edit since the last call, by occurrence.
+    pub fn take_enter_requests(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.enter_requests)
+    }
+    /// The board of its own the selected part of a sheet is drawn from, by label.
+    pub fn selected_zone(&self) -> Option<&str> {
+        let Some(Selection::Component(id)) = self.selected else { return None };
+        self.document.zone_member(id).map(|z| z.reference.as_str())
+    }
+    /// Why a net may not start or end at `target`: a pin of a part off the board.
+    fn net_refusal(&self, target: &ConnectionTarget) -> Option<String> {
+        match target {
+            ConnectionTarget::Terminal(t) if !self.wiring() => self.document.net_reaches(t).err(),
+            ConnectionTarget::Terminal(t) => self.document.harness_reaches(t).err(),
+            _ => None,
+        }
     }
     /// The occurrence a component is bound to and the host does not offer — UNLINKED.
     ///
@@ -601,7 +695,7 @@ impl Editor {
     /// reports that state too, in its own words, and picking another device is a fair
     /// answer to it.
     fn unlinked_device<'a>(&self, c: &'a Component) -> Option<&'a str> {
-        if self.labels_from_host.is_none() {
+        if self.labels_from_host.is_none() || self.document.zone_member(c.id).is_some() {
             return None;
         }
         let lost = c.part.as_ref()?.instance.as_deref()?;
@@ -804,6 +898,15 @@ impl Editor {
                 None => d.place_power_symbol(symbol, at, rotation).map(Some),
             }
         });
+        // On a sheet, the harness tools place a part off the board.
+        if let Ok(Some(id)) = placed
+            && self.document.kind == DocumentKind::Sheet
+            && self.harness_tools
+            && let Some(c) = self.document.components.iter_mut().find(|c| c.id == id)
+        {
+            c.off_board = true;
+            self.document.board.placements.retain(|p| p.component != id);
+        }
         match placed {
             Ok(id) => {
                 if labelled {
@@ -845,7 +948,7 @@ impl Editor {
         };
         let wire = self
             .document
-            .attached_wire(terminal)
+            .attached_harness_wire(terminal)
             .filter(|_| self.wiring())?;
         Some(format!(
             "{} already has connection {}. Each pin in a wiring diagram takes one connection.",
@@ -1246,6 +1349,7 @@ impl Editor {
                     self.duplicate();
                 }
                 ui.small("Connected wires follow moves and rotation.");
+                self.pin_functions_table(ui, &c);
                 if let Some(part) = &c.part {
                     ui.separator();
                     ui.label("Part");
@@ -1351,6 +1455,23 @@ impl Editor {
             ui.label("Select a device or connection to edit it.");
             if !self.wiring() {
                 self.values_table(ui);
+            }
+        }
+        // A part of a sheet is on the board or off it; a drag across the board
+        // zone's edge moves it too.
+        if let Some(board) = self.selected_zone().map(str::to_owned) {
+            ui.label(format!(
+                "Part of the board {board}, a document of its own: read-only here. A harness wire may end on a point \
+                 {board} declares."
+            ));
+            if ui.button(format!("Edit {board}")).clicked() {
+                self.enter_selected_zone();
+            }
+        }
+        if let Some(off) = self.selected_off_board() {
+            ui.label(if off { "Off the board: harness wires only." } else { "On the board." });
+            if ui.button(if off { "Move onto the board" } else { "Take off the board" }).clicked() {
+                self.set_selected_off_board(!off);
             }
         }
         if self.selected.is_some() && ui.button("Delete selection").clicked() {
@@ -1891,6 +2012,62 @@ impl Editor {
     }
     /// Whether `q` is already a point of the net: a pin, a junction, a label, or
     /// anywhere along a wire, which is where [`Tool::Wire`] ends a run.
+    /// The board zone on a sheet: the box round the parts on the board, grown by
+    /// [`ZONE_MARGIN`]; `None` with none on it.
+    pub fn board_zone(&self) -> Option<(Point, Point)> {
+        Self::zone_of(&self.document)
+    }
+    fn zone_of(document: &Document) -> Option<(Point, Point)> {
+        let (lo, hi) = document.board_zone_extent()?;
+        Some((lo.offset(Point::new(-ZONE_MARGIN, -ZONE_MARGIN)), hi.offset(Point::new(ZONE_MARGIN, ZONE_MARGIN))))
+    }
+    /// A part dragged across the board zone's edge: its id, and whether it is now
+    /// off the board. The zone is the one `before` had, as the drag began, because
+    /// the zone is drawn round its parts and a part dragged inside it would carry
+    /// the edge along with it.
+    fn zone_crossing(&self, before: &Document) -> Option<(Uuid, bool)> {
+        if self.document.kind != DocumentKind::Sheet {
+            return None;
+        }
+        let Some(Selection::Component(id)) = self.selected else { return None };
+        if self.document.zone_member(id).is_some() {
+            return None;
+        }
+        let c = self.document.components.iter().find(|c| c.id == id)?;
+        if before.components.iter().find(|c| c.id == id).is_none_or(|was| was.at == c.at && was.gates == c.gates) {
+            return None;
+        }
+        let boxes = c.sheet_boxes();
+        let n = boxes.len().max(1) as i64;
+        let (sx, sy) = boxes.iter().fold((0i64, 0i64), |(x, y), (_, a, b)| {
+            (x + (a.x as i64 + b.x as i64) / 2, y + (a.y as i64 + b.y as i64) / 2)
+        });
+        let center = Point::new((sx / n) as i32, (sy / n) as i32);
+        let inside = Self::zone_of(before)
+            .is_some_and(|(lo, hi)| (lo.x..=hi.x).contains(&center.x) && (lo.y..=hi.y).contains(&center.y));
+        // Out of the zone only with the harness tools up: laying out the board's
+        // schematic with the net tools, a part dragged past the edge makes room and
+        // the zone grows round it, rather than the part leaving the board.
+        match (c.off_board, inside) {
+            (true, true) => Some((id, false)),
+            (false, false) if self.wiring() => Some((id, true)),
+            _ => None,
+        }
+    }
+    /// Why the Wire tool may not run a net to `q`: a pin of a part off the board.
+    fn off_board_pin_at(&self, q: Point) -> Option<String> {
+        if self.wiring() || self.document.kind != DocumentKind::Sheet {
+            return None;
+        }
+        let c = self
+            .document
+            .components
+            .iter()
+            .filter(|c| c.off_board)
+            .find(|c| c.symbol.pins.iter().any(|p| c.pin_at(p) == q))?;
+        let pin = c.symbol.pins.iter().find(|p| c.pin_at(p) == q)?;
+        self.document.net_reaches(&Terminal { component: c.id, pin: pin.number.clone() }).err()
+    }
     fn lands_on_net(&self, q: Point) -> bool {
         let d = &self.document;
         d.terminal_at(q).is_some()
@@ -2202,7 +2379,7 @@ impl Editor {
             && let Some(p) = ui.input(|i| i.pointer.press_origin())
         {
             if let Some(terminal) = self.hit_target(p, rect) {
-                if let Some(refusal) = self.taken(&terminal) {
+                if let Some(refusal) = self.taken(&terminal).or_else(|| self.net_refusal(&terminal)) {
                     self.notice = Some(refusal);
                 } else {
                     self.wire_start = None;
@@ -2240,7 +2417,14 @@ impl Editor {
             let target = Point::new(at.x + q.x - start.x, at.y + q.y - start.y).snapped();
             let gate = self.selected_gate();
             self.document = before.clone();
-            Self::move_component(&mut self.document, id, gate, Some(target), None);
+            // A sub-board's part moves its whole zone.
+            match self.document.zone_member(id).map(|z| z.occurrence.clone()) {
+                Some(zone) => {
+                    let by = Point::new(target.x - at.x, target.y - at.y);
+                    let _ = self.document.move_zone(&zone, by);
+                }
+                None => Self::move_component(&mut self.document, id, gate, Some(target), None),
+            }
         }
         if let (Some((before, start, at)), Some(p), Some(Selection::Label(id))) =
             (&self.drag, pointer, self.selected)
@@ -2272,14 +2456,15 @@ impl Editor {
                     .filter(|p| rect.contains(*p))
                     .and_then(|p| self.hit_target(p, rect))
             {
-                if let Some(refusal) = self.taken(&end) {
+                if let Some(refusal) = self.taken(&end).or_else(|| self.net_refusal(&end)) {
                     self.notice = Some(refusal);
                 } else {
                     let mut id = None;
                     let stock_part_number = self.stock_part_number.trim().to_owned();
+                    let harness = self.wiring();
                     self.transaction(|d| {
-                        id = d.connect_targets(start, end);
-                        if d.kind == DocumentKind::Wiring
+                        id = d.connect_targets_as(start, end, harness);
+                        if harness
                             && let Some(w) = d.wires.iter_mut().find(|w| Some(w.id) == id)
                         {
                             w.stock_part_number = stock_part_number;
@@ -2292,11 +2477,27 @@ impl Editor {
                 }
             }
             if let Some((before, _, _)) = self.drag.take() {
+                let crossing = self.zone_crossing(&before);
                 self.commit(before, None);
+                // A part dropped across the board zone's edge, as the zone stood
+                // when the drag began, moves on or off the board. It is a second
+                // transaction in the same frame, so the host stores the two as one
+                // undo step; a refusal leaves the move itself standing, and says why.
+                if let Some((id, off_board)) = crossing {
+                    self.set_component_off_board(id, off_board);
+                }
             }
             if let Some((before, _, _, _)) = self.path_drag.take() {
                 self.commit(before, None);
             }
+        }
+        // A double click on a board of its own's part edits that board.
+        if response.double_clicked_by(PointerButton::Primary)
+            && self.tool == Tool::Select
+            && let Some(p) = pointer
+        {
+            self.pick(p, rect, ui.ctx());
+            self.enter_selected_zone();
         }
         if response.clicked_by(PointerButton::Primary)
             && let Some(p) = pointer
@@ -2375,6 +2576,9 @@ impl Editor {
                         self.label_placed = true;
                     }
                 }
+                Tool::Wire if self.off_board_pin_at(q).is_some() => {
+                    self.notice = self.off_board_pin_at(q);
+                }
                 Tool::Wire => {
                     // A run ends where it lands on the net: a pin, a junction, a
                     // label or a wire (KiCad's rule), so A to B then C is two
@@ -2447,6 +2651,35 @@ impl Editor {
                     );
                 }
             }
+        }
+        // The board zone, round the parts on the board, under them.
+        if let Some((lo, hi)) = self.board_zone() {
+            let zone = Rect::from_two_pos(self.screen(lo, rect), self.screen(hi, rect));
+            painter.rect_filled(zone, 6., Color32::from_rgba_unmultiplied(70, 120, 90, 28));
+            painter.rect_stroke(zone, 6., Stroke::new(1.5, Color32::from_rgb(90, 160, 115)), egui::StrokeKind::Inside);
+            painter.text(
+                zone.left_top() + Vec2::new(6., 4.),
+                egui::Align2::LEFT_TOP,
+                "Board",
+                egui::FontId::proportional(12.),
+                Color32::from_rgb(120, 190, 140),
+            );
+        }
+        // Each board of its own the assembly places: its zone, read-only, by label.
+        for z in &self.document.zones {
+            let Some((lo, hi)) = self.document.sub_zone_extent(&z.occurrence) else { continue };
+            let lo = lo.offset(Point::new(-ZONE_MARGIN, -ZONE_MARGIN));
+            let hi = hi.offset(Point::new(ZONE_MARGIN, ZONE_MARGIN));
+            let zone = Rect::from_two_pos(self.screen(lo, rect), self.screen(hi, rect));
+            painter.rect_filled(zone, 6., Color32::from_rgba_unmultiplied(70, 100, 140, 28));
+            painter.rect_stroke(zone, 6., Stroke::new(1.5, Color32::from_rgb(100, 140, 190)), egui::StrokeKind::Inside);
+            painter.text(
+                zone.left_top() + Vec2::new(6., 4.),
+                egui::Align2::LEFT_TOP,
+                format!("Board {} (read-only)", z.reference),
+                egui::FontId::proportional(12.),
+                Color32::from_rgb(140, 170, 210),
+            );
         }
         for c in &self.document.components {
             // A component whose device the assembly does not offer is drawn in the
@@ -2533,6 +2766,8 @@ impl Editor {
                 part: None,
                 pads: None,
                 gates: vec![],
+                pin_functions: Default::default(),
+                off_board: false,
             };
             self.paint_component(&painter, &preview, rect, ACCENT);
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -2598,6 +2833,8 @@ impl Editor {
                     part: None,
                     pads: None,
                     gates: vec![],
+                    pin_functions: Default::default(),
+                    off_board: false,
                 };
                 self.paint_component(&painter, &c, rect, ACCENT);
             }
@@ -2635,6 +2872,8 @@ impl Editor {
                     part: None,
                     pads: None,
                     gates: vec![],
+                    pin_functions: Default::default(),
+                    off_board: false,
                 };
                 self.paint_component(&painter, &preview, rect, ACCENT.gamma_multiply(0.6));
             }
@@ -2865,7 +3104,8 @@ impl Editor {
                     ),
                 );
             }
-            let Some(name) = pin_name(&pin.name).filter(|_| !c.symbol.hide_pin_names) else {
+            // The function chosen for this pin on this part, else its main name.
+            let Some(name) = pin_name(c.pin_label(pin)).filter(|_| !c.symbol.hide_pin_names) else {
                 continue;
             };
             // The name belongs inside the body, past the lead, as the symbol editor

@@ -49,6 +49,18 @@ fn face_normal(face: &FaceRecord, u: f64, v: f64) -> Result<Vec3, String> {
 /// `surface_uv_tolerance`).  Capped to a fraction of the smaller domain
 /// span so a pole or collapsed direction cannot widen the band into the
 /// whole face.
+/// `BREP_CLASSIFY_THIN_BODY_BAND` (default off, `=1` on): see
+/// [`SolidClassifier::classify`].
+fn thin_body_band_enabled() -> bool {
+    crate::switch!("BREP_CLASSIFY_THIN_BODY_BAND", false)
+}
+
+/// `BREP_CLASSIFY_THIN_BODY_BAND_CHECK` (default off, `=1` on): measure the
+/// thin-body band and report where it would change the answer, keeping it.
+fn thin_body_band_check() -> bool {
+    crate::switch!("BREP_CLASSIFY_THIN_BODY_BAND_CHECK", false)
+}
+
 fn face_uv_tolerance(face: &FaceRecord, u: f64, v: f64, spatial: f64) -> f64 {
     surface_uv_band(&face.surface, u, v, spatial)
 }
@@ -68,6 +80,74 @@ pub fn surface_uv_band(surface: &crate::NurbsSurface, u: f64, v: f64, spatial: f
         _ => f64::INFINITY,
     };
     band.min(cap)
+}
+
+/// `BREP_CLASSIFY_METRIC_TRIM` (default on; `=0` reads the isotropic band as
+/// before): see [`metric_trim`].
+fn metric_trim_enabled() -> bool {
+    switch!("BREP_CLASSIFY_METRIC_TRIM", true)
+}
+
+/// `BREP_CLASSIFY_METRIC_TRIM_CHECK` (default off): compute the old read and
+/// the metric read side by side and print each ray hit where they differ.
+fn metric_trim_check() -> bool {
+    switch!("BREP_CLASSIFY_METRIC_TRIM_CHECK", false)
+}
+
+/// The trim read of a ray's crossing at `(u, v)`, with its `Boundary` band
+/// measured in space along each parameter direction. [`face_uv_tolerance`]
+/// is one uv radius, `spatial / min(|Su|, |Sv|)`: on a wall 5e-3 tall and a
+/// dozen long (|Su| 11, |Sv| 8.8e-3) a 1e-6 band read 1.1e-4 in u, 1.25e-3 in
+/// space, and every ray from a point within a millimetre of the wall's corner
+/// edge read `Boundary` there and gave up ("no clean ray direction").
+///
+/// The spatial band is the ellipse with semi-axes `spatial / |Su|` and
+/// `spatial / |Sv|` about the hit. When the two differ by more than 4×, a hit
+/// the isotropic band reads `Boundary` is read again with the ellipse's minor
+/// radius at its centre and at its eight tips every 45°. It stays `Boundary`
+/// unless all nine reads agree on one side. A straight trim within the
+/// ellipse misses all nine only if it cuts off a cap between two tips, at
+/// least `cos 22.5°` (0.92) of the band from the hit. Hits on a near-isotropic
+/// chart and hits the old band reads `Inside` or `Outside` read as before.
+fn metric_trim(face: &FaceRecord, u: f64, v: f64, spatial: f64) -> Result<PolygonClass, String> {
+    let band = face_uv_tolerance(face, u, v, spatial);
+    let old = parameter_point_in_face(face, Vec2 { x: u, y: v }, band)?;
+    let check = metric_trim_check();
+    if old != PolygonClass::Boundary || !(metric_trim_enabled() || check) {
+        return Ok(old);
+    }
+    let Ok(derivatives) = face.surface.derivatives(u, v, 1) else {
+        return Ok(old);
+    };
+    let cap = match (face.surface.domain_u(), face.surface.domain_v()) {
+        (Ok([u0, u1]), Ok([v0, v1])) => ((u1 - u0).min(v1 - v0) * 0.05).max(1e-12),
+        _ => f64::INFINITY,
+    };
+    let along_u = crate::tolerance::parametric_tolerance(spatial, derivatives[1][0].length()).min(cap);
+    let along_v = crate::tolerance::parametric_tolerance(spatial, derivatives[0][1].length()).min(cap);
+    let minor = along_u.min(along_v);
+    if !(minor > 0.0) || along_u.max(along_v) <= 4.0 * minor {
+        return Ok(old);
+    }
+    let centre = parameter_point_in_face(face, Vec2 { x: u, y: v }, minor)?;
+    let mut answer = centre;
+    if centre != PolygonClass::Boundary {
+        for step in 0..8 {
+            let angle = step as f64 * std::f64::consts::FRAC_PI_4;
+            let tip = Vec2 { x: u + along_u * angle.cos(), y: v + along_v * angle.sin() };
+            if parameter_point_in_face(face, tip, minor)? != centre {
+                answer = PolygonClass::Boundary;
+                break;
+            }
+        }
+    }
+    if check && answer != old {
+        eprintln!(
+            "classify metric trim: face {} uv ({u:.9}, {v:.9}) band {band:.3e} axes ({along_u:.3e}, {along_v:.3e}) old {old:?} metric {answer:?}",
+            face.id
+        );
+    }
+    Ok(if metric_trim_enabled() { answer } else { old })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -271,13 +351,44 @@ fn clip_segment_to_aabb(
     Some([s0, s1])
 }
 
+/// `BREP_CLASSIFY_PLANAR_TRIM_BOXES` (default on; `=0` restores): a planar
+/// face's box is its boundary's (the control points of the edges its loops
+/// use), not its carrier's. A linear function over a plane region takes its
+/// extremes on the region's boundary, so the region lies in the boundary's
+/// box. A boolean's planar faces keep the carrier they were cut from: on a
+/// molded bottle cap 180 of 484 planes span up to 85 times their trims, every
+/// ray met about 100 face boxes against 14 on the same body read back from
+/// STEP, and 4096 points took 57 s against 8 s.
+fn planar_trim_boxes_enabled() -> bool {
+    switch!("BREP_CLASSIFY_PLANAR_TRIM_BOXES", true)
+}
+
+/// The box of a planar face's boundary curves, when every coedge's edge is
+/// known; `None` for a curved face, a face with no loop, or a missing edge.
+fn planar_trim_box(face: &FaceRecord, edges: &std::collections::HashMap<u64, &crate::topology::EdgeRecord>) -> Option<Aabb> {
+    if edges.is_empty() || face.loops.is_empty() || !face.surface.is_affine().unwrap_or(false) {
+        return None;
+    }
+    let mut trimmed = Aabb::empty();
+    for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+        let edge = edges.get(&coedge.edge_id)?;
+        trimmed.include(Aabb::from_curve_controls(&edge.curve).ok()?);
+    }
+    Some(trimmed)
+}
+
 impl<'a> SolidClassifier<'a> {
     pub fn new(solid: &'a BrepSolid, tolerance: f64) -> Result<Self, String> {
         let build_started = classify_profile_started();
         let faces: Vec<&FaceRecord> = solid.shells.iter().flat_map(|shell| &shell.faces).collect();
+        let edges: std::collections::HashMap<u64, &crate::topology::EdgeRecord> =
+            if planar_trim_boxes_enabled() { solid.edges.iter().map(|edge| (edge.id, edge)).collect() } else { Default::default() };
         let face_boxes = faces
             .iter()
-            .map(|face| Aabb::from_surface_controls(&face.surface))
+            .map(|face| match planar_trim_box(face, &edges) {
+                Some(trimmed) => Ok(trimmed),
+                None => Aabb::from_surface_controls(&face.surface),
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let mut bounds = Aabb::empty();
         for face_box in &face_boxes {
@@ -435,6 +546,101 @@ impl<'a> SolidClassifier<'a> {
         if !self.coincident_caps.is_empty() && env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
             eprintln!("feature_scale: classify at {point:?} on band {on_tolerance:.3e} (uncapped {:.3e}, {} caps)", tolerance * 10.0, self.coincident_caps.len());
         }
+        // THIN-BODY BAND (`BREP_CLASSIFY_THIN_BODY_BAND`, default off; with
+        // `BREP_CLASSIFY_THIN_BODY_BAND_CHECK` the band is measured and a
+        // differing answer reported, the answer kept): where the body is
+        // thinner than four On bands at a face the point lies within the band
+        // of, the band is capped at a quarter of the body's local thickness
+        // there, measured exactly along the face's inward normal from the
+        // point's foot to the next face. A lens 1.8e-6 thick read a point
+        // 4.7e-7 outside it On its wall (the band is 1e-6), so inside.
+        let (thin_on, thin_check) = (thin_body_band_enabled(), thin_body_band_check());
+        if thin_on || thin_check {
+            if let Some(cap) = self.thin_body_cap(point, on_tolerance)? {
+                if cap < on_tolerance {
+                    // The rays then read crossings at a tenth of the cap: at
+                    // the classifier's own tolerance two crossings of a wall
+                    // 8e-7 across merge into one.
+                    let ray_tolerance = (0.1 * cap).min(self.tolerance);
+                    if thin_on {
+                        return self.classify_banded(point, cap, ray_tolerance);
+                    }
+                    let kept = self.classify_banded(point, on_tolerance, self.tolerance)?;
+                    let capped = self.classify_banded(point, cap, ray_tolerance)?;
+                    if kept.class != capped.class {
+                        eprintln!(
+                            "thin-body band check: {point:?} reads {:?} at the band {on_tolerance:.3e}, {:?} at the thickness cap {cap:.3e}",
+                            kept.class, capped.class
+                        );
+                    }
+                    return Ok(kept);
+                }
+            }
+        }
+        self.classify_banded(point, on_tolerance, self.tolerance)
+    }
+
+    /// The least quarter of the body's local thickness at every face whose
+    /// band `band` reaches the point inside its trim, where that thickness is
+    /// under four bands: from the point's foot on the face, along the face's
+    /// inward normal, to the nearest other boundary point within four bands
+    /// (a face's own surface is passed over at its foot). `None` where the
+    /// body is no thinner than that.
+    fn thin_body_cap(&self, point: Vec3, band: f64) -> Result<Option<f64>, String> {
+        let mut candidates = Vec::new();
+        self.bvh.containing_point(point, band, &mut candidates);
+        let mut cap: Option<f64> = None;
+        let reach = 4.0 * band;
+        for &index in &candidates {
+            let face = self.faces[index];
+            let projection = project_point_to_surface(&face.surface, point)?;
+            if projection.distance > band {
+                continue;
+            }
+            let uv = Vec2 { x: projection.u, y: projection.v };
+            if parameter_point_in_face(face, uv, face_uv_tolerance(face, projection.u, projection.v, band))? == PolygonClass::Outside {
+                continue;
+            }
+            let Ok(normal) = face_normal(face, projection.u, projection.v) else { continue };
+            let inward = normal.scale(-1.0);
+            // The probe starts a thousandth of a band inside, past its own
+            // wall (no self-hit to exclude, at any distance from the origin),
+            // and reads the hits at that resolution (the intersection merges
+            // hits within ten of its tolerance; at the classifier's own a
+            // wall 8e-7 across would merge with its foot).
+            let offset = 1e-3 * band;
+            let resolution = 1e-3 * band;
+            let foot = projection.point;
+            let from = foot.add(inward.scale(offset));
+            let to = foot.add(inward.scale(reach));
+            let mut hits = Vec::new();
+            self.bvh.intersecting_segment(from, to, band, &mut hits);
+            let ray = make_line(from, to)?;
+            for &other in &hits {
+                let other_face = self.faces[other];
+                for hit in ray_face_intersections(&ray, &other_face.surface, resolution)? {
+                    let distance = hit.point.sub(foot).length();
+                    if !(distance > offset) || distance > reach {
+                        continue;
+                    }
+                    let trim = parameter_point_in_face(
+                        other_face,
+                        Vec2 { x: hit.u, y: hit.v },
+                        face_uv_tolerance(other_face, hit.u, hit.v, resolution),
+                    )?;
+                    if trim != PolygonClass::Outside {
+                        let quarter = distance / 4.0;
+                        cap = Some(cap.map_or(quarter, |c: f64| c.min(quarter)));
+                    }
+                }
+            }
+        }
+        Ok(cap)
+    }
+
+    /// [`Self::classify`] at the On band `on_tolerance`, its rays' crossings
+    /// read at `tolerance`.
+    fn classify_banded(&self, point: Vec3, on_tolerance: f64, tolerance: f64) -> Result<PointClassification, String> {
         let mut candidates = Vec::new();
         self.bvh
             .containing_point(point, on_tolerance, &mut candidates);
@@ -595,14 +801,7 @@ impl<'a> SolidClassifier<'a> {
                         continue 'directions;
                     }
                     let trim_started = classify_profile_started();
-                    let trim_class = parameter_point_in_face(
-                        face,
-                        Vec2 {
-                            x: intersection.u,
-                            y: intersection.v,
-                        },
-                        face_uv_tolerance(face, intersection.u, intersection.v, on_tolerance),
-                    )?;
+                    let trim_class = metric_trim(face, intersection.u, intersection.v, on_tolerance)?;
                     classify_profile(|p| {
                         p.ray_trim_tests += 1;
                         p.ray_trim_ms += classify_elapsed_ms(trim_started);
@@ -752,4 +951,7 @@ pub fn classify_point(
     classify_profile_report("classify_point");
     result
 }
+
+
+
 

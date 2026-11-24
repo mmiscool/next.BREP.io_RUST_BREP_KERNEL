@@ -79,6 +79,10 @@ pub struct Follower {
     /// A Save's write found the server unreachable since the last answer
     /// ([`Self::note_unreachable`]).
     missed_write: bool,
+    /// Scripts: while held, the feed is asked only when [`Self::ask_now`] says so (the first question
+    /// too), never by the interval, so a loaded machine's clock cannot add a question or a notice a
+    /// script then counts.
+    pub held: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -144,7 +148,7 @@ impl Follower {
                 // A failed question is asked again at the next interval.
             }
         }
-        let due = self.asked_at.is_none_or(|at| now - at >= FOLLOW_SECS);
+        let due = self.asked_at.is_none_or(|at| !self.held && now - at >= FOLLOW_SECS);
         if moved.is_none() && due && self.request.is_none() {
             self.asked_at = Some(now);
             self.requests += 1;

@@ -156,6 +156,10 @@ pub struct Document {
     /// document ([`ecad::BlockSync`]).
     pub ecad_blocks: [ecad::BlockSync; 4],
     pub ecad_parts_revision: Option<u64>,
+    /// The components on the PCB the last frame (`ecad_parts::answer_board_checks`):
+    /// one that appears says whether it sits on its footprint. `None` until the
+    /// board is first seen, so opening a document says nothing.
+    pub ecad_placed: Option<std::collections::BTreeSet<brep_ecad_core::Uuid>>,
     /// The broken-reference lines `crate::panels::ecad_parts::sync` has
     /// already put in front of the user. A device whose part is missing is a
     /// STANDING state and the revision bumps on every edit, so without this it
@@ -427,6 +431,7 @@ impl Document {
             ecad: crate::workbench::ecad::Editors::new(),
             ecad_blocks: ecad_blocks(),
             ecad_parts_revision: None,
+            ecad_placed: None,
             ecad_parts_reported: Vec::new(),
             ecad_occurrences: None,
             ecad_outdated: Vec::new(),
@@ -465,6 +470,7 @@ impl Document {
             ecad: crate::workbench::ecad::Editors::new(),
             ecad_blocks: ecad_blocks(),
             ecad_parts_revision: None,
+            ecad_placed: None,
             ecad_parts_reported: Vec::new(),
             ecad_occurrences: None,
             ecad_outdated: Vec::new(),

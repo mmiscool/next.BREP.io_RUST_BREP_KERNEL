@@ -296,6 +296,24 @@ static SHEET: &[Action<Editor>] = &[
                 Some(Selection::Component(_) | Selection::Label(_))
             )
     }),
+    // A sheet's board zone: the selected part onto the board, or off it. A drag
+    // across the zone's edge does the same.
+    sheet_action("sheet.board.enter", "Onto the board", ActionGroup::Selection, |e| {
+        e.set_selected_off_board(false);
+    })
+    .offered_when(|e| sheet(e) && e.document.kind == DocumentKind::Sheet)
+    .enabled_when(|e| e.selected_off_board() == Some(true)),
+    sheet_action("sheet.board.leave", "Off the board", ActionGroup::Selection, |e| {
+        e.set_selected_off_board(true);
+    })
+    .offered_when(|e| sheet(e) && e.document.kind == DocumentKind::Sheet)
+    .enabled_when(|e| e.selected_off_board() == Some(false)),
+    // A board of its own on the sheet: edit it, as the Work part.
+    sheet_action("sheet.board.edit", "Edit this board", ActionGroup::Selection, |e| {
+        e.enter_selected_zone();
+    })
+    .offered_when(|e| sheet(e) && e.document.kind == DocumentKind::Sheet)
+    .enabled_when(|e| e.selected_zone().is_some()),
     sheet_action(
         "sheet.duplicate",
         "Duplicate",

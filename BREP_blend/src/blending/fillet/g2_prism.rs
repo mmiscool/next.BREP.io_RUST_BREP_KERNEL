@@ -16,7 +16,7 @@
 use super::*;
 use crate::topology::{CoedgeRecord, VertexRecord};
 
-fn planar_normal(face: &FaceRecord) -> Option<Vec3> {
+pub(super) fn planar_normal(face: &FaceRecord) -> Option<Vec3> {
     let s = &face.surface;
     if s.degree_u != 1 || s.degree_v != 1 || s.control_points.len() != 2 || s.control_points[0].len() != 2 {
         return None;
@@ -44,7 +44,7 @@ fn line_ends(edge: &EdgeRecord) -> Option<(Vec3, Vec3)> {
 }
 
 /// The (u, v) of `point` on a planar face's affine chart.
-fn chart_uv(face: &FaceRecord, point: Vec3) -> Option<[f64; 2]> {
+pub(super) fn chart_uv(face: &FaceRecord, point: Vec3) -> Option<[f64; 2]> {
     let q = crate::project_point_to_surface(&face.surface, point).ok()?;
     (q.distance <= 1e-9 * (1.0 + point.length())).then_some([q.u, q.v])
 }
@@ -55,7 +55,7 @@ fn line2(a: [f64; 2], b: [f64; 2]) -> Option<NurbsCurve> {
 
 /// `curve` (3D, rational) mapped onto a planar face's affine chart, control by
 /// control.
-fn mapped_on_plane(face: &FaceRecord, curve: &NurbsCurve) -> Option<NurbsCurve> {
+pub(super) fn mapped_on_plane(face: &FaceRecord, curve: &NurbsCurve) -> Option<NurbsCurve> {
     let mut controls = Vec::with_capacity(curve.control_points.len());
     for c in &curve.control_points {
         let uv = chart_uv(face, c.point().ok()?)?;

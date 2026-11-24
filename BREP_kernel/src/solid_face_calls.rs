@@ -16,7 +16,18 @@ pub fn thicken_faces(solid: &BrepSolid, face_points: &[Vec3], thickness: f64) ->
         faces.insert(crate::resolve_face_by_point(solid, point)?);
     }
     let sheet = crate::feature_pipeline::features::sew_to_solid::extract(solid, &faces);
-    thicken_sheet_faces(&[sheet], thickness, OffsetCorners::Sharp)
+    let thickened = thicken_sheet_faces(&[sheet], thickness, OffsetCorners::Sharp);
+    // Every face of the solid named: the sheet is the solid's whole closed
+    // boundary, which may be one face closed in both directions (a torus) with
+    // no edge for the sheet's walls to stand on. What its faces sweep moving
+    // out to `thickness` is the hollow between the boundary and the body grown
+    // (or shrunk) by `thickness` with sharp joins, as the closed shell builds
+    // it; that is answered where the sheet's own construction refuses.
+    let whole = solid.shells.iter().flat_map(|shell| &shell.faces).all(|face| faces.contains(&face.id));
+    match thickened {
+        Err(refusal) if whole => crate::offset_shell_closed(solid, -thickness).map(|hollow| hollow.solid).map_err(|_| refusal),
+        thickened => thickened,
+    }
 }
 
 /// How two solids meet, as they stand: the volume they share and the gap

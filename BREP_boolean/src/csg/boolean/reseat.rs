@@ -41,6 +41,31 @@ pub(super) fn seam_reseat_enabled() -> bool {
 }
 
 
+/// Which contacts a re-seat reads: a plane of the other operand along a
+/// generatrix (the original re-seat), and a cylinder of the other operand
+/// tangent from outside (`BREP_SEAM_RESEAT_CYLINDERS`).
+#[derive(Clone, Copy)]
+pub(super) struct ContactKinds {
+    pub(super) planes: bool,
+    pub(super) cylinders: bool,
+}
+
+/// `BREP_SEAM_RESEAT_CYLINDERS` (default off; `on`, `check`): a
+/// primitive-shaped cylinder wall that one cylinder of the other operand
+/// touches from outside along a generatrix has its seam re-seated onto that
+/// line before imprint, as a plane's contact does. Two holes cut one after
+/// the other, tangent along a line: where the contact lay on the earlier
+/// hole's own seam, the imprint left that wall unsplit and the body failed
+/// its Euler check; with the later hole's seam on the contact the line pairs
+/// as the plane case does. Under it the raw API (no later references given)
+/// re-seats these cylinder walls only; the plane re-seat keeps its gate.
+/// `check` builds both ways, prints one `boolean.seam_reseat_cylinders`
+/// line, and returns the body built without it.
+pub(super) fn seam_reseat_cylinders_mode() -> crate::env_read::Mode {
+    crate::mode_switch!("BREP_SEAM_RESEAT_CYLINDERS", false)
+}
+
+
 /// Both operands, each with every tangent cylinder wall the gate admits
 /// re-seated on its contact line; an operand nothing applies to is borrowed.
 pub(super) fn reseat_tangent_seams<'a>(
@@ -49,11 +74,22 @@ pub(super) fn reseat_tangent_seams<'a>(
     later: &[String],
     tolerance: f64,
 ) -> (Cow<'a, BrepSolid>, Cow<'a, BrepSolid>) {
+    reseat_tangent_seams_of(first, second, later, tolerance, ContactKinds { planes: true, cylinders: seam_reseat_cylinders_mode() == crate::env_read::Mode::On })
+}
+
+/// [`reseat_tangent_seams`] for the given contact kinds.
+pub(super) fn reseat_tangent_seams_of<'a>(
+    first: &'a BrepSolid,
+    second: &'a BrepSolid,
+    later: &[String],
+    tolerance: f64,
+    kinds: ContactKinds,
+) -> (Cow<'a, BrepSolid>, Cow<'a, BrepSolid>) {
     let weld = crate::tolerance::assembler_weld(tolerance);
     let before = TOPOLOGY_WORK.with(|work| work.get());
     let result = (
-        reseat_operand(first, second, later, weld).map_or(Cow::Borrowed(first), Cow::Owned),
-        reseat_operand(second, first, later, weld).map_or(Cow::Borrowed(second), Cow::Owned),
+        reseat_operand(first, second, later, weld, kinds).map_or(Cow::Borrowed(first), Cow::Owned),
+        reseat_operand(second, first, later, weld, kinds).map_or(Cow::Borrowed(second), Cow::Owned),
     );
     if crate::profile::profile_enabled() {
         let after = TOPOLOGY_WORK.with(|work| work.get());
@@ -195,6 +231,39 @@ fn tangent_contact(wall: &FaceRecord, other: &BrepSolid, weld: f64) -> Option<Co
     }
 }
 
+/// The one cylinder face of `other` tangent to the cylinder `wall` from
+/// outside along a generatrix (parallel axes, the axes the radii's sum apart
+/// within `weld`), or `None` (no such face, or two). The contact line runs
+/// through `wall`'s axis point toward the other's.
+fn cylinder_contact(wall: &FaceRecord, other: &BrepSolid, weld: f64) -> Option<Contact> {
+    let Some(crate::AnalyticSurface::RuledRevolution { frame, rho0, rho1, .. }) = wall.surface.analytic() else {
+        return None;
+    };
+    if rho0 != rho1 {
+        return None;
+    }
+    let mut contacts = Vec::new();
+    for face in other.shells.iter().flat_map(|shell| &shell.faces) {
+        let Some(crate::AnalyticSurface::RuledRevolution { frame: theirs, rho0: r0, rho1: r1, .. }) = face.surface.analytic() else {
+            continue;
+        };
+        if r0 != r1 || frame.axis.cross(theirs.axis).length() > 1e-9 {
+            continue;
+        }
+        let apart = theirs.origin.sub(frame.origin);
+        let apart = apart.sub(frame.axis.scale(apart.dot(frame.axis)));
+        if (apart.length() - (rho0 + r0)).abs() > weld {
+            continue;
+        }
+        let Ok(toward) = apart.normalized() else { continue };
+        contacts.push(Contact { point: frame.origin.add(toward.scale(*rho0)), axis: frame.axis });
+    }
+    match contacts.len() {
+        1 => contacts.pop(),
+        _ => None,
+    }
+}
+
 // Re-seating changes carrier/curve/pcurve coordinates, never record order,
 // ids or coedge incidence. These readings therefore remain valid across all
 // admitted walls of one operand. Keep the first slot for duplicate face ids,
@@ -235,24 +304,24 @@ fn topology_memo_enabled() -> bool {
     switch!("BREP_RESEAT_TOPOLOGY_MEMO", true)
 }
 
-fn reseat_operand(solid: &BrepSolid, other: &BrepSolid, later: &[String], weld: f64) -> Option<BrepSolid> {
-    reseat_operand_indexed(solid, other, later, weld, topology_memo_enabled())
+fn reseat_operand(solid: &BrepSolid, other: &BrepSolid, later: &[String], weld: f64, kinds: ContactKinds) -> Option<BrepSolid> {
+    reseat_operand_indexed(solid, other, later, weld, topology_memo_enabled(), kinds)
 }
 
-fn reseat_operand_indexed(solid: &BrepSolid, other: &BrepSolid, later: &[String], weld: f64, indexed: bool) -> Option<BrepSolid> {
+fn reseat_operand_indexed(solid: &BrepSolid, other: &BrepSolid, later: &[String], weld: f64, indexed: bool, kinds: ContactKinds) -> Option<BrepSolid> {
     let topology = indexed.then(|| ReseatTopology::new(solid));
     let mut result: Option<BrepSolid> = None;
     let faces: Vec<u64> = solid.shells.iter().flat_map(|shell| &shell.faces).map(|face| face.id).collect();
     for face_id in faces {
         let current = result.as_ref().unwrap_or(solid);
-        if let Some(reseated) = reseat_wall(current, face_id, other, later, weld, topology.as_ref()) {
+        if let Some(reseated) = reseat_wall(current, face_id, other, later, weld, topology.as_ref(), kinds) {
             result = Some(reseated);
         }
     }
     result
 }
 
-fn reseat_wall(solid: &BrepSolid, face_id: u64, other: &BrepSolid, later: &[String], weld: f64, topology: Option<&ReseatTopology>) -> Option<BrepSolid> {
+fn reseat_wall(solid: &BrepSolid, face_id: u64, other: &BrepSolid, later: &[String], weld: f64, topology: Option<&ReseatTopology>, kinds: ContactKinds) -> Option<BrepSolid> {
     // The diagnostic hatch retains the original collect/find and census work.
     let faces: Option<Vec<&FaceRecord>> = topology.is_none().then(|| solid.shells.iter().flat_map(|shell| &shell.faces).collect());
     let wall = if let Some(topology) = topology {
@@ -303,7 +372,11 @@ fn reseat_wall(solid: &BrepSolid, face_id: u64, other: &BrepSolid, later: &[Stri
     {
         return None;
     }
-    let contact = tangent_contact(wall, other, weld)?;
+    let contact = kinds
+        .planes
+        .then(|| tangent_contact(wall, other, weld))
+        .flatten()
+        .or_else(|| kinds.cylinders.then(|| cylinder_contact(wall, other, weld)).flatten())?;
     // The carrier's full-multiplicity u knot whose control row lies on the
     // contact line at both ends; the one re-seat that is exact.
     let surface = &wall.surface;

@@ -1,5 +1,7 @@
 # BREP_gizmos — in-scene gizmos and overlay widgets
 
+Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_gizmos` · [licence summary](#licence)
+
 Pure-geometry gizmos and overlay widgets for the BREP CAD stack (publishes on
 crates.io as **`BREP_gizmos`**, lib `brep_gizmos`): the transform gizmo,
 ViewCube, datum/axis visuals, dimension leaders, and curve display used by the
@@ -99,4 +101,15 @@ gizmos themselves never touch the kernel or the GPU.
 
 - License: the Autodrop3d licence in `LICENSE.md`, shipped in the crate
   (`license-file` in the manifest).
-- Version: 0.2.6.
+- Version: 0.2.7.
+
+## Licence
+
+In plain words: the crates are free to use as they are, including in a commercial project. If you
+fix or change something in the kernel, send the change back as a pull request to
+[github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL). If you do not want to share your
+changes, buy a commercial licence from [Autodrop3d LLC](https://autodrop3d.com); with it you never
+have to share your code back.
+
+The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the manifest) and at
+[LICENSE.md](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL/blob/master/LICENSE.md); if this summary and the file ever differ, the file wins.

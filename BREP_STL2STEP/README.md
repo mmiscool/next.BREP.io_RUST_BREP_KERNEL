@@ -1,5 +1,7 @@
 # BREP_STL2STEP
 
+Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo install BREP_STL2STEP` · [licence summary](#licence)
+
 Command-line STL-to-STEP converter of the BREP crate family. It depends on
 `BREP_reconstruction`; its binary name is `stl2step`.
 
@@ -29,5 +31,16 @@ a successful run always prints a human-readable terminal report.
 Exit statuses are `0` for success, `2` for usage, `3` for STL input, `4` for conversion,
 and `5` for output I/O. Run `stl2step --help` for all recognition and tolerance options.
 
-The package is version 0.2.23 and contains only this binary. Licence: the Autodrop3d
+The package is version 0.2.24 and contains only this binary. Licence: the Autodrop3d
 licence in `LICENSE.md`, shipped in the crate.
+
+## Licence
+
+In plain words: the crates are free to use as they are, including in a commercial project. If you
+fix or change something in the kernel, send the change back as a pull request to
+[github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL). If you do not want to share your
+changes, buy a commercial licence from [Autodrop3d LLC](https://autodrop3d.com); with it you never
+have to share your code back.
+
+The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the manifest) and at
+[LICENSE.md](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL/blob/master/LICENSE.md); if this summary and the file ever differ, the file wins.

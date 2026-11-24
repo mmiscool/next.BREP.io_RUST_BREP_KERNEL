@@ -2417,7 +2417,7 @@ pub fn carrier_edge_curve(
 /// the old adaptive trace: its last point, or its midpoint when the first
 /// subdivision fires. Near-collapsed images and uncertified inputs stay eager.
 /// `BREP_OFFSET_LAZY_CARRIER_TRACE`; on by default since
-/// 2026-11-02 (lane O batch 21), `0`/`off` restores the eager trace.
+/// 2026-11-02, `0`/`off` restores the eager trace.
 pub fn lazy_carrier_trace(
     surface: &NurbsSurface,
     pcurve: &NurbsCurve,

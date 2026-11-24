@@ -867,9 +867,11 @@ struct OwnedFollowup {
     doc: u64,
     /// The new revisions' keys: the Save waits until the index has each.
     keys: Vec<String>,
-    /// Frames waited for the index; past the cap the Save goes ahead and
-    /// asks about what the index still lacks.
-    polls: u32,
+    /// When the wait for the index began (once every checkout and new
+    /// revision had landed); past the cap the Save goes ahead and asks about
+    /// what the index still lacks. Wall time, not frames: a client that draws
+    /// frames quickly would otherwise spend the wait in a fraction of it.
+    since: Option<web_time::Instant>,
 }
 
 struct PendingInstructionsPdf {
@@ -2828,7 +2830,7 @@ impl FileDialog {
                                 crate::document::owned_save::shown(&new_key, &[])
                             ),
                         );
-                        let followup = self.owned_followup.get_or_insert(OwnedFollowup { doc, keys: Vec::new(), polls: 0 });
+                        let followup = self.owned_followup.get_or_insert(OwnedFollowup { doc, keys: Vec::new(), since: None });
                         followup.keys.push(new_key);
                     }
                     Err(why) => docs.engine_mut().push_notice(format!("'{new_key}' holds the change, but the assembly could not name it: {why}")),
@@ -2875,10 +2877,9 @@ impl FileDialog {
                 return;
             }
             if let Some(followup) = self.owned_followup.as_mut() {
-                // ~10 s at the 50 ms repaint below.
-                const INDEX_WAIT_POLLS: u32 = 200;
-                if followup.polls < INDEX_WAIT_POLLS && followup.keys.iter().any(|key| store.plm_revision(key).is_none()) {
-                    followup.polls += 1;
+                const INDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+                let since = *followup.since.get_or_insert_with(web_time::Instant::now);
+                if since.elapsed() < INDEX_WAIT && followup.keys.iter().any(|key| store.plm_revision(key).is_none()) {
                     ctx.request_repaint_after(std::time::Duration::from_millis(50));
                     return;
                 }
@@ -2909,7 +2910,7 @@ impl FileDialog {
                             // A change kept by an earlier Save is written now; the
                             // assembly was written before it landed and still marks
                             // it: save the assembly again, as for new revisions.
-                            self.owned_followup.get_or_insert(OwnedFollowup { doc: id, keys: Vec::new(), polls: 0 });
+                            self.owned_followup.get_or_insert(OwnedFollowup { doc: id, keys: Vec::new(), since: None });
                         }
                     } else {
                         // Kept in the assembly: marked, so it reads unsaved, the

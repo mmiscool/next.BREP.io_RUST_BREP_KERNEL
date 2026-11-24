@@ -68,6 +68,22 @@ impl Block {
 /// One editor's standing with its block: the value it holds and the history
 /// revision it was last in step at, so a frame in which nothing changed costs
 /// one integer comparison.
+/// What the sheet-and-board editor's sheet was merged from, kept between frames:
+/// the `pcb` and `diagram` blocks it splits back into, and where the diagram was
+/// drawn on the sheet this session (`brep_ecad_core::sheet`). The two blocks keep
+/// their own [`BlockSync`]s; this is what joins them.
+#[derive(Debug, Default)]
+pub struct SheetState {
+    pub source: Option<brep_ecad_core::sheet::SheetSource>,
+    /// Where the diagram's content was drawn, held for the session so an undo
+    /// that re-merges does not move it while the diagram has none stored.
+    pub offset: Option<brep_ecad_core::Point>,
+    /// The boards of their own the assembly places, as last merged, and the
+    /// revision they were read at: the sheet is merged again when they change.
+    pub boards: Vec<brep_ecad_core::sheet::SubBoard>,
+    pub boards_revision: Option<u64>,
+}
+
 #[derive(Debug)]
 pub struct BlockSync {
     block: Block,
@@ -126,6 +142,26 @@ impl BlockSync {
     /// Whether [`Self::pull`] has run at all: `false` until the editor first
     /// loads this block, which is the document's OPEN as far as the editor can
     /// tell (a document is built with its syncs, and a load builds a document).
+    /// [`Self::store`] without an undo checkpoint: the second block of ONE sheet
+    /// edit, which belongs to the checkpoint the first block's store just took.
+    pub fn store_no_undo(&mut self, history: &mut History, value: Value) -> Result<(), String> {
+        if let Some(reason) = &self.unreadable {
+            return Err(format!("the {} block was not written: {reason}", self.block.key()));
+        }
+        history.set_document_block_no_undo(self.block.key(), Some(value.clone()));
+        self.held = Some(value);
+        self.revision = Some(history.revision());
+        Ok(())
+    }
+
+    /// Take the block as it now stands as the editor's, at the current revision:
+    /// after a write of the OTHER block of a sheet moved the revision past this
+    /// one's store.
+    pub fn hold(&mut self, history: &History) {
+        self.held = self.block.read(history).cloned();
+        self.revision = Some(history.revision());
+    }
+
     pub fn pulled(&self) -> bool {
         self.revision.is_some()
     }
@@ -201,6 +237,13 @@ impl BlockSync {
     }
 
     /// The editor could not read the block [`Self::pull`] just handed it.
+    /// Forget a refusal: the sheet's two blocks are refused together, and read
+    /// together once both can be (`viewport::ecad::pull_sheet`), though only the
+    /// one that moved is handed out again by [`Self::pull`].
+    pub fn clear_refusal(&mut self) {
+        self.unreadable = None;
+    }
+
     pub fn refuse(&mut self, reason: String) {
         self.unreadable = Some(reason);
     }

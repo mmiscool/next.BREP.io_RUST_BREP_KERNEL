@@ -1,8 +1,10 @@
 # BREP — a boundary-representation geometry kernel
 
+Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_kernel` · [licence summary](#licence)
+
 A native/WASM B-rep geometry kernel for building CAD applications, written in
 Rust. Published on crates.io as **`BREP_kernel`** with library name
-`brep_kernel`; this is version **0.27.0**.
+`brep_kernel`; this is version **0.28.0**.
 It is the authoritative geometry engine behind the BREP CAD application
 (`BREP_app` + `BREP_render` in this repository, re-exported as `brep::kernel` by
 the umbrella `BREP` crate), and is usable standalone as a
@@ -187,7 +189,7 @@ is `BREP_kernel`, the Rust library is the idiomatic lowercase `brep_kernel`:
 
 ```toml
 [dependencies]
-brep_kernel = { package = "BREP_kernel", version = "0.27" }
+brep_kernel = { package = "BREP_kernel", version = "0.28" }
 ```
 
 ```rust
@@ -242,10 +244,19 @@ application links it as an rlib inside its own wasm bundle; `wasm-pack build
 The packaged crate ships the library sources, this README, the licence and the
 manifest; it carries no test suite.
 
-## License and links
+## Licence
 
-- License: the Autodrop3d licence in `LICENSE.md`, shipped in the crate
-  (`license-file` in the manifest).
+In plain words: the crates are free to use as they are, including in a commercial project. If you
+fix or change something in the kernel, send the change back as a pull request to
+[github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL). If you do not want to share your
+changes, buy a commercial licence from [Autodrop3d LLC](https://autodrop3d.com); with it you never
+have to share your code back.
+
+The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the manifest) and at
+[LICENSE.md](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL/blob/master/LICENSE.md); if this summary and the file ever differ, the file wins.
+
+## Links
+
 - The family: [`BREP_gizmos`](https://crates.io/crates/BREP_gizmos) (overlay
   widgets), [`BREP_render`](https://crates.io/crates/BREP_render) (the wgpu
   render/pick engine), [`BREP_app`](https://crates.io/crates/BREP_app) (the

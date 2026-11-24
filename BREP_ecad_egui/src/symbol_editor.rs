@@ -745,6 +745,40 @@ impl SymbolEditor {
                 }
                 ui.label("Pin name");
                 hits.mark("pin_name", &ui.text_edit_singleline(&mut p.name));
+                // The other functions this pin can serve. Each placed part
+                // chooses which one its sheet prints for the pin; nothing
+                // electrical reads the choice.
+                ui.label("Alternate functions");
+                let mut gone = None;
+                for (n, name) in p.alternates.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        let field = egui::TextEdit::singleline(name)
+                            .desired_width(160.)
+                            .hint_text("I2C1_SDA");
+                        hits.mark(format!("alternate:{n}"), &ui.add(field));
+                        let remove = ui.small_button("Remove").on_hover_text("Drop this function from the pin.");
+                        hits.mark(format!("remove_alternate:{n}"), &remove);
+                        if remove.clicked() {
+                            gone = Some(n);
+                        }
+                    });
+                }
+                if let Some(n) = gone {
+                    p.alternates.remove(n);
+                    coalesce = None;
+                }
+                let add = ui.button("Add function").on_hover_text(
+                    "Another name this pin goes by, such as I2C1_SDA beside PA1. \
+                     A placed part picks which one its sheet shows.",
+                );
+                hits.mark("add_alternate", &add);
+                if add.clicked() {
+                    p.alternates.push(String::new());
+                    coalesce = None;
+                }
+                if let Some(why) = alternates_problem(p) {
+                    ui.label(egui::RichText::new(why).color(ui.visuals().warn_fg_color));
+                }
                 // What this pin IS on the part: the connection point of its
                 // number, which the pads and the 3D model name the same way.
                 // Said HERE, beside the number it is named by, so that authoring
@@ -1482,6 +1516,7 @@ impl SymbolEditor {
                     // Unnamed, as KiCad's `~`: its number already labels it, and a
                     // stock name would be drawn on every pin until each is renamed.
                     name: String::new(),
+                    alternates: vec![],
                     electrical_type: "passive".into(),
                     at: a,
                     end: along(a, aim.opposite(), length),
@@ -1506,6 +1541,24 @@ impl SymbolEditor {
 }
 /// Where a pin's name is drawn, given its tip `at` and body end `end` on screen: the
 /// anchor, how the text hangs from it, and the name — or `None` for an unnamed pin.
+/// What is wrong with `pin`'s alternate functions, in the words the Inspector
+/// shows: a blank one, one that repeats the main name, or two the same. A
+/// placed part chooses among them by name, so each must be one name.
+fn alternates_problem(pin: &Pin) -> Option<String> {
+    for (n, name) in pin.alternates.iter().enumerate() {
+        let name = name.trim();
+        if name.is_empty() {
+            return Some("An alternate function has no name. Name it or remove it.".into());
+        }
+        if name == pin.name.trim() {
+            return Some(format!("{name} is the pin's main name already."));
+        }
+        if pin.alternates[..n].iter().any(|other| other.trim() == name) {
+            return Some(format!("{name} is listed twice."));
+        }
+    }
+    None
+}
 fn pin_name_label(pin: &Pin, at: Pos2, end: Pos2) -> Option<(Pos2, Align2, &str)> {
     let name = crate::pin_name(&pin.name)?;
     let (align, offset) = crate::pin_name_placement(at, end);

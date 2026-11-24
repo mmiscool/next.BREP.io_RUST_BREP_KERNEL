@@ -126,11 +126,9 @@ fn walk(features: &[Value], library: &Value, occurrence: &str, label: &str, foun
     }
 }
 
-/// A device offered to a sheet, and whether the part it came from carries a
-/// SYMBOL — which is what makes it a Diagram part rather than a PCB-only one.
-/// Read here rather than from the open document's library, because a nested
-/// device's key is not a key of THAT library.
-struct Offer { part: Part, symbol: bool }
+/// A device offered to the sheet. One sheet takes every part with a symbol or
+/// pads, on the board or off it.
+struct Offer { part: Part }
 
 
 /// A part's pads as a sheet copies them: named after the part when the Pads
@@ -180,7 +178,6 @@ fn offers_and_refusals(reached: Vec<Device>) -> (Vec<Offer>, Vec<String>) {
         if symbol.is_none() && pads.is_none() { return None; }
         let signature = device.signature;
         let offer = Offer {
-            symbol: symbol.is_some(),
             part: Part {
                 source: brep_ecad_core::PartSource {
                     key: key.clone(), signature, instance: Some(device.occurrence),
@@ -783,8 +780,7 @@ fn remove_feature_by_id(draft: &mut Value, id: &str) -> bool {
 /// the PCB's sheet a part with pads is seated by the board the frame it is offered.
 /// A part the assembly cannot add another of is said, and arms nothing.
 pub(crate) fn answer_duplicate_requests(doc: &mut Document) {
-    let requests: Vec<String> = doc.ecad.diagram.duplicate_requests.drain(..)
-        .chain(doc.ecad.pcb.duplicate_requests.drain(..)).collect();
+    let requests: Vec<String> = doc.ecad.pcb.duplicate_requests.drain(..).collect();
     if requests.is_empty() { return; }
     let mut answered = false;
     for key in requests {
@@ -803,10 +799,113 @@ pub(crate) fn answer_duplicate_requests(doc: &mut Document) {
         }
     }
     if answered { sync(doc); }
-    for editor in [&mut doc.ecad.diagram, &mut doc.ecad.pcb] {
-        editor.arm_pending_duplicate();
-        editor.cancel_pending_duplicate();
+    doc.ecad.pcb.arm_pending_duplicate();
+    doc.ecad.pcb.cancel_pending_duplicate();
+}
+
+/// The board's checks that need the parts' 3D models, answered after the PCB
+/// editor drew:
+///
+/// * when its design rule check ran (`Editor::take_drc_run`), each placed part
+///   whose pcb points' 3D seats miss their pads adds one finding per pin, at that
+///   pad (`ViolationKind::PinSeat`), after the board's own;
+/// * when a part is newly on the board, one line says whether it sits on its
+///   footprint: every checked pin on its pad, or the pins that miss. A part with
+///   no seated pcb points says nothing, since nothing was checked.
+///
+/// Each part is measured as Qualify measures it on the part itself
+/// (`pin_seats::part_pin_seats`, kept per document content), so a board's check
+/// and the part's own read the same.
+pub(crate) fn answer_board_checks(doc: &mut Document) {
+    let ran = doc.ecad.pcb.take_drc_run();
+    let placed: BTreeSet<brep_ecad_core::Uuid> =
+        doc.ecad.pcb.document.board.placements.iter().map(|p| p.component).collect();
+    let fresh: BTreeSet<brep_ecad_core::Uuid> = match &doc.ecad_placed {
+        Some(before) => placed.difference(before).copied().collect(),
+        None => BTreeSet::new(),
+    };
+    doc.ecad_placed = Some(placed);
+    if !ran && fresh.is_empty() {
+        return;
     }
+    let history = &doc.engine.history;
+    let top: Vec<Value> = (0..history.len())
+        .filter_map(|index| {
+            let kind = history.feature_type(index)?;
+            if !matches!(kind.as_str(), "ACOMP" | "ASSEMBLY COMPONENT") { return None; }
+            Some(serde_json::json!({"type": kind, "inputParams": history.feature_params(index)?}))
+        })
+        .collect();
+    let library = history.parts_library();
+    let sheet = &doc.ecad.pcb.document;
+    let mut findings = Vec::new();
+    let mut lines: Vec<(NoticeSeverity, String)> = Vec::new();
+    for placement in &sheet.board.placements {
+        let is_fresh = fresh.contains(&placement.component);
+        if !ran && !is_fresh { continue; }
+        let Some(component) = sheet.components.iter().find(|c| c.id == placement.component) else { continue };
+        let Some(occurrence) = component.part.as_ref().and_then(|part| part.instance.as_deref()) else { continue };
+        let Some(document) = occurrence_document(&top, library, occurrence) else { continue };
+        let verdict = super::pin_seats::part_pin_seats(document);
+        let reference = component.reference.clone();
+        match verdict.as_ref() {
+            Ok(seats) => {
+                let misses: Vec<&super::pin_seats::PinSeat> = seats.iter().filter(|seat| !seat.passes).collect();
+                if ran {
+                    for seat in &misses {
+                        let at = placement.footprint.pads.iter().find(|pad| pad.number == seat.pin)
+                            .map_or(placement.at, |pad| placement.transform(pad.at));
+                        findings.push(brep_ecad_core::board::Violation {
+                            kind: brep_ecad_core::board::ViolationKind::PinSeat,
+                            message: format!("{reference}: {}", seat.message.as_deref().unwrap_or("its seat misses its pad")),
+                            at,
+                        });
+                    }
+                }
+                if is_fresh && !seats.is_empty() {
+                    lines.push(if misses.is_empty() {
+                        (NoticeSeverity::Info, match seats.len() {
+                            1 => format!("{reference} sits on its footprint: its checked pin lands on its pad."),
+                            n => format!("{reference} sits on its footprint: all {n} checked pins land on their pads."),
+                        })
+                    } else {
+                        (NoticeSeverity::Warning, format!(
+                            "{reference} does not sit on its footprint: {}. Qualify on the part shows each pin.",
+                            misses.iter().filter_map(|seat| seat.message.as_deref()).collect::<Vec<_>>().join("; ")
+                        ))
+                    });
+                }
+            }
+            Err(error) => {
+                if is_fresh {
+                    lines.push((NoticeSeverity::Warning, format!(
+                        "{reference}: its pins could not be checked against its footprint ({error})."
+                    )));
+                }
+            }
+        }
+    }
+    if ran {
+        doc.ecad.pcb.add_board_findings(findings);
+    }
+    for (severity, line) in lines {
+        doc.engine.push_notice_as(severity, line);
+    }
+}
+
+/// The part document an occurrence chain (`ACOMP5:ACOMP9`) places, walked down
+/// from the top-level components through each sub-assembly's own library.
+fn occurrence_document<'a>(top: &[Value], library: &'a Value, occurrence: &str) -> Option<&'a Value> {
+    let mut ids = occurrence.split(':');
+    let first = ids.next()?;
+    let key = top.iter().find(|f| f["inputParams"]["id"].as_str() == Some(first))?["inputParams"]["partName"].as_str()?;
+    let mut document = &library[key]["document"];
+    for id in ids {
+        let feature = features_of(document).iter().find(|f| f["inputParams"]["id"].as_str() == Some(id))?;
+        let key = feature["inputParams"]["partName"].as_str()?;
+        document = &document["partsLibrary"][key]["document"];
+    }
+    document.is_object().then_some(document)
 }
 
 pub(crate) fn sync(doc: &mut Document) {
@@ -833,15 +932,10 @@ pub(crate) fn sync(doc: &mut Document) {
         .collect();
     let (offered, refused) = offers_and_refusals(reached);
     let missing: Vec<String> = missing.into_iter().chain(refused).collect();
-    // A nested device's key is a key of ITS OWN parent's library, not of this
-    // document's, so "does it have a symbol" is carried out of the walk rather
-    // than looked up here.
-    doc.ecad.diagram.parts = offered.iter().filter(|offer| offer.symbol).map(|offer| offer.part.clone()).collect();
     doc.ecad.pcb.parts = offered.into_iter().map(|offer| offer.part).collect();
     // The pane's button runs Assembly's own Add Component (`take_add_part_request`),
     // so the hint under it says only what the button does not: which parts it lists.
     let hints = [
-        (&mut doc.ecad.diagram, "A part appears here once the assembly holds it and it has a symbol. Draw one in the Symbol workbench, or import one from KiCad into the part."),
         (&mut doc.ecad.pcb, "A part appears here once the assembly holds it and it has a symbol or pads. Parts with pads go onto the board as well."),
     ];
     for (editor, hint) in hints {
@@ -879,8 +973,7 @@ pub static HIT_KEYS: &[crate::automation::hit_keys::HitKeyDoc] = &[
 /// was not drawn publishes none. Called every frame, not only on a new revision.
 pub(crate) fn take_add_part_request(doc: &mut Document) -> bool {
     let active = match doc.engine.settings.workbench.as_str() {
-        "diagram" => Some(&doc.ecad.diagram),
-        "schematic" | "pcb" => Some(&doc.ecad.pcb),
+        "diagram" | "schematic" | "pcb" => Some(&doc.ecad.pcb),
         _ => None,
     };
     if crate::automation::registry::enabled() {
@@ -892,7 +985,8 @@ pub(crate) fn take_add_part_request(doc: &mut Document) -> bool {
         );
     }
     let mut asked = false;
-    for editor in [&mut doc.ecad.diagram, &mut doc.ecad.pcb] {
+    {
+        let editor = &mut doc.ecad.pcb;
         editor.library_hits.clear();
         asked |= std::mem::take(&mut editor.add_part_requested);
     }
@@ -900,8 +994,7 @@ pub(crate) fn take_add_part_request(doc: &mut Document) -> bool {
 }
 
 pub(crate) fn take_open_requests(doc: &mut Document) -> Vec<String> {
-    let requests: BTreeSet<_> = doc.ecad.diagram.open_part_requests.drain(..)
-        .chain(doc.ecad.pcb.open_part_requests.drain(..)).collect();
+    let requests: BTreeSet<_> = doc.ecad.pcb.open_part_requests.drain(..).collect();
     if requests.is_empty() { return Vec::new(); }
     let document: Value = serde_json::from_str(&doc.engine.history.request_json()).unwrap_or_default();
     // A nested device's key is a key of ITS OWN parent's library, so the entry
@@ -1043,6 +1136,70 @@ pub(crate) fn refresh_snapshots(
     Ok(notes)
 }
 
+/// Carry the HARNESS connections across a part refresh: an end at a point the new
+/// version renamed (`ACOMP9:P1.VBUS` to `ACOMP9:P1.V5`) is rewritten to the new
+/// name, and an end at a point it no longer declares is named. `assembly` is the
+/// draft with the new entry in it, `before` the assembly as it stood.
+///
+/// The sheet's own wires (`diagram:` ids) are left to [`follow_sheet`], which
+/// folds them again from their pins in the same transaction. This is for the
+/// rest: a connection drawn in the Wire Harness pane names a point, and before
+/// this a renamed or removed point only showed up as an unresolved end when the
+/// harness was routed. Renames are read with `point_renames`, the evidence the
+/// sheet's terminals follow (a shared seat or `mapsTo`, else position, which is
+/// said).
+///
+/// Returns one line per end it renamed by position or could not keep.
+pub(crate) fn follow_harness_points(assembly: &mut Value, before: &Value) -> Vec<String> {
+    let Some(connections) = assembly["wireHarness"]["connections"].as_array().cloned() else { return Vec::new() };
+    let now = devices(features_of(assembly), &assembly["partsLibrary"]);
+    let then = devices(features_of(before), &before["partsLibrary"]);
+    let mut notes = Vec::new();
+    let mut changed = false;
+    let mut connections = connections;
+    for device in &now {
+        let Some(was) = then.iter().find(|was| was.occurrence == device.occurrence) else { continue };
+        if was.blocks.get("ports") == device.blocks.get("ports") { continue }
+        let renames = brep_render::brep_kernel::point_renames(&was.blocks, &device.blocks);
+        let declared: BTreeSet<String> =
+            brep_render::brep_kernel::declared_point_endpoints(&device.occurrence, &device.blocks)
+                .into_iter().map(|endpoint| endpoint.id).collect();
+        let declared_before: BTreeSet<String> =
+            brep_render::brep_kernel::declared_point_endpoints(&device.occurrence, &was.blocks)
+                .into_iter().map(|endpoint| endpoint.id).collect();
+        let prefix = format!("{}:", device.occurrence);
+        for connection in connections.iter_mut() {
+            if connection["id"].as_str().is_some_and(|id| id.starts_with("diagram:")) { continue }
+            let name = connection["name"].as_str().filter(|n| !n.is_empty())
+                .or(connection["id"].as_str()).unwrap_or("?").to_owned();
+            for side in ["from", "to"] {
+                let Some(end) = connection[side].as_str().map(str::to_owned) else { continue };
+                // Only an end AT this occurrence: a deeper chain is another device's.
+                let Some((group, point)) = end.strip_prefix(&prefix).and_then(|rest| rest.split_once('.')) else { continue };
+                if group.contains(':') || !declared_before.contains(&end) || declared.contains(&end) { continue }
+                let renamed = renames.all().get(point).map(|to| format!("{prefix}{group}.{to}"))
+                    .filter(|to| declared.contains(to));
+                match renamed {
+                    Some(to) => {
+                        if renames.positional.contains_key(point) {
+                            notes.push(format!("harness connection '{name}': '{end}' was read as renamed to '{to}' by \
+                                POSITION; nothing in either version seats it, so check that it is the same point."));
+                        }
+                        connection[side] = Value::String(to);
+                        changed = true;
+                    }
+                    None => notes.push(format!("harness connection '{name}' ends at '{end}', which '{}' no longer \
+                        declares. It shows as Missing port in the Wire Harness pane: pick its new end there.", device.reference)),
+                }
+            }
+        }
+    }
+    if changed {
+        assembly["wireHarness"]["connections"] = Value::Array(connections);
+    }
+    notes
+}
+
 /// Endpoint identities from the embedded part declarations, for a refresh before
 /// the new parts have run. Resolution still goes through the kernel's one resolver.
 ///
@@ -1056,6 +1213,178 @@ pub(crate) fn declared_endpoints(document: &Value) -> Vec<brep_render::brep_kern
         .flat_map(|device| brep_render::brep_kernel::declared_point_endpoints(
             &device.occurrence, &device.blocks))
         .collect()
+}
+
+/// The boards of their own this assembly places, at any depth below sub-assemblies
+/// that are not boards themselves, as the sheet draws them (`brep_ecad_core::sheet::SubBoard`): each one's schematic, its `pcb`
+/// block, and the pins of it the board declares a point for. A board whose
+/// schematic does not read is left out; its own document says why.
+pub(crate) fn sub_boards(history: &brep_render::history::History) -> Vec<brep_ecad_core::sheet::SubBoard> {
+    // The top level as features, read from the history (a nested level is its
+    // part's own embedded document).
+    let top: Vec<Value> = (0..history.len())
+        .filter(|&index| history.feature_type(index)
+            .is_some_and(|kind| matches!(kind.as_str(), "ACOMP" | "ASSEMBLY COMPONENT")))
+        .filter_map(|index| {
+            let mut params = history.feature_params(index)?.clone();
+            params["id"] = Value::String(history.feature_id(index)?);
+            Some(serde_json::json!({"type": "ACOMP", "inputParams": params}))
+        })
+        .collect();
+    let mut out = Vec::new();
+    boards_in(&top, history.parts_library(), "", "", &mut out);
+    out
+}
+
+/// The boards among `features` and, through every sub-assembly that is not a
+/// board, below them: a board is a zone, and what is inside it is its own.
+fn boards_in(features: &[Value], library: &Value, occurrence: &str, label: &str,
+    out: &mut Vec<brep_ecad_core::sheet::SubBoard>) {
+    for feature in features.iter().filter(|feature| is_component(feature)) {
+        let params = &feature["inputParams"];
+        let (Some(id), Some(key)) = (params["id"].as_str(), params["partName"].as_str()) else { continue };
+        let chain = if occurrence.is_empty() { id.to_owned() } else { format!("{occurrence}:{id}") };
+        let designator = params["bom"]["Reference_Designator"].as_str().unwrap_or("").trim();
+        let own = if designator.is_empty() { id } else { designator };
+        let reference = if label.is_empty() { own.to_owned() } else { format!("{label}/{own}") };
+        let document = &library[key]["document"];
+        if document.is_null() { continue; }
+        if !brep_render::brep_kernel::document_is_boundary(document) {
+            boards_in(features_of(document), &document["partsLibrary"], &chain, &reference, out);
+            continue;
+        }
+        let Some(pcb) = document.get("pcb").filter(|block| !block.is_null()) else { continue };
+        let Some(mut schematic) = brep_ecad_core::Document::from_value(pcb.clone()).ok()
+            .filter(|schematic| schematic.kind == brep_ecad_core::DocumentKind::Schematic) else { continue };
+        // A LEGACY part of the board's, drawn before parts carried a chain, is
+        // bound here as `follow_sheet` binds one: by its key and its label. Only
+        // on the sheet's copy; the board's own document is not written.
+        let reached = devices(features_of(document), &document["partsLibrary"]);
+        for component in &mut schematic.components {
+            let label = component.reference.clone();
+            let Some(part) = component.part.as_mut().filter(|part| part.instance.is_none()) else { continue };
+            if let [device] = reached.iter().filter(|device| device.key == part.key && device.reference == label)
+                .collect::<Vec<_>>()[..] {
+                part.instance = Some(device.occurrence.clone());
+            }
+        }
+        let declared = declared_pins(document, &schematic);
+        out.push(brep_ecad_core::sheet::SubBoard { occurrence: chain, reference, schematic, declared });
+    }
+}
+
+/// The board a device chain is inside, if any: the board's own chain, label and
+/// document, and the chain inside it (`ACOMP5:ACOMP9:ACOMP1` → `ACOMP5:ACOMP9`,
+/// `ACOMP1`).
+fn board_of<'a>(document: &'a Value, reached: &[Device], chain: &str) -> Option<(String, String, &'a Value, String)> {
+    let parts: Vec<&str> = chain.split(':').collect();
+    let mut owner = document;
+    for depth in 0..parts.len().saturating_sub(1) {
+        let feature = features_of(owner).iter().find(|f| is_component(f) && f["inputParams"]["id"] == parts[depth])?;
+        let inner = &owner["partsLibrary"][feature["inputParams"]["partName"].as_str()?]["document"];
+        if inner.is_null() { return None; }
+        if brep_render::brep_kernel::document_is_boundary(inner) {
+            let outer = parts[..=depth].join(":");
+            let reference = reached.iter().find(|d| d.occurrence == outer).map_or(outer.clone(), |d| d.reference.clone());
+            return Some((outer, reference, inner, parts[depth + 1..].join(":")));
+        }
+        owner = inner;
+    }
+    None
+}
+
+/// A board of its own placed at `occurrence`, as entering it names it: its label,
+/// and how many placements of this assembly's share its document (each takes an
+/// edit made inside it).
+pub(crate) fn board_placements(history: &brep_render::history::History, occurrence: &str) -> Option<(String, usize)> {
+    let boards = sub_boards(history);
+    let board = boards.iter().find(|board| board.occurrence == occurrence)?;
+    // Placements of one board document carry the same schematic, at any depth.
+    let shared = boards.iter().filter(|other| other.schematic == board.schematic).count();
+    Some((board.reference.clone(), shared))
+}
+
+/// The boards a sheet asked to edit, each made the Work part in place, in the
+/// workbench the sheet was shown in. A board placed more than once says so: an
+/// edit inside it is an edit of every placement.
+pub(crate) fn enter_requested_boards(docs: &mut crate::document::Documents) {
+    let requests = docs.view_mut().ecad.pcb.take_enter_requests();
+    for occurrence in requests {
+        let workbench = docs.view().engine.settings.workbench.clone();
+        let named = board_placements(&docs.view().engine.history, &occurrence);
+        let path = match docs.work_part_path() {
+            Some(at) => format!("{at}:{occurrence}"),
+            None => occurrence.clone(),
+        };
+        match docs.begin_work_part_as(&path, crate::document::work_part::WorkPartMode::InPlace) {
+            Ok(()) => {
+                let engine = docs.engine_mut();
+                engine.settings.workbench = workbench;
+                let (reference, shared) = named.unwrap_or((occurrence, 1));
+                engine.push_notice_as(NoticeSeverity::Info, match shared {
+                    1 => format!("Editing the board {reference}: its own document. Return to the assembly from the Work part bar."),
+                    n => format!("Editing the board {reference}: its own document, placed {n} times in this assembly. \
+                        Every placement takes these edits. Return to the assembly from the Work part bar."),
+                });
+            }
+            Err(error) => docs.engine_mut().push_notice(format!("Edit board {occurrence}: {error}")),
+        }
+    }
+}
+
+/// The addresses a board's own ports map to (`mapsTo`), each with the point that
+/// declares it, as `(target, "PORT.POINT")`.
+fn board_mappings(board: &Value) -> Vec<(String, String)> {
+    board["ports"].as_array().into_iter().flatten().flat_map(|port| {
+        let name = port["name"].as_str().unwrap_or("").to_owned();
+        port["points"].as_array().into_iter().flatten().filter_map(move |point| {
+            let target = point["mapsTo"].as_str().map(str::trim).filter(|t| !t.is_empty())?;
+            Some((target.to_owned(), format!("{name}.{}", point["name"].as_str().unwrap_or(""))))
+        })
+    }).collect()
+}
+
+/// The address, inside `board`, of pin `pin` (of symbol unit `unit`) of the device
+/// at `chain` in it.
+fn board_pin_address(board: &Value, chain: &str, unit: u32, pin: &str) -> Result<String, String> {
+    let reached = devices(features_of(board), &board["partsLibrary"]);
+    let device = reached.iter().find(|device| device.occurrence == chain)
+        .ok_or_else(|| format!("the board has no occurrence '{chain}'"))?;
+    let group = brep_render::brep_kernel::port_group_for_unit(&device.blocks, unit);
+    let inner: Vec<_> = reached.iter()
+        .flat_map(|device| brep_render::brep_kernel::declared_point_endpoints(&device.occurrence, &device.blocks))
+        .collect();
+    brep_render::brep_kernel::resolve_component_pin(&inner, chain, group.as_deref(), pin)
+}
+
+/// The pins of `schematic`'s parts that `board` declares a point for: a port point
+/// of the board's whose `mapsTo` is that pin's address.
+fn declared_pins(board: &Value, schematic: &brep_ecad_core::Document) -> Vec<brep_ecad_core::Terminal> {
+    let mapped: BTreeSet<String> = board_mappings(board).into_iter().map(|(target, _)| target).collect();
+    if mapped.is_empty() { return Vec::new(); }
+    let mut out = Vec::new();
+    for component in &schematic.components {
+        let Some(chain) = component.part.as_ref().and_then(|part| part.instance.as_deref()) else { continue };
+        for pin in &component.symbol.pins {
+            if board_pin_address(board, chain, pin.unit, &pin.number).is_ok_and(|address| mapped.contains(&address)) {
+                out.push(brep_ecad_core::Terminal { component: component.id, pin: pin.number.clone() });
+            }
+        }
+    }
+    out
+}
+
+/// A harness end on a pin INSIDE a board of this assembly's (`ACOMP9:ACOMP1`, pin
+/// `1`): the board's own declared point for it (`ACOMP9:P1.VBUS`), which is the one
+/// way through a board. `None` when `chain` is not inside a board placed here.
+fn through_board(document: &Value, reached: &[Device], chain: &str, unit: u32, pin: &str) -> Option<Result<String, String>> {
+    let (outer, reference, board, inner) = board_of(document, reached, chain)?;
+    Some(board_pin_address(board, &inner, unit, pin).and_then(|address| {
+        board_mappings(board).into_iter().find(|(target, _)| *target == address)
+            .map(|(_, point)| format!("{outer}:{point}"))
+            .ok_or_else(|| format!("it is inside the board '{reference}', which declares no point for it. Declare it on the \
+                board: a port point that maps to '{address}' (Qualify)"))
+    }))
 }
 
 /// How an UNLINKED component is put to the user: what it was bound to, why that
@@ -1140,6 +1469,15 @@ pub(crate) fn follow_sheet(
             let resolve = |terminal: &brep_ecad_core::Terminal| -> Result<Option<String>, String> {
                 let component = sheet.components.iter().find(|c| c.id == terminal.component)
                     .ok_or_else(|| "A connection names a component the sheet no longer has.".to_string())?;
+                // A pin inside a board placed here is reached through the point the
+                // board declares for it, never directly.
+                if let Some(chain) = component.part.as_ref().and_then(|part| part.instance.as_deref()) {
+                    let unit = component.symbol.pins.iter().find(|pin| pin.number == terminal.pin).map_or(1, |pin| pin.unit);
+                    if let Some(through) = through_board(&*document, &reached, chain, unit, &terminal.pin) {
+                        return through.map(Some)
+                            .map_err(|reason| format!("'{}' pin '{}': {reason}", component.reference, terminal.pin));
+                    }
+                }
                 let Some(device) = device(component)? else {
                     // A free symbol drives no 3D data, so a wire to one is not
                     // a harness connection and is not a problem either.

@@ -65,10 +65,15 @@ pub use linear_asym::chamfer_edges_asymmetric_linear;
 mod chamfer_star;
 #[path = "fillet/edges.rs"]
 pub mod edges;
+#[path = "fillet/setback_g2.rs"]
+mod setback_g2;
+pub use setback_g2::fillet_edges_setback_g2;
 #[path = "fillet/planar_clip.rs"]
 mod planar_clip;
 #[path = "fillet/tool.rs"]
 pub mod tool;
+#[path = "fillet/pivot_chain.rs"]
+mod pivot_chain;
 #[path = "fillet/vanishing.rs"]
 mod vanishing;
 #[path = "fillet/spine_first.rs"]

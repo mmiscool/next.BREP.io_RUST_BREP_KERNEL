@@ -294,7 +294,7 @@ pub fn solid_signed_volume_for_sign_with_bound(solid: &BrepSolid, bar: f64, enab
 /// split this often, against four times for the exact reading.
 pub const COARSE_SIGN_DEPTH: usize = 1;
 
-/// `BREP_SEW_SIGN_COARSE_THIN` (default on since the 2026-11-20 tier-P
+/// `BREP_SEW_SIGN_COARSE_THIN` (default on since the 2026-11-20
 /// promotion; `=0` restores the coarse quadtree on every face): in
 /// [`solid_sign_coarse_certificate`], a face whose trim cannot hold one whole
 /// coarse cell ([`trim_holds_no_coarse_cell`]) is read by its exact route
@@ -510,7 +510,7 @@ fn control_box_volume(solid: &BrepSolid) -> f64 {
 }
 
 /// `BREP_SIGN_SLIVER_BOUND` (on by default since 2026-11-03,
-/// tier-P promotion; `0`/`off` restores the reading alone): before the sign
+/// promotion; `0`/`off` restores the reading alone): before the sign
 /// reading, try a certificate that integrates every face's cells exactly as
 /// the reading does but skips the surface stations of its chord corrections,
 /// bounding them instead (see [`sliver_bound_certificate`]). Read on every
@@ -558,7 +558,7 @@ pub fn sliver_bound_certificate(solid: &BrepSolid, bar: f64) -> Option<f64> {
     }
 }
 
-/// `BREP_SIGN_CANONICAL_LOOPS` (default on since the 2026-11-21 tier-P
+/// `BREP_SIGN_CANONICAL_LOOPS` (default on since the 2026-11-21
 /// promotion; `0|off` reads every face as given; `check` reads both and prints
 /// one `mass.sign_canonical_check` line per certificate, the given rotation
 /// deciding): see [`sliver_bound_certificate`].

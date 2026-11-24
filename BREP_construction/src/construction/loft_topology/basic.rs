@@ -354,6 +354,57 @@ fn loft_profile_brep_core(
              lies in it, so the end cap would be a sliver rather than a face",
         )
     })?;
+    // Sections all planar on parallel planes must advance along the normal one
+    // way. Where the stations' offsets turn back, the skin rises to the turning
+    // station and comes down again: every point inside that section's outline
+    // lies, near it, in the outline of the stations on both sides, which stand
+    // on the same side of its plane, so the material there is swept twice and
+    // the skin passes through itself. A step of no advance is the same turn
+    // inside a smooth run (its interpolant leaves the plane and comes back); it
+    // is allowed only on a ruled span, both ends a column break or an end of
+    // the loft, which is then a flat shoulder between the two outlines.
+    let frames = sections
+        .iter()
+        .map(|section| section_frame(section, tolerance))
+        .collect::<Result<Vec<_>, _>>()?;
+    let parallel = frames
+        .iter()
+        .all(|frame| frame.planar && frame.normal.cross(first_frame.normal).length() <= 1e-9);
+    if parallel {
+        let offsets: Vec<f64> = frames
+            .iter()
+            .map(|frame| frame.centroid.sub(first_frame.centroid).dot(first_frame.normal))
+            .collect();
+        // No advance is an offset difference at rounding of the sections'
+        // coordinates (coplanar sections read their offsets from different
+        // samples); any advance past that is an advance, however short.
+        let scale = frames.iter().fold(1.0f64, |m, frame| {
+            m.max(frame.centroid.x.abs()).max(frame.centroid.y.abs()).max(frame.centroid.z.abs())
+        });
+        let noise = 1e-12 * scale;
+        let rise = (offsets[section_count - 1] - offsets[0]).signum();
+        let ruled_end = |k: usize| k == 0 || k == section_count - 1 || breaks.contains(&k);
+        if let Some(k) = (1..section_count).find(|&k| {
+            let step = (offsets[k] - offsets[k - 1]) * rise;
+            if step.abs() <= noise {
+                !(ruled_end(k - 1) && ruled_end(k))
+            } else {
+                step < 0.0
+            }
+        }) {
+            return Err(KernelRefusal::input(
+                KernelStage::Classify,
+                "section_order",
+                format!(
+                    "loftSolid: section {k} does not advance past section {} along their common normal \
+                     (offsets {:.6} then {:.6}); the loft would turn back through itself",
+                    k - 1,
+                    offsets[k - 1],
+                    offsets[k],
+                ),
+            ));
+        }
+    }
     let first_normal = if first_frame.normal.dot(start_advance) >= 0.0 {
         first_frame.normal
     } else {

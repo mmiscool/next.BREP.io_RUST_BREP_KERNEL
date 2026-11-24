@@ -43,7 +43,29 @@ fn plm_follow_now(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     Ok(Outcome::Done(json!({ "requests": follower.requests, "moves": follower.moves })))
 }
 
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FollowHoldArgs {
+    /// `true`: the follower asks the feed only at `plm_follow_now`; `false`: at its interval again.
+    pub hold: bool,
+}
+
+fn plm_follow_hold_schema() -> Value {
+    json!({"type":"object","properties":{"held":{"type":"boolean"},"requests":{"type":"integer","minimum":0},"moves":{"type":"integer","minimum":0}},
+        "required":["held","requests","moves"],"additionalProperties":false})
+}
+
+/// Hold the follower's interval so only `plm_follow_now` asks the feed: a script that counts the
+/// follower's questions or the notices its answers raise reads the same on a loaded machine.
+fn plm_follow_hold(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: FollowHoldArgs = parse_args(args)?;
+    ctx.app.plm.set_follow_hold(a.hold);
+    let follower = ctx.app.plm.follower();
+    Ok(Outcome::Done(json!({ "held": follower.held, "requests": follower.requests, "moves": follower.moves })))
+}
+
 pub static COMMANDS: &[CommandSpec] = &[
     app_command!("plm", "plm_follow_now", "Ask the PLM change feed at the next frame instead of at its interval (the pane follows other clients: a moved feed re-reads every open PLM document's part and the inbox). Answers the follower's counts so far: feed requests and moves.", crate::automation::command::NoArgs, plm_follow_now, Mutate, MUTATE, super::domain_output_schema::plm_follow_now),
+    app_command!("plm", "plm_follow_hold", "Hold (`hold: true`) or release the PLM change feed's interval: while held the pane asks the feed only when `plm_follow_now` says so (its first question too), never on the clock, so a script that counts feed requests or the reach notices (server unreachable, reachable again) reads the same however loaded the machine. Answers the hold and the follower's counts so far.", FollowHoldArgs, plm_follow_hold, Mutate, MUTATE_NOWAIT, plm_follow_hold_schema),
     app_command!("plm", "plm_bake_pass", "Run one pass of the PLM bake worker: claim each queued job in turn (`POST /api/bake/next`), open the document the server assembled on an engine of its own, build it, and keep it (`PUT …/result`) or report why not (`POST …/fail`, with the build's feature errors). Returns each job's `{id, number, revision, source, status: done|failed|dropped, error|why}` and the pass's `ms`. The open documents are untouched. An error means the server did not answer or refused the token.", BakePassArgs, plm_bake_pass, Mutate, MUTATE, super::domain_output_schema::plm_bake_pass),
 ];

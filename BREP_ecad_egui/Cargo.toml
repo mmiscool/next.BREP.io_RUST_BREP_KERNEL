@@ -1,12 +1,12 @@
 [package]
 name = "BREP_ecad_egui"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.92"
 license-file = "LICENSE.md"
-description = "Embeddable egui editors for schematics, wiring diagrams, boards, symbols, and pads."
+description = "Embeddable egui editors for schematics, wiring diagrams, boards, symbols, and pads, from next.BREP.io (Rust B-rep CAD)."
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-homepage = "https://v2.brep.io"
+homepage = "https://next.brep.io"
 readme = "README.md"
 keywords = ["ecad", "egui", "schematic", "pcb", "editor"]
 categories = ["gui", "science", "visualization"]
@@ -29,7 +29,7 @@ include = [
 name = "brep_ecad_egui"
 
 [dependencies]
-BREP_ecad_core = { version = "0.7.0", path = "../BREP_ecad_core" }
+BREP_ecad_core = { version = "0.8.0", path = "../BREP_ecad_core" }
 egui = "0.35"
 
 [profile.dev.package.BREP_ecad_core]

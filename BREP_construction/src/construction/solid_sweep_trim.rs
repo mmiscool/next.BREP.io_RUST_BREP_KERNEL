@@ -32,6 +32,19 @@ fn end_slivers_on() -> bool {
     crate::switch!("BREP_SWEEP_TRIM_END_SLIVERS", true)
 }
 
+/// `BREP_SWEEP_TRIM_TIP_SPLICE` (on unless =0): a loop through two preimages
+/// of one world point (a double curve's end on its sheet: the sheet meets
+/// itself there) runs on through both instead of being split there as a
+/// pinch ([`Arrangement::split_pinched_loops`]), so each such vertex keeps one
+/// link and the sweep is built instead of refused `trim_ring_tips`; such a
+/// face is then cut between the two preimages
+/// ([`ConvexSweep::cut_self_meeting_loops`]) so no face uses an edge twice;
+/// and a ring tumbled through a whole turn is taken (the time cap 360°, not
+/// 200°).
+pub fn tip_splice_on() -> bool {
+    crate::switch!("BREP_SWEEP_TRIM_TIP_SPLICE", true)
+}
+
 /// `BREP_SWEEP_TRIM_ONE_SIDED` (default on, `=0` gives the vertex up as before): the vertex solve's Jacobian
 /// read one-sided where a sheet ends within the difference step (a strip's
 /// zero line leaving its face at the vertex), where it gave the vertex up.
@@ -382,6 +395,9 @@ pub struct PoseGrid {
     /// The farthest a pose's centre lies from the origin (for rounding).
     farthest: f64,
     times: Vec<f64>,
+    /// Whether the times are the equally spaced ones of [`PoseGrid::new`]
+    /// (else increasing, and a pose is found by search).
+    uniform: bool,
     poses: Vec<Rigid>,
     centres: Vec<Vec3>,
     reach: f64,
@@ -405,6 +421,22 @@ impl PoseGrid {
     pub fn new<T: Depth>(motion: &TwoTurnMotion, tool: &T, t0: f64, t1: f64, count: usize) -> PoseGrid {
         let count = count.max(2);
         let times: Vec<f64> = (0..count).map(|i| t0 + (t1 - t0) * i as f64 / (count - 1) as f64).collect();
+        Self::with_times(motion, tool, times, true)
+    }
+
+    /// [`PoseGrid::new`] at the given times (a grid denser where the motion's
+    /// sheets change fast): None unless there are two or more, strictly
+    /// increasing and finite.
+    pub fn new_with_times<T: Depth>(motion: &TwoTurnMotion, tool: &T, times: Vec<f64>) -> Option<PoseGrid> {
+        if times.len() < 2 || !times.iter().all(|t| t.is_finite()) || !times.windows(2).all(|w| w[1] > w[0]) {
+            return None;
+        }
+        Some(Self::with_times(motion, tool, times, false))
+    }
+
+    /// The grid at `times`; `uniform` when they are equally spaced (a pose
+    /// is then found by its index, else by search).
+    fn with_times<T: Depth>(motion: &TwoTurnMotion, tool: &T, times: Vec<f64>, uniform: bool) -> PoseGrid {
         let poses: Vec<Rigid> = times.iter().map(|&t| motion.pose(t)).collect();
         let (centre, reach) = tool.centre_and_reach();
         let centres: Vec<Vec3> = poses.iter().map(|p| p.apply(centre)).collect();
@@ -428,7 +460,7 @@ impl PoseGrid {
         });
         let seconds = if trim_reuse_on() { times.iter().map(|&t| Rigid::turn(motion.points[1], motion.directions[1], motion.rates[1] * t)).collect() } else { Vec::new() };
         let farthest = centres.iter().map(|c: &Vec3| c.length()).fold(0.0, f64::max);
-        PoseGrid { motion: *motion, seconds, farthest, times, poses, centres, reach, speed_bound, planes }
+        PoseGrid { motion: *motion, seconds, farthest, times, uniform, poses, centres, reach, speed_bound, planes }
     }
 
     pub fn times(&self) -> &[f64] {
@@ -989,6 +1021,11 @@ pub enum SheetId {
     /// leading band) pose over half of the ring's turns: (ψ fraction,
     /// fraction across the band from one grazing branch to the other).
     Band(u8, u8),
+    /// A ring's collar about a point where the whole tube circle grazes (the
+    /// grazing harmonic's a = b = 0; `ring::RingCollar`): both branches as one
+    /// sheet through that circle, (λ fraction across [−ε, ε], tube angle
+    /// fraction); λ > 0 is the lower branch, λ < 0 the upper.
+    Collar(u8),
 }
 
 impl SheetId {
@@ -998,7 +1035,7 @@ impl SheetId {
     }
 
     pub fn is_ring(&self) -> bool {
-        matches!(self, SheetId::Envelope(..) | SheetId::Band(..))
+        matches!(self, SheetId::Envelope(..) | SheetId::Band(..) | SheetId::Collar(..))
     }
 }
 
@@ -1034,6 +1071,23 @@ pub struct Segment {
     pub b: Vec3,
 }
 
+/// The switches forced on the calling thread, for jobs it hands the shared
+/// pool (a pool thread does not share the caller's thread-locals); none
+/// outside tests.
+#[cfg(feature = "parallel")]
+fn forced_switches() -> Vec<(&'static str, bool)> {
+    let forced: Vec<(&'static str, bool)> = Vec::new();
+    forced
+}
+
+/// Runs `job` on a pool thread with the caller's `forced` switches, restoring
+/// the thread's own after.
+#[cfg(feature = "parallel")]
+fn with_forced<R>(forced: &[(&'static str, bool)], job: impl FnOnce() -> R) -> R {
+    let _ = forced;
+    job()
+}
+
 /// What decides a sheet point's visibility.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Active {
@@ -1058,6 +1112,12 @@ pub struct ConvexSweep<'a> {
     /// A ring's seam: the angle about its axis where its sheets' two halves
     /// meet (0 for a polyhedron).
     seam: f64,
+    /// A ring's envelope chart stretched about where its grazing branches all
+    /// but meet (`ring::RingWarp`; None: the chart is (ψ fraction, τ)).
+    warp: Option<ring::RingWarp>,
+    /// A ring's collars about the points its whole tube circle grazes
+    /// (`BREP_SWEEP_RING_COLLAR`); their discs are cut from the envelopes.
+    collars: Vec<ring::RingCollar>,
 }
 
 /// One face's frame in its plane (a strip's chart): origin, in-plane axes,
@@ -1072,7 +1132,7 @@ struct FaceFrame {
 impl<'a> ConvexSweep<'a> {
     pub fn new(tool: &'a Convex, motion: &'a TwoTurnMotion, grid: &'a PoseGrid) -> Self {
         let (_, reach) = tool.centre_and_reach();
-        ConvexSweep { tool: Tool::Convex(tool), motion, grid, size: reach, seam: 0.0 }
+        ConvexSweep { tool: Tool::Convex(tool), motion, grid, size: reach, seam: 0.0, warp: None, collars: Vec::new() }
     }
 
     /// The sweep of a ring, where the ring's grazing loop is two branches
@@ -1091,9 +1151,10 @@ impl<'a> ConvexSweep<'a> {
         }
         let seam = seam.rem_euclid(std::f64::consts::TAU);
         let (_, reach) = Depth::centre_and_reach(torus);
-        let sweep = ConvexSweep { tool: Tool::Ring(torus), motion, grid, size: reach, seam };
+        let sweep = ConvexSweep { tool: Tool::Ring(torus), motion, grid, size: reach, seam, warp: None, collars: Vec::new() };
         const ROUND: usize = 64;
-        for &t in &grid.times {
+        // (Under the collar switch a circle grazed all round is the collar's.)
+        for &t in grid.times.iter().filter(|_| !ring::ring_collar_on()) {
             if (0..ROUND).any(|k| sweep.ring_branches(t, std::f64::consts::TAU * k as f64 / ROUND as f64).is_none()) {
                 return Err(refuse("trim_ring_branches", "the ring's grazing loop is not two branches all through the motion".into()));
             }
@@ -1148,7 +1209,13 @@ impl<'a> ConvexSweep<'a> {
     fn own_index(&self, t: f64) -> usize {
         let n = self.grid.times.len();
         let (t0, t1) = (self.grid.times[0], self.grid.times[n - 1]);
-        (((t - t0) / (t1 - t0) * (n - 1) as f64).round().max(0.0) as usize).min(n - 1)
+        if self.grid.uniform {
+            return (((t - t0) / (t1 - t0) * (n - 1) as f64).round().max(0.0) as usize).min(n - 1);
+        }
+        // Unequal times (a stretched grid): the nearest of them.
+        let times = &self.grid.times;
+        let k = times.partition_point(|&s| s < t).min(n - 1);
+        if k > 0 && (t - times[k - 1]).abs() <= (times[k] - t).abs() { k - 1 } else { k }
     }
 
     /// A cap's chart: the bilinear map of the unit square onto its polygon
@@ -1179,7 +1246,7 @@ impl<'a> ConvexSweep<'a> {
         }
         let tool = self.convex();
         match sheet {
-            SheetId::Envelope(..) | SheetId::Band(..) => unreachable!("a ring sheet in a polyhedron's arm"),
+            SheetId::Envelope(..) | SheetId::Band(..) | SheetId::Collar(..) => unreachable!("a ring sheet in a polyhedron's arm"),
             SheetId::Strip(face) => {
                 let t = self.t_of(p[1]);
                 let pose = self.motion.pose(t);
@@ -1378,7 +1445,7 @@ impl<'a> ConvexSweep<'a> {
                 }
                 SheetId::Cap(_, face) => Border::Sheet(SheetId::Strip(face)),
                 SheetId::Strip(_) => Border::Unknown,
-                SheetId::Envelope(..) | SheetId::Band(..) => unreachable!("a ring sheet in a polyhedron's arm"),
+                SheetId::Envelope(..) | SheetId::Band(..) | SheetId::Collar(..) => unreachable!("a ring sheet in a polyhedron's arm"),
             },
             Active::Competitor(at) => {
                 let n = self.grid.times.len();
@@ -1432,7 +1499,9 @@ impl<'a> ConvexSweep<'a> {
     /// The sheets of this tool.
     pub fn sheets(&self) -> Vec<SheetId> {
         if matches!(self.tool, Tool::Ring(_)) {
-            return [0u8, 1].iter().flat_map(|&a| [0u8, 1].map(move |b| (a, b))).flat_map(|(a, b)| [SheetId::Envelope(a, b), SheetId::Band(a, b)]).collect();
+            let mut out: Vec<SheetId> = [0u8, 1].iter().flat_map(|&a| [0u8, 1].map(move |b| (a, b))).flat_map(|(a, b)| [SheetId::Envelope(a, b), SheetId::Band(a, b)]).collect();
+            out.extend((0..self.collars.len()).map(|k| SheetId::Collar(k as u8)));
+            return out;
         }
         let mut out: Vec<SheetId> = (0..self.convex().polygons.len()).map(SheetId::Strip).collect();
         out.extend((0..self.convex().edges.len()).map(SheetId::Trace));
@@ -1480,26 +1549,32 @@ impl<'a> ConvexSweep<'a> {
         // read without the scan, its full value only where a crossing needs
         // it (`BREP_SWEEP_GRID_LAZY`); every other use reads signs alone.
         let lazy = grid_lazy_on();
-        let unread: std::cell::RefCell<Vec<Vec<bool>>> = std::cell::RefCell::new(vec![vec![false; nc]; nr]);
-        let values: Vec<Vec<f64>> = (0..nr)
-            .map(|i| {
-                (0..nc)
-                    .map(|j| {
-                        if lazy {
-                            if let Some(point) = self.point(sheet, param(i, j)) {
-                                if point.local < 0.0 {
-                                    unread.borrow_mut()[i][j] = true;
-                                    return -1.0;
-                                }
-                                return self.value(sheet, &point).0;
-                            }
-                            return -1.0;
-                        }
-                        self.eval(sheet, param(i, j))
-                    })
-                    .collect()
-            })
-            .collect();
+        // Each node's value and whether only its sign was read; the rows are
+        // independent (read on the shared pool under the `parallel` feature,
+        // the same values in the same places).
+        let node = |i: usize, j: usize| -> (f64, bool) {
+            if lazy {
+                if let Some(point) = self.point(sheet, param(i, j)) {
+                    if point.local < 0.0 {
+                        return (-1.0, true);
+                    }
+                    return (self.value(sheet, &point).0, false);
+                }
+                return (-1.0, false);
+            }
+            (self.eval(sheet, param(i, j)), false)
+        };
+        let row = |i: usize| -> Vec<(f64, bool)> { (0..nc).map(|j| node(i, j)).collect() };
+        #[cfg(feature = "parallel")]
+        let nodes: Vec<Vec<(f64, bool)>> = {
+            use rayon::prelude::*;
+            let forced = forced_switches();
+            (0..nr).into_par_iter().map(|i| with_forced(&forced, || row(i))).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let nodes: Vec<Vec<(f64, bool)>> = (0..nr).map(row).collect();
+        let unread: std::cell::RefCell<Vec<Vec<bool>>> = std::cell::RefCell::new(nodes.iter().map(|r| r.iter().map(|x| x.1).collect()).collect());
+        let values: Vec<Vec<f64>> = nodes.iter().map(|r| r.iter().map(|x| x.0).collect()).collect();
         let values = std::cell::RefCell::new(values);
         // A node's full value, read now if its sign alone was.
         let full = |(i, j): (usize, usize)| -> f64 {
@@ -1548,7 +1623,8 @@ impl<'a> ConvexSweep<'a> {
             // zero: read it just outside, name the partner from just inside.
             let border = match (self.point(sheet, at(kept)), self.point(sheet, at(outside))) {
                 (Some(inside), Some(o)) => self.partner(sheet, &inside, self.value(sheet, &o).1),
-                (Some(inside), None) => self.partner(sheet, &inside, self.value(sheet, &inside).1),
+                // Into a collar's disc cut from an envelope: the collar.
+                (Some(inside), None) => self.ring_hole_border(sheet, at(outside)).unwrap_or_else(|| self.partner(sheet, &inside, self.value(sheet, &inside).1)),
                 _ => Border::Unknown,
             };
             let hit = (at(kept), border);
@@ -1722,7 +1798,7 @@ impl<'a> ConvexSweep<'a> {
         }
         let _ = a;
         match sheet {
-            SheetId::Envelope(..) | SheetId::Band(..) => unreachable!("a ring sheet in a polyhedron's arm"),
+            SheetId::Envelope(..) | SheetId::Band(..) | SheetId::Collar(..) => unreachable!("a ring sheet in a polyhedron's arm"),
             SheetId::Trace(edge) => {
                 let [va, vb, f, g] = self.convex().edges[edge];
                 match side {
@@ -1854,8 +1930,10 @@ impl<'a> ConvexSweep<'a> {
             };
             let (v0, v1) = poly.iter().chain(holes.iter().flatten()).fold((f64::INFINITY, f64::NEG_INFINITY), |a, q| (a.0.min(q[1]), a.1.max(q[1])));
             let dv = (v1 - v0) / scanlines as f64;
-            let mut part = 0.0;
-            for k in 0..scanlines {
+            // One scanline's terms and misses (under the `parallel` feature
+            // the scanlines are read on the shared pool and their terms added
+            // in order after; without it, one sum as before).
+            let line = |k: usize, part: &mut dyn FnMut(f64), misses: &mut usize| {
                 let v = v0 + (k as f64 + 0.5) * dv;
                 let mut xs: Vec<f64> = Vec::new();
                 for ring in std::iter::once(&poly).chain(holes.iter()) {
@@ -1879,13 +1957,41 @@ impl<'a> ConvexSweep<'a> {
                         for (g, w) in GAUSS {
                             let u = 0.5 * (ua + ub) + 0.5 * (ub - ua) * g;
                             match integrand([u, v]) {
-                                Some(f) => part += f * w * 0.5 * (ub - ua) * dv,
-                                None => misses += 1,
+                                Some(f) => part(f * w * 0.5 * (ub - ua) * dv),
+                                None => *misses += 1,
                             }
                         }
                     }
                 }
-            }
+            };
+            #[cfg(feature = "parallel")]
+            let part = {
+                use rayon::prelude::*;
+                let forced = forced_switches();
+                // Each scanline's terms, added after in the order one sum
+                // takes them (the same bits).
+                let lines: Vec<(Vec<f64>, usize)> = (0..scanlines).into_par_iter().map(|k| {
+                    with_forced(&forced, || {
+                        let (mut terms, mut m) = (Vec::new(), 0usize);
+                        line(k, &mut |t| terms.push(t), &mut m);
+                        (terms, m)
+                    })
+                }).collect();
+                misses += lines.iter().map(|x| x.1).sum::<usize>();
+                let mut part = 0.0;
+                for t in lines.iter().flat_map(|x| &x.0) {
+                    part += t;
+                }
+                part
+            };
+            #[cfg(not(feature = "parallel"))]
+            let part = {
+                let mut part = 0.0;
+                for k in 0..scanlines {
+                    line(k, &mut |t| part += t, &mut misses);
+                }
+                part
+            };
             parts.push((sheet, winding * closure.face_sign[l] as f64 * part));
         }
         let total: f64 = parts.iter().map(|p| p.1).sum();
@@ -1897,11 +2003,11 @@ impl<'a> ConvexSweep<'a> {
     /// steps that may leave the kept region by a little.
     pub fn raw(&self, sheet: SheetId, p: [f64; 2]) -> Option<Vec3> {
         if sheet.is_ring() {
-            return self.ring_point(sheet, p).map(|q| q.world);
+            return self.ring_point_whole(sheet, p).map(|q| q.world);
         }
         let tool = self.convex();
         match sheet {
-            SheetId::Envelope(..) | SheetId::Band(..) => unreachable!("a ring sheet in a polyhedron's arm"),
+            SheetId::Envelope(..) | SheetId::Band(..) | SheetId::Collar(..) => unreachable!("a ring sheet in a polyhedron's arm"),
             SheetId::Strip(face) => {
                 let t = self.t_of(p[1]);
                 let pose = self.motion.pose(t);
@@ -1927,7 +2033,7 @@ impl<'a> ConvexSweep<'a> {
             return self.ring_local_raw(sheet, p);
         }
         match sheet {
-            SheetId::Envelope(..) | SheetId::Band(..) => unreachable!("a ring sheet in a polyhedron's arm"),
+            SheetId::Envelope(..) | SheetId::Band(..) | SheetId::Collar(..) => unreachable!("a ring sheet in a polyhedron's arm"),
             SheetId::Trace(edge) => {
                 let t = self.t_of(p[1]);
                 let pose = self.motion.pose(t);
@@ -1945,6 +2051,282 @@ impl<'a> ConvexSweep<'a> {
             }
             SheetId::Strip(_) => None,
         }
+    }
+
+    /// Cut in two each face whose loop passes one world vertex at two
+    /// distinct points of its sheet's parameters (a double curve's end: the
+    /// sheet meets itself there, and the double curve's edge bounds the face
+    /// on both sides). The cut is a line of one parameter held between them,
+    /// across the loop wherever it lies inside (the line as
+    /// `self_meeting_cut` chooses it); its arcs border the sheet itself and
+    /// mate each other. Each face then passes each such vertex once: a
+    /// reader that places a loop on its surface by inverting its edges'
+    /// points meets each preimage on a face of its own. The two corners are
+    /// found by their points (within `tolerance` in the world, over 1e-6
+    /// apart in the parameters), so the loops a cut leaves are read as they
+    /// are. Returns the cuts; the arrangement is to be closed again.
+    pub fn cut_self_meeting_loops(&self, arrangement: &mut Arrangement, tolerance: f64) -> usize {
+        let mut cuts = 0;
+        let mut l = 0;
+        while l < arrangement.loops.len() && cuts < 64 {
+            match self.self_meeting_cut(arrangement, l, tolerance) {
+                Some((d, c)) if self.cut_loop(arrangement, l, d, c) => cuts += 1,
+                _ => l += 1,
+            }
+        }
+        cuts
+    }
+
+    /// The line (held coordinate, value) cutting outer loop `l` between two
+    /// of its corners at one world point and distinct parameters (the first
+    /// such pair a line serves), if one serves:
+    /// of fifteen lines in each coordinate between the two corners, those that
+    /// cross no hole of the face, pass no loop sample within 1e-7, cross the
+    /// loop an even number of times with each chord meeting itself nowhere in
+    /// the world (near a double curve's tip the sheet folds over the strip
+    /// between its preimages), and keep every crossing twice `tolerance`
+    /// from every vertex and every other crossing; the one keeping the most.
+    fn self_meeting_cut(&self, arrangement: &Arrangement, l: usize, tolerance: f64) -> Option<(usize, f64)> {
+        let lp = &arrangement.loops[l];
+        let m = lp.arcs.len();
+        let end = |a: usize| *arrangement.arcs[a].params.last().expect("params");
+        let at = |a: usize| *arrangement.arcs[a].points.last().expect("points");
+        let pairs: Vec<([f64; 2], [f64; 2])> = (0..m).flat_map(|i| {
+            // (Not neighbours: an arc shorter than the tolerance is no meeting.)
+            ((i + 2)..m).filter(move |&j| !(i == 0 && j == m - 1)).map(move |j| (i, j))
+        }).filter(|&(i, j)| {
+            let (p, q) = (end(lp.arcs[i]), end(lp.arcs[j]));
+            at(lp.arcs[i]).sub(at(lp.arcs[j])).length() <= tolerance && ((p[0] - q[0]).abs() > 1e-6 || (p[1] - q[1]).abs() > 1e-6)
+        }).map(|(i, j)| (end(lp.arcs[i]), end(lp.arcs[j]))).collect();
+        // A face's outer loop only (a hole is not a polygon to cut).
+        if pairs.is_empty() || !(lp.area > 0.0) {
+            return None;
+        }
+        let owners = arrangement.hole_owners();
+        let samples = |k: usize| arrangement.loops[k].arcs.iter().flat_map(|&a| arrangement.arcs[a].params.iter().copied()).collect::<Vec<_>>();
+        let own = samples(l);
+        // Every vertex so far: a crossing near one leaves a piece too short to
+        // imprint on its mate.
+        let ends: Vec<Vec3> = arrangement.arcs.iter().filter(|a| !a.points.is_empty()).flat_map(|a| [a.points[0], *a.points.last().expect("points")]).collect();
+        // The first pair a line serves.
+        for (p, q) in pairs {
+            let mut best: Option<(f64, usize, f64)> = None;
+            for d in [0usize, 1] {
+                let (lo, hi) = (p[d].min(q[d]), p[d].max(q[d]));
+                if hi - lo < 1e-6 {
+                    continue;
+                }
+                for k in 1..16 {
+                    let c = lo + (hi - lo) * k as f64 / 16.0;
+                    if own.iter().any(|s| (s[d] - c).abs() < 1e-7) {
+                        continue;
+                    }
+                    // A hole of the face across the line is not cut with it.
+                    let crossed = (0..arrangement.loops.len()).any(|o| {
+                        if owners[o] != Some(l) || arrangement.loops[o].arcs.is_empty() {
+                            return false;
+                        }
+                        let s = samples(o);
+                        s.iter().any(|x| x[d] < c) && s.iter().any(|x| x[d] > c)
+                    });
+                    if crossed {
+                        continue;
+                    }
+                    // The crossings, in the world and along the line.
+                    let mut hits: Vec<(f64, Vec3)> = Vec::new();
+                    for &a in &lp.arcs {
+                        let arc = &arrangement.arcs[a];
+                        for (w, x) in arc.params.windows(2).zip(arc.points.windows(2)) {
+                            let (va, vb) = (w[0][d] - c, w[1][d] - c);
+                            if va * vb < 0.0 {
+                                let f = va / (va - vb);
+                                hits.push((w[0][1 - d] + (w[1][1 - d] - w[0][1 - d]) * f, x[0].add(x[1].sub(x[0]).scale(f))));
+                            }
+                        }
+                    }
+                    if hits.len() < 2 || hits.len() % 2 != 0 {
+                        continue;
+                    }
+                    // Clearance: each crossing from every vertex and every other
+                    // crossing.
+                    let mut clear = f64::INFINITY;
+                    for (i, h) in hits.iter().enumerate() {
+                        clear = ends.iter().fold(clear, |m, e| m.min(e.sub(h.1).length()));
+                        clear = hits[i + 1..].iter().fold(clear, |m, g| m.min(g.1.sub(h.1).length()));
+                    }
+                    // Each chord meets itself nowhere in the world: near a double
+                    // curve's tip the sheet folds over the strip between its two
+                    // preimages, and a chord across it would.
+                    hits.sort_by(|x, y| x.0.total_cmp(&y.0));
+                    let folds = hits.chunks(2).any(|pair| {
+                        let world: Vec<Option<Vec3>> = (0..=16).map(|i| {
+                            let mut r = [0.0; 2];
+                            r[d] = c;
+                            r[1 - d] = pair[0].0 + (pair[1].0 - pair[0].0) * i as f64 / 16.0;
+                            self.raw(lp.sheet, r)
+                        }).collect();
+                        if world.iter().any(Option::is_none) {
+                            return true;
+                        }
+                        let world: Vec<Vec3> = world.into_iter().flatten().collect();
+                        let along: Vec<f64> = std::iter::once(0.0).chain(world.windows(2).scan(0.0, |t, w| { *t += w[1].sub(w[0]).length(); Some(*t) })).collect();
+                        (0..world.len()).any(|i| ((i + 2)..world.len()).any(|j| world[j].sub(world[i]).length() < 0.5 * (along[j] - along[i])))
+                    });
+                    if folds || clear < 2.0 * tolerance {
+                        continue;
+                    }
+                    if best.map_or(true, |b| clear > b.0) {
+                        best = Some((clear, d, c));
+                    }
+                }
+            }
+            if let Some(b) = best {
+                return Some((b.1, b.2));
+            }
+        }
+        None
+    }
+
+    /// Cut loop `l` along the line where coordinate `d` is `c`: the arcs the
+    /// line crosses split there, a chord between each pair of crossings in
+    /// order along the line, and the loop's runs between crossings joined by
+    /// the chords into loops. False (the loop unchanged) unless the line
+    /// crosses it an even number of times, at least twice.
+    fn cut_loop(&self, arrangement: &mut Arrangement, l: usize, d: usize, c: f64) -> bool {
+        let sheet = arrangement.loops[l].sheet;
+        let e = 1 - d;
+        // Split every crossed arc at its crossings; `seq` the loop's arcs in
+        // order, `cross_after[s]` the crossing at the end of seq[s].
+        let mut cross_after: Vec<Option<usize>> = Vec::new();
+        let mut crossings: Vec<f64> = Vec::new();
+        let mut crossing_point: Vec<([f64; 2], Vec3)> = Vec::new();
+        let original = arrangement.loops[l].arcs.clone();
+        let mut pieces: Vec<ArcRecord> = Vec::new();
+        for &id in &original {
+            let arc = &arrangement.arcs[id];
+            let mut points = vec![arc.points[0]];
+            let mut params = vec![arc.params[0]];
+            for k in 0..arc.params.len() - 1 {
+                let (a, b) = (arc.params[k], arc.params[k + 1]);
+                let (va, vb) = (a[d] - c, b[d] - c);
+                if va * vb < 0.0 {
+                    let f = va / (va - vb);
+                    let mut p = [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f];
+                    p[d] = c;
+                    let world = self.raw(sheet, p).unwrap_or_else(|| arc.points[k].add(arc.points[k + 1].sub(arc.points[k]).scale(f)));
+                    points.push(world);
+                    params.push(p);
+                    pieces.push(ArcRecord { sheet, border: arc.border, points: std::mem::take(&mut points), params: std::mem::take(&mut params) });
+                    cross_after.push(Some(crossings.len()));
+                    crossings.push(p[e]);
+                    crossing_point.push((p, world));
+                    points = vec![world];
+                    params = vec![p];
+                }
+                points.push(arc.points[k + 1]);
+                params.push(arc.params[k + 1]);
+            }
+            pieces.push(ArcRecord { sheet, border: arc.border, points, params });
+            cross_after.push(None);
+        }
+        let n = crossings.len();
+        if n < 2 || n % 2 != 0 {
+            return false;
+        }
+        // Pieces into the arrangement: the first piece of each original arc
+        // keeps its id, the rest are new.
+        let mut piece_id = vec![usize::MAX; pieces.len()];
+        let mut next_original = original.iter();
+        let mut first_of_arc = true;
+        for (s, piece) in pieces.into_iter().enumerate() {
+            if first_of_arc {
+                let id = *next_original.next().expect("an original arc per run");
+                arrangement.arcs[id] = piece;
+                piece_id[s] = id;
+            } else {
+                piece_id[s] = arrangement.arcs.len();
+                arrangement.arcs.push(piece);
+            }
+            first_of_arc = cross_after[s].is_none();
+        }
+        let seq = piece_id;
+        // Chords: crossings paired in order along the line.
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| crossings[a].total_cmp(&crossings[b]));
+        let mut partner = vec![0usize; n];
+        for pair in order.chunks(2) {
+            partner[pair[0]] = pair[1];
+            partner[pair[1]] = pair[0];
+        }
+        // Position in seq of each crossing (it ends seq[pos]).
+        let mut at = vec![0usize; n];
+        for (s, x) in cross_after.iter().enumerate() {
+            if let Some(q) = x {
+                at[*q] = s;
+            }
+        }
+        let len = seq.len();
+        let chord = |arrangement: &mut Arrangement, from: usize, to: usize| -> usize {
+            let (a, b) = (crossing_point[from], crossing_point[to]);
+            const STATIONS: usize = 33;
+            let mut points = Vec::with_capacity(STATIONS);
+            let mut params = Vec::with_capacity(STATIONS);
+            for i in 0..STATIONS {
+                let f = i as f64 / (STATIONS - 1) as f64;
+                let mut p = [a.0[0] + (b.0[0] - a.0[0]) * f, a.0[1] + (b.0[1] - a.0[1]) * f];
+                p[d] = c;
+                let world = if i == 0 { a.1 } else if i == STATIONS - 1 { b.1 } else { self.raw(sheet, p).unwrap_or_else(|| a.1.add(b.1.sub(a.1).scale(f))) };
+                points.push(world);
+                params.push(p);
+            }
+            arrangement.arcs.push(ArcRecord { sheet, border: Border::Sheet(sheet), points, params });
+            arrangement.arcs.len() - 1
+        };
+        let mut used = vec![false; n];
+        let mut new_loops: Vec<Vec<usize>> = Vec::new();
+        for q0 in 0..n {
+            if used[q0] {
+                continue;
+            }
+            let mut ids = Vec::new();
+            let mut q = q0;
+            loop {
+                used[q] = true;
+                // The run after crossing q, to the next crossing.
+                let mut s = (at[q] + 1) % len;
+                loop {
+                    ids.push(seq[s]);
+                    if cross_after[s].is_some() {
+                        break;
+                    }
+                    s = (s + 1) % len;
+                }
+                let reached = cross_after[s].expect("a crossing ends the run");
+                let other = partner[reached];
+                ids.push(chord(arrangement, reached, other));
+                q = other;
+                if q == q0 {
+                    break;
+                }
+                if used[q] {
+                    return false;
+                }
+            }
+            new_loops.push(ids);
+        }
+        let closed = arrangement.loops[l].closed;
+        let area = |arrangement: &Arrangement, ids: &[usize]| -> f64 {
+            ids.iter().flat_map(|&a| arrangement.arcs[a].params.windows(2).map(|w| 0.5 * (w[0][0] * w[1][1] - w[1][0] * w[0][1])).collect::<Vec<_>>()).sum()
+        };
+        for (k, ids) in new_loops.into_iter().enumerate() {
+            let record = LoopRecordT { sheet, area: area(arrangement, &ids), arcs: ids, closed };
+            if k == 0 {
+                arrangement.loops[l] = record;
+            } else {
+                arrangement.loops.push(record);
+            }
+        }
+        true
     }
 
     /// Refine every arc of a closed arrangement onto the exact sheets: each
@@ -1965,7 +2347,9 @@ impl<'a> ConvexSweep<'a> {
             let side_of = |params: &[[f64; 2]]| -> Option<(usize, f64)> {
                 (0..2).find_map(|c| {
                     let v = params[0][c];
-                    let on = (v == 0.0 || v == 1.0) && params.iter().all(|q| q[c] == v);
+                    // A domain side; under the tip switch also a line cut
+                    // across a face (one coordinate held exactly).
+                    let on = (v == 0.0 || v == 1.0 || tip_splice_on()) && params.len() > 1 && params.iter().all(|q| q[c] == v);
                     on.then_some((c, v))
                 })
             };
@@ -2125,7 +2509,7 @@ impl<'a> ConvexSweep<'a> {
         let mut corners: std::collections::BTreeMap<usize, Vec<(SheetId, [f64; 2], [bool; 2], bool)>> = Default::default();
         let side_of = |params: &[[f64; 2]], c: usize| -> bool {
             let v = params[0][c];
-            (v == 0.0 || v == 1.0) && params.iter().all(|q| q[c] == v)
+            (v == 0.0 || v == 1.0 || tip_splice_on()) && params.len() > 1 && params.iter().all(|q| q[c] == v)
         };
         for lp in &arrangement.loops {
             let m = lp.arcs.len();
@@ -2262,7 +2646,7 @@ impl<'a> ConvexSweep<'a> {
         }
         let tool = self.convex();
         match sheet {
-            SheetId::Envelope(..) | SheetId::Band(..) => unreachable!("a ring sheet in a polyhedron's arm"),
+            SheetId::Envelope(..) | SheetId::Band(..) | SheetId::Collar(..) => unreachable!("a ring sheet in a polyhedron's arm"),
             SheetId::Cap(end, face) => {
                 let own = if end == 0 { 0 } else { self.grid.times.len() - 1 };
                 let pose = self.grid.poses[own];
@@ -2499,7 +2883,18 @@ impl<'a> ConvexSweep<'a> {
             } else {
                 ((lo - margin).max(0.0), (hi + margin).min(1.0))
             };
-            charts[l] = Some(self.sheet_surface(lp.sheet, lo, hi)?);
+            // Under the tip switch a ring envelope's surface also spans only
+            // its face's ψ fractions (with the margin): a sheet that meets
+            // itself holds its double curve's other preimage elsewhere in
+            // ψ, and a reader inverting an edge's points onto a surface
+            // holding both may land on the other.
+            charts[l] = Some(if matches!(lp.sheet, SheetId::Envelope(..)) && tip_splice_on() {
+                let (ulo, uhi) = members.iter().flat_map(|&m| arrangement.loops[m].arcs.iter()).flat_map(|&a| arrangement.arcs[a].params.iter().map(|p| p[0])).fold((f64::INFINITY, f64::NEG_INFINITY), |acc, u| (acc.0.min(u), acc.1.max(u)));
+                let pad = 0.02 * (uhi - ulo).max(1e-3);
+                self.ring_sheet_surface_over(lp.sheet, lo, hi, ((ulo - pad).max(0.0), (uhi + pad).min(1.0)))?
+            } else {
+                self.sheet_surface(lp.sheet, lo, hi)?
+            });
         }
         // Edges: one per mated pair; each arc's coedge (edge, forward, pcurve).
         let mut edge_records = Vec::new();
@@ -3389,7 +3784,18 @@ impl Arrangement {
             let m = arcs.len();
             // Corner i: after arc i. A repeat at corners i < j, not adjacent
             // (an arc from a vertex to itself is a closed arc, not a pinch).
-            let found = (0..m).find_map(|i| ((i + 2)..m).find(|&j| class(arcs[i]) == class(arcs[j]) && !(i == 0 && j == m - 1) && class(arcs[i]) != usize::MAX).map(|j| (i, j)));
+            // On a ring's sheet under the tip switch, only where both corners
+            // are one point of the sheet's parameters (within 1e-6, a corner's
+            // imprint error): two corners farther apart are two preimages of
+            // one world point (a double curve's end on the sheet), and the
+            // loop runs on through both.
+            let end = |a: usize| *self.arcs[a].params.last().expect("params");
+            let ring = self.loops[l].sheet.is_ring();
+            let one_point = |i: usize, j: usize| {
+                let (p, q) = (end(arcs[i]), end(arcs[j]));
+                !(ring && tip_splice_on()) || ((p[0] - q[0]).abs() <= 1e-6 && (p[1] - q[1]).abs() <= 1e-6)
+            };
+            let found = (0..m).find_map(|i| ((i + 2)..m).find(|&j| class(arcs[i]) == class(arcs[j]) && !(i == 0 && j == m - 1) && class(arcs[i]) != usize::MAX && one_point(i, j)).map(|j| (i, j)));
             let Some((i, j)) = found else {
                 l += 1;
                 continue;

@@ -360,6 +360,21 @@ fn resolve(
                         gate: 0,
                         number: item.required("number")?.arg(1).into(),
                         name: item.required("name")?.arg(1).into(),
+                        // `(alternate "I2C1_SDA" bidirectional line)`: the other
+                        // functions the pin serves, by name. Their own types
+                        // and shapes are not kept; see `Pin::alternates`.
+                        alternates: item
+                            .list()
+                            .iter()
+                            .filter(|e| e.head() == "alternate")
+                            .map(|e| e.arg(1).to_owned())
+                            .filter(|name| !name.is_empty())
+                            .fold(vec![], |mut names, name| {
+                                if !names.contains(&name) {
+                                    names.push(name);
+                                }
+                                names
+                            }),
                         electrical_type: item.arg(1).into(),
                         at: p,
                         end,

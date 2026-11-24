@@ -153,6 +153,10 @@ use crate::feature_pipeline::{
 };
 use crate::{make_line, SelectionGeometry, Vec3};
 
+#[path = "ports_contact.rs"]
+mod contact;
+pub use contact::{contact_body_axis, contact_body_end, contact_body_solid, ContactAxis, ContactRule, PortContactRow};
+
 /// The id of the tail's appended result (never a history feature). The scene
 /// entities a declared point publishes ride it, so the display pipeline draws
 /// and picks a connection point exactly as it draws a feature's curves.
@@ -214,30 +218,102 @@ pub struct PortPoint {
     /// Optional geometry that LOCATES the point: a scene point, a plane/datum
     /// frame origin, a face midpoint or an edge. Unresolved is reported, never
     /// fatal — the transform placement stands.
-    #[serde(default, rename = "pointRef", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "pointRef",
+        deserialize_with = "lenient_text",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub point_ref: Option<String>,
     /// Optional geometry that sets the DIRECTION: a face normal, a frame
     /// normal, an axis or an edge chord. A `pointRef` naming a face seats the
     /// direction too when this is absent.
-    #[serde(default, rename = "directionRef", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "directionRef",
+        deserialize_with = "lenient_text",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub direction_ref: Option<String>,
+    /// Optional: a SOLID of the part that IS this point's contact (a pin that
+    /// is a whole body). It seats what `pointRef`/`directionRef` leave empty:
+    /// the origin at the body's wire-side end, the direction along its axis,
+    /// outward ([`contact_body_axis`]). Absent reads exactly as before.
+    #[serde(
+        default,
+        rename = "contactBody",
+        deserialize_with = "lenient_text",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub contact_body: Option<String>,
     #[serde(default, rename = "reverseDirection", skip_serializing_if = "is_false")]
     pub reverse_direction: bool,
     /// The straight run a wire keeps before it may bend (a spline anchor
     /// attached here takes it as its forward/backward distance).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "lenient_number", skip_serializing_if = "Option::is_none")]
     pub extension: Option<f64>,
-    #[serde(default, rename = "displayLength", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "displayLength",
+        deserialize_with = "lenient_number",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub display_length: Option<f64>,
     /// ASSEMBLY declaration: the descendant point this one IS, by address
     /// (`ACOMP2:J5.VCC`). The mapped point takes the target's resolved
     /// placement, so the interface follows the child.
-    #[serde(default, rename = "mapsTo", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "mapsTo",
+        deserialize_with = "lenient_text",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub maps_to: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+/// A reference field (`pointRef`, `directionRef`, `contactBody`, `mapsTo`)
+/// read leniently. These are names, so a JSON number or boolean is read as
+/// its text (`0` -> `"0"`), and null as absent. Strict `Option<String>` let
+/// one stray scalar fail the WHOLE block: a user typed
+/// `0` into a seat field, the panel stored `"pointRef": 0.0`, every reader
+/// of the block saw no groups at all, and the part could not be qualified
+/// or re-edited. An unresolvable name is reported per point, never fatal.
+fn lenient_text<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    Ok(match Value::deserialize(deserializer)? {
+        Value::String(text) => Some(text),
+        Value::Number(number) => Some(match number.as_f64() {
+            // `0.0` was typed as `0`: give the name back as typed.
+            Some(value) if value.fract() == 0.0 && value.abs() < 1e15 => format!("{}", value as i64),
+            _ => number.to_string(),
+        }),
+        Value::Bool(flag) => Some(flag.to_string()),
+        // Null, or a shape no name has: absent, so the point keeps its
+        // transform placement and its group stays readable.
+        _ => None,
+    })
+}
+
+/// A length field (`extension`, `displayLength`) read leniently: a number,
+/// or text that parses as one; anything else reads as absent (the default),
+/// rather than failing the whole block as a strict `Option<f64>` did.
+fn lenient_number<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde_json::Value;
+    Ok(match Value::deserialize(deserializer)? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse::<f64>().ok().filter(|value| value.is_finite()),
+        _ => None,
+    })
 }
 
 // ===========================================================================
@@ -428,6 +504,16 @@ pub struct PortPointRow {
     pub position: [f64; 3],
     /// The unit direction it resolved facing (`record.direction`).
     pub direction: [f64; 3],
+    /// The contact body's axis and the end the wire took, for a point that
+    /// names one and whose body derives an axis. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<PortContactRow>,
+    /// The point has NO wire end: its contact body derived none and it has no
+    /// other seat or offset of its own, so nothing is published for it (a
+    /// harness end there is unresolved) rather than a wire end at the part
+    /// origin. Its row stays so the point, and its problem, are still shown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unplaced: bool,
 }
 
 /// What the ports tail resolved, and everything about the block that does not
@@ -717,6 +803,19 @@ pub fn seat_of(
     point: &PortPoint,
     scene: &SceneMap,
 ) -> (Frame, Vec<String>) {
+    let (seat, problems, _, _) = seat_with_contact(point, scene);
+    (seat, problems)
+}
+
+/// [`seat_of`], plus what the point's contact body derived (when it names one
+/// that derives an axis). The body fills each half of the seat only where the
+/// explicit references leave it empty: origin `pointRef` -> the body's wire
+/// end -> the part origin; direction `directionRef` -> what `pointRef`
+/// implies -> the body's outward axis -> +X.
+fn seat_with_contact(
+    point: &PortPoint,
+    scene: &SceneMap,
+) -> (Frame, Vec<String>, Option<(String, ContactAxis, bool)>, Option<String>) {
     let mut problems = Vec::new();
     let mut origin = Vec3::new(0.0, 0.0, 0.0);
     // `None` until a reference SUPPLIES one. A seated origin with no direction
@@ -735,10 +834,41 @@ pub fn seat_of(
             Err(problem) => problems.push(problem),
         }
     }
+    let mut given_direction = None;
     if let Some(reference) = trimmed(point.direction_ref.as_deref()) {
         match resolve_seat_direction(scene, reference) {
-            Ok(resolved) => direction = Some(resolved),
+            Ok(resolved) => {
+                direction = Some(resolved);
+                given_direction = Some(resolved);
+            }
             Err(problem) => problems.push(problem),
+        }
+    }
+    // The contact body, below both references. `reverseDirection` on a
+    // body-seated origin takes the OTHER end (the wire still leaving outward)
+    // rather than flipping the wire back through the pin. A body with no
+    // distinct ends takes its end from the Direction, and the wire leaves
+    // along it (or against it, reversed).
+    let mut contact = None;
+    let mut body_problem = None;
+    if let Some(body) = trimmed(point.contact_body.as_deref()) {
+        let seats_origin = trimmed(point.point_ref.as_deref()).is_none();
+        match contact_body_end(scene, body, seats_origin && point.reverse_direction, given_direction) {
+            Ok(derived) => {
+                if seats_origin {
+                    origin = derived.wire_end();
+                }
+                if direction.is_none() || (seats_origin && derived.rule == ContactRule::Direction) {
+                    direction = Some(derived.outward());
+                }
+                contact = Some((body.to_string(), derived, seats_origin));
+            }
+            Err(problem) => {
+                if seats_origin {
+                    body_problem = Some(problem.clone());
+                }
+                problems.push(problem);
+            }
         }
     }
     // No direction, or one too degenerate to make a basis from: the WORLD axes
@@ -750,7 +880,7 @@ pub fn seat_of(
             .unwrap_or_else(|_| Frame { origin, ..world_seat() }),
         None => Frame { origin, ..world_seat() },
     };
-    (seat, problems)
+    (seat, problems, contact, body_problem)
 }
 
 /// A local offset carried into world space by `seat`.
@@ -842,11 +972,14 @@ pub fn seed_history_run(
             if name_problem("point", name).is_some() || !points_seen.insert(name) {
                 continue;
             }
-            if point.point_ref.is_some() || point.direction_ref.is_some() || point.maps_to.is_some()
+            if point.point_ref.is_some()
+                || point.direction_ref.is_some()
+                || point.maps_to.is_some()
+                || point.contact_body.is_some()
             {
                 continue;
             }
-            let Ok((record, _, _)) =
+            let Ok((record, _, _, _, _)) =
                 resolve_point(point, port, name, &declaration.purpose, scene, env)
             else {
                 continue;
@@ -935,12 +1068,14 @@ pub fn finish_history_run(
             }
             let address = address(port, name);
             match resolve_point(point, port, name, &declaration.purpose, scene, env) {
-                Ok((record, seat, problems)) => {
+                Ok((record, seat, problems, contact, unplaced)) => {
                     report.problems.extend(problems);
                     let (position, direction) = (record.point, record.direction);
-                    if let Err(error) = publish_port(&mut result, &address, record) {
-                        report.problems.push(format!("{address}: {error}"));
-                        continue;
+                    if !unplaced {
+                        if let Err(error) = publish_port(&mut result, &address, record) {
+                            report.problems.push(format!("{address}: {error}"));
+                            continue;
+                        }
                     }
                     report.points.push(PortPointRow {
                         address,
@@ -951,6 +1086,8 @@ pub fn finish_history_run(
                         seat: seat.into(),
                         position: [position.x, position.y, position.z],
                         direction: [direction.x, direction.y, direction.z],
+                        contact,
+                        unplaced,
                     });
                 }
                 Err(error) => report.problems.push(format!("{address}: {error}")),
@@ -977,7 +1114,7 @@ fn resolve_point(
     purpose: &str,
     scene: &SceneMap,
     env: &Env,
-) -> Result<(PortRecord, Frame, Vec<String>), String> {
+) -> Result<(PortRecord, Frame, Vec<String>, Option<PortContactRow>, bool), String> {
     let address = address(port, name);
     let mut problems = Vec::new();
 
@@ -1005,6 +1142,8 @@ fn resolve_point(
                     },
                     seat,
                     problems,
+                    None,
+                    false,
                 ));
             }
             None => problems.push(format!(
@@ -1026,7 +1165,17 @@ fn resolve_point(
         [0.0, 0.0, 0.0],
     )?;
 
-    let (seat, seat_problems) = seat_of(point, scene);
+    let (seat, mut seat_problems, contact, body_problem) = seat_with_contact(point, scene);
+    // A contact body that was to seat the origin and derived nothing must not
+    // leave the wire end at the world origin: a point with an offset of its
+    // own keeps it (its last explicit place), one without has no wire end
+    // (it is reported, not published) and says why.
+    let unplaced = body_problem.is_some() && position == [0.0, 0.0, 0.0];
+    if let (true, Some(problem)) = (unplaced, body_problem) {
+        if let Some(entry) = seat_problems.iter_mut().find(|entry| **entry == problem) {
+            entry.push_str("; this point has no wire end until it is seated");
+        }
+    }
     problems.extend(
         seat_problems
             .into_iter()
@@ -1037,9 +1186,23 @@ fn resolve_point(
     let mut direction = seated_direction(&seat, rotation)
         .normalized()
         .map_err(|_| "direction is a zero vector".to_string())?;
-    if point.reverse_direction {
+    // A body-seated origin already took the other end for `reverseDirection`.
+    let reversed_by_end = contact.as_ref().is_some_and(|(_, _, seats_origin)| *seats_origin);
+    if point.reverse_direction && !reversed_by_end {
         direction = direction.scale(-1.0);
     }
+    let contact = contact.map(|(body, derived, seats_origin)| {
+        let a = |v: Vec3| [v.x, v.y, v.z];
+        PortContactRow {
+            body,
+            end: if derived.wire_at_plus { "+axis" } else { "-axis" }.to_string(),
+            axis: a(derived.axis),
+            wire_end: a(derived.wire_end()),
+            other_end: a(derived.other_end()),
+            seats_origin,
+            rule: derived.rule.as_str().to_string(),
+        }
+    });
     Ok((
         PortRecord {
             point: base,
@@ -1056,6 +1219,8 @@ fn resolve_point(
         },
         seat,
         problems,
+        contact,
+        unplaced,
     ))
 }
 

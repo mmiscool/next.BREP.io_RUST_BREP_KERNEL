@@ -631,11 +631,16 @@ fn loop_split_face_impl(
             );
         }
         if closed {
-            if touch_rings && shared_ring.is_none() && on_a_loop(start_point, &regions) {
+            // `BREP_COSURFACE_EXACT_APART`: a ring proven off every boundary
+            // edge by more than the On band touches no loop, whatever the
+            // weld floor reads of its vertex beside a loop vertex (coaxial
+            // cylinders put both seams on one side, 2.1e-6 apart).
+            let apart = crate::switch!("BREP_COSURFACE_EXACT_APART", false) && ring_apart_from_edges(solid, face, index, *piece_id, 1e-6);
+            if !apart && touch_rings && shared_ring.is_none() && on_a_loop(start_point, &regions) {
                 touch_arcs.push((cut_entry(*piece_id, pcurve, &samples, start_point, end_point, key), piece.start_vertex_id, piece.end_vertex_id));
                 continue;
             }
-            if on_a_loop(start_point, &regions) {
+            if !apart && on_a_loop(start_point, &regions) {
                 return Ok(Err(Decline::RingTouches(*piece_id)));
             }
             let area = signed_area(&samples[..samples.len() - 1]);
@@ -875,8 +880,21 @@ fn loop_split_face_impl(
         let chord_start = piece_chains.len() - chord_arcs.len();
         let chord_ends: Vec<Vec<Vec2>> = chord_arcs.iter().map(|(entry, _, _)| vec![entry.start(), entry.end()]).collect();
         let piece_boxes: Vec<[Vec2; 2]> = piece_chains.iter().map(|(_, chain, _)| chain_box(chain, band)).collect();
+        // `BREP_COSURFACE_EXACT_APART`: a ring of one closed piece proven off
+        // every boundary edge of the face by more than the On band (concentric
+        // coplanar circles, `ring_apart_from_edges`) neither crosses nor
+        // grazes the loops, however near it runs in the chart (a coaxial
+        // cylinder's circle 2.1e-6 inside a cap's rim).
+        let exact_apart_rings: HashSet<u64> = if crate::switch!("BREP_COSURFACE_EXACT_APART", false) {
+            rings.iter().filter(|ring| ring.entries.len() == 1 && ring_apart_from_edges(solid, face, index, ring.id, 1e-6)).map(|ring| ring.id).collect()
+        } else {
+            HashSet::default()
+        };
         for (i, (id, chain, clear)) in piece_chains.iter().enumerate() {
             for (loop_chain, loop_box) in loop_chains.iter().zip(&loop_boxes) {
+                if exact_apart_rings.contains(id) {
+                    break;
+                }
                 if boxes_meet(&piece_boxes[i], loop_box) && chains_meet(chain, loop_chain, band, clear, clear_radius).is_some() {
                     return Ok(Err(Decline::Crosses(*id)));
                 }
@@ -1409,3 +1427,97 @@ pub fn loop_split_census(line: impl FnOnce() -> String) {
         }
     }
 }
+
+/// Whether the closed piece `piece_id` stands off every boundary edge of
+/// `face` by more than `clearance`, PROVEN: the piece and every edge exact
+/// circular arcs ([`exact_circle`]), all in one plane, each edge's circle
+/// apart from the piece's by more than `clearance` everywhere (their radii's
+/// difference less their centres' distance, less four of each curve's
+/// exactness tolerance, the farthest either can stand off its circle: the cap
+/// of a cylinder cut by a coaxial cylinder's circle 2.1e-6 inside its rim).
+/// Anything else is not proven and keeps the chart checks.
+fn ring_apart_from_edges(solid: &BrepSolid, face: &FaceRecord, index: &FragmentIndex, piece_id: u64, clearance: f64) -> bool {
+    let Some(piece) = index.pieces_by_id.get(&piece_id) else { return false };
+    let Some((centre, axis, radius, slack)) = exact_circle(&piece.curve) else { return false };
+    let mut any = false;
+    for coedge in face.loops.iter().flat_map(|lp| &lp.coedges) {
+        let Some(edge) = solid.edges.iter().find(|edge| edge.id == coedge.edge_id) else { return false };
+        if edge.degenerate {
+            continue;
+        }
+        let Some((rim_centre, rim_axis, rim_radius, rim_slack)) = exact_circle(&edge.curve) else { return false };
+        let offset = rim_centre.sub(centre);
+        let coplanar = rim_axis.cross(axis).length() <= 1e-12 && offset.dot(axis).abs() <= slack + rim_slack;
+        let gap = (rim_radius - radius).abs() - offset.length() - 4.0 * (slack + rim_slack);
+        if !coplanar || !(gap > clearance) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+/// The circle a curve is EXACTLY (centre, unit axis, radius): a rational
+/// quadratic whose every interior knot has multiplicity two (so each span is
+/// one rational Bezier arc), each span's ends on the circle, its middle
+/// control point where the tangents at the ends meet (as far from both), its
+/// middle weight the cosine of half the span's angle against its ends' (the
+/// arc of that circle, exactly), each span 120 degrees at most, all to 1e-12
+/// of the circle's own size, with
+/// no allowance for its distance from the origin (a circle far out whose
+/// coordinates cannot meet that is not proven). Returns the circle and that
+/// tolerance; the curve stands within a few of it of the circle (a rational
+/// curve of positive weights lies in its control points' hull). `None` for
+/// anything else, a fit that runs on a circle at its samples included.
+fn exact_circle(curve: &crate::NurbsCurve) -> Option<(Vec3, Vec3, f64, f64)> {
+    if curve.degree != 2 || curve.control_points.len() < 3 || curve.control_points.len() % 2 == 0 {
+        return None;
+    }
+    // Interior knots each twice: spans [2k, 2k + 1, 2k + 2].
+    let knots = &curve.knots;
+    if knots.len() != curve.control_points.len() + 3 {
+        return None;
+    }
+    let interior = &knots[3..knots.len() - 3];
+    if interior.len() % 2 != 0 || interior.chunks(2).any(|pair| pair[0] != pair[1]) {
+        return None;
+    }
+    let points: Vec<Vec3> = curve.control_points.iter().map(|p| p.point().ok()).collect::<Option<_>>()?;
+    let weights: Vec<f64> = curve.control_points.iter().map(|p| p.w).collect();
+    if weights.iter().any(|w| !(*w > 0.0)) {
+        return None;
+    }
+    let [t0, t1] = curve.domain().ok()?;
+    let fitted = crate::recognize_circle(curve, t0, t1, f64::INFINITY)?;
+    let (centre, axis, radius) = (fitted.centre, fitted.axis, fitted.radius);
+    let tolerance = 1e-12 * (1.0 + radius);
+    for k in (0..points.len() - 1).step_by(2) {
+        let (p0, p1, p2) = (points[k], points[k + 1], points[k + 2]);
+        let (w0, w1, w2) = (weights[k], weights[k + 1], weights[k + 2]);
+        let (a, b) = (p0.sub(centre), p2.sub(centre));
+        if (a.length() - radius).abs() > tolerance || (b.length() - radius).abs() > tolerance {
+            return None;
+        }
+        if a.dot(axis).abs() > tolerance || b.dot(axis).abs() > tolerance || p1.sub(centre).dot(axis).abs() > tolerance {
+            return None;
+        }
+        // The middle point on both end tangents, as far from both ends.
+        if p1.sub(p0).dot(a).abs() > tolerance * radius || p1.sub(p2).dot(b).abs() > tolerance * radius {
+            return None;
+        }
+        if (p1.sub(p0).length() - p1.sub(p2).length()).abs() > tolerance {
+            return None;
+        }
+        let cos_full = (a.dot(b) / (radius * radius)).clamp(-1.0, 1.0);
+        let cos_half = ((1.0 + cos_full) / 2.0).sqrt();
+        // Spans of 120 degrees at most (the kernel's circles): the middle
+        // point then stands within 2r of the chord, and a weight off by 1e-12
+        // moves the curve by no more than about 2e-12 r. A wider span's far
+        // middle point turns a round-off weight into a bulge.
+        if cos_half < 0.5 || (w1 / (w0 * w2).sqrt() - cos_half).abs() > 1e-12 {
+            return None;
+        }
+    }
+    Some((centre, axis, radius, tolerance))
+}
+

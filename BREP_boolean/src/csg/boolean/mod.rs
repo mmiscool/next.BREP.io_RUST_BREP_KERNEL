@@ -133,6 +133,27 @@ pub struct BooleanOptions {
     pub seam_rejoin_later_references: Option<Vec<String>>,
 }
 
+thread_local! {
+    static WITHOUT_PERTURBATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `action` with this thread's booleans refusing a degenerate exact
+/// arrangement where they would retry it on rigidly perturbed operands (the
+/// perturbation ladder, the last resort after the exact recoveries, which
+/// still run): for a caller with a fallback of its own (another layout of the
+/// same cut), which comes back with the ladder only where every fallback
+/// refused.
+pub fn without_perturbation<T>(action: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WITHOUT_PERTURBATION.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(WITHOUT_PERTURBATION.with(|cell| cell.replace(true)));
+    action()
+}
+
 /// [`BooleanOptions::touched_assembly`] under its environment override.
 fn touched_assembly(options: &BooleanOptions) -> bool {
     match std::env::var("BREP_TOUCHED_ASSEMBLY").as_deref() {
@@ -437,6 +458,10 @@ pub fn boolean_operation(
                 if let Some(solid) = union_through_the_difference(first, second, options) {
                     return Ok(solid);
                 }
+            }
+            // The ladder itself: not under `without_perturbation`.
+            if WITHOUT_PERTURBATION.with(|cell| cell.get()) {
+                return Err(error);
             }
             match perturbation_retry(first, second, operation, options) {
                 Ok(solid) => Ok(solid),
@@ -2270,6 +2295,77 @@ pub fn boolean_operation_nary_with_options(
     operation: BooleanOperation,
     options: &BooleanOptions,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // More operands than one arrangement takes (255): folded a chunk at a
+    // time, the result so far the next chunk's first operand. Union and
+    // intersection are associative, and a difference takes the first operand
+    // less all the rest, so the answer is the one arrangement's would be.
+    let most = nary_chunk();
+    if operands.len() > most && nary_chunks_on() {
+        let mut whole = boolean_operation_nary_with_options(&operands[..most], operation, options)?;
+        for chunk in operands[most..].chunks(most - 1) {
+            // A last chunk of one operand is the binary boolean of the two
+            // (as every two-operand call is answered by the pairwise path).
+            if let [only] = chunk {
+                whole = boolean_operation(&whole, only, operation, options)?;
+                continue;
+            }
+            let mut next = Vec::with_capacity(chunk.len() + 1);
+            next.push(whole);
+            next.extend_from_slice(chunk);
+            whole = boolean_operation_nary_with_options(&next, operation, options)?;
+        }
+        return Ok(whole);
+    }
+    let arranged = boolean_operation_nary_arranged(operands, operation, options);
+    match arranged {
+        Err(error) if nary_sequential_fallback_enabled() && operands.len() > 2 && error.message.contains("boolean assembly") => {
+            // The binary path, operand by operand: each step is the pairwise
+            // boolean every other caller makes.
+            let mut whole = operands[0].clone();
+            for operand in &operands[1..] {
+                whole = match boolean_operation(&whole, operand, operation, options) {
+                    Ok(solid) => solid,
+                    Err(_) => return Err(error),
+                };
+            }
+            Ok(whole)
+        }
+        other => other,
+    }
+}
+
+/// `BREP_NARY_SEQUENTIAL_FALLBACK` (default on; `=0` refuses as before): an n-ary boolean whose single
+/// arrangement fails to assemble is answered by the binary boolean applied
+/// operand by operand, and refuses as before only if that fails too. A disc
+/// less a counterbore, a hole and a countersink whose tops lie on the
+/// counterbore's floor (three faces on one plane, the countersink's rim
+/// crossing the counterbore wall's foot) left an open loop as one arrangement
+/// and builds cut by cut.
+/// The operands one n-ary arrangement takes.
+const NARY_MOST: usize = 255;
+
+/// The operands a fold takes a chunk at a time: `NARY_MOST` (a test may set
+/// fewer on its thread).
+fn nary_chunk() -> usize {
+    NARY_MOST
+}
+
+
+/// `BREP_NARY_CHUNKS` (on unless =0): an n-ary boolean of more operands than
+/// one arrangement takes is folded a chunk at a time instead of refused.
+fn nary_chunks_on() -> bool {
+    crate::switch!("BREP_NARY_CHUNKS", true)
+}
+
+fn nary_sequential_fallback_enabled() -> bool {
+    crate::switch!("BREP_NARY_SEQUENTIAL_FALLBACK", true)
+}
+
+fn boolean_operation_nary_arranged(
+    operands: &[BrepSolid],
+    operation: BooleanOperation,
+    options: &BooleanOptions,
+) -> Result<BrepSolid, KernelRefusal> {
     if operands.len() > 1 {
         if let Some(scaled) = WorkingScale::of(&operands.iter().collect::<Vec<_>>(), options)? {
             return boolean_operation_nary_with_options(&scaled.solids, operation, &scaled.options)
@@ -2283,7 +2379,7 @@ pub fn boolean_operation_nary_with_options(
     if operands.len() == 1 {
         return Ok(operands[0].clone());
     }
-    if operands.len() > 255 {
+    if operands.len() > nary_chunk() {
         return Err(KernelRefusal::input(KernelStage::Collect, "operands", "boolean_operation_nary: at most 255 operands supported"));
     }
     // Each whole ball turned onto the one line the others cut it about
@@ -2620,6 +2716,32 @@ pub fn boolean_operation_with_diagnostics(
         profile_stage("seam_prepare_ms", started.elapsed().as_secs_f64() * 1000.0);
         return boolean_operation_with_diagnostics_impl(&first, &second, operation, options, closed_inputs).map(without_sliver_shells);
     }
+    // CYLINDER CONTACTS (`reseat::seam_reseat_cylinders_mode`): with no later
+    // references stated, only the cylinder-against-cylinder re-seat runs.
+    let cylinders = reseat::seam_reseat_cylinders_mode();
+    if reseat::seam_reseat_enabled() && cylinders != crate::env_read::Mode::Off {
+        let kinds = reseat::ContactKinds { planes: false, cylinders: true };
+        let (reseated_first, reseated_second) = reseat::reseat_tangent_seams_of(first, second, &[], options.tolerance, kinds);
+        let moved = matches!(reseated_first, std::borrow::Cow::Owned(_)) || matches!(reseated_second, std::borrow::Cow::Owned(_));
+        if moved {
+            let reseated = boolean_operation_with_diagnostics_impl(&reseated_first, &reseated_second, operation, options, closed_inputs).map(without_sliver_shells);
+            if cylinders == crate::env_read::Mode::On {
+                return reseated;
+            }
+            let plain = boolean_operation_with_diagnostics_impl(first, second, operation, options, closed_inputs).map(without_sliver_shells);
+            let volume = |result: &Result<KernelOutcome<BrepSolid>, KernelRefusal>| {
+                result.as_ref().ok().and_then(|outcome| crate::solid_mass_properties(&outcome.value).ok()).map(|mass| mass.volume)
+            };
+            eprintln!(
+                "boolean.seam_reseat_cylinders check: plain {} volume {:?}, reseated {} volume {:?}",
+                if plain.is_ok() { "built" } else { "refused" },
+                volume(&plain),
+                if reseated.is_ok() { "built" } else { "refused" },
+                volume(&reseated)
+            );
+            return plain;
+        }
+    }
     boolean_operation_with_diagnostics_impl(first, second, operation, options, closed_inputs).map(without_sliver_shells)
 }
 
@@ -2891,6 +3013,8 @@ fn prepared_operands(
         profile_line!("boolean.reading_memo hits={hits} misses={misses}");
         let (served, stored) = crate::heal::refit_memo_counts_served_stored();
         profile_line!("boolean.refit_memo served={served} stored={stored}");
+        let (served, stored, mismatches) = crate::heal::claim_record_memo_counts();
+        profile_line!("boolean.claim_record_memo served={served} stored={stored} check_mismatches={mismatches}");
     }
     profile_stage("heal_ms", stage_started.elapsed().as_secs_f64() * 1_000.0);
     // Seamless full-period band faces (STEP import) break the seam-aware
@@ -3071,12 +3195,12 @@ thread_local! {
 /// meeting end to end through their caps do not count).
 fn hair_deep_overlap(first: &BrepSolid, second: &BrepSolid, tolerance: f64) -> bool {
     use crate::AnalyticSurface as A;
-    fn faces(solid: &BrepSolid) -> Vec<(&crate::AnalyticSurface, crate::spatial::Aabb, &crate::NurbsSurface)> {
+    fn faces(solid: &BrepSolid) -> Vec<(&crate::AnalyticSurface, crate::spatial::Aabb, &crate::NurbsSurface, &crate::FaceRecord)> {
         solid
             .shells
             .iter()
             .flat_map(|shell| &shell.faces)
-            .filter_map(|face| Some((face.surface.analytic()?, crate::Aabb::from_surface_controls(&face.surface).ok()?, &face.surface)))
+            .filter_map(|face| Some((face.surface.analytic()?, crate::Aabb::from_surface_controls(&face.surface).ok()?, &face.surface, face)))
             .collect()
     }
     // A face's extent along `axis`: its control points' (the hull holds it).
@@ -3096,8 +3220,8 @@ fn hair_deep_overlap(first: &BrepSolid, second: &BrepSolid, tolerance: f64) -> b
             && (a.maximum.y.min(b.maximum.y) - a.minimum.y.max(b.minimum.y)) > tolerance
             && (a.maximum.z.min(b.maximum.z) - a.minimum.z.max(b.minimum.z)) > tolerance
     };
-    for (a, box_a, surface_a) in faces(first) {
-        for (b, box_b, surface_b) in faces(second) {
+    for (a, box_a, surface_a, face_a) in faces(first) {
+        for (b, box_b, surface_b, face_b) in faces(second) {
             if !boxes_overlap(&box_a, &box_b) {
                 continue;
             }
@@ -3126,7 +3250,14 @@ fn hair_deep_overlap(first: &BrepSolid, second: &BrepSolid, tolerance: f64) -> b
                     }
                 }
                 (A::Sphere { frame: fa, radius: ra }, A::Sphere { frame: fb, radius: rb }) => {
-                    if crossing(fb.origin.sub(fa.origin).length(), *ra, *rb) {
+                    // The two balls' lens meets the faces only along the
+                    // circle where the spheres cross; a face that circle is
+                    // proven off (a part of a cavity the circle passes
+                    // beside) holds no lens, however deep the carriers' is.
+                    if crossing(fb.origin.sub(fa.origin).length(), *ra, *rb)
+                        && !circle_off_face(face_a, first, (fa.origin, *ra), (fb.origin, *rb), tolerance)
+                        && !circle_off_face(face_b, second, (fb.origin, *rb), (fa.origin, *ra), tolerance)
+                    {
                         return true;
                     }
                 }
@@ -3136,6 +3267,83 @@ fn hair_deep_overlap(first: &BrepSolid, second: &BrepSolid, tolerance: f64) -> b
     }
     false
 }
+
+/// Whether the circle where the sphere `own` (centre, radius), carrying
+/// `face`, crosses the sphere `other` is proven to lie off `face`: every edge
+/// of the face stands clear of `other` by more than `tolerance` (its control
+/// hull, halved where it does not decide, wholly inside or wholly outside),
+/// so the circle, which lies on `other`, never meets the face's boundary and
+/// is wholly on the face or wholly off it; and one point of it is outside the
+/// face's trim. A face with no trim, or anything unproven, is not off.
+fn circle_off_face(face: &crate::FaceRecord, solid: &BrepSolid, own: (Vec3, f64), other: (Vec3, f64), tolerance: f64) -> bool {
+    use crate::classification::{parameter_point_in_face, PolygonClass};
+    let ((ca, ra), (cb, rb)) = (own, other);
+    if face.loops.iter().all(|lp| lp.coedges.is_empty()) {
+        return false;
+    }
+    // A curve's points on [t0, t1] all inside or all outside the other ball:
+    // its control points (positive weights: the hull holds the curve) all
+    // within `rb - tolerance` of the centre, or their box farther than
+    // `rb + tolerance` from it; otherwise each half, a few times over.
+    fn clear(curve: &crate::NurbsCurve, depth: u32, centre: Vec3, radius: f64, tolerance: f64) -> bool {
+        let points: Option<Vec<Vec3>> = curve.control_points.iter().map(|control| if control.w > 0.0 { control.point().ok() } else { None }).collect();
+        let Some(points) = points else { return false };
+        if points.iter().all(|point| point.sub(centre).length() < radius - tolerance) {
+            return true;
+        }
+        let (mut low, mut high) = (Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY));
+        for point in &points {
+            low = Vec3::new(low.x.min(point.x), low.y.min(point.y), low.z.min(point.z));
+            high = Vec3::new(high.x.max(point.x), high.y.max(point.y), high.z.max(point.z));
+        }
+        let near = Vec3::new(centre.x.clamp(low.x, high.x), centre.y.clamp(low.y, high.y), centre.z.clamp(low.z, high.z));
+        if near.sub(centre).length() > radius + tolerance {
+            return true;
+        }
+        if depth == 0 {
+            return false;
+        }
+        let Ok([t0, t1]) = curve.domain() else { return false };
+        match curve.split(0.5 * (t0 + t1)) {
+            Ok((left, right)) => clear(&left, depth - 1, centre, radius, tolerance) && clear(&right, depth - 1, centre, radius, tolerance),
+            Err(_) => false,
+        }
+    }
+    for coedge in face.loops.iter().flat_map(|lp| &lp.coedges) {
+        let Some(edge) = solid.edges.iter().find(|edge| edge.id == coedge.edge_id) else { return false };
+        let Ok([d0, d1]) = edge.curve.domain() else { return false };
+        // The edge's own span of its curve.
+        let mut span = edge.curve.clone();
+        if edge.t1 < d1 {
+            match span.split(edge.t1) {
+                Ok((left, _)) => span = left,
+                Err(_) => return false,
+            }
+        }
+        if edge.t0 > d0 {
+            match span.split(edge.t0) {
+                Ok((_, right)) => span = right,
+                Err(_) => return false,
+            }
+        }
+        if !clear(&span, 10, cb, rb, tolerance) {
+            return false;
+        }
+    }
+    let axis = cb.sub(ca);
+    let distance = axis.length();
+    let Ok(n) = axis.normalized() else { return false };
+    let along = (distance * distance + ra * ra - rb * rb) / (2.0 * distance);
+    let across = ra * ra - along * along;
+    let Ok(side) = n.perpendicular() else { return false };
+    if !(across > 0.0) {
+        return false;
+    }
+    let point = ca.add(n.scale(along)).add(side.scale(across.sqrt()));
+    let Ok(projection) = crate::project_point_to_surface(&face.surface, point) else { return false };
+    matches!(parameter_point_in_face(face, crate::Vec2 { x: projection.u, y: projection.v }, 1e-9), Ok(PolygonClass::Outside))
+}
+
 
 /// The empty solid a legitimately empty boolean returns.
 fn empty_solid() -> BrepSolid {

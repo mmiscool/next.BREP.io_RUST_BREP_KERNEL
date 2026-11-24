@@ -1,12 +1,13 @@
 [package]
 name = "BREP_simulation"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-description = "Motion studies for BREP assemblies: the study document model, mates as motors, the timeline's clips and sampling a study at a time"
+homepage = "https://next.brep.io"
+description = "Motion studies for next.BREP.io (Rust B-rep CAD) assemblies: the study document model, mates as motors, the timeline's clips and sampling a study at a time."
 readme = "README.md"
-keywords = ["cad", "assembly", "simulation", "motion"]
+keywords = ["cad", "b-rep", "assembly", "simulation", "motion"]
 categories = ["data-structures", "simulation"]
 # The `!` entries are a backstop: test code never ships.
 include = [

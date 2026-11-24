@@ -7,6 +7,10 @@ use super::*;
 /// its crossings spray micro edge-splits over the very edges it follows
 /// (glue unions march the touching pair in one operand order and produced
 /// thousands of noise splits). Skip such branches entirely.
+fn shared_boundary_midpoints_enabled() -> bool {
+    crate::switch!("BREP_SHARED_BOUNDARY_MIDPOINTS", false)
+}
+
 pub(super) fn branch_follows_shared_boundary(
     points: &[Vec3],
     first: TaggedFace<'_>,
@@ -20,9 +24,31 @@ pub(super) fn branch_follows_shared_boundary(
     };
     let weld_limit = assembler_weld(tolerance);
     let step = (points.len() / 16).max(1);
+    // `BREP_SHARED_BOUNDARY_MIDPOINTS` (default off): a point of the section
+    // between each two sampled stations is read too. A 2.6e-3 section between two rims
+    // marched in three stations, two on one rim and one on the other, read as
+    // following those rims at every station and was dropped; its middle stands
+    // 1.3e-3 off both.
+    let mut samples: Vec<Vec3> = points.iter().step_by(step).copied().chain(std::iter::once(*last)).collect();
+    if shared_boundary_midpoints_enabled() {
+        // Each chord midpoint is carried onto the section itself (projected onto
+        // the two carriers in turn), so it lies where the section does: on a
+        // boundary the section rides it reads on that boundary however curved
+        // the boundary is between stations, and on a section between two rims it
+        // reads off both.
+        let stations = samples.clone();
+        for pair in stations.windows(2) {
+            let mut point = pair[0].add(pair[1]).scale(0.5);
+            for _ in 0..8 {
+                point = project_point_to_surface(&first.face.surface, point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?.point;
+                point = project_point_to_surface(&second.face.surface, point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?.point;
+            }
+            samples.push(point);
+        }
+    }
     for face in [first, second] {
         let face_edges = face_edges(face, edges)?;
-        for point in points.iter().step_by(step).chain(std::iter::once(last)) {
+        for point in samples.iter() {
             // A tangential contact curve is only determinable to the
             // square-root of the tolerance times the local size (the
             // intersection is ill-conditioned there), so the marched points

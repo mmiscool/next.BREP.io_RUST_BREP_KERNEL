@@ -381,8 +381,8 @@ fn line_line_mode() -> LineLineMode {
 }
 
 
-/// Lane O batch 22 (tier-3 finding 1, `BREP_CURVE_TANGENT_MERGE_LOCAL`,
-/// default on since batch 27; `1`/`on`, `census`): the duplicate guard's radius for
+/// `BREP_CURVE_TANGENT_MERGE_LOCAL` (default on since 2026-11-03;
+/// `1`/`on`, `census`): the duplicate guard's radius for
 /// TANGENTIAL hits and the cluster's representative.
 ///
 /// Today a tangential hit merges every other hit within
@@ -410,7 +410,7 @@ enum TangentMergeMode {
 
 fn tangent_merge_mode() -> TangentMergeMode {
     static MODE: std::sync::OnceLock<TangentMergeMode> = std::sync::OnceLock::new();
-    // On by default since 2026-11-03 (lane O batch 27); `0`/`off` restores
+    // On by default since 2026-11-03; `0`/`off` restores
     // today's |p|-scaled radius.
     let mode = *MODE.get_or_init(|| match std::env::var("BREP_CURVE_TANGENT_MERGE_LOCAL").as_deref() {
         Ok("0") | Ok("off") => TangentMergeMode::Off,
@@ -533,7 +533,15 @@ pub(crate) fn intersect_curves_exact_only(first: &NurbsCurve, second: &NurbsCurv
     for [s,t] in seeds {
         let a = first.evaluate(s).ok()?;
         let b = second.evaluate(t).ok()?;
-        if !hits.iter().any(|hit| hit.point.sub(a).length() <= 4.0*tolerance && hit.point.sub(b).length() <= 4.0*tolerance) { return None; }
+        if hits.iter().any(|hit| hit.point.sub(a).length() <= 4.0*tolerance && hit.point.sub(b).length() <= 4.0*tolerance) { continue; }
+        // A graze seed (the reading's stationary point or a span end, the
+        // curves within a hundred tolerances there) stands for a touch the
+        // roots may miss; where Newton takes it to a stationary pair of the
+        // two curves farther apart than the tolerance (the gap square to both
+        // tangents), the curves do not touch there, and the crossings beside
+        // it are the roots' own seeds; where it reaches one of those hits,
+        // it adds none. Any other unmatched seed declines.
+        if !graze_seeds_enabled() || !closest_approach_apart(first,second,s,t,tolerance,&hits)? { return None; }
     }
     Some(hits)
 }
@@ -574,7 +582,7 @@ pub fn intersect_curves(
                 return Ok(exact);
             }
             let general = intersect_curves_general(first, second, tolerance)?;
-            // Self-check (lane O batch 22, finding 2): the 2026-11-02 census
+            // Self-check: the 2026-11-02 census
             // recorded one general crossing for a pair every later replay
             // answers with two; a second call here, compared by bits, makes
             // the record say whether the search itself wavered in the run.
@@ -595,7 +603,7 @@ pub fn intersect_curves(
 /// boxes. See [`exact_conic_conic_pairs`].
 fn conic_conic_mode() -> LineLineMode {
     static MODE: std::sync::OnceLock<LineLineMode> = std::sync::OnceLock::new();
-    // On by default since 2026-11-03 (lane O batch 27); `0`/`off` restores
+    // On by default since 2026-11-03; `0`/`off` restores
     // the general search for two planar conics.
     let mode = *MODE.get_or_init(|| match std::env::var("BREP_EXACT_CONIC_CONIC").as_deref() {
         Ok("0") | Ok("off") => LineLineMode::Off,
@@ -934,6 +942,48 @@ fn intersect_curves_general(
 /// The general search past its seeding: a Newton run from each `[s, t]`
 /// seed (a Gauss–Newton retry for those that fail), then the gap filter, the
 /// duplicate guard and the tangency reading, sorted by `s`.
+/// `BREP_EXACT_CONIC_GRAZE_SEEDS` (default off, `=1` on): an exact-lane seed
+/// matching no hit is let pass by [`closest_approach_apart`] instead of
+/// declining the lane.
+fn graze_seeds_enabled() -> bool {
+    crate::switch!("BREP_EXACT_CONIC_GRAZE_SEEDS", false)
+}
+
+/// Whether Newton from the seed `(s, t)` (with curvature terms, then
+/// Gauss–Newton) reaches a stationary pair of the two curves farther apart
+/// than `tolerance`: the gap between the two points longer than it and
+/// square to each curve's tangent (within 1e-6 of their lengths' product),
+/// the pair inside both domains (a closed curve's seam counts as inside); or a pair within the tolerance of each other
+/// at one of `hits` (within four tolerances). `None` where a reading fails.
+fn closest_approach_apart(first: &NurbsCurve, second: &NurbsCurve, s: f64, t: f64, tolerance: f64, hits: &[CurveCurveIntersection]) -> Option<bool> {
+    let [s0, s1] = first.domain().ok()?;
+    let [t0, t1] = second.domain().ok()?;
+    // An open curve's end is no stationary point of its own (Newton clamped
+    // there); a closed curve's seam is a point like any other.
+    let closed = |curve: &NurbsCurve, lo: f64, hi: f64| -> Option<bool> { Some(curve.evaluate(lo).ok()?.sub(curve.evaluate(hi).ok()?).length() <= tolerance) };
+    let (closed_first, closed_second) = (closed(first, s0, s1)?, closed(second, t0, t1)?);
+    for curvature in [true, false] {
+        let [u, v] = newton_closest_pair(first, second, s, t, curvature).ok()?;
+        if !((closed_first || (u > s0 && u < s1)) && (closed_second || (v > t0 && v < t1))) {
+            continue;
+        }
+        let (p, dp) = first.deriv1(u).ok()?;
+        let (q, dq) = second.deriv1(v).ok()?;
+        let gap = p.sub(q);
+        let length = gap.length();
+        if length <= tolerance && hits.iter().any(|hit| hit.point.sub(p).length() <= 4.0 * tolerance && hit.point.sub(q).length() <= 4.0 * tolerance) {
+            return Some(true);
+        }
+        if length > tolerance
+            && gap.dot(dp).abs() <= 1e-6 * length * dp.length()
+            && gap.dot(dq).abs() <= 1e-6 * length * dq.length()
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 fn intersect_curves_from_seeds(
     first: &NurbsCurve,
     second: &NurbsCurve,
@@ -989,7 +1039,7 @@ fn intersect_curves_from_seeds(
         } else {
             tolerance * 10.0
         };
-        // Lane O batch 22: the contact-derived tangential radius (see
+        // The contact-derived tangential radius (see
         // `TangentMergeMode`). Read only when the rule is on or counted.
         let merge_mode = tangent_merge_mode();
         let local = if tangential && merge_mode != TangentMergeMode::Off {

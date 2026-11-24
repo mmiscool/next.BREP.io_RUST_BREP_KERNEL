@@ -1,12 +1,12 @@
 [package]
 name = "BREP_gizmos"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-homepage = "https://v2.brep.io"
+homepage = "https://next.brep.io"
 readme = "README.md"
-keywords = ["cad", "brep", "gizmo", "viewcube", "overlay"]
+keywords = ["cad", "brep", "b-rep", "gizmo", "viewcube"]
 categories = ["graphics", "gui", "visualization"]
 # The `!` entries are a backstop: test code never ships. The publish snapshot
 # `cargo package` of this manifest from shipping test files.
@@ -21,7 +21,7 @@ include = [
     "!**/test_support.rs",
     "!**/testdata/**",
 ]
-description = "BREP in-scene gizmos and overlay widgets (transform gizmo, ViewCube, datum/axis visuals, dimension leaders). Pure geometry + hit-testing, no kernel or GPU dependency — the render engine consumes the emitted overlay geometry. A CPU rasterizer is provided for headless demo/verification."
+description = "In-scene gizmos and overlay widgets for the next.BREP.io Rust B-rep CAD kernel (transform gizmo, ViewCube, datum/axis visuals, dimension leaders). Pure geometry + hit-testing, no kernel or GPU dependency; a CPU rasterizer is provided for headless demo/verification."
 
 # The package publishes as BREP_gizmos; the library keeps the historical
 # brep_gizmos symbol so every existing `use brep_gizmos::` keeps compiling.

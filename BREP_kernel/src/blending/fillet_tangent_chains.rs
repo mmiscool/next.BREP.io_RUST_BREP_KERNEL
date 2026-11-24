@@ -1,6 +1,7 @@
 //! A fillet of edges and every edge their G1 tangent chains continue into:
 //! the fillet feature's "Follow tangent" selection, as one public call; and
-//! the fillet with the caller's options (follow tangents, refuse a pinch).
+//! the fillet with the caller's options (follow tangents, refuse a pinch);
+//! and the equal-distance chamfer with the caller's options (follow tangents).
 use crate::{fillet_edges, BrepSolid, KernelRefusal, KernelStage, Vec3};
 
 /// [`fillet_edges`] of `edge_points`' edges and every unselected edge on the
@@ -64,20 +65,7 @@ pub fn fillet_edges_with_options(
     options: FilletOptions,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
-    let mut points = edge_points.to_vec();
-    let mut names = edge_names.map(|names| names.to_vec());
-    if options.follow_tangent_chains {
-        let seeds = edge_points
-            .iter()
-            .map(|point| brep_blend::fillet::edges::resolve_edge_by_point(solid, *point))
-            .collect::<Result<Vec<u64>, KernelRefusal>>()?;
-        let added = crate::feature_pipeline::features::common::tangent_chain_expansion(solid, &seeds, &seeds)
-            .map_err(|error| KernelRefusal::internal(KernelStage::Collect, "tangent_chain", error))?;
-        points.extend(added.iter().map(|(_, point, _)| *point));
-        if let Some(names) = names.as_mut() {
-            names.extend(added.iter().map(|(_, _, name)| name.clone()));
-        }
-    }
+    let (points, names) = widen_along_tangent_chains(solid, edge_points, edge_names, options.follow_tangent_chains)?;
     if options.refuse_pinch {
         if let Some(refusal) = brep_blend::fillet::pinch_refusal(solid, &points, radius) {
             return Err(refusal);
@@ -92,6 +80,59 @@ pub fn fillet_edges_with_options(
         Some(Ok(built)) => Ok(built),
         _ => Err(refused),
     }
+}
+
+/// How [`chamfer_edges_with_options`] reads a selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChamferOptions {
+    /// Also chamfer every edge the picked edges' tangent chains continue into,
+    /// walked as [`fillet_edges_tangent_chains`] walks them: a hole's rim cut
+    /// as two half circles is one chain, so a point on either half chamfers
+    /// the whole rim.
+    pub follow_tangent_chains: bool,
+}
+
+/// An equal-distance chamfer ([`chamfer_edges_asymmetric`] with both
+/// setbacks `distance`) of `edge_points`' edges, read with `options`: the
+/// selection widened along its tangent chains first when asked. An edge the
+/// chains add takes the same distance and carries its own name.
+///
+/// [`chamfer_edges_asymmetric`]: crate::chamfer_edges_asymmetric
+pub fn chamfer_edges_with_options(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    distance: f64,
+    options: ChamferOptions,
+    name: Option<&str>,
+) -> Result<BrepSolid, KernelRefusal> {
+    let (points, names) = widen_along_tangent_chains(solid, edge_points, edge_names, options.follow_tangent_chains)?;
+    crate::chamfer_edges_asymmetric(solid, &points, names.as_deref(), distance, distance, name)
+}
+
+/// `edge_points` (and their names) plus, when `follow`, a point on (and the
+/// name of) every unpicked edge on the picked edges' tangent chains.
+fn widen_along_tangent_chains(
+    solid: &BrepSolid,
+    edge_points: &[Vec3],
+    edge_names: Option<&[String]>,
+    follow: bool,
+) -> Result<(Vec<Vec3>, Option<Vec<String>>), KernelRefusal> {
+    let mut points = edge_points.to_vec();
+    let mut names = edge_names.map(|names| names.to_vec());
+    if follow {
+        let seeds = edge_points
+            .iter()
+            .map(|point| brep_blend::fillet::edges::resolve_edge_by_point(solid, *point))
+            .collect::<Result<Vec<u64>, KernelRefusal>>()?;
+        let added = crate::feature_pipeline::features::common::tangent_chain_expansion(solid, &seeds, &seeds)
+            .map_err(|error| KernelRefusal::internal(KernelStage::Collect, "tangent_chain", error))?;
+        points.extend(added.iter().map(|(_, point, _)| *point));
+        if let Some(names) = names.as_mut() {
+            names.extend(added.iter().map(|(_, _, name)| name.clone()));
+        }
+    }
+    Ok((points, names))
 }
 
 fn is_plane(face: &crate::topology::FaceRecord) -> bool {
@@ -198,4 +239,5 @@ fn swallowed_face_route(solid: &BrepSolid, edge_points: &[Vec3], edge_names: Opt
     }
     Some(fillet_edges(&healed, &points, edge_names.map(|_| names.as_slice()), radius, false, name))
 }
+
 

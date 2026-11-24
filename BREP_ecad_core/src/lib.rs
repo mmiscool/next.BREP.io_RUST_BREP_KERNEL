@@ -20,6 +20,8 @@
 //! Object IDs are random version 4 UUIDs. On `wasm32-unknown-unknown` the randomness
 //! comes from the host: enable the `uuid` crate's `js` feature or configure another
 //! `getrandom` backend, or creating an object fails. See the README for an example.
+pub mod pin_functions;
+pub mod seat_check;
 pub mod autoroute;
 pub mod board;
 pub mod erc;
@@ -30,6 +32,7 @@ pub mod graphic;
 pub mod kicad;
 pub mod kicad_git;
 pub mod netlist;
+pub mod sheet;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub use uuid::Uuid;
@@ -110,7 +113,17 @@ pub struct Pin {
     #[serde(default, skip_serializing_if = "unit_is_unset")]
     pub gate: u32,
     pub number: String,
+    /// The pin's main name (`PA1`).
     pub name: String,
+    /// The other functions the pin can serve (`I2C1_SDA`, `USART2_RTS`), as
+    /// KiCad's `(alternate …)` lists them. Each placed component chooses one of
+    /// these, or the main name, for each pin ([`Component::pin_functions`]).
+    /// The choice is DOCUMENTARY: it is the name the sheet prints, and nothing
+    /// electrical reads it — nets, ERC and the netlist keep binding by number
+    /// and reading the main name and type. Omitted when empty, for the reason
+    /// `unit` is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternates: Vec<String>,
     pub electrical_type: String,
     pub at: Point,
     pub end: Point,
@@ -314,6 +327,12 @@ pub struct Component {
     /// The part's board pads, copied when it was placed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pads: Option<board::Footprint>,
+    /// On a [`DocumentKind::Sheet`] only: the part is OFF the board, outside its
+    /// zone (a fan, a panel switch). It takes harness wires and no nets, and the
+    /// board does not seat it. Never set on a schematic or a wiring diagram, whose
+    /// kind says it ([`Document::on_board`]).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub off_board: bool,
     /// Where each gate of a symbol split into gates ([`Pin::gate`]) sits on the
     /// sheet, one entry per gate: each is moved and turned on its own and named
     /// by the reference and its letter (`U1A`), while the component stays ONE
@@ -321,6 +340,13 @@ pub struct Component {
     /// and omitted, for a symbol drawn whole.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gates: Vec<GatePlacement>,
+    /// The function chosen for each pin that serves more than one, by pin
+    /// number: one of that pin's [`Pin::alternates`]. A pin not listed, or one
+    /// whose chosen name its symbol no longer offers, goes by its main name
+    /// ([`Component::pin_label`]). Kept here and not in the symbol copy,
+    /// which a part refresh replaces. Omitted when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pin_functions: BTreeMap<String, String>,
 }
 /// One gate of a component on the sheet: the gate's geometry, taken about
 /// `pivot` in symbol coordinates, turned by `rotation` quarter turns and put
@@ -466,6 +492,11 @@ pub struct Wire {
     /// Wiring diagrams only: stock part number of the wire or cable.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stock_part_number: String,
+    /// On a [`DocumentKind::Sheet`] only: a HARNESS wire, joining two pins point to
+    /// point, rather than a net. Never set on a schematic or a wiring diagram, whose
+    /// kind says it ([`Document::is_harness`]).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub harness: bool,
 }
 impl Wire {
     pub fn new(a: Point, b: Point) -> Self {
@@ -478,6 +509,7 @@ impl Wire {
             end: None,
             connection_id: String::new(),
             stock_part_number: String::new(),
+            harness: false,
         }
     }
     pub fn points(&self) -> Vec<Point> {
@@ -645,6 +677,12 @@ pub enum DocumentKind {
     /// Point-to-point connections without nets: every wire joins two symbol pins, each
     /// pin takes at most one wire, and the output is a connection list.
     Wiring,
+    /// One assembly's sheet: a board's schematic and the harness wiring round it, as
+    /// a host edits them together ([`sheet`]). Parts are on the board or off it
+    /// ([`Component::off_board`]), and wires are nets or harness wires
+    /// ([`Wire::harness`]). A host stores it split, as a schematic and a wiring
+    /// diagram ([`Document::split_sheet`]).
+    Sheet,
 }
 impl DocumentKind {
     fn is_schematic(&self) -> bool {
@@ -673,6 +711,18 @@ pub struct Document {
     /// from off the sheet, so its power inputs are not reported undriven.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub power_flags: Vec<Terminal>,
+    /// A wiring diagram kept beside a board's schematic only: where, in this
+    /// diagram's coordinates, the board's schematic origin sits when the two are
+    /// drawn as one sheet ([`sheet`]). Absent until the diagram is first written
+    /// from a sheet, so every older diagram reads and writes as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_zone: Option<Point>,
+    /// The boards of their own this assembly places (sub-board zones, [`sheet`]). A
+    /// wiring diagram stores where each one's schematic is drawn on the sheet, by
+    /// occurrence, once it has been written from a sheet; a sheet holds each one with
+    /// its parts and nets, read-only. Never on a schematic.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zones: Vec<sheet::SheetZone>,
 }
 /// Current document format version.
 pub const DOCUMENT_VERSION: u32 = 4;
@@ -692,6 +742,8 @@ impl Default for Document {
             board: board::Board::default(),
             no_connects: vec![],
             power_flags: vec![],
+            board_zone: None,
+            zones: vec![],
         }
     }
 }
@@ -714,6 +766,12 @@ impl Document {
                 version: WIRING_DOCUMENT_VERSION,
                 kind,
                 title: "Untitled wiring diagram".into(),
+                ..Self::default()
+            },
+            DocumentKind::Sheet => Self {
+                version: sheet::SHEET_DOCUMENT_VERSION,
+                kind,
+                title: "Untitled sheet".into(),
                 ..Self::default()
             },
         }
@@ -751,6 +809,8 @@ impl Document {
             part: None,
             pads: None,
             gates: vec![],
+            pin_functions: Default::default(),
+            off_board: false,
         });
         self.components.last_mut().unwrap().sync_gates();
         let flags: Vec<_> = self
@@ -1078,9 +1138,17 @@ impl Document {
         for terminal in self.no_connects.iter_mut().chain(self.power_flags.iter_mut()) {
             rename(terminal);
         }
+        // And so does the function chosen for a pin.
+        if let Some(c) = self.components.iter_mut().find(|c| c.id == id) {
+            let functions = std::mem::take(&mut c.pin_functions);
+            c.pin_functions = functions
+                .into_iter()
+                .map(|(pin, function)| (renames.get(&pin).cloned().unwrap_or(pin), function))
+                .collect();
+        }
     }
     pub fn add_wire(&mut self, a: Point, b: Point) {
-        if self.kind == DocumentKind::Schematic
+        if self.kind != DocumentKind::Wiring
             && a != b
             && (a.x == b.x || a.y == b.y)
             && !self
@@ -1089,8 +1157,8 @@ impl Document {
                 .any(|w| (w.a == a && w.b == b) || (w.a == b && w.b == a))
         {
             let mut wire = Wire::new(a, b);
-            wire.start = self.terminal_at(a);
-            wire.end = self.terminal_at(b);
+            wire.start = self.net_terminal_at(a);
+            wire.end = self.net_terminal_at(b);
             self.wires.push(wire);
         }
     }
@@ -1099,6 +1167,7 @@ impl Document {
         if self.kind == DocumentKind::Wiring {
             return Err("A wiring diagram has no nets".into());
         }
+        self.net_reaches(&terminal)?;
         let name = name.trim();
         if name.is_empty() {
             return Err("Enter a net name".into());
@@ -1129,7 +1198,7 @@ impl Document {
     /// Move the tip; free wire endpoints follow, and direct pin contact is
     /// recomputed at the new location.
     pub fn transform_label(&mut self, id: Uuid, at: Point, rotation: u8) {
-        let terminal = self.terminal_at(at);
+        let terminal = self.net_terminal_at(at);
         let Some(label) = self.labels.iter_mut().find(|l| l.id == id) else {
             return;
         };
@@ -1162,6 +1231,10 @@ impl Document {
             .iter()
             .find(|p| p.number == terminal.pin)
             .map(|p| c.pin_at(p))
+    }
+    /// [`Document::terminal_at`], for a net: never a pin of a sheet's part off the board.
+    pub fn net_terminal_at(&self, at: Point) -> Option<Terminal> {
+        self.terminal_at(at).filter(|t| self.net_reaches(t).is_ok())
     }
     pub fn terminal_at(&self, at: Point) -> Option<Terminal> {
         self.components.iter().find_map(|c| {
@@ -1301,11 +1374,28 @@ impl Document {
         start: ConnectionTarget,
         end: ConnectionTarget,
     ) -> Option<Uuid> {
+        self.connect_targets_as(start, end, self.kind == DocumentKind::Wiring)
+    }
+    /// [`Document::connect_targets`] drawing a harness wire (`harness`) or a net.
+    /// Only a [`DocumentKind::Sheet`] holds both; the other kinds draw their own.
+    pub fn connect_targets_as(
+        &mut self,
+        start: ConnectionTarget,
+        end: ConnectionTarget,
+        harness: bool,
+    ) -> Option<Uuid> {
         if let (ConnectionTarget::Terminal(a), ConnectionTarget::Terminal(b)) = (&start, &end) {
-            return self.connect(a.clone(), b.clone());
+            return self.connect_as(a.clone(), b.clone(), harness);
         }
-        if self.kind == DocumentKind::Wiring {
+        if self.kind == DocumentKind::Wiring || (harness && self.kind == DocumentKind::Sheet) {
             return None; // Connections run pin to pin; there are no junctions.
+        }
+        for target in [&start, &end] {
+            if let ConnectionTarget::Terminal(t) = target
+                && self.net_reaches(t).is_err()
+            {
+                return None;
+            }
         }
         let a = self.target_position(&start)?;
         let b = self.target_position(&end)?;
@@ -1330,7 +1420,23 @@ impl Document {
         Some(id)
     }
     pub fn connect(&mut self, start: Terminal, end: Terminal) -> Option<Uuid> {
+        self.connect_as(start, end, self.kind == DocumentKind::Wiring)
+    }
+    /// [`Document::connect`] drawing a harness wire (`harness`) or a net. A schematic
+    /// draws only nets and a wiring diagram only harness wires, whatever is asked.
+    pub fn connect_as(&mut self, start: Terminal, end: Terminal, harness: bool) -> Option<Uuid> {
+        let harness = match self.kind {
+            DocumentKind::Schematic => false,
+            DocumentKind::Wiring => true,
+            DocumentKind::Sheet => harness,
+        };
         if start == end {
+            return None;
+        }
+        if !harness && (self.net_reaches(&start).is_err() || self.net_reaches(&end).is_err()) {
+            return None;
+        }
+        if harness && (self.harness_reaches(&start).is_err() || self.harness_reaches(&end).is_err()) {
             return None;
         }
         let a = self.terminal_position(&start)?;
@@ -1339,13 +1445,14 @@ impl Document {
             return None;
         }
         if self.wires.iter().any(|w| {
-            (w.start.as_ref() == Some(&start) && w.end.as_ref() == Some(&end))
-                || (w.start.as_ref() == Some(&end) && w.end.as_ref() == Some(&start))
+            self.is_harness(w) == harness
+                && ((w.start.as_ref() == Some(&start) && w.end.as_ref() == Some(&end))
+                    || (w.start.as_ref() == Some(&end) && w.end.as_ref() == Some(&start)))
         }) {
             return None;
         }
-        let wiring = self.kind == DocumentKind::Wiring;
-        if wiring && (self.attached_wire(&start).is_some() || self.attached_wire(&end).is_some()) {
+        let wiring = harness;
+        if wiring && (self.attached_harness_wire(&start).is_some() || self.attached_harness_wire(&end).is_some()) {
             return None;
         }
         let mut wire = Wire::new(a, b);
@@ -1365,10 +1472,19 @@ impl Document {
                 n += 1;
             }
             wire.connection_id = format!("W{n}");
+            wire.harness = self.kind == DocumentKind::Sheet;
         }
         let id = wire.id;
         self.wires.push(wire);
         Some(id)
+    }
+    /// The HARNESS wire with an end attached to this pin, if any: the connection a
+    /// harness pin takes one of. A net on the same pin is not one.
+    pub fn attached_harness_wire(&self, terminal: &Terminal) -> Option<&Wire> {
+        self.wires.iter().find(|w| {
+            self.is_harness(w)
+                && (w.start.as_ref() == Some(terminal) || w.end.as_ref() == Some(terminal))
+        })
     }
     /// The wire with an end attached to this pin, if any.
     pub fn attached_wire(&self, terminal: &Terminal) -> Option<&Wire> {
@@ -1397,6 +1513,7 @@ impl Document {
         let mut rows: Vec<_> = self
             .wires
             .iter()
+            .filter(|w| self.is_harness(w))
             .filter_map(|w| {
                 let (start, end) = (w.start.as_ref()?, w.end.as_ref()?);
                 Some(Connection {
@@ -1414,7 +1531,7 @@ impl Document {
     }
     /// The connection list as CSV: a header row, then one row per connection.
     pub fn connections_csv(&self) -> Result<String, String> {
-        if self.kind != DocumentKind::Wiring {
+        if self.kind == DocumentKind::Schematic {
             return Err("Only a wiring diagram has a connection list".into());
         }
         self.validate()?;
@@ -1467,11 +1584,13 @@ impl Document {
         draft.transform_component(id, at, rotation); // bind legacy endpoints before changing geometry
         let valid_terminal =
             |t: &Terminal| t.component != id || symbol.pins.iter().any(|p| p.number == t.pin);
-        if draft.kind == DocumentKind::Wiring {
+        {
             // A connection needs both of its pins; one that loses a pin goes with it.
+            let kind = draft.kind;
             draft.wires.retain(|w| {
-                w.start.as_ref().is_none_or(valid_terminal)
-                    && w.end.as_ref().is_none_or(valid_terminal)
+                !Self::harness_in(kind, w)
+                    || (w.start.as_ref().is_none_or(valid_terminal)
+                        && w.end.as_ref().is_none_or(valid_terminal))
             });
         }
         for wire in &mut draft.wires {
@@ -1491,6 +1610,11 @@ impl Document {
         draft.no_connects.retain(valid_terminal);
         draft.power_flags.retain(valid_terminal);
         let c = draft.components.iter_mut().find(|c| c.id == id).unwrap();
+        // A chosen function the new version still offers on that pin stays;
+        // the rest go, and those pins read their main names again.
+        c.pin_functions.retain(|number, function| {
+            symbol.pins.iter().any(|p| &p.number == number && p.alternates.contains(function))
+        });
         c.symbol = symbol;
         c.sync_gates();
         draft.transform_component(id, at, rotation);
@@ -1536,10 +1660,11 @@ impl Document {
             .wires
             .iter()
             .map(|w| {
-                (
-                    w.start.clone().or_else(|| self.terminal_at(w.a)),
-                    w.end.clone().or_else(|| self.terminal_at(w.b)),
-                )
+                // On a sheet a net's loose end never binds to a part off the board.
+                let at = |p: Point| {
+                    self.terminal_at(p).filter(|t| self.is_harness(w) || self.net_reaches(t).is_ok())
+                };
+                (w.start.clone().or_else(|| at(w.a)), w.end.clone().or_else(|| at(w.b)))
             })
             .collect();
         // Which way each flag's pin on this component points, before the turn.
@@ -1695,11 +1820,12 @@ impl Document {
             .retain(|l| !l.terminal.as_ref().is_some_and(|t| t.component == id));
         self.no_connects.retain(|t| t.component != id);
         self.power_flags.retain(|t| t.component != id);
-        if self.kind == DocumentKind::Wiring {
+        {
             // A connection needs both of its pins.
+            let kind = self.kind;
             let attached = |t: &Option<Terminal>| t.as_ref().is_some_and(|t| t.component == id);
             self.wires
-                .retain(|w| !attached(&w.start) && !attached(&w.end));
+                .retain(|w| !Self::harness_in(kind, w) || (!attached(&w.start) && !attached(&w.end)));
         }
         for w in &mut self.wires {
             if w.start.as_ref().is_some_and(|t| t.component == id) {
@@ -1739,6 +1865,7 @@ impl Document {
         let version = match self.kind {
             DocumentKind::Schematic => DOCUMENT_VERSION,
             DocumentKind::Wiring => WIRING_DOCUMENT_VERSION,
+            DocumentKind::Sheet => sheet::SHEET_DOCUMENT_VERSION,
         };
         if self.version != version {
             return Err(format!("Unsupported document version {}", self.version));
@@ -1846,6 +1973,15 @@ impl Document {
         if self.kind == DocumentKind::Wiring {
             self.validate_wiring()?;
         }
+        if self.kind == DocumentKind::Sheet {
+            self.validate_sheet()?;
+        } else if self.components.iter().any(|c| c.off_board) || self.wires.iter().any(|w| w.harness) {
+            return Err("Only a sheet marks parts off the board or wires as harness wires".into());
+        } else if self.kind == DocumentKind::Schematic && !self.zones.is_empty() {
+            return Err("A schematic places no sub-board zones".into());
+        } else if self.zones.iter().any(|z| !z.members.is_empty() || !z.nets.is_empty() || !z.declared.is_empty()) {
+            return Err("A wiring diagram stores only where each sub-board zone sits".into());
+        }
         self.board
             .validate(&self.components.iter().map(|c| c.id).collect())?;
         Ok(())
@@ -1879,13 +2015,22 @@ impl Document {
     /// Rebuild electrical equivalence classes. Interior crossings do not connect
     /// unless a junction, pin, or label is explicitly present there.
     pub fn netlist(&self) -> Netlist {
+        // A sub-board's nets are its own document's, and its net labels name its
+        // own nets, never this board's.
+        if !self.zones.is_empty() {
+            return self.without_zones().netlist();
+        }
+        // On a sheet, the nets are the board's: harness wires and parts off the
+        // board join none.
+        let wires: Vec<&Wire> = self.wires.iter().filter(|w| !self.is_harness(w) && self.zone_of_net(w.id).is_none()).collect();
+        let components: Vec<&Component> = self.components.iter().filter(|c| self.on_board(c)).collect();
         let mut points = BTreeSet::new();
-        for w in &self.wires {
+        for w in &wires {
             points.extend([w.a, w.b]);
         }
         points.extend(self.junctions.iter().copied());
         points.extend(self.labels.iter().map(|l| l.at));
-        for c in &self.components {
+        for c in &components {
             points.extend(c.symbol.pins.iter().map(|p| c.pin_at(p)));
         }
         let points: Vec<_> = points.into_iter().collect();
@@ -1902,7 +2047,7 @@ impl Document {
             let b = root(g, b);
             g[b] = a;
         }
-        for w in &self.wires {
+        for w in &wires {
             let a = index[&w.a];
             let path = w.points();
             for (i, p) in points.iter().enumerate() {
@@ -1930,7 +2075,7 @@ impl Document {
                 .labels
                 .insert(l.name.clone());
         }
-        for c in &self.components {
+        for c in &components {
             for p in &c.symbol.pins {
                 nets.get_mut(&root(&groups, index[&c.pin_at(p)]))
                     .unwrap()

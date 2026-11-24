@@ -154,7 +154,8 @@ impl<'a> SolidBuilder<'a> {
         if !switch!("BREP_STEP_SEAT_VERTICES_ON_CONICS", true) {
             return Ok(());
         }
-        let mut ends: HashMap<u64, (Vec<Vec3>, bool)> = HashMap::default();
+        // Per vertex: every incident end, and each end's conic flag.
+        let mut ends: HashMap<u64, Vec<(Vec3, bool)>> = HashMap::default();
         for edge in &self.edges {
             if edge.degenerate {
                 continue;
@@ -162,25 +163,63 @@ impl<'a> SolidBuilder<'a> {
             let conic = edge.curve.degree == 2
                 && edge.curve.control_points.iter().any(|control| (control.w - 1.0).abs() > 1e-12);
             for (vertex, t) in [(edge.start_vertex_id, edge.t0), (edge.end_vertex_id, edge.t1)] {
-                let entry = ends.entry(vertex).or_insert_with(|| (Vec::new(), false));
-                entry.0.push(edge.curve.evaluate(t)?);
-                entry.1 |= conic;
+                ends.entry(vertex).or_default().push((edge.curve.evaluate(t)?, conic));
             }
         }
+        let mean_of = |points: &mut dyn Iterator<Item = Vec3>| {
+            let (sum, count) = points.fold((Vec3::new(0.0, 0.0, 0.0), 0usize), |(sum, count), point| (sum.add(point), count + 1));
+            (count > 0).then(|| sum.scale(1.0 / count as f64))
+        };
         let mut moves = Vec::new();
+        // Vertices moved under the unstated-precision band, whose incident
+        // non-conic curves are re-healed onto the new point below.
+        let mut reseated: Vec<(u64, Vec3)> = Vec::new();
+        // A degenerate edge collapses onto its vertex's written point and is
+        // not re-healed, so a vertex carrying one is never reseated.
+        let collapsed: std::collections::HashSet<u64> =
+            self.edges.iter().filter(|edge| edge.degenerate).flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id]).collect();
         for vertex in &self.vertices {
-            let Some((points, any_conic)) = ends.get(&vertex.id) else { continue };
-            if !*any_conic || points.is_empty() {
+            let Some(points) = ends.get(&vertex.id) else { continue };
+            if !points.iter().any(|(_, conic)| *conic) {
                 continue;
             }
-            let mean = points
-                .iter()
-                .fold(Vec3::new(0.0, 0.0, 0.0), |sum, point| sum.add(*point))
-                .scale(1.0 / points.len() as f64);
-            let agree = points.iter().all(|point| point.sub(mean).length() <= crate::VERTEX_MATCH_FLOOR);
+            let Some(mean) = mean_of(&mut points.iter().map(|(point, _)| *point)) else { continue };
+            let agree = points.iter().all(|(point, _)| point.sub(mean).length() <= crate::VERTEX_MATCH_FLOOR);
             let miss = mean.sub(vertex.point).length();
             if agree && miss > crate::VERTEX_MATCH_FLOOR && miss <= VENDOR_ENDPOINT_HEAL_CEILING {
                 moves.push((vertex.id, mean, miss));
+                continue;
+            }
+            // UNSTATED PRECISION (`Resolver::unstated_identity_band`): in a file
+            // that states no usable precision, a vertex that misses its conics'
+            // common end by more than the floor but within the model-size band
+            // is seated on that end, the conics being exact and the rest of its
+            // curves healable: every other incident end must lie within the band
+            // of the vertex too, and is re-healed onto the seat below.
+            // abc_00000196 (an Onshape file stating 1e-17 m) writes both ends of an
+            // r 9.3 mm arc 8.17e-3 mm off the circle, between two lines that
+            // meet it there.
+            let conic_mean = mean_of(&mut points.iter().filter(|(_, conic)| *conic).map(|(point, _)| *point));
+            let Some(conic_mean) = conic_mean else { continue };
+            let conics_agree = points
+                .iter()
+                .filter(|(_, conic)| *conic)
+                .all(|(point, _)| point.sub(conic_mean).length() <= crate::VERTEX_MATCH_FLOOR);
+            let conic_miss = conic_mean.sub(vertex.point).length();
+            if !conics_agree || conic_miss <= crate::VERTEX_MATCH_FLOOR {
+                continue;
+            }
+            if collapsed.contains(&vertex.id) {
+                continue;
+            }
+            let Some(band) = self.resolver.unstated_identity_band() else { continue };
+            let others_near = points
+                .iter()
+                .filter(|(_, conic)| !*conic)
+                .all(|(point, _)| point.sub(vertex.point).length() <= band);
+            if conic_miss <= band && others_near {
+                moves.push((vertex.id, conic_mean, conic_miss));
+                reseated.push((vertex.id, vertex.point));
             }
         }
         for (id, point, miss) in moves {
@@ -190,6 +229,40 @@ impl<'a> SolidBuilder<'a> {
             if self.readings.is_some() {
                 for edge_id in self.edges.iter().filter(|e| e.start_vertex_id == id || e.end_vertex_id == id).map(|e| e.id).collect::<Vec<_>>() {
                     self.capture_stage(edge_id, || format!("its vertex seated on the conic ends ({miss:.3e})"));
+                }
+            }
+        }
+        // Re-heal each reseated vertex's other curves onto the seat. The seat
+        // stands only if every incident end then meets it within the floor;
+        // a heal its own guards decline (a closed curve, a gap past half the
+        // chord, a folding leg) undoes the seat and every curve it changed,
+        // so the vertex is left as written for validation to judge.
+        for (id, original) in reseated {
+            let mut changed: Vec<(usize, NurbsCurve)> = Vec::new();
+            for index in 0..self.edges.len() {
+                let edge = &self.edges[index];
+                if edge.degenerate || (edge.start_vertex_id != id && edge.end_vertex_id != id) {
+                    continue;
+                }
+                let (start, end) = (self.vertex_point(edge.start_vertex_id), self.vertex_point(edge.end_vertex_id));
+                let healed = heal_imported_edge_endpoints(&edge.curve, start, end)?;
+                changed.push((index, std::mem::replace(&mut self.edges[index].curve, healed)));
+            }
+            let seat = self.vertex_point(id);
+            let mut meets = true;
+            for edge in self.edges.iter().filter(|edge| edge.start_vertex_id == id || edge.end_vertex_id == id) {
+                for (vertex, t) in [(edge.start_vertex_id, edge.t0), (edge.end_vertex_id, edge.t1)] {
+                    if vertex == id && edge.curve.evaluate(t)?.sub(seat).length() > crate::VERTEX_MATCH_FLOOR {
+                        meets = false;
+                    }
+                }
+            }
+            if !meets {
+                for (index, curve) in changed {
+                    self.edges[index].curve = curve;
+                }
+                if let Some(vertex) = self.vertices.iter_mut().find(|vertex| vertex.id == id) {
+                    vertex.point = original;
                 }
             }
         }

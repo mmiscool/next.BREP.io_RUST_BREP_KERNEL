@@ -901,20 +901,13 @@ impl EngineState {
         serde_json::json!({ "welds": rows, "volume": total_volume, "mass": total_mass }).to_string()
     }
 
-    pub fn mass_properties_json(&self, name: Option<&str>, density: f64) -> String {
+    /// The solids a mass read measures, with their resident handles: a named solid (must be resident) or, for
+    /// the whole model, every scene solid that has resident geometry (draw order). `Err` is the reply's message.
+    fn mass_targets(&self, name: Option<&str>) -> Result<(HashMap<String, u32>, Vec<String>), String> {
         let handles = self.resident_solid_handles();
-
-        // Resolve the target solids: a named solid (must be resident) or, for the
-        // whole model, every scene solid that has resident geometry (draw order).
         let targets: Vec<String> = match name {
             Some(name) if handles.contains_key(name) => vec![name.to_string()],
-            Some(name) => {
-                return serde_json::json!({
-                    "ok": false,
-                    "message": format!("solid '{name}' has no resident geometry"),
-                })
-                .to_string();
-            }
+            Some(name) => return Err(format!("solid '{name}' has no resident geometry")),
             None => self
                 .scene
                 .solids()
@@ -924,8 +917,47 @@ impl EngineState {
                 .collect(),
         };
         if targets.is_empty() {
-            return serde_json::json!({ "ok": false, "message": "no solids" }).to_string();
+            return Err("no solids".to_string());
         }
+        Ok((handles, targets))
+    }
+
+    /// Volume and surface area only, of one solid or (summed) of all: the first sweep of
+    /// [`Self::mass_properties_json`] without the second-moment sweep, which costs as much again. Both
+    /// numbers are bit-identical to that reply's `volume` and `surfaceArea`.
+    pub fn volume_json(&self, name: Option<&str>) -> String {
+        let (handles, targets) = match self.mass_targets(name) {
+            Ok(found) => found,
+            Err(message) => return serde_json::json!({ "ok": false, "message": message }).to_string(),
+        };
+        let (mut volume, mut surface_area) = (0.0, 0.0);
+        for target in &targets {
+            match brep_kernel::mass_measures_handle_native(handles[target]) {
+                Ok(properties) => {
+                    volume += properties.volume;
+                    surface_area += properties.surface_area;
+                }
+                Err(error) => {
+                    return serde_json::json!({ "ok": false, "message": format!("{target}: {error}") }).to_string();
+                }
+            }
+        }
+        let target = if targets.len() == 1 { targets[0].clone() } else { "(whole model)".to_string() };
+        serde_json::json!({
+            "ok": true,
+            "target": target,
+            "solidCount": targets.len(),
+            "volume": volume,
+            "surfaceArea": surface_area,
+        })
+        .to_string()
+    }
+
+    pub fn mass_properties_json(&self, name: Option<&str>, density: f64) -> String {
+        let (handles, targets) = match self.mass_targets(name) {
+            Ok(found) => found,
+            Err(message) => return serde_json::json!({ "ok": false, "message": message }).to_string(),
+        };
 
         // Per-solid density mass properties straight from the kernel.
         let mut props = Vec::with_capacity(targets.len());

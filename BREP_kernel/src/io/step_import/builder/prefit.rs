@@ -49,6 +49,10 @@ struct CoedgeFit {
     ask: Result<crate::PcurveFit, String>,
     /// The floor refit, made exactly when the loop's trigger fires.
     floor: Option<Result<crate::PcurveFit, String>>,
+    /// `BREP_STEP_PREFIT_READINGS`: the trim readings of the fit the loop
+    /// keeps when no seam stitch or refine changes it (the floor refit when
+    /// its residual is the smaller, else the ask fit), with that fit.
+    reading: Option<(crate::PcurveFit, Result<super::loops::TrimRead, String>)>,
 }
 
 struct FaceFits {
@@ -63,6 +67,9 @@ struct Job {
     surface: NurbsSurface,
     tolerance: f64,
     coedges: Vec<(u64, bool, NurbsCurve, f64, f64)>,
+    /// The loop reads its trims (`BREP_STEP_PREFIT_READINGS` on and a
+    /// resolver or capture that takes them), so the helper reads them too.
+    readings: bool,
     /// The face's loops as the aliasing scan reads them, when the switch was
     /// on on the loop's thread; empty otherwise.
     loops: Vec<Vec<super::alias_verdicts::ScanCoedge>>,
@@ -84,7 +91,7 @@ impl Prefits {
 }
 
 fn fit_job(job: Job) -> FaceFits {
-    let Job { surface, tolerance, coedges, loops } = job;
+    let Job { surface, tolerance, coedges, readings, loops } = job;
     let fits = coedges
         .into_iter()
         .map(|(edge_id, forward, curve, t0, t1)| {
@@ -101,7 +108,18 @@ fn fit_job(job: Job) -> FaceFits {
                 }
                 _ => None,
             };
-            CoedgeFit { edge_id, forward, curve, t0, t1, tolerance, ask, floor }
+            // The fit `build_loop` keeps: the floor refit replaces the ask fit
+            // only on a strictly smaller residual (an error in either leaves
+            // the loop to report it).
+            let kept = match (&ask, &floor) {
+                (Ok(ask), None) => Some(ask),
+                (Ok(ask), Some(Ok(floor))) => Some(if floor.report.residual < ask.report.residual { floor } else { ask }),
+                _ => None,
+            };
+            let reading = kept.filter(|_| readings).map(|fit| {
+                (fit.clone(), super::loops::read_trim(&surface, &curve, t0, t1, forward, fit))
+            });
+            CoedgeFit { edge_id, forward, curve, t0, t1, tolerance, ask, floor, reading }
         })
         .collect();
     let unaliased = if loops.is_empty() { Vec::new() } else { super::alias_verdicts::helper_verdicts(&surface, loops) };
@@ -128,6 +146,7 @@ impl<'a> SolidBuilder<'a> {
         // `BREP_STEP_ALIAS_VERDICTS`, read here on the loop's thread; never
         // under the joint pass's trace, which runs every scan live.
         let verdicts = super::alias_verdicts::alias_verdicts_enabled() && std::env::var("BREP_DEBUG_PCURVE").is_err();
+        let readings = prefit_readings_enabled() && (self.resolver.trim_readings || self.readings.is_some());
         let mut jobs = Vec::with_capacity(pending.len());
         for face in pending {
             let mut coedges = Vec::new();
@@ -155,7 +174,7 @@ impl<'a> SolidBuilder<'a> {
                     );
                 }
             }
-            jobs.push(Job { surface: face.surface.clone(), tolerance: loop_pcurve_tolerance(&face.surface)?, coedges, loops });
+            jobs.push(Job { surface: face.surface.clone(), tolerance: loop_pcurve_tolerance(&face.surface)?, coedges, readings, loops });
         }
         let Some(slots) = crate::claim_slots::ClaimSlots::spawn(jobs, fit_job) else {
             return Ok(None);
@@ -177,7 +196,7 @@ impl Prefits {
         let stats = STATS.with(|stats| stats.take());
         if crate::profile::profile_enabled() {
             profile_line!(
-                "step_import.prefit shell=#{shell_ref} faces={} check={} taken={} claimed={} hits={} misses={} unused={} disagree={} hit_fit_ms={:.2}",
+                "step_import.prefit shell=#{shell_ref} faces={} check={} taken={} claimed={} hits={} misses={} unused={} disagree={} hit_fit_ms={:.2} reading_hits={} reading_disagree={}",
                 self.slots.len(),
                 u8::from(self.check),
                 self.slots.taken,
@@ -186,7 +205,9 @@ impl Prefits {
                 stats.misses,
                 stats.unused,
                 stats.disagree,
-                stats.hit_fit_ms
+                stats.hit_fit_ms,
+                stats.reading_hits,
+                stats.reading_disagree
             );
         }
     }
@@ -199,6 +220,9 @@ struct Stats {
     unused: usize,
     disagree: usize,
     hit_fit_ms: f64,
+    /// Trim readings taken from a helper, and (under `check`) found to differ.
+    reading_hits: usize,
+    reading_disagree: usize,
 }
 
 thread_local! {
@@ -321,6 +345,64 @@ pub(super) fn fit_range(
         stats.hits += 1;
         stats.hit_fit_ms += elapsed;
         stats.disagree += usize::from(!agrees);
+    });
+    computed
+}
+
+/// `BREP_STEP_PREFIT_READINGS` (default on; `=0` reads every trim on the
+/// loop's thread): a prefit helper also reads the trim it fitted
+/// ([`super::loops::read_trim`]), so the loop's report block takes the reading
+/// instead of making it. With the fits moved onto helpers, these reads were
+/// the largest part of a 496-face SolidWorks part's face loop left on one
+/// thread (13.7 of 25.8 s, mostly `image_to_foot`'s 1025 global projections
+/// per trim off its bar). A reading is taken only for the very fit the loop
+/// keeps, compared bit for bit, so it is the reading the loop would make;
+/// under `BREP_STEP_PREFIT=check` the loop reads every trim itself and counts
+/// any difference (`reading_disagree`).
+fn prefit_readings_enabled() -> bool {
+    crate::switch!("BREP_STEP_PREFIT_READINGS", true)
+}
+
+/// [`super::loops::read_trim`] of `fit` as the trim of `edge` in sense
+/// `forward` on `surface`: from the face's offered readings when a helper read
+/// this fit for these inputs (every bit the same), else read here.
+pub(super) fn read_trim_range(
+    surface: &NurbsSurface,
+    edge: &EdgeRecord,
+    forward: bool,
+    fit: &crate::PcurveFit,
+) -> Result<super::loops::TrimRead, String> {
+    let fresh = || super::loops::read_trim(surface, &edge.curve, edge.t0, edge.t1, forward, fit);
+    let offered = OFFERED.with(|cell| {
+        let cell = cell.borrow();
+        let (fits, _, check) = cell.as_ref()?;
+        if !same_surface(&fits.surface, surface) {
+            return None;
+        }
+        let coedge = fits.coedges.iter().find(|coedge| {
+            coedge.edge_id == edge.id
+                && coedge.forward == forward
+                && coedge.t0.to_bits() == edge.t0.to_bits()
+                && coedge.t1.to_bits() == edge.t1.to_bits()
+                && same_curve(&coedge.curve, &edge.curve)
+        })?;
+        let (read_fit, reading) = coedge.reading.as_ref()?;
+        let same = same_curve(&read_fit.curve, &fit.curve) && format!("{:?}", read_fit.report) == format!("{:?}", fit.report);
+        same.then(|| (reading.clone(), *check))
+    });
+    let Some((reading, check)) = offered else {
+        return fresh();
+    };
+    if !check {
+        STATS.with(|stats| stats.borrow_mut().reading_hits += 1);
+        return reading;
+    }
+    let computed = fresh();
+    let agrees = format!("{reading:?}") == format!("{computed:?}");
+    STATS.with(|stats| {
+        let mut stats = stats.borrow_mut();
+        stats.reading_hits += 1;
+        stats.reading_disagree += usize::from(!agrees);
     });
     computed
 }

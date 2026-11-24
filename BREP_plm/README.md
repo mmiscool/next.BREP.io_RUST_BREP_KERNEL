@@ -1,5 +1,7 @@
 # BREP_plm — a PLM server for the BREP CAD application
 
+Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_plm` · [licence summary](#licence)
+
 `BREP_plm` is a self-hosted product lifecycle management server: parts with
 part numbers as their database keys, revisions with a lifecycle,
 explicit checkout, bills of materials, configurable workflows and review, over one
@@ -198,9 +200,14 @@ This needs `tokio` (with `macros` and `rt-multi-thread`) and `axum` 0.7 beside
 
 ## Licence
 
-The Autodrop3d licence in `LICENSE.md`, shipped in the crate (`license-file`
-in the manifest). It is not an SPDX licence: read it before you modify or
-redistribute the crate.
+In plain words: the crates are free to use as they are, including in a commercial project. If you
+fix or change something in the kernel, send the change back as a pull request to
+[github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL). If you do not want to share your
+changes, buy a commercial licence from [Autodrop3d LLC](https://autodrop3d.com); with it you never
+have to share your code back.
+
+The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the manifest) and at
+[LICENSE.md](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL/blob/master/LICENSE.md); if this summary and the file ever differ, the file wins.
 
 Administrators can use **Administration → Setup wizard** to configure numbering,
 catalog taxonomy, accounts and lifecycle labels, with optional KiCad symbols, linked footprints and STEP models in KiCad’s

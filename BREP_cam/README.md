@@ -1,5 +1,7 @@
 # BREP_cam
 
+Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_cam` · [licence summary](#licence)
+
 `BREP_cam` is the CAM engine of the BREP CAD kernel. Its Rust library target is
 `brep_cam`. It is pure Rust and builds for native targets and for
 `wasm32-unknown-unknown`, so the same code generates toolpaths in the desktop
@@ -93,3 +95,14 @@ cargo build --manifest-path BREP_cam/Cargo.toml
 The public package contains production sources, the built-in posts
 (`posts/`), the technology table (`data/`), the manifest, README, and
 license.
+
+## Licence
+
+In plain words: the crates are free to use as they are, including in a commercial project. If you
+fix or change something in the kernel, send the change back as a pull request to
+[github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL). If you do not want to share your
+changes, buy a commercial licence from [Autodrop3d LLC](https://autodrop3d.com); with it you never
+have to share your code back.
+
+The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the manifest) and at
+[LICENSE.md](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL/blob/master/LICENSE.md); if this summary and the file ever differ, the file wins.

@@ -409,7 +409,7 @@ fn posed_payload(base: &DisplaySolidPayload, pose: &RigidPose, solid: &BrepSolid
 }
 
 /// The display payload of one solid; see [`display_payload_handle_native`].
-fn display_payload_of_solid(solid: &BrepSolid, lod_factor: f64) -> Result<DisplaySolidPayload, String> {
+pub(crate) fn display_payload_of_solid(solid: &BrepSolid, lod_factor: f64) -> Result<DisplaySolidPayload, String> {
     let chord = display_chord_tolerance(solid, lod_factor);
     let mesh = tessellate_brep_watertight(solid, chord)?;
     let mut faces = Vec::new();

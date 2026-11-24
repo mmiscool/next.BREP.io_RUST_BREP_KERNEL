@@ -1,7 +1,9 @@
 # BREP_app
 
+Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_app` · [licence summary](#licence)
+
 The BREP CAD application: one Rust egui/wgpu codebase for native desktop and
-WebAssembly. Package `BREP_app`, library `brep_app`, version 0.28.0.
+WebAssembly. Package `BREP_app`, library `brep_app`, version 0.29.0.
 The 3D engine is `BREP_render`; geometry comes from `BREP_kernel`.
 
 ## Build and run
@@ -194,3 +196,14 @@ downloads as exports) and registered as
 `LICENSE.md` (the Autodrop3d licence, `license-file` in the manifest) and
 `THIRD-PARTY-NOTICES.md`, which covers the four bundled font faces; a native
 binary distributed on its own needs both files beside it.
+
+## Licence
+
+In plain words: the crates are free to use as they are, including in a commercial project. If you
+fix or change something in the kernel, send the change back as a pull request to
+[github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL). If you do not want to share your
+changes, buy a commercial licence from [Autodrop3d LLC](https://autodrop3d.com); with it you never
+have to share your code back.
+
+The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the manifest) and at
+[LICENSE.md](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL/blob/master/LICENSE.md); if this summary and the file ever differ, the file wins.

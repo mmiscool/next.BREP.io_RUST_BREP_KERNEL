@@ -88,7 +88,7 @@ impl Plane {
     }
 }
 
-/// `BREP_OFFSET_SPHERE_CUT_CLOSED_VOLUME` (default on since the tier P
+/// `BREP_OFFSET_SPHERE_CUT_CLOSED_VOLUME` (default on since the
 /// promotion of 2026-11-20; `=0` restores the integrals): the hull's and the
 /// cavity's volumes read in closed form ([`ball_cut_volume`]) when their caps
 /// are disjoint, each integral run only when the closed form does not agree,

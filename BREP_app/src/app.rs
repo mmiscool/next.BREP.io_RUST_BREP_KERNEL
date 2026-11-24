@@ -93,6 +93,9 @@ pub struct BrepApp {
     /// recipe) — a reusable modal file dialog opened from the toolbar.
     file: FileDialog,
     stl_import: Option<crate::panels::stl_import::StlImportPreview>,
+    /// Automation only: every mesh import preview, open or opened later, holds
+    /// its runner replies while set (`import_preview_hold`).
+    hold_mesh_preview: bool,
     /// The "Submit Bug" flow: on the toolbar bug button it screenshots the app
     /// (UI + 3D model) BEFORE its own dialog opens, then collects a description
     /// (+ optional email) and POSTs the model + screenshot to the public reports
@@ -704,10 +707,22 @@ impl BrepApp {
     }
 
     fn start_mesh_preview(&mut self, format: brep_render::runner::MeshImportFormat, name: String, bytes: Vec<u8>) {
-        self.stl_import = Some(crate::panels::stl_import::StlImportPreview::new(
+        let mut preview = crate::panels::stl_import::StlImportPreview::new(
             self.docs.active_id(), format, name, bytes, self.docs.spawn_engine(),
-        ));
+        );
+        preview.hold = self.hold_mesh_preview;
+        self.stl_import = Some(preview);
         self.viewport.forget_document();
+    }
+
+    /// Hold (or release) the mesh import preview's runner replies, for the
+    /// open preview and any opened later. Answers whether one is open.
+    pub(crate) fn set_mesh_preview_hold(&mut self, hold: bool) -> bool {
+        self.hold_mesh_preview = hold;
+        if let Some(preview) = self.stl_import.as_mut() {
+            preview.hold = hold;
+        }
+        self.stl_import.is_some()
     }
 
     /// Whether the mesh import preview is open.
@@ -861,6 +876,7 @@ impl BrepApp {
             model_store,
             file,
             stl_import: None,
+            hold_mesh_preview: false,
             bug_report: BugReportPanel::new(),
             info: crate::panels::info::InfoPanel::new(),
             diagnostics,
@@ -2399,8 +2415,12 @@ impl eframe::App for BrepApp {
             let workbench = doc.engine.settings.workbench.clone();
             doc.ecad.pin_view(&workbench);
         }
+        // A sheet's "Edit this board": that board becomes the Work part.
+        crate::panels::ecad_parts::enter_requested_boards(&mut self.docs);
         // A sheet's Duplicate past the last offered occurrence: another assembly component.
         crate::panels::ecad_parts::answer_duplicate_requests(self.docs.active_mut());
+        // The board's checks that read the parts' 3D models (pins on their pads).
+        crate::panels::ecad_parts::answer_board_checks(self.docs.active_mut());
         let requests = crate::panels::ecad_parts::take_open_requests(self.docs.active_mut());
         for key in requests {
             self.file.open_document(&mut self.docs, self.model_store.as_ref(), &key);

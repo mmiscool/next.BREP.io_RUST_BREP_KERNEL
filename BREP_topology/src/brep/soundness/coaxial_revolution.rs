@@ -1,5 +1,5 @@
 //! Coaxial revolution certificate (`BREP_SOUNDNESS_COAXIAL_REVOLUTION`, default
-//! on since the tier P promotion of 2026-11-20, `=0` restores the full scan;
+//! on since the promotion of 2026-11-20, `=0` restores the full scan;
 //! `BREP_SOUNDNESS_COAXIAL_REVOLUTION_CHECK=1` runs the full scan as well,
 //! returns ITS report, and says so on stderr when the scan flags a body the
 //! certificate passed).

@@ -477,6 +477,12 @@ const WELD_FRACTION: f64 = 1e-9;
 /// by orders of magnitude and the constant is a floor, not a threshold.
 const FOLD_TRANSVERSAL_SINE: f64 = 1e-6;
 
+/// `BREP_FOLD_ANALYTIC_EXEMPT` (default on; `=0` restores): see ANALYTIC
+/// CARRIERS DO NOT FOLD in [`confirm_fold`].
+fn fold_analytic_exempt_enabled() -> bool {
+    crate::switch!("BREP_FOLD_ANALYTIC_EXEMPT", true)
+}
+
 /// `BREP_FOLD_TRACE=1` prints why each same-face candidate was confirmed,
 /// rejected or left undecided, with the numbers behind the verdict. The
 /// attribution a population sweep needs — "which rule turned this hit away,
@@ -1773,6 +1779,28 @@ pub fn confirm_fold(
         fold_trace!("fold face {}: domain/closedness unreadable", face.id);
         return FoldVerdict::Undecided;
     };
+    // ANALYTIC CARRIERS DO NOT FOLD (`BREP_FOLD_ANALYTIC_EXEMPT`, default on,
+    // =0 restores): a recognized plane, cylinder, cone not crossing its axis,
+    // sphere or ring torus carries its parameter period one to one onto its
+    // surface, its poles and seam aside, so two distinct trimmed feet on it
+    // are two points. A spindle torus (tube radius at least the axis radius),
+    // a cone through its apex and a general revolution can pass through
+    // themselves and are still read. The
+    // confirmation reads both feet against the crossing point within the
+    // mesh's chord band, and on a carrier bent tighter than that band two feet
+    // on one wall pass it: a rod of radius 5.9e-3 through a 9 mm box, cut
+    // obliquely, had its wall read as a face folding through itself (feet 30
+    // degrees round the wall, 2.9e-3 apart, band 1.4e-2).
+    let one_to_one = |carrier: &crate::AnalyticSurface| match carrier {
+        crate::AnalyticSurface::Plane { .. } | crate::AnalyticSurface::Sphere { .. } => true,
+        crate::AnalyticSurface::RuledRevolution { rho0, rho1, .. } => rho0 * rho1 > 0.0 || (*rho0 == 0.0) != (*rho1 == 0.0),
+        crate::AnalyticSurface::Torus { major_radius, minor_radius, .. } => minor_radius.abs() < major_radius.abs(),
+        _ => false,
+    };
+    if fold_analytic_exempt_enabled() && surface.analytic().is_some_and(one_to_one) {
+        fold_trace!("fold face {}: an analytic carrier, one to one on its period: not a fold", face.id);
+        return FoldVerdict::Rejected;
+    }
     let span_u = domain_u[1] - domain_u[0];
     let span_v = domain_v[1] - domain_v[0];
     let period = [closed_u.then_some(span_u), closed_v.then_some(span_v)];
@@ -2914,6 +2942,11 @@ struct Chain {
     owner: Vec<usize>,
     /// End minus start — zero, or a whole number of periods.
     wind: Vec2,
+    /// The chords the loop has with every pcurve at the classifier's full
+    /// density, point pcurves included: whether the loop is scanned (and
+    /// counted) at all is decided on this, so lifting a point once never
+    /// drops a loop from the report.
+    dense: usize,
 }
 
 impl Chain {
@@ -3288,10 +3321,36 @@ fn period_shift(point: Vec2, target: Vec2, period: [Option<f64>; 2]) -> Vec2 {
 /// itself. Deciding it per SAMPLE (which is what `validate()`'s uv-wire
 /// warning does) takes any genuine chord longer than half a period the short
 /// way round instead.
-fn lift_loop(loop_record: &LoopRecord, period: [Option<f64>; 2]) -> Result<Chain, String> {
+/// `BREP_LOOP_SCAN_POINT_PCURVE` (default on; `=0` restores; `check` scans
+/// both ways and stops unless the crossings and unreadable loops agree): a
+/// pcurve that is one point (every control point within 1e-12 of the first) is lifted
+/// as that one point, not as `trim_sample_count` copies of it (see
+/// [`is_one_point`]); a loop is scanned and counted on its full-density
+/// chord count either way. A short edge
+/// normal to its plane projects to a point, and its reconciled pcurve kept
+/// some 2000 spans: 8160 coincident samples, whose zero-length chords all
+/// overlap, so the sweep offered 33 million pairs from one coedge (a 92-face
+/// import's scan, 7.7 s). The loop's polygon loses only the copies.
+fn point_pcurves_once_mode() -> crate::env_read::Mode {
+    crate::mode_switch!("BREP_LOOP_SCAN_POINT_PCURVE", true)
+}
+
+/// Whether every control point of `curve` is the first one to within 1e-12 of
+/// its size: a pcurve whose every point lies that close to one point (the
+/// curve stays inside its control points' hull), which a reconciled
+/// projection leaves at rounding apart, never at a distance the scan's weld
+/// band (a fraction of the face's domain) could tell from one point.
+fn is_one_point(curve: &NurbsCurve) -> bool {
+    let Some(first) = curve.control_points.first().and_then(|p| p.point().ok()) else { return false };
+    let band = 1e-12 * (1.0 + first.x.abs() + first.y.abs());
+    curve.control_points.iter().all(|p| p.point().is_ok_and(|q| (q.x - first.x).abs() <= band && (q.y - first.y).abs() <= band))
+}
+
+fn lift_loop(loop_record: &LoopRecord, period: [Option<f64>; 2], point_once: bool) -> Result<Chain, String> {
     let mut points: Vec<Vec2> = Vec::new();
     let mut owner: Vec<usize> = Vec::new();
     let mut previous_end: Option<Vec2> = None;
+    let mut dense = 0;
     for (index, coedge) in loop_record.coedges.iter().enumerate() {
         let curve = &coedge.pcurve;
         let [start, end] = curve.domain()?;
@@ -3306,7 +3365,9 @@ fn lift_loop(loop_record: &LoopRecord, period: [Option<f64>; 2]) -> Result<Chain
             Some(target) => period_shift(at(start)?, target, period),
             None => Vec2 { x: 0.0, y: 0.0 },
         };
-        let samples = crate::classification::trim_sample_count(curve);
+        let full = crate::classification::trim_sample_count(curve);
+        dense += full;
+        let samples = if point_once && is_one_point(curve) { 1 } else { full };
         for sample in 0..samples {
             let parameter = start + (end - start) * sample as f64 / samples as f64;
             points.push(at(parameter)?.add(shift));
@@ -3325,6 +3386,7 @@ fn lift_loop(loop_record: &LoopRecord, period: [Option<f64>; 2]) -> Result<Chain
         points,
         owner,
         wind,
+        dense,
     })
 }
 
@@ -3350,6 +3412,24 @@ fn lift_loop(loop_record: &LoopRecord, period: [Option<f64>; 2]) -> Result<Chain
 /// cross. Nothing in the kernel's build path calls this; the blend acceptance
 /// and the case gate are its callers.
 pub fn loop_self_crossings(solid: &BrepSolid) -> LoopCrossingReport {
+    match point_pcurves_once_mode() {
+        crate::env_read::Mode::Off => loop_self_crossings_lifted(solid, false),
+        crate::env_read::Mode::On => loop_self_crossings_lifted(solid, true),
+        crate::env_read::Mode::Check => {
+            let (once, every) = (loop_self_crossings_lifted(solid, true), loop_self_crossings_lifted(solid, false));
+            assert_eq!(
+                (format!("{:?}", once.crossings), &once.unreadable, once.loops),
+                (format!("{:?}", every.crossings), &every.unreadable, every.loops),
+                "BREP_LOOP_SCAN_POINT_PCURVE=check: lifting point pcurves once changed the scan"
+            );
+            once
+        }
+    }
+}
+
+/// [`loop_self_crossings`], each point pcurve lifted once (`point_once`) or at
+/// the classifier's full density.
+fn loop_self_crossings_lifted(solid: &BrepSolid, point_once: bool) -> LoopCrossingReport {
     let mut report = LoopCrossingReport {
         loops: 0,
         chords: 0,
@@ -3386,7 +3466,7 @@ pub fn loop_self_crossings(solid: &BrepSolid) -> LoopCrossingReport {
         // domain is as likely to be [0, 1] as [0, 2π].
         let weld = UV_WELD_FRACTION * (span_u.abs() + span_v.abs()).max(1.0);
         for loop_record in &face.loops {
-            let chain = match lift_loop(loop_record, period) {
+            let chain = match lift_loop(loop_record, period, point_once) {
                 Ok(chain) => chain,
                 Err(message) => {
                     report.unreadable.push(format!(
@@ -3397,11 +3477,16 @@ pub fn loop_self_crossings(solid: &BrepSolid) -> LoopCrossingReport {
                 }
             };
             let count = chain.chords();
-            if count < 4 {
+            if chain.dense < 4 {
                 continue;
             }
             report.loops += 1;
             report.chords += count;
+            // Under 4 chords only when every pcurve is one point (a real one
+            // keeps at least 4): one place, which cannot cross itself.
+            if count < 4 {
+                continue;
+            }
             let chords: Vec<Chord> = (0..count).map(|index| chain.chord(index)).collect();
 
             let mut seen: HashSet<(usize, usize)> = HashSet::default();

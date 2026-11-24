@@ -26,7 +26,7 @@
 use super::*;
 use crate::env_read::Mode;
 
-/// `BREP_MASS_SPHERE_CAPS`: `1|on` (default since the 2026-11-20 tier-P
+/// `BREP_MASS_SPHERE_CAPS`: `1|on` (default since the 2026-11-20
 /// promotion) returns the closed form; `check` reads both, prints the
 /// comparison and returns the trimmed reading; `0|off` keeps the trimmed
 /// route.

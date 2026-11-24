@@ -845,7 +845,31 @@ impl BrepSolid {
     /// locus between the same endpoint vertices (OCC wall-split rims). Each
     /// such pair contributes a single locus to the cell complex, so Euler
     /// accounting credits it once.
+    ///
+    /// A pair that is the WHOLE loop of a face is not one locus counted
+    /// twice: the face between the two edges is a cell of the complex (a lens
+    /// sliver), and the plain count already holds it. ABC 00000702's torus
+    /// face 449 is bounded by two arcs 1.1e-5 apart (u 0.999999 and 1.0 in its
+    /// chart) with faces 545 and 473 meeting across it. The credit, read at
+    /// 1e-6 x (1 + |p|) = 1.2e-3 so far from the origin, took the arcs for one
+    /// locus and turned the solid's characteristic -8 (genus 5) into an
+    /// impossible -7, so two of the file's 29 solids failed validation
+    /// (`BREP_EULER_LENS_PAIR=0` credits such pairs as before).
     pub fn coincident_parallel_edge_pairs(&self) -> usize {
+        let lens_loops: std::collections::HashSet<(u64, u64)> = if switch!("BREP_EULER_LENS_PAIR", true) {
+            self.shells
+                .iter()
+                .flat_map(|shell| &shell.faces)
+                .flat_map(|face| &face.loops)
+                .filter(|record| record.coedges.len() == 2 && record.coedges[0].edge_id != record.coedges[1].edge_id)
+                .map(|record| {
+                    let (a, b) = (record.coedges[0].edge_id, record.coedges[1].edge_id);
+                    (a.min(b), a.max(b))
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
         let candidates: Vec<&EdgeRecord> =
             self.edges.iter().filter(|edge| !edge.degenerate).collect();
         let mut consumed = vec![false; candidates.len()];
@@ -865,6 +889,9 @@ impl BrepSolid {
                     || (first.start_vertex_id == second.end_vertex_id
                         && first.end_vertex_id == second.start_vertex_id);
                 if !endpoints_match {
+                    continue;
+                }
+                if lens_loops.contains(&(first.id.min(second.id), first.id.max(second.id))) {
                     continue;
                 }
                 // Locus agreement at interior samples, direction-agnostic.
@@ -1061,6 +1088,7 @@ fn retain_coedge_reading(key: Vec<u64>, value: f64) {
 // returns exactly what re-reading would. A boolean validates its result three
 // times (assembly, face merge, the closing check) and most coedges arrive at
 // the later two unchanged.
+
 
 
 /// The active memo's lifetime: one operation. Nested scopes share the outer

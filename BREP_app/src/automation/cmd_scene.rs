@@ -56,6 +56,14 @@ fn one() -> f64 {
     1.0
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeArgs {
+    /// A solid name; omitted = every resident solid (summed).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// Surface point → viewport-local point (what the engine's pickers take).
 fn local(ctx: &Ctx<'_>, x: f32, y: f32) -> Result<(f64, f64), String> {
     let r = ctx.app.viewport.last_rect().ok_or("the 3D viewport was not drawn last frame")?;
@@ -554,6 +562,22 @@ fn weld_list_result_schema() -> Value {
         "required":["welds","volume","mass"],"additionalProperties":false})
 }
 
+fn volume_result_schema() -> Value {
+    json!({"type":"object","properties":{
+        "ok":{"const":true},"target":{"type":"string"},"solidCount":{"type":"integer","minimum":1},
+        "volume":{"type":"number"},"surfaceArea":{"type":"number"}
+    },"required":["ok","target","solidCount","volume","surfaceArea"],"additionalProperties":false})
+}
+
+fn volume(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: VolumeArgs = parse_args(args)?;
+    let v = parse(&ctx.app.docs.engine().volume_json(a.name.as_deref()));
+    if v.get("ok") == Some(&Value::Bool(false)) {
+        return Err(v.get("message").and_then(Value::as_str).unwrap_or("volume unavailable").to_string());
+    }
+    Ok(Outcome::Done(v))
+}
+
 fn mass_properties(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: MassArgs = parse_args(args)?;
     let v = parse(&ctx.app.docs.engine().mass_properties_json(a.name.as_deref(), a.density));
@@ -575,6 +599,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     app_command!("scene", "set_visible", "Show or hide a scene entity by name.", VisibleArgs, set_visible, Mutate, MUTATE_NOWAIT),
     app_command!("scene", "locate", "Where an entity is on the surface, in egui points: a face's triangle centroid, an edge's ARC-LENGTH midpoint, a vertex (by topoId), a solid's bbox centre — projected through the camera. A committed SKETCH is reached as `kind: \"solid\"` under its feature id; one with no mesh (an open chain, a points-only hole placement, a Helix) anchors on the midpoint of its longest edge, or on its first point. `under` is the ranked candidate list a DWELL there would open, filtered the way the viewport filters it; `rank` is this entity's place in that list. What a REGULAR click takes is `takes` — the nearest admitted candidate by depth, which is also what the hover highlight lights — and `reaches` says whether that is this entity; `occluded_by` is what the click would take instead. (A reference field's picker is unchanged and still takes the list's top candidate, so `takes` is that while one is open.) The list resolves a part to its OWNING SOLID where the filter admits only solids, so a face of a cylinder ranks 0 when the cylinder does. The bridge from a reference name to a pointer click, which `click_entity` and `drag_entity` spend.", LocateArgs, locate, Read, READ, locate_result_schema),
     app_command!("scene", "model_inspect", "The model summary: `solidCount`, `valid` (every solid passed the kernel's topology validation and measured), total `volumeMm3`, overall `boundsMm` {min, max} as {x, y, z}, `warnings`, and per solid {name, valid, issues, volumeMm3, boundsMm}. Null where the kernel could not give a number, with a warning; never an estimate.", NoArgs, model_inspect, Read, READ, model_inspect_result_schema),
+    app_command!("scene", "volume", "Volume and surface area of one solid or of all (summed) and nothing else: bit-identical to `mass_properties`' `volume` and `surfaceArea`, at about half its cost (no centroid, inertia or principal moments). For a check that reads only the volume.", VolumeArgs, volume, Read, READ, volume_result_schema),
     app_command!("scene", "mass_properties", "Volume, surface area, mass, centroid, inertia and principal moments of one solid or of all — the closed-form check for an example model.", MassArgs, mass_properties, Read, READ, mass_properties_result_schema),
     app_command!("scene", "weld_list", "Every weld in the history: its kind, size and run (as its weld symbol states them), seam length, and weld metal bodies, volume and mass (each bead's density) - the weld list for BOM and instructions.", NoArgs, weld_list, Read, READ, weld_list_result_schema),
 ];

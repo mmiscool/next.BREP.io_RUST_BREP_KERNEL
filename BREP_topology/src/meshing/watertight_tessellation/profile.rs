@@ -119,6 +119,7 @@ pub(in crate::watertight_tessellation) enum Route {
     FullBiperiodic = 15,
     PointedCone = 16,
     NurbsRectangle = 17,
+    RuledBand = 18,
 }
 
 impl Route {
@@ -142,6 +143,7 @@ impl Route {
             15 => "full_biperiodic",
             16 => "pointed_cone",
             17 => "nurbs_rectangle",
+            18 => "ruled_band",
             _ => "?",
         }
     }

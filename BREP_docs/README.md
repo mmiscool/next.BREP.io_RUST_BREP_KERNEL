@@ -1,5 +1,7 @@
 # BREP_docs — the help-site generator for the BREP CAD application
 
+Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo install BREP_docs` · [licence summary](#licence)
+
 `BREP_docs` builds the BREP CAD application's in-app help: it renders a BREP
 source tree's user documentation from Markdown into a static, searchable HTML
 site that the application opens from its toolbar and that any static web
@@ -48,6 +50,11 @@ None.
 
 ## Licence
 
-The Autodrop3d licence in `LICENSE.md`, shipped in the crate (`license-file`
-in the manifest). It is not an SPDX licence: read it before you modify or
-redistribute the crate.
+In plain words: the crates are free to use as they are, including in a commercial project. If you
+fix or change something in the kernel, send the change back as a pull request to
+[github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL). If you do not want to share your
+changes, buy a commercial licence from [Autodrop3d LLC](https://autodrop3d.com); with it you never
+have to share your code back.
+
+The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the manifest) and at
+[LICENSE.md](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL/blob/master/LICENSE.md); if this summary and the file ever differ, the file wins.

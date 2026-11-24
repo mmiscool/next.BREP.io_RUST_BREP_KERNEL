@@ -673,6 +673,18 @@ fn closed_partial_enabled() -> bool {
     switch!("BREP_FRAGMENT_CLOSED_PARTIAL", true)
 }
 
+/// `BREP_FRAGMENT_CLOSED_PARTIAL_EXACT_ENDS` (default on; `=0` restores the
+/// snap): see CLOSED PARTIAL EXACT ENDS in the loop builder.
+fn closed_partial_exact_ends_enabled() -> bool {
+    switch!("BREP_FRAGMENT_CLOSED_PARTIAL_EXACT_ENDS", true)
+}
+
+/// `BREP_FRAGMENT_CLOSED_PARTIAL_ORDER` (default on; `=0` restores the
+/// reversal): see CLOSED PARTIAL ORDER in the loop builder.
+fn closed_partial_order_enabled() -> bool {
+    switch!("BREP_FRAGMENT_CLOSED_PARTIAL_ORDER", true)
+}
+
 
 fn build_loop_uses<U: LoopUse>(
     mut uses: Vec<U>,
@@ -887,8 +899,17 @@ fn build_loop_uses<U: LoopUse>(
                         // Which of this arc's ends are run ends (not the seam).
                         let snap_low = if forward { arc_index == 0 } else { arc_index + 1 == arc_count };
                         let snap_high = if forward { arc_index + 1 == arc_count } else { arc_index == 0 };
+                        // CLOSED PARTIAL EXACT ENDS (`BREP_FRAGMENT_CLOSED_PARTIAL_EXACT_ENDS`,
+                        // default on, =0 restores the snap): the arc is cut from its
+                        // carrier at the run ends' projections, so it already ends
+                        // on the carrier within a chord's sag of the run end, and the
+                        // assembler welds its neighbours there. Moving an end pole
+                        // onto the run end deforms an exact rational arc: on a plate
+                        // less a grid of overlapping holes the lens arcs moved the
+                        // volume by 4e-6 of itself and the area by twice the 1e-7 bar.
+                        let snap_ends = !closed_partial_exact_ends_enabled();
                         for (snap, uv, at_start) in [(snap_low, low_end, true), (snap_high, high_end, false)] {
-                            if !snap {
+                            if !snap || !snap_ends {
                                 continue;
                             }
                             let point = surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Fragment, "evaluate")?;
@@ -907,7 +928,26 @@ fn build_loop_uses<U: LoopUse>(
                             pcurve: if forward { pcurve } else { pcurve.reversed().or_refuse(KernelStage::Fragment, "reversed")? },
                         });
                     }
-                    if !forward {
+                    // CLOSED PARTIAL ORDER (`BREP_FRAGMENT_CLOSED_PARTIAL_ORDER`,
+                    // default on, =0 restores reversing them for a backward
+                    // run): the coedges of a run over the chain's own start
+                    // follow the run, the first one beginning where the run
+                    // begins. Whether the two arcs come out of the list in that
+                    // order or reversed depends on how the chain runs along its
+                    // carrier, so the order is read from the arcs' own ends.
+                    // A plate's top face less a 2x2 block of mutually tangent
+                    // holes walks each hole's arc across its circle's start,
+                    // and the reversal left that loop open at every joint.
+                    if closed_partial_order_enabled() && built.len() == 2 {
+                        let begins = |coedge: &FragmentCoedge| -> Result<f64, KernelRefusal> {
+                            let [low, _] = coedge.pcurve.domain().or_refuse(KernelStage::Fragment, "domain")?;
+                            let uv = coedge.pcurve.evaluate(low).or_refuse(KernelStage::Fragment, "evaluate")?;
+                            Ok(Vec2 { x: uv.x, y: uv.y }.sub(from).length())
+                        };
+                        if begins(&built[1])? < begins(&built[0])? {
+                            built.swap(0, 1);
+                        }
+                    } else if !forward {
                         built.reverse();
                     }
                     if !built.is_empty() {

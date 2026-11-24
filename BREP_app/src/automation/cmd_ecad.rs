@@ -85,7 +85,7 @@ fn ecad_action(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     // A row button's id carries its workbench in front; eCAD's does not.
     let id = a.id.strip_prefix(workbench.as_str()).and_then(|rest| rest.strip_prefix('.'));
     let id = match target {
-        Target::Diagram | Target::Pcb => id.unwrap_or(&a.id),
+        Target::Pcb => id.unwrap_or(&a.id),
         // The symbol and pads editors' ids already lead with their workbench.
         Target::Symbol | Target::Pads => &a.id,
     };
@@ -114,7 +114,6 @@ fn ecad_action(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     }
     let name = workbench.as_str();
     match target {
-        Target::Diagram => run(name, &mut doc.ecad.diagram, brep_ecad_egui::actions().collect(), id, brep_ecad_egui::Editor::run_action),
         Target::Pcb => run(name, &mut doc.ecad.pcb, brep_ecad_egui::actions().collect(), id, brep_ecad_egui::Editor::run_action),
         Target::Symbol => run(
             name,
@@ -145,6 +144,11 @@ fn ecad_state(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
         .iter()
         .find(|sync| sync.block() == block)
         .expect("a document keeps one BlockSync per block");
+    // The sheet is unreadable when either of its blocks is.
+    let sync = match doc.ecad_blocks.iter().find(|s| target == Target::Pcb && s.block() == crate::document::ecad::Block::Diagram) {
+        Some(diagram) if diagram.unreadable().is_some() && sync.unreadable().is_none() => diagram,
+        _ => sync,
+    };
     let mut state = crate::viewport::ecad::state_json(target, &doc.ecad, sync, &doc.engine.history);
     // The workbench itself, not the view the editor was last held in: right
     // after a `settings_set` the frame that pins the view has not run yet.

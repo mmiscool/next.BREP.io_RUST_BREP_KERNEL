@@ -1,4 +1,4 @@
-//! `BREP_OFFSET_REVOLVED_CURVED_EROSION` (default on since the tier P
+//! `BREP_OFFSET_REVOLVED_CURVED_EROSION` (default on since the
 //! promotion of 2026-11-21; `=0` restores the refusal): the SHRUNK rounded
 //! parallel body of a solid of revolution whose half-section has curved sides,
 //! the half-section's erosion by d revolved a full turn, where the pipeline

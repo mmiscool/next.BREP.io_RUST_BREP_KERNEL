@@ -24,6 +24,13 @@ pub struct SourceEdge {
     // single weld-tolerance apart). This keeps the weld from confusing a hole
     // wall's two rims, or a rim with its neighbouring plate rim.
     pub boundary_key: Option<(u8, u64)>,
+    /// The imprint piece a section source is (`None` for boundary and
+    /// derived sources): two different pieces running apart by more than ten
+    /// identity tolerances at their middles are not welded into one edge
+    /// under `BREP_FEATURE_SCALE_LENS`, whatever the weld band reads (a
+    /// plane across a lens 1.8e-6 thick cuts its two walls in two arcs that
+    /// share both ends).
+    pub piece: Option<u64>,
     /// MATERIAL SIDE of a TANGENT section's coedge (`ImprintOptions::
     /// tangent_curve_imprint`; `TangentSectionRecord::piece_ids`): the
     /// direction into the face from the section's midpoint, `n_out × t`
@@ -155,6 +162,7 @@ fn boundary_source_edge(
         name: edge.name.clone(),
         constructed: false,
         boundary_key: Some((operand, edge_id)),
+        piece: None,
         tangent_side: None,
     })
 }
@@ -187,6 +195,7 @@ pub(super) fn source_edge(source: &FragmentEdgeSource, index: &AssembleIndex) ->
                 name: imprint_edge_name(index, &piece.support_faces),
                 constructed: true,
                 boundary_key: None,
+                piece: Some(*piece_id),
                 tangent_side: None,
             })
         }
@@ -206,6 +215,7 @@ pub(super) fn source_edge(source: &FragmentEdgeSource, index: &AssembleIndex) ->
             name: None,
             constructed: false,
             boundary_key: None,
+            piece: None,
             tangent_side: None,
         }),
     }
@@ -361,6 +371,8 @@ pub struct Assembler {
     // later source onto one of these keeps the edge; a weld of an imprint
     // source onto a boundary edge leaves the boundary edge unmarked.
     pub imprint_edges: HashSet<u64>,
+    /// The imprint piece each edge was created from (`SourceEdge::piece`).
+    pub edge_piece: HashMap<u64, u64>,
     pub next_vertex_id: u64,
     pub next_edge_id: u64,
     pub next_coedge_id: u64,
@@ -558,6 +570,9 @@ impl Assembler {
                     source.boundary_key,
                     self.edge_boundary_key.get(&edge.id).copied(),
                 ) {
+                    continue;
+                }
+                if pieces_apart(source.piece, self.edge_piece.get(&edge.id).copied(), &source, edge, identity_tolerance) {
                     continue;
                 }
                 // A tangent section's coedges pair by material side (see
@@ -931,6 +946,9 @@ impl Assembler {
         if source.constructed {
             self.imprint_edges.insert(id);
         }
+        if let Some(piece) = source.piece {
+            self.edge_piece.insert(id, piece);
+        }
         if let Some(side) = source.tangent_side {
             self.edge_tangent_side.insert(id, side);
         }
@@ -979,6 +997,21 @@ impl Assembler {
 /// edge, however close their geometry runs. Anything else (cross-operand, or
 /// an imprint/derived source on either side) is left to the geometric +
 /// opposite-sense checks that follow.
+/// Whether two different imprint pieces stand apart (`SourceEdge::piece`,
+/// `BREP_FEATURE_SCALE_LENS`): their curves' middles farther than ten
+/// identity tolerances from each other's curve.
+fn pieces_apart(incoming: Option<u64>, existing: Option<u64>, source: &SourceEdge, edge: &EdgeRecord, identity_tolerance: f64) -> bool {
+    let (Some(a), Some(b)) = (incoming, existing) else { return false };
+    if a == b || !crate::switch!("BREP_FEATURE_SCALE_LENS", false) {
+        return false;
+    }
+    let middle = |curve: &crate::NurbsCurve, t0: f64, t1: f64| curve.evaluate(0.5 * (t0 + t1)).ok();
+    let gap = |point: Option<Vec3>, curve: &crate::NurbsCurve| point.and_then(|p| project_point_to_curve(curve, p).ok()).map(|foot| foot.distance);
+    let band = 10.0 * identity_tolerance;
+    gap(middle(&source.curve, source.t0, source.t1), &edge.curve).is_some_and(|d| d > band)
+        || gap(middle(&edge.curve, edge.t0, edge.t1), &source.curve).is_some_and(|d| d > band)
+}
+
 pub(super) fn weld_refused_by_identity(
     incoming: Option<(u8, u64)>,
     existing: Option<(u8, u64)>,

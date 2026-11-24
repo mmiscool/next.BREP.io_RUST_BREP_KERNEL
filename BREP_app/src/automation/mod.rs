@@ -46,6 +46,7 @@ mod schema_dsl;
 #[cfg(feature = "automation")]
 mod cmd_classes;
 mod cmd_files;
+mod cmd_import_preview;
 #[cfg(feature = "automation")]
 mod cmd_camera;
 #[cfg(feature = "automation")]

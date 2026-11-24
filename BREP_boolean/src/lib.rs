@@ -79,7 +79,7 @@ pub use fragment::{
 #[doc(hidden)]
 pub mod boolean;
 pub use boolean::{
-    boolean_operation, boolean_operation_nary, boolean_operation_nary_with_options, boolean_operation_with_diagnostics, boolean_operation_with_diagnostics_at_offset, boolean_split_operands,
+    boolean_operation, without_perturbation, boolean_operation_nary, boolean_operation_nary_with_options, boolean_operation_with_diagnostics, boolean_operation_with_diagnostics_at_offset, boolean_split_operands,
     BooleanOperation, BooleanOptions,
 };
 #[path = "csg/oracle.rs"]

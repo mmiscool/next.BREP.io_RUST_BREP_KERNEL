@@ -714,6 +714,12 @@ pub(super) fn tessellate_face_watertight(
         tess_route(Route::PointedCone);
         return Ok(());
     }
+    if matches!(face.surface.analytic(), Some(crate::AnalyticSurface::RuledRevolution { .. }))
+        && tessellate_ruled_band(face, bridged.polygon(), [u0, u1, v0, v1], closed_u, chord_tolerance, face_id, mesh)?
+    {
+        tess_route(Route::RuledBand);
+        return Ok(());
+    }
     // Intrinsic uv scale, computed HERE (before triangulation) so the CDT path
     // can metric-scale its Delaunay too: maximum first-derivative magnitude per
     // direction, so flips, margins, and CDT quality act in (approximately)

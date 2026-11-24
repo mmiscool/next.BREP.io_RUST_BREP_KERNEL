@@ -43,6 +43,27 @@ fn enabled() -> bool {
     })
 }
 
+/// The fewest grid cells a knot span gets in each direction before its curvature asks for more. One: the
+/// curvature is read at nine samples in every span pair (so a single-span inflection is seen) and every
+/// emitted triangle is checked against the chord and normal-turn bars below, so a floor adds triangles
+/// without making the mesh any more certain. Three (the old floor) gave a densely knotted fitted face 18
+/// triangles a span whatever its chord. `BREP_TESS_SPAN_FLOOR=<n>` sets it (3 restores the old grids).
+const SPAN_FLOOR_DEFAULT: usize = 1;
+fn span_floor() -> usize {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var("BREP_TESS_SPAN_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(SPAN_FLOOR_DEFAULT)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        SPAN_FLOOR_DEFAULT
+    }
+}
+
 fn supported_carrier(face: &FaceRecord) -> bool {
     match face.surface.analytic() {
         None => true,
@@ -254,8 +275,9 @@ fn curvature_grid(
     let [u0, u1, v0, v1] = bounds;
     let us = knot_lines(&face.surface.knots_u, u0, u1);
     let vs = knot_lines(&face.surface.knots_v, v0, v1);
-    let mut nu = vec![3usize; us.len() - 1];
-    let mut nv = vec![3usize; vs.len() - 1];
+    let floor = span_floor();
+    let mut nu = vec![floor; us.len() - 1];
+    let mut nv = vec![floor; vs.len() - 1];
     let perp = |x: Vec3, t: Vec3| -> Vec3 {
         let tt = t.length_squared();
         if tt > 0. {
@@ -356,6 +378,13 @@ fn curvature_grid(
             if !grew {
                 break;
             }
+        }
+    }
+    // The grid ends inside the trim, so each direction needs one interior line at least: a direction
+    // that is a single span of one cell has none, and takes two cells.
+    for counts in [&mut nu, &mut nv] {
+        if counts.iter().sum::<usize>() < 2 {
+            counts[0] = 2;
         }
     }
     let expand = |spans: &[f64], counts: &[usize]| -> Option<Vec<f64>> {
@@ -603,7 +632,10 @@ pub fn tessellate_rectangle_watertight(
         return decline(face_id, "singular or over-budget curvature grid");
     };
     for pass in 0..4 {
-        if us.len() > MAX_LINES
+        // `build_grid` needs an interior line in each direction (its counts are lines less two).
+        if us.len() < 3
+            || vs.len() < 3
+            || us.len() > MAX_LINES
             || vs.len() > MAX_LINES
             || (us.len() - 2) * (vs.len() - 2) > MAX_VERTICES
         {

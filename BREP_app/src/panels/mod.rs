@@ -99,6 +99,7 @@ pub mod plm_parts;
 pub mod plm_family;
 /// Review and the inbox (plm-cad-integration-todo §3 S4).
 pub mod plm_review;
+pub mod pin_seats;
 pub mod qualify;
 pub mod replace_component;
 pub mod family_table_editor;

@@ -88,7 +88,7 @@ pub(super) fn ecad_state() -> Value {
         "popupOpen":boolean,"modalOpen":boolean,"keysReachEditor":boolean});
     let mut symbol=common.clone();symbol["target"]=json!({"const":"symbol"});
     symbol["unitCount"]=count.clone();symbol["gateCount"]=count.clone();
-    symbol["pins"]=array(closed_object_optional(json!({"number":text,"name":text,"at":point,"end":point,"unit":count,"gate":count}),&[]));
+    symbol["pins"]=array(closed_object_optional(json!({"number":text,"name":text,"alternates":strings,"at":point,"end":point,"unit":count,"gate":count}),&[]));
     symbol["graphics"]=array(closed_object_optional(json!({"kind":{"enum":["path","circle","text"]},"points":array(point.clone()),
         "radius":count,"text":text,"size":count,"angle":count}),&["radius","text","size","angle"]));
     symbol["selection"]=nullable(json!({"oneOf":[
@@ -109,9 +109,12 @@ pub(super) fn ecad_state() -> Value {
         closed_object_optional(json!({"kind":{"const":"component"},"id":text,"reference":maybe}),&[]),
         closed_object_optional(json!({"kind":{"enum":["wire","label"]},"id":text}),&[]),
         closed_object_optional(json!({"kind":{"const":"junction"},"at":point}),&[])]}));
-    sheet["components"]=array(closed_object_optional(json!({"id":text,"reference":text,"value":text,"symbol":text,"at":point,"rotation":integer,"pins":count,
-        "gates":array(closed_object_optional(json!({"gate":count,"name":text,"at":point,"rotation":integer}),&[]))}),&[]));
-    sheet["wires"]=array(closed_object_optional(json!({"id":text,"from":maybe,"to":maybe,"connectionId":text,"stockPartNumber":text}),&[]));
+    sheet["harnessTools"]=boolean.clone();
+    sheet["boardZone"]=nullable(array(point.clone()));
+    sheet["subBoards"]=array(closed_object_optional(json!({"occurrence":text,"reference":text,"zone":nullable(array(point.clone())),"parts":strings,"declared":strings}),&[]));
+    sheet["components"]=array(closed_object_optional(json!({"id":text,"reference":text,"value":text,"symbol":text,"at":point,"rotation":integer,"pins":count,"offBoard":boolean,"subBoard":maybe,
+        "pinFunctions":{"type":"object","additionalProperties":text},"gates":array(closed_object_optional(json!({"gate":count,"name":text,"at":point,"rotation":integer}),&[]))}),&[]));
+    sheet["wires"]=array(closed_object_optional(json!({"id":text,"from":maybe,"to":maybe,"connectionId":text,"stockPartNumber":text,"harness":boolean}),&[]));
     sheet["labels"]=array(closed_object_optional(json!({"id":text,"name":text,"at":point,"rotation":integer}),&[]));
     sheet["junctions"]=count.clone();sheet["nets"]=array(closed_object_optional(json!({"name":text,"pins":strings}),&[]));
     sheet["erc"]=closed_object_optional(json!({"run":boolean,"findings":array(closed_object_optional(json!({"severity":text,"kind":text,"message":text,"at":point,"pins":strings,"fix":maybe}),&[])),
@@ -123,7 +126,7 @@ pub(super) fn ecad_state() -> Value {
             "spokes":nullable(array(closed_object_optional(json!({"pad":text,"spokes":count}),&[])))}),&[])),"zonesStale":boolean,
         "netClasses":array(closed_object_optional(json!({"name":text,"clearance":integer,"trackWidth":integer,"viaDiameter":integer,"viaDrill":integer,"patterns":strings,"nets":strings}),&[])),
         "netClassOf":dictionary,"netClassAssigned":dictionary,"netClassNet":maybe,
-        "findings":nullable(array(closed_object_optional(json!({"kind":text,"message":text}),&[]))),"selectedZone":nullable(count.clone()),"drawings":array(graphic),"selectedDrawing":nullable(count.clone()),"cutouts":array(array(point.clone())),"selectedCutout":nullable(count.clone()),
+        "findings":nullable(array(closed_object_optional(json!({"kind":text,"message":text,"at":point}),&[]))),"selectedZone":nullable(count.clone()),"drawings":array(graphic),"selectedDrawing":nullable(count.clone()),"cutouts":array(array(point.clone())),"selectedCutout":nullable(count.clone()),
         "selectedPad":nullable(closed_object_optional(json!({"reference":maybe,"number":text}),&[])),
         "selectedSilk":nullable(closed_object_optional(json!({"reference":maybe,"index":count}),&[])),"message":text}),&[]);
     json!({"type":"object","oneOf":[closed_object_optional(json!({"target":{"type":"null"}}),&[]),closed_object_optional(symbol,&[]),closed_object_optional(pads,&[]),closed_object_optional(sheet,&[])]})

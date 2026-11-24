@@ -416,6 +416,11 @@ pub(super) struct Resolver<'a> {
     /// surface models stay skipped and counted; the Parasolid lane turns it
     /// on for sheet bodies, which its translation writes as open shells.
     pub(super) sheets: bool,
+    /// The inputs of [`Self::unstated_identity_band`], read from the whole file
+    /// on first use and shared with every resolver derived from this one: the
+    /// loosest stated precision in mm (`None` when the file states none) and
+    /// the diagonal of its `VERTEX_POINT`s' box in the file's own length unit.
+    identity_inputs: std::sync::Arc<std::sync::OnceLock<(Option<f64>, f64)>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -428,6 +433,7 @@ impl<'a> Resolver<'a> {
             angle_scale: std::sync::Arc::default(),
             trim_readings: true,
             sheets: false,
+            identity_inputs: std::sync::Arc::default(),
         }
     }
 
@@ -439,6 +445,7 @@ impl<'a> Resolver<'a> {
             angle_scale: self.angle_scale.clone(),
             trim_readings: false,
             sheets: self.sheets,
+            identity_inputs: self.identity_inputs.clone(),
         }
     }
 
@@ -452,6 +459,7 @@ impl<'a> Resolver<'a> {
             angle_scale: self.angle_scale.clone(),
             trim_readings: self.trim_readings,
             sheets: self.sheets,
+            identity_inputs: self.identity_inputs.clone(),
         }
     }
 
@@ -461,6 +469,67 @@ impl<'a> Resolver<'a> {
         *self
             .angle_scale
             .get_or_init(|| derive_angle_scale(self.entities))
+    }
+
+    /// UNSTATED PRECISION (`BREP_STEP_UNSTATED_PRECISION_BAND`, default on, =0
+    /// restores): the vertex identity band, in mm, for a file that states no
+    /// usable precision, or `None` when it states one (or the switch is off).
+    /// A file that states none, or only figures under
+    /// [`UNSTATED_PRECISION_FRACTION`] of its model's size (Onshape writes
+    /// `1.E-17` metres: no geometry in doubles meets that), says nothing the
+    /// importer can hold it to, so its band comes from the model's size:
+    /// [`UNSTATED_BAND_FRACTION`] of the diagonal of its vertices' box, capped
+    /// at [`UNSTATED_BAND_CEILING_MM`]. Callers take it only as a widening of
+    /// their own band (`max`), and only where that band would refuse. A file
+    /// that states a usable precision keeps the importer's own bands.
+    ///
+    /// The sweep over the file (one pass over its entities) runs once per
+    /// file, on the first call: the import report asks for it on every file,
+    /// to name the band. The band is computed from every `VERTEX_POINT` of the
+    /// file read at this resolver's unit, so a mixed-unit file reads its
+    /// diagonal at one unit; the ceiling bounds what that can widen.
+    pub(super) fn unstated_identity_band(&self) -> Option<f64> {
+        if !crate::switch!("BREP_STEP_UNSTATED_PRECISION_BAND", true) {
+            return None;
+        }
+        let (loosest, diagonal_raw) = self.identity_inputs();
+        let diagonal = diagonal_raw * self.length_scale;
+        if !(diagonal.is_finite() && diagonal > 0.0) {
+            return None;
+        }
+        let unstated = loosest.is_none_or(|stated| stated < UNSTATED_PRECISION_FRACTION * diagonal);
+        unstated.then(|| (UNSTATED_BAND_FRACTION * diagonal).min(UNSTATED_BAND_CEILING_MM))
+    }
+
+    /// The loosest length precision the file states, in millimetres, for
+    /// refusal messages that say why a gap is too wide to close.
+    pub(super) fn stated_precision_mm(&self) -> Option<f64> {
+        self.identity_inputs().0
+    }
+
+    /// The file's loosest stated precision (mm) and the raw diagonal of its
+    /// vertices' box, swept once per file.
+    fn identity_inputs(&self) -> (Option<f64>, f64) {
+        *self.identity_inputs.get_or_init(|| {
+            let loosest = stated_precisions_mm(self.entities).last().copied();
+            let (mut low, mut high) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+            for entity in self.entities.values() {
+                let Some(geometry) = entity.find("VERTEX_POINT").and_then(|args| args.get(1)).and_then(|value| value.as_ref_id().ok()) else {
+                    continue;
+                };
+                let Some(point) = self.entities.get(&geometry).and_then(|point| point.find("CARTESIAN_POINT")).and_then(|args| args.get(1)).and_then(|value| value.as_list().ok()) else {
+                    continue;
+                };
+                for (axis, coordinate) in point.iter().take(3).enumerate() {
+                    if let Ok(value) = coordinate.as_real() {
+                        low[axis] = low[axis].min(value);
+                        high[axis] = high[axis].max(value);
+                    }
+                }
+            }
+            let diagonal = (0..3).map(|axis| (high[axis] - low[axis]).powi(2)).sum::<f64>().sqrt();
+            (loosest, if diagonal.is_finite() { diagonal } else { 0.0 })
+        })
     }
 
     /// A `CONICAL_SURFACE` semi-angle in radians, from the raw attribute.
@@ -497,6 +566,15 @@ impl<'a> Resolver<'a> {
         }
     }
 }
+
+/// [`Resolver::unstated_identity_band`]: a stated precision under this
+/// fraction of the model's diagonal is no precision doubles can hold.
+pub(super) const UNSTATED_PRECISION_FRACTION: f64 = 1e-12;
+/// [`Resolver::unstated_identity_band`]: the band as a fraction of the
+/// model's diagonal.
+pub(super) const UNSTATED_BAND_FRACTION: f64 = 2e-4;
+/// [`Resolver::unstated_identity_band`]: the band's ceiling, in mm.
+pub(super) const UNSTATED_BAND_CEILING_MM: f64 = 1e-2;
 
 /// Millimetres per one of the given unit entity (an entity carrying
 /// `LENGTH_UNIT`): `SI_UNIT(prefix, .METRE.)` → 1000 × prefix;
@@ -1500,6 +1578,31 @@ fn clamp_spline_start<T: SplineElement>(
     let p = degree;
     if knots.len() < 2 * (p + 1) || points.len() + p + 1 != knots.len() {
         return Ok(()); // let the constructor report the real shape error
+    }
+    // OVER-CLAMPED START (`BREP_STEP_OVERCLAMPED_KNOTS`, default on, =0
+    // restores): more than `p + 1` leading knots within the identity
+    // tolerance of the first make spans of no width (or of round-off width)
+    // whose first control points weigh nothing anywhere else; their basis
+    // there divides by below the guard and the point is evaluated with zero
+    // weight. The extra knots and as many leading control points are dropped
+    // and the remaining `p + 1` set to one value. abc_00000234's face #3509
+    // starts its u knots at -5.08e-17 four times and then 0.0 (cubic): every
+    // evaluation at the domain start had zero weight and the body was refused.
+    // Read with the extra knot dropped the face measures 13.55 mm2 inside its
+    // whole surface's 13.62 mm2; OpenCASCADE's 2514.87 mm2 for it is the zero
+    // weight blowing up its integration, and the body otherwise agrees to 1e-5.
+    if crate::switch!("BREP_STEP_OVERCLAMPED_KNOTS", true) {
+        let first = knots[0];
+        let leading = knots.iter().take_while(|knot| (**knot - first).abs() <= crate::curve::KNOT_IDENTITY_TOL).count();
+        if leading > p + 1 && points.len() > leading - (p + 1) + p {
+            let extra = leading - (p + 1);
+            knots.drain(..extra);
+            points.drain(..extra);
+            let start = knots[p];
+            for knot in knots.iter_mut().take(p + 1) {
+                *knot = start;
+            }
+        }
     }
     let u0 = knots[p];
     let already = (0..=p).all(|i| (knots[i] - u0).abs() <= crate::curve::KNOT_IDENTITY_TOL);

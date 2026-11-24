@@ -86,8 +86,10 @@ use brep_render::engine_state::{EngineState, NoticeSeverity};
 /// entry first, then reload.
 ///
 /// Returns what the user should look at afterwards, one line each: the sheet
-/// components the refresh could not keep bound, and the point renames it
-/// carried across on POSITION rather than on evidence. Neither is a refusal —
+/// components the refresh could not keep bound, the point renames it
+/// carried across on POSITION rather than on evidence, and each harness
+/// connection end at a point the new version no longer declares (an end at a
+/// renamed point is rewritten to the new name). None is a refusal —
 /// the entry is rewritten and the rest of the sheet folds, because one dangling
 /// instance costing the user an entire refresh is the worse outcome.
 pub fn refresh_library_entry(
@@ -117,7 +119,10 @@ pub fn refresh_library_entry_value(
     }
     let signature = format!("{:016x}", brep_render::brep_kernel::stable_json_hash(&document));
     let sheets = ["diagram", "pcb"].iter().any(|block| assembly.get(*block).is_some_and(|v| !v.is_null()));
-    if !sheets {
+    // Harness connections name the part's points, so a refresh may rename or
+    // remove what they end on (`ecad_parts::follow_harness_points`).
+    let harness = assembly["wireHarness"]["connections"].as_array().is_some_and(|c| !c.is_empty());
+    if !sheets && !harness {
         let entry = match assembly["partsLibrary"].get_mut(part_name) {
             Some(entry) if entry.is_object() => entry,
             _ => return Err(format!("no parts-library entry '{part_name}'")),
@@ -152,6 +157,7 @@ pub fn refresh_library_entry_value(
         _ => return Err(format!("no parts-library entry '{part_name}'")),
     }
     let mut notes = super::ecad_parts::refresh_snapshots(&mut draft, assembly, part_name)?;
+    notes.extend(super::ecad_parts::follow_harness_points(&mut draft, assembly));
     // Refresh can remove pins and therefore diagram connections. Carry that
     // removal into the harness in this same transaction, before rebuilding.
     // Components the assembly can no longer place come back as UNLINKED lines

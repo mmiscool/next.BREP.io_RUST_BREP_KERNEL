@@ -1,5 +1,7 @@
 # BREP_render — the wgpu render/pick engine
 
+Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_render` · [licence summary](#licence)
+
 The windowing-agnostic rendering, picking, and viewer-state engine for the
 BREP kernel (publishes on crates.io as **`BREP_render`**, lib `brep_render`).
 It runs a kernel feature history in-process, populates a renderer-agnostic
@@ -110,8 +112,17 @@ The crate is standalone (not a workspace member) on purpose: the kernel's own
 would override. Native builds link the kernel with its `parallel`
 tessellation feature; the wasm build deliberately does not.
 
-## License and links
+## Licence
 
-- License: the Autodrop3d licence in `LICENSE.md`, shipped in the crate
-  (`license-file` in the manifest).
-- Version: 0.26.0.
+In plain words: the crates are free to use as they are, including in a commercial project. If you
+fix or change something in the kernel, send the change back as a pull request to
+[github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL). If you do not want to share your
+changes, buy a commercial licence from [Autodrop3d LLC](https://autodrop3d.com); with it you never
+have to share your code back.
+
+The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the manifest) and at
+[LICENSE.md](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL/blob/master/LICENSE.md); if this summary and the file ever differ, the file wins.
+
+## Links
+
+- Version: 0.27.0.

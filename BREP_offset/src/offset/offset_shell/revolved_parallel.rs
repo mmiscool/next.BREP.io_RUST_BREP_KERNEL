@@ -1020,7 +1020,7 @@ fn holds_the_distance(grown: &[Piece], chain: &[Piece], distance: f64, scale: f6
     true
 }
 
-/// `BREP_OFFSET_REVOLVED_TRIMMED` (default on since the tier P promotion of
+/// `BREP_OFFSET_REVOLVED_TRIMMED` (default on since the promotion of
 /// 2026-11-21; `=0` restores the walk alone): where the walk declines (a
 /// concave corner, or growths that meet across a gap, such as a groove
 /// narrower than twice the distance) or the rims are arcs, the grown

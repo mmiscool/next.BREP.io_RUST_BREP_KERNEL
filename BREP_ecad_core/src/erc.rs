@@ -165,6 +165,10 @@ impl Document {
         if self.kind == DocumentKind::Wiring {
             return vec![];
         }
+        // A sub-board's parts, nets and markers are checked in its own document.
+        if !self.zones.is_empty() {
+            return self.without_zones().erc();
+        }
         let netlist = self.netlist();
         let mut out = vec![];
         let tip = |component, pin: &str| {
@@ -412,7 +416,8 @@ impl Document {
             }
         }
         // A gate of a part placed as gates that has no placement.
-        for c in &self.components {
+        // A sheet's parts off the board are no part of the board's nets.
+        for c in self.components.iter().filter(|c| self.on_board(c)) {
             if c.gates.is_empty() {
                 continue;
             }
@@ -438,7 +443,8 @@ impl Document {
             }
         }
         let mut seen: BTreeMap<&str, Vec<&crate::Component>> = BTreeMap::new();
-        for c in &self.components {
+        // A sheet's parts off the board are no part of the board's nets.
+        for c in self.components.iter().filter(|c| self.on_board(c)) {
             seen.entry(c.reference.as_str()).or_default().push(c);
         }
         for (reference, parts) in seen {
@@ -461,15 +467,22 @@ impl Document {
     fn dangling_wire_ends(&self) -> Vec<ErcFinding> {
         let mut anchors: BTreeSet<Point> = self.junctions.iter().copied().collect();
         anchors.extend(self.labels.iter().map(|l| l.at));
-        for c in &self.components {
+        // A sheet's parts off the board are no part of the board's nets.
+        for c in self.components.iter().filter(|c| self.on_board(c)) {
             anchors.extend(c.symbol.pins.iter().map(|p| c.pin_at(p)));
         }
         let mut out = vec![];
         for (i, w) in self.wires.iter().enumerate() {
+            // A harness wire joins two pins by its terminals; it is no net. A
+            // sub-board's nets are checked in that board's own document.
+            if self.is_harness(w) || self.zone_of_net(w.id).is_some() {
+                continue;
+            }
             for end in [w.a, w.b] {
                 let touches = anchors.contains(&end)
                     || self.wires.iter().enumerate().any(|(j, other)| {
                         j != i
+                            && !self.is_harness(other)
                             && other
                                 .points()
                                 .windows(2)

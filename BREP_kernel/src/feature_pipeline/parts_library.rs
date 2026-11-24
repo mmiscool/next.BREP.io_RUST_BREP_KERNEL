@@ -794,6 +794,7 @@ type IsolatedRun = (
     BTreeMap<String, PortRecord>,
     Vec<NestedConstraint>,
     BTreeMap<String, crate::AffineTransform>,
+    Option<crate::feature_pipeline::ports::PortsReport>,
 );
 
 fn run_isolated_features(
@@ -923,14 +924,11 @@ fn run_isolated_features(
     // only resident until the free loop below. This is the one place a part's
     // connection points are captured, so the tail HAS to run on this lane too —
     // without it every placed part would arrive with an empty port map.
-    let declared: Vec<String> = crate::feature_pipeline::ports::finish_history_run(
-        request,
-        &mut scene,
-        &env,
-    )
-    .report
-    .map(|report| report.points.into_iter().map(|row| row.address).collect())
-    .unwrap_or_default();
+    let ports_report = crate::feature_pipeline::ports::finish_history_run(request, &mut scene, &env).report;
+    let declared: Vec<String> = ports_report
+        .as_ref()
+        .map(|report| report.points.iter().map(|row| row.address.clone()).collect())
+        .unwrap_or_default();
     for handle in all_handles {
         sheet_metal::remove_tree(handle);
         crate::free_registered_solid(handle);
@@ -953,7 +951,7 @@ fn run_isolated_features(
         // solid. A generic empty modeling document remains an error.
         None if members.is_empty() && !electronics_part =>
             Err("embedded part document produced no solids".into()),
-        None => Ok((members, ports, nested_constraints, nested_poses)),
+        None => Ok((members, ports, nested_constraints, nested_poses, ports_report)),
     }
 }
 
@@ -1030,7 +1028,7 @@ pub(crate) fn rebuild_part(document: &serde_json::Value) -> Result<RebuiltPart, 
 
 fn rebuild_part_uncached(document: &serde_json::Value) -> Result<RebuiltPart, String> {
     let saved = scene_metadata::take_store();
-    let outcome = run_isolated_document(document, None).and_then(|(members, ports, nested_constraints, nested_poses)| {
+    let outcome = run_isolated_document(document, None).and_then(|(members, ports, nested_constraints, nested_poses, _)| {
         let refs: Vec<(&str, &BrepSolid)> = members
             .iter()
             .map(|(name, solid)| (name.as_str(), solid))
@@ -1050,6 +1048,33 @@ fn rebuild_part_uncached(document: &serde_json::Value) -> Result<RebuiltPart, St
 /// component ids are the SUB-document's, and collide with the parent's.
 pub(crate) fn in_isolated_run() -> bool {
     STACK.with(|stack| !stack.borrow().is_empty())
+}
+
+/// A part document's own solids, meshed for display, and its declared ports
+/// as the ports tail resolved them: what a board needs to check where a
+/// part's pins land on its pads without opening the part
+/// (`brep_ecad_core::seat_check`). The part runs ISOLATED, exactly as a
+/// library entry's snapshot is rebuilt, so the caller's history cache and
+/// scene-metadata store are untouched; `lod_factor` is the display chord
+/// scale the app's viewport meshes with (1.0 = Normal).
+pub struct PartPinGeometry {
+    /// Each surviving solid by name, with its display payload.
+    pub solids: Vec<(String, crate::DisplaySolidPayload)>,
+    /// The ports report (`None` when the document declares no ports).
+    pub ports: Option<crate::feature_pipeline::ports::PortsReport>,
+}
+
+/// See [`PartPinGeometry`].
+pub fn part_pin_geometry(document: &serde_json::Value, lod_factor: f64) -> Result<PartPinGeometry, String> {
+    let saved = scene_metadata::take_store();
+    let outcome = run_isolated_document(document, None);
+    scene_metadata::restore_store(saved);
+    let (members, _, _, _, ports) = outcome?;
+    let solids = members
+        .iter()
+        .map(|(name, solid)| crate::display_payload_of_solid(solid, lod_factor).map(|payload| (name.clone(), payload)))
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(PartPinGeometry { solids, ports })
 }
 
 /// An embedded part document's OWN PMI, resolved against the geometry the

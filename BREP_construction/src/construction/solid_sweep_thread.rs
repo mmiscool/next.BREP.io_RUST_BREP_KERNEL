@@ -342,6 +342,14 @@ impl RingBlank {
     }
 }
 
+/// How a gear's spaces are sliced: on cylinders about its axis (a face gear, its teeth across its
+/// face) or on planes square to it (a wheel, its teeth across its rim).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Family {
+    Cylinders,
+    Planes,
+}
+
 /// The gear axis's frame: its point, its direction and two directions square to it.
 fn gear_frame(motion: &TwoTurns) -> (Vec3, Vec3, Vec3, Vec3) {
     let (point, d) = (motion.axes[1].0, motion.axes[1].1.normalized().unwrap_or(Vec3::new(0.0, 0.0, 1.0)));
@@ -359,22 +367,32 @@ pub const AIR_STEP: f64 = 0.03;
 /// it over the space (from `AIR_STEP` of the thread's depth above the face), between the middles
 /// of the tooth tops
 /// either side. `seed`: an angle near the space. Returns the points and the space's middle angle.
-fn slice(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, pitch: f64, r: f64, seed: f64, count: usize) -> Result<(Vec<Vec3>, f64, f64), String> {
+fn slice(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, family: Family, pitch: f64, r: f64, seed: f64, fallback: Option<(f64, f64)>, count: usize) -> Result<(Vec<Vec3>, f64, f64), String> {
     let (o, d, e1, e2) = gear_frame(motion);
-    let place = |f: f64, z: f64| o.add(e1.scale(r * f.cos())).add(e2.scale(r * f.sin())).add(d.scale(z));
+    // A slice's point at angle `f` and depth coordinate `z`: on a cylinder of radius `r`, `z` is
+    // the height; on the plane at height `r`, the distance from the axis (the rim its face).
+    let place = |f: f64, z: f64| match family {
+        Family::Cylinders => o.add(e1.scale(r * f.cos())).add(e2.scale(r * f.sin())).add(d.scale(z)),
+        Family::Planes => o.add(e1.scale(z * f.cos())).add(e2.scale(z * f.sin())).add(d.scale(r)),
+    };
     let cut = |f: f64, z: f64| swept_holds(tool, motion, place(f, z));
-    let face = blank.face_at(r);
+    let (face, floor, weight) = match family {
+        Family::Cylinders => (blank.face_at(r), blank.bottom, r),
+        Family::Planes => (blank.outer, blank.inner, blank.outer),
+    };
     // The space's run nearest the seed, and the tooth tops either side, read just under the face;
     // where the teeth come to a point below it (the whole circle cut there), lower down, at the
     // tips' level.
-    let n = 480;
-    let (lo, hi) = (seed - pitch, seed + pitch);
+    // A pitch and a half either way, so the tooth tops either side of the space nearest the
+    // seed lie within the search even where the spaces are wide and the tops narrow (at a rim).
+    let n = 720;
+    let (lo, hi) = (seed - 1.5 * pitch, seed + 1.5 * pitch);
     let at = |k: usize| lo + (hi - lo) * k as f64 / n as f64;
     // Offsets are shares of the thread's depth, so the trace is the same at any scale.
     let depth = tool.tip + tool.root;
     let mut level = face - 0.004 * depth;
     let mut cuts: Vec<bool> = (0..=n).map(|k| cut(at(k), level)).collect();
-    while cuts.iter().all(|&c| c) && level > blank.bottom {
+    while cuts.iter().all(|&c| c) && level > floor {
         level -= 0.02 * depth;
         cuts = (0..=n).map(|k| cut(at(k), level)).collect();
     }
@@ -395,38 +413,55 @@ fn slice(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, pitch: f64, r:
             k += 1;
         }
     }
-    let (start, end) = best.ok_or_else(|| format!("no tooth space on the face at r = {r}"))?;
-    let (mut left, mut right) = (start, end);
-    while left > 0 && !cuts[left - 1] {
-        left -= 1;
-    }
-    while right < n && !cuts[right + 1] {
-        right += 1;
-    }
-    if left == 0 || right == n {
-        return Err(format!("the tooth tops beside the space at r = {r} reach past the search"));
-    }
-    let (ml, el, er, mr) = (0.5 * (at(left) + at(start - 1)), at(start), at(end), 0.5 * (at(end + 1) + at(right)));
-    // The slice runs from half a pitch before the space's middle to half a pitch after it (the
-    // tooth middles either side), and `delta` past each, so where the cut runs across a middle
-    // (above the tips, where they come to a point below the face) a cell divider through it
-    // crosses the space rather than meets one of its walls. The strips either side of a middle,
-    // `delta` each way, must hold the bottom as a graph in angle: on a flat tooth top a share of
-    // its width (past it the bottom steps down into the space); where the teeth come to a point
-    // below the face, over the smooth tip, at least a fiftieth of a pitch.
-    let lowered = level < face - 0.004 * depth;
-    let delta = if lowered { (0.3 * (el - ml).min(mr - er)).max(0.02 * pitch) } else { 0.3 * (el - ml).min(mr - er) };
-    let centre = 0.5 * (el + er);
+    // A slice the tool never reaches (beyond the blank, past the tool's reach) is the air step's
+    // floor alone, laid on its neighbour's middle and strips (`fallback`).
+    let (centre, delta) = match (best, fallback) {
+        (None, Some(fallback)) if cuts.iter().all(|&c| !c) => fallback,
+        (best, _) => {
+            let (start, end) = best.ok_or_else(|| format!("no tooth space on the face at r = {r}"))?;
+            let (mut left, mut right) = (start, end);
+            while left > 0 && !cuts[left - 1] {
+                left -= 1;
+            }
+            while right < n && !cuts[right + 1] {
+                right += 1;
+            }
+            if left == 0 || right == n {
+                return Err(format!("the tooth tops beside the space at r = {r} reach past the search"));
+            }
+            let (ml, el, er, mr) = (0.5 * (at(left) + at(start - 1)), at(start), at(end), 0.5 * (at(end + 1) + at(right)));
+            // The slice runs from half a pitch before the space's middle to half a pitch after it (the
+            // tooth middles either side), and `delta` past each, so where the cut runs across a middle
+            // (above the tips, where they come to a point below the face) a cell divider through it
+            // crosses the space rather than meets one of its walls. The strips either side of a middle,
+            // `delta` each way, must hold the bottom as a graph in angle: on a flat tooth top a share of
+            // its width (past it the bottom steps down into the space); where the teeth come to a point
+            // below the face, over the smooth tip, at least a fiftieth of a pitch.
+            let lowered = level < face - 0.004 * depth;
+            let delta = if lowered { (0.3 * (el - ml).min(mr - er)).max(0.02 * pitch) } else { 0.3 * (el - ml).min(mr - er) };
+            let centre = 0.5 * (el + er);
+            (centre, delta)
+        }
+    };
     let (ml, mr) = (centre - 0.5 * pitch - delta, centre + 0.5 * pitch + delta);
     // From just below the blank's bottom (all of the cut counted), but no lower than the tool
     // can reach (so a thick blank does not spread the grid's rows past the cut), to a band over
     // the air step. The tool lies within its reach of its axis segment, and the gear's turn keeps
     // heights along the gear's axis.
-    let lowest = {
-        let height = |s: f64| tool.axis_point.add(tool.axis_direction.scale(s)).sub(o).dot(d);
-        height(tool.start).min(height(tool.end)) - tool.reach()
+    let lowest = match family {
+        Family::Cylinders => {
+            let height = |s: f64| tool.axis_point.add(tool.axis_direction.scale(s)).sub(o).dot(d);
+            height(tool.start).min(height(tool.end)) - tool.reach()
+        }
+        // The least distance of the tool's axis segment from the gear's axis, less the reach.
+        Family::Planes => {
+            let flat = |v: Vec3| v.sub(d.scale(v.dot(d)));
+            let (a, u) = (flat(tool.axis_point.sub(o)), flat(tool.axis_direction));
+            let s = if u.dot(u) > 0.0 { (-a.dot(u) / u.dot(u)).clamp(tool.start, tool.end) } else { tool.start };
+            a.add(u.scale(s)).length() - tool.reach()
+        }
     };
-    let (z0, z1) = ((blank.bottom).max(lowest) - 0.05 * depth, face + 0.2 * depth);
+    let (z0, z1) = (floor.max(lowest) - 0.05 * depth, face + 0.2 * depth);
     let inside = |f: f64, z: f64| -> bool {
         if z >= z1 || f <= ml || f >= mr || z <= z0 {
             return false;
@@ -528,7 +563,7 @@ fn slice(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, pitch: f64, r:
         }
         points.push((cf + sf * a, cz + sz * a));
     }
-    let loop_points = periodic_loop(&points, r, pitch, (ml, mr), delta, z1, (mr - ml) / nf as f64, (z1 - z0) / nz as f64, count)?;
+    let loop_points = periodic_loop(&points, weight, pitch, (ml, mr), delta, z1, (mr - ml) / nf as f64, (z1 - z0) / nz as f64, count)?;
     Ok((loop_points.into_iter().map(|(f, z)| place(f, z)).collect(), centre, delta))
 }
 
@@ -673,13 +708,13 @@ fn closed_polyline(points: &[Vec3], breaks: &[usize]) -> Result<Vec<crate::Nurbs
 /// near `seed` there), `count` points each, the end slices (outside the ring) put on their tangent
 /// planes, lofted. `pitch`: the angle between neighbouring spaces.
 pub fn tooth_space(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, pitch: f64, radii: &[f64], seed: f64, count: usize) -> Result<crate::BrepSolid, crate::KernelRefusal> {
-    Ok(traced_space(tool, motion, blank, pitch, radii, seed, count)?.0)
+    Ok(traced_space(tool, motion, blank, Family::Cylinders, pitch, radii, seed, count)?.0)
 }
 
 /// [`tooth_space`] and, at each of `radii`, the angle a cell divider after the space crosses it:
 /// the tooth middle after the space, less than half its strip on, so the divider crosses a tooth
 /// tip's flank and not its crest.
-fn traced_space(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, pitch: f64, radii: &[f64], seed: f64, count: usize) -> Result<(crate::BrepSolid, Vec<f64>), crate::KernelRefusal> {
+fn traced_space(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, family: Family, pitch: f64, radii: &[f64], seed: f64, count: usize) -> Result<(crate::BrepSolid, Vec<f64>), crate::KernelRefusal> {
     let fail = |message: String| crate::KernelRefusal::unsupported(crate::KernelStage::Classify, "thread_space", format!("threadSweep: {message}"));
     tool.check().map_err(fail)?;
     if radii.len() < 2 || count < 8 {
@@ -688,29 +723,36 @@ fn traced_space(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, pitch: 
     let mid = radii.len() / 2;
     let mut sections: Vec<Vec<Vec3>> = vec![Vec::new(); radii.len()];
     let mut centres = vec![0.0; radii.len()];
-    let (first, centre, delta) = slice(tool, motion, blank, pitch, radii[mid], seed, count).map_err(fail)?;
+    let (first, centre, delta) = slice(tool, motion, blank, family, pitch, radii[mid], seed, None, count).map_err(fail)?;
     sections[mid] = first;
     centres[mid] = divider_angle(centre, delta, pitch);
-    let mut near = centre;
+    let middle_delta = delta;
+    let (mut near, mut strip) = (centre, middle_delta);
     for k in (0..mid).rev() {
-        let (points, c, delta) = slice(tool, motion, blank, pitch, radii[k], near, count).map_err(fail)?;
+        let (points, c, delta) = slice(tool, motion, blank, family, pitch, radii[k], near, Some((near, strip)), count).map_err(fail)?;
         sections[k] = points;
-        (centres[k], near) = (divider_angle(c, delta, pitch), c);
+        (centres[k], near, strip) = (divider_angle(c, delta, pitch), c, delta);
     }
-    near = centre;
+    (near, strip) = (centre, middle_delta);
     for k in mid + 1..radii.len() {
-        let (points, c, delta) = slice(tool, motion, blank, pitch, radii[k], near, count).map_err(fail)?;
+        let (points, c, delta) = slice(tool, motion, blank, family, pitch, radii[k], near, Some((near, strip)), count).map_err(fail)?;
         sections[k] = points;
-        (centres[k], near) = (divider_angle(c, delta, pitch), c);
+        (centres[k], near, strip) = (divider_angle(c, delta, pitch), c, delta);
     }
     // The end slices on planes (the loft's end caps must be planar) square to the radius through
     // their middle: the inner one no farther out than the bore at the slice's widest angle from
     // that radius (so no part of the ring lies behind it), the outer one no nearer than the rim.
     let (o, d, _, _) = gear_frame(motion);
-    if !(radii[0] < blank.inner && radii[radii.len() - 1] > blank.outer) {
-        return Err(fail(format!("the end slices ({} and {}) must lie inside the bore and outside the rim ({} and {})", radii[0], radii[radii.len() - 1], blank.inner, blank.outer)));
+    let (low, high) = match family {
+        Family::Cylinders => (blank.inner, blank.outer),
+        Family::Planes => (blank.bottom, blank.face),
+    };
+    if !(radii[0] < low && radii[radii.len() - 1] > high) {
+        return Err(fail(format!("the end slices ({} and {}) must lie beyond the blank ({low} and {high})", radii[0], radii[radii.len() - 1])));
     }
-    for (k, outer) in [(0usize, false), (radii.len() - 1, true)] {
+    // (Plane slices are planar already.)
+    let ends: &[(usize, bool)] = if family == Family::Cylinders { &[(0, false), (radii.len() - 1, true)] } else { &[] };
+    for &(k, outer) in ends {
         let centre = sections[k].iter().fold(Vec3::new(0.0, 0.0, 0.0), |a, q| a.add(*q)).scale(1.0 / count as f64);
         let off = centre.sub(o);
         let normal = off.sub(d.scale(off.dot(d))).normalized().map_err(|e| fail(e))?;
@@ -749,6 +791,164 @@ pub fn thread_gear(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, teet
     thread_cut_gear(tool, motion, blank, teeth, &radii, 0.5 * TAU / teeth.max(1) as f64, 180)
 }
 
+/// The wheel the thread cuts across the rim of `blank` (a ring from `inner`, 0 for a disk, to its
+/// rim at `outer`, between the planes at `bottom` and `face`; `face_outer` unused), its `teeth`
+/// spaces alike, at the kernel's own resolution: plane slices square to the wheel's axis (13
+/// from 0.7/12 of its thickness below it to as far above, one a twelfth beyond each side; failing
+/// that, two other layouts, and then the same nearer the blank), 180 points each. See
+/// [`thread_cut_wheel`].
+pub fn thread_wheel(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, teeth: usize) -> Result<crate::BrepSolid, crate::KernelRefusal> {
+    let thick = blank.face - blank.bottom;
+    // The cut of the space from the cell can miss a crossing where a slice stands close to a
+    // cap (the cases' worm wheel at 13 slices from 0.4/12 of the thickness beyond it does), so
+    // a few layouts are tried in turn, the first that builds taken; each result is validated by
+    // the cut and the sew as always.
+    // The end slices stand a twelfth of the thickness beyond the blank, or nearer (a 24th, a 48th)
+    // where the tool does not reach so far.
+    // The layouts are first tried with the booleans' perturbation ladder off (a layout whose cut
+    // is degenerate refuses at once, where the ladder spent a minute on it, and the next layout
+    // is tried); only if every layout refuses are they tried again in turn with it.
+    let layouts = [(13usize, 0.7), (17, 0.3), (11, 0.5)];
+    let mut last = None;
+    for perturbation in [false, true] {
+        for end in [thick / 12.0, thick / 24.0, thick / 48.0] {
+            for (inner, beyond) in layouts {
+                let (from, to) = (blank.bottom - end * beyond, blank.face + end * beyond);
+                let mut levels = vec![blank.bottom - end];
+                levels.extend((0..inner).map(|k| from + (to - from) * k as f64 / (inner - 1) as f64));
+                levels.push(blank.face + end);
+                match thread_cut_wheel_with(tool, motion, blank, teeth, &levels, 0.5 * TAU / teeth.max(1) as f64, 180, perturbation) {
+                    Ok(wheel) => return Ok(wheel),
+                    Err(refusal) => last = Some(refusal),
+                }
+            }
+        }
+    }
+    Err(last.expect("layouts tried"))
+}
+
+/// [`thread_cut_gear`] for a wheel cut across its rim: one space traced on the planes at
+/// `levels` (heights along the wheel's axis) and lofted, the blank's cell about it (a wedge, or
+/// for a ring an annular sector, at each height between radial dividers through that height's
+/// divider angle, lofted from the blank's bottom to its face, the dividers leaning with the teeth)
+/// cut by it, and the cell's faces less those on its dividers copied round the axis and sewn.
+pub fn thread_cut_wheel(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, teeth: usize, levels: &[f64], seed: f64, count: usize) -> Result<crate::BrepSolid, crate::KernelRefusal> {
+    thread_cut_wheel_with(tool, motion, blank, teeth, levels, seed, count, true)
+}
+
+/// [`thread_cut_wheel`] with its booleans' perturbation ladder on or off.
+#[allow(clippy::too_many_arguments)]
+fn thread_cut_wheel_with(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, teeth: usize, levels: &[f64], seed: f64, count: usize, perturbation: bool) -> Result<crate::BrepSolid, crate::KernelRefusal> {
+    let boolean_options = crate::BooleanOptions::default();
+    let boolean = |a: &crate::BrepSolid, b: &crate::BrepSolid, operation: crate::BooleanOperation| {
+        if perturbation { crate::boolean_operation(a, b, operation, &boolean_options) } else { crate::without_perturbation(|| crate::boolean_operation(a, b, operation, &boolean_options)) }
+    };
+    let fail = |message: String| crate::KernelRefusal::unsupported(crate::KernelStage::Classify, "thread_wheel", format!("threadSweep: {message}"));
+    if teeth < 2 || !(blank.inner >= 0.0 && blank.outer > blank.inner && blank.face > blank.bottom) {
+        return Err(fail("a wheel needs two teeth or more and a blank of positive size".into()));
+    }
+    let pitch = TAU / teeth as f64;
+    let (space, dividers) = traced_space(tool, motion, blank, Family::Planes, pitch, levels, seed, count)?;
+    let (o, d, e1, e2) = gear_frame(motion);
+    let middle: Vec<(f64, f64)> = levels.iter().copied().zip(dividers.iter().copied()).collect();
+    let at = |z: f64| -> (f64, f64) {
+        let k = (1..middle.len()).find(|&k| middle[k].0 >= z).unwrap_or(middle.len() - 1);
+        let (a, b) = (middle[k - 1], middle[k]);
+        (z, a.1 + (b.1 - a.1) * (z - a.0) / (b.0 - a.0))
+    };
+    // The wedge reaches a 24th of the thickness past the blank's sides, and a quarter past its rim,
+    // so the blank's own faces bound the cell: none of the wedge's lies on them.
+    let thick = blank.face - blank.bottom;
+    let (low, high) = (blank.bottom - thick / 24.0, blank.face + thick / 24.0);
+    let gap = 0.02 * thick;
+    let mut plan = vec![at(low)];
+    plan.extend(middle.iter().copied().filter(|m| m.0 > low + gap && m.0 < high - gap));
+    plan.push(at(high));
+    if plan.len() < 4 {
+        return Err(fail("the slices give fewer than four divider angles across the wheel".into()));
+    }
+    // One section per height: out from the axis along the divider before the space, round past
+    // the rim to the one after it, and back in.
+    let line = |a: Vec3, b: Vec3| crate::NurbsCurve::new(1, vec![0.0, 0.0, 1.0, 1.0], vec![crate::Vec4::from_point(a, 1.0), crate::Vec4::from_point(b, 1.0)]);
+    let reach = 1.25 * blank.outer;
+    let mut sections = Vec::with_capacity(plan.len());
+    for &(z, a) in &plan {
+        let b = a - pitch;
+        let centre = o.add(d.scale(z));
+        let point = |rho: f64, angle: f64| centre.add(e1.scale(rho * angle.cos())).add(e2.scale(rho * angle.sin()));
+        sections.push(vec![
+            line(centre, point(reach, b)).map_err(fail)?,
+            crate::make_arc(centre, e1, e2, reach, b, a).map_err(fail)?,
+            line(point(reach, a), centre).map_err(fail)?,
+        ]);
+    }
+    let wedge = crate::loft_profile_brep(&sections)?;
+    // The blank itself, exact: its section revolved about the axis, the seam on the far side.
+    let away = 0.5 * (plan[0].1 + plan[plan.len() - 1].1) - 0.5 * pitch + PI;
+    let radial = e1.scale(away.cos()).add(e2.scale(away.sin()));
+    let at_rz = |rho: f64, z: f64| o.add(radial.scale(rho)).add(d.scale(z));
+    let corners = [at_rz(blank.inner, blank.bottom), at_rz(blank.outer, blank.bottom), at_rz(blank.outer, blank.face), at_rz(blank.inner, blank.face)];
+    let profile: Vec<crate::NurbsCurve> = (0..4).map(|k| line(corners[k], corners[(k + 1) % 4])).collect::<Result<_, _>>().map_err(fail)?;
+    let whole = crate::revolve_profile_brep(&profile, o, d, TAU).map_err(fail)?;
+    let piece = boolean(&whole, &wedge, crate::BooleanOperation::Intersect)?;
+    // The wedge's divider faces: those its radial lines sweep (their points spread across the
+    // radius and over the height).
+    let [piece_shell] = wedge.shells.as_slice() else {
+        return Err(fail("the wheel's cell is not one shell".into()));
+    };
+    let samples = |solid: &crate::BrepSolid, face: &crate::topology::FaceRecord| -> Vec<Vec3> {
+        let vertex = |id: u64| solid.vertices.iter().find(|v| v.id == id).map(|v| v.point);
+        let mut points = Vec::new();
+        for e in face.loops.iter().flat_map(|l| &l.coedges).filter_map(|c| solid.edges.iter().find(|e| e.id == c.edge_id)) {
+            points.extend([vertex(e.start_vertex_id), vertex(e.end_vertex_id)].into_iter().flatten());
+            points.extend((1..4).filter_map(|k| e.curve.evaluate(e.t0 + (e.t1 - e.t0) * k as f64 / 4.0).ok()));
+        }
+        points
+    };
+    let radius = |q: Vec3| {
+        let rel = q.sub(o);
+        rel.sub(d.scale(rel.dot(d))).length()
+    };
+    let height = |q: Vec3| q.sub(o).dot(d);
+    let divider_surfaces: Vec<&crate::NurbsSurface> = piece_shell
+        .faces
+        .iter()
+        .filter(|face| {
+            let points = samples(&wedge, face);
+            let spread = |f: &dyn Fn(Vec3) -> f64| points.iter().map(|&q| f(q)).fold(f64::NEG_INFINITY, f64::max) - points.iter().map(|&q| f(q)).fold(f64::INFINITY, f64::min);
+            spread(&radius) > 0.5 * reach && spread(&height) > 0.5 * thick
+        })
+        .map(|face| &face.surface)
+        .collect();
+    if divider_surfaces.len() != 2 {
+        return Err(fail(format!("the wheel's cell has {} divider faces, not two", divider_surfaces.len())));
+    }
+    let cell = boolean(&piece, &space, crate::BooleanOperation::Subtract)?;
+    let [shell] = cell.shells.as_slice() else {
+        return Err(fail("the cut cell is not one shell".into()));
+    };
+    let tolerance = 1e-7 * blank.outer;
+    let on = |q: Vec3| divider_surfaces.iter().any(|surface| crate::project_point_to_surface(surface, q).is_ok_and(|f| f.distance < tolerance));
+    let mut kept = Vec::new();
+    let mut dropped = 0;
+    for face in &shell.faces {
+        let points = samples(&cell, face);
+        if !points.is_empty() && points.iter().all(|&q| on(q)) {
+            dropped += 1;
+        } else {
+            kept.push(face.id);
+        }
+    }
+    if dropped == 0 {
+        return Err(fail("no face of the cut cell lies on its dividers".into()));
+    }
+    let (wheel, report, _) = crate::sew_rotated_copies(&cell, &kept, o, d, pitch, teeth, (2e-8 * blank.outer).max(1e-6))?;
+    if let Some(issue) = report.issues.first() {
+        return Err(fail(format!("the cells do not sew into one valid solid: {issue}")));
+    }
+    Ok(wheel)
+}
+
 /// The angle of a cell divider at a slice whose space's middle is `centre` and strips `delta`.
 fn divider_angle(centre: f64, delta: f64, pitch: f64) -> f64 {
     centre + 0.5 * pitch + 0.4 * delta
@@ -766,7 +966,7 @@ pub fn thread_cut_gear(tool: &ThreadTool, motion: &TwoTurns, blank: &RingBlank, 
         return Err(fail("a gear needs two teeth or more and a ring of positive size".into()));
     }
     let pitch = TAU / teeth as f64;
-    let (space, dividers) = traced_space(tool, motion, blank, pitch, radii, seed, count)?;
+    let (space, dividers) = traced_space(tool, motion, blank, Family::Cylinders, pitch, radii, seed, count)?;
     let (o, d, e1, e2) = gear_frame(motion);
     // The divider after the space by radius, with the ring's own radii as ends.
     let middle: Vec<(f64, f64)> = radii.iter().copied().zip(dividers.iter().copied()).collect();

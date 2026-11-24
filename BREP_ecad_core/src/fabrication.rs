@@ -278,7 +278,8 @@ impl Document {
     /// Lines are in the order of their first reference.
     pub fn electronics_bom_csv(&self) -> String {
         let mut groups: BTreeMap<(String, String), Vec<&str>> = BTreeMap::new();
-        for component in &self.components {
+        // The board's parts: a sheet's parts off the board are on the assembly BOM.
+        for component in self.components.iter().filter(|c| self.on_board(c)) {
             if component.symbol.power_net.is_some() {
                 continue;
             }

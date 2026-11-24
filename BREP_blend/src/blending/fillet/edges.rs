@@ -735,6 +735,111 @@ fn is_seam(solid: &BrepSolid, edge_id: u64) -> bool {
     users == 1
 }
 
+/// `BREP_PICK_AMBIGUOUS_VERTEX` (default on, `=0` picks the nearest edge as
+/// before): a point on the vertex where two edges meet tangent to each other
+/// (a pick at a split arc's or chain's joint) picks both of them, instead of
+/// resolving silently to one.
+fn pick_ambiguous_vertex_on() -> bool {
+    switch!("BREP_PICK_AMBIGUOUS_VERTEX", true)
+}
+
+/// Two edges ending at `point` (within a round-off of each edge's own size)
+/// and tangent there: the pick names neither of them.
+fn ambiguous_tangent_pick(solid: &BrepSolid, point: Vec3) -> Option<(u64, u64)> {
+    // Each edge ending at the point, with its direction out of the vertex
+    // (the chord over a millionth of the edge, scaled before it is normalised).
+    let ends: Vec<(u64, Vec3)> = solid
+        .edges
+        .iter()
+        .filter(|e| !e.degenerate)
+        .filter_map(|edge| {
+            let span = edge.t1 - edge.t0;
+            let (a, b) = (edge.curve.evaluate(edge.t0).ok()?, edge.curve.evaluate(edge.t1).ok()?);
+            let size = a.sub(b).length().max(edge.curve.evaluate(edge.t0 + 0.5 * span).ok()?.sub(a).length());
+            // Within a round-off of the edge's own size, and never past a
+            // millionth (far under the pick's own 1e-3).
+            let near = (1e-9 * (1.0 + size)).min(1e-6);
+            let (t, sign) = if a.sub(point).length() <= near { (edge.t0, 1.0) } else if b.sub(point).length() <= near { (edge.t1, -1.0) } else { return None };
+            // The curve's own derivative there (no chord to round away).
+            let d = edge.curve.derivatives(t, 1).ok()?;
+            let out = d.get(1)?.scale(sign * span.signum());
+            out.normalized().ok().map(|d| (edge.id, d))
+        })
+        .collect();
+    for i in 0..ends.len() {
+        for j in i + 1..ends.len() {
+            if ends[i].0 != ends[j].0 && ends[i].1.dot(ends[j].1) < -1.0 + 1e-8 {
+                return Some((ends[i].0, ends[j].0));
+            }
+        }
+    }
+    None
+}
+
+/// The picks with each one on a tangent joint replaced by a point inside each
+/// of its two edges (the names duplicated alike); `None` where no pick is on
+/// such a joint.
+fn widen_vertex_picks(solid: &BrepSolid, edge_points: &[Vec3], edge_names: Option<&[String]>) -> Option<(Vec<Vec3>, Option<Vec<String>>)> {
+    let inside = |id: u64| -> Option<Vec3> {
+        let edge = solid.edges.iter().find(|e| e.id == id)?;
+        edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)).ok()
+    };
+    let mut widened = false;
+    let mut points = Vec::with_capacity(edge_points.len() + 1);
+    let mut names = edge_names.map(|_| Vec::with_capacity(edge_points.len() + 1));
+    for (k, point) in edge_points.iter().enumerate() {
+        let name = edge_names.and_then(|n| n.get(k)).cloned();
+        match ambiguous_tangent_pick(solid, *point).and_then(|(a, b)| Some((inside(a)?, inside(b)?))) {
+            Some((pa, pb)) => {
+                widened = true;
+                points.extend([pa, pb]);
+                if let Some(names) = names.as_mut() {
+                    names.extend([name.clone().unwrap_or_default(), name.unwrap_or_default()]);
+                }
+            }
+            None => {
+                points.push(*point);
+                if let Some(names) = names.as_mut() {
+                    names.push(name.unwrap_or_default());
+                }
+            }
+        }
+    }
+    // A pair already picked by another point is picked once.
+    let mut seen: Vec<u64> = Vec::new();
+    let mut keep = vec![true; points.len()];
+    for (k, p) in points.iter().enumerate() {
+        if let Ok(id) = resolve_edge_by_point(solid, *p) {
+            if seen.contains(&id) { keep[k] = false; } else { seen.push(id); }
+        }
+    }
+    let points: Vec<Vec3> = points.iter().zip(&keep).filter(|(_, &k)| k).map(|(p, _)| *p).collect();
+    let names = names.map(|n| n.into_iter().zip(keep.iter()).filter(|(_, &k)| k).map(|(n, _)| n).collect());
+    widened.then_some((points, names))
+}
+
+
+thread_local! {
+    /// Open `fillet_edges` calls on this thread: the pick is judged on the
+    /// caller's own body only (inner steps re-read picks on bodies they split).
+    static FILLET_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct FilletDepth;
+
+impl FilletDepth {
+    fn enter() -> (FilletDepth, bool) {
+        let outer = FILLET_DEPTH.with(|d| { let v = d.get(); d.set(v + 1); v == 0 });
+        (FilletDepth, outer)
+    }
+}
+
+impl Drop for FilletDepth {
+    fn drop(&mut self) {
+        FILLET_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Resolve a point within 1e-3 of a trimmed edge.
 pub fn resolve_edge_by_point(solid: &BrepSolid, point: Vec3) -> Result<u64, KernelRefusal> {
     let nearest = crate::topology::nearest_edge(solid, point);
@@ -815,7 +920,21 @@ pub fn fillet_edges(
     // mate split along a smooth meridian so the network's miter closes the
     // crease — and the walls are merged back afterwards
     // (`blend/creased_rim.rs`). Every other selection takes the body as it
-    // came. One straight edge of a convex polyhedron chamfered: one plane clip
+    // came. A pick on the vertex where two tangent edges meet names both of
+    // them (on the caller's own body, `BREP_PICK_AMBIGUOUS_VERTEX`): it is read
+    // as a pick inside each, the pair's name given to both.
+    let (_depth, outer) = FilletDepth::enter();
+    if outer && pick_ambiguous_vertex_on() {
+        if let Some((points, names)) = widen_vertex_picks(solid, edge_points, edge_names) {
+            return fillet_edges(solid, &points, names.as_deref(), radius, chamfer, name);
+        }
+    }
+    // Closed tangent chains whose round is as tight as a corner they turn:
+    // per-edge exact cutters (`pivot_chain.rs`, `BREP_FILLET_PIVOT_CHAIN`).
+    if let Some(built) = super::pivot_chain::pivot_chain(solid, edge_points, edge_names, radius, chamfer, name) {
+        return built;
+    }
+    // One straight edge of a convex polyhedron chamfered: one plane clip
     // (`planar_clip.rs`, `BREP_CHAMFER_PLANAR_CLIP`).
     if chamfer && edge_points.len() == 1 && edge_names.is_none() {
         let mode = super::planar_clip::planar_clip_mode();

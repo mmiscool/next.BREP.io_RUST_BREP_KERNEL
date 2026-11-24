@@ -47,6 +47,35 @@ fn curve_subrange(
     Ok(result)
 }
 
+/// Conservative hull of the carrier interval accepted by
+/// `edge_fraction_at_point`, including its fractional endpoint slack. A
+/// positive-weight B-spline lies in the hull of the controls whose basis
+/// supports meet this interval; no curve fitting or endpoint-only box is used.
+fn guide_carrier_bounds(edge: &EdgeRecord, tolerance: f64) -> Option<crate::spatial::Aabb> {
+    let curve = &edge.curve;
+    let [lo, hi] = curve.domain().ok()?;
+    let span = edge.t1 - edge.t0;
+    if !span.is_finite() || span <= 0.0 || !tolerance.is_finite() || tolerance < 0.0
+        || curve.control_points.iter().any(|p| !p.w.is_finite() || p.w <= 0.0)
+    { return None; }
+    let parameter_slack = span * 1e-7 + 32.0 * f64::EPSILON * lo.abs().max(hi.abs()).max(1.0);
+    let low = (edge.t0 - parameter_slack).max(lo);
+    let high = (edge.t1 + parameter_slack).min(hi);
+    if low > high { return None; }
+    let mut bounds = crate::spatial::Aabb::empty();
+    let mut magnitude = 1.0_f64;
+    let mut count = 0;
+    for (i, control) in curve.control_points.iter().enumerate() {
+        if *curve.knots.get(i)? > high || *curve.knots.get(i + curve.degree + 1)? < low { continue; }
+        let point = control.point().ok()?;
+        if ![point.x, point.y, point.z].iter().all(|v| v.is_finite()) { return None; }
+        magnitude = magnitude.max(point.x.abs()).max(point.y.abs()).max(point.z.abs());
+        bounds.include_point(point);
+        count += 1;
+    }
+    (count > 0).then(|| bounds.expanded(tolerance + 64.0 * f64::EPSILON * (curve.degree + 1) as f64 * magnitude))
+}
+
 fn edge_fraction_at_point(
     edge: &EdgeRecord,
     point: Vec3,
@@ -369,6 +398,18 @@ fn conform_overlapping_one_use_edges_pass(
         .cloned()
         .collect::<Vec<_>>();
     let geometric_tolerance = assembler.tolerance.max(1e-3);
+    // This only rejects guides whose FIRST existing narrow-phase sample is
+    // provably too far from the carrier. Keep candidate order and every
+    // projection/split/weld decision for survivors unchanged.
+    let bounds_check = crate::switch!("BREP_CONFORM_GUIDE_BOUNDS_CHECK", false);
+    let bounds_on = bounds_check || crate::switch!("BREP_CONFORM_GUIDE_BOUNDS", false);
+    let bounds: HashMap<_, _> = if bounds_on {
+        candidates.iter().filter_map(|e| guide_carrier_bounds(e, geometric_tolerance).map(|b| (e.id, b))).collect()
+    } else { HashMap::default() };
+    let guide_starts: HashMap<_, _> = if bounds_on {
+        candidates.iter().filter_map(|e| e.curve.evaluate(e.t0).ok().map(|p| (e.id, p))).collect()
+    } else { HashMap::default() };
+
     // A split landing within the assembler's WELD radius of an endpoint mints a
     // piece whose chordal length is ≤ that same radius — which `Assembler::edge`
     // stamps degenerate on arrival, so the piece can never weld and the rest is
@@ -424,6 +465,7 @@ fn conform_overlapping_one_use_edges_pass(
             candidates.len()
         );
     }
+    let mut bounds_rejected = 0usize;
     let mut plans = HashMap::<u64, Vec<CoedgeRecord>>::default();
     for face in faces.iter() {
         for coedge in face
@@ -462,6 +504,18 @@ fn conform_overlapping_one_use_edges_pass(
                     assembler.edge_boundary_key.get(&other.id).copied(),
                 ) {
                     continue;
+                }
+                if bounds_on {
+                    if let (Some(bound), Some(point)) = (bounds.get(&edge.id), guide_starts.get(&other.id)) {
+                        if [point.x, point.y, point.z].iter().all(|v| v.is_finite()) && !bound.contains(*point) {
+                            bounds_rejected += 1;
+                            if bounds_check {
+                                assert!(!edge_lies_on(other, edge, geometric_tolerance)?,
+                                    "conform guide bounds disagrees with projection: guide {} carrier {}", other.id, edge.id);
+                            }
+                            continue;
+                        }
+                    }
                 }
                 let lies_on = edge_lies_on(other, edge, geometric_tolerance)?;
                 if debug_conform && other.id != edge.id {
@@ -644,7 +698,9 @@ fn conform_overlapping_one_use_edges_pass(
                 let forward = edge_a < edge_b;
                 // A conformance split inherits its parent assembler edge's
                 // original-boundary identity so its pieces re-weld only to
-                // pieces of the SAME original edge, never to a coincident twin.
+                // pieces of the SAME original edge, never to a coincident twin;
+                // and its imprint piece (`SourceEdge::piece`), so a lens's two
+                // section arcs stay two edges through the repair.
                 let parent_key = assembler.edge_boundary_key.get(&edge.id).copied();
                 let parent_constructed = assembler.imprint_edges.contains(&edge.id);
                 let (piece_curve, piece_t0, piece_t1) = if cut_pieces {
@@ -670,6 +726,7 @@ fn conform_overlapping_one_use_edges_pass(
                         name: edge.name.clone(),
                         constructed: parent_constructed,
                         boundary_key: parent_key,
+                        piece: assembler.edge_piece.get(&edge.id).copied(),
                         tangent_side: None,
                     },
                     forward,
@@ -719,6 +776,9 @@ fn conform_overlapping_one_use_edges_pass(
                 plans.insert(coedge.id, replacements);
             }
         }
+    }
+    if bounds_on && crate::imprint::profile_enabled() {
+        profile_line!("conform.guide_bounds candidates={} rejected={} check={}", candidates.len(), bounds_rejected, bounds_check);
     }
     let mut applied = false;
     for face in faces {

@@ -1,12 +1,12 @@
 [package]
 name = "BREP_script_core"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
-homepage = "https://v2.brep.io"
+homepage = "https://next.brep.io"
 rust-version = "1.92"
-description = "The BREP script interpreter core: evaluate one JavaScript file on Boa, call one global function with one JSON argument, and return its JSON result or its refusal. Shared by the PLM server's hooks and the CAD app, native and wasm."
+description = "The next.BREP.io script interpreter core (Rust B-rep CAD): evaluate one JavaScript file on Boa, call one global function with one JSON argument, and return its JSON result or its refusal. Shared by the PLM server's hooks and the CAD app, native and wasm."
 readme = "README.md"
 keywords = ["javascript", "scripting", "boa", "json", "wasm"]
 categories = ["development-tools", "wasm"]

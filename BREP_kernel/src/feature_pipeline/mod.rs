@@ -47,7 +47,7 @@ pub use parts_library::{
     add_part_to_library, add_part_to_library_impl, install_parts_library, missing_library_parts,
     parts_library_json, parts_library_map, parts_library_revision, refresh_library_entry,
     refresh_library_entry_impl, same_build, follow_saved_rows, follow_saved_rows_known, kernel_source_stamp,
-    PartsLibraryEntry, PartsLibraryMap, stable_json_hash,
+    PartsLibraryEntry, PartsLibraryMap, stable_json_hash, part_pin_geometry, PartPinGeometry,
 };
 // Assembly constraint state + lifecycle: the `assembly` history block, the
 // ten constraint schemas, the mate-mapping + solve tail, and the exported

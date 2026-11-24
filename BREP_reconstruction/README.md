@@ -1,5 +1,7 @@
 # BREP_reconstruction
 
+Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_reconstruction` · [licence summary](#licence)
+
 `BREP_reconstruction` owns code that needs both the kernel-free
 `BREP_RANSAC` recognizer and `BREP_kernel`: mesh/metadata conversion,
 carrier-to-kernel conversion, hybrid analytic/faceted reconstruction, STEP
@@ -27,7 +29,18 @@ under:
 `segment_for_hybrid` (crate root) exposes the mesh partition the hybrid builder starts
 from.
 
-It is a library-only package, version 0.24.0. The kernel dependency is pinned
-EXACTLY (`BREP_kernel = "=0.27.0"`), so the two move in lockstep; it also depends on
+It is a library-only package, version 0.25.0. The kernel dependency is pinned
+EXACTLY (`BREP_kernel = "=0.28.0"`), so the two move in lockstep; it also depends on
 `BREP_RANSAC`, `serde` and `web-time`. Licence: the Autodrop3d licence in
 `LICENSE.md`, shipped in the crate.
+
+## Licence
+
+In plain words: the crates are free to use as they are, including in a commercial project. If you
+fix or change something in the kernel, send the change back as a pull request to
+[github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL). If you do not want to share your
+changes, buy a commercial licence from [Autodrop3d LLC](https://autodrop3d.com); with it you never
+have to share your code back.
+
+The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the manifest) and at
+[LICENSE.md](https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL/blob/master/LICENSE.md); if this summary and the file ever differ, the file wins.

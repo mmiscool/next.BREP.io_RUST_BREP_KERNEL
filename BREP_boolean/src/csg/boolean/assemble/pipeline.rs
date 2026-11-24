@@ -159,6 +159,7 @@ fn assemble_fragments_impl(
         edge_use_counts: HashMap::default(),
         edge_first_forward: HashMap::default(),
         edge_boundary_key: HashMap::default(),
+        edge_piece: HashMap::default(),
             imprint_edges: Default::default(),
         next_vertex_id: 1,
         next_edge_id: 1,

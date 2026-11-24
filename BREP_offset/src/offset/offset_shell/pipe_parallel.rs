@@ -59,6 +59,54 @@ pub(super) fn pipe_cones_on() -> bool {
     switch!("BREP_OFFSET_PIPE_CONES", true)
 }
 
+/// `BREP_OFFSET_PIPE_SMOOTH_JOINS` (default on; `=0` restores): an edge whose
+/// two faces meet tangentially all along (no station of `junction_stations`
+/// left, and the two faces' movers carry nine stations of it to one point
+/// within 1e-9) needs no pipe. Both faces move it to the same curve, so it
+/// is one moved edge shared by the two moved faces, and its vertices are one
+/// moved point. A body rounded everywhere (a box grown once) then grows again
+/// by its moved faces alone: a box grown by a then by b is the box grown by
+/// a + b, exactly.
+fn pipe_smooth_joins_on() -> bool {
+    switch!("BREP_OFFSET_PIPE_SMOOTH_JOINS", true)
+}
+
+/// `BREP_OFFSET_PIPE_REVOLVED_CYLINDERS` (default on; `=0` restores): a
+/// partial revolution whose generatrix keeps one distance from its axis is
+/// read as the cylinder it lies on. The rounds this lane writes about a
+/// straight edge are quarter turns, which recognition reads as the general
+/// `Revolution`, so a body the lane grew was declined when grown again and
+/// the general pipeline refused it (brep-conformance chain-offset-twice: a
+/// box offset by 0.2, then by 0.6 or more).
+fn pipe_revolved_cylinders_on() -> bool {
+    switch!("BREP_OFFSET_PIPE_REVOLVED_CYLINDERS", true)
+}
+
+/// The one distance of `generatrix` from the axis through `origin` along
+/// `axis`, read at its ends and seven interior stations, when every reading
+/// agrees to 1e-12 of the radius: the revolved surface then lies on that
+/// cylinder.
+fn constant_radius(generatrix: &NurbsCurve, origin: Vec3, axis: Vec3) -> Result<Option<f64>, KernelRefusal> {
+    let [t0, t1] = generatrix.domain().or_refuse(KernelStage::Refine, "domain")?;
+    let Ok(axis) = axis.normalized() else { return Ok(None) };
+    let radial = |point: Vec3| {
+        let offset = point.sub(origin);
+        offset.sub(axis.scale(offset.dot(axis))).length()
+    };
+    let first = radial(generatrix.evaluate(t0).or_refuse(KernelStage::Refine, "evaluate")?);
+    if !(first > 0.0 && first.is_finite()) {
+        return Ok(None);
+    }
+    for k in 1..=8 {
+        let t = t0 + (t1 - t0) * k as f64 / 8.0;
+        let r = radial(generatrix.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?);
+        if (r - first).abs() > 1e-12 * first.max(1.0) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(first))
+}
+
 pub(super) fn pipe_corners_on() -> bool {
     switch!("BREP_OFFSET_PIPE_CORNERS", true)
 }
@@ -184,6 +232,12 @@ fn mover_of(face: &FaceRecord) -> Result<Option<Mover>, KernelRefusal> {
             }
             mover
         }
+        Some(AnalyticSurface::Revolution { frame, generatrix, .. }) if pipe_revolved_cylinders_on() => {
+            let Some(radius) = constant_radius(generatrix, frame.origin, frame.axis)? else { return Ok(None) };
+            let probe = Mover::Cylinder { origin: frame.origin, axis: frame.axis, radius, sign: 1.0 };
+            let sign = if probe.normal(at).dot(outward) >= 0.0 { 1.0 } else { -1.0 };
+            Mover::Cylinder { origin: frame.origin, axis: frame.axis, radius, sign }
+        }
         Some(AnalyticSurface::Sphere { frame, radius }) => {
             let probe = Mover::Sphere { centre: frame.origin, radius: *radius, sign: 1.0 };
             let sign = if probe.normal(at).dot(outward) >= 0.0 { 1.0 } else { -1.0 };
@@ -307,8 +361,83 @@ fn pipe_surface(spine: &NurbsCurve, first: &Mover, second: &Mover, distance: f64
     if net.iter().flatten().any(|p| !(p.w > 0.0)) {
         return Ok(None);
     }
+    let (degree, knots_u, net) = if pipe_canonical_on() { canonical(degree, spine.degree, knots_u, net) } else { (degree, knots_u, net) };
     let surface = NurbsSurface::new(degree, 2, knots_u, vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0], net).or_refuse(KernelStage::Refine, "NurbsSurface::new")?;
     Ok(Some(surface))
+}
+
+/// `BREP_OFFSET_PIPE_CANONICAL` (default on; `=0` restores the raw net): a
+/// pipe written in the standard form of the surface it is, where it can be
+/// exactly. Raw, a round between two planes on a straight edge is a degree-3
+/// by rational-quadratic net with end weights 1 and 2 + 2k: the right surface,
+/// but not the layout of a cylinder, so the next offset of the grown body
+/// cannot read it as one and refused (brep-conformance chain-offset-twice: a
+/// box offset by a, then by b).
+fn pipe_canonical_on() -> bool {
+    switch!("BREP_OFFSET_PIPE_CANONICAL", true)
+}
+
+/// The net with, where each holds exactly, (a) the arc across the pipe
+/// reparametrised so its end weights are equal (s -> s c / (1 - s + s c),
+/// which keeps s = 0 and 1 where they were, so the rails and their pcurves do
+/// not move; possible when every row carries the same weight ratio) and (b)
+/// each span along the spine reduced to the spine's own degree when the net is
+/// that degree's elevation (a straight spine between faces whose normals do
+/// not turn along it). Either that does not hold is left as it was.
+fn canonical(degree: usize, spine_degree: usize, knots_u: Vec<f64>, mut net: Vec<Vec<Vec4>>) -> (usize, Vec<f64>, Vec<Vec<Vec4>>) {
+    let ratio = |row: &Vec<Vec4>| row[0].w / row[2].w;
+    let first = ratio(&net[0]);
+    let middle = |row: &Vec<Vec4>| row[1].w / (row[0].w * row[2].w).sqrt();
+    let uniform = net.iter().all(|row| (ratio(row) / first - 1.0).abs() <= 1e-12 && (middle(row) / middle(&net[0]) - 1.0).abs() <= 1e-12);
+    if uniform {
+        let c = first.sqrt();
+        for row in net.iter_mut() {
+            row[1] = scaled(row[1], c);
+            row[2] = scaled(row[2], c * c);
+        }
+    }
+    if spine_degree != 1 || degree != 3 {
+        return (degree, knots_u, net);
+    }
+    // Each span of a degree-1 spine elevated to degree 3: P1 = (2 P0 + P3) / 3,
+    // P2 = (P0 + 2 P3) / 3, homogeneous.
+    let spans = (net.len() - 1) / 3;
+    let scale = net.iter().flatten().map(|p| p.x.abs().max(p.y.abs()).max(p.z.abs()).max(p.w.abs())).fold(1.0, f64::max);
+    let near = |a: Vec4, b: Vec4| (a.x - b.x).abs().max((a.y - b.y).abs()).max((a.z - b.z).abs()).max((a.w - b.w).abs()) <= 1e-12 * scale;
+    let mix = |a: Vec4, b: Vec4, wa: f64, wb: f64| Vec4 { x: wa * a.x + wb * b.x, y: wa * a.y + wb * b.y, z: wa * a.z + wb * b.z, w: wa * a.w + wb * b.w };
+    for span in 0..spans {
+        for j in 0..3 {
+            let (p0, p1, p2, p3) = (net[3 * span][j], net[3 * span + 1][j], net[3 * span + 2][j], net[3 * span + 3][j]);
+            if !near(p1, mix(p0, p3, 2.0 / 3.0, 1.0 / 3.0)) || !near(p2, mix(p0, p3, 1.0 / 3.0, 2.0 / 3.0)) {
+                return (degree, knots_u, net);
+            }
+        }
+    }
+    let reduced: Vec<Vec<Vec4>> = (0..=spans).map(|span| net[3 * span].clone()).collect();
+    let mut knots = Vec::with_capacity(spans + 3);
+    let mut breaks: Vec<f64> = Vec::new();
+    for &knot in &knots_u {
+        if breaks.last().is_none_or(|last| knot > *last) {
+            breaks.push(knot);
+        }
+    }
+    knots.push(breaks[0]);
+    knots.extend(breaks.iter().copied());
+    knots.push(breaks[breaks.len() - 1]);
+    (1, knots, reduced)
+}
+
+/// The same surface with its parameters swapped (u for v).
+fn transposed(surface: &NurbsSurface) -> Result<NurbsSurface, KernelRefusal> {
+    let rows = surface.control_points.len();
+    let columns = surface.control_points[0].len();
+    let net = (0..columns).map(|j| (0..rows).map(|i| surface.control_points[i][j]).collect()).collect();
+    NurbsSurface::new(surface.degree_v, surface.degree_u, surface.knots_v.clone(), surface.knots_u.clone(), net).or_refuse(KernelStage::Refine, "NurbsSurface::new")
+}
+
+/// `p` with its weight and coordinates scaled by `factor` (the same point).
+fn scaled(p: Vec4, factor: f64) -> Vec4 {
+    Vec4 { x: p.x * factor, y: p.y * factor, z: p.z * factor, w: p.w * factor }
 }
 
 /// The lane's answer, or `None` when it declines (the caller's refusal stands).
@@ -372,9 +501,17 @@ fn pipe_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<(BrepS
     }
     // (edge, face used forward, face used backward)
     let mut rounds: Vec<(u64, u64, u64)> = Vec::new();
+    // (edge, one face, the other): a tangent join, carried by both moved
+    // faces as one moved edge and needing no pipe.
+    let mut smooth: Vec<(u64, u64, u64)> = Vec::new();
     for (edge_id, edge_uses) in &uses {
         let Some(edge) = edge_by_id.get(edge_id) else { return Ok(None) };
         if edge.degenerate {
+            // A pole: a point every mover of its one face carries to a point
+            // (a corner ball's apex), moved with that face.
+            if pipe_smooth_joins_on() && edge_uses.iter().all(|(face, _)| *face == edge_uses[0].0) {
+                continue;
+            }
             return Ok(None);
         }
         match edge_uses.as_slice() {
@@ -393,6 +530,13 @@ fn pipe_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<(BrepS
                     .expect("its use");
                 let Some((mate, _)) = junction_mate(&faces, face, *edge_id) else { return Ok(None) };
                 let stations = junction_stations(face, coedge, edge, mate)?;
+                // `junction_stations` skips every station where the two faces
+                // meet tangentially, so a join with none left is tangent
+                // all along; the movers' agreement below makes it exact.
+                if pipe_smooth_joins_on() && stations.is_empty() {
+                    smooth.push((*edge_id, *first, *second));
+                    continue;
+                }
                 if stations.is_empty() || !stations.iter().all(JunctionStation::is_convex) {
                     os_debug!("pipe parallel lane: edge {edge_id} is not convex all along");
                     return Ok(None);
@@ -403,10 +547,11 @@ fn pipe_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<(BrepS
             _ => return Ok(None),
         }
     }
-    if rounds.is_empty() {
+    if rounds.is_empty() && smooth.is_empty() {
         return Ok(None);
     }
     rounds.sort();
+    smooth.sort();
     let seams: HashSet<u64> = uses
         .iter()
         .filter(|(_, edge_uses)| matches!(edge_uses.as_slice(), [(first, _), (second, _)] if first == second))
@@ -478,7 +623,44 @@ fn pipe_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<(BrepS
     };
     let mut vertices: Vec<VertexRecord> = Vec::new();
     let mut vertex_of: HashMap<(u64, u64), u64> = HashMap::default(); // (face, source vertex)
+    // Across a tangent join both faces move a shared vertex to one point:
+    // each (face, vertex) is read as its class's least member.
+    let mut class: HashMap<(u64, u64), (u64, u64)> = HashMap::default();
+    fn root(class: &HashMap<(u64, u64), (u64, u64)>, mut key: (u64, u64)) -> (u64, u64) {
+        while let Some(next) = class.get(&key) {
+            if *next == key {
+                break;
+            }
+            key = *next;
+        }
+        key
+    }
+    for (edge_id, first, second) in &smooth {
+        let edge = edge_by_id[edge_id];
+        for vertex in [edge.start_vertex_id, edge.end_vertex_id] {
+            let (a, b) = (root(&class, (*first, vertex)), root(&class, (*second, vertex)));
+            if a != b {
+                let (low, high) = if a < b { (a, b) } else { (b, a) };
+                class.insert(high, low);
+            }
+        }
+        // The two faces' movers agree along the join, or it is no join.
+        for k in 0..=8 {
+            let t = edge.t0 + (edge.t1 - edge.t0) * k as f64 / 8.0;
+            let point = edge.curve.evaluate(t).or_refuse(KernelStage::Refine, "evaluate")?;
+            let gap = movers[first].moved(point, distance).sub(movers[second].moved(point, distance)).length();
+            if gap > 1e-9 * (1.0 + point.length()) {
+                os_debug!("pipe parallel lane: tangent edge {edge_id}'s faces move it apart by {gap:.3e}");
+                return Ok(None);
+            }
+        }
+    }
+    let smooth_mate: HashMap<(u64, u64), u64> = smooth
+        .iter()
+        .flat_map(|(edge_id, first, second)| [((*first, *edge_id), *second), ((*second, *edge_id), *first)])
+        .collect();
     let mut vertex = |face: u64, source_vertex: u64, take: &mut dyn FnMut() -> u64, vertices: &mut Vec<VertexRecord>| -> Result<u64, KernelRefusal> {
+        let (face, source_vertex) = root(&class, (face, source_vertex));
         if let Some(id) = vertex_of.get(&(face, source_vertex)) {
             return Ok(*id);
         }
@@ -506,10 +688,13 @@ fn pipe_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<(BrepS
                 t1: edge.t1,
                 start_vertex_id: start,
                 end_vertex_id: end,
-                degenerate: false,
+                degenerate: edge.degenerate,
                 name: None,
             });
             edge_of.insert((face.id, coedge.edge_id), id);
+            if let Some(mate) = smooth_mate.get(&(face.id, coedge.edge_id)) {
+                edge_of.insert((*mate, coedge.edge_id), id);
+            }
         }
     }
     // The moved faces: the source loops over the moved edges, pcurves as they are.
@@ -600,6 +785,17 @@ fn pipe_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<(BrepS
             arcs.insert((*edge_id, edge.start_vertex_id), start_id);
             ((start_id, true), (end_id, true))
         };
+        // A pipe the canonical form left straight along its spine is a
+        // cylinder: written arc-first (u across, v along), the layout of a
+        // cylinder of revolution, so the next offset reads it as one; its
+        // pcurves swap their coordinates with it.
+        let across_first = pipe_canonical_on() && surface.degree_u == 1;
+        let surface = if across_first { transposed(&surface)? } else { surface };
+        let at = |t: f64, s: f64| if across_first { (s, t) } else { (t, s) };
+        let segment = |a: (f64, f64), b: (f64, f64)| {
+            let ((u0, v0), (u1, v1)) = (at(a.0, a.1), at(b.0, b.1));
+            line(u0, v0, u1, v1)
+        };
         let mut face = FaceRecord {
             id: take(),
             surface,
@@ -608,10 +804,10 @@ fn pipe_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<(BrepS
             loops: vec![LoopRecord {
                 id: take(),
                 coedges: vec![
-                    CoedgeRecord { id: take(), edge_id: rail_low, forward: true, pcurve: line(t0, 0.0, t1, 0.0)? },
-                    CoedgeRecord { id: take(), edge_id: end_arc.0, forward: end_arc.1, pcurve: line(t1, 0.0, t1, 1.0)? },
-                    CoedgeRecord { id: take(), edge_id: rail_high, forward: false, pcurve: line(t1, 1.0, t0, 1.0)? },
-                    CoedgeRecord { id: take(), edge_id: start_arc.0, forward: start_arc.1, pcurve: line(t0, 1.0, t0, 0.0)? },
+                    CoedgeRecord { id: take(), edge_id: rail_low, forward: true, pcurve: segment((t0, 0.0), (t1, 0.0))? },
+                    CoedgeRecord { id: take(), edge_id: end_arc.0, forward: end_arc.1, pcurve: segment((t1, 0.0), (t1, 1.0))? },
+                    CoedgeRecord { id: take(), edge_id: rail_high, forward: false, pcurve: segment((t1, 1.0), (t0, 1.0))? },
+                    CoedgeRecord { id: take(), edge_id: start_arc.0, forward: start_arc.1, pcurve: segment((t0, 1.0), (t0, 0.0))? },
                 ],
             }],
         };
@@ -619,9 +815,10 @@ fn pipe_parallel_impl(source: &BrepSolid, distance: f64) -> Result<Option<(BrepS
         // follows it, and its normal must then point away from the spine.
         face.same_sense = parameter_space_area(&face).or_refuse(KernelStage::Refine, "parameter_space_area")? > 0.0;
         let (tm, sm) = ((t0 + t1) * 0.5, 0.5);
-        let outward = super::face_normal(&face, tm, sm)?;
+        let (um, vm) = at(tm, sm);
+        let outward = super::face_normal(&face, um, vm)?;
         let spine = edge.curve.evaluate(tm).or_refuse(KernelStage::Refine, "evaluate")?;
-        if outward.dot(face.surface.evaluate(tm, sm).or_refuse(KernelStage::Refine, "evaluate")?.sub(spine)) <= 0.0 {
+        if outward.dot(face.surface.evaluate(um, vm).or_refuse(KernelStage::Refine, "evaluate")?.sub(spine)) <= 0.0 {
             os_debug!("pipe parallel lane: edge {edge_id}'s pipe would face its spine");
             return Ok(None);
         }

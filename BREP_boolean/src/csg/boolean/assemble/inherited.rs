@@ -587,6 +587,12 @@ fn volume_reference_trace(before: &Option<HashMap<u64, ShellTraceRead>>, after: 
 
 /// Distant edges may reuse a clean content reading, but an unseen or changed
 /// imported trim must still be challenged. Distance alone certifies no repair.
+/// `BREP_INHERITED_READ_BEFORE_FITS` (default on): see
+/// [`challenge_inherited_trims_scoped`]'s early body read.
+fn inherited_read_before_fits_enabled() -> bool {
+    crate::switch!("BREP_INHERITED_READ_BEFORE_FITS", true)
+}
+
 pub fn challenge_inherited_trims_scoped(
     solid: &mut BrepSolid,
     tolerance: f64,
@@ -632,7 +638,15 @@ pub fn challenge_inherited_trims_scoped(
     // Taking that reading early costs a scan the pass skips when no move is
     // accepted, so only a body whose trims hold enough knot spans to near the
     // scan's budget is read early (the result is the same either way).
-    let read_early = crate::heal::trim_knot_spans(solid) >= crate::soundness::VECTOR_AREA_SPAN_BUDGET / 4;
+    // INHERITED READ BEFORE FITS (`BREP_INHERITED_READ_BEFORE_FITS`, default
+    // on, `=0` keeps the span gate alone): every body is read before its first
+    // fit. The read is still lazy (taken only when a pair asks for a fit), and
+    // it costs one scan where fits are declined on a readable body. A helmet
+    // whose scan is unreadable fitted 113 pairs (23.5 s of a 53 s subtract),
+    // admitted 80 and sent every one back at the body gate; read first, the
+    // pass halts before any fit and the result is the same bytes.
+    let read_early = inherited_read_before_fits_enabled()
+        || crate::heal::trim_knot_spans(solid) >= crate::soundness::VECTOR_AREA_SPAN_BUDGET / 4;
     let mut halted = false;
     for edge in edges {
         if edge.degenerate || !(edge.t1 != edge.t0) || constructed.contains(&edge.id) {

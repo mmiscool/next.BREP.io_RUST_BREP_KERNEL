@@ -1,6 +1,68 @@
 use super::*;
 
 impl<'a> SolidBuilder<'a> {
+    /// A face on a surface closed in BOTH directions (a whole torus) whose
+    /// only bound is a VERTEX_LOOP becomes the torus our own primitive builds:
+    /// the two iso circles through that vertex (the u = u0 tube circle and the
+    /// v = v0 major circle) as seam edges, each used twice by one loop around
+    /// the chart's rectangle. Read as written, the one degenerate edge left the
+    /// face with V − E + F = 1, an impossible characteristic for a closed
+    /// surface: ABC 00002089 has a whole ring torus (a one-face solid, radii
+    /// 1.07 .. 2.33 from its centre) refused at validation. Only a vertex at a
+    /// corner of the chart is handled (where the two seams cross); anything
+    /// else is left as read. `BREP_STEP_VERTEX_LOOP_TORUS=0` leaves every face
+    /// as read.
+    pub(super) fn close_vertex_loop_tori(&mut self, faces: &mut [PendingFace]) -> Result<(), String> {
+        if !crate::switch!("BREP_STEP_VERTEX_LOOP_TORUS", true) {
+            return Ok(());
+        }
+        let mut replaced: Vec<u64> = Vec::new();
+        for face in faces.iter_mut() {
+            if face.bounds.len() != 1 || face.bounds[0].0.len() != 1 {
+                continue;
+            }
+            let degenerate_id = face.bounds[0].0[0].0;
+            let edge = self.edge_record(degenerate_id).clone();
+            if !edge.degenerate || edge.start_vertex_id != edge.end_vertex_id {
+                continue;
+            }
+            let surface = &face.surface;
+            if surface.closed_directions()? != (true, true) {
+                continue;
+            }
+            let [u0, _] = surface.domain_u()?;
+            let [v0, _] = surface.domain_v()?;
+            let point = self.vertex_point(edge.start_vertex_id);
+            let corner = surface.evaluate(u0, v0)?;
+            let band = 1e-6 * (1.0 + point.length());
+            if corner.sub(point).length() > band {
+                continue;
+            }
+            let tube = surface.iso_curve_u(u0)?;
+            let major = surface.iso_curve_v(v0)?;
+            let [tube_t0, tube_t1] = tube.domain()?;
+            let [major_t0, major_t1] = major.domain()?;
+            let (tube_id, major_id) = (self.fresh(), self.fresh());
+            let vertex = edge.start_vertex_id;
+            self.edges.push(EdgeRecord { id: major_id, curve: major, t0: major_t0, t1: major_t1, start_vertex_id: vertex, end_vertex_id: vertex, degenerate: false, name: None });
+            self.edges.push(EdgeRecord { id: tube_id, curve: tube, t0: tube_t0, t1: tube_t1, start_vertex_id: vertex, end_vertex_id: vertex, degenerate: false, name: None });
+            self.rebuild_edge_index();
+            // Around the chart's rectangle from (u0, v0): along u on the major
+            // circle, up v on the tube at u1, back along u, down v at u0.
+            face.bounds[0].0 = vec![(major_id, true), (tube_id, true), (major_id, false), (tube_id, false)];
+            replaced.push(degenerate_id);
+        }
+        // The vertex loops' degenerate edges, now bounding nothing.
+        let still_used: std::collections::HashSet<u64> =
+            faces.iter().flat_map(|face| &face.bounds).flat_map(|(specs, _)| specs.iter().map(|(id, _)| *id)).collect();
+        let before = self.edges.len();
+        self.edges.retain(|edge| !replaced.contains(&edge.id) || still_used.contains(&edge.id));
+        if self.edges.len() != before {
+            self.rebuild_edge_index();
+        }
+        Ok(())
+    }
+
     /// Pre-pass over all faces: re-seat OCC full-cylinder/cone rim circles onto
     /// the surface seam meridian.
     ///

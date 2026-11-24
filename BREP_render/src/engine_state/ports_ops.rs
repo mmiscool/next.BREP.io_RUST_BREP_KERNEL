@@ -27,6 +27,9 @@ pub enum PortRefField {
     Point,
     /// `directionRef` — the geometry it faces along.
     Direction,
+    /// `contactBody` — the SOLID that is the point's contact (a pin that is a
+    /// whole body). It seats what the two references leave empty.
+    Body,
 }
 
 impl PortRefField {
@@ -35,6 +38,7 @@ impl PortRefField {
         match self {
             PortRefField::Point => "pointRef",
             PortRefField::Direction => "directionRef",
+            PortRefField::Body => "contactBody",
         }
     }
 
@@ -43,6 +47,7 @@ impl PortRefField {
         match self {
             PortRefField::Point => "Seat this connection point on",
             PortRefField::Direction => "Point it along",
+            PortRefField::Body => "The contact body of",
         }
     }
 
@@ -50,11 +55,13 @@ impl PortRefField {
     /// implies no direction, so it is offered to `pointRef` alone; SOLID is
     /// offered to neither, because a click meant for a face that landed on the
     /// body instead would seat the point at the body's centre, which is never
-    /// what the click meant.
+    /// what the click meant. The contact body is the one field that wants a
+    /// SOLID, and only a solid.
     pub fn filter(self) -> Vec<String> {
         let kinds: &[&str] = match self {
             PortRefField::Point => &["VERTEX", "EDGE", "FACE", "PLANE"],
             PortRefField::Direction => &["EDGE", "FACE", "PLANE"],
+            PortRefField::Body => &["SOLID"],
         };
         kinds.iter().map(|kind| (*kind).to_string()).collect()
     }
@@ -242,7 +249,7 @@ impl EngineState {
         let was_seated = self
             .declared_point_value(address)
             .map(|point| {
-                ["pointRef", "directionRef"].iter().any(|key| {
+                ["pointRef", "directionRef", "contactBody"].iter().any(|key| {
                     point
                         .get(*key)
                         .and_then(Value::as_str)
