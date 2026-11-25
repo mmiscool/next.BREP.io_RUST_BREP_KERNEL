@@ -3,7 +3,7 @@
 Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_surface_offset` · [licence summary](#licence)
 
 `BREP_surface_offset` holds the surface offsets of the BREP kernel. Its Rust library
-target is `brep_surface_offset`; this is version **0.29.0**.
+target is `brep_surface_offset`; this is version **0.30.0**.
 
 It is one of the implementation crates the kernel is built from. Applications
 should depend on [`BREP_kernel`](https://crates.io/crates/BREP_kernel), which

@@ -102,11 +102,8 @@ fn split_self_touching_source(source: &BrepSolid) -> Result<Option<BrepSolid>, K
             .map(|split| split.edge_id)
             .collect::<Vec<_>>(),
     );
-    let imprint = ImprintResultRecord {
-        faces_in_unproved_pairs: None,
-        edge_splits,
-        ..empty_imprint()
-    };
+    let mut imprint = empty_imprint();
+    imprint.edge_splits = edge_splits;
     Ok(Some(apply_edge_splits(source, SOURCE_OPERAND, &imprint)?))
 }
 

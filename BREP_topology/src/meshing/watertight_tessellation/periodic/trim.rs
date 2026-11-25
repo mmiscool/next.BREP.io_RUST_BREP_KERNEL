@@ -465,6 +465,37 @@ fn close_periodic_trim_dir(
             holes.push(chain.clone());
         }
     }
+    // RIM-ONLY POLE CAP (`BREP_TESS_RIM_POLE_CAP`, default on, `=0` restores; `check`
+    // reports): a cap whose
+    // one loop is its rim, the pole written as no edge at all (a STEP drill
+    // point: a cone face bounded by the hole's bottom circle alone), is the band
+    // from the rim to the cross end where the surface collapses to one point.
+    // That pole is given its ring here; with neither or both ends collapsed the
+    // face keeps its path. Without it the rim alone is a zero-area polygon and
+    // the generic path sprays the cap (2.4x its area, a 0-volume mesh).
+    let rim_pole_cap_check = crate::env_read!("BREP_TESS_RIM_POLE_CAP").as_deref() == Some("check");
+    if rings.len() == 1 && !rings[0].pole && holes.is_empty() && (rim_pole_cap_enabled() || rim_pole_cap_check) {
+        let collapsed_at = |q: f64| -> Option<Vec3> {
+            let at = |p: f64| if p_is_u { face.surface.evaluate(p, q) } else { face.surface.evaluate(q, p) };
+            let first = at(p0).ok()?;
+            let band = chord_tolerance.max(1e-9) * 1e-3;
+            (1..=8)
+                .all(|k| at(p0 + period * k as f64 / 8.0).ok().is_some_and(|point| point.sub(first).length() <= band))
+                .then_some(first)
+        };
+        let pole = match (collapsed_at(q0), collapsed_at(q1)) {
+            (Some(point), None) => Some((q0, point)),
+            (None, Some(point)) => Some((q1, point)),
+            _ => None,
+        };
+        if let (Some((level, _)), true) = (pole, rim_pole_cap_check) {
+            eprintln!("TESS_RIM_POLE_CAP: a rim-only cap would be closed at its pole (cross level {level:.6}); the switch meshes it so");
+        } else if let Some((level, position)) = pole {
+            let uv = if p_is_u { [p0, level] } else { [level, p0] };
+            let vertex = FaceVertex { uv, position };
+            rings.push(PeriodicRing { level, points: vec![vertex], pole: true, raw: vec![vertex], direction: 0 });
+        }
+    }
     // A wall has exactly two cross-level boundaries; at least one must be a rim
     // (two poles would be an isolated point, not a surface patch).
     if rings.len() != 2 || rings.iter().all(|ring| ring.pole) {
@@ -613,4 +644,10 @@ fn close_periodic_trim_dir(
         polygon = bridge_holes(polygon, holes);
     }
     Ok(Some((polygon, wraps_cross_seam)))
+}
+
+/// `BREP_TESS_RIM_POLE_CAP` (default on, `=0` restores; `check` reports each cap it would
+/// close and meshes it as before): see `close_periodic_trim_dir`.
+fn rim_pole_cap_enabled() -> bool {
+    crate::switch!("BREP_TESS_RIM_POLE_CAP", true)
 }

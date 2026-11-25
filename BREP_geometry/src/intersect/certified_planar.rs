@@ -62,11 +62,28 @@ fn midpoint(controls:&[P])->P {
 }
 
 #[derive(Clone)]
-struct Span { controls:Vec<P>, start:f64, end:f64 }
+struct Span { controls:Vec<P>, tangents:Vec<P>, start:f64, end:f64 }
 impl Span {
     fn split(self)->Option<(Self,Self)> {
         let middle=self.start*0.5+self.end*0.5;
         if middle<=self.start || middle>=self.end { return None; }
+        let (mut dl,mut dr)=(Vec::new(),Vec::new());
+        if !self.tangents.is_empty() {
+            // Subdivide the derivative polynomial independently: subtracting
+            // deep position enclosures loses the small tangent to cancellation.
+            let mut work=self.tangents;
+            dl.push(work[0]);dr.push(*work.last()?);
+            while work.len()>1 {
+                work=work.windows(2).map(|p|blend(p[0],p[1],I::point(0.5))).collect();
+                dl.push(work[0]);dr.push(*work.last()?);
+            }
+            dr.reverse();
+            // Each child uses its own unit parameter, so its derivative is
+            // half the parent's derivative restricted to that half interval.
+            for point in dl.iter_mut().chain(&mut dr) {
+                for value in point { *value=*value*I::point(0.5); }
+            }
+        }
         let mut work=self.controls;
         let mut left=vec![work[0]];let mut right=vec![*work.last()?];
         while work.len()>1 {
@@ -74,13 +91,18 @@ impl Span {
             left.push(work[0]);right.push(*work.last()?);
         }
         right.reverse();
-        Some((Self{controls:left,start:self.start,end:middle},Self{controls:right,start:middle,end:self.end}))
+        Some((Self{controls:left,tangents:dl,start:self.start,end:middle},Self{controls:right,tangents:dr,start:middle,end:self.end}))
     }
     fn bounds(&self)->P {
         [0,1,2].map(|i|I::range(self.controls.iter().map(|p|p[i].lo).fold(f64::INFINITY,f64::min),
             self.controls.iter().map(|p|p[i].hi).fold(f64::NEG_INFINITY,f64::max)))
     }
     fn derivative(&self)->P {
+        if !self.tangents.is_empty() {
+            return [0,1,2].map(|i|I::range(
+                self.tangents.iter().map(|p|p[i].lo).fold(f64::INFINITY,f64::min),
+                self.tangents.iter().map(|p|p[i].hi).fold(f64::NEG_INFINITY,f64::max)));
+        }
         let n=I::point((self.controls.len()-1) as f64);
         [0,1,2].map(|i| {
             let d:Vec<_>=self.controls.windows(2).map(|p|n*(p[1][i]-p[0][i])).collect();
@@ -91,7 +113,7 @@ impl Span {
 
 /// Bezier extraction with outward-rounded control arithmetic, including the
 /// knot ratios. Only constant positive weights are supported here.
-fn spans(curve:&NurbsCurve)->Option<Vec<Span>> {
+fn spans(curve:&NurbsCurve,derivative_net:bool,origin:Option<[f64;3]>)->Option<Vec<Span>> {
     curve.domain().ok()?;
     let p=curve.degree;let knots=&curve.knots;let n=curve.control_points.len();
     if p==0 || p>8 || n>4096 || knots.len()!=n+p+1 { return None; }
@@ -110,7 +132,12 @@ fn spans(curve:&NurbsCurve)->Option<Vec<Span>> {
         let a=I::point(xyz[0]).divide(I::point(weight))?;
         let b=I::point(xyz[1]).divide(I::point(weight))?;
         let c=I::point(xyz[2]).divide(I::point(weight))?;
-        [a,b,c].iter().all(|v|v.lo.abs().max(v.hi.abs())<1e100).then_some([a,b,c])
+        let point=[a,b,c];
+        if !point.iter().all(|v|v.lo.abs().max(v.hi.abs())<1e100) {return None;}
+        Some(match origin {
+            Some(origin)=>[0,1,2].map(|i|point[i]-I::point(origin[i])),
+            None=>point,
+        })
     }).collect::<Option<_>>()?;
     let (mut a,mut b)=(p,p+1);let m=knots.len()-1;let zero=[I::point(0.);3];
     let mut controls=points[..=p].to_vec();let mut result=Vec::new();
@@ -133,7 +160,11 @@ fn spans(curve:&NurbsCurve)->Option<Vec<Span>> {
                 if b<m {next[r-j]=controls[p];}
             }
         }
-        result.push(Span{controls,start:knots[a],end:knots[b]});
+        let tangents=if derivative_net {
+            let n=I::point((controls.len()-1) as f64);
+            controls.windows(2).map(|pair|[0,1,2].map(|i|n*(pair[1][i]-pair[0][i]))).collect()
+        } else {Vec::new()};
+        result.push(Span{controls,tangents,start:knots[a],end:knots[b]});
         if b>=m {break;}
         for i in p-mult..=p {next[i]=points[b-p+i];}
         controls=next;a=b;b+=1;
@@ -261,6 +292,39 @@ fn refine(first:&NurbsCurve,second:&NurbsCurve,a:&Span,b:&Span,k:[I;2],axes:[usi
 /// unresolved boundary roots and positive-dimensional overlaps. The caller
 /// must retain its ordinary path on `None`; a partial answer is never exposed.
 pub fn intersections(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64)->Option<Vec<CurveCurveIntersection>> {
+    let enabled=crate::switch!("BREP_CERTIFIED_PROFILE_DERIVATIVE_NET",true);
+    let check=crate::switch!("BREP_CERTIFIED_PROFILE_DERIVATIVE_NET_CHECK",false);
+    let result=intersections_with_frames(first,second,tolerance,enabled);
+    if check {
+        let alternate=intersections_with_frames(first,second,tolerance,!enabled);
+        let signature=|roots:&Option<Vec<CurveCurveIntersection>>| roots.as_ref().map(|roots| {
+            roots.iter().map(|r| (r.s.to_bits(),r.t.to_bits(),r.point.x.to_bits(),
+                r.point.y.to_bits(),r.point.z.to_bits(),r.gap.to_bits(),r.tangential)).collect::<Vec<_>>()
+        });
+        if signature(&result)!=signature(&alternate) {
+            let (old,new)=if enabled {(&alternate,&result)} else {(&result,&alternate)};
+            eprintln!("CERTIFIED_PROFILE_DERIVATIVE_NET old={:?} new={:?} applied={enabled}",
+                old.as_ref().map(Vec::len),new.as_ref().map(Vec::len));
+        }
+    }
+    result
+}
+
+fn intersections_with_frames(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64,derivative_net:bool)->Option<Vec<CurveCurveIntersection>> {
+    let base=intersections_impl(first,second,tolerance,derivative_net,false);
+    if base.is_some() {return base;}
+    let enabled=crate::switch!("BREP_CERTIFIED_PROFILE_LOCAL_FRAME",true);
+    let check=crate::switch!("BREP_CERTIFIED_PROFILE_LOCAL_FRAME_CHECK",false);
+    if !enabled && !check {return base;}
+    let candidate=intersections_impl(first,second,tolerance,derivative_net,true);
+    if check && candidate.is_some() {
+        eprintln!("CERTIFIED_PROFILE_LOCAL_FRAME old=None new={:?} applied={enabled}",
+            candidate.as_ref().map(Vec::len));
+    }
+    if enabled {candidate} else {base}
+}
+
+fn intersections_impl(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64,derivative_net:bool,local_frame:bool)->Option<Vec<CurveCurveIntersection>> {
     if !tolerance.is_finite() || tolerance<=0. {return None;}
     let mut low=[f64::INFINITY;3];let mut high=[f64::NEG_INFINITY;3];
     for p in first.control_points.iter().chain(&second.control_points) {
@@ -271,18 +335,44 @@ pub fn intersections(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64)->Option
         let area=|axes:[usize;2]|(high[axes[0]]-low[axes[0]])*(high[axes[1]]-low[axes[1]]);
         area(*a).total_cmp(&area(*b))
     })?;
-    let a=spans(first)?;let b=spans(second)?;
+    let initial_origin=local_frame.then(||[0,1,2].map(|i|low[i]*0.5+high[i]*0.5));
+    let a=spans(first,derivative_net,initial_origin)?;
+    let b=spans(second,derivative_net,initial_origin)?;
     let mut stack=Vec::new();
-    if a.len().checked_mul(b.len())?>65536 {return None;}
-    for x in a {for y in &b {stack.push((x.clone(),y.clone(),0));}}
+    let pairs=a.len().checked_mul(b.len())?;
+    if pairs>65536 {return None;}
+    if local_frame && pairs.checked_mul(first.control_points.len().checked_add(second.control_points.len())?)?>1_048_576 {
+        return None;
+    }
+    for (i,x) in a.iter().enumerate() {for (j,y) in b.iter().enumerate() {
+        if let Some(origin)=initial_origin {
+            // Re-extract, rather than translate already widened controls.
+            // Each original parameter rectangle retains one shared frame
+            // through all descendants, preserving its equation and Jacobian.
+            let px=midpoint(&x.controls);let py=midpoint(&y.controls);
+            let origin=[0,1,2].map(|k|origin[k]+px[k].mid()*0.5+py[k].mid()*0.5);
+            let xs=spans(first,derivative_net,Some(origin))?;
+            let ys=spans(second,derivative_net,Some(origin))?;
+            stack.push((xs[i].clone(),ys[j].clone(),0,Some(origin)));
+        } else {
+            stack.push((x.clone(),y.clone(),0,None));
+        }
+    }}
     let mut roots=Vec::new();let mut boxes=0;
-    while let Some((a,b,depth))=stack.pop() {
+    while let Some((a,b,depth,origin))=stack.pop() {
         boxes+=1;if boxes>65536 {return None;}
         if separated(&a,&b,axes) {continue;}
         match krawczyk(&a,&b,axes) {
             Read::Empty=>continue,
             Read::Unique(k)=>{
-                let (ea,eb)=tighten_unique(&a,&b,axes,tolerance)?;
+                let (mut ea,mut eb)=tighten_unique(&a,&b,axes,tolerance)?;
+                if let Some(origin)=origin {
+                    ea=[0,1,2].map(|i|ea[i]+I::point(origin[i]));
+                    eb=[0,1,2].map(|i|eb[i]+I::point(origin[i]));
+                    // Restoring a large world offset can widen an enclosure
+                    // by a world-coordinate ulp; local precision is insufficient.
+                    if !small(ea,tolerance) || !small(eb,tolerance) {return None;}
+                }
                 let root=refine(first,second,&a,&b,k,axes,tolerance)?;
                 if !inside(root.point,ea,tolerance) || !inside(second.evaluate(root.t).ok()?,eb,tolerance) {return None;}
                 roots.push(root);continue;
@@ -291,8 +381,8 @@ pub fn intersections(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64)->Option
         }
         if depth>=80 {return None;}
         let size=|s:&Span|s.bounds().iter().map(|v|v.hi-v.lo).fold(0.0,f64::max);
-        if size(&a)>=size(&b) {let (x,y)=a.split()?;stack.push((x,b.clone(),depth+1));stack.push((y,b,depth+1));}
-        else {let (x,y)=b.split()?;stack.push((a.clone(),x,depth+1));stack.push((a,y,depth+1));}
+        if size(&a)>=size(&b) {let (x,y)=a.split()?;stack.push((x,b.clone(),depth+1,origin));stack.push((y,b,depth+1,origin));}
+        else {let (x,y)=b.split()?;stack.push((a.clone(),x,depth+1,origin));stack.push((a,y,depth+1,origin));}
     }
     roots.sort_by(|a,b|a.s.total_cmp(&b.s).then(a.t.total_cmp(&b.t)));
     Some(roots)

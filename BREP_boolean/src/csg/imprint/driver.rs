@@ -1859,11 +1859,17 @@ fn build_imprints_with_carrier_seeds(
             // exchange order, and append missing partial spans after all pairs
             // have run so duplicate sections retain their established IDs and
             // fragment names. Seams are retained by the exact lane itself.
-            let planar_iso = planar_iso_section(
+            // OPERAND WEDGES (`BREP_FEATURE_SCALE_OPERAND_WEDGES`): a tilted
+            // pair FeatureScale registered is sectioned below the usual angle.
+            let operand_wedge = crate::feature_scale::operand_wedges_mode() == crate::env_read::Mode::On && {
+                let (zero, one) = if first.operand == 0 { (first.face.id, second.face.id) } else { (second.face.id, first.face.id) };
+                first.operand != second.operand && tail_feature_scale.operand_wedge(zero, one)
+            };
+            let planar_iso = super::support::with_operand_wedge_pair(operand_wedge, || planar_iso_section(
                 &first.face.surface,
                 &second.face.surface,
                 options.tolerance,
-            )?;
+            ))?;
             profile.planar_iso += profile.lap(&mut lap_start);
             let analytic = if witness_apart { certified_sections } else { crate::intersect_analytic_pair(
                 &first.face.surface,

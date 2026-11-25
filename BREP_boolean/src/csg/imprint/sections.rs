@@ -596,6 +596,46 @@ fn reuse_hull_gate_enabled() -> bool {
 /// straddling face now keeps its cut (whose pcurve rebuild then fails the
 /// carrier floor, so the true section cuts both carriers). On by default;
 /// `0`/`off` restores the unconditional two-sided drop.
+fn ring_cosurface_carrier_enabled() -> bool {
+    switch!("BREP_SHARED_RING_COSURFACE_CARRIER", true)
+}
+
+/// What [`ring_carrier_floor`] is asked about: whether the reuse is a closed
+/// ring, whether `BREP_SHARED_RING_COSURFACE_CARRIER` is on, and the face the
+/// reused boundary would newly cut.
+#[derive(Clone, Copy)]
+struct RingReuse {
+    ring: bool,
+    enabled: bool,
+    kept: FaceKey,
+}
+
+/// How far a reused boundary may stand off a face it newly cuts: the import
+/// floor, or the weld gate for a ring reused onto a face read as one surface
+/// (`pairs`) with a face that carries the ring (`carries_rim`) and on which the
+/// ring lies within the import floor (`own_residual`).
+fn ring_carrier_floor(
+    reuse: RingReuse,
+    pairs: &[(FaceKey, FaceKey)],
+    carries_rim: impl Fn(FaceKey) -> bool,
+    own_residual: impl Fn(FaceKey) -> Option<f64>,
+    tolerance: f64,
+    weld_gate: f64,
+) -> f64 {
+    let import_floor = tolerance.max(1e-7);
+    if !reuse.ring || !reuse.enabled {
+        return import_floor;
+    }
+    let partner = |&(first, second): &(FaceKey, FaceKey)| {
+        if first == reuse.kept { Some(second) } else if second == reuse.kept { Some(first) } else { None }
+    };
+    let gap_explained = pairs.iter().filter_map(partner).any(|face| {
+        carries_rim(face) && own_residual(face).is_some_and(|residual| residual <= import_floor)
+    });
+    if gap_explained { weld_gate } else { import_floor }
+}
+
+
 fn shared_section_straddle_enabled() -> bool {
     switch!("BREP_SHARED_SECTION_STRADDLE", true)
 }
@@ -663,6 +703,8 @@ pub(super) fn reuse_boundary_section_edges(
         /// (the owning face included). See the two-sided note at the apply
         /// loop: a face in this list must not be cut.
         redundant: Vec<FaceKey>,
+        /// A closed ring reusing a closed boundary edge.
+        ring: bool,
     }
     // Decide first (immutable borrow of result.pieces), apply after.
     let mut decisions: Vec<Reuse> = Vec::new();
@@ -750,6 +792,7 @@ pub(super) fn reuse_boundary_section_edges(
                             arc: ring.clone(),
                             aligned: piece_tangent.dot(ring_tangent) >= 0.0,
                             redundant: vec![*face_key],
+                            ring: true,
                         });
                     }
                 }
@@ -905,6 +948,7 @@ pub(super) fn reuse_boundary_section_edges(
                             arc,
                             aligned,
                             redundant: Vec::new(),
+                            ring: false,
                         });
                     }
                 }
@@ -988,27 +1032,53 @@ pub(super) fn reuse_boundary_section_edges(
             // inherit an import error; a newly cut face may not borrow it.
             if std::env::var("BREP_SHARED_SECTION_CARRIER_FLOOR").as_deref() != Ok("0") {
                 let [lo, hi] = reuse.arc.domain().or_refuse(KernelStage::Intersect, "domain")?;
-                let mut off = 0.0f64;
                 // Include each knot span so a short span is not skipped by a
                 // whole-domain grid. This is a sampled residual check, like the
                 // existing bidirectional section/arc comparison above.
-                for knots in reuse.arc.knots.windows(2) {
-                    let a = knots[0].max(lo);
-                    let b = knots[1].min(hi);
-                    if b <= a {
-                        continue;
+                let residual = |surface: &NurbsSurface| -> Result<f64, KernelRefusal> {
+                    let mut off = 0.0f64;
+                    for knots in reuse.arc.knots.windows(2) {
+                        let a = knots[0].max(lo);
+                        let b = knots[1].min(hi);
+                        if b <= a {
+                            continue;
+                        }
+                        for station in 0..=8 {
+                            let point = reuse.arc.evaluate(a + (b - a) * station as f64 / 8.0)
+                                .or_refuse(KernelStage::Intersect, "evaluate")?;
+                            off = off.max(project_point_to_surface(surface, point)
+                                .or_refuse(KernelStage::Intersect, "project_point_to_surface")?.distance);
+                        }
                     }
-                    for station in 0..=8 {
-                        let point = reuse.arc.evaluate(a + (b - a) * station as f64 / 8.0)
-                            .or_refuse(KernelStage::Intersect, "evaluate")?;
-                        off = off.max(project_point_to_surface(surface, point)
-                            .or_refuse(KernelStage::Intersect, "project_point_to_surface")?.distance);
-                    }
-                }
+                    Ok(off)
+                };
+                let off = residual(surface)?;
                 if debug {
                     eprintln!("shared-section CARRIER piece {} face {}:{} off={off:.3e}", piece.id, key.operand, key.face_id);
                 }
-                if off > tolerance.max(1e-7) {
+                // `BREP_SHARED_RING_COSURFACE_CARRIER` (default on; `=0` restores the import floor): a ring
+                // reused onto a face the boolean already reads as one surface
+                // with a face carrying the rim lies off it by that pair's own gap, not
+                // by an import residual; the assembler cannot weld two rings
+                // whose seam vertices differ, so the floor is the weld gate
+                // there. Two extruded splines whose walls stand 1.5e-6 apart:
+                // each rim's copy on the other wall started at that wall's
+                // seam, 4.4e-6 from the rim's own, and both stayed one-use.
+                // The rim belongs to every face of its operand whose boundary
+                // carries the edge (a cap and a wall); the kept face must read
+                // as one surface with one of them, and the rim must lie on that
+                // face within the import floor, so what it stands off the kept
+                // face is the pair's gap and not an import residual.
+                let carries_rim = |face: FaceKey| {
+                    face.operand == reuse.owning.operand
+                        && face_edge_lists.get(&face).is_some_and(|edges| edges.iter().any(|edge| edge.id == reuse.edge_id))
+                };
+                let own_residual = |face: FaceKey| face_surface(&face).and_then(|surface| residual(surface).ok());
+                let floor = ring_carrier_floor(
+                    RingReuse { ring: reuse.ring, enabled: ring_cosurface_carrier_enabled(), kept: key },
+                    &result.cosurface_pairs, carries_rim, own_residual, tolerance, endpoint_gate,
+                );
+                if off > floor {
                     ok = false;
                     break;
                 }

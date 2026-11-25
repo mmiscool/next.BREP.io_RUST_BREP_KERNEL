@@ -781,6 +781,7 @@ pub(super) fn merge_residual_coincident_vertices(
     // plane and both near-tangent walls; merging them sent each half of the
     // cut onto the other's ends.
     let edge_guard = crate::switch!("BREP_RESIDUAL_MERGE_EDGE_GUARD", true);
+    let evidence_reach = crate::switch!("BREP_RESIDUAL_MERGE_EDGE_GUARD_EVIDENCE", true);
     let on_edges = |point: Vec3, radius: f64| -> Vec<(u8, u64)> {
         let mut found = Vec::new();
         for (&(operand, edge_id), edge) in edge_curves.iter() {
@@ -826,7 +827,15 @@ pub(super) fn merge_residual_coincident_vertices(
             let b: Vec<_> = on_b.iter().filter(|edge| edge.0 == operand).copied().collect();
             match (a.is_empty(), b.is_empty()) {
                 (false, false) => {
-                    a.iter().all(|&edge| edge_distance(edge, p_b) > band) && b.iter().all(|&edge| edge_distance(edge, p_a) > band)
+                    // EVIDENCE REACH (`BREP_RESIDUAL_MERGE_EDGE_GUARD_EVIDENCE`,
+                    // default on, `=0` off): each junction stands within its
+                    // evidence radius of the edges it lies on, so one farther
+                    // than twice the two radii from the other's edges is not
+                    // that junction, however thin the body between them reads
+                    // against the band (a lens 3.2e-4 deep cut across its two
+                    // rulings, the band 1.7e-3).
+                    let reach = if evidence_reach { 2.0 * (radius_of(id_a) + radius_of(id_b)) } else { band };
+                    a.iter().all(|&edge| edge_distance(edge, p_b) > reach) && b.iter().all(|&edge| edge_distance(edge, p_a) > reach)
                 }
                 (false, true) => beside_another(operand, p_b, &a),
                 (true, false) => beside_another(operand, p_a, &b),

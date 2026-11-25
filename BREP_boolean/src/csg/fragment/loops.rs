@@ -175,13 +175,41 @@ struct InteriorSegmentNode {
     end: usize,
     children: Option<[usize; 2]>,
 }
+/// SEQUENTIAL CUT SPEED (`BREP_SEQUENTIAL_CUT_SPEED`, default on; `=0`
+/// restores the earlier code, `=check` runs it and compares): exact levers
+/// for many cuts made one after another in one body (a plate taking 400 holes
+/// one at a time spends each cut on work that grows with the plate). Each
+/// lever leaves every result bit unchanged. Returns (on, check).
+pub(crate) fn sequential_cut_speed() -> (bool, bool) {
+    if crate::env_read!("BREP_SEQUENTIAL_CUT_SPEED").as_deref() == Some("check") {
+        return (false, true);
+    }
+    (crate::switch!("BREP_SEQUENTIAL_CUT_SPEED", true), false)
+}
+
+/// Check mode: a lever's two readings differed. Appended to the file
+/// `BREP_SEQUENTIAL_CUT_SPEED_CENSUS` names, when set, one line per mismatch.
+pub(crate) fn sequential_cut_speed_mismatch(lever: &str) {
+    if let Ok(path) = std::env::var("BREP_SEQUENTIAL_CUT_SPEED_CENSUS") {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "mismatch {lever}");
+        }
+    }
+}
+
 impl InteriorSegmentIndex {
-    fn new(edges: Vec<(Vec2, Vec2)>) -> Self {
+    /// `select`: split each node at its median by a partial selection
+    /// instead of a full sort. The split edge, the two halves' contents and
+    /// so every node's box can differ, but a query still reads the exact
+    /// minimum over every edge (boxes only skip edges that cannot lower it),
+    /// so the distance is the same to the bit.
+    fn new(edges: Vec<(Vec2, Vec2)>, select: bool) -> Self {
         let mut index = Self { edges, nodes: Vec::new() };
-        index.build(0, index.edges.len());
+        index.build(0, index.edges.len(), select);
         index
     }
-    fn build(&mut self, start: usize, end: usize) -> usize {
+    fn build(&mut self, start: usize, end: usize, select: bool) -> usize {
         let mut low = Vec2 { x: f64::INFINITY, y: f64::INFINITY };
         let mut high = Vec2 { x: f64::NEG_INFINITY, y: f64::NEG_INFINITY };
         for &(a, b) in &self.edges[start..end] {
@@ -196,14 +224,19 @@ impl InteriorSegmentIndex {
         self.nodes.push(InteriorSegmentNode { low, high, start, end, children: None });
         if end - start > 8 {
             let x_axis = high.x - low.x >= high.y - low.y;
-            self.edges[start..end].sort_by(|(a, b), (c, d)| {
+            let order = |(a, b): &(Vec2, Vec2), (c, d): &(Vec2, Vec2)| {
                 let first = if x_axis { a.x + b.x } else { a.y + b.y };
                 let second = if x_axis { c.x + d.x } else { c.y + d.y };
                 first.total_cmp(&second)
-            });
+            };
             let middle = start + (end - start) / 2;
-            let left = self.build(start, middle);
-            let right = self.build(middle, end);
+            if select {
+                self.edges[start..end].select_nth_unstable_by(middle - start, order);
+            } else {
+                self.edges[start..end].sort_by(order);
+            }
+            let left = self.build(start, middle, select);
+            let right = self.build(middle, end, select);
             self.nodes[id].children = Some([left, right]);
         }
         id
@@ -283,9 +316,14 @@ pub fn interior_points_in_polygons_indexed(
     let outer_edges = edges(outer_polygon);
     let hole_edges: Vec<Vec<(Vec2, Vec2)>> = hole_polygons.iter().map(|hole| edges(hole)).collect();
     let edge_count = outer_edges.len() + hole_edges.iter().map(Vec::len).sum::<usize>();
-    let index = (indexed && edge_count >= 64
-        && std::iter::once(&outer_edges).chain(hole_edges.iter()).flatten().all(|(a, b)| a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite()))
-        .then(|| InteriorSegmentIndex::new(std::iter::once(&outer_edges).chain(hole_edges.iter()).flatten().copied().collect()));
+    let (select_split, select_check) = sequential_cut_speed();
+    let use_index = indexed && edge_count >= 64
+        && std::iter::once(&outer_edges).chain(hole_edges.iter()).flatten().all(|(a, b)| a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite());
+    let all_edges = || std::iter::once(&outer_edges).chain(hole_edges.iter()).flatten().copied().collect::<Vec<_>>();
+    let index = use_index.then(|| InteriorSegmentIndex::new(all_edges(), select_split));
+    // Check mode: the selection-split index answers every query beside the
+    // sorted one, and any difference is reported.
+    let check_index = (use_index && select_check).then(|| InteriorSegmentIndex::new(all_edges(), true));
     let parity = parity_index_enabled();
     let outer_parity = if parity { PolygonParityIndex::new(outer_polygon) } else { None };
     let hole_parity: Vec<Option<PolygonParityIndex<'_>>> = hole_polygons.iter()
@@ -293,7 +331,17 @@ pub fn interior_points_in_polygons_indexed(
     let inside_outer = |point: Vec2| outer_parity.as_ref().map_or_else(|| point_in_polygon(point, outer_polygon), |index| index.contains(point));
     let inside_hole = |hole: usize, point: Vec2| hole_parity[hole].as_ref().map_or_else(|| point_in_polygon(point, &hole_polygons[hole]), |index| index.contains(point));
     let distance = |candidate: Vec2| match &index {
-        Some(index) => index.distance(candidate),
+        Some(index) => {
+            let reading = index.distance(candidate);
+            if let Some(check) = &check_index {
+                let other = check.distance(candidate);
+                if other.to_bits() != reading.to_bits() {
+                    eprintln!("BREP_SEQUENTIAL_CUT_SPEED check: interior distance {reading:e} sorted vs {other:e} selected");
+                    sequential_cut_speed_mismatch("interior_index");
+                }
+            }
+            reading
+        }
         None => {
             let mut clearance = f64::INFINITY;
             for cycle in std::iter::once(&outer_edges).chain(hole_edges.iter()) {

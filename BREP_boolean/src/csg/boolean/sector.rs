@@ -233,6 +233,18 @@ fn oriented_normal(face: &FaceRecord, u: f64, v: f64) -> Option<Vec3> {
     Some(if face.same_sense { normal } else { normal.scale(-1.0) })
 }
 
+fn precise_sector_foot(
+    surface:&crate::NurbsSurface, point:Vec3, original:crate::SurfaceProjection,
+)->Option<crate::SurfaceProjection> {
+    let precision=1e-12*(1.0+point.length());
+    if original.distance<=precision || original.distance>crate::tolerance::DEFAULT_MODEL {
+        return None;
+    }
+    let refined=crate::projection::refine_trim_foot(surface,point,original).ok()?;
+    (refined.distance<original.distance && point.sub(refined.point).length()<=precision)
+        .then_some(refined)
+}
+
 /// One reading at parameter `t` of a section coedge of `fragment`, against
 /// the other operand's face `other` the section was cut on.
 fn sample(
@@ -241,6 +253,7 @@ fn sample(
     pcurve: &NurbsCurve,
     t: f64,
     other: &FaceRecord,
+    refine_projection: bool,
 ) -> Result<Sample, KernelRefusal> {
     let Ok(derivatives) = pcurve.derivatives(t, 1) else {
         return Ok(Sample::Skip);
@@ -279,6 +292,22 @@ fn sample(
     let side = binormal.dot(other_in_plane);
     if side.abs() >= TANGENT_BAND_SIN {
         return Ok(Sample::Class(if side > 0.0 { PointClass::Out } else { PointClass::In }, 0));
+    }
+    // A nearest-foot query can stop at the model's on-carrier band while
+    // this sector needs a round-off-sized residual. Refine only that existing
+    // branch, and retain every original fallback unless it meets the same
+    // exact-side admission test.
+    if refine_projection && exact_side_enabled() && side.abs() >= EXACT_SIDE_FLOOR {
+        if let Some(foot) = precise_sector_foot(&other.surface, point, projection) {
+            if let Some(n) = oriented_normal(other, foot.u, foot.v) {
+                if let Ok(n) = n.sub(tangent.scale(n.dot(tangent))).normalized() {
+                    let refined_side=binormal.dot(n);
+                    if refined_side.abs()>=EXACT_SIDE_FLOOR {
+                        return Ok(Sample::Class(if refined_side>0.0 {PointClass::Out} else {PointClass::In},0));
+                    }
+                }
+            }
+        }
     }
     // EXACT SIDE (`BREP_SECTOR_EXACT_SIDE`, default on): on a section that
     // lies on the other carrier to round-off (an analytic lane's exact curve),
@@ -347,13 +376,33 @@ fn sample(
 /// The sector's verdict for one fragment: In or Out against the other
 /// operand, or declined with the reason.
 pub fn sector_class(context: &SectorContext<'_>, fragment: &FaceFragmentRecord) -> Result<SectorVerdict, KernelRefusal> {
+    let enabled=crate::switch!("BREP_SECTOR_PRECISE_FOOT",true);
+    let check=crate::switch!("BREP_SECTOR_PRECISE_FOOT_CHECK",false);
+    let result=sector_class_with_precision(context,fragment,enabled);
+    if check {
+        let alternate=sector_class_with_precision(context,fragment,!enabled);
+        let changed=match (&result,&alternate) {
+            (Ok(a),Ok(b))=>a.class!=b.class || a.route!=b.route,
+            (Err(_),Err(_))=>false,
+            _=>true,
+        };
+        if changed {
+            let (old,new)=if enabled {(&alternate,&result)} else {(&result,&alternate)};
+            eprintln!("SECTOR_PRECISE_FOOT operand={} face={} old={old:?} new={new:?} applied={enabled}",
+                fragment.operand,fragment.source_face_id);
+        }
+    }
+    result
+}
+
+fn sector_class_with_precision(context:&SectorContext<'_>,fragment:&FaceFragmentRecord,refine_projection:bool)->Result<SectorVerdict,KernelRefusal> {
     let enabled = crate::switch!("BREP_SECTOR_PARTIAL_BOUNDARY", true);
     let check = crate::switch!("BREP_SECTOR_PARTIAL_BOUNDARY_CHECK", false);
     if !check {
-        return sector_class_impl(context, fragment, enabled);
+        return sector_class_impl(context, fragment, enabled, refine_projection);
     }
-    let old = sector_class_impl(context, fragment, false);
-    let new = sector_class_impl(context, fragment, true);
+    let old = sector_class_impl(context, fragment, false, refine_projection);
+    let new = sector_class_impl(context, fragment, true, refine_projection);
     let changed = match (&old, &new) {
         (Ok(a), Ok(b)) => a.class != b.class || a.route != b.route,
         (Err(_), Err(_)) => false,
@@ -366,7 +415,7 @@ pub fn sector_class(context: &SectorContext<'_>, fragment: &FaceFragmentRecord) 
     if enabled { new } else { old }
 }
 
-fn sector_class_impl(context: &SectorContext<'_>, fragment: &FaceFragmentRecord, partial_boundary: bool) -> Result<SectorVerdict, KernelRefusal> {
+fn sector_class_impl(context: &SectorContext<'_>, fragment: &FaceFragmentRecord, partial_boundary: bool, refine_projection: bool) -> Result<SectorVerdict, KernelRefusal> {
     let own = FaceKey { operand: fragment.operand, face_id: fragment.source_face_id };
     if context.cosurface.contains(&own) {
         return Ok(SectorVerdict::declined("cosurface", 0, 0));
@@ -417,7 +466,7 @@ fn sector_class_impl(context: &SectorContext<'_>, fragment: &FaceFragmentRecord,
         let mut coedge_verdict = None;
         for fraction in SAMPLE_FRACTIONS {
             samples += 1;
-            match sample(context, fragment, &coedge.pcurve, t0 + (t1 - t0) * fraction, other)? {
+            match sample(context, fragment, &coedge.pcurve, t0 + (t1 - t0) * fraction, other, refine_projection)? {
                 Sample::Class(class, steps) => {
                     ladder_steps += steps;
                     if steps > 0 {
@@ -460,5 +509,6 @@ pub fn sector_census_line(line: impl FnOnce() -> String) {
         }
     }
 }
+
 
 

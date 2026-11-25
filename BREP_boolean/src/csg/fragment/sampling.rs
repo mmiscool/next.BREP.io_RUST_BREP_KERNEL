@@ -254,8 +254,16 @@ pub(super) fn enforce_boundary_crossing_parity(
     // crossing — chain endpoints legitimately sit ON boundary junctions and
     // the arrangement cannot distinguish below its own slack anyway.
     let exclusion = tolerance * 50.0;
-    let crossings = |polyline: &[Vec2], anchor_start: Vec2, anchor_end: Vec2| -> usize {
+    // Sequential cut speed (see `loops::sequential_cut_speed`): the boundary
+    // segments a polyline segment's box can meet come from a grid over their
+    // boxes instead of a scan of all of them. Every segment the box test
+    // below admits shares a cell with the query, so the count is the same.
+    let (grid_on, grid_check) = super::loops::sequential_cut_speed();
+    let grid = (grid_on || grid_check).then(|| BoundaryGrid::new(boundaries)).flatten();
+    let visit = std::cell::RefCell::new((vec![0u32; boundaries.len()], 0u32));
+    let crossings_with = |polyline: &[Vec2], anchor_start: Vec2, anchor_end: Vec2, use_grid: bool| -> usize {
         let mut count = 0usize;
+        let mut candidates: Vec<usize> = Vec::new();
         for pair in polyline.windows(2) {
             let (p, q) = (pair[0], pair[1]);
             let low_x = p.x.min(q.x) - exclusion;
@@ -263,7 +271,21 @@ pub(super) fn enforce_boundary_crossing_parity(
             let low_y = p.y.min(q.y) - exclusion;
             let high_y = p.y.max(q.y) + exclusion;
             let direction = q.sub(p);
-            for (a, b) in boundaries {
+            candidates.clear();
+            match (&grid, use_grid) {
+                (Some(grid), true) => {
+                    let mut visit = visit.borrow_mut();
+                    let (stamps, stamp) = &mut *visit;
+                    *stamp = stamp.wrapping_add(1);
+                    if *stamp == 0 {
+                        stamps.iter_mut().for_each(|s| *s = 0);
+                        *stamp = 1;
+                    }
+                    grid.candidates(low_x, high_x, low_y, high_y, stamps, *stamp, &mut candidates);
+                }
+                _ => candidates.extend(0..boundaries.len()),
+            }
+            for (a, b) in candidates.iter().map(|&i| &boundaries[i]) {
                 if a.x.max(b.x) < low_x
                     || a.x.min(b.x) > high_x
                     || a.y.max(b.y) < low_y
@@ -295,6 +317,17 @@ pub(super) fn enforce_boundary_crossing_parity(
                     continue;
                 }
                 count += 1;
+            }
+        }
+        count
+    };
+    let crossings = |polyline: &[Vec2], anchor_start: Vec2, anchor_end: Vec2| -> usize {
+        let count = crossings_with(polyline, anchor_start, anchor_end, grid_on);
+        if grid_check && grid.is_some() {
+            let other = crossings_with(polyline, anchor_start, anchor_end, true);
+            if other != count {
+                eprintln!("BREP_SEQUENTIAL_CUT_SPEED check: boundary crossings {count} scanned vs {other} from the grid (face {face_id})");
+                super::loops::sequential_cut_speed_mismatch("crossing_grid");
             }
         }
         count
@@ -337,6 +370,87 @@ pub(super) fn enforce_boundary_crossing_parity(
         run_start = index;
     }
     kept
+}
+
+/// A uniform grid over boundary segments' boxes, for
+/// [`enforce_boundary_crossing_parity`]: each segment is listed in every cell
+/// its box spans; a query box gets every segment listed in a cell it spans,
+/// once. Cell indices are monotone in the coordinate, so two boxes that
+/// overlap (closed intervals) span a common cell, and no segment whose box
+/// meets the query box is left out. `None` for few segments or any
+/// non-finite coordinate (the caller then scans them all).
+struct BoundaryGrid {
+    origin: Vec2,
+    cell: Vec2,
+    columns: usize,
+    rows: usize,
+    cells: Vec<Vec<u32>>,
+}
+
+impl BoundaryGrid {
+    fn new(boundaries: &[(Vec2, Vec2)]) -> Option<Self> {
+        if boundaries.len() < 64 || boundaries.len() > u32::MAX as usize {
+            return None;
+        }
+        let mut low = Vec2 { x: f64::INFINITY, y: f64::INFINITY };
+        let mut high = Vec2 { x: f64::NEG_INFINITY, y: f64::NEG_INFINITY };
+        for (a, b) in boundaries {
+            for p in [a, b] {
+                if !(p.x.is_finite() && p.y.is_finite()) {
+                    return None;
+                }
+                low.x = low.x.min(p.x);
+                low.y = low.y.min(p.y);
+                high.x = high.x.max(p.x);
+                high.y = high.y.max(p.y);
+            }
+        }
+        let side = (boundaries.len() as f64).sqrt().ceil().clamp(1.0, 1024.0) as usize;
+        let cell = Vec2 { x: ((high.x - low.x) / side as f64).max(f64::MIN_POSITIVE), y: ((high.y - low.y) / side as f64).max(f64::MIN_POSITIVE) };
+        let mut grid = Self { origin: low, cell, columns: side, rows: side, cells: vec![Vec::new(); side * side] };
+        for (index, (a, b)) in boundaries.iter().enumerate() {
+            let (c0, c1) = (grid.column(a.x.min(b.x)), grid.column(a.x.max(b.x)));
+            let (r0, r1) = (grid.row(a.y.min(b.y)), grid.row(a.y.max(b.y)));
+            for row in r0..=r1 {
+                for column in c0..=c1 {
+                    grid.cells[row * grid.columns + column].push(index as u32);
+                }
+            }
+        }
+        Some(grid)
+    }
+
+    fn column(&self, x: f64) -> usize {
+        let at = ((x - self.origin.x) / self.cell.x).floor();
+        if at.is_nan() || at <= 0.0 { 0 } else { (at as usize).min(self.columns - 1) }
+    }
+
+    fn row(&self, y: f64) -> usize {
+        let at = ((y - self.origin.y) / self.cell.y).floor();
+        if at.is_nan() || at <= 0.0 { 0 } else { (at as usize).min(self.rows - 1) }
+    }
+
+    /// Every segment listed in a cell the box spans, each once (`stamps`
+    /// marks the segments already taken under `stamp`). A box with a
+    /// non-finite side takes every segment.
+    #[allow(clippy::too_many_arguments)]
+    fn candidates(&self, low_x: f64, high_x: f64, low_y: f64, high_y: f64, stamps: &mut [u32], stamp: u32, out: &mut Vec<usize>) {
+        if !(low_x.is_finite() && high_x.is_finite() && low_y.is_finite() && high_y.is_finite()) {
+            out.extend(0..stamps.len());
+            return;
+        }
+        for row in self.row(low_y)..=self.row(high_y) {
+            for column in self.column(low_x)..=self.column(high_x) {
+                for &index in &self.cells[row * self.columns + column] {
+                    let index = index as usize;
+                    if stamps[index] != stamp {
+                        stamps[index] = stamp;
+                        out.push(index);
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn refine_near_hints(

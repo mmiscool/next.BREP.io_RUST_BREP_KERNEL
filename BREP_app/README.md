@@ -3,7 +3,7 @@
 Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_app` · [licence summary](#licence)
 
 The BREP CAD application: one Rust egui/wgpu codebase for native desktop and
-WebAssembly. Package `BREP_app`, library `brep_app`, version 0.30.0.
+WebAssembly. Package `BREP_app`, library `brep_app`, version 0.31.0.
 The 3D engine is `BREP_render`; geometry comes from `BREP_kernel`.
 
 ## Build and run

@@ -1260,19 +1260,7 @@ pub(super) fn merge_pair_imprint(
 }
 
 pub(super) fn empty_imprint() -> ImprintResultRecord {
-    ImprintResultRecord {
-        faces_in_unproved_pairs: None,
-        vertices: Vec::new(),
-        pieces: Vec::new(),
-        by_face: Vec::new(),
-        edge_splits: Vec::new(),
-        barrier_edges: Vec::new(),
-        tangent_nodes: Vec::new(),
-        section_evidence: false,
-        cosurface_pairs: Vec::new(),
-        operand_sliver_regions: Vec::new(),
-        tangent_sections: Vec::new(),
-    }
+    ImprintResultRecord::default()
 }
 
 pub(super) fn flip_fragment(fragment: &mut FaceFragmentRecord) -> Result<(), KernelRefusal> {

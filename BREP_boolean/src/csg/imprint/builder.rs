@@ -1125,6 +1125,21 @@ impl<'a> ImprintBuilder<'a> {
                     if hit.t < edge.t0 - 1e-9 || hit.t > edge.t1 + 1e-9 {
                         continue;
                     }
+                    // `BREP_FEATURE_SCALE_CROSSING_CAP` (default on, `=0` restores): the crossing
+                    // search reads curves within 1e-5 as meeting; beside a
+                    // registered sliver that band is capped at the sliver's
+                    // local scale, so a section that passes a few 1e-6 from an
+                    // edge it never meets (a turned box's corner edge piercing
+                    // the other's face just inside that face's edge) does not
+                    // plant a vertex on the edge where the solid has none.
+                    if crossing_cap_enabled() && !self.feature_scale.is_empty() {
+                        if let (Ok(on_curve), Ok(on_edge)) = (curve.evaluate(hit.s), edge.curve.evaluate(hit.t)) {
+                            let gap = on_curve.sub(on_edge).length();
+                            if gap > self.feature_scale.cap(on_curve, 1e-5).max(self.tolerance) {
+                                continue;
+                            }
+                        }
+                    }
                     let mut curve_parameter = hit.s;
                     let mut edge_parameter = hit.t;
                     let mut fuzzy_junction = None;
@@ -2217,4 +2232,8 @@ fn external_touch(section: &NurbsCurve, s: f64, edge: &NurbsCurve, t: f64) -> Op
         return Some(false);
     }
     Some(a.dot(b) < 0.0)
+}
+
+fn crossing_cap_enabled() -> bool {
+    crate::switch!("BREP_FEATURE_SCALE_CROSSING_CAP", true)
 }

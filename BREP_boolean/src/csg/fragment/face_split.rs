@@ -245,7 +245,7 @@ fn boundary_has_cosurface_partner(
     })
 }
 
-/// `BREP_COSURFACE_CORNER_COPY` (default off): a cut on a face that reads as one
+/// `BREP_COSURFACE_CORNER_COPY` (default on; `=0` restores the 1e-7 bound): a cut on a face that reads as one
 /// surface with the cut's other support face, lying along a boundary edge whose
 /// neighbouring face also reads as one surface with a face of the other operand
 /// that carries the cut too, is that operand's copy of the same corner edge: the two corners sit within the
@@ -253,8 +253,12 @@ fn boundary_has_cosurface_partner(
 /// weld floor. Without it a copy a little more than the model tolerance off the
 /// boundary splits off a sub-resolution strip whose test point can read Out
 /// beside a side face that reads On.
+fn dup_cut_space_nomination_enabled() -> bool {
+    crate::switch!("BREP_DUP_CUT_SPACE_NOMINATION", true)
+}
+
 fn cosurface_corner_copy_on() -> bool {
-    crate::switch!("BREP_COSURFACE_CORNER_COPY", false)
+    crate::switch!("BREP_COSURFACE_CORNER_COPY", true)
 }
 
 fn boundary_is_cosurface_corner(
@@ -577,6 +581,12 @@ fn wedge(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f64) -
 /// band.
 fn lens_enabled() -> bool {
     crate::switch!("BREP_FEATURE_SCALE_LENS", true)
+}
+
+/// `BREP_FRAGMENT_EXACT_END_STAYS` (default on; `=0` restores the snap): see the endpoint snap in
+/// [`fragment_face_arranged`].
+fn exact_end_stays_on() -> bool {
+    crate::switch!("BREP_FRAGMENT_EXACT_END_STAYS", true)
 }
 
 /// FEATURE SCALE, end gap (`BREP_FEATURE_SCALE_END_GAP`, default on, `=0` off): an
@@ -1948,15 +1958,45 @@ fn fragment_face_arranged(
             let keep = own.is_none_or(|vertex| moved.sub(*vertex).length() <= at.sub(*vertex).length());
             keep
         };
+        // `BREP_FRAGMENT_EXACT_END_STAYS` (default on, `=0` restores): on a plane, a straight
+        // cut's end is an exact vertex, not a marched end's slack. One that its
+        // own vertex places a resolvable distance off the domain edge (more
+        // than eight identity bands in model space) stays where it is: a box
+        // turned a few 1e-6 rad has a corner edge piercing the other's face
+        // 4e-6 inside its edge, and snapping that end onto the edge put the
+        // vertex where the solid has none while its mates kept the true one.
+        // A face read as one surface with a face of the other operand keeps the
+        // snap: its pair's slivers are below resolution and its vertices are
+        // read at the pair's band, not placed exactly.
+        let straight_on_plane = exact_end_stays_on()
+            && !index.cosurface_pairs.iter().any(|(first, _)| *first == face_key)
+            && face.surface.is_affine().unwrap_or(false)
+            && piece.curve.degree == 1
+            && piece.curve.control_points.len() == 2;
+        let exact_end_off_edge = |snapped: Vec2, original: Vec2, vertex_id: u64| -> bool {
+            if !straight_on_plane || (snapped.x == original.x && snapped.y == original.y) {
+                return false;
+            }
+            let (Some(vertex), Ok(moved)) = (index.vertex_points.get(&vertex_id), face.surface.evaluate(snapped.x, snapped.y)) else {
+                return false;
+            };
+            let identity = crate::classification::surface_uv_band(&face.surface, original.x, original.y, 1e-7);
+            let off = original.sub(snapped).length();
+            off > identity * 8.0 && moved.sub(*vertex).length() > 8e-7
+        };
         if !bridge_keys.contains(&format!("i:{}", piece.start_vertex_id)) {
             let snapped = snap_endpoint_to_domain(points[0]);
-            if keeps_vertex(snapped, points[0], piece.start_vertex_id) {
+            if keeps_vertex(snapped, points[0], piece.start_vertex_id)
+                && !exact_end_off_edge(snapped, points[0], piece.start_vertex_id)
+            {
                 points[0] = snapped;
             }
         }
         if !bridge_keys.contains(&format!("i:{}", piece.end_vertex_id)) {
             let snapped = snap_endpoint_to_domain(points[last]);
-            if keeps_vertex(snapped, points[last], piece.end_vertex_id) {
+            if keeps_vertex(snapped, points[last], piece.end_vertex_id)
+                && !exact_end_off_edge(snapped, points[last], piece.end_vertex_id)
+            {
                 points[last] = snapped;
             }
         }
@@ -2454,6 +2494,50 @@ fn fragment_face_arranged(
                 .is_some_and(|projection| projection.distance <= bound)
         })
     };
+    // [`coincident_in_space`] at the weld band, and the reverse: every station
+    // of the boundary's curve lies within the same band of the cut's, so the
+    // two are one curve, not a cut that merely stays near part of the boundary.
+    // Only where the boundary has the other operand's coincident copy beside it
+    // (the weld band's own condition).
+    let follows_copy_both_ways = |cut: &Chain, boundary: &Chain| -> bool {
+        let (ChainSource::Boundary { curve, coedge }, ChainSource::Cut { curve: section, piece_id, .. }) = (&boundary.source, &cut.source) else {
+            return false;
+        };
+        let copy = index.pieces_by_id.get(piece_id).is_some_and(|piece| {
+            boundary_has_cosurface_partner(solid, face_key, coedge.edge_id, piece, index)
+        });
+        if !copy || !coincident_in_space(cut, boundary, true) {
+            return false;
+        }
+        let Ok([start, end]) = curve.domain() else {
+            return false;
+        };
+        let stations = boundary.segments.len().max(16);
+        let mut distances = Vec::with_capacity(stations + 1);
+        for station in 0..=stations {
+            let Some(distance) = curve
+                .evaluate(start + (end - start) * station as f64 / stations as f64)
+                .ok()
+                .and_then(|at| crate::project_point_to_curve(section, at).ok())
+                .map(|projection| projection.distance)
+            else {
+                return false;
+            };
+            if distance > crate::tolerance::WELD_FLOOR {
+                return false;
+            }
+            distances.push(distance);
+        }
+        // A copy offset to one side all along (two coaxial rims a weld floor
+        // apart) bounds a real strip, however thin: it is a cut. The rim again
+        // turned or moved by round-off crosses it, coming to it inside: there
+        // the nearest station reads well under the farthest.
+        let interior = &distances[stations / 20 + 1..stations - stations / 20];
+        let (nearest, farthest) = interior
+            .iter()
+            .fold((f64::INFINITY, 0.0f64), |(low, high), &distance| (low.min(distance), high.max(distance)));
+        farthest <= 1e-7 || nearest <= 0.1 * farthest
+    };
     let mut dropped_chains = HashSet::default();
     for (index, chain) in chains.iter().enumerate() {
         if !matches!(chain.source, ChainSource::Cut { .. }) {
@@ -2495,6 +2579,21 @@ fn fragment_face_arranged(
                         && near_chain(a.add(*b).scale(0.5), boundary, midpoint_tolerance)
                 })
             };
+            // DUPLICATE CUT BY SPACE (`BREP_DUP_CUT_SPACE_NOMINATION`, default
+            // on, `=0` restores): a cut whose ends match the boundary's and that follows it in
+            // model space at every station ([`coincident_in_space`] at the weld
+            // band, both ways: the boundary's stations lie on the cut too, and
+            // only along a boundary with the other operand's coincident copy
+            // beside it, and only a copy that comes to the boundary inside, not
+            // one offset to one side all along) is nominated even where the
+            // chart test above misses. That
+            // test measures the cut's samples, on the true curve, against the
+            // boundary's chords, whose sag can exceed its band, so it passed or
+            // failed by where the cut happened to be sampled: spline-prisms
+            // 5047's moved copy (b's rim 4.7e-6 off a's top rim, translated)
+            // kept the rim as a cut and split the cap into slivers.
+            let interior_coincident = interior_coincident
+                || (dup_cut_space_nomination_enabled() && follows_copy_both_ways(chain, boundary));
             if !interior_coincident {
                 continue;
             }

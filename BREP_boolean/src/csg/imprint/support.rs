@@ -2300,6 +2300,66 @@ impl AffinePatch {
     }
 }
 
+/// The corner where both patches' edges stop a near-parallel pair's line at
+/// `point`: the first patch's plane and the two edge planes (each through its
+/// patch edge, across its patch), when both edges pass within `tolerance` of
+/// `point` and cross each other at a readable angle.
+fn wedge_corner(one: &AffinePatch, two: &AffinePatch, point: Vec3, tolerance: f64) -> Option<Vec3> {
+    let side = |patch: &AffinePatch| -> Option<(Vec3, f64)> {
+        let (aa, ab, bb) = (patch.a.dot(patch.a), patch.a.dot(patch.b), patch.b.dot(patch.b));
+        let det = aa * bb - ab * ab;
+        let grad_s = patch.a.scale(bb / det).sub(patch.b.scale(ab / det));
+        let grad_t = patch.b.scale(aa / det).sub(patch.a.scale(ab / det));
+        let (s, t) = patch.square(point);
+        let mut best: Option<(f64, Vec3, f64)> = None;
+        for (grad, value) in [(grad_s, s), (grad_t, t)] {
+            for edge in [0.0, 1.0] {
+                let length = grad.length();
+                let distance = (value - edge).abs() / length;
+                if best.map_or(true, |(seen, _, _)| distance < seen) {
+                    let unit = grad.scale(1.0 / length);
+                    best = Some((distance, unit, unit.dot(patch.origin) + edge / length));
+                }
+            }
+        }
+        let (distance, normal, level) = best?;
+        (distance <= tolerance).then_some((normal, level))
+    };
+    let (first_edge, first_level) = side(one)?;
+    let (second_edge, second_level) = side(two)?;
+    if first_edge.cross(second_edge).length() < 1e-3 {
+        return None;
+    }
+    let rows = [
+        (one.normal, one.normal.dot(one.origin)),
+        (first_edge, first_level),
+        (second_edge, second_level),
+    ];
+    // Solve about `point` so the offsets carry no cancellation.
+    let residual = rows.map(|(normal, level)| level - normal.dot(point));
+    let [n1, n2, n3] = rows.map(|(normal, _)| normal);
+    let volume = n1.dot(n2.cross(n3));
+    if volume.abs() < 1e-6 {
+        return None;
+    }
+    let shift = n2.cross(n3).scale(residual[0]).add(n3.cross(n1).scale(residual[1])).add(n1.cross(n2).scale(residual[2])).scale(1.0 / volume);
+    let corner = point.add(shift);
+    (shift.length() <= tolerance && two.normal.dot(corner.sub(two.origin)).abs() <= tolerance).then_some(corner)
+}
+
+thread_local! {
+    static OPERAND_WEDGE_PAIR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `action` with the pair being sectioned marked as a registered operand
+/// wedge (or not): [`plane_pair_section`] then takes crossings down to 1e-8 rad.
+pub(crate) fn with_operand_wedge_pair<T>(wedge: bool, action: impl FnOnce() -> T) -> T {
+    let previous = OPERAND_WEDGE_PAIR.with(|cell| cell.replace(wedge));
+    let result = action();
+    OPERAND_WEDGE_PAIR.with(|cell| cell.set(previous));
+    result
+}
+
 fn plane_pair_section(first: &NurbsSurface, second: &NurbsSurface, tolerance: f64) -> Result<Option<IsoSection>, KernelRefusal> {
     let (Some(one), Some(two)) = (AffinePatch::read(first), AffinePatch::read(second)) else {
         return Ok(None);
@@ -2309,7 +2369,19 @@ fn plane_pair_section(first: &NurbsSurface, second: &NurbsSurface, tolerance: f6
     // Planes crossing at under 1e-5 rad stay with the feature-scale planar
     // iso and grazing-crossing lanes, which own that regime (brep-bench
     // tangent/wedge-a-millionth-steep crosses at 1e-6) and the parallel band.
-    if sine <= 1e-5 {
+    // OPERAND WEDGES (`BREP_FEATURE_SCALE_OPERAND_WEDGES`): the line is taken
+    // down to 1e-8 rad. A box against a copy of itself turned 3.6e-6 to
+    // 9.2e-6 rad about a skew axis through its centre crosses every one of its
+    // six faces' partners inside the face; the lanes below found no branch for
+    // any of them (every march seed rejected as tangent) and the arrangement
+    // came back open. The line's position carries no cancellation (see the
+    // formula below): its error is about the rounding of the offsets over the
+    // sine, 1e-9 mm at 1e-6 rad on a 10 mm part.
+    // Only a pair FeatureScale registered as such a wedge takes the lower
+    // floor: other tilted pairs (revolve side planes, a tiny-angle sweep,
+    // coplanar tool walls) keep the lanes they were built on.
+    let floor = if OPERAND_WEDGE_PAIR.with(std::cell::Cell::get) { 1e-8 } else { 1e-5 };
+    if sine <= floor {
         return Ok(None);
     }
     let offset = two.origin.sub(one.origin).dot(two.normal);
@@ -2322,8 +2394,21 @@ fn plane_pair_section(first: &NurbsSurface, second: &NurbsSurface, tolerance: f6
     if range[1] - range[0] <= tolerance.max(1e-12) {
         return Ok(None);
     }
-    let start = p0.add(direction.scale(range[0]));
-    let end = p0.add(direction.scale(range[1]));
+    let mut start = p0.add(direction.scale(range[0]));
+    let mut end = p0.add(direction.scale(range[1]));
+    // OPERAND WEDGES: the line of two near-parallel planes is well placed in
+    // its own planes but not along them, so an end where BOTH patches' edges
+    // stop it (four planes nearly through one point: a box corner against a
+    // copy turned 1e-4 degrees) is placed on the first plane and the two edge
+    // planes, which cross at a good angle, instead of on the line clipped by
+    // one of them (1e-10 along the edge, off the other operand's side face).
+    if OPERAND_WEDGE_PAIR.with(std::cell::Cell::get) {
+        for point in [&mut start, &mut end] {
+            if let Some(corner) = wedge_corner(&one, &two, *point, tolerance) {
+                *point = corner;
+            }
+        }
+    }
     // A line that runs along a patch's boundary (two boxes meeting along an
     // edge) or only touches a patch at a corner is a contact the iso readings
     // and the boundary exchange already decline or own: the section must run
@@ -2749,6 +2834,7 @@ fn plane_cone_check(first: &NurbsSurface, second: &NurbsSurface, exact: &NurbsCu
     }
     Ok(())
 }
+
 
 
 

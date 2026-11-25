@@ -47,12 +47,18 @@ const THIN_ANGLE: f64 = 1e-3;
 /// A sliver between two almost parallel plane faces: `height` is the largest
 /// separation of the two planes over `region`, the box both patches cover.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct ThinPair {
     pub height: f64,
     pub region: Aabb,
     /// A slab of one operand's material (two of its faces facing away from
     /// each other), not a gap between the two operands' faces.
     pub same_operand: bool,
+    /// `BREP_FEATURE_SCALE_OPERAND_WEDGES`: the two planes (origin, unit
+    /// normal) of a TILTED pair, whose thickness runs from zero at the line
+    /// where they cross to `height` at the region's far edge. Its cap is a
+    /// quarter of the thickness at the point asked about, not of `height`.
+    pub planes: Option<[(Vec3, Vec3); 2]>,
 }
 
 /// The local feature sizes of one boolean's operands. A cap is linear in the
@@ -62,6 +68,7 @@ pub struct ThinPair {
 const LONGEST_BAND: f64 = 1.5e-3;
 
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct FeatureScale {
     pub thin_pairs: Vec<ThinPair>,
     /// `(first operand's face id, second operand's face id)` of every pair
@@ -70,6 +77,10 @@ pub struct FeatureScale {
     pub operand_slivers: Vec<(u64, u64)>,
     /// The region of each of those slivers (the box both faces share).
     pub operand_sliver_regions: Vec<Aabb>,
+    /// `(first operand's face id, second operand's face id)` of every tilted
+    /// pair `BREP_FEATURE_SCALE_OPERAND_WEDGES` registered: only these are
+    /// sectioned below the plane-pair section's usual angle floor.
+    pub operand_wedges: Vec<(u64, u64)>,
 }
 
 impl FeatureScale {
@@ -105,6 +116,7 @@ impl FeatureScale {
         let reach = 4.0 * LONGEST_BAND;
         let mut thin_pairs = Vec::new();
         let mut operand_slivers = Vec::new();
+        let mut operand_wedges = Vec::new();
         let mut operand_sliver_regions = Vec::new();
         for (i, &(a_operand, a_origin, a_normal, a_box, a_face)) in planes.iter().enumerate() {
             for &(b_operand, b_origin, b_normal, b_box, b_face) in &planes[i + 1..] {
@@ -139,7 +151,14 @@ impl FeatureScale {
                 // The smallest corner reading too: a uniform sliver reads the
                 // same at every corner, a tilted one does not.
                 let mut lowest = f64::INFINITY;
+                // The signed reading of the second plane over the first at
+                // each corner: a pair that CROSSES inside the region reads
+                // both signs (a wedge), a tapered gap one.
+                let (mut below, mut above) = (0.0f64, 0.0f64);
                 for corner in corners(region) {
+                    let signed = corner.sub(a_normal.scale(corner.sub(a_origin).dot(a_normal))).sub(b_origin).dot(b_normal);
+                    below = below.min(signed);
+                    above = above.max(signed);
                     for (on_origin, on_normal, other_origin, other_normal) in [
                         (a_origin, a_normal, b_origin, b_normal),
                         (b_origin, b_normal, a_origin, a_normal),
@@ -178,6 +197,34 @@ impl FeatureScale {
                 // walls a few 1e-6 off over their extent) keeps the one-surface
                 // reading its fixtures were built on.
                 let uniform = height - lowest <= 1e-3 * height;
+                let crosses = below < -tolerance && above > tolerance;
+                // OPERAND WEDGES (`BREP_FEATURE_SCALE_OPERAND_WEDGES`, default
+                // off; `check` prints): a TILTED pair of the two operands that
+                // the route above registers (it does not read as one surface)
+                // and whose planes CROSS inside the region (the second plane's
+                // signed reading over the first takes both signs at its
+                // corners: a box against a copy of itself turned a few 1e-6
+                // rad about its centre) is a wedge-shaped sliver as thick as
+                // `height` at its far edge and of no thickness where the planes
+                // cross. Its bands are capped at a quarter of the LOCAL
+                // thickness ([`ThinPair::local_cap`]) rather than of the
+                // far-edge height, which reached across the crossing line and
+                // merged the wedge's corners, and the imprint sections the pair
+                // below the plane-pair section's usual angle floor
+                // ([`FeatureScale::operand_wedge`]). Pairs that do not register
+                // (revolve side-plane copies, coplanar tool walls a few 1e-6
+                // off) keep the one-surface reading their fixtures were built on,
+                // even where they cross.
+                // (Crossing alone: a pair crossing at the middle of its region
+                // reads the same height at every corner, as a uniform slab does.)
+                let operand_wedge = registered && !same_operand && crosses;
+                if operand_wedge && operand_wedges_mode() == Mode::Check {
+                    eprintln!(
+                        "BREP_FEATURE_SCALE_OPERAND_WEDGES check: faces {}/{} height {height:.3e} signed {below:.3e}..{above:.3e} over {:?}..{:?}",
+                        a_face.id, b_face.id, region.minimum, region.maximum
+                    );
+                }
+                let wedge_on = operand_wedge && operand_wedges_mode() == Mode::On;
                 let operand_sliver = !registered
                     && !same_operand
                     && uniform
@@ -205,17 +252,27 @@ impl FeatureScale {
                             a_face.id, b_face.id, region.minimum, region.maximum
                         );
                     }
-                    thin_pairs.push(ThinPair { height, region, same_operand });
+                    let planes = wedge_on.then_some([(a_origin, a_normal), (b_origin, b_normal)]);
+                    if wedge_on {
+                        operand_wedges.push((a_face.id, b_face.id));
+                    }
+                    thin_pairs.push(ThinPair { height, region, same_operand, planes });
                 }
             }
         }
-        Ok(Self { thin_pairs, operand_slivers, operand_sliver_regions })
+        Ok(Self { thin_pairs, operand_slivers, operand_sliver_regions, operand_wedges })
     }
 
     /// Whether the first operand's face `first` and the second's `second`
     /// stand a resolvable sliver apart (`BREP_FEATURE_SCALE_OPERAND_SLIVERS`).
     pub fn operand_sliver(&self, first: u64, second: u64) -> bool {
         self.operand_slivers.contains(&(first, second))
+    }
+
+    /// Whether the pair (first operand's face, second operand's face) is a
+    /// registered operand wedge.
+    pub fn operand_wedge(&self, first: u64, second: u64) -> bool {
+        self.operand_wedges.contains(&(first, second))
     }
 
     /// Whether any feature limits a band (no work at the cap sites when not).
@@ -230,7 +287,7 @@ impl FeatureScale {
         self.thin_pairs
             .iter()
             .filter(|pair| pair.region.expanded(uncapped).contains(point))
-            .fold(uncapped, |cap, pair| cap.min(FRACTION * pair.height))
+            .fold(uncapped, |cap, pair| cap.min(pair.local_cap(point)))
     }
 
     /// [`Self::cap`] by the slabs of one operand's material alone. The
@@ -312,6 +369,28 @@ fn corners(region: Aabb) -> [Vec3; 8] {
         Vec3::new(hi.x, hi.y, hi.z),
     ]
 }
+
+impl ThinPair {
+    /// The cap at `point`: a quarter of the height, or for a wedge a quarter of
+    /// its thickness there (the larger distance from the point to either plane,
+    /// at most the height), never under the model floor.
+    pub fn local_cap(&self, point: Vec3) -> f64 {
+        match self.planes {
+            None => FRACTION * self.height,
+            Some([(a_origin, a_normal), (b_origin, b_normal)]) => {
+                let thickness = point.sub(a_origin).dot(a_normal).abs().max(point.sub(b_origin).dot(b_normal).abs()).min(self.height);
+                (FRACTION * thickness).max(OPERAND_SLIVER_FLOOR)
+            }
+        }
+    }
+}
+
+/// `BREP_FEATURE_SCALE_OPERAND_WEDGES` (default on; `=0` restores, `check`
+/// prints), see [`FeatureScale::between`].
+pub fn operand_wedges_mode() -> Mode {
+    crate::mode_switch!(live "BREP_FEATURE_SCALE_OPERAND_WEDGES", true)
+}
+
 
 /// Two operands' planes at most this far apart are one surface whatever the
 /// tolerance (the model tolerance): an operand sliver must exceed it.

@@ -439,7 +439,10 @@ pub struct FaceImprints {
     pub piece_ids: Vec<u64>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Not exhaustive: a new field is not a breaking change. Outside this crate,
+/// start from `ImprintResultRecord::default()` and set the fields you need.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct ImprintResultRecord {
     pub vertices: Vec<ImprintVertex>,
     pub pieces: Vec<ImprintPieceRecord>,

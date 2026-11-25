@@ -3,7 +3,7 @@
 Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_solvers` · [licence summary](#licence)
 
 `BREP_solvers` holds the constraint solvers of the BREP kernel. Its Rust library
-target is `brep_solvers`; this is version **0.29.0**.
+target is `brep_solvers`; this is version **0.30.0**.
 
 It is one of the implementation crates the kernel is built from. Applications
 should depend on [`BREP_kernel`](https://crates.io/crates/BREP_kernel), which
