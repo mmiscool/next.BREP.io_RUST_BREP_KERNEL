@@ -212,6 +212,24 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         .into_iter()
         .map(|solid| (solid.name, solid.solid))
         .collect();
+    // The part's MOUNT FRAME (`part_mount`): the whole part (members, ports and
+    // nested poses) moved into its footprint frame BEFORE the instance pose, so
+    // the component's own pose stays the one it was given, the pose the solver
+    // writes back. No block, no change.
+    let mount = crate::feature_pipeline::part_mount::part_mount(&entry.document)
+        .map_err(|error| format!("part '{part_name}': {error}"))?;
+    let (members, ports, nested_poses) = match mount {
+        None => (members, ports, nested_poses),
+        Some(mount) => {
+            if matches!(ctx.param("flexible"), Some(serde_json::Value::Bool(true))) {
+                return Err(format!(
+                    "part '{part_name}' has a mount frame, and a flexible instance of a mounted part is not \
+                     supported yet: make this instance rigid, or clear the part's mount"
+                ));
+            }
+            mount_part(&part_name, mount, members, ports, nested_poses)?
+        }
+    };
     let source = serde_json::json!({
         "sourceKey": entry.source_key,
         "sourceSignature": entry.source_signature,
@@ -270,6 +288,39 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         ports::publish_port(&mut result, &id, posed)?;
     }
     Ok(result)
+}
+
+/// Move a decoded part into its mount frame: every member solid and every
+/// port record by `mount`, and each nested occurrence's part-local pose
+/// composed after it (`mount · local`), so the sub-assembly's occurrences stay
+/// where its members are.
+#[allow(clippy::type_complexity)]
+fn mount_part(
+    part_name: &str,
+    mount: AffineTransform,
+    members: Vec<(String, crate::BrepSolid)>,
+    ports: BTreeMap<String, PortRecord>,
+    nested_poses: BTreeMap<String, AffineTransform>,
+) -> Result<(Vec<(String, crate::BrepSolid)>, BTreeMap<String, PortRecord>, BTreeMap<String, AffineTransform>), String> {
+    if !mount.is_rigid(1e-9) {
+        return Err(format!("part '{part_name}': mount: not a rigid pose"));
+    }
+    let members = members
+        .into_iter()
+        .map(|(name, solid)| match crate::transform_brep(&solid, mount, false) {
+            Ok(moved) => Ok((name, moved)),
+            Err(error) => Err(format!("part '{part_name}': mount: member '{name}': {error}")),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let ports = ports.into_iter().map(|(id, port)| {
+        let moved = component::pose_port(&port, &mount);
+        (id, moved)
+    }).collect();
+    let nested_poses = nested_poses
+        .into_iter()
+        .map(|(path, local)| component::compose(&mount, &local).map(|pose| (path, pose)))
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    Ok((members, ports, nested_poses))
 }
 
 /// The self-heal lane: re-execute the entry's embedded document in isolation,

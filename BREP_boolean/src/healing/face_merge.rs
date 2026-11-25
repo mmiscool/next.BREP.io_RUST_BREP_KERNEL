@@ -83,10 +83,17 @@ fn planar_support(
         .surface
         .evaluate(midpoint_u, midpoint_v)
         .or_refuse(KernelStage::Sew, "evaluate")?;
-    let normal = face
-        .surface
-        .normal(midpoint_u, midpoint_v)
-        .or_refuse(KernelStage::Sew, "normal")?;
+    // No normal at the domain centre (a cusp, pinch or fold line through the
+    // carrier): no plane (`BREP_SINGULAR_CENTRE_NOT_PLANAR`, default off).
+    let normal = match face.surface.normal(midpoint_u, midpoint_v) {
+        Ok(normal) => normal,
+        Err(error) => {
+            if crate::imprint::support::singular_centre_not_planar(|| format!("face_merge: face {}", face.id), &error) {
+                return Ok(None);
+            }
+            return Err(error).or_refuse(KernelStage::Sew, "normal");
+        }
+    };
     let controls = face
         .surface
         .control_points
@@ -773,6 +780,24 @@ fn coextrusion_pair(
             );
         }
         return Ok(None);
+    }
+    let certified_on = crate::switch!("BREP_COEXTRUSION_CERTIFIED_APART", true);
+    let certified_check = crate::switch!("BREP_COEXTRUSION_CERTIFIED_APART_CHECK", false);
+    if (certified_on || certified_check) && profile_a.degree > 1 && profile_b.degree > 1 {
+        // A finite complete profile-crossing cover excludes a shared arc.
+        // The sampling band can call two shallowly crossing profiles equal;
+        // merging them would replace distinct wall patches by one carrier.
+        let crossings = match (older.surface.linear_extrusion(), newer.surface.linear_extrusion()) {
+            (Some(a), Some(b)) => crate::analytic_surface::certified_parallel_extrusion_sections(a, b, tolerance),
+            _ => None,
+        };
+        if let Some(crossings) = crossings {
+            if certified_check {
+                eprintln!("COEXTRUSION_CERTIFIED_APART faces={}x{} crossings={} applied={certified_on}",
+                    older.id, newer.id, crossings.len());
+            }
+            if certified_on { return Ok(None); }
+        }
     }
     let union = [
         support_a.interval[0].min(interval_b[0]),
@@ -4113,5 +4138,6 @@ pub fn merge_same_surface_faces_open(
 ) -> Result<BrepSolid, KernelRefusal> {
     merge_same_surface_faces_impl(solid, tolerance, false, 5e-3, &[], None)
 }
+
 
 

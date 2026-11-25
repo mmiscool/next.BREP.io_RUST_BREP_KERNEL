@@ -163,7 +163,8 @@ pub fn mirror_brep_buffer(request_json: &str) -> Result<WasmSolidBuffer, JsValue
 
 /// Cut a solid by a plane (Golovanov §6.4). Returns `{ "below": <solid>,
 /// "above": <solid> }` — the −n and +n pieces of the split. Errors with
-/// "plane does not intersect the solid" when the plane misses the body.
+/// "plane does not intersect the solid" when the plane misses the body, and
+/// with the boolean's own refusal when the cut fails.
 #[wasm_bindgen]
 pub fn split_solid_by_plane_json(request_json: &str) -> Result<String, JsValue> {
     let request: SplitByPlaneRequest = json_in(request_json)?;

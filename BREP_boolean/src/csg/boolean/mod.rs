@@ -231,6 +231,7 @@ mod touch;
 pub(crate) mod reseat;
 mod ball_align;
 mod rejoin;
+mod window_retry;
 
 pub use rim::*;
 use select::*;
@@ -293,6 +294,17 @@ pub fn boolean_operation(
             .map_err(|error| scaled.refusal(error))
             .and_then(|solid| scaled.back(&solid));
     }
+    boolean_operation_unscaled(first, second, operation, options)
+        .or_else(|refused| window_retry::retry(first, second, operation, options, refused, boolean_operation_unscaled))
+}
+
+/// [`boolean_operation`] on operands already at their working scale.
+fn boolean_operation_unscaled(
+    first: &BrepSolid,
+    second: &BrepSolid,
+    operation: BooleanOperation,
+    options: &BooleanOptions,
+) -> Result<BrepSolid, KernelRefusal> {
     match boolean_operation_with_diagnostics(first, second, operation, options) {
         Ok(outcome) => {
             // An empty difference or common part of two solids whose faces only
@@ -2248,6 +2260,7 @@ fn build_nary_imprint(
         barrier_edges: Vec::new(),
         section_evidence,
         cosurface_pairs: Vec::new(),
+        operand_sliver_regions: Vec::new(),
         tangent_sections: Vec::new(),
         by_face: by_face
             .into_iter()
@@ -2721,6 +2734,43 @@ pub fn boolean_operation_with_diagnostics(
     let cylinders = reseat::seam_reseat_cylinders_mode();
     if reseat::seam_reseat_enabled() && cylinders != crate::env_read::Mode::Off {
         let kinds = reseat::ContactKinds { planes: false, cylinders: true };
+        let volume = |result: &Result<KernelOutcome<BrepSolid>, KernelRefusal>| {
+            result.as_ref().ok().and_then(|outcome| crate::solid_mass_properties(&outcome.value).ok()).map(|mass| mass.volume)
+        };
+        if reseat::seam_reseat_retry_enabled() {
+            // RETRY: the operands as given first; the re-seated ones (with the
+            // tangent-cylinder cosurface exchange) only when that refuses, so a
+            // body built without a re-seat stays the operand of the next cut as
+            // it would be without the switch. `check` reports what the retry
+            // would give and returns the first attempt.
+            let plain = boolean_operation_with_diagnostics_impl(first, second, operation, options, closed_inputs).map(without_sliver_shells);
+            if plain.is_ok() {
+                return plain;
+            }
+            let (reseated_first, reseated_second) = reseat::reseat_tangent_seams_of(first, second, &[], options.tolerance, kinds);
+            let moved = matches!(reseated_first, std::borrow::Cow::Owned(_)) || matches!(reseated_second, std::borrow::Cow::Owned(_));
+            if !moved {
+                return plain;
+            }
+            let reseated = crate::imprint::driver::with_tangent_cylinder_filter(|| {
+                boolean_operation_with_diagnostics_impl(&reseated_first, &reseated_second, operation, options, closed_inputs).map(without_sliver_shells)
+            });
+            if cylinders == crate::env_read::Mode::Check {
+                eprintln!(
+                    "boolean.seam_reseat_cylinders check: plain refused, reseated retry {} volume {:?}",
+                    if reseated.is_ok() { "built" } else { "refused" },
+                    volume(&reseated)
+                );
+                return plain;
+            }
+            return match reseated {
+                Ok(mut outcome) => {
+                    outcome.diagnostics.count_n("seam_reseat_cylinders.retry_built", 1);
+                    Ok(outcome)
+                }
+                Err(_) => plain,
+            };
+        }
         let (reseated_first, reseated_second) = reseat::reseat_tangent_seams_of(first, second, &[], options.tolerance, kinds);
         let moved = matches!(reseated_first, std::borrow::Cow::Owned(_)) || matches!(reseated_second, std::borrow::Cow::Owned(_));
         if moved {
@@ -2729,9 +2779,6 @@ pub fn boolean_operation_with_diagnostics(
                 return reseated;
             }
             let plain = boolean_operation_with_diagnostics_impl(first, second, operation, options, closed_inputs).map(without_sliver_shells);
-            let volume = |result: &Result<KernelOutcome<BrepSolid>, KernelRefusal>| {
-                result.as_ref().ok().and_then(|outcome| crate::solid_mass_properties(&outcome.value).ok()).map(|mass| mass.volume)
-            };
             eprintln!(
                 "boolean.seam_reseat_cylinders check: plain {} volume {:?}, reseated {} volume {:?}",
                 if plain.is_ok() { "built" } else { "refused" },

@@ -1270,6 +1270,7 @@ pub(super) fn empty_imprint() -> ImprintResultRecord {
         tangent_nodes: Vec::new(),
         section_evidence: false,
         cosurface_pairs: Vec::new(),
+        operand_sliver_regions: Vec::new(),
         tangent_sections: Vec::new(),
     }
 }
@@ -3360,6 +3361,7 @@ pub(super) fn translate_composite_imprint(
     for (first, second) in record.cosurface_pairs {
         out.cosurface_pairs.push((face(&first)?, face(&second)?));
     }
+    out.operand_sliver_regions.extend(record.operand_sliver_regions);
     // The per-pair cross-pair vertex identity (see the doc above): a greedy
     // positional registry in the driver's minting order, first point kept.
     let merge = tolerance.max(1e-5) * crate::tolerance::merge_scale(scale);

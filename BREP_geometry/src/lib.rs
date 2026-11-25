@@ -285,6 +285,9 @@ pub mod curve_clear;
 #[doc(hidden)]
 pub mod curve_curve_intersection;
 pub use curve_curve_intersection::{intersect_curves, CurveCurveIntersection};
+#[path = "intersect/certified_planar.rs"]
+#[doc(hidden)]
+pub mod certified_planar;
 #[path = "intersect/surface_surface_intersection.rs"]
 #[doc(hidden)]
 pub mod surface_surface_intersection;

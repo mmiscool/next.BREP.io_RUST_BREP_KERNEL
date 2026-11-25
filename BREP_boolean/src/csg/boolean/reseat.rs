@@ -50,7 +50,7 @@ pub(super) struct ContactKinds {
     pub(super) cylinders: bool,
 }
 
-/// `BREP_SEAM_RESEAT_CYLINDERS` (default off; `on`, `check`): a
+/// `BREP_SEAM_RESEAT_CYLINDERS` (default on; `off`/`0`, `check`): a
 /// primitive-shaped cylinder wall that one cylinder of the other operand
 /// touches from outside along a generatrix has its seam re-seated onto that
 /// line before imprint, as a plane's contact does. Two holes cut one after
@@ -60,9 +60,11 @@ pub(super) struct ContactKinds {
 /// as the plane case does. Under it the raw API (no later references given)
 /// re-seats these cylinder walls only; the plane re-seat keeps its gate.
 /// `check` builds both ways, prints one `boolean.seam_reseat_cylinders`
-/// line, and returns the body built without it.
+/// line, and returns the body built without it. With the retry
+/// ([`seam_reseat_retry_enabled`]) a boolean that builds as given is never
+/// re-seated, so on by default it acts only where the plain boolean refuses.
 pub(super) fn seam_reseat_cylinders_mode() -> crate::env_read::Mode {
-    crate::mode_switch!("BREP_SEAM_RESEAT_CYLINDERS", false)
+    crate::mode_switch!("BREP_SEAM_RESEAT_CYLINDERS", true)
 }
 
 
@@ -256,12 +258,112 @@ fn cylinder_contact(wall: &FaceRecord, other: &BrepSolid, weld: f64) -> Option<C
             continue;
         }
         let Ok(toward) = apart.normalized() else { continue };
-        contacts.push(Contact { point: frame.origin.add(toward.scale(*rho0)), axis: frame.axis });
+        let point = frame.origin.add(toward.scale(*rho0));
+        // Whether the other face already has an edge on the contact line (its
+        // seam, or a line an earlier cut left there).
+        let edged = face.loops.iter().flat_map(|loop_record| &loop_record.coedges).any(|coedge| {
+            other.edges.iter().find(|edge| edge.id == coedge.edge_id).is_some_and(|edge| {
+                !edge.degenerate
+                    && [edge.t0, edge.t1, 0.5 * (edge.t0 + edge.t1)].iter().all(|&t| {
+                        edge.curve.evaluate(t).is_ok_and(|at| {
+                            let delta = at.sub(point);
+                            delta.sub(frame.axis.scale(delta.dot(frame.axis))).length() <= weld
+                        })
+                    })
+            })
+        });
+        contacts.push((Contact { point, axis: frame.axis }, edged));
+    }
+    if edged_contact_choice_enabled() {
+        return ranked_seam_line(wall, frame.axis, *rho0, &contacts, other, weld);
     }
     match contacts.len() {
-        1 => contacts.pop(),
+        1 => contacts.pop().map(|(contact, _)| contact),
         _ => None,
     }
+}
+
+/// The seam line to re-seat a cylinder wall onto, ranked over the carrier's
+/// full-multiplicity u knots (the lines a re-seat can reach exactly):
+///
+/// 0. a contact where the other operand already has an edge on the line (its
+///    seam, or a line an earlier cut left): this wall needs an edge there to
+///    pair with;
+/// 1. a free line: no contact, and no straight edge of the other operand
+///    passing within the near band of it;
+/// 2. a contact inside the other face: it builds with or without a seam on it;
+/// 3. a near miss: a straight edge of the other operand passing within the
+///    near band but farther than the weld. A seam there puts its end vertices
+///    beside that edge, the imprint takes them as junctions on it, and the
+///    web between them closes at a point; a hole cut later beside this one
+///    then fails to assemble.
+///
+/// The wall is re-seated only when some line ranks better than its current
+/// seam (u = start), onto the first best one. Holes cut one at a time in a
+/// zero-web grid touch two earlier holes, one of them on that hole's seam,
+/// and the outer rows sit a hair inside the plate's sides.
+fn ranked_seam_line(wall: &FaceRecord, axis: Vec3, radius: f64, contacts: &[(Contact, bool)], other: &BrepSolid, weld: f64) -> Option<Contact> {
+    let surface = &wall.surface;
+    let near = 1e-3 * radius.max(1.0);
+    let off_line = |point: Vec3, on: Vec3| {
+        let delta = point.sub(on);
+        delta.sub(axis.scale(delta.dot(axis))).length()
+    };
+    let segments: Vec<(Vec3, Vec3)> = other
+        .edges
+        .iter()
+        .filter(|edge| !edge.degenerate && edge.curve.degree == 1 && edge.curve.control_points.len() == 2)
+        .filter_map(|edge| Some((edge.curve.evaluate(edge.t0).ok()?, edge.curve.evaluate(edge.t1).ok()?)))
+        .collect();
+    // The least distance between the line through `on` along the axis and a
+    // segment, read in the plane normal to the axis.
+    let flat = |point: Vec3| point.sub(axis.scale(point.dot(axis)));
+    let segment_gap = |on: Vec3, (a, b): (Vec3, Vec3)| -> f64 {
+        let (p, a, b) = (flat(on), flat(a), flat(b));
+        let ab = b.sub(a);
+        let length = ab.dot(ab);
+        let t = if length <= f64::EPSILON { 0.0 } else { (p.sub(a).dot(ab) / length).clamp(0.0, 1.0) };
+        p.sub(a.add(ab.scale(t))).length()
+    };
+    let rank = |on: Vec3| -> u8 {
+        if let Some((_, edged)) = contacts.iter().find(|(contact, _)| off_line(contact.point, on) <= weld) {
+            return if *edged { 0 } else { 2 };
+        }
+        let gap = segments.iter().map(|&segment| segment_gap(on, segment)).fold(f64::INFINITY, f64::min);
+        if gap > weld && gap <= near { 3 } else { 1 }
+    };
+    let row_point = |row: usize| surface.control_points[row].first().and_then(|control| control.point().ok());
+    let current = rank(row_point(0)?);
+    let mut best: Option<(u8, Vec3)> = None;
+    for (_, row) in full_knots(&surface.knots_u, surface.degree_u) {
+        let Some(point) = row_point(row) else { continue };
+        let score = rank(point);
+        if best.map_or(true, |(known, _)| score < known) {
+            best = Some((score, point));
+        }
+    }
+    let (score, point) = best?;
+    (score < current).then_some(Contact { point, axis })
+}
+
+/// `BREP_SEAM_RESEAT_CYLINDERS_RETRY` (default on; acts only under
+/// [`seam_reseat_cylinders_mode`]): the boolean runs on the operands as given
+/// first, and the re-seat is computed and built (with
+/// `BREP_COSURFACE_TANGENT_CYLINDERS` on) only when that refuses; `check`
+/// prints what the retry gives and returns the first attempt. Measured on
+/// the dense-holes grids, a re-seat applied at every cut moves seams that a
+/// later cut meets, and that cut then fails where the plain body would have
+/// built; every single step built from a plain operand.
+pub(super) fn seam_reseat_retry_enabled() -> bool {
+    switch!("BREP_SEAM_RESEAT_CYLINDERS_RETRY", true)
+}
+
+/// `BREP_SEAM_RESEAT_EDGED_CONTACT` (default on; acts only under
+/// [`seam_reseat_cylinders_mode`]): the cylinder re-seat chooses its line by
+/// [`ranked_seam_line`] instead of re-seating onto a lone contact. `=0`
+/// restores the lone-contact rule.
+fn edged_contact_choice_enabled() -> bool {
+    switch!("BREP_SEAM_RESEAT_EDGED_CONTACT", true)
 }
 
 // Re-seating changes carrier/curve/pcurve coordinates, never record order,

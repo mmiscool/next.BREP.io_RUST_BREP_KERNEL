@@ -119,6 +119,58 @@ pub(super) fn branch_follows_shared_boundary(
     Ok(true)
 }
 
+/// `BREP_MARCH_RIDES_EXCHANGED_SPAN` (default on, `=0` restores; `check`
+/// reports each piece it would leave out and mints it): a piece of a marched run that lies along
+/// a piece the pair's lies-on exchange has already minted is that piece again,
+/// and is not minted. The run is still processed, so its junctions and edge
+/// splits stand as before; only the duplicate piece is left out (dropping the
+/// whole run lost a pole junction its fuzzy hits placed, and a revolve ∪
+/// wedge union came out open). The exchange takes an edge of one face lying
+/// on the other face's carrier as an exact section; the marcher then
+/// finds the same curve as the carriers' intersection. Where the edge bounds
+/// only ONE of the two faces the shared-boundary test above does not read it
+/// (the other face has no edge there), and a fitted run standing off the rim
+/// reads inside the face and is minted a second time with free ends: a twisted
+/// tooth flank on a sleeve's cylinder (part-insert-m5's knurl band), whose rim
+/// helix the lies-on exchange already gave, came back as three runs and its
+/// middle one was minted with a free end and left the union with open loops.
+pub(super) fn exchanged_span_mode() -> crate::env_read::Mode {
+    if crate::env_read!("BREP_MARCH_RIDES_EXCHANGED_SPAN").as_deref() == Some("check") {
+        crate::env_read::Mode::Check
+    } else if crate::switch!("BREP_MARCH_RIDES_EXCHANGED_SPAN", true) {
+        crate::env_read::Mode::On
+    } else {
+        crate::env_read::Mode::Off
+    }
+}
+
+/// Whether the piece `curve` over `[t0, t1]` lies along one of `spans` (each
+/// a minted piece: its curve and the range of it the piece covers) within
+/// `limit` at nine points from end to end; the largest distance when it does.
+pub(super) fn piece_rides_exchanged(
+    curve: &NurbsCurve,
+    t0: f64,
+    t1: f64,
+    spans: &[(NurbsCurve, f64, f64)],
+    limit: f64,
+) -> Result<Option<f64>, KernelRefusal> {
+    let mut worst = 0.0f64;
+    for step in 0..=8 {
+        let point = curve.evaluate(t0 + (t1 - t0) * step as f64 / 8.0).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let mut best = f64::INFINITY;
+        for (span, low, high) in spans {
+            let foot = project_point_to_curve(span, point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+            let on = span.evaluate(foot.u.clamp(low.min(*high), low.max(*high))).or_refuse(KernelStage::Intersect, "evaluate")?;
+            best = best.min(on.sub(point).length());
+        }
+        if best > limit {
+            return Ok(None);
+        }
+        worst = worst.max(best);
+    }
+    Ok(Some(worst))
+}
+
 /// Keep only the runs of a marched branch that lie inside (or on the
 /// boundary of) BOTH faces' trimmed regions. The marcher works on the
 /// untrimmed carriers and happily chases intersections far outside the

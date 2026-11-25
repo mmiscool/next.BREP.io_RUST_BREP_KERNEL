@@ -728,6 +728,8 @@ fn conform_overlapping_one_use_edges_pass(
                         boundary_key: parent_key,
                         piece: assembler.edge_piece.get(&edge.id).copied(),
                         tangent_side: None,
+                        feature_radius: None,
+                        distinct_ends: false,
                     },
                     forward,
                 )?;

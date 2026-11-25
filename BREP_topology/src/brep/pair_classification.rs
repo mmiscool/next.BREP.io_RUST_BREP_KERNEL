@@ -63,7 +63,24 @@ fn planar_support(surface: &NurbsSurface, tolerance: f64) -> Result<Option<(Vec3
     let u = KnotVector::new(surface.knots_u.clone(), surface.degree_u)?.domain();
     let v = KnotVector::new(surface.knots_v.clone(), surface.degree_v)?.domain();
     let origin = surface.evaluate((u[0] + u[1]) / 2.0, (v[0] + v[1]) / 2.0)?;
-    let normal = surface.normal((u[0] + u[1]) / 2.0, (v[0] + v[1]) / 2.0)?;
+    // A carrier with no normal at its domain centre (a cusp or pinch line
+    // through it) is no plane. `BREP_SINGULAR_CENTRE_NOT_PLANAR` (default
+    // off; `check` reports each surface) answers "not planar" instead of
+    // failing the whole pair classification.
+    let normal = match surface.normal((u[0] + u[1]) / 2.0, (v[0] + v[1]) / 2.0) {
+        Ok(normal) => normal,
+        Err(error) => {
+            let on = crate::switch!("BREP_SINGULAR_CENTRE_NOT_PLANAR", false);
+            let check = !on && env_read!("BREP_SINGULAR_CENTRE_NOT_PLANAR").as_deref() == Some("check");
+            if check {
+                eprintln!("SINGULAR_CENTRE_NOT_PLANAR: planar_support: no normal at the carrier's domain centre ({error}); the switch reads it as not planar");
+            }
+            if on {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    };
     let controls = surface
         .control_points
         .iter()

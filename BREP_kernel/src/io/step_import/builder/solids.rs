@@ -173,7 +173,9 @@ fn certify_brep_with_voids_topology(solid: &BrepSolid) -> Result<(), KernelRefus
     Ok(())
 }
 
-pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSolid) -> Result<(), KernelRefusal> {
+/// `touch_band` is the file's identity band (see the void-edge samples below):
+/// `None` keeps the classifier tolerance alone.
+pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSolid, touch_band: Option<f64>) -> Result<(), KernelRefusal> {
     let edge_map: HashMap<u64, &EdgeRecord> =
         solid.edges.iter().map(|edge| (edge.id, edge)).collect();
     let vertex_map: HashMap<u64, Vec3> = solid
@@ -282,6 +284,21 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
     // curved void (many samples) is O(samples x outer-faces) and can blow the
     // import timeout; a single build gives byte-identical results far faster.
     let outer_classifier = crate::SolidClassifier::new(&outer, tolerance).or_refuse(KernelStage::Validate, "brep_with_voids_classifier")?;
+    // VOID TOUCH (`BREP_STEP_VOID_TOUCH_BAND`, default on, =0 restores): a void
+    // edge sample the classifier reads Out is a TOUCH, not a void bowing out,
+    // when its nearest point of the outer boundary is within the file's
+    // identity band: the void meets the outer boundary within the precision
+    // the file is read at. The distance is to the TRIMMED outer shell
+    // (`nearest_boundary_point`), not to a face's carrier, so a sample far
+    // outside near some face's extended surface still refuses.
+    // abc_00000197 states no usable precision (identity band 2e-4 of its
+    // diagonal, capped 1e-2 mm); its void's edge 1546 runs 6.9e-5 mm outside the
+    // outer shell against a classifier tolerance of 1.1e-6 and the body was
+    // refused, although the outer shell's own volume is confirmed by a
+    // converging mesh. Read only for a sample that reads Out.
+    let touch_band = touch_band
+        .filter(|band| band.is_finite() && *band > tolerance)
+        .filter(|_| switch!("BREP_STEP_VOID_TOUCH_BAND", true));
     let mut void_bounds = Vec::new();
     for (shell_index, shell) in solid.shells.iter().enumerate().skip(1) {
         let ids = shell_vertex_ids(shell).map_err(brep_with_voids_input)?;
@@ -352,6 +369,13 @@ pub(in crate::step_import) fn certify_brep_with_voids_containment(solid: &BrepSo
                                 continue;
                             };
                             if outer_classifier.classify(point).or_refuse(KernelStage::Validate, "brep_with_voids_classify")?.class == crate::PointClass::Out {
+                                if let Some(band) = touch_band {
+                                    let touching = crate::nearest_boundary_point(&outer, point, tolerance)?
+                                        .is_some_and(|foot| foot.distance <= band);
+                                    if touching {
+                                        continue;
+                                    }
+                                }
                                 return Err(brep_with_voids_input(format!(
                                     "step_import: BREP_WITH_VOIDS void {shell_index} edge {} bows outside the outer shell",
                                     coedge.edge_id
@@ -567,7 +591,10 @@ pub(in crate::step_import) fn build_brep_with_voids_captured(
             "step_import: BREP_WITH_VOIDS has mixed outer/void orientations {shell_volumes:?}"
         )).into());
     }
-    certify_brep_with_voids_containment(&solid)?;
+    // The file's identity band: the unstated band where it states no usable
+    // precision, else the precision it states.
+    let touch_band = resolver.unstated_identity_band().or_else(|| resolver.stated_precision_mm());
+    certify_brep_with_voids_containment(&solid, touch_band)?;
     let outer_volume = shell_volumes[0];
     let net_volume = shell_volumes.iter().sum::<f64>();
     if outer_volume <= tolerance || !net_volume.is_finite() || net_volume <= tolerance {

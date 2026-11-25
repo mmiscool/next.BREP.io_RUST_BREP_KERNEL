@@ -123,7 +123,98 @@ fn developable_cdt_enabled() -> bool {
     switch!("BREP_TESS_DEVELOPABLE_CDT", true)
 }
 
+/// `BREP_TESS_RULED_BAND_FALLBACK` (default on, `=0` restores): the ruled band (`ruled_band.rs`)
+/// for the cylinder and cone walls the general road cannot mesh well, whatever
+/// `BREP_TESS_RULED_BAND` says. A wall of [`RULED_BAND_FIRST_STATIONS`] boundary stations or more
+/// tries the band first and the general road after it; a smaller wall the general road cannot mesh
+/// within the face budget (`MAX_FACE_TRIANGLES`) is tried once more as a band, and a band that
+/// declines leaves that refusal as it was. Every smaller wall the general road meshes is meshed
+/// as before.
+fn ruled_band_fallback_enabled() -> bool {
+    switch!("BREP_TESS_RULED_BAND_FALLBACK", true)
+}
+
+/// A wall with at least this many boundary stations tries the ruled band before the general road
+/// (`BREP_TESS_RULED_BAND_FALLBACK`): the general road on such a wall at a fine chord takes minutes
+/// before it runs out of budget, if it does.
+const RULED_BAND_FIRST_STATIONS: usize = 2048;
+
+/// How the ruled band is offered to this face ([`tessellate_face_watertight`]).
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum BandMode {
+    /// As `BREP_TESS_RULED_BAND` says.
+    Default,
+    /// Tried first; the general road follows if it declines (a wall of many stations).
+    First,
+    /// The retry after the general road ran out of budget: a decline is that refusal again.
+    Retry,
+}
+
+thread_local! {
+    static RULED_BAND_MODE: std::cell::Cell<BandMode> = const { std::cell::Cell::new(BandMode::Default) };
+}
+
+/// How the ruled band is offered to the face being meshed.
+pub(super) fn ruled_band_mode() -> BandMode {
+    RULED_BAND_MODE.with(|mode| mode.get())
+}
+
+/// Whether the ruled band is tried on this face whatever `BREP_TESS_RULED_BAND` says.
+pub(super) fn ruled_band_forced() -> bool {
+    ruled_band_mode() != BandMode::Default
+}
+
+fn with_band_mode<T>(mode: BandMode, action: impl FnOnce() -> T) -> T {
+    let before = RULED_BAND_MODE.with(|m| m.replace(mode));
+    let out = action();
+    RULED_BAND_MODE.with(|m| m.set(before));
+    out
+}
+
 pub(super) fn tessellate_face_watertight(
+    face: &FaceRecord,
+    samples: &HashMap<u64, EdgeSamples>,
+    chord_tolerance: f64,
+    face_id: u32,
+    mesh: &mut Mesh,
+) -> Result<(), String> {
+    let (positions, normals, indices, face_ids) =
+        (mesh.positions.len(), mesh.normals.len(), mesh.indices.len(), mesh.face_ids.len());
+    let ruled = ruled_band_fallback_enabled()
+        && matches!(face.surface.analytic(), Some(crate::AnalyticSurface::RuledRevolution { .. }));
+    let stations: usize = face.loops.iter().flat_map(|l| l.coedges.iter())
+        .map(|c| samples.get(&c.edge_id).map_or(0, |s| s.positions.len()))
+        .sum();
+    if ruled && stations >= RULED_BAND_FIRST_STATIONS {
+        return with_band_mode(BandMode::First, || {
+            tessellate_face_general(face, samples, chord_tolerance, face_id, mesh)
+        });
+    }
+    let result = tessellate_face_general(face, samples, chord_tolerance, face_id, mesh);
+    let Err(why) = &result else { return result };
+    if !why.starts_with("tessellation budget") || !ruled {
+        return result;
+    }
+    mesh.positions.truncate(positions);
+    mesh.normals.truncate(normals);
+    mesh.indices.truncate(indices);
+    mesh.face_ids.truncate(face_ids);
+    let retried = with_band_mode(BandMode::Retry, || {
+        tessellate_face_general(face, samples, chord_tolerance, face_id, mesh)
+    });
+    match retried {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            mesh.positions.truncate(positions);
+            mesh.normals.truncate(normals);
+            mesh.indices.truncate(indices);
+            mesh.face_ids.truncate(face_ids);
+            result
+        }
+    }
+}
+
+fn tessellate_face_general(
     face: &FaceRecord,
     samples: &HashMap<u64, EdgeSamples>,
     chord_tolerance: f64,
@@ -239,7 +330,8 @@ pub(super) fn tessellate_face_watertight(
     }
     if chains.is_empty() {
         for loop_record in &face.loops {
-            chains.push(loop_chain(&loop_record.coedges, samples)?);
+            let sides = seam_side_offsets(&loop_record.coedges, [closed_u, closed_v], [u0, u1, v0, v1])?;
+            chains.push(loop_chain_offset(&loop_record.coedges, samples, &sides)?);
         }
     }
     if chains.is_empty() {
@@ -714,11 +806,15 @@ pub(super) fn tessellate_face_watertight(
         tess_route(Route::PointedCone);
         return Ok(());
     }
-    if matches!(face.surface.analytic(), Some(crate::AnalyticSurface::RuledRevolution { .. }))
-        && tessellate_ruled_band(face, bridged.polygon(), [u0, u1, v0, v1], closed_u, chord_tolerance, face_id, mesh)?
-    {
-        tess_route(Route::RuledBand);
-        return Ok(());
+    if matches!(face.surface.analytic(), Some(crate::AnalyticSurface::RuledRevolution { .. })) {
+        if tessellate_ruled_band(face, bridged.polygon(), [u0, u1, v0, v1], closed_u, chord_tolerance, face_id, mesh)? {
+            tess_route(Route::RuledBand);
+            return Ok(());
+        }
+        if ruled_band_mode() == BandMode::Retry {
+            // The retry after a budget refusal: the general road already ran out of budget.
+            return Err("tessellation budget: the ruled band declined this wall".into());
+        }
     }
     // Intrinsic uv scale, computed HERE (before triangulation) so the CDT path
     // can metric-scale its Delaunay too: maximum first-derivative magnitude per

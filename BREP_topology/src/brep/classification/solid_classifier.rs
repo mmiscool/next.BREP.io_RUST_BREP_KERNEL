@@ -49,10 +49,10 @@ fn face_normal(face: &FaceRecord, u: f64, v: f64) -> Result<Vec3, String> {
 /// `surface_uv_tolerance`).  Capped to a fraction of the smaller domain
 /// span so a pole or collapsed direction cannot widen the band into the
 /// whole face.
-/// `BREP_CLASSIFY_THIN_BODY_BAND` (default off, `=1` on): see
+/// `BREP_CLASSIFY_THIN_BODY_BAND` (default on, `=0` off): see
 /// [`SolidClassifier::classify`].
 fn thin_body_band_enabled() -> bool {
-    crate::switch!("BREP_CLASSIFY_THIN_BODY_BAND", false)
+    crate::switch!("BREP_CLASSIFY_THIN_BODY_BAND", true)
 }
 
 /// `BREP_CLASSIFY_THIN_BODY_BAND_CHECK` (default off, `=1` on): measure the
@@ -546,9 +546,9 @@ impl<'a> SolidClassifier<'a> {
         if !self.coincident_caps.is_empty() && env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
             eprintln!("feature_scale: classify at {point:?} on band {on_tolerance:.3e} (uncapped {:.3e}, {} caps)", tolerance * 10.0, self.coincident_caps.len());
         }
-        // THIN-BODY BAND (`BREP_CLASSIFY_THIN_BODY_BAND`, default off; with
-        // `BREP_CLASSIFY_THIN_BODY_BAND_CHECK` the band is measured and a
-        // differing answer reported, the answer kept): where the body is
+        // THIN-BODY BAND (`BREP_CLASSIFY_THIN_BODY_BAND`, default on; with it
+        // off and `BREP_CLASSIFY_THIN_BODY_BAND_CHECK` on, the band is measured
+        // and a differing answer reported, the answer kept): where the body is
         // thinner than four On bands at a face the point lies within the band
         // of, the band is capped at a quarter of the body's local thickness
         // there, measured exactly along the face's inward normal from the

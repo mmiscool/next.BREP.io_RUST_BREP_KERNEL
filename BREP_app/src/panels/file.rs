@@ -2884,9 +2884,16 @@ impl FileDialog {
                     return;
                 }
             }
-            if let Some(OwnedFollowup { doc: id, .. }) = self.owned_followup.take() {
+            if let Some(OwnedFollowup { doc: id, keys, .. }) = self.owned_followup.take() {
                 // Every new revision landed: save the assembly again so the
                 // documents holding them (and the assembly itself) name them.
+                // This session made each of them and saved the change into it,
+                // so each is checked out to us: say so to the index first, or a
+                // row read before the change feed caught up (a loaded machine)
+                // has the Save ask to check it out again and stop at that prompt.
+                for key in &keys {
+                    store.note_checked_out(key);
+                }
                 if docs.active_id() == id {
                     if let Some(name) = docs.active().name().map(str::to_string) {
                         self.save_to(docs, store, name);

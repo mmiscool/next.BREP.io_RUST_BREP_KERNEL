@@ -533,6 +533,19 @@ pub fn restricted_carrier(face: &FaceRecord) -> Option<MarchWindow> {
     Some(MarchWindow { surface, lifted })
 }
 
+/// `BREP_SINGULAR_CENTRE_NOT_PLANAR` (default off; `=check` prints each case
+/// it would change): whether a planarity test whose carrier has no normal at
+/// its domain centre reads the carrier as not planar instead of failing.
+/// Shared by [`face_bounds`] and the face merge's planar support; the pair
+/// classifier's planar support reads the same switch.
+pub(crate) fn singular_centre_not_planar(what: impl FnOnce() -> String, error: &str) -> bool {
+    let on = crate::switch!("BREP_SINGULAR_CENTRE_NOT_PLANAR", false);
+    if !on && env_read!("BREP_SINGULAR_CENTRE_NOT_PLANAR").as_deref() == Some("check") {
+        eprintln!("SINGULAR_CENTRE_NOT_PLANAR: {}: no normal at the carrier's domain centre ({error}); the switch reads it as not planar", what());
+    }
+    on
+}
+
 pub(super) fn face_bounds(
     face: &FaceRecord,
     restricted: Option<&NurbsSurface>,
@@ -552,10 +565,21 @@ pub(super) fn face_bounds(
         .surface
         .evaluate((u0 + u1) / 2.0, (v0 + v1) / 2.0)
         .or_refuse(KernelStage::Intersect, "csg.imprint.support")?;
-    let normal = face
-        .surface
-        .normal((u0 + u1) / 2.0, (v0 + v1) / 2.0)
-        .or_refuse(KernelStage::Intersect, "csg.imprint.support")?;
+    // The normal only decides whether the carrier is a plane, and a plane has
+    // one everywhere. A carrier with none at its domain centre (a cusp, pinch
+    // or fold line through it, which can lie outside the face) is curved:
+    // `BREP_SINGULAR_CENTRE_NOT_PLANAR` (default off; `check` reports each
+    // face) gives it the curved bound instead of refusing the Boolean.
+    let normal = match face.surface.normal((u0 + u1) / 2.0, (v0 + v1) / 2.0) {
+        Ok(normal) => Some(normal),
+        Err(error) => {
+            if singular_centre_not_planar(|| format!("face_bounds: face {} of operand {operand}", face.id), &error) {
+                None
+            } else {
+                return Err(error).or_refuse(KernelStage::Intersect, "csg.imprint.support");
+            }
+        }
+    };
     let surface_controls = face
         .surface
         .control_points
@@ -569,10 +593,11 @@ pub(super) fn face_bounds(
         .map(|point| point.sub(origin).length())
         .fold(1.0f64, f64::max);
     let plane_tolerance = (tolerance * 100.0).max(1e-7) * scale;
-    if surface_controls
-        .iter()
-        .any(|point| point.sub(origin).dot(normal).abs() > plane_tolerance)
-    {
+    if normal.is_none_or(|normal| {
+        surface_controls
+            .iter()
+            .any(|point| point.sub(origin).dot(normal).abs() > plane_tolerance)
+    }) {
         // Curved carrier: bound the trimmed uv sub-patch when the trims
         // cover only part of it (a revolve wall's full carrier box spans
         // the whole ring and pairs with everything).

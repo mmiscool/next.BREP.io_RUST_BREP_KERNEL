@@ -1,4 +1,5 @@
 use super::*;
+use crate::env_read::Mode;
 
 /// Lift each rim continuously to the covering plane before taking a boundary
 /// primitive. Integer translations of individual coedges must not change the
@@ -92,11 +93,24 @@ pub fn lifted_band_integral(
         let between_ccw = if p_is_u { directions[0] > 0.0 } else { directions[0] < 0.0 };
         let complement = between_ccw != face.same_sense;
         let mut previous = super::winding::lifted_loops_integral(&lifted, kinds, p_is_u, 1)?;
+        let mode = group_scale_mode();
+        let groups: Vec<u8> = kinds.iter().map(|&kind| convergence_group(kind)).collect();
+        // Check mode: where the group bar would have stopped, and its values.
+        let mut group_stop: Option<(usize, Vec<f64>)> = None;
         for refine in [2, 4, 8, 16, 32] {
             let values = super::winding::lifted_loops_integral(&lifted, kinds, p_is_u, refine)?;
-            let converged = values.iter().zip(&previous).all(|(a, b)| (a - b).abs() <= 1e-12 * a.abs().max(1.0));
+            let component = values.iter().zip(&previous).all(|(a, b)| (a - b).abs() <= 1e-12 * a.abs().max(1.0));
+            let grouped = mode != Mode::Off && group_converged(&values, &previous, &groups);
             previous = values;
-            if converged { break; }
+            if mode == Mode::Check && grouped && group_stop.is_none() {
+                group_stop = Some((refine, previous.clone()));
+            }
+            if if mode == Mode::On { grouped } else { component } { break; }
+        }
+        if let Some((refine, stopped)) = group_stop {
+            let scales = group_scales(&previous, &groups);
+            let worst = stopped.iter().zip(&previous).zip(&scales).map(|((a, b), scale)| (a - b).abs() / scale).fold(0.0f64, f64::max);
+            eprintln!("BREP_MASS_TORUS_LIFT_GROUP_SCALE check: face {} group bar stops at refine {refine}, its values differ from the component bar's by {worst:.3e} of their group scale", face.id);
         }
         if complement {
             for (value, &kind) in previous.iter_mut().zip(kinds) {
@@ -106,4 +120,55 @@ pub fn lifted_band_integral(
         return Ok(Some(previous));
     }
     Ok(None)
+}
+
+/// `BREP_MASS_TORUS_LIFT_GROUP_SCALE` (default on since 2026-11-24; `0|off`
+/// restores the per-component bar; `check` keeps that bar and prints where
+/// the group bar would have stopped): the lifted band's
+/// refinement stops when two readings agree to 1e-12 of each component's
+/// GROUP scale, the largest magnitude among the requested kinds of the same
+/// unit (the vector area's three components, the first moments, the second
+/// moments and products), instead of each component's own value. A vector
+/// component near zero carries the rounding of the vector's whole length:
+/// on a band whose rim is 218 projected edges, the vector area (-35.4,
+/// -46624.4, 0.125) agreed to 1e-14 of its length at the first doubling, but
+/// its 0.125 component read 5e-10 apart at every level, so all five levels
+/// ran (63 times the first reading's cost) for no change in any value. The
+/// group bar is also rotation invariant, which the per-component one is not.
+pub fn group_scale_mode() -> Mode {
+    crate::mode_switch!("BREP_MASS_TORUS_LIFT_GROUP_SCALE", true)
+}
+
+
+/// The unit group of an integrand: kinds in one group are compared against
+/// one scale (area; volume; vector area; first moments; second moments and
+/// products).
+pub fn convergence_group(kind: Integrand) -> u8 {
+    match kind {
+        Integrand::Area => 0,
+        Integrand::Volume | Integrand::VolumeAbout(_) => 1,
+        Integrand::NormalX | Integrand::NormalY | Integrand::NormalZ => 2,
+        Integrand::MomentX | Integrand::MomentY | Integrand::MomentZ | Integrand::MomentAbout(..) => 3,
+        Integrand::SecondXX | Integrand::SecondYY | Integrand::SecondZZ
+        | Integrand::ProductXY | Integrand::ProductXZ | Integrand::ProductYZ
+        | Integrand::SecondAbout(..) | Integrand::ProductAbout(..) => 4,
+    }
+}
+
+/// Each component's group scale: the largest magnitude in its group, at
+/// least 1 (the per-component bar's absolute floor).
+pub fn group_scales(values: &[f64], groups: &[u8]) -> Vec<f64> {
+    groups
+        .iter()
+        .map(|group| {
+            values.iter().zip(groups).filter(|(_, other)| *other == group).map(|(value, _)| value.abs()).fold(1.0f64, f64::max)
+        })
+        .collect()
+}
+
+/// Two readings agree to 1e-12 of every component's group scale. A
+/// non-finite reading never agrees.
+pub fn group_converged(values: &[f64], previous: &[f64], groups: &[u8]) -> bool {
+    let scales = group_scales(values, groups);
+    values.iter().zip(previous).zip(&scales).all(|((a, b), scale)| (a - b).abs() <= 1e-12 * scale)
 }

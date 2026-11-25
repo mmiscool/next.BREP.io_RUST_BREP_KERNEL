@@ -624,8 +624,9 @@ impl EngineState {
     /// `xtBinary` lane of [`Self::import_xt_bytes_feature`]. An assembly's
     /// parts are read from beside `path` on disk (by base name, any case) and
     /// placed as its instances say, all in one IMPORT3D feature carrying the
-    /// placed bodies (`nativeBrep`). Where there is no folder to read (the
-    /// browser), an assembly is refused with a message that says so.
+    /// placed bodies (`nativeBrep`); a component whose file is not there is
+    /// left out with a warning notice naming it. Where there is no folder to
+    /// read (the browser), an assembly is refused with a message that says so.
     pub fn import_solidworks_feature(&mut self, bytes: &[u8], path: &str, assembly: bool) -> Result<String, String> {
         if !assembly {
             let partitions = brep_kernel::solidworks::solidworks_part_partitions(bytes).map_err(|e| format!("SolidWorks part: {e}"))?;
@@ -640,6 +641,10 @@ impl EngineState {
             std::fs::read(entry.path()).ok()
         };
         let report = brep_kernel::solidworks::import_solidworks_assembly_report(bytes, &mut resolve)?;
+        // A component file not beside the assembly is left out, and said so.
+        for event in report.diagnostics.events.iter().filter(|e| e.code == brep_kernel::solidworks::MISSING_COMPONENT_FILE) {
+            self.push_notice_as(super::NoticeSeverity::Warning, event.message.clone());
+        }
         let id = self.next_feature_id(&crate::features::feature_short_name("IMPORT3D"));
         let payload = brep_kernel::native_import_payload_with_appearance(&id, &report.solids, &report.appearances)?;
         let feature = serde_json::json!({

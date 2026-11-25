@@ -562,7 +562,12 @@ pub use feature_pipeline::assembly::{
 pub use feature_pipeline::{AssemblyState, ConstraintEntry};
 // The ONE matrix → `{translate, rotateEulerDeg}` (intrinsic XYZ, degrees) pose
 // encoder, shared by the solver write-back and any out-of-crate ACOMP author.
-pub use feature_pipeline::assembly::transform_to_pose_params;
+pub use feature_pipeline::assembly::{pose_params_to_transform, transform_to_pose_params};
+// A part's mount frame (the `mount` block): read, written, and whether it is identity.
+pub use feature_pipeline::part_mount::{
+    is_identity as mount_is_identity, mount_aligned_to_footprint, mount_block_of, mount_from_block, mount_origin_to,
+    mount_seated_on, part_mount, reference_plane as mount_reference_plane, AlignPad, AlignReport, AlignSeat, MOUNT_BLOCK,
+};
 // The feature-schema catalogue (feature definitions: name + `inputParamsSchema`),
 // so a native UI can drive schema-driven feature dialogs without the JSON export.
 pub use feature_pipeline::feature_schema_catalogue;

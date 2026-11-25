@@ -679,7 +679,7 @@ pub(super) fn pose_to_transform(
 /// The read-side half of [`transform_to_pose_params`]: `{translate,
 /// rotateEulerDeg}` composed exactly as the ACOMP feature composes it (literal
 /// numbers only — expressions are the feature's business).
-pub(super) fn pose_params_to_transform(pose: &serde_json::Value) -> Result<AffineTransform, String> {
+pub fn pose_params_to_transform(pose: &serde_json::Value) -> Result<AffineTransform, String> {
     let triple = |key: &str| -> Result<[f64; 3], String> {
         let values = pose.get(key).and_then(|value| value.as_array());
         let Some(values) = values else { return Ok([0.0; 3]) };

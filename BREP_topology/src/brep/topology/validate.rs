@@ -105,7 +105,27 @@ impl BrepSolid {
             bbox_hi.y = bbox_hi.y.max(vertex.point.y);
             bbox_hi.z = bbox_hi.z.max(vertex.point.z);
         }
-        let model_diagonal = if self.vertices.is_empty() {
+        // `BREP_VALIDATE_EDGE_EXTENT` (default on, `=0` restores the vertices alone): the edges'
+        // control points too, whose hull holds each edge. A solid with few vertices for its size
+        // (a lens of two spheres: one or two vertices on the circle they meet in) otherwise reads
+        // a diagonal near zero and is held to the absolute floor, which a pcurve fitted to a few
+        // 1e-7 of a 10^4 mm radius already exceeds.
+        if crate::switch!("BREP_VALIDATE_EDGE_EXTENT", true) {
+            for edge in &self.edges {
+                for point in &edge.curve.control_points {
+                    if point.w > 0.0 && point.w.is_finite() {
+                        let (x, y, z) = (point.x / point.w, point.y / point.w, point.z / point.w);
+                        bbox_lo.x = bbox_lo.x.min(x);
+                        bbox_lo.y = bbox_lo.y.min(y);
+                        bbox_lo.z = bbox_lo.z.min(z);
+                        bbox_hi.x = bbox_hi.x.max(x);
+                        bbox_hi.y = bbox_hi.y.max(y);
+                        bbox_hi.z = bbox_hi.z.max(z);
+                    }
+                }
+            }
+        }
+        let model_diagonal = if bbox_lo.x > bbox_hi.x {
             0.0
         } else {
             bbox_hi.sub(bbox_lo).length()

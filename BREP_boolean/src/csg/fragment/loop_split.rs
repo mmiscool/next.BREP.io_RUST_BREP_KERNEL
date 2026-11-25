@@ -635,7 +635,7 @@ fn loop_split_face_impl(
             // edge by more than the On band touches no loop, whatever the
             // weld floor reads of its vertex beside a loop vertex (coaxial
             // cylinders put both seams on one side, 2.1e-6 apart).
-            let apart = crate::switch!("BREP_COSURFACE_EXACT_APART", false) && ring_apart_from_edges(solid, face, index, *piece_id, 1e-6);
+            let apart = crate::switch!("BREP_COSURFACE_EXACT_APART", true) && ring_apart_from_edges(solid, face, index, *piece_id, 1e-6);
             if !apart && touch_rings && shared_ring.is_none() && on_a_loop(start_point, &regions) {
                 touch_arcs.push((cut_entry(*piece_id, pcurve, &samples, start_point, end_point, key), piece.start_vertex_id, piece.end_vertex_id));
                 continue;
@@ -885,7 +885,7 @@ fn loop_split_face_impl(
         // coplanar circles, `ring_apart_from_edges`) neither crosses nor
         // grazes the loops, however near it runs in the chart (a coaxial
         // cylinder's circle 2.1e-6 inside a cap's rim).
-        let exact_apart_rings: HashSet<u64> = if crate::switch!("BREP_COSURFACE_EXACT_APART", false) {
+        let exact_apart_rings: HashSet<u64> = if crate::switch!("BREP_COSURFACE_EXACT_APART", true) {
             rings.iter().filter(|ring| ring.entries.len() == 1 && ring_apart_from_edges(solid, face, index, ring.id, 1e-6)).map(|ring| ring.id).collect()
         } else {
             HashSet::default()

@@ -10,6 +10,7 @@
 //! the region both patches cover. brep-bench tangent/wedge-a-millionth-steep:
 //! the cube's top and the half-space's face 1e-6 steep bound a wedge 5e-6
 //! thick at its far end.
+use crate::env_read::Mode;
 
 use crate::spatial::Aabb;
 pub use crate::{BrepSolid, NurbsSurface, Vec3};
@@ -63,6 +64,12 @@ const LONGEST_BAND: f64 = 1.5e-3;
 #[derive(Clone, Debug, Default)]
 pub struct FeatureScale {
     pub thin_pairs: Vec<ThinPair>,
+    /// `(first operand's face id, second operand's face id)` of every pair
+    /// registered by `BREP_FEATURE_SCALE_OPERAND_SLIVERS`: two surfaces a
+    /// resolvable sliver apart, which the imprint must not read as one.
+    pub operand_slivers: Vec<(u64, u64)>,
+    /// The region of each of those slivers (the box both faces share).
+    pub operand_sliver_regions: Vec<Aabb>,
 }
 
 impl FeatureScale {
@@ -97,6 +104,8 @@ impl FeatureScale {
         }
         let reach = 4.0 * LONGEST_BAND;
         let mut thin_pairs = Vec::new();
+        let mut operand_slivers = Vec::new();
+        let mut operand_sliver_regions = Vec::new();
         for (i, &(a_operand, a_origin, a_normal, a_box, a_face)) in planes.iter().enumerate() {
             for &(b_operand, b_origin, b_normal, b_box, b_face) in &planes[i + 1..] {
                 let same_operand = a_operand == b_operand;
@@ -127,21 +136,69 @@ impl FeatureScale {
                 // The region's corners, put onto each plane, measured from the
                 // other: the largest is the sliver's thickness over the region.
                 let mut height = 0.0f64;
+                // The smallest corner reading too: a uniform sliver reads the
+                // same at every corner, a tilted one does not.
+                let mut lowest = f64::INFINITY;
                 for corner in corners(region) {
                     for (on_origin, on_normal, other_origin, other_normal) in [
                         (a_origin, a_normal, b_origin, b_normal),
                         (b_origin, b_normal, a_origin, a_normal),
                     ] {
                         let on_plane = corner.sub(on_normal.scale(corner.sub(on_origin).dot(on_normal)));
-                        height = height.max(on_plane.sub(other_origin).dot(other_normal).abs());
+                        let reading = on_plane.sub(other_origin).dot(other_normal).abs();
+                        height = height.max(reading);
+                        lowest = lowest.min(reading);
                     }
                 }
                 let floor = if same_operand { tolerance } else { coincident };
-                if height > floor
+                let registered = height > floor
                     && FRACTION * height < LONGEST_BAND
                     && faces_overlap(a_face, b_face, region)?
-                    && (same_operand || !crate::imprint::reads_as_one_surface(&a_face.surface, &b_face.surface, tolerance)?)
-                {
+                    && (same_operand || !crate::imprint::reads_as_one_surface(&a_face.surface, &b_face.surface, tolerance)?);
+                // OPERAND SLIVERS (`BREP_FEATURE_SCALE_OPERAND_SLIVERS`, default
+                // on, =0 restores; `check` prints the pairs it would add): two operands'
+                // parallel planes whose height over their shared region the
+                // imprint can resolve (a quarter of it at least the tolerance,
+                // and over the model floor, 1e-7) bound a real sliver, even
+                // where the surface-pair classifier reads them as one surface.
+                // A thinner pair stays one surface (the coincident reading):
+                // registered, it would make the whole boolean refuse as a
+                // sliver below the section's resolution. The height is exact: it is read at the corners of
+                // the region the two patches share, and a plane's distance from
+                // another is linear over that box, so its maximum is at a
+                // corner. The pair must overlap. Without it, two boxes whose
+                // faces stand 1e-5 apart (100 times the model tolerance) read
+                // as one surface here, no band is capped, and the imprint's
+                // vertex registry (1.2e-5 at tolerance 1e-7) merged the corners
+                // of the 1e-5 slab the coincident-pair offset had built between
+                // them; its pieces vanished and the boolean was refused.
+                // Only a UNIFORM sliver between parallel planes: its thickness
+                // the same at every corner of the region to 1e-3 of itself. A
+                // tilted pair (a wedge of planes 1e-6 rad apart, coplanar tool
+                // walls a few 1e-6 off over their extent) keeps the one-surface
+                // reading its fixtures were built on.
+                let uniform = height - lowest <= 1e-3 * height;
+                let operand_sliver = !registered
+                    && !same_operand
+                    && uniform
+                    && operand_slivers_mode() != Mode::Off
+                    && FRACTION * height >= tolerance
+                    && height > OPERAND_SLIVER_FLOOR
+                    && FRACTION * height < LONGEST_BAND
+                    && faces_overlap(a_face, b_face, region)?;
+                if operand_sliver && operand_slivers_mode() == Mode::Check {
+                    eprintln!(
+                        "BREP_FEATURE_SCALE_OPERAND_SLIVERS check: faces {}/{} height {height:.3e} would cap bands at {:.3e} over {:?}..{:?}",
+                        a_face.id, b_face.id, FRACTION * height, region.minimum, region.maximum
+                    );
+                }
+                if operand_sliver && operand_slivers_mode() == Mode::On {
+                    // The planes are gathered operand 0 first, so `a` is the
+                    // first operand's face.
+                    operand_slivers.push((a_face.id, b_face.id));
+                    operand_sliver_regions.push(region);
+                }
+                if registered || (operand_sliver && operand_slivers_mode() == Mode::On) {
                     if env_read!("BREP_DEBUG_FEATURE_SCALE").is_some() {
                         eprintln!(
                             "feature_scale: sliver faces {}/{} height={height:.3e} same_operand={same_operand} region={:?}..{:?}",
@@ -152,7 +209,13 @@ impl FeatureScale {
                 }
             }
         }
-        Ok(Self { thin_pairs })
+        Ok(Self { thin_pairs, operand_slivers, operand_sliver_regions })
+    }
+
+    /// Whether the first operand's face `first` and the second's `second`
+    /// stand a resolvable sliver apart (`BREP_FEATURE_SCALE_OPERAND_SLIVERS`).
+    pub fn operand_sliver(&self, first: u64, second: u64) -> bool {
+        self.operand_slivers.contains(&(first, second))
     }
 
     /// Whether any feature limits a band (no work at the cap sites when not).
@@ -249,3 +312,14 @@ fn corners(region: Aabb) -> [Vec3; 8] {
         Vec3::new(hi.x, hi.y, hi.z),
     ]
 }
+
+/// Two operands' planes at most this far apart are one surface whatever the
+/// tolerance (the model tolerance): an operand sliver must exceed it.
+const OPERAND_SLIVER_FLOOR: f64 = 1e-7;
+
+/// `BREP_FEATURE_SCALE_OPERAND_SLIVERS` (default on since 2026-11-24; `0|off`
+/// restores; `check` prints and registers nothing), see [`FeatureScale::between`].
+pub fn operand_slivers_mode() -> Mode {
+    crate::mode_switch!(live "BREP_FEATURE_SCALE_OPERAND_SLIVERS", true)
+}
+

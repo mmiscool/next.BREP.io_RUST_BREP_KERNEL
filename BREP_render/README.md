@@ -125,4 +125,4 @@ The exact terms are in `LICENSE.md`, shipped in the crate (`license-file` in the
 
 ## Links
 
-- Version: 0.27.0.
+- Version: 0.28.0.

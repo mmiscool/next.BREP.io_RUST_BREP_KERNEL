@@ -2998,9 +2998,32 @@ fn offset_face_carrier_impl(
                     (points, parameters, None)
                 }
             };
-            let image_collapsed = points
-                .iter()
-                .all(|point| point.sub(points[0]).length() <= collapse_tolerance);
+            let within = |bar: f64| points.iter().all(|point| point.sub(points[0]).length() <= bar);
+            let distance_collapsed = within(collapse_tolerance);
+            // `BREP_OFFSET_OPEN_IMAGE_COLLAPSE` (default on, `0` restores; `check` logs
+            // each disagreement): the distance-scaled bar is for images whose
+            // source closes on one vertex (a pole, an apex, a fold ring). An
+            // open source edge keeps two image vertices, which a collapse
+            // would leave on a zero-length "degenerate" edge no weld can pair;
+            // its image collapses only within the model floor and a 1e-4 share
+            // of the distance. A rounded corner shelled to within 6e-4 of its
+            // radius keeps its 8.5e-4 arc.
+            let open_mode = crate::mode_switch!("BREP_OFFSET_OPEN_IMAGE_COLLAPSE", true);
+            let image_collapsed = if open_mode != crate::env_read::Mode::Off
+                && source_start != source_end
+                && !source_edge.degenerate
+            {
+                let open_collapsed = within(1e-6f64.max(distance.abs() * 1e-4));
+                if open_mode == crate::env_read::Mode::Check && open_collapsed != distance_collapsed {
+                    eprintln!(
+                        "OPEN_IMAGE_COLLAPSE differs: source face {face_id} edge {} distance {distance:.6e}: distance bar {collapse_tolerance:.3e} collapsed={distance_collapsed}, open rule {open_collapsed}",
+                        source_edge.id,
+                    );
+                }
+                if open_mode == crate::env_read::Mode::On { open_collapsed } else { distance_collapsed }
+            } else {
+                distance_collapsed
+            };
             let (edge_id, forward) =
                 if let Some((edge_id, edge_start_vertex_id, creator_forward)) =
                     edge_images.get(&source_edge.id)

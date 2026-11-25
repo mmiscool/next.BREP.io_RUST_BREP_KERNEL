@@ -310,6 +310,7 @@ mod blit;
 pub(crate) mod ecad;
 mod interaction;
 mod labels;
+mod mount_frame;
 mod move_card;
 mod popups;
 mod sheet;

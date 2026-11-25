@@ -125,6 +125,8 @@ struct PeriodicRing {
     /// samples with the wrap-closing corner appended.
     points: Vec<FaceVertex>,
     pole: bool,
+    /// The loop's own chain, in traversal order (for a rim the sorted `points` lose it).
+    raw: Vec<FaceVertex>,
     /// Traversal sense of the loop along the periodic parameter as the FACE
     /// walks it (+1 with increasing `p`, −1 against, 0 inconclusive). The
     /// material side of a rim is to its left, so this is what tells the two
@@ -191,6 +193,134 @@ pub(in crate::watertight_tessellation) fn close_periodic_trim(
         }
     }
     Ok(None)
+}
+
+/// `BREP_TESS_UNALIGNED_RIMS` (default on, `=0` restores the seam-cut rectangle for these walls).
+fn unaligned_rims_enabled() -> bool {
+    crate::switch!("BREP_TESS_UNALIGNED_RIMS", true)
+}
+
+/// A wall between two full rims whose pcurves run past the periodic domain (a rim given on
+/// `[-0.34, 0.66]`, its partner on `[0.12, 1.12]`): neither rim has a sample on the seam, so the
+/// seam-cut rectangle, which sorts each rim into `[p0, p1]` and pads the missing seam end, covers
+/// more than one period. Here each rim is unwrapped by continuity around exactly one period from
+/// its sample nearest `p0` (`a` on the lower rim, `b` on the upper), and the wall is cut along the
+/// straight chart line from `a` to `b`: the cut is private to the wall, sampled once on the surface
+/// and used for both of its sides, so they weld, and the rims keep their shared samples. Holes are
+/// moved into the same period; one that reaches the cut declines. The polygon carries periodic
+/// parameters past the domain, so it is meshed with the domain-wrapping evaluator.
+fn unaligned_rim_wall(
+    face: &FaceRecord,
+    rings: [&PeriodicRing; 2],
+    holes: &[Vec<FaceVertex>],
+    p_is_u: bool,
+    p0: f64,
+    period: f64,
+    chord_tolerance: f64,
+) -> Result<Option<Vec<FaceVertex>>, String> {
+    let p_of = |v: &FaceVertex| if p_is_u { v.uv[0] } else { v.uv[1] };
+    let set_p = |v: &mut FaceVertex, p: f64| if p_is_u { v.uv[0] = p } else { v.uv[1] = p };
+    // One period of a rim, ascending in p, from its sample nearest p0 back to that sample a period on.
+    let unwrap = |raw: &[FaceVertex]| -> Option<Vec<FaceVertex>> {
+        let n = raw.len();
+        if n < 3 {
+            return None;
+        }
+        let circle = |p: f64| {
+            let d = (p - p0).rem_euclid(period);
+            d.min(period - d)
+        };
+        let start = (0..n).min_by(|&a, &b| circle(p_of(&raw[a])).total_cmp(&circle(p_of(&raw[b]))))?;
+        let mut seq = Vec::with_capacity(n + 1);
+        let mut first = raw[start];
+        let base = p_of(&first) - ((p_of(&first) - p0) / period).round() * period;
+        set_p(&mut first, base);
+        seq.push(first);
+        let mut p = base;
+        for k in 1..=n {
+            let mut v = raw[(start + k) % n];
+            let mut delta = p_of(&v) - p_of(&raw[(start + k - 1) % n]);
+            delta -= (delta / period).round() * period;
+            p += delta;
+            set_p(&mut v, p);
+            seq.push(v);
+        }
+        let net = p - base;
+        if (net.abs() - period).abs() > 1e-6 * period {
+            return None;
+        }
+        if net < 0.0 {
+            seq.reverse();
+            let shift = base - p_of(&seq[0]);
+            for v in &mut seq {
+                let q = p_of(v) + shift;
+                set_p(v, q);
+            }
+        }
+        Some(seq)
+    };
+    let (Some(lower), Some(upper)) = (unwrap(&rings[0].raw), unwrap(&rings[1].raw)) else {
+        return Ok(None);
+    };
+    let (a, b) = (lower[0], upper[0]);
+    let eval = |uv: [f64; 2]| face.surface.evaluate_extended(uv[0], uv[1]);
+    let at = |t: f64| [a.uv[0] + t * (b.uv[0] - a.uv[0]), a.uv[1] + t * (b.uv[1] - a.uv[1])];
+    let mut ts = vec![0.0, 1.0];
+    for _ in 0..24 {
+        let mut refined = Vec::with_capacity(ts.len() * 2);
+        let mut split = false;
+        for pair in ts.windows(2) {
+            refined.push(pair[0]);
+            let mid = 0.5 * (pair[0] + pair[1]);
+            if deflection_to_chord(eval(at(mid))?, eval(at(pair[0]))?, eval(at(pair[1]))?) > chord_tolerance {
+                refined.push(mid);
+                split = true;
+            }
+        }
+        refined.push(1.0);
+        ts = refined;
+        if !split {
+            break;
+        }
+    }
+    let cut: Vec<(f64, Vec3)> = ts[1..ts.len() - 1].iter().map(|&t| Ok((t, eval(at(t))?))).collect::<Result<_, String>>()?;
+    let lift = |uv: [f64; 2]| if p_is_u { [uv[0] + period, uv[1]] } else { [uv[0], uv[1] + period] };
+    let mut polygon: Vec<FaceVertex> = lower.clone();
+    for &(t, position) in &cut {
+        polygon.push(FaceVertex { uv: lift(at(t)), position });
+    }
+    polygon.extend(upper.iter().rev().copied());
+    for &(t, position) in cut.iter().rev() {
+        polygon.push(FaceVertex { uv: at(t), position });
+    }
+    if signed_area(&polygon) < 0.0 {
+        polygon.reverse();
+    }
+    // Holes into the wall's period, clear of the cut.
+    let lo = p_of(&a).max(p_of(&b));
+    let hi = p_of(&a).min(p_of(&b)) + period;
+    let margin = 1e-6 * period;
+    let mut moved = Vec::with_capacity(holes.len());
+    for hole in holes {
+        let mean = hole.iter().map(p_of).sum::<f64>() / hole.len() as f64;
+        let shift = ((0.5 * (lo + hi) - mean) / period).round() * period;
+        let mut hole = hole.clone();
+        for v in &mut hole {
+            let p = p_of(v) + shift;
+            set_p(v, p);
+        }
+        if hole.iter().any(|v| p_of(v) <= lo + margin || p_of(v) >= hi - margin) {
+            return Ok(None);
+        }
+        if signed_area(&hole) > 0.0 {
+            hole.reverse();
+        }
+        moved.push(hole);
+    }
+    if !moved.is_empty() {
+        polygon = bridge_holes(polygon, moved);
+    }
+    Ok(Some(polygon))
 }
 
 /// One-direction attempt for [`close_periodic_trim`]: treat `p_is_u` as the
@@ -278,6 +408,7 @@ fn close_periodic_trim_dir(
                 level: coord(&chain[0]).1,
                 points: vec![chain[0]],
                 pole: true,
+                raw: chain.clone(),
                 direction,
             });
         } else if (pmax - pmin) >= 0.6 * period && (qmax - qmin) <= 0.05 * q_extent {
@@ -318,6 +449,7 @@ fn close_periodic_trim_dir(
                 level,
                 points,
                 pole: false,
+                raw: chain.clone(),
                 direction,
             });
         } else {
@@ -370,6 +502,18 @@ fn close_periodic_trim_dir(
             rings[1].level,
             if wraps_cross_seam { "CROSS-SEAM band" } else { "between-rims band" },
         );
+    }
+    if !wraps_cross_seam && rings.iter().all(|ring| !ring.pole) && unaligned_rims_enabled() {
+        let outside = rings.iter().any(|ring| {
+            ring.raw.iter().any(|vertex| {
+                let p = coord(vertex).0;
+                p < p0 - 1e-9 * period || p > p1 + 1e-9 * period
+            })
+        });
+        if outside {
+            return Ok(unaligned_rim_wall(face, [&rings[0], &rings[1]], &holes, p_is_u, p0, period, chord_tolerance)?
+                .map(|polygon| (polygon, true)));
+        }
     }
     let q_period = q1 - q0;
     // Re-express the complement as an ordinary rectangle by lifting the lower rim

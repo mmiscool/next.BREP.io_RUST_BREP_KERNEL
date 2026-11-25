@@ -23,7 +23,7 @@ pub(super) fn tessellated_solids(entities: &HashMap<usize, Entity>, scale: f64) 
         return Ok(Vec::new());
     }
     ids.sort_unstable();
-    if entities.values().any(|e| e.has("MAPPED_ITEM") || e.has("REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION") || e.has("NEXT_ASSEMBLY_USAGE_OCCURRENCE")) {
+    if places_parts(entities) {
         return Err("step_import: tessellated solid: the file places its parts (an assembly or mapped items), which this reader does not follow".into());
     }
     // Each solid's unit: the context of the representation listing it.
@@ -39,6 +39,69 @@ pub(super) fn tessellated_solids(entities: &HashMap<usize, Entity>, scale: f64) 
         }
     }
     ids.into_iter().map(|id| solid_of(entities, id, units.get(&id).copied().unwrap_or(scale))).collect()
+}
+
+/// Whether the file places its parts: an assembly usage, a transformed
+/// representation relationship, or a mapped item.
+///
+/// `BREP_STEP_TESSELLATED_PRESENTATION_MAPS` (default on, `=0` restores; `check` reports a
+/// file the switch would read and refuses it as before): a mapped item that
+/// only draughting models use (a PMI saved view's placement of the part's
+/// shape, NIST ftc_08's `MBD_A`..`MBD_D`) draws the part for that view and
+/// places nothing in the shape the reader builds, so it does not count. A
+/// mapped item anything else holds, or that nothing holds, still counts.
+fn places_parts(entities: &HashMap<usize, Entity>) -> bool {
+    if entities.values().any(|e| e.has("REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION") || e.has("NEXT_ASSEMBLY_USAGE_OCCURRENCE")) {
+        return true;
+    }
+    let mapped: rustc_hash::FxHashSet<usize> = entities.iter().filter(|(_, e)| e.has("MAPPED_ITEM")).map(|(&id, _)| id).collect();
+    if mapped.is_empty() {
+        return false;
+    }
+    let check = crate::env_read!("BREP_STEP_TESSELLATED_PRESENTATION_MAPS").as_deref() == Some("check");
+    if !check && !crate::switch!("BREP_STEP_TESSELLATED_PRESENTATION_MAPS", true) {
+        return true;
+    }
+    fn references(value: &Value, out: &mut Vec<usize>) {
+        match value {
+            Value::Ref(id) => out.push(*id),
+            Value::List(values) | Value::Typed(_, values) => values.iter().for_each(|value| references(value, out)),
+            _ => {}
+        }
+    }
+    // A mapped item no draughting model holds (or that nothing holds) may
+    // place a part: only one that draughting models alone use is set aside.
+    let mut drawn: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+    let mut placing = false;
+    let mut held = Vec::new();
+    for entity in entities.values() {
+        held.clear();
+        entity.records.iter().flat_map(|(_, args)| args).for_each(|value| references(value, &mut held));
+        held.retain(|id| mapped.contains(id));
+        if held.is_empty() {
+            continue;
+        }
+        if entity.has("DRAUGHTING_MODEL") {
+            drawn.extend(held.iter().copied());
+        } else {
+            placing = true;
+        }
+    }
+    let placing = placing || drawn.len() < mapped.len();
+    if check {
+        if !placing {
+            eprintln!("STEP_TESSELLATED_PRESENTATION_MAPS: {} mapped item(s), each only in draughting models; the switch reads the tessellated solid", mapped.len());
+        }
+        return true;
+    }
+    placing
+}
+
+/// `BREP_STEP_COMPLEX_TRIANGULATED_FACE` (default on, `=0` restores): a tessellated solid's
+/// `COMPLEX_TRIANGULATED_FACE`s (triangle strips and fans, NIST ftc_08) are
+/// read as their triangles; off, such a face is refused as before.
+fn complex_triangulated_face_enabled() -> bool {
+    crate::switch!("BREP_STEP_COMPLEX_TRIANGULATED_FACE", true)
 }
 
 fn get(entities: &HashMap<usize, Entity>, id: usize) -> Result<&Entity, String> {
@@ -57,8 +120,10 @@ fn solid_of(entities: &HashMap<usize, Entity>, id: usize, scale: f64) -> Result<
     for item in items {
         let face_id = item.as_ref_id()?;
         let face = get(entities, face_id)?;
-        let Some(face) = face.find("TRIANGULATED_FACE") else {
-            return Err(format!("step_import: tessellated solid: item #{face_id} is not a TRIANGULATED_FACE"));
+        let (face, complex) = match (face.find("TRIANGULATED_FACE"), face.find("COMPLEX_TRIANGULATED_FACE")) {
+            (Some(face), _) => (face, false),
+            (None, Some(face)) if complex_triangulated_face_enabled() => (face, true),
+            _ => return Err(format!("step_import: tessellated solid: item #{face_id} is not a TRIANGULATED_FACE")),
         };
         // (name, coordinates, pnmax, normals, geometric_link, pnindex, triangles)
         let list_id = face.get(1).ok_or("step_import: triangulated face: no coordinates")?.as_ref_id()?;
@@ -85,6 +150,41 @@ fn solid_of(entities: &HashMap<usize, Entity>, id: usize, scale: f64) -> Result<
             welded.insert(key, points.len() - 1);
             Ok(points.len() - 1)
         };
+        if complex {
+            // (name, coordinates, pnmax, normals, geometric_link, pnindex,
+            // triangle_strips, triangle_fans): a strip's triangle k is its
+            // points k, k+1, k+2, the odd ones turned (k+1, k, k+2) so every
+            // triangle turns the same way; a fan's triangles share its first
+            // point. A strip's triangle that repeats a corner (a strip joined
+            // through a degenerate triangle) bounds nothing and is left out.
+            let lists = |at: usize| -> Result<Vec<Vec<usize>>, String> {
+                match face.get(at) {
+                    Some(Value::List(items)) => items
+                        .iter()
+                        .map(|item| item.as_list()?.iter().map(index).collect::<Result<Vec<_>, _>>())
+                        .collect(),
+                    _ => Ok(Vec::new()),
+                }
+            };
+            for strip in lists(6)? {
+                for k in 0..strip.len().saturating_sub(2) {
+                    let corners = [point(strip[k])?, point(strip[k + 1])?, point(strip[k + 2])?];
+                    let corners = if k % 2 == 0 { corners } else { [corners[1], corners[0], corners[2]] };
+                    if corners[0] != corners[1] && corners[1] != corners[2] && corners[0] != corners[2] {
+                        triangles.push(corners);
+                    }
+                }
+            }
+            for fan in lists(7)? {
+                for k in 1..fan.len().saturating_sub(1) {
+                    let corners = [point(fan[0])?, point(fan[k])?, point(fan[k + 1])?];
+                    if corners[0] != corners[1] && corners[1] != corners[2] && corners[0] != corners[2] {
+                        triangles.push(corners);
+                    }
+                }
+            }
+            continue;
+        }
         for tri in face.get(6).ok_or("step_import: triangulated face: no triangles")?.as_list()? {
             let t = tri.as_list()?;
             if t.len() != 3 {

@@ -869,6 +869,7 @@ impl<'a> Resolver<'a> {
             let semi_angle = self.cone_semi_angle(args[3].as_real()?);
             let (base, height, c_start) = axial_extent(&frame, samples);
             let tan = semi_angle.tan();
+            let (base, height, c_start) = cone_cap_to_apex(&frame, samples, radius, tan, (base, height, c_start));
             let mut radius_bottom = radius + c_start * tan;
             let mut radius_top = radius + (c_start + height) * tan;
             // The apex band must scale with the geometry, not sit at an absolute
@@ -1818,3 +1819,49 @@ pub(super) fn reparameterize_collapsed_bezier_domain(
     Ok(true)
 }
 
+
+/// `BREP_STEP_CONE_CAP_TO_APEX` (default on, `=0` restores; `check` reports each cone it
+/// would extend and keeps the sampled band): a conical face whose boundary
+/// samples all lie on one parallel is the cap between that circle and the
+/// apex (the other side is unbounded), so its carrier runs from the circle to
+/// the apex. The sampled extent alone is the pad `axial_extent` adds, a band
+/// 2e-4 tall around the rim: a blind hole's drill point (NIST ftc_07 and
+/// ftc_10, a 59° cone bounded by the hole's bottom circle) came out a
+/// nonsingular sliver its one rim winds once around, which validation
+/// rejects.
+fn cone_cap_to_apex(
+    frame: &Frame,
+    samples: &[Vec3],
+    radius: f64,
+    tan: f64,
+    sampled: (Vec3, f64, f64),
+) -> (Vec3, f64, f64) {
+    let check = crate::env_read!("BREP_STEP_CONE_CAP_TO_APEX").as_deref() == Some("check");
+    if !check && !crate::switch!("BREP_STEP_CONE_CAP_TO_APEX", true) {
+        return sampled;
+    }
+    if samples.is_empty() || tan == 0.0 || !tan.is_finite() {
+        return sampled;
+    }
+    let (mut c_min, mut c_max) = (f64::INFINITY, f64::NEG_INFINITY);
+    for point in samples {
+        let c = point.sub(frame.origin).dot(frame.z);
+        c_min = c_min.min(c);
+        c_max = c_max.max(c);
+    }
+    if !(c_max - c_min <= 1e-7 * (1.0 + radius.abs())) {
+        return sampled;
+    }
+    let c_rim = 0.5 * (c_min + c_max);
+    let c_apex = -radius / tan;
+    // The rim keeps the pad `axial_extent` gives it; the apex end is the apex.
+    let pad = 1e-4 + 1e-9;
+    let (low, high) = if c_apex < c_rim { (c_apex, c_rim + pad) } else { (c_rim - pad, c_apex) };
+    if check {
+        eprintln!(
+            "STEP_CONE_CAP_TO_APEX: a cone of radius {radius:.6} sampled on one parallel (c = {c_rim:.6}) would run to its apex at c = {c_apex:.6}; the switch extends it"
+        );
+        return sampled;
+    }
+    (frame.origin.add(frame.z.scale(low)), high - low, low)
+}

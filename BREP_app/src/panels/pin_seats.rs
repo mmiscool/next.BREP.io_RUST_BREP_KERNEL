@@ -4,9 +4,13 @@
 //! it reads the part's pads and declared points, and cuts each contact body's
 //! display mesh with the board's slabs to get its section.
 //!
-//! The part's frame is the footprint's: top copper at z = 0, millimetres with
+//! The footprint's frame is the board's: top copper at z = 0, millimetres with
 //! y up, where the pads are micrometres with y down (`ecad_parts::board_transform`
-//! places a part by the same mapping).
+//! places a part by the same mapping). The part's model is moved into it by its
+//! mount frame (the `mount` block, `brep_kernel::part_mount`), here and nowhere
+//! else in the check: both the open part and a library entry are measured in
+//! model coordinates, as their features build them, so the mount is applied
+//! exactly once.
 //!
 //! Only a SEATED point is checked, one that names a contact body or a point
 //! reference; an unseated point says nothing about where its pin is. A point
@@ -15,7 +19,7 @@
 //! reference wins over a contact body: it is the more specific answer, and a
 //! contact body of a merged connector is no pin's own.
 
-use brep_ecad_core::seat_check::{pad_seat_check, SeatContact, SeatVerdict, ASSUMED_THICKNESS, TOP_SLAB};
+use brep_ecad_core::seat_check::{pad_seat_check, SeatContact, SeatVerdict, SUBSTRATE_THICKNESS, TOP_SLAB};
 use brep_ecad_core::board::Footprint;
 use brep_ecad_core::Point;
 use brep_render::engine_state::EngineState;
@@ -44,16 +48,24 @@ struct PartView<'a> {
     ports: Option<&'a serde_json::Value>,
     report: Option<&'a brep_render::brep_kernel::PortsReport>,
     solids: &'a [brep_render::scene::SolidDisplay],
+    /// The part's mount frame, `None` for identity (no block).
+    mount: Option<brep_render::brep_kernel::AffineTransform>,
 }
 
 /// Every seated pcb point of the open part, checked. Empty when the part has
-/// no pads or no pcb points.
+/// no pads or no pcb points, and when its mount block does not read as a pose
+/// (Qualify's mount section says why: a check in the wrong frame would be
+/// worse than none).
 pub(crate) fn pin_seats(engine: &EngineState) -> Vec<PinSeat> {
+    let Ok(mount) = engine.history.mount_block().map(brep_render::brep_kernel::mount_from_block).transpose() else {
+        return Vec::new();
+    };
     check(&PartView {
         pads: engine.history.pads_block(),
         ports: engine.history.ports_block(),
         report: engine.ports_report(),
         solids: engine.scene.solids(),
+        mount,
     })
 }
 
@@ -78,7 +90,9 @@ pub(crate) fn part_pin_seats(document: &serde_json::Value) -> std::rc::Rc<Result
     if let Some(hit) = VERDICTS.with(|cache| cache.borrow().get(&key).cloned()) {
         return hit;
     }
-    let verdict = brep_render::brep_kernel::part_pin_geometry(document, 1.0).map(|geometry| {
+    let verdict = brep_render::brep_kernel::part_mount(document).and_then(|mount| {
+        brep_render::brep_kernel::part_pin_geometry(document, 1.0).map(|geometry| (mount, geometry))
+    }).map(|(mount, geometry)| {
         let solids: Vec<brep_render::scene::SolidDisplay> = geometry
             .solids
             .into_iter()
@@ -89,6 +103,7 @@ pub(crate) fn part_pin_seats(document: &serde_json::Value) -> std::rc::Rc<Result
             ports: Some(&document["ports"]),
             report: geometry.ports.as_ref(),
             solids: &solids,
+            mount,
         })
     });
     let verdict = std::rc::Rc::new(verdict);
@@ -137,6 +152,65 @@ fn check(part: &PartView) -> Vec<PinSeat> {
         }
     }
     out
+}
+
+/// Align to footprint on the open part (`brep_kernel::mount_aligned_to_footprint`):
+/// the mount refitted from the part's seated pcb points onto its pads, with the
+/// leftover. The fit reads each point's resolved seat from the ports report,
+/// in model coordinates, so it does not depend on the frame the part is in now;
+/// an unplaced point and a reference that found nothing are left out, as the
+/// pad check leaves them.
+pub(crate) fn align_to_footprint(engine: &EngineState) -> Result<brep_render::brep_kernel::AlignReport, String> {
+    use brep_render::brep_kernel::{AlignPad, AlignSeat};
+    let mount = engine
+        .history
+        .mount_block()
+        .map(brep_render::brep_kernel::mount_from_block)
+        .transpose()
+        .map_err(|error| format!("the mount block does not read as a pose ({error}): reset it first"))?;
+    let pads = engine
+        .history
+        .pads_block()
+        .and_then(|v| serde_json::from_value::<Footprint>(v.clone()).ok())
+        .ok_or("the part has no footprint to align to")?;
+    let report = engine.ports_report().ok_or("the part's connection points have not been resolved yet")?;
+    let groups = engine.history.ports_block().map(declared_groups).unwrap_or_default();
+    let mut seats = Vec::new();
+    for (group, points) in groups.iter().filter(|(group, _)| group.purpose.trim() == "pcb") {
+        for point in points {
+            let address = brep_render::brep_kernel::port_address(&group.name, &point.name);
+            let reference = set(&point.point_ref);
+            if reference.is_none() && set(&point.contact_body).is_none() {
+                continue;
+            }
+            if reference.is_some_and(|reference| !resolves(Some(report), &address, reference)) {
+                continue;
+            }
+            let Some(row) = report.points.iter().find(|row| row.address == address && !row.unplaced) else { continue };
+            let support = match (reference, set(&point.contact_body)) {
+                (None, Some(body)) => engine
+                    .scene
+                    .solids()
+                    .iter()
+                    .find(|solid| solid.name == body)
+                    .map(|solid| solid.mesh.positions.iter().map(|p| p.map(f64::from)).collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            seats.push(AlignSeat { pin: point.name.trim().to_owned(), position: row.position, direction: row.direction, support });
+        }
+    }
+    let pads: Vec<AlignPad> = pads
+        .pads
+        .iter()
+        .filter(|pad| !pad.number.trim().is_empty())
+        .map(|pad| AlignPad {
+            number: pad.number.trim().to_owned(),
+            at: [f64::from(pad.at.x) / 1_000., -f64::from(pad.at.y) / 1_000.],
+            smd: pad.drill.is_none(),
+        })
+        .collect();
+    brep_render::brep_kernel::mount_aligned_to_footprint(mount.as_ref(), &seats, &pads)
 }
 
 /// The block's groups with their points, read one point at a time: a point
@@ -197,11 +271,35 @@ fn set(text: &Option<String>) -> Option<&str> {
 fn contact_of(part: &PartView, point: &PortPoint, address: &str) -> Option<(&'static str, SeatContact)> {
     if set(&point.point_ref).is_some() {
         let row = part.report?.points.iter().find(|row| row.address == address)?;
-        return Some(("seat", SeatContact::Seat(footprint_point(row.position[0], row.position[1]))));
+        let [x, y, _] = mounted(part.mount.as_ref(), row.position);
+        return Some(("seat", SeatContact::Seat(footprint_point(x, y))));
     }
     let body = set(&point.contact_body)?;
     let solid = part.solids.iter().find(|solid| solid.name == body)?;
-    Some(("body", body_contact(&solid.mesh.positions, &solid.mesh.indices)))
+    let Some(mount) = part.mount.as_ref() else {
+        return Some(("body", body_contact(&solid.mesh.positions, &solid.mesh.indices)));
+    };
+    let positions: Vec<[f32; 3]> = solid
+        .mesh
+        .positions
+        .iter()
+        .map(|p| {
+            let [x, y, z] = mounted(Some(mount), [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]);
+            [x as f32, y as f32, z as f32]
+        })
+        .collect();
+    Some(("body", body_contact(&positions, &solid.mesh.indices)))
+}
+
+/// A model-frame point in the footprint frame: moved by the part's mount.
+fn mounted(mount: Option<&brep_render::brep_kernel::AffineTransform>, p: [f64; 3]) -> [f64; 3] {
+    match mount {
+        None => p,
+        Some(mount) => {
+            let q = mount.point(brep_render::brep_kernel::Vec3::new(p[0], p[1], p[2]));
+            [q.x, q.y, q.z]
+        }
+    }
 }
 
 /// A part-frame point (mm, y up) in footprint coordinates (µm, y down).
@@ -209,11 +307,11 @@ fn footprint_point(x: f64, y: f64) -> Point {
     Point::new((x * 1_000.).round() as i32, (-y * 1_000.).round() as i32)
 }
 
-/// A body's sections in the top-copper slab and through an assumed board,
+/// A body's sections in the top-copper slab and through the board (`SUBSTRATE_THICKNESS`),
 /// from its triangle mesh, with its lowest point's height in micrometres.
 pub(crate) fn body_contact(positions: &[[f32; 3]], indices: &[u32]) -> SeatContact {
     let slab = f64::from(TOP_SLAB) / 1_000.;
-    let thickness = f64::from(ASSUMED_THICKNESS) / 1_000.;
+    let thickness = f64::from(SUBSTRATE_THICKNESS) / 1_000.;
     let mut top = Vec::new();
     let mut through = Vec::new();
     for tri in indices.chunks_exact(3) {
@@ -228,7 +326,7 @@ pub(crate) fn body_contact(positions: &[[f32; 3]], indices: &[u32]) -> SeatConta
     }
     let lowest = positions.iter().map(|p| f64::from(p[2])).fold(f64::INFINITY, f64::min);
     let lowest = if lowest.is_finite() { (lowest * 1_000.).round() as i32 } else { i32::MAX };
-    SeatContact::Body { top, through, lowest, thickness: ASSUMED_THICKNESS }
+    SeatContact::Body { top, through, lowest, thickness: SUBSTRATE_THICKNESS }
 }
 
 /// The part of a triangle between the planes z = `low` and z = `high`, as the

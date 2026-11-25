@@ -701,6 +701,11 @@ pub enum RefSelectTarget {
     /// `ports_ops::ports_commit_ref`, and NOTHING ROLLS: a point resolves at
     /// the tail of the run, so the geometry it may name is what is on screen.
     PortPoint { field: ports_ops::PortRefField },
+    /// A MOUNT FRAME helper's one pick (`mount_ops`): `feature_id` and `path`
+    /// are the block key. Finish resolves the pick against the scene on
+    /// screen and writes the mount it asks for, composed onto the current
+    /// one, as one undo step; nothing rolls.
+    Mount { pick: mount_ops::MountPick },
     /// A drawing-sheet object's reference field — a dimension's anchors, an
     /// ordinate set's datum or members, a section's cutting line, a detail's
     /// centre or rim: `feature_id` is the object id, the picks are ANCHORS
@@ -1122,6 +1127,9 @@ mod wire_harness_ops;
 /// references reach a caller, the tail not being a feature.
 mod ports_ops;
 pub use ports_ops::PortRefField;
+/// A part's mount frame set from a pick: origin to a point, seat on a face.
+mod mount_ops;
+pub use mount_ops::MountPick;
 pub use selection_ux::RefSelectField;
 // Every harness wire as a BOM line with its cut length (MF QTY), or the reason
 // the last applied run cannot give one.

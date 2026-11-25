@@ -475,6 +475,11 @@ pub struct ImprintResultRecord {
     /// the sections were built on is the one the fragments are kept by.
     #[serde(default)]
     pub cosurface_pairs: Vec<(FaceKey, FaceKey)>,
+    /// `BREP_FEATURE_SCALE_OPERAND_SLIVERS`: the regions (minimum, maximum) of
+    /// the slivers FeatureScale registered between the two operands' faces.
+    /// The fragmenter narrows its endpoint bands on a face that meets one.
+    #[serde(default)]
+    pub operand_sliver_regions: Vec<([f64; 3], [f64; 3])>,
     /// Every EXTENDED tangential contact the tangent-curve lane recognised
     /// ([`ImprintOptions::tangent_curve_lane`]): the carriers touch along a
     /// curve inside both trims. A planar-carrier contact is marched and the

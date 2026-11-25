@@ -336,14 +336,35 @@ pub fn interior_points_in_polygons_indexed(
     let standard = [0.25, 0.1, 0.05, 0.01, 0.002, 4e-4].map(|factor| scale * factor);
     // Whether the standard steps found the point (the loop may break out early).
     let mut found_by_standard = true;
+    // HOLE-EDGE STEPS (`BREP_FRAGMENT_INTERIOR_HOLE_EDGES`, default on, `=0` off): the
+    // steps start only from the outer cycle's edge midpoints. A plate whose
+    // sides each have a hole a hair inside them at their middle (holes in a
+    // grid 1.1e-3 from the sides) has every step from every side land in a
+    // hole, the smallest step 4e-4·√area being wider than that gap, and the
+    // plate's whole face region was dropped with no fragment. Only where the
+    // outer edges found nothing, the same steps start from every hole edge's
+    // midpoint, to either side.
+    let hole_fallback = switch!("BREP_FRAGMENT_INTERIOR_HOLE_EDGES", true) && !hole_edges.is_empty();
+    let outer_sources: Vec<(Vec2, Vec2, f64)> = outer_edges.iter().map(|&(a, b)| (a, b, 1.0)).collect();
+    for pass in 0..2 {
+        if pass == 1 && (best.is_some() || !hole_fallback) {
+            break;
+        }
+        let hole_sources: Vec<(Vec2, Vec2, f64)>;
+        let sources: &[(Vec2, Vec2, f64)] = if pass == 0 {
+            &outer_sources
+        } else {
+            hole_sources = hole_edges.iter().flatten().flat_map(|&(a, b)| [(a, b, 1.0), (a, b, -1.0)]).collect();
+            &hole_sources
+        };
     for (step, epsilon) in standard.iter().chain(thin_steps.iter()).copied().enumerate() {
-        if step == standard.len() {
+        if pass == 0 && step == standard.len() {
             found_by_standard = best.is_some();
         }
         if step >= standard.len() && best.is_some() {
             break;
         }
-        for &(a, b) in &outer_edges {
+        for &(a, b, side) in sources {
             let direction = b.sub(a);
             let length = direction.length();
             if length <= 1e-12 {
@@ -354,7 +375,7 @@ pub fn interior_points_in_polygons_indexed(
                     x: -direction.y / length,
                     y: direction.x / length,
                 }
-                .scale(epsilon),
+                .scale(epsilon * side),
             );
             if !inside_outer(candidate)
                 || (0..hole_polygons.len()).any(|hole| inside_hole(hole, candidate))
@@ -383,6 +404,7 @@ pub fn interior_points_in_polygons_indexed(
         if best.is_some() && best_clearance >= epsilon * 0.5 {
             break;
         }
+    }
     }
     let Some(primary) = best else {
         return Vec::new();

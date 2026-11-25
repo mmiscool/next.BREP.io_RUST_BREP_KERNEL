@@ -156,7 +156,7 @@ pub use intersect::{intersect_analytic_pair_with, ruled_gate, ruled_gate_census,
 pub use recognition::recognize;
 #[path = "analytic_surface/extrusion.rs"]
 mod extrusion;
-pub use extrusion::{extrusion_structure, plane_extrusion_section, parallel_extrusion_sections, ExtrusionStructure};
+pub use extrusion::{extrusion_structure, plane_extrusion_section, parallel_extrusion_sections, certified_parallel_extrusion_sections, ExtrusionStructure};
 pub(crate) use extrusion::ReducedProfile;
 pub use revolution::{revolution_structure, RevolutionStructure};
 pub use revolution::circumcenter;

@@ -63,6 +63,8 @@ pub struct FragmentIndex<'a> {
     pub pieces_by_id: HashMap<u64, &'a ImprintPieceRecord>,
     pub(super) vertex_points: HashMap<u64, Vec3>,
     pub(super) cosurface_pairs: HashSet<(FaceKey, FaceKey)>,
+    /// `BREP_FEATURE_SCALE_OPERAND_SLIVERS`: the operand slivers' regions.
+    pub(super) operand_sliver_regions: Vec<crate::spatial::Aabb>,
 }
 
 impl<'a> FragmentIndex<'a> {
@@ -79,6 +81,11 @@ impl<'a> FragmentIndex<'a> {
             by_face,
             cosurface_pairs: imprint.cosurface_pairs.iter()
                 .flat_map(|&(a,b)| [(a,b),(b,a)]).collect(),
+            operand_sliver_regions: imprint
+                .operand_sliver_regions
+                .iter()
+                .map(|(lo, hi)| crate::spatial::Aabb { minimum: Vec3::new(lo[0], lo[1], lo[2]), maximum: Vec3::new(hi[0], hi[1], hi[2]) })
+                .collect(),
             pieces_by_id: imprint
                 .pieces
                 .iter()
@@ -235,6 +242,46 @@ fn boundary_has_cosurface_partner(
                 && neighbour.loops.iter().flat_map(|lp| &lp.coedges)
                     .any(|coedge| coedge.edge_id == boundary_edge)
         })
+    })
+}
+
+/// `BREP_COSURFACE_CORNER_COPY` (default off): a cut on a face that reads as one
+/// surface with the cut's other support face, lying along a boundary edge whose
+/// neighbouring face also reads as one surface with a face of the other operand
+/// that carries the cut too, is that operand's copy of the same corner edge: the two corners sit within the
+/// pairs' separations of one another, so the duplicate test measures it at the
+/// weld floor. Without it a copy a little more than the model tolerance off the
+/// boundary splits off a sub-resolution strip whose test point can read Out
+/// beside a side face that reads On.
+fn cosurface_corner_copy_on() -> bool {
+    crate::switch!("BREP_COSURFACE_CORNER_COPY", false)
+}
+
+fn boundary_is_cosurface_corner(
+    solid: &BrepSolid,
+    face: FaceKey,
+    boundary_edge: u64,
+    piece: &ImprintPieceRecord,
+    index: &FragmentIndex,
+) -> bool {
+    let Some(other) = piece.support_faces.iter().find(|other| other.operand != face.operand) else {
+        return false;
+    };
+    if !index.cosurface_pairs.contains(&(face, *other)) {
+        return false;
+    }
+    solid.shells.iter().flat_map(|shell| &shell.faces).any(|neighbour| {
+        neighbour.id != face.face_id
+            && neighbour.loops.iter().flat_map(|lp| &lp.coedges).any(|coedge| coedge.edge_id == boundary_edge)
+            && index.cosurface_pairs.iter().any(|(first, second)| {
+                // The partner must carry the cut itself: then the cut runs along
+                // its edge with the cut's other support, not merely near a face
+                // that happens to read as one surface with the neighbour.
+                first.operand == face.operand
+                    && first.face_id == neighbour.id
+                    && second.operand != face.operand
+                    && index.by_face.get(&(second.operand, second.face_id)).is_some_and(|ids| ids.contains(&piece.id))
+            })
     })
 }
 
@@ -462,14 +509,32 @@ fn wedge(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f64) -
             // A lens leaves the other's far end too: the cut's other end lies
             // on one of the other's ends.
             let far_end = if inward > 0.0 { hi } else { lo };
-            let two_ended = cut.evaluate(far_end).ok().is_some_and(|far| {
-                [other_lo, other_hi].iter().any(|&end| other.evaluate(end).ok().is_some_and(|point| point.sub(far).length() <= search))
+            let far_point = cut.evaluate(far_end).ok();
+            let far_partner = far_point.and_then(|far| {
+                [other_lo, other_hi]
+                    .iter()
+                    .filter_map(|&end| other.evaluate(end).ok())
+                    .filter(|point| point.sub(far).length() <= search)
+                    .min_by(|p, q| p.sub(far).length().total_cmp(&q.sub(far).length()))
+                    .map(|point| (far, point))
+            });
+            let two_ended = far_partner.is_some();
+            // How far apart the two stand in model space at their ends: a
+            // lens bulges, parting at its middle by more than twice either
+            // end's gap. Two straight runs leaving both ends within the search
+            // part halfway by the mean of their end gaps, a wedge however the
+            // chart reads (a box face turned 1e-4 degrees on itself).
+            let end_gaps = far_partner.and_then(|(far, partner)| {
+                let gap = |p: Vec3, q: Vec3| -> Option<f64> {
+                    Some(face.surface.evaluate(p.x, p.y).ok()?.sub(face.surface.evaluate(q.x, q.y).ok()?).length())
+                };
+                Some(gap(cut_sample[0], other_sample[0])?.max(gap(far, partner)?))
             });
             // Where the ordinary reading declines (parting under 8e-7 a tenth
             // along, or a resolution under the identity band), a lens is read
             // halfway instead.
             let lens = if two_ended && lens_enabled() && (space <= 8e-7 || resolution < identity) {
-                parting(0.5).filter(|(space, _)| *space > 8e-7)
+                parting(0.5).filter(|(space, _)| *space > 8e-7 && end_gaps.is_some_and(|ends| *space > 2.0 * ends))
             } else {
                 None
             };
@@ -504,14 +569,14 @@ fn wedge(face: &FaceRecord, cut: &NurbsCurve, other: &NurbsCurve, search: f64) -
     found
 }
 
-/// FEATURE SCALE, lens (`BREP_FEATURE_SCALE_LENS`, default off, `=1` on): a
+/// FEATURE SCALE, lens (`BREP_FEATURE_SCALE_LENS`, default on, `=0` off): a
 /// [`wedge`] whose two curves share both ends, which the ordinary reading
 /// declines (parting under 8e-7 a tenth of the way along the cut, or asking a
 /// resolution under the identity band), is read again halfway, and one
 /// parting by eight resolutions there is resolved no finer than the identity
 /// band.
 fn lens_enabled() -> bool {
-    crate::switch!("BREP_FEATURE_SCALE_LENS", false)
+    crate::switch!("BREP_FEATURE_SCALE_LENS", true)
 }
 
 /// FEATURE SCALE, end gap (`BREP_FEATURE_SCALE_END_GAP`, default on, `=0` off): an
@@ -996,7 +1061,19 @@ fn fragment_face_arranged(
     // Only for a strip a feature-scale measure found: a cut-against-boundary
     // strip the fragmenter always measured kept its wide bands (narrowing them
     // too opened loops on revolve ∪ wedge fixtures with coincident side planes).
-    let strip_snap = feature_strip;
+    // OPERAND SLIVERS (`BREP_FEATURE_SCALE_OPERAND_SLIVERS`): a face that meets
+    // a sliver FeatureScale registered between the two operands matches its
+    // chain ends in the strip's bands too. Two boxes whose +y faces stand 1e-5
+    // apart: a side face's strip between its own edge and the other box's
+    // edge (the cosurface exchange's cut) is exactly 1e-5 wide, the wide
+    // bands (1e-5 in model space) took the strip's corners for one vertex, the
+    // cut read as a duplicate of the bent boundary and was dropped, and the
+    // slab lost its four side faces.
+    let strip_snap = feature_strip
+        || (strip_resolution.is_some()
+            && !index.operand_sliver_regions.is_empty()
+            && crate::spatial::Aabb::from_surface_controls(&face.surface)
+                .is_ok_and(|face_box| index.operand_sliver_regions.iter().any(|region| face_box.intersects(*region, original_resolution))));
     let (image_band, image_band_3d) = if strip_snap {
         (sampling_bound, 1e-7)
     } else {
@@ -2360,6 +2437,8 @@ fn fragment_face_arranged(
         }
         let copy_boundary = index.pieces_by_id.get(piece_id).is_some_and(|piece| {
             boundary_has_cosurface_partner(solid, face_key, coedge.edge_id, piece, index)
+                || (cosurface_corner_copy_on()
+                    && boundary_is_cosurface_corner(solid, face_key, coedge.edge_id, piece, index))
         });
         let bound = if weld_scale {
             if copy_boundary { crate::tolerance::WELD_FLOOR } else { 1e-7 }

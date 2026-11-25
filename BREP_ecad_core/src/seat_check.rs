@@ -26,9 +26,10 @@ pub const SEAT_TOLERANCE: i32 = 50;
 /// Half the height of the slab a surface-mount pin is read in, about the top
 /// copper (z = 0), in micrometres.
 pub const TOP_SLAB: i32 = 50;
-/// The board thickness a through-hole pin is read through when there is no
-/// board to take it from (a part on its own, in Qualify), in micrometres.
-pub const ASSUMED_THICKNESS: i32 = 1_600;
+/// The board thickness a through-hole pin is read through: the one the 3D
+/// board is built with ([`SUBSTRATE_THICKNESS`], 1.6 mm). There is no
+/// stack-up to read, so the pad check and the 3D board share this one number.
+pub use crate::board::SUBSTRATE_THICKNESS;
 
 /// What a pin's 3D model puts on the board, in footprint coordinates.
 #[derive(Clone, Debug, PartialEq)]
@@ -160,11 +161,12 @@ impl SeatVerdict {
         *self == SeatVerdict::OnPad
     }
 
-    /// The finding in words, `None` when the pin is on its pad. `thickness` is
-    /// named when it was assumed rather than read from a board.
+    /// The finding in words, `None` when the pin is on its pad. With
+    /// `assumed`, the thickness is named: the board's standard one, which is
+    /// what the 3D board is built with.
     pub fn message(&self, pin: &str, contact: &SeatContact, assumed: bool) -> Option<String> {
         let thickness = match contact {
-            SeatContact::Body { thickness, .. } if assumed => format!(" (read through an assumed {} mm board)", mm(*thickness)),
+            SeatContact::Body { thickness, .. } if assumed => format!(" (read through the {} mm board every board is built with)", mm(*thickness)),
             _ => String::new(),
         };
         Some(match self {

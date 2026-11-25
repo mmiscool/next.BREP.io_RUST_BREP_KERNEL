@@ -49,6 +49,66 @@ pub(in crate::watertight_tessellation) fn loop_chain_offset(
     Ok(chain)
 }
 
+/// `BREP_TESS_SEAM_SIDE` (default on, `=0` restores): per-coedge whole-period offsets that put a
+/// coedge lying ON a periodic seam line (its pcurve held at one end of a closed direction) on the
+/// side its two neighbours meet it from. A seam line is both ends of the domain at once, so either
+/// copy is a valid pcurve; a writer that hands the other copy leaves the loop jumping a whole
+/// period at both ends of that coedge, and the loop comes out self-crossing in the chart (the
+/// general road then folds it).
+pub fn seam_side_offsets(
+    coedges: &[CoedgeRecord],
+    closed: [bool; 2],
+    domain: [f64; 4],
+) -> Result<Vec<[f64; 2]>, String> {
+    let mut offsets = vec![[0.0f64, 0.0f64]; coedges.len()];
+    if !crate::switch!("BREP_TESS_SEAM_SIDE", true) || coedges.len() < 2 || !(closed[0] || closed[1]) {
+        return Ok(offsets);
+    }
+    let n = coedges.len();
+    let mut ends = Vec::with_capacity(n);
+    for coedge in coedges {
+        let [t0, t1] = coedge.pcurve.domain()?;
+        let a = coedge.pcurve.evaluate(t0)?;
+        let b = coedge.pcurve.evaluate(t1)?;
+        ends.push(([a.x, a.y], [b.x, b.y], t0, t1));
+    }
+    for axis in 0..2 {
+        if !closed[axis] {
+            continue;
+        }
+        let (low, high) = (domain[2 * axis], domain[2 * axis + 1]);
+        let period = high - low;
+        let tolerance = 1e-9 * period.abs().max(1.0);
+        for i in 0..n {
+            let (_, _, t0, t1) = ends[i];
+            let mut on = None;
+            for side in [low, high] {
+                let mut all = true;
+                for k in 0..=4 {
+                    let p = coedges[i].pcurve.evaluate(t0 + (t1 - t0) * k as f64 / 4.0)?;
+                    if ([p.x, p.y][axis] - side).abs() > tolerance {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    on = Some(side);
+                }
+            }
+            let Some(side) = on else { continue };
+            let other = if side == low { high } else { low };
+            // The neighbours' ends that meet this coedge's start and end.
+            let before = ends[(i + n - 1) % n].1[axis];
+            let after = ends[(i + 1) % n].0[axis];
+            let near_other = |x: f64| (x - other).abs() < (x - side).abs();
+            if near_other(before) && near_other(after) {
+                offsets[i][axis] = other - side;
+            }
+        }
+    }
+    Ok(offsets)
+}
+
 pub fn signed_area(chain: &[FaceVertex]) -> f64 {
     crate::polygon::signed_area_2d(chain.len(), |i| chain[i].uv)
 }

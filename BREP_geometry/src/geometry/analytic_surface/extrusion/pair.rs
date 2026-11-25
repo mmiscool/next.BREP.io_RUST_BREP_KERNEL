@@ -5,15 +5,28 @@ use super::*;
 /// covered by the exact curve crossing lanes are admitted; overlaps,
 /// unsupported conics and uncertain contacts keep general SSI.
 pub fn parallel_extrusion_sections(a: &ExtrusionStructure, b: &ExtrusionStructure, tolerance: f64) -> Option<Vec<NurbsCurve>> {
+    parallel_sections_impl(a,b,tolerance,false)
+}
+
+/// Complete polynomial-profile crossings, declining unresolved contacts or
+/// overlaps. The ordinary analytic path does not call this entry point.
+pub fn certified_parallel_extrusion_sections(a:&ExtrusionStructure,b:&ExtrusionStructure,tolerance:f64)->Option<Vec<NurbsCurve>> {
+    parallel_sections_impl(a,b,tolerance,true)
+}
+
+fn parallel_sections_impl(a:&ExtrusionStructure,b:&ExtrusionStructure,tolerance:f64,certified:bool)->Option<Vec<NurbsCurve>> {
     if !tolerance.is_finite() || tolerance <= 0.0 { return None; }
+    let norm = |v:Vec3| if certified {
+        crate::certified_planar::distance_upper(v,Vec3::default())
+    } else {v.length()};
     let axis = a.direction.normalized().ok()?;
     let other = b.direction.normalized().ok()?;
-    if axis.cross(other).length() > 32.0*f64::EPSILON { return None; }
+    if norm(axis.cross(other)) > 32.0*f64::EPSILON { return None; }
     // Bound the discarded perpendicular motion over both entire sweeps,
     // including normalization roundoff in the chosen common axis.
     let drift = |e: &ExtrusionStructure| -> Option<f64> {
         let length = e.sweep_domain[1]-e.sweep_domain[0];
-        let value = e.direction.sub(axis.scale(e.direction.dot(axis))).length()*length;
+        let value = norm(e.direction.sub(axis.scale(e.direction.dot(axis))))*length;
         if !length.is_finite() || length <= 0.0 || !value.is_finite() { return None; }
         Some(value)
     };
@@ -30,7 +43,9 @@ pub fn parallel_extrusion_sections(a: &ExtrusionStructure, b: &ExtrusionStructur
         NurbsCurve::new(curve.degree,curve.knots.clone(),controls).ok()
     };
     let pa = projected(&a.profile)?; let pb = projected(&b.profile)?;
-    let hits = match crate::curve_curve_intersection::intersect_curves_exact_only(&pa,&pb,tolerance) {
+    let hits = if certified {
+        crate::certified_planar::intersections(&pa,&pb,tolerance)?
+    } else { match crate::curve_curve_intersection::intersect_curves_exact_only(&pa,&pb,tolerance) {
         Some(hits) => {
             if hits.iter().any(|h|h.tangential) { return None; }
             hits
@@ -50,14 +65,14 @@ pub fn parallel_extrusion_sections(a: &ExtrusionStructure, b: &ExtrusionStructur
             hits
         }
         None => return None,
-    };
+    }};
     if hits.is_empty() { return None; }
     let mut curves = Vec::new();
     for hit in hits {
         let p = a.profile.evaluate(hit.s).ok()?;
         let q = b.profile.evaluate(hit.t).ok()?;
         let relative = q.sub(p);
-        let residual = relative.sub(axis.scale(relative.dot(axis))).length();
+        let residual = norm(relative.sub(axis.scale(relative.dot(axis))));
         if !residual.is_finite() || residual+drift_a+drift_b>tolerance { return None; }
         let a_end = a.direction.dot(axis)*(a.sweep_domain[1]-a.sweep_domain[0]);
         let b_start = relative.dot(axis);

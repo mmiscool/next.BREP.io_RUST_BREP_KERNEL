@@ -388,9 +388,19 @@ fn unescape(value: &str) -> String {
 /// The event an import report carries for a virtual part with no body.
 pub const VIRTUAL_PART_WITHOUT_BODY: &str = "import.solidworks.virtual_part_without_body";
 
+/// The diagnostic code for a component whose file was not found: its
+/// instances are left out and the rest of the assembly is placed.
+pub const MISSING_COMPONENT_FILE: &str = "import.solidworks.missing_component_file";
+
 /// A SolidWorks assembly's bodies, each instance's part read through
 /// `resolve` (given a file's base name, its bytes) and placed; sub-assemblies
 /// recursively. Suppressed instances are left out.
+///
+/// A component whose file `resolve` does not find (a part or a
+/// sub-assembly) is left out, as SolidWorks opens an assembly whose
+/// references are missing; the report names each such file once
+/// ([`MISSING_COMPONENT_FILE`]). An assembly none of whose components is
+/// found is refused, naming every missing file.
 ///
 /// A virtual component (an instance of a part kept inside the assembly that
 /// made it, its file named `<part>^<assembly>`) is read from that assembly's
@@ -404,14 +414,32 @@ pub fn import_solidworks_assembly_report(
     let mut report: Option<ParasolidImportReport> = None;
     let mut parts: rustc_hash::FxHashMap<(String, u32), ParasolidImportReport> = rustc_hash::FxHashMap::default();
     let mut empty = Vec::new();
-    place(bytes, crate::step_matrix::MAT4_IDENTITY, 0, resolve, &mut parts, &mut report, &mut empty)?;
+    let mut missing = Missing::default();
+    place(bytes, crate::step_matrix::MAT4_IDENTITY, 0, resolve, &mut parts, &mut report, &mut empty, &mut missing)?;
     let Some(mut report) = report else {
-        return Err(if empty.is_empty() {
+        return Err(if !missing.files.is_empty() {
+            format!(
+                "solidworks_import: none of the assembly's component files is beside it (missing: {}); put the parts and sub-assemblies it uses in its folder",
+                missing.describe()
+            )
+        } else if empty.is_empty() {
             "solidworks_import: the assembly places no part".to_string()
         } else {
             format!("solidworks_import: the assembly places no part with a body (virtual parts without one: {})", empty.join(", "))
         });
     };
+    if !missing.files.is_empty() {
+        report.diagnostics.event(
+            crate::DiagnosticSeverity::Warning,
+            crate::KernelStage::Collect,
+            MISSING_COMPONENT_FILE,
+            format!(
+                "solidworks_import: {} component file(s) not beside the assembly, their instances left out: {}",
+                missing.files.len(),
+                missing.describe()
+            ),
+        );
+    }
     for name in empty {
         report.diagnostics.event(
             crate::DiagnosticSeverity::Warning,
@@ -421,6 +449,30 @@ pub fn import_solidworks_assembly_report(
         );
     }
     Ok(report)
+}
+
+/// The component files an assembly uses that were not found, each with the
+/// number of instances (at any depth) left out for it, in the order met.
+#[derive(Default)]
+struct Missing {
+    files: Vec<(String, usize)>,
+}
+
+impl Missing {
+    fn add(&mut self, file_name: &str) {
+        match self.files.iter_mut().find(|(f, _)| f.eq_ignore_ascii_case(file_name)) {
+            Some((_, n)) => *n += 1,
+            None => self.files.push((file_name.to_string(), 1)),
+        }
+    }
+
+    fn describe(&self) -> String {
+        self.files
+            .iter()
+            .map(|(f, n)| if *n == 1 { f.clone() } else { format!("{f} (x{n})") })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// An assembly's own name, from its instance tree: the assembly model no
@@ -450,14 +502,23 @@ fn virtual_part(assembly: &[u8], file_name: &str) -> Result<Option<Vec<u8>>, Str
     let Some((part, owner)) = file_name.split_once('^') else { return Ok(None) };
     // Only the assembly that made it keeps it: another's part of the same
     // name is not this one (cross review).
-    let owner = owner.rsplit_once('.').map_or(owner, |(stem, _)| stem);
-    if !own_name(assembly)?.is_some_and(|name| name.eq_ignore_ascii_case(owner)) {
+    let (owner, extension) = owner.rsplit_once('.').unwrap_or((owner, ""));
+    // A virtual component nested in a virtual sub-assembly names its owner
+    // with the owner's own `^` written as `_`.
+    let same = |a: &str, b: &str| a.replace('^', "_").eq_ignore_ascii_case(&b.replace('^', "_"));
+    if !own_name(assembly)?.is_some_and(|name| same(&name, owner)) {
         return Ok(None);
     }
-    let stream = format!("VirtualComp/{part}");
-    Ok(solidworks_streams(assembly, &|name: &str| name == stream)?.into_iter().next().map(|(_, data)| data))
+    // The OLE container keeps it as `VirtualComp/<part>`, the 2015+ archive
+    // as `VirtualComp/<part>-<extension>` (`-sldprt`, `-sldasm`).
+    let plain = format!("VirtualComp/{part}");
+    let suffixed = format!("VirtualComp/{part}-{}", extension.to_ascii_lowercase());
+    let mut found = solidworks_streams(assembly, &|name: &str| name == plain || name.eq_ignore_ascii_case(&suffixed))?;
+    found.sort_by_key(|(name, _)| name != &plain);
+    Ok(found.into_iter().next().map(|(_, data)| data))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn place(
     bytes: &[u8],
     parent: crate::Mat4,
@@ -466,6 +527,7 @@ fn place(
     parts: &mut rustc_hash::FxHashMap<(String, u32), ParasolidImportReport>,
     report: &mut Option<ParasolidImportReport>,
     empty: &mut Vec<String>,
+    missing: &mut Missing,
 ) -> Result<(), String> {
     if depth > 32 {
         return Err("solidworks_import: assemblies nest more than 32 deep".into());
@@ -475,9 +537,10 @@ fn place(
         let matrix = crate::step_matrix::mat4_mul(&parent, &component.transform);
         let kept = virtual_part(bytes, &component.file_name).map_err(|e| format!("solidworks_import: {}: {e}", component.file_name))?;
         let is_virtual = kept.is_some();
-        let file = kept
-            .or_else(|| resolve(&component.file_name))
-            .ok_or_else(|| format!("solidworks_import: {} uses {}, which is not beside the assembly", component.name, component.file_name))?;
+        let Some(file) = kept.or_else(|| resolve(&component.file_name)) else {
+            missing.add(&component.file_name);
+            continue;
+        };
         if component.assembly {
             // A sub-assembly's file records the tree of one configuration;
             // an instance of another is not read.
@@ -491,7 +554,7 @@ fn place(
                     recorded.unwrap_or(0)
                 ));
             }
-            place(&file, matrix, depth + 1, resolve, parts, report, empty)?;
+            place(&file, matrix, depth + 1, resolve, parts, report, empty, missing)?;
             continue;
         }
         let key = (component.file_name.to_ascii_lowercase(), component.configuration);

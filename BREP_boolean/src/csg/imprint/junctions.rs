@@ -771,8 +771,8 @@ pub(super) fn merge_residual_coincident_vertices(
             .copied()
     };
     let operand_guard = std::env::var("BREP_RESIDUAL_MERGE_OPERAND_GUARD").as_deref() != Ok("0");
-    // OPERAND-EDGE GUARD (`BREP_RESIDUAL_MERGE_EDGE_GUARD`, default off, `=1`
-    // on): the operand edges each junction lies on (within its evidence
+    // OPERAND-EDGE GUARD (`BREP_RESIDUAL_MERGE_EDGE_GUARD`, default on, `=0`
+    // off): the operand edges each junction lies on (within its evidence
     // radius, inside the edge's span). Two junctions on edges of one operand,
     // neither within the band of an edge the other lies on, are where a
     // section crosses two different edges: two points, whatever the union of
@@ -780,7 +780,7 @@ pub(super) fn merge_residual_coincident_vertices(
     // rulings 0.098 apart, every point between them within the band of the
     // plane and both near-tangent walls; merging them sent each half of the
     // cut onto the other's ends.
-    let edge_guard = crate::switch!("BREP_RESIDUAL_MERGE_EDGE_GUARD", false);
+    let edge_guard = crate::switch!("BREP_RESIDUAL_MERGE_EDGE_GUARD", true);
     let on_edges = |point: Vec3, radius: f64| -> Vec<(u8, u64)> {
         let mut found = Vec::new();
         for (&(operand, edge_id), edge) in edge_curves.iter() {
@@ -804,13 +804,34 @@ pub(super) fn merge_residual_coincident_vertices(
             return false;
         }
         let (on_a, on_b) = (on_edges(p_a, radius_of(id_a)), on_edges(p_b, radius_of(id_b)));
+        // A junction on no edge of an operand stands beside the nearest one
+        // (a marched section's end run 7e-3 past a rim it ends on): it is on
+        // another edge than a junction on `edges` when that nearest edge is
+        // not among them and every one of them is farther than the band.
+        let beside_another = |operand: u8, point: Vec3, edges: &[(u8, u64)]| -> bool {
+            let nearest = edge_curves
+                .iter()
+                .filter(|(&(owner, _), edge)| owner == operand && !edge.degenerate)
+                .filter_map(|(&key, edge)| project_point_to_curve(&edge.curve, point).ok().map(|foot| (key, foot.distance)))
+                .min_by(|x, y| x.1.total_cmp(&y.1));
+            nearest.is_some_and(|(key, distance)| {
+                !edges.contains(&key) && edges.iter().all(|&edge| {
+                    let off = edge_distance(edge, point);
+                    off > band && off > distance
+                })
+            })
+        };
         [0u8, 1u8].iter().any(|&operand| {
             let a: Vec<_> = on_a.iter().filter(|edge| edge.0 == operand).copied().collect();
             let b: Vec<_> = on_b.iter().filter(|edge| edge.0 == operand).copied().collect();
-            !a.is_empty()
-                && !b.is_empty()
-                && a.iter().all(|&edge| edge_distance(edge, p_b) > band)
-                && b.iter().all(|&edge| edge_distance(edge, p_a) > band)
+            match (a.is_empty(), b.is_empty()) {
+                (false, false) => {
+                    a.iter().all(|&edge| edge_distance(edge, p_b) > band) && b.iter().all(|&edge| edge_distance(edge, p_a) > band)
+                }
+                (false, true) => beside_another(operand, p_b, &a),
+                (true, false) => beside_another(operand, p_a, &b),
+                (true, true) => false,
+            }
         })
     };
 

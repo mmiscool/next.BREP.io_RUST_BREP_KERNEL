@@ -48,6 +48,17 @@ pub struct SourceEdge {
     /// every other source: the scan pairs by arrival as before. Appended at
     /// the end of the struct (2026-10-11).
     pub tangent_side: Option<Vec3>,
+    /// `BREP_ASSEMBLY_FEATURE_WELD`: the weld radius at this source's
+    /// `[start, end]`, a quarter of the shortest edge its fragment loop
+    /// meets there (see [`FeatureWeld`]). `None` where no loop was read:
+    /// the band alone decides, as before.
+    pub feature_radius: Option<[f64; 2]>,
+    /// Whether the topology upstream already holds this source's two ends
+    /// distinct: an operand edge or an imprint piece whose start and end
+    /// vertex ids differ. Only such an edge bounds the feature radius of its
+    /// ends, so a piece the imprint merged shut (fitting noise a few 1e-6
+    /// long) never shrinks a weld that today's band makes.
+    pub distinct_ends: bool,
 }
 
 /// id-index over the immutable operands + imprint, built once before the
@@ -164,6 +175,8 @@ fn boundary_source_edge(
         boundary_key: Some((operand, edge_id)),
         piece: None,
         tangent_side: None,
+        feature_radius: None,
+        distinct_ends: edge.start_vertex_id != edge.end_vertex_id && !edge.degenerate,
     })
 }
 
@@ -197,6 +210,8 @@ pub(super) fn source_edge(source: &FragmentEdgeSource, index: &AssembleIndex) ->
                 boundary_key: None,
                 piece: Some(*piece_id),
                 tangent_side: None,
+                feature_radius: None,
+                distinct_ends: piece.start_vertex_id != piece.end_vertex_id,
             })
         }
         FragmentEdgeSource::Derived {
@@ -217,6 +232,11 @@ pub(super) fn source_edge(source: &FragmentEdgeSource, index: &AssembleIndex) ->
             boundary_key: None,
             piece: None,
             tangent_side: None,
+            feature_radius: None,
+            // A sub-span of an operand edge cut at imprint vertices: the
+            // fragmenter splits only at a vertex the imprint kept apart from
+            // the edge's ends, so its ends are distinct unless it collapsed.
+            distinct_ends: start.sub(*end).length() > 1e-8,
         }),
     }
 }
@@ -320,6 +340,18 @@ impl VertexCandidates {
     }
 
     fn first(&mut self, vertices: &[VertexRecord], point: Vec3, tolerance: f64) -> Option<u64> {
+        self.first_admitted(vertices, point, tolerance, |_, _| true)
+    }
+
+    /// [`Self::first`] restricted to the vertices `admit(id, distance)`
+    /// accepts among those within `tolerance`.
+    fn first_admitted(
+        &mut self,
+        vertices: &[VertexRecord],
+        point: Vec3,
+        tolerance: f64,
+        admit: impl Fn(u64, f64) -> bool,
+    ) -> Option<u64> {
         self.reconsider_axis(vertices);
         for (index, vertex) in vertices.iter().enumerate().skip(self.indexed) {
             match Self::key(Self::coordinate(vertex.point, self.axis), tolerance) {
@@ -329,7 +361,13 @@ impl VertexCandidates {
         }
         self.indexed = vertices.len();
         let Some(key) = Self::key(Self::coordinate(point, self.axis), tolerance) else {
-            return vertices.iter().find(|v| v.point.sub(point).length() <= tolerance).map(|v| v.id);
+            return vertices
+                .iter()
+                .find(|v| {
+                    let distance = v.point.sub(point).length();
+                    distance <= tolerance && admit(v.id, distance)
+                })
+                .map(|v| v.id);
         };
         let mut first = None;
         for index in (key - 1..=key + 1)
@@ -337,7 +375,8 @@ impl VertexCandidates {
             .chain(&self.unbucketed)
         {
             if first.is_some_and(|earlier| earlier <= *index) { continue; }
-            if vertices[*index].point.sub(point).length() <= tolerance { first = Some(*index); }
+            let distance = vertices[*index].point.sub(point).length();
+            if distance <= tolerance && admit(vertices[*index].id, distance) { first = Some(*index); }
         }
         first.map(|index| vertices[index].id)
     }
@@ -391,6 +430,277 @@ pub struct Assembler {
     /// boundary key is a region's edge pair; radial validation certifies
     /// the resulting multi-region edge before anything is returned.
     pub cellular: bool,
+    /// `BREP_ASSEMBLY_FEATURE_WELD` state: the mode, each vertex's weld
+    /// radius and the fragment being assembled (for check-mode reports).
+    pub feature: FeatureWeld,
+}
+
+/// Differing check-mode decisions printed per process before only the
+/// per-assembly count is (see [`FeatureWeld::report`]).
+const FEATURE_WELD_REPORT_LINES: usize = 20;
+
+/// Below this a feature is under the model tolerance and the feature weld
+/// stops shrinking: two points closer than it are one point.
+pub(super) const FEATURE_WELD_FLOOR: f64 = 1e-7;
+
+/// `BREP_ASSEMBLY_FEATURE_WELD` (default on, `0` restores; `check` keeps the
+/// band weld and reports every decision the feature weld would make
+/// differently). The band weld merges any two endpoints within the caller's
+/// tolerance (1e-5 for booleans, 2e-3 for offset) and reads any edge whose
+/// chord falls within it as degenerate, even where the imprint and the
+/// fragmenter have already proved the two points distinct: two ends of one
+/// edge of a fragment loop. A shell whose inner corner arcs are 8.5e-4 long
+/// lost them under offset's 2e-3 band (the arcs' ends welded, the corner
+/// faces fell away), and two boxes whose faces stand 1e-5 apart lost the
+/// corners of the sliver faces between them. The feature weld bounds each
+/// vertex's radius by a quarter of the shortest edge its loop meets there,
+/// floored at [`FEATURE_WELD_FLOOR`], and reads an edge as degenerate only
+/// when flagged or shorter than the floor.
+#[derive(Debug, Default)]
+pub struct FeatureWeld {
+    pub mode: FeatureWeldMode,
+    /// Weld radius per assembler vertex id (absent: the band).
+    pub radius: HashMap<u64, f64>,
+    /// `(operand, source face id)` of the fragment being assembled.
+    pub fragment: Option<(u8, u64)>,
+    /// Decisions that differed in check mode.
+    pub differences: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FeatureWeldMode {
+    #[default]
+    Off,
+    Check,
+    On,
+}
+
+impl FeatureWeld {
+    pub(super) fn from_switch() -> Self {
+        let mode = match crate::mode_switch!(live "BREP_ASSEMBLY_FEATURE_WELD", true) {
+            crate::env_read::Mode::Off => FeatureWeldMode::Off,
+            crate::env_read::Mode::Check => FeatureWeldMode::Check,
+            crate::env_read::Mode::On => FeatureWeldMode::On,
+        };
+        FeatureWeld { mode, ..Default::default() }
+    }
+
+    /// Counts a differing decision; prints the first
+    /// [`FEATURE_WELD_REPORT_LINES`] per process (every one under
+    /// `BREP_ASSEMBLY_FEATURE_WELD_LOG=all`), so a check-mode census does
+    /// not flood its log. The count is printed per assembly at its end.
+    fn report(&mut self, what: std::fmt::Arguments<'_>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static PRINTED: AtomicUsize = AtomicUsize::new(0);
+        self.differences += 1;
+        let all = env_read!("BREP_ASSEMBLY_FEATURE_WELD_LOG").as_deref() == Some("all");
+        if all || PRINTED.fetch_add(1, Ordering::Relaxed) < FEATURE_WELD_REPORT_LINES {
+            eprintln!("FEATURE_WELD differs fragment={:?}: {what}", self.fragment);
+        }
+    }
+}
+
+/// Loops up to this many coedges also bound each vertex by its distance to
+/// the loop's non-adjacent corners; longer loops read adjacent edges only.
+const FEATURE_WELD_PAIRWISE_LOOP: usize = 64;
+
+/// The feature radii of a fragment loop's sources, in each source's own
+/// `[start, end]` order. Vertex `j` (the start of coedge `j` along the loop)
+/// takes `max(floor, min(band, f/4))`, where `f` is the shorter chord of
+/// the two loop edges meeting there and, on loops of at most
+/// [`FEATURE_WELD_PAIRWISE_LOOP`] coedges, its distance to every corner of
+/// the loop that is not its neighbour. Only an edge whose ends the topology
+/// upstream already holds distinct (`SourceEdge::distinct_ends`, chord over
+/// the floor) is a feature: the loop's corners joined by any other edge
+/// count as one corner, so fitting noise the imprint merged shut never
+/// shrinks a radius.
+/// The short sources (chord within `band`, over the model floor) of the
+/// fragments' loops that may keep their two ends apart, keyed
+/// `(fragment, (loop, coedge))` in the order the assembler reads them.
+///
+/// A short source qualifies when another fragment carries a short source on
+/// the same two ends ([`mate_short_sources`]), so both faces sharing it read
+/// it alike whatever kind each sees, AND no pair of longer sources needs its
+/// two ends merged: two fragments' copies of one longer edge (far ends within
+/// a quarter of the short chord, midpoints within the band) whose near ends land on the two different ends
+/// of the short source pair only through the band weld, so keeping the short
+/// edge would leave both copies one-use. Such a short source and its mates
+/// keep the band reading. [`Assembler::edge`] keeps a qualifying source's
+/// ends apart under `BREP_ASSEMBLY_FEATURE_WELD`.
+pub(super) fn short_source_mates(
+    fragments: &[crate::fragment::FaceFragmentRecord],
+    index: &AssembleIndex,
+    band: f64,
+) -> Result<HashSet<(usize, (usize, usize))>, KernelRefusal> {
+    let mut short = Vec::new();
+    // Every source: (fragment, start, end, midpoint).
+    let mut all: Vec<(usize, Vec3, Vec3, Vec3)> = Vec::new();
+    for (fragment_index, fragment) in fragments.iter().enumerate() {
+        for (loop_index, fragment_loop) in fragment.loops.iter().enumerate() {
+            for (coedge_index, usage) in fragment_loop.coedges.iter().enumerate() {
+                let source = source_edge(&usage.source, index)?;
+                let chord = source.start.sub(source.end).length();
+                if chord > FEATURE_WELD_FLOOR && chord <= band && !source.degenerate {
+                    short.push(((fragment_index, (loop_index, coedge_index)), source.start, source.end, chord));
+                } else if chord > band {
+                    let mid = source.curve.evaluate(0.5 * (source.t0 + source.t1)).unwrap_or(source.start.add(source.end).scale(0.5));
+                    all.push((fragment_index, source.start, source.end, mid));
+                }
+            }
+        }
+    }
+    let mut mated = mate_short_sources(&short);
+    if mated.is_empty() {
+        return Ok(mated);
+    }
+    // Longer sources by the band cell of each end.
+    let cell = |point: Vec3| ((point.x / band).floor() as i64, (point.y / band).floor() as i64, (point.z / band).floor() as i64);
+    let mut by_cell: HashMap<(i64, i64, i64), Vec<(usize, bool)>> = HashMap::default();
+    for (source, &(_, start, end, _)) in all.iter().enumerate() {
+        by_cell.entry(cell(start)).or_default().push((source, true));
+        by_cell.entry(cell(end)).or_default().push((source, false));
+    }
+    let near = |point: Vec3| {
+        let (x, y, z) = cell(point);
+        let mut found = Vec::new();
+        for dx in -1..=1 { for dy in -1..=1 { for dz in -1..=1 {
+            if let Some(list) = by_cell.get(&(x + dx, y + dy, z + dz)) {
+                found.extend(list.iter().copied().filter(|&(source, at_start)| {
+                    let (_, start, end, _) = all[source];
+                    (if at_start { start } else { end }).sub(point).length() <= band
+                }));
+            }
+        }}}
+        found
+    };
+    let mut demoted = HashSet::default();
+    for &(key, start, end, chord) in &short {
+        if !mated.contains(&key) {
+            continue;
+        }
+        let reach = 0.25 * chord;
+        let side = |point: Vec3| {
+            if point.sub(start).length() <= reach { Some(false) } else if point.sub(end).length() <= reach { Some(true) } else { None }
+        };
+        let ends_here = near(start);
+        let needs_merge = ends_here.iter().any(|&(source, at_start)| {
+            let (fragment, s0, s1, mid) = all[source];
+            let (here, far) = if at_start { (s0, s1) } else { (s1, s0) };
+            let Some(here_side) = side(here) else { return false };
+            near(far).iter().any(|&(other, other_at_start)| {
+                let (other_fragment, o0, o1, other_mid) = all[other];
+                if other_fragment == fragment || other == source {
+                    return false;
+                }
+                let (other_far, other_here) = if other_at_start { (o0, o1) } else { (o1, o0) };
+                // A copy of the same edge: the far ends coincide as closely
+                // as the short source's own ends must stay apart. Two edges
+                // ending a short chord apart at both ends (the walls beside
+                // a small arc) are two edges, not one edge shifted.
+                other_far.sub(far).length() <= reach
+                    && other_mid.sub(mid).length() <= band
+                    && side(other_here).is_some_and(|other_side| other_side != here_side)
+            })
+        });
+        if needs_merge {
+            demoted.insert(key);
+        }
+    }
+    if !demoted.is_empty() {
+        // A demoted short source takes its mates with it: they are one edge.
+        for &(key, start, end, chord) in &short {
+            if !demoted.contains(&key) {
+                continue;
+            }
+            for &(other, other_start, other_end, other_chord) in &short {
+                let reach = 0.25 * chord.min(other_chord);
+                let direct = start.sub(other_start).length().max(end.sub(other_end).length());
+                let reversed = start.sub(other_end).length().max(end.sub(other_start).length());
+                if direct.min(reversed) <= reach {
+                    mated.remove(&other);
+                }
+            }
+        }
+    }
+    Ok(mated)
+}
+
+/// [`short_source_mates`] over `(key, start, end, chord)` rows, the key's
+/// first field naming the fragment: the keys of the rows another fragment's
+/// row matches, ends in either order within a quarter of the shorter chord.
+pub(super) fn mate_short_sources<K: Copy + Eq + std::hash::Hash>(
+    short: &[((usize, K), Vec3, Vec3, f64)],
+) -> HashSet<(usize, K)> {
+    let mut mated = HashSet::default();
+    for (a, &(key, start, end, chord)) in short.iter().enumerate() {
+        for &(other, other_start, other_end, other_chord) in &short[a + 1..] {
+            if other.0 == key.0 {
+                continue;
+            }
+            let reach = 0.25 * chord.min(other_chord);
+            let direct = start.sub(other_start).length().max(end.sub(other_end).length());
+            let reversed = start.sub(other_end).length().max(end.sub(other_start).length());
+            if direct.min(reversed) <= reach {
+                mated.insert(key);
+                mated.insert(other);
+            }
+        }
+    }
+    mated
+}
+
+pub(super) fn loop_feature_radii(sources: &[(SourceEdge, bool)], band: f64) -> Vec<[f64; 2]> {
+    let count = sources.len();
+    if count == 0 {
+        return Vec::new();
+    }
+    let feature = |(source, _): &(SourceEdge, bool)| {
+        let chord = source.start.sub(source.end).length();
+        (source.distinct_ends && !source.degenerate && chord > FEATURE_WELD_FLOOR).then_some(chord)
+    };
+    let chords: Vec<Option<f64>> = sources.iter().map(feature).collect();
+    let corner = |j: usize| {
+        let (source, forward) = &sources[j];
+        if *forward { source.start } else { source.end }
+    };
+    // Corner clusters: vertex j joins vertex j-1's cluster unless edge j-1
+    // is a feature. A loop with no feature at all is one cluster.
+    let mut cluster = vec![0usize; count];
+    for j in 1..count {
+        cluster[j] = cluster[j - 1] + usize::from(chords[j - 1].is_some());
+    }
+    let clusters = cluster[count - 1] + usize::from(chords[count - 1].is_some());
+    if chords[count - 1].is_none() && clusters > 1 {
+        // The wrap edge is not a feature: the tail run is the head cluster.
+        let tail = cluster[count - 1];
+        for value in cluster.iter_mut().filter(|value| **value == tail) {
+            *value = 0;
+        }
+    }
+    let clusters = clusters.max(1);
+    let adjacent = |a: usize, b: usize| {
+        a == b || (a + 1) % clusters == b || (b + 1) % clusters == a
+    };
+    let at_vertex = |j: usize| {
+        let before = chords[(j + count - 1) % count].unwrap_or(f64::INFINITY);
+        let mut shortest = before.min(chords[j].unwrap_or(f64::INFINITY));
+        if count <= FEATURE_WELD_PAIRWISE_LOOP && clusters > 3 {
+            let here = corner(j);
+            for k in 0..count {
+                if !adjacent(cluster[j], cluster[k]) {
+                    shortest = shortest.min(corner(k).sub(here).length());
+                }
+            }
+        }
+        (0.25 * shortest).min(band).max(FEATURE_WELD_FLOOR)
+    };
+    let radii: Vec<f64> = (0..count).map(at_vertex).collect();
+    (0..count)
+        .map(|j| {
+            let (head, tail) = (radii[j], radii[(j + 1) % count]);
+            if sources[j].1 { [head, tail] } else { [tail, head] }
+        })
+        .collect()
 }
 
 pub(super) fn snap_edge_curve_endpoints(
@@ -478,7 +788,21 @@ impl Assembler {
         &mut self, source_start: Vec3, source_end: Vec3,
         target_start: u64, target_end: u64, reversed: bool,
     ) -> Result<bool, KernelRefusal> {
-        let source_ids = [self.vertex(source_start), self.vertex(source_end)];
+        self.join_weld_endpoints_within(source_start, source_end, target_start, target_end, reversed, None)
+    }
+
+    /// [`Self::join_weld_endpoints`] with the source's feature radii: under
+    /// `BREP_ASSEMBLY_FEATURE_WELD=on` no vertex moves farther than its own
+    /// radius.
+    fn join_weld_endpoints_within(
+        &mut self, source_start: Vec3, source_end: Vec3,
+        target_start: u64, target_end: u64, reversed: bool,
+        feature_radius: Option<[f64; 2]>,
+    ) -> Result<bool, KernelRefusal> {
+        let source_ids = [
+            self.vertex_within(source_start, feature_radius.map(|radius| radius[0])),
+            self.vertex_within(source_end, feature_radius.map(|radius| radius[1])),
+        ];
         let target_ids = if reversed { [target_end, target_start] }
                          else { [target_start, target_end] };
         let mut aliases = self.vertex_aliases.clone();
@@ -492,9 +816,17 @@ impl Assembler {
         }
         if aliases == self.vertex_aliases { return Ok(true); }
         let band = self.tolerance.max(1e-7);
+        let feature_on = self.feature.mode == FeatureWeldMode::On;
         for vertex in &self.vertices {
             let target = root(&aliases, vertex.id);
-            if vertex.point.sub(self.vertex_point(target)?).length() > band {
+            // A vertex no loop gave a radius keeps the band on its own
+            // side; the move is held to the smaller reach of the two ends.
+            let reach = if feature_on {
+                self.vertex_radius(vertex.id, band).min(self.vertex_radius(target, band))
+            } else {
+                band
+            };
+            if vertex.point.sub(self.vertex_point(target)?).length() > reach {
                 return Ok(false);
             }
         }
@@ -528,22 +860,80 @@ impl Assembler {
     }
 
     fn vertex(&mut self, point: Vec3) -> u64 {
+        self.vertex_within(point, None)
+    }
+
+    /// The vertex at `point`: the first within the weld band, or, under
+    /// `BREP_ASSEMBLY_FEATURE_WELD`, the first within both this point's
+    /// feature `radius` and the found vertex's own (see [`FeatureWeld`]).
+    fn vertex_within(&mut self, point: Vec3, radius: Option<f64>) -> u64 {
         // Offset/intersection endpoints are independently fitted and can
         // differ by the sewing tolerance. Welding those endpoint vertices is
         // what makes consecutive coedges form a topological loop; the edge
         // geometry itself remains unchanged.
         let tolerance = self.tolerance.max(1e-7);
-        let found = match &mut self.weld_candidates.vertex_candidates {
-            Some(index) => index.first(&self.vertices, point, tolerance),
-            None => self.vertices.iter().find(|vertex| vertex.point.sub(point).length() <= tolerance).map(|vertex| vertex.id),
+        let band = self.vertex_lookup(point, tolerance, None);
+        let mode = self.feature.mode;
+        let found = if mode == FeatureWeldMode::Off {
+            band
+        } else {
+            let own = radius.unwrap_or(tolerance).min(tolerance);
+            let feature = self.vertex_lookup(point, tolerance, Some(own));
+            if mode == FeatureWeldMode::Check && feature != band {
+                let (band_id, feature_id) = (band.map(|id| self.canonical_vertex(id)), feature.map(|id| self.canonical_vertex(id)));
+                self.feature.report(format_args!(
+                    "vertex at ({:.9},{:.9},{:.9}) band={tolerance:.3e} radius={own:.3e}: band welds to {band_id:?}, feature to {feature_id:?}",
+                    point.x, point.y, point.z,
+                ));
+            }
+            if mode == FeatureWeldMode::On { feature } else { band }
         };
-        if let Some(id) = found {
-            return self.canonical_vertex(id);
+        if let Some(record) = found {
+            // The radius rides the vertex RECORD the lookup admits by.
+            if mode == FeatureWeldMode::On {
+                if let Some(radius) = radius {
+                    let held = self.feature.radius.entry(record).or_insert(radius);
+                    *held = held.min(radius);
+                }
+            }
+            return self.canonical_vertex(record);
         }
         let id = self.next_vertex_id;
         self.next_vertex_id += 1;
         self.vertices.push(VertexRecord { id, point });
+        if mode != FeatureWeldMode::Off {
+            if let Some(radius) = radius {
+                self.feature.radius.insert(id, radius.min(tolerance));
+            }
+        }
         id
+    }
+
+    /// The first vertex within `tolerance` of `point`; with `feature`, only
+    /// one also within that radius and within its own recorded radius.
+    fn vertex_lookup(&mut self, point: Vec3, tolerance: f64, feature: Option<f64>) -> Option<u64> {
+        let radii = &self.feature.radius;
+        let admit = |id: u64, distance: f64| match feature {
+            None => true,
+            Some(own) => distance <= own.min(radii.get(&id).copied().unwrap_or(tolerance)),
+        };
+        match &mut self.weld_candidates.vertex_candidates {
+            Some(index) => index.first_admitted(&self.vertices, point, tolerance, admit),
+            None => self
+                .vertices
+                .iter()
+                .find(|vertex| {
+                    let distance = vertex.point.sub(point).length();
+                    distance <= tolerance && admit(vertex.id, distance)
+                })
+                .map(|vertex| vertex.id),
+        }
+    }
+
+    /// The feature radius recorded at a vertex (the band where none is).
+    fn vertex_radius(&self, id: u64, band: f64) -> f64 {
+        let held = |id: u64| self.feature.radius.get(&id).copied();
+        held(id).or_else(|| held(self.canonical_vertex(id))).unwrap_or(band).min(band)
     }
 
     pub fn edge(
@@ -553,8 +943,39 @@ impl Assembler {
     ) -> Result<(u64, bool), KernelRefusal> {
         let weld_tolerance = assembler_weld(self.tolerance);
         let identity_tolerance = self.tolerance.max(1e-7);
+        let chord = source.start.sub(source.end).length();
+        let band_degenerate = source.degenerate || chord <= identity_tolerance;
+        // `BREP_ASSEMBLY_FEATURE_WELD`: a source that is a feature
+        // (`SourceEdge::distinct_ends`; a short one only when another face
+        // carries its mate, `short_source_mates`) is degenerate only when
+        // flagged or under the model floor; any other keeps the band reading.
+        let feature_mode = self.feature.mode;
+        let feature_radius = source.feature_radius.filter(|_| feature_mode != FeatureWeldMode::Off);
+        let feature_degenerate = match feature_radius {
+            Some(_) if source.distinct_ends => source.degenerate || chord <= FEATURE_WELD_FLOOR,
+            Some(_) => band_degenerate,
+            None => band_degenerate,
+        };
+        let kind = match (source.boundary_key, source.piece) {
+            (Some(_), _) => "boundary",
+            (None, Some(_)) => "imprint",
+            (None, None) => "derived",
+        };
+        if feature_mode == FeatureWeldMode::Check && feature_degenerate != band_degenerate {
+            self.feature.report(format_args!(
+                "{kind} edge ({:.9},{:.9},{:.9})->({:.9},{:.9},{:.9}) chord={chord:.3e} band={identity_tolerance:.3e}: band reads degenerate={band_degenerate}, feature {feature_degenerate}",
+                source.start.x, source.start.y, source.start.z, source.end.x, source.end.y, source.end.z,
+            ));
+        }
         let source_degenerate =
-            source.degenerate || source.start.sub(source.end).length() <= identity_tolerance;
+            if feature_mode == FeatureWeldMode::On { feature_degenerate } else { band_degenerate };
+        let source_kind = kind;
+        // The pairing bands: today's band, and the feature weld's, bounded by
+        // the source's own end radii and a quarter of its chord.
+        let source_pair_radius = feature_radius.map(|[start, end]| start.min(end));
+        let feature_curve_band = source_pair_radius
+            .map(|_| weld_tolerance.min(0.25 * chord).max(FEATURE_WELD_FLOOR))
+            .unwrap_or(weld_tolerance);
         // A degenerate pole edge is a face-local topological placeholder,
         // not a shared boundary. Geometrically coincident pole edges must
         // remain distinct so each is referenced by exactly one coedge.
@@ -587,9 +1008,14 @@ impl Assembler {
                 }
                 let start = self.vertex_point(edge.start_vertex_id)?;
                 let end = self.vertex_point(edge.end_vertex_id)?;
-                if edge.degenerate || start.sub(end).length() <= identity_tolerance {
-                    continue;
-                }
+                // Feature weld: identity at the smaller of the source's and
+                // the candidate's end radii.
+                let feature_identity = source_pair_radius.map(|own| {
+                    own.min(self.vertex_radius(edge.start_vertex_id, identity_tolerance))
+                        .min(self.vertex_radius(edge.end_vertex_id, identity_tolerance))
+                        .min(identity_tolerance)
+                });
+                let candidate_chord = start.sub(end).length();
                 let direct_gap = start.sub(source.start).length()
                     .max(end.sub(source.end).length());
                 let reversed_gap = start.sub(source.end).length()
@@ -597,12 +1023,33 @@ impl Assembler {
                 // A broad curve-comparison band cannot establish endpoint
                 // identity. A later conformance piece may connect these two
                 // nearby vertices, even if that short edge is not built yet.
-                let direct = direct_gap <= identity_tolerance;
-                let reversed = reversed_gap <= identity_tolerance
-                    && (!direct || reversed_gap < direct_gap);
-                if !direct && !reversed {
-                    continue;
+                let ends_match = |identity: f64, floor: f64| -> Option<bool> {
+                    if edge.degenerate || candidate_chord <= floor {
+                        return None;
+                    }
+                    let direct = direct_gap <= identity;
+                    let reversed = reversed_gap <= identity && (!direct || reversed_gap < direct_gap);
+                    (direct || reversed).then_some(reversed)
+                };
+                let band_ends = ends_match(identity_tolerance, identity_tolerance);
+                let feature_ends = feature_identity.map(|identity| ends_match(identity, FEATURE_WELD_FLOOR));
+                if feature_mode == FeatureWeldMode::Check {
+                    if let Some(feature_ends) = feature_ends.filter(|ends| *ends != band_ends) {
+                        self.feature.report(format_args!(
+                            "{source_kind} pair ({:.9},{:.9},{:.9})->({:.9},{:.9},{:.9}) with edge {}: band ends {band_ends:?}, feature {feature_ends:?} (gaps {direct_gap:.3e}/{reversed_gap:.3e})",
+                            source.start.x, source.start.y, source.start.z, source.end.x, source.end.y, source.end.z, edge.id,
+                        ));
+                    }
                 }
+                let (ends, curve_band) = match (feature_mode, feature_ends) {
+                    (FeatureWeldMode::On, Some(ends)) => (ends, feature_curve_band),
+                    _ => (band_ends, weld_tolerance),
+                };
+                let Some(reversed) = ends else {
+                    continue;
+                };
+                let edge = &self.edges[index];
+                let weld_tolerance = curve_band;
                 let same_curve = [0.2, 0.5, 0.8].into_iter().all(|fraction| {
                     let source_parameter = source.t0 + (source.t1 - source.t0) * fraction;
                     let edge_fraction = if reversed { 1.0 - fraction } else { fraction };
@@ -660,8 +1107,8 @@ impl Assembler {
                         continue;
                     }
                     let endpoints = (edge.start_vertex_id, edge.end_vertex_id);
-                    if !self.join_weld_endpoints(source.start, source.end,
-                        endpoints.0, endpoints.1, reversed)? { continue; }
+                    if !self.join_weld_endpoints_within(source.start, source.end,
+                        endpoints.0, endpoints.1, reversed, feature_radius)? { continue; }
                     welded = Some((index, reversed));
                     break;
                 }
@@ -842,8 +1289,8 @@ impl Assembler {
                 return Ok((id, reversed));
             }
         }
-        let start_vertex_id = self.vertex(source.start);
-        let end_vertex_id = self.vertex(source.end);
+        let start_vertex_id = self.vertex_within(source.start, feature_radius.map(|radius| radius[0]));
+        let end_vertex_id = self.vertex_within(source.end, feature_radius.map(|radius| radius[1]));
         let canonical_start = self.vertex_point(start_vertex_id)?;
         let canonical_end = self.vertex_point(end_vertex_id)?;
         // A degenerate source can be a true point placeholder (pole), a
@@ -897,6 +1344,10 @@ impl Assembler {
         } else {
             (source.curve, source.t0, source.t1)
         };
+        let record_floor = match (feature_mode, feature_radius) {
+            (FeatureWeldMode::On, Some(_)) if source.distinct_ends => FEATURE_WELD_FLOOR,
+            _ => identity_tolerance,
+        };
         let id = self.next_edge_id;
         if std::env::var("BREP_DEBUG_EDGE").is_ok_and(|v| v == id.to_string()) {
             let eval_start = curve.evaluate(edge_t0);
@@ -929,9 +1380,11 @@ impl Assembler {
             // Historical marking: closed and sub-tolerance edges stay
             // face-local unless a closed weld later claims them (the weld
             // clears this flag on success — see above).
+            // Under the feature weld a chord within the band is still a
+            // real edge, as it was for `source_degenerate`.
             degenerate: source_degenerate
                 || start_vertex_id == end_vertex_id
-                || canonical_start.sub(canonical_end).length() <= identity_tolerance,
+                || canonical_start.sub(canonical_end).length() <= record_floor,
             name: source.name,
         });
         self.edge_use_counts.insert(id, 1);
@@ -1002,7 +1455,7 @@ impl Assembler {
 /// identity tolerances from each other's curve.
 fn pieces_apart(incoming: Option<u64>, existing: Option<u64>, source: &SourceEdge, edge: &EdgeRecord, identity_tolerance: f64) -> bool {
     let (Some(a), Some(b)) = (incoming, existing) else { return false };
-    if a == b || !crate::switch!("BREP_FEATURE_SCALE_LENS", false) {
+    if a == b || !crate::switch!("BREP_FEATURE_SCALE_LENS", true) {
         return false;
     }
     let middle = |curve: &crate::NurbsCurve, t0: f64, t1: f64| curve.evaluate(0.5 * (t0 + t1)).ok();
@@ -1039,3 +1492,4 @@ fn reaches_into(curve: &crate::NurbsCurve, t0: f64, t1: f64, other: &crate::Nurb
     projection.distance <= tolerance
         && other.evaluate(projection.u.clamp(low, high)).is_ok_and(|nearest| nearest.sub(middle).length() <= tolerance)
 }
+

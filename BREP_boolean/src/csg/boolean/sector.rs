@@ -347,6 +347,26 @@ fn sample(
 /// The sector's verdict for one fragment: In or Out against the other
 /// operand, or declined with the reason.
 pub fn sector_class(context: &SectorContext<'_>, fragment: &FaceFragmentRecord) -> Result<SectorVerdict, KernelRefusal> {
+    let enabled = crate::switch!("BREP_SECTOR_PARTIAL_BOUNDARY", true);
+    let check = crate::switch!("BREP_SECTOR_PARTIAL_BOUNDARY_CHECK", false);
+    if !check {
+        return sector_class_impl(context, fragment, enabled);
+    }
+    let old = sector_class_impl(context, fragment, false);
+    let new = sector_class_impl(context, fragment, true);
+    let changed = match (&old, &new) {
+        (Ok(a), Ok(b)) => a.class != b.class || a.route != b.route,
+        (Err(_), Err(_)) => false,
+        _ => true,
+    };
+    if changed {
+        eprintln!("SECTOR_PARTIAL_BOUNDARY operand={} face={} old={old:?} new={new:?} applied={enabled}",
+            fragment.operand, fragment.source_face_id);
+    }
+    if enabled { new } else { old }
+}
+
+fn sector_class_impl(context: &SectorContext<'_>, fragment: &FaceFragmentRecord, partial_boundary: bool) -> Result<SectorVerdict, KernelRefusal> {
     let own = FaceKey { operand: fragment.operand, face_id: fragment.source_face_id };
     if context.cosurface.contains(&own) {
         return Ok(SectorVerdict::declined("cosurface", 0, 0));
@@ -382,6 +402,14 @@ pub fn sector_class(context: &SectorContext<'_>, fragment: &FaceFragmentRecord) 
         if let Ok(uv) = coedge.pcurve.evaluate((t0 + t1) * 0.5) {
             if let Ok(midpoint) = fragment.surface.evaluate(uv.x, uv.y) {
                 if context.near_boundary(other_key.operand, other, midpoint) {
+                    // This section cannot read a sector bounded by two faces.
+                    // Another section through the interior of the other face
+                    // can still classify the connected fragment. Keep those
+                    // readings, requiring agreement as below; without any
+                    // usable reading the result remains undecided.
+                    if partial_boundary {
+                        continue;
+                    }
                     return Ok(SectorVerdict::declined("on_boundary", ladder_steps, samples));
                 }
             }

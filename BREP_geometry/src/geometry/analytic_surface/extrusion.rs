@@ -75,4 +75,4 @@ pub use section::plane_extrusion_section;
 
 #[path = "extrusion/pair.rs"]
 mod pair;
-pub use pair::parallel_extrusion_sections;
+pub use pair::{parallel_extrusion_sections, certified_parallel_extrusion_sections};

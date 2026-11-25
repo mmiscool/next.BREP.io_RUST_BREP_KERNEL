@@ -76,7 +76,7 @@ pub use constraints::{
 // matrix → `{translate, rotateEulerDeg}` (intrinsic XYZ, degrees) conversion,
 // re-exported so out-of-crate ACOMP authors reuse it instead of re-deriving
 // the Euler decomposition (and its gimbal-lock branch).
-pub use mapping::transform_to_pose_params;
+pub use mapping::{pose_params_to_transform, transform_to_pose_params};
 
 /// The refusal for a `fixed` constraint (kernel ABI, app command, batch):
 /// Fixed is the component instance's own setting, never a constraint.

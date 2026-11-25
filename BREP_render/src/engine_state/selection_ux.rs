@@ -503,6 +503,8 @@ impl EngineState {
                     // A point pick resolves against the modeling scene before
                     // the feature, whose solids are in world coordinates.
                     RefSelectTarget::PointPick => super::pmi_ops::world_vertex_ref(&hit.solid, hit.position),
+                    // A mount's origin pick resolves against the same scene.
+                    RefSelectTarget::Mount { .. } => super::pmi_ops::world_vertex_ref(&hit.solid, hit.position),
                     _ => return,
                 }
             }
@@ -658,6 +660,13 @@ impl EngineState {
                 field,
                 state.names.first().map(String::as_str).unwrap_or_default(),
             );
+            self.end_ref_select(state.restore_index);
+            return;
+        }
+        // A MOUNT helper's pick becomes numbers in the `mount` block (one undo
+        // step); nothing rolled, and the shared tail re-runs.
+        if let RefSelectTarget::Mount { pick } = state.target {
+            self.mount_commit_pick(pick, state.names.first().map(String::as_str));
             self.end_ref_select(state.restore_index);
             return;
         }

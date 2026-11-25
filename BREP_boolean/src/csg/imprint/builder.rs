@@ -1,6 +1,61 @@
 use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
+/// Search another projection basin only when it can recover an on-section
+/// pierce. The sampled bracket supplies a candidate, not a global minimum
+/// certificate; the existing weld tolerance certifies the accepted residual.
+fn project_section_pierce(curve: &NurbsCurve, point: Vec3, tolerance: f64,
+    rescue: bool, check: bool) -> Result<crate::CurveProjection, String>
+{
+    let original = project_point_to_curve(curve, point)?;
+    let weld = assembler_weld(tolerance);
+    // Preserve the existing coarse pierce rejection gate, including its
+    // origin-relative scale; farther projections keep the older rescue path.
+    if !(rescue || check) || original.distance <= weld
+        || original.distance > 2e-3 * (1.0 + point.length()) {
+        return Ok(original);
+    }
+    let candidate = sampled_pierce_foot(curve, point).ok().filter(|foot| {
+        foot.distance <= weld && foot.distance < original.distance
+    });
+    if check {
+        eprintln!("pierce branch projection: original_u={} original_distance={} candidate={:?} applied={}",
+            original.u, original.distance, candidate.map(|foot| (foot.u, foot.distance)),
+            rescue && candidate.is_some());
+    }
+    Ok(if rescue { candidate.unwrap_or(original) } else { original })
+}
+
+fn sampled_pierce_foot(curve: &NurbsCurve, point: Vec3) -> Result<crate::CurveProjection, String> {
+    let [start, end] = curve.domain()?;
+    const STATIONS: usize = 512;
+    let (mut best_u, mut best) = (start, f64::INFINITY);
+    for index in 0..=STATIONS {
+        let u = start + (end - start) * index as f64 / STATIONS as f64;
+        let distance = curve.evaluate(u)?.sub(point).length_squared();
+        if distance < best { best = distance; best_u = u; }
+    }
+    let step = (end - start) / STATIONS as f64;
+    let (mut low, mut high) = ((best_u - step).max(start), (best_u + step).min(end));
+    for _ in 0..64 {
+        let (a, b) = (low + (high - low) / 3.0, high - (high - low) / 3.0);
+        if curve.evaluate(a)?.sub(point).length_squared() < curve.evaluate(b)?.sub(point).length_squared() {
+            high = b;
+        } else { low = a; }
+    }
+    let u = 0.5 * (low + high);
+    let foot = curve.evaluate(u)?;
+    Ok(crate::CurveProjection { u, point: foot, distance: foot.sub(point).length() })
+}
+
+fn distinct_projected_pierces(a: crate::CurveProjection, b: crate::CurveProjection,
+    apart: f64, on_section: f64, overlap: f64) -> bool
+{
+    a.distance <= on_section && b.distance <= on_section && apart > overlap
+        && a.point.sub(b.point).length() >= 0.5 * apart
+}
+
+
 /// Record one split parameter on `edge`, honouring the near-endpoint guard
 /// and the dedupe band.  Two split points closer than the assembler's weld
 /// tolerance can never survive as distinct vertices — they weld at assembly
@@ -143,8 +198,16 @@ fn section_lies_in_plane(curve: &NurbsCurve, first: TaggedFace<'_>, second: Tagg
     })
 }
 
+/// Replay-only endpoint incidence; empty during original pair traversal.
+#[derive(Clone, Default)]
+pub(super) struct SectionEndEvidence {
+    free_march_ends: HashSet<(u64, u64)>,
+    section_ends: Vec<(u64, Vec3)>,
+}
+
 fn section_endpoint_parameters<'p>(curve: &NurbsCurve, supports: [FaceKey; 2],
-    pieces: impl Iterator<Item = &'p ImprintPieceRecord>, tolerance: f64) -> Result<Vec<f64>, KernelRefusal>
+    pieces: impl Iterator<Item = &'p ImprintPieceRecord>, tolerance: f64,
+    evidence: &SectionEndEvidence) -> Result<Vec<f64>, KernelRefusal>
 {
     let [start, end] = curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
     let start_point = curve.evaluate(start).or_refuse(KernelStage::Intersect, "evaluate")?;
@@ -154,11 +217,31 @@ fn section_endpoint_parameters<'p>(curve: &NurbsCurve, supports: [FaceKey; 2],
         if piece.start_vertex_id == piece.end_vertex_id || piece.shared_edge.is_some()
             || piece.curve.degree != 1 || piece.curve.control_points.len() != 2
             || piece.support_faces.iter().filter(|face| supports.contains(face)).count() != 1 { continue; }
-        for parameter in [piece.t0, piece.t1] {
+        for (parameter, vertex) in [(piece.t0, piece.start_vertex_id), (piece.t1, piece.end_vertex_id)] {
             let Ok(point) = piece.curve.evaluate(parameter) else { continue };
             let Ok(foot) = project_point_to_curve(curve, point) else { continue };
             if foot.distance <= tolerance && foot.distance.is_finite() && foot.u > start && foot.u < end
                 && point.sub(start_point).length() > tolerance && point.sub(end_point).length() > tolerance {
+                // A free march stop on a shared straight interval is not an
+                // isolated junction. Keep boundary anchors and endpoints met
+                // by another section; those can genuinely terminate the overlap.
+                let unanchored_overlap = evidence.free_march_ends.contains(&(piece.id, vertex))
+                    && curve.degree == 1 && curve.control_points.len() == 2
+                    && end_point.sub(start_point).normalized().is_ok_and(|direction| {
+                        [piece.t0, piece.t1].into_iter().all(|t| piece.curve.evaluate(t).is_ok_and(|p| {
+                            p.sub(start_point).cross(direction).length() <= tolerance
+                        }))
+                    })
+                    && !evidence.section_ends.iter().any(|(id, other)| {
+                        *id != piece.id && other.sub(point).length() <= tolerance
+                    });
+                if unanchored_overlap {
+                    let reject = switch!("BREP_PLANAR_SECTION_FREE_OVERLAP_GUARD", true);
+                    if switch!("BREP_PLANAR_SECTION_END_DISCOVERY_CHECK", false) {
+                        eprintln!("planar local discovery: free overlap end piece={} vertex={} pair={supports:?} rejected={reject}", piece.id, vertex);
+                    }
+                    if reject { continue; }
+                }
                 parameters.push(foot.u);
             }
         }
@@ -215,9 +298,16 @@ pub(super) struct ImprintBuilder<'a> {
     pub(super) pieces: Vec<ImprintPieceRecord>,
     /// Accepted straight sections from the discovery pass, before junction merging.
     pub(super) section_end_seeds: Vec<ImprintPieceRecord>,
+    pub(super) section_end_evidence: SectionEndEvidence,
     pub(super) record_planar_sections: bool,
     pub(super) planar_sections: Vec<PlanarSectionReplay>,
     pub(super) marched_section: bool,
+    /// `BREP_MARCH_RIDES_EXCHANGED_SPAN`: while a marched run of a pair is
+    /// processed, the pieces that pair's lies-on exchange minted (curve and
+    /// range), and the switch's mode; a sub-piece lying along one is that piece
+    /// again and is not minted (`check` reports it and mints it).
+    pub(super) exchanged_rides: Vec<(NurbsCurve, f64, f64)>,
+    pub(super) exchanged_rides_mode: crate::env_read::Mode,
     pub(super) by_face: HashMap<FaceKey, Vec<u64>>,
     pub(super) edge_splits: HashMap<(u8, u64), Vec<f64>>,
     pub(super) barrier_edges: HashSet<(u8, u64)>,
@@ -723,13 +813,28 @@ impl<'a> ImprintBuilder<'a> {
             piece.start_vertex_id != piece.end_vertex_id && piece.shared_edge.is_none()
                 && piece.curve.degree == 1 && piece.curve.control_points.len() == 2
         }).cloned().collect();
+        // Keep incidence fixed while individual sections are replaced: a
+        // replay must not certify the endpoint of a later replay's witness.
+        let vertices: HashMap<_, _> = self.vertices.iter().map(|vertex| (vertex.id, vertex.point)).collect();
+        self.section_end_evidence = SectionEndEvidence::default();
+        for piece in &self.pieces {
+            for vertex in [piece.start_vertex_id, piece.end_vertex_id] {
+                if let Some(point) = vertices.get(&vertex) {
+                    self.section_end_evidence.section_ends.push((piece.id, *point));
+                }
+                if self.marched_pieces.contains(&piece.id)
+                    && self.vertex_sources.get(&vertex) == Some(&JunctionSource::FacePoint) {
+                    self.section_end_evidence.free_march_ends.insert((piece.id, vertex));
+                }
+            }
+        }
         let resolve = |key: FaceKey| faces.iter().copied().find(|face| face.key() == key)
             .expect("recorded section carrier remains available");
         let mut replayed = 0;
         let recorded = records.len();
         for record in records {
             let candidates = section_endpoint_parameters(&record.curve, record.supports,
-                self.section_end_seeds.iter(), self.tolerance)?;
+                self.section_end_seeds.iter(), self.tolerance, &self.section_end_evidence)?;
             let missing = missing_section_parameters(&record.curve, &record.accepted, candidates, self.tolerance)?;
             if missing.is_empty() { continue; }
             if check {
@@ -764,6 +869,7 @@ impl<'a> ImprintBuilder<'a> {
             eprintln!("planar local discovery: recorded={recorded} replayed={replayed} witnesses={}", self.section_end_seeds.len());
         }
         self.section_end_seeds.clear();
+        self.section_end_evidence = SectionEndEvidence::default();
         Ok(())
     }
 
@@ -823,7 +929,7 @@ impl<'a> ImprintBuilder<'a> {
                 let supports = [first.key(), second.key()];
                 let parameters = section_endpoint_parameters(&curve, supports,
                     self.pieces.iter().filter(|_| self.section_end_seeds.is_empty())
-                        .chain(self.section_end_seeds.iter()), self.tolerance)?;
+                        .chain(self.section_end_seeds.iter()), self.tolerance, &self.section_end_evidence)?;
                 if seed_section_ends {
                     if self.section_end_seeds.is_empty() { split_parameters.extend(parameters); }
                     else { discovered_end_parameters.extend(parameters); }
@@ -1265,12 +1371,17 @@ impl<'a> ImprintBuilder<'a> {
                     // reading is the one the projector returned. Escape
                     // hatch BREP_PIERCE_PROJECTION_CACHE=0.
                     let cache_projections = pierce_projection_cache_enabled();
+                    let rescue_branch = switch!("BREP_PIERCE_BRANCH_PROJECTION", false);
+                    let check_branch = switch!("BREP_PIERCE_BRANCH_PROJECTION_CHECK", false);
+                    let pierce_tolerance = self.tolerance;
                     let mut raw_projections: Vec<Option<crate::CurveProjection>> = vec![None; pierces.len()];
                     let mut project_pierce = |index: usize| -> Result<crate::CurveProjection, KernelRefusal> {
                         if let Some(projection) = raw_projections[index] {
                             return Ok(projection);
                         }
-                        let projection = project_point_to_curve(&curve, pierces[index].point).or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
+                        let projection = project_section_pierce(&curve, pierces[index].point,
+                            pierce_tolerance, rescue_branch, check_branch)
+                            .or_refuse(KernelStage::Intersect, "project_point_to_curve")?;
                         if cache_projections {
                             raw_projections[index] = Some(projection);
                         }
@@ -1371,10 +1482,8 @@ impl<'a> ImprintBuilder<'a> {
                             }
                             let other_projection = project_pierce(other_index)?;
                             if distinct_pierces_on_section
-                                && projection.distance <= on_section
-                                && other_projection.distance <= on_section
-                                && apart > overlap_limit
-                                && projection.point.sub(other_projection.point).length() >= 0.5 * apart
+                                && distinct_projected_pierces(projection, other_projection,
+                                    apart, on_section, overlap_limit)
                             {
                                 continue;
                             }
@@ -1816,6 +1925,31 @@ impl<'a> ImprintBuilder<'a> {
                     );
                 }
                 continue;
+            }
+            if self.exchanged_rides_mode != crate::env_read::Mode::Off
+                && !self.exchanged_rides.is_empty()
+            {
+                if let Some(worst) = piece_rides_exchanged(&piece, t0, t1, &self.exchanged_rides, assembler_weld(self.tolerance))? {
+                    if self.exchanged_rides_mode == crate::env_read::Mode::Check {
+                        eprintln!(
+                            "MARCH_RIDES_EXCHANGED_SPAN: pair {}x{}: a marched piece of length {:.4e} at ({:.6},{:.6},{:.6}) lies along an exchanged piece within {worst:.3e}; the switch does not mint it",
+                            first.face.id,
+                            second.face.id,
+                            curve_length_rough(&piece)?,
+                            midpoint.x, midpoint.y, midpoint.z
+                        );
+                    } else {
+                        if debug_process {
+                            eprintln!(
+                                "process_curve[{:?}/{:?}]: sub-seg SKIP rides an exchanged piece within {worst:.3e} mid=({:.5},{:.5},{:.5})",
+                                first.key(),
+                                second.key(),
+                                midpoint.x, midpoint.y, midpoint.z
+                            );
+                        }
+                        continue;
+                    }
+                }
             }
             let mut start = self.polish_endpoint(
                 piece.evaluate(t0).or_refuse(KernelStage::Intersect, "evaluate")?,

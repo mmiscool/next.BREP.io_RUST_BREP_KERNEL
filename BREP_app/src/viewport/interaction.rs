@@ -219,6 +219,9 @@ impl Viewport {
             // PAINTED, not laid out — they must never take a press from the
             // gizmo underneath them (see the function's own note).
             Self::draw_transform_axis_labels(&ctx, rect, state);
+            // The open part's MOUNT FRAME: the footprint's axes and seating
+            // outline in the model's coordinates. Painted, never hit-tested.
+            Self::draw_mount_frame(&ctx, rect, state);
             // The gizmo's own READOUT: what the drag is worth, and — when the
             // motion refused — why, said at the gizmo rather than in a dock on
             // the far side of the window. Also the Transform Face PIVOT marker,

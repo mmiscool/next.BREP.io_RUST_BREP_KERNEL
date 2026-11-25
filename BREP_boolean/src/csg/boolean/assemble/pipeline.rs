@@ -168,6 +168,7 @@ fn assemble_fragments_impl(
         next_face_id: 1,
         edge_by_boundary_key: HashMap::default(),
         edge_tangent_side: HashMap::default(),
+        feature: super::builder::FeatureWeld::from_switch(),
         cellular: declared_kind == crate::BodyKind::Cellular,
     };
     let mut faces = Vec::new();
@@ -196,7 +197,17 @@ fn assemble_fragments_impl(
     // that read the result's orientation in place of its volume.
     let sign_chords = sign_chords_mode();
     let mut aims: Vec<(u64, Vec3, Option<Vec3>)> = Vec::new();
-    for fragment in selected {
+    // `BREP_ASSEMBLY_FEATURE_WELD`: a source shorter than the band is a
+    // feature only when another fragment carries a short source on the same
+    // two ends, so both faces sharing it read it alike whatever kind each sees
+    // (imprint piece on one, an operand edge's sub-span on the other); a short
+    // source with no such mate is fitting noise and keeps the band reading.
+    let short_mated = if assembler.feature.mode != super::builder::FeatureWeldMode::Off {
+        super::builder::short_source_mates(&selected, &index, tolerance.max(1e-7))?
+    } else {
+        HashSet::default()
+    };
+    for (fragment_index, fragment) in selected.into_iter().enumerate() {
         let dbg_operand = fragment.operand;
         let dbg_face = fragment.source_face_id;
         if sign_chords != crate::env_read::Mode::Off {
@@ -213,10 +224,30 @@ fn assemble_fragments_impl(
             origins.push((assembler.next_face_id, fragment.operand, true));
         }
         let mut loops = Vec::new();
-        for fragment_loop in fragment.loops {
+        assembler.feature.fragment = Some((fragment.operand, fragment.source_face_id));
+        let feature_band = assembler.tolerance.max(1e-7);
+        for (loop_index, fragment_loop) in fragment.loops.into_iter().enumerate() {
             let mut coedges = Vec::new();
-            for usage in fragment_loop.coedges {
-                let mut source = source_edge(&usage.source, &index)?;
+            // `BREP_ASSEMBLY_FEATURE_WELD`: every source of the loop is read
+            // first, so each end's radius knows both edges that meet there.
+            let mut sources = fragment_loop
+                .coedges
+                .iter()
+                .map(|usage| source_edge(&usage.source, &index).map(|source| (source, usage.forward)))
+                .collect::<Result<Vec<_>, KernelRefusal>>()?;
+            if assembler.feature.mode != super::builder::FeatureWeldMode::Off {
+                for (coedge_index, (source, _)) in sources.iter_mut().enumerate() {
+                    if source.start.sub(source.end).length() <= feature_band {
+                        source.distinct_ends = !source.degenerate
+                            && short_mated.contains(&(fragment_index, (loop_index, coedge_index)));
+                    }
+                }
+                let radii = super::builder::loop_feature_radii(&sources, feature_band);
+                for ((source, _), radius) in sources.iter_mut().zip(radii) {
+                    source.feature_radius = Some(radius);
+                }
+            }
+            for (usage, (mut source, _)) in fragment_loop.coedges.into_iter().zip(sources) {
                 if let crate::fragment::FragmentEdgeSource::Imprint { piece_id } = &usage.source {
                     if tangent_pieces.contains(piece_id) {
                         source.tangent_side = tangent_material_side(
@@ -300,6 +331,14 @@ fn assemble_fragments_impl(
             name,
         });
         assembler.next_face_id += 1;
+    }
+    if assembler.feature.differences > 0 {
+        eprintln!(
+            "FEATURE_WELD check: {} decision(s) differ in this assembly ({} edges, {} vertices)",
+            assembler.feature.differences,
+            assembler.edges.len(),
+            assembler.vertices.len()
+        );
     }
     if profile {
         profile_line!(

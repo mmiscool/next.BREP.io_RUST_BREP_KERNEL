@@ -167,6 +167,100 @@ fn pinched(polygon: &[[f64; 2]], domain: [f64; 4]) -> bool {
     false
 }
 
+/// Whether every triangle lies within `bar` of the surface and turns with it: the surface's normal
+/// at each corner on the triangle's side, and its three edge middles and its centroid within `bar`
+/// of the surface (their distance to it, by projection). On a ruled wall between rims of unequal
+/// radii (a cone), a triangle between two rulings lies in their plane and so on the surface but for
+/// the rims' own sag, though the surface's point at its parameter middle lies far from its chord:
+/// distance to the surface, not to that point, is the reading.
+fn band_within(face: &FaceRecord, vertices: &[FaceVertex], triangles: &[[usize; 3]], domain: [f64; 4], bar: f64)
+    -> Result<bool, String> {
+    let normals: Vec<Vec3> = vertices.iter().map(|v| face_normal_at(face, v.uv, domain)).collect::<Result<_, _>>()?;
+    let sense = if face.same_sense { 1.0 } else { -1.0 };
+    for &[a, b, c] in triangles {
+        let (pa, pb, pc) = (vertices[a].position, vertices[b].position, vertices[c].position);
+        let geometric = pb.sub(pa).cross(pc.sub(pa));
+        if [a, b, c].iter().any(|&i| geometric.dot(normals[i]) * sense <= 0.0) {
+            return Ok(false);
+        }
+        let centroid = pa.add(pb).add(pc).scale(1.0 / 3.0);
+        for q in [pa.add(pb).scale(0.5), pb.add(pc).scale(0.5), pc.add(pa).scale(0.5), centroid] {
+            if crate::project_point_to_surface(&face.surface, q)?.distance > bar {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Split every interior edge (one not on the boundary, whose vertices are the first `boundary`)
+/// that sags past `bar` at its middle, the new vertex on the surface at the edge's middle in the
+/// chart, its two triangles made four; repeated while any interior edge sags past the bar, up to
+/// half as many triangles again. Boundary edges are never split: they are the shared edges' samples.
+fn split_sagging_diagonals(face: &FaceRecord, vertices: &mut Vec<FaceVertex>, triangles: &mut Vec<[usize; 3]>,
+    boundary: usize, bar: f64) -> Result<(), String> {
+    let cap = triangles.len() + triangles.len() / 2;
+    let on_boundary = |i: usize, j: usize| {
+        i < boundary && j < boundary && ((i + 1) % boundary == j || (j + 1) % boundary == i)
+    };
+    for _round in 0..64 {
+        // Edge -> the triangles holding it.
+        let mut holders: std::collections::HashMap<(usize, usize), Vec<usize>> = std::collections::HashMap::new();
+        for (index, t) in triangles.iter().enumerate() {
+            for (i, j) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                holders.entry((i.min(j), i.max(j))).or_default().push(index);
+            }
+        }
+        // Sagging interior edges, each taken only when none of its triangles is taken already.
+        let mut taken = vec![false; triangles.len()];
+        let mut splits: Vec<((usize, usize), usize)> = Vec::new();
+        let mut keys: Vec<&(usize, usize)> = holders.keys().collect();
+        keys.sort_unstable();
+        for &&(i, j) in &keys {
+            if on_boundary(i, j) || holders[&(i, j)].iter().any(|&t| taken[t]) {
+                continue;
+            }
+            let mid = [0.5 * (vertices[i].uv[0] + vertices[j].uv[0]), 0.5 * (vertices[i].uv[1] + vertices[j].uv[1])];
+            let p = face.surface.evaluate(mid[0], mid[1])?;
+            let middle = vertices[i].position.add(vertices[j].position).scale(0.5);
+            if crate::project_point_to_surface(&face.surface, middle)?.distance > bar {
+                for &t in &holders[&(i, j)] {
+                    taken[t] = true;
+                }
+                let m = vertices.len();
+                vertices.push(FaceVertex { uv: mid, position: p });
+                splits.push(((i, j), m));
+            }
+        }
+        if splits.is_empty() {
+            return Ok(());
+        }
+        if triangles.len() + 2 * splits.len() > cap {
+            return Ok(());
+        }
+        let mut at: std::collections::HashMap<usize, ((usize, usize), usize)> = std::collections::HashMap::new();
+        for &(edge, m) in &splits {
+            for &t in &holders[&edge] {
+                at.insert(t, (edge, m));
+            }
+        }
+        let mut next = Vec::with_capacity(triangles.len() + 2 * splits.len());
+        for (index, &t) in triangles.iter().enumerate() {
+            let Some(&((i, j), m)) = at.get(&index) else {
+                next.push(t);
+                continue;
+            };
+            // the triangle holding the edge i-j (either way round) becomes two, at m
+            let k = (0..3).find(|&k| (t[k] == i && t[(k + 1) % 3] == j) || (t[k] == j && t[(k + 1) % 3] == i)).unwrap_or(0);
+            let (a, b, c) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
+            next.push([a, m, c]);
+            next.push([m, b, c]);
+        }
+        *triangles = next;
+    }
+    Ok(())
+}
+
 fn decline(face_id: u32, why: &str) -> Result<bool, String> {
     if std::env::var("BREP_DEBUG_TESS_DISPATCH").is_ok() {
         eprintln!("[ruled-band] face {face_id}: declined: {why}");
@@ -185,7 +279,7 @@ pub(super) fn tessellate_ruled_band(
     mesh: &mut Mesh,
 ) -> Result<bool, String> {
     let _ = closed_u; // a partial wall (cut short by a boolean) is as monotone as a whole one
-    if !ruled_band_enabled()
+    if !(ruled_band_enabled() || ruled_band_forced())
         || !matches!(face.surface.analytic(), Some(crate::AnalyticSurface::RuledRevolution { .. }))
         || polygon.len() < 4
     {
@@ -239,12 +333,17 @@ pub(super) fn tessellate_ruled_band(
         return decline(face_id, &format!("rim sag {rim_sag:.3e} past twice the chord"));
     }
     let bar = chord_tolerance.max(rim_sag);
-    // Every vertex is a boundary station: the check reads the triangles alone.
-    if !matches!(within_tolerance(face, &ccw, &triangles, ccw.len(), domain, bar)?, GridCheck::Passed) {
-        return decline(face_id, "a triangle misses the chord or the normal-turn bar");
+    // A diagonal between the two chains may span a little more of u than any rim segment (their
+    // stations interleave) and so sag a little more: such diagonals are split at their middle.
+    let boundary = ccw.len();
+    let (mut vertices, mut triangles) = (ccw.clone(), triangles);
+    split_sagging_diagonals(face, &mut vertices, &mut triangles, boundary, bar)?;
+    if !band_within(face, &vertices, &triangles, domain, bar)? {
+        return decline(face_id, "a triangle leaves the surface by more than the chord, or turns against it");
     }
+    let ccw = vertices;
     if std::env::var("BREP_DEBUG_TESS_DISPATCH").is_ok() {
-        eprintln!("[ruled-band] face {face_id}: {} triangles, sharpest corner {sharpest:.2} degrees, crowding {crowding:.1e}", triangles.len());
+        eprintln!("[ruled-band] face {face_id}: {} triangles ({} added stations), sharpest corner {sharpest:.2} degrees, crowding {crowding:.1e}", triangles.len(), ccw.len() - boundary);
     }
     let base = (mesh.positions.len() / 3) as u32;
     for vertex in &ccw {

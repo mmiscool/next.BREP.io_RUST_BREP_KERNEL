@@ -1483,6 +1483,9 @@ pub const PADS: &str = brep_kernel::PADS_BLOCK;
 /// The part's declared connection points (`ports.rs`) — data, not history,
 /// and a sibling of `symbol` and `pads`.
 pub const PORTS: &str = brep_kernel::PORTS_BLOCK;
+/// The part's mount frame (`brep_kernel` `part_mount`): how it sits on its
+/// footprint, applied to every instance. Never written as identity.
+pub const MOUNT: &str = brep_kernel::MOUNT_BLOCK;
 
 impl History {
     /// The document's `diagram` block, if any.
@@ -1503,6 +1506,18 @@ impl History {
     /// The document's `pads` block, if any.
     pub fn pads_block(&self) -> Option<&Value> {
         self.document().get(PADS)
+    }
+
+    /// The document's `mount` block (its mount frame), if any.
+    pub fn mount_block(&self) -> Option<&Value> {
+        self.document().get(MOUNT).filter(|block| !block.is_null())
+    }
+
+    /// Replace (or, with `None`, remove) the `mount` block as one undoable
+    /// USER edit. The caller passes `None` for identity
+    /// (`brep_kernel::mount_block_of`), so an identity mount leaves no key.
+    pub fn set_mount_block(&mut self, block: Option<Value>, coalesce_key: Option<&str>) {
+        self.set_ecad_block(MOUNT, block, coalesce_key);
     }
 
     /// The document's `ports` block (its declared connection points), if any.

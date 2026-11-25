@@ -942,11 +942,11 @@ fn intersect_curves_general(
 /// The general search past its seeding: a Newton run from each `[s, t]`
 /// seed (a Gauss–Newton retry for those that fail), then the gap filter, the
 /// duplicate guard and the tangency reading, sorted by `s`.
-/// `BREP_EXACT_CONIC_GRAZE_SEEDS` (default off, `=1` on): an exact-lane seed
+/// `BREP_EXACT_CONIC_GRAZE_SEEDS` (default on, `=0` off): an exact-lane seed
 /// matching no hit is let pass by [`closest_approach_apart`] instead of
 /// declining the lane.
 fn graze_seeds_enabled() -> bool {
-    crate::switch!("BREP_EXACT_CONIC_GRAZE_SEEDS", false)
+    crate::switch!("BREP_EXACT_CONIC_GRAZE_SEEDS", true)
 }
 
 /// Whether Newton from the seed `(s, t)` (with curvature terms, then

@@ -61,6 +61,9 @@ pub mod wire_harness;
 /// decision 8): the pin/port report, following an edit from one side to the
 /// other, and resolving a placed part's pin to its port id (see `part_pins.rs`).
 pub mod part_pins;
+/// A part's mount frame: how it sits on its footprint, applied to every
+/// instance (see `part_mount.rs`).
+pub mod part_mount;
 pub mod pmi;
 pub mod ports;
 pub use features::import3d::imported_solid_names;

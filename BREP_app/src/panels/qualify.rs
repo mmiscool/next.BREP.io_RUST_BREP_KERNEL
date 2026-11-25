@@ -62,7 +62,7 @@ use serde_json::Value;
 use crate::automation::hit_keys::HitKeyDoc;
 use crate::workbench::ecad::{Editors, Target};
 use brep_render::brep_kernel::{self, PinPointReport, PortDeclaration};
-use brep_render::engine_state::{EngineState, PortRefField};
+use brep_render::engine_state::{EngineState, MountPick, PortRefField};
 
 /// The row glyphs, every one catalogued artwork (`assets/glyphs`) drawn by
 /// [`crate::icon_text`] — this app ships no icon font, so an uncatalogued
@@ -115,6 +115,74 @@ enum Edit {
     RemovePoint(usize, usize),
 }
 
+/// What the mount section asked for.
+#[derive(Clone, Debug, PartialEq)]
+enum MountEdit {
+    /// A whole pose, `[translate, rotateEulerDeg]`, from one field's change;
+    /// the field names the undo step a drag coalesces into.
+    Pose([f64; 3], [f64; 3], String),
+    /// +90° about x composed onto the current mount.
+    YUpToZUp,
+    Reset,
+    /// Enter the picker for a helper: origin to a picked point, or seat on a
+    /// picked face. The pick itself is written when the picker finishes.
+    Pick(MountPick),
+    /// Align to footprint: refit the mount from the seated pins onto their
+    /// pads (`brep_kernel::mount_aligned_to_footprint`), with the leftover.
+    Align,
+}
+
+/// What the last Align to footprint did, for the line under its button and
+/// the verifier global. It is shown while the mount is still the one it wrote.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+struct AlignOutcome {
+    /// The mount block as Align left it.
+    written: Option<Value>,
+    /// The largest and the RMS pin-to-pad distance (mm) and the pin with the
+    /// largest, when the fit ran.
+    largest: Option<f64>,
+    rms: Option<f64>,
+    worst: Option<String>,
+    pins: usize,
+    notes: Vec<String>,
+    /// Why Align refused, when it did. Nothing was written then.
+    error: Option<String>,
+}
+
+/// Write a mount edit as one undoable step. An identity result removes the
+/// block (`brep_kernel::mount_block_of`), so a part brought back to identity
+/// re-serializes as it was before it had a mount.
+fn apply_mount(engine: &mut EngineState, edit: MountEdit) {
+    if let MountEdit::Pick(pick) = edit {
+        engine.begin_ref_select_for_mount(pick);
+        return;
+    }
+    let current = engine
+        .history
+        .mount_block()
+        .and_then(|block| brep_kernel::mount_from_block(block).ok());
+    let (mount, coalesce) = match edit {
+        MountEdit::Reset | MountEdit::Pick(_) | MountEdit::Align => (None, None),
+        MountEdit::Pose(translate, rotate, field) => {
+            let pose = serde_json::json!({ "translate": translate, "rotateEulerDeg": rotate });
+            (brep_kernel::mount_from_block(&pose).ok(), Some(format!("field:{field}")))
+        }
+        MountEdit::YUpToZUp => {
+            let turn = brep_kernel::mount_from_block(&serde_json::json!({ "rotateEulerDeg": [90.0, 0.0, 0.0] }));
+            let composed = turn.and_then(|turn| match current {
+                Some(current) => turn.compose(&current),
+                None => Ok(turn),
+            });
+            (composed.ok(), None)
+        }
+    };
+    let block = mount.as_ref().and_then(brep_kernel::mount_block_of);
+    if block.as_ref() == engine.history.mount_block() {
+        return;
+    }
+    engine.history.set_mount_block(block, coalesce.as_deref());
+}
+
 /// Where a jump goes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Jump {
@@ -145,6 +213,10 @@ pub struct QualifyPanel {
     /// history revision it was read at: it cuts meshes, so not once a frame.
     pin_seats: Vec<super::pin_seats::PinSeat>,
     pin_seats_at: Option<(u64, u64)>,
+    /// The part's `mount` block as of the same run, for the verifier global.
+    mount: Option<Value>,
+    /// The last Align to footprint.
+    align: Option<AlignOutcome>,
 }
 
 impl Default for QualifyPanel {
@@ -155,7 +227,7 @@ impl Default for QualifyPanel {
 
 impl QualifyPanel {
     pub fn new() -> Self {
-        Self { hits: HashMap::new(), selected: None, adopted: None, gizmo_armed_for: None, pin_seats: Vec::new(), pin_seats_at: None }
+        Self { hits: HashMap::new(), selected: None, adopted: None, gizmo_armed_for: None, pin_seats: Vec::new(), pin_seats_at: None, mount: None, align: None }
     }
 
     pub fn hits_json(&self) -> String {
@@ -175,6 +247,8 @@ impl QualifyPanel {
             "selected": self.selected,
             "gizmoArmedFor": self.gizmo_armed_for,
             "pinSeats": self.pin_seats,
+            "mount": self.mount,
+            "align": self.align,
         })
         .to_string()
     }
@@ -201,6 +275,7 @@ impl QualifyPanel {
         let at = (engine.applied_generation(), engine.history.revision());
         if self.pin_seats_at != Some(at) {
             self.pin_seats = super::pin_seats::pin_seats(engine);
+            self.mount = engine.history.mount_block().cloned();
             self.pin_seats_at = Some(at);
         }
 
@@ -303,6 +378,9 @@ impl QualifyPanel {
                 });
         }
 
+        // --- the mount frame --------------------------------------------------
+        let mount_edit = self.mount_section(ui, engine, target.is_none());
+
         // --- the reports ------------------------------------------------------
         ui.add_space(4.0);
         self.reports(ui, engine);
@@ -322,6 +400,11 @@ impl QualifyPanel {
         }
         if let Some(jump) = jump {
             self.jump(engine, ecad, jump);
+        }
+        match mount_edit {
+            Some(MountEdit::Align) => self.align_mount(engine),
+            Some(mount_edit) => apply_mount(engine, mount_edit),
+            None => {}
         }
         // Last, so it follows whatever the frame just did to the selection.
         self.follow_gizmo(engine, target);
@@ -767,6 +850,156 @@ impl QualifyPanel {
     }
 
     /// A section heading inside the selected point's fields.
+    /// The part's MOUNT FRAME on the board (`brep_kernel::part_mount`): how
+    /// the whole part, every solid with its seats, is moved into its
+    /// footprint's frame wherever it is placed. Its own features are not
+    /// touched, so this editor still shows the model as built. Offered on a
+    /// part with pads, where there is a footprint to sit on.
+    fn mount_section(&mut self, ui: &mut egui::Ui, engine: &EngineState, pickable: bool) -> Option<MountEdit> {
+        if engine.history.pads_block().is_none() {
+            return None;
+        }
+        let mut asked = None;
+        ui.add_space(4.0);
+        egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+            let room = (ui.clip_rect().right() - ui.max_rect().left()).max(0.0);
+            ui.set_width(ui.available_width().min(room));
+            self.section(ui, "Mount on board");
+            let block = engine.history.mount_block();
+            let pose = match block.map(brep_kernel::mount_from_block).transpose() {
+                Ok(mount) => mount.map(|mount| brep_kernel::transform_to_pose_params(&mount)),
+                Err(error) => {
+                    let line = ui.label(
+                        egui::RichText::new(format!("The mount block does not read as a pose ({error}), so no pin is checked. Reset it.")).color(WARN_COLOR).small(),
+                    );
+                    self.hits.insert("qualify:mount:status".into(), line.rect);
+                    None
+                }
+            };
+            let triple = |key: &str| -> [f64; 3] {
+                let values = pose.as_ref().and_then(|pose| pose[key].as_array().cloned()).unwrap_or_default();
+                [0, 1, 2].map(|k| values.get(k).and_then(Value::as_f64).unwrap_or(0.0))
+            };
+            let status = if block.is_none() {
+                "The model is in its footprint's frame: top copper at z = 0, the footprint origin at 0, 0."
+            } else {
+                "Every solid of the part, with its seats, is moved by this onto its footprint wherever the part is placed. The features are not changed."
+            };
+            if block.is_none() || pose.is_some() {
+                let line = ui.label(egui::RichText::new(status).weak().small());
+                self.hits.insert("qualify:mount:status".into(), line.rect);
+            }
+            for (key, caption, speed, hover) in [
+                ("translate", "Move", 0.05, "Where the model's origin goes on the footprint, in millimetres (y up, top copper at z = 0)."),
+                ("rotateEulerDeg", "Turn", 1.0, "How the model is turned onto the footprint, in degrees about x, then y, then z."),
+            ] {
+                let values = triple(key);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(caption).weak());
+                    for (axis, value) in values.iter().enumerate() {
+                        let mut edited = *value;
+                        let field = ui.add(egui::DragValue::new(&mut edited).speed(speed).max_decimals(4)).on_hover_text(hover);
+                        self.hits.insert(format!("qualify:mount:{key}{axis}"), field.rect);
+                        if field.changed() && edited.is_finite() {
+                            let mut translate = triple("translate");
+                            let mut rotate = triple("rotateEulerDeg");
+                            match key {
+                                "translate" => translate[axis] = edited,
+                                _ => rotate[axis] = edited,
+                            }
+                            asked = Some(MountEdit::Pose(translate, rotate, format!("{key}{axis}")));
+                        }
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                let up = ui
+                    .add(crate::icon_text::icon_button(ui, "Y up \u{2192} Z up").small())
+                    .on_hover_text("Turn the model +90° about x: for a model built with y up, where a board's up is z");
+                self.hits.insert("qualify:mount:y_up".into(), up.rect);
+                if up.clicked() {
+                    asked = Some(MountEdit::YUpToZUp);
+                }
+                let reset = ui
+                    .add_enabled(block.is_some(), crate::icon_text::icon_button(ui, "Reset").small())
+                    .on_hover_text("Clear the mount: the model is placed as it is built");
+                self.hits.insert("qualify:mount:reset".into(), reset.rect);
+                if reset.clicked() {
+                    asked = Some(MountEdit::Reset);
+                }
+            });
+            // The picks are offered only where there is a model to pick IN.
+            ui.horizontal(|ui| {
+                for (key, caption, hover, pick) in [
+                    ("seat", "Seat on face", "Pick the face the part sits on (lead undersides, a standoff, the body's underside): it is turned to face down and moved to the board's top, z = 0", MountPick::Seat),
+                    ("origin", "Origin to point", "Pick the point that goes on the footprint origin (a pin's centre, a corner): the part moves in the board's plane, and its height stays", MountPick::Origin),
+                ] {
+                    let button = ui
+                        .add_enabled(pickable, crate::icon_text::icon_button(ui, &format!("{GLYPH_PICK} {caption}")).small())
+                        .on_hover_text(hover)
+                        .on_disabled_hover_text("Go to the 3D model to pick geometry");
+                    self.hits.insert(format!("qualify:mount:{key}"), button.rect);
+                    if button.clicked() {
+                        asked = Some(MountEdit::Pick(pick));
+                    }
+                }
+            });
+            let align = ui
+                .add(crate::icon_text::icon_button(ui, "Align to footprint").small())
+                .on_hover_text("Fit the part onto its pads as one rigid move: the seating plane from the pins' wires (or the plane already set), then the pins matched to their pads by number. The leftover is shown below");
+            self.hits.insert("qualify:mount:align".into(), align.rect);
+            if align.clicked() {
+                asked = Some(MountEdit::Align);
+            }
+            if let Some(outcome) = self.align.clone().filter(|outcome| outcome.written.as_ref() == block) {
+                let mut lines = Vec::new();
+                match (&outcome.error, outcome.largest, outcome.rms) {
+                    (Some(error), _, _) => lines.push((format!("Align refused: {error}."), true)),
+                    (None, Some(largest), Some(rms)) => lines.push((
+                        format!(
+                            "Aligned {} pins: largest {largest:.3} mm (pin {}), RMS {rms:.3} mm.",
+                            outcome.pins,
+                            outcome.worst.as_deref().unwrap_or("?")
+                        ),
+                        false,
+                    )),
+                    _ => {}
+                }
+                lines.extend(outcome.notes.iter().map(|note| (format!("Note: {note}."), true)));
+                for (i, (text, warn)) in lines.into_iter().enumerate() {
+                    let text = egui::RichText::new(text).small();
+                    let line = ui.label(if warn { text.color(WARN_COLOR) } else { text.weak() });
+                    self.hits.insert(format!("qualify:mount:align_report:{i}"), line.rect);
+                }
+            }
+        });
+        asked
+    }
+
+    /// Align to footprint, written as one undo step; the outcome is kept for
+    /// the line under the button. A refusal writes nothing.
+    fn align_mount(&mut self, engine: &mut EngineState) {
+        let outcome = match super::pin_seats::align_to_footprint(engine) {
+            Ok(report) => {
+                let block = brep_kernel::mount_block_of(&report.mount);
+                if block.as_ref() != engine.history.mount_block() {
+                    engine.history.set_mount_block(block.clone(), None);
+                }
+                AlignOutcome {
+                    written: block,
+                    largest: Some(report.largest),
+                    rms: Some(report.rms),
+                    worst: Some(report.worst),
+                    pins: report.pins,
+                    notes: report.notes,
+                    error: None,
+                }
+            }
+            Err(error) => AlignOutcome { written: engine.history.mount_block().cloned(), error: Some(error), ..AlignOutcome::default() },
+        };
+        self.align = Some(outcome);
+    }
+
     fn section(&mut self, ui: &mut egui::Ui, caption: &str) {
         ui.add_space(3.0);
         ui.label(egui::RichText::new(caption).small().strong());
@@ -1480,5 +1713,6 @@ pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "qualify", prefix: "qualify:pinseat:", meaning: "a pcb point's pin seat check, by address: whether its 3D seat lands on its pin's pad", command: None },
     HitKeyDoc { panel: "qualify", prefix: "qualify:gizmo", meaning: "whether the move/rotate handles are on the selected point", command: None },
     HitKeyDoc { panel: "qualify", prefix: "qualify:problem:", meaning: "one line of the pin/point or ports report", command: None },
+    HitKeyDoc { panel: "qualify", prefix: "qualify:mount:", meaning: "the part's mount frame on the board: its status, a move or turn field (translate0..2, rotateEulerDeg0..2), Y up to Z up, reset, a pick (seat on a face, origin to a point), Align to footprint (align) and its report lines (align_report:N)", command: None },
 ];
 

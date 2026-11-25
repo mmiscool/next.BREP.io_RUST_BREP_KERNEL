@@ -61,15 +61,20 @@ fn frame_transform(u: Vec3, v: Vec3, n: Vec3, center: Vec3) -> Result<AffineTran
 /// `plane_normal`. Returns `(below, above)` where `below` is the piece on the
 /// −n side of the plane and `above` the piece on the +n side.
 ///
-/// Contract: when the plane does not actually divide the solid into two
-/// non-degenerate pieces (it misses the body, or is tangent so one side is
-/// empty), this returns `Err("split_solid_by_plane: plane does not intersect
-/// the solid")` rather than a degenerate/empty piece.
+/// Contract: when the plane misses the solid's box this returns
+/// `Err("split_solid_by_plane: plane does not intersect the solid")`; when a
+/// cut fails the error names the boolean's own refusal; when the plane meets
+/// the box but a piece comes out empty (a tangent plane, or a plane through
+/// the box beside the body) the error says which piece. It never returns a
+/// degenerate or empty piece.
 pub fn split_solid_by_plane(
     solid: &BrepSolid,
     plane_point: Vec3,
     plane_normal: Vec3,
 ) -> Result<(BrepSolid, BrepSolid), String> {
+    if plane_misses_box(solid, plane_point, plane_normal) {
+        return Err("split_solid_by_plane: plane does not intersect the solid".into());
+    }
     let options = BooleanOptions::default();
     let cut = |cover: f64| -> Result<_, String> {
         let (tool_below, tool_above) = plane_tools(solid, plane_point, plane_normal, cover)?;
@@ -90,11 +95,46 @@ pub fn split_solid_by_plane(
     }
 
     match (below, above) {
-        (Ok(below), Ok(above)) if !is_empty_piece(&below) && !is_empty_piece(&above) => {
-            Ok((below, above))
-        }
-        _ => Err("split_solid_by_plane: plane does not intersect the solid".into()),
+        (Ok(below), Ok(above)) => match (is_empty_piece(&below), is_empty_piece(&above)) {
+            (false, false) => Ok((below, above)),
+            (below_empty, above_empty) => Err(format!(
+                "split_solid_by_plane: the plane crosses the solid's box but the cut left the piece {} the plane empty",
+                match (below_empty, above_empty) {
+                    (true, true) => "on each side of",
+                    (true, false) => "below",
+                    _ => "above",
+                },
+            )),
+        },
+        (Err(error), _) | (_, Err(error)) => Err(format!("split_solid_by_plane: the cut failed: {error}")),
     }
+}
+
+/// Whether every corner of the solid's control-point box lies strictly on one
+/// side of the plane, so the plane cannot meet the solid at all.
+fn plane_misses_box(solid: &BrepSolid, plane_point: Vec3, plane_normal: Vec3) -> bool {
+    let (bounds, Ok(n)) = (solid_aabb(solid), plane_normal.normalized()) else {
+        return false;
+    };
+    if !bounds.minimum.x.is_finite() {
+        return false;
+    }
+    let (lo, hi) = (bounds.minimum, bounds.maximum);
+    let reach = 1e-9 * bounds.diagonal().max(1.0);
+    let sides = (0..8).map(|corner| {
+        let point = Vec3::new(
+            if corner & 1 == 0 { lo.x } else { hi.x },
+            if corner & 2 == 0 { lo.y } else { hi.y },
+            if corner & 4 == 0 { lo.z } else { hi.z },
+        );
+        point.sub(plane_point).dot(n)
+    });
+    let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+    for side in sides {
+        low = low.min(side);
+        high = high.max(side);
+    }
+    low > reach || high < -reach
 }
 
 /// The piece of `solid` on one side of the plane through `plane_point` with
@@ -105,7 +145,7 @@ pub fn split_solid_by_plane(
 /// part of the solid on its side whenever the plane meets that box.
 /// `Ok(None)` when nothing of the solid lies on that side; an error only when
 /// the cut itself fails, so a caller can tell a plane that misses from a
-/// boolean that declined (which [`split_solid_by_plane`] reports alike).
+/// boolean that declined.
 pub fn solid_piece_by_plane(
     solid: &BrepSolid,
     plane_point: Vec3,

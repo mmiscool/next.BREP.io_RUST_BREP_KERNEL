@@ -1512,11 +1512,14 @@ fn build_imprints_with_carrier_seeds(
         vertex_sources: HashMap::default(),
         pieces: Vec::new(),
         section_end_seeds: Vec::new(),
+        section_end_evidence: Default::default(),
         // Open offset carriers do not have a closed solid's wall/cap incidence.
-        record_planar_sections: !open_carriers && (switch!("BREP_PLANAR_SECTION_END_DISCOVERY", false)
+        record_planar_sections: !open_carriers && (switch!("BREP_PLANAR_SECTION_END_DISCOVERY", true)
             || switch!("BREP_PLANAR_SECTION_END_DISCOVERY_CHECK", false)),
         planar_sections: Vec::new(),
         marched_section: false,
+        exchanged_rides: Vec::new(),
+        exchanged_rides_mode: crate::env_read::Mode::Off,
         by_face: HashMap::default(),
         edge_splits: HashMap::default(),
         marched_pieces: HashSet::default(),
@@ -1756,11 +1759,45 @@ fn build_imprints_with_carrier_seeds(
             // the strict reconstruction test misses (partial overlaps,
             // differing parameterizations); both route to the boundary-curve
             // exchange below.
-            // `BREP_COSURFACE_EXACT_APART` (default off, `=1` on): two exact
+            // `BREP_COSURFACE_EXACT_APART` (default on, `=0` off): two exact
             // concentric carriers proved apart by more than the On band
             // (coaxial cylinders 2.1e-6 apart in radius) are two surfaces,
-            // whatever the sampled reading's band (1e-5) says.
-            let is_cosurface = !(concentric_apart && crate::switch!("BREP_COSURFACE_EXACT_APART", false))
+            // whatever the sampled reading's band (1e-5) says, unless their
+            // boundaries run within twice the weld floor of each other (one
+            // end plane, rims 5e-6 apart): the assembly welds such rims as
+            // one, and only the cosurface exchange keeps that weld closed.
+            // A complete finite profile crossing cover excludes a shared
+            // profile arc. Unlike a sampled off-carrier point, it cannot veto
+            // a genuinely coincident trimmed portion elsewhere on a carrier.
+            let certified_on = crate::switch!("BREP_EXTRUSION_CERTIFIED_CROSSINGS", true);
+            let certified_check = crate::switch!("BREP_EXTRUSION_CERTIFIED_CROSSINGS_CHECK", false);
+            let certified_sections = if certified_on || certified_check {
+                match (first.face.surface.linear_extrusion(),second.face.surface.linear_extrusion()) {
+                    (Some(a),Some(b)) if a.profile.degree>1 && b.profile.degree>1 =>
+                        brep_geometry::analytic_surface::certified_parallel_extrusion_sections(a,b,options.tolerance),
+                    _=>None,
+                }
+            } else {None};
+            let witness_apart = certified_on && certified_sections.is_some();
+            if certified_check {
+                if let Some(sections)=&certified_sections {
+                    eprintln!("EXTRUSION_CERTIFIED_CROSSINGS pair={}x{} sections={} sampled={:?} enabled={}",
+                        first.face.id,second.face.id,sections.len(),pair_classification.relation,certified_on);
+                }
+            }
+            // OPERAND SLIVERS (`BREP_FEATURE_SCALE_OPERAND_SLIVERS`): two
+            // planes FeatureScale measured a resolvable sliver apart are two
+            // surfaces, whatever the pair reading's band says; read as one,
+            // the sliver's two caps were dropped as coincident copies.
+            let operand_sliver = {
+                let (zero, one) = if first.operand == 0 { (first.face.id, second.face.id) } else { (second.face.id, first.face.id) };
+                first.operand != second.operand && tail_feature_scale.operand_sliver(zero, one)
+            };
+            let is_cosurface = !operand_sliver
+                && !(concentric_apart
+                    && crate::switch!("BREP_COSURFACE_EXACT_APART", true)
+                    && !boundaries_within(&face_edge_lists[&first.key()], &face_edge_lists[&second.key()], 2.0 * crate::tolerance::WELD_FLOOR))
+                && !witness_apart
                 && (pair_classification.relation == SurfacePairRelation::Cosurface
                     || cosurface_pair(&first.face.surface, &second.face.surface, options.tolerance)?);
             profile.cosurface += profile.lap(&mut lap_start);
@@ -1769,8 +1806,25 @@ fn build_imprints_with_carrier_seeds(
                     eprintln!("pair {}x{}: cosurface", first.face.id, second.face.id);
                 }
                 cosurface_pairs.push((first.key(), second.key()));
+                let tangent_mode = tangent_cylinders_off_carrier_mode();
+                let tangent_cylinders = tangent_mode != crate::env_read::Mode::Off
+                    && distinct_cylinder_carriers(&first.face.surface, &second.face.surface, options.tolerance);
+                let off_carrier = |edge: &EdgeRecord, target: TaggedFace<'_>| -> Result<bool, KernelRefusal> {
+                    if !tangent_cylinders {
+                        return Ok(false);
+                    }
+                    let off = edge_interior_off_carrier(edge, &target.face.surface, options.tolerance)?;
+                    if off && (debug_pairs || tangent_mode == crate::env_read::Mode::Check) {
+                        eprintln!(
+                            "pair {}x{}: tangent cylinders read cosurface: edge {} lies off face {}:{}'s carrier, {}",
+                            first.face.id, second.face.id, edge.id, target.operand, target.face.id,
+                            if tangent_mode == crate::env_read::Mode::On { "not exchanged" } else { "exchanged (check)" }
+                        );
+                    }
+                    Ok(off && tangent_mode == crate::env_read::Mode::On)
+                };
                 for edge in &face_edge_lists[&second.key()] {
-                    if !edge.degenerate {
+                    if !edge.degenerate && !off_carrier(edge, first)? {
                         builder.process_curve(
                             cached_subcurve(second.operand, edge)?,
                             first,
@@ -1783,7 +1837,7 @@ fn build_imprints_with_carrier_seeds(
                     }
                 }
                 for edge in &face_edge_lists[&first.key()] {
-                    if !edge.degenerate {
+                    if !edge.degenerate && !off_carrier(edge, second)? {
                         builder.process_curve(
                             cached_subcurve(first.operand, edge)?,
                             first,
@@ -1811,13 +1865,19 @@ fn build_imprints_with_carrier_seeds(
                 options.tolerance,
             )?;
             profile.planar_iso += profile.lap(&mut lap_start);
-            let analytic = crate::intersect_analytic_pair(
+            let analytic = if witness_apart { certified_sections } else { crate::intersect_analytic_pair(
                 &first.face.surface,
                 &second.face.surface,
                 options.tolerance,
-            );
+            ) };
             profile.analytic += profile.lap(&mut lap_start);
             let exact_section = planar_iso.is_some() || analytic.is_some();
+            // The pieces this pair's lies-on exchange mints (each its curve's
+            // own range), for `BREP_MARCH_RIDES_EXCHANGED_SPAN` to read the pair's
+            // marched runs against. A span the exchange processes but mints
+            // nothing from, or defers, is not one.
+            let exchanged_mode = exchanged_span_mode();
+            let mut exchanged_spans: Vec<(NurbsCurve, f64, f64)> = Vec::new();
 
             for (source, target) in [(first, second), (second, first)] {
                 for edge in &face_edge_lists[&source.key()] {
@@ -1849,7 +1909,11 @@ fn build_imprints_with_carrier_seeds(
                         }
                     }
                     for span in spans {
+                        let minted_before = builder.pieces.len();
                         builder.process_curve(span, first, second, &[target], &[target], false, None)?;
+                        if exchanged_mode != crate::env_read::Mode::Off {
+                            exchanged_spans.extend(builder.pieces[minted_before..].iter().map(|piece| (piece.curve.clone(), piece.t0, piece.t1)));
+                        }
                     }
                 }
             }
@@ -3346,6 +3410,10 @@ fn build_imprints_with_carrier_seeds(
                         };
                         let process_started = profile.enabled.then(Instant::now);
                         builder.marched_section = true;
+                        if exchanged_mode != crate::env_read::Mode::Off {
+                            builder.exchanged_rides = exchanged_spans.clone();
+                            builder.exchanged_rides_mode = exchanged_mode;
+                        }
                         builder.process_curve(
                             section_curve,
                             first,
@@ -3356,6 +3424,8 @@ fn build_imprints_with_carrier_seeds(
                             exact_pcurves,
                         )?;
                         builder.marched_section = false;
+                        builder.exchanged_rides.clear();
+                        builder.exchanged_rides_mode = crate::env_read::Mode::Off;
                         if let Some(started) = process_started {
                             profile.process += started.elapsed();
                         }
@@ -3380,7 +3450,7 @@ fn build_imprints_with_carrier_seeds(
     for (span, first, second, target) in deferred_boundary_spans {
         builder.process_curve(span, first, second, &[target], &[target], false, None)?;
     }
-    let discover = switch!("BREP_PLANAR_SECTION_END_DISCOVERY", false);
+    let discover = switch!("BREP_PLANAR_SECTION_END_DISCOVERY", true);
     let check_discovery = switch!("BREP_PLANAR_SECTION_END_DISCOVERY_CHECK", false);
     if !open_carriers && (discover || check_discovery) {
         let all_faces: Vec<_> = first_faces.iter().chain(&second_faces).copied().collect();
@@ -3548,6 +3618,11 @@ fn build_imprints_with_carrier_seeds(
         barrier_edges: builder.barrier_edges.into_iter().collect(),
         section_evidence,
         cosurface_pairs,
+        operand_sliver_regions: tail_feature_scale
+            .operand_sliver_regions
+            .iter()
+            .map(|region| ([region.minimum.x, region.minimum.y, region.minimum.z], [region.maximum.x, region.maximum.y, region.maximum.z]))
+            .collect(),
     };
     RESCUE_FIRINGS.with(|cell| cell.set((march_swap_rescues, clip_swap_rescues)));
     if profile.enabled {
@@ -4933,6 +5008,45 @@ fn pair_normals_parallel_at(
 
 
 
+/// Whether some curved boundary edge of one face comes within `reach` of a
+/// curved boundary edge of the other: each non-degenerate edge of `first`
+/// sampled at 17 points across its span, each sample's distance to every edge
+/// of `second`. Straight edges (a cylinder's seam, along its axis) are not
+/// read: two coaxial walls 2.1e-6 apart have their seams that close whatever
+/// their rims do. Read only to decline [`concentric_carriers_apart`]'s use as
+/// two surfaces (`BREP_COSURFACE_EXACT_APART`), so a missed closest point
+/// keeps that use.
+fn boundaries_within(first: &[&EdgeRecord], second: &[&EdgeRecord], reach: f64) -> bool {
+    let curved = |edge: &&&EdgeRecord| !edge.degenerate && !straight(&edge.curve);
+    first.iter().filter(curved).any(|edge| {
+        (0..=16).any(|step| {
+            let t = edge.t0 + (edge.t1 - edge.t0) * step as f64 / 16.0;
+            let Ok(point) = edge.curve.evaluate(t) else { return false };
+            second.iter().filter(curved).any(|other| project_point_to_curve(&other.curve, point).is_ok_and(|foot| foot.distance <= reach))
+        })
+    })
+}
+
+/// Whether every control point of `curve` lies on the line through its first
+/// and last, to 1e-12 of that chord: a straight curve whatever its weights.
+fn straight(curve: &NurbsCurve) -> bool {
+    let points: Vec<Vec3> = curve.control_points.iter().filter_map(|p| p.point().ok()).collect();
+    if points.len() != curve.control_points.len() || points.len() < 2 {
+        return false;
+    }
+    let (start, end) = (points[0], points[points.len() - 1]);
+    let chord = end.sub(start);
+    let length = chord.length();
+    if !(length > 0.0) {
+        return false;
+    }
+    let along = chord.scale(1.0 / length);
+    points.iter().all(|p| {
+        let offset = p.sub(start);
+        offset.sub(along.scale(offset.dot(along))).length() <= 1e-12 * length
+    })
+}
+
 /// Two exact analytic carriers on one axis (or one centre) whose surfaces are
 /// apart everywhere by more than `band`: concentric spheres of different
 /// radii; coaxial tori in one plane whose tubes are nested or clear of each
@@ -4987,7 +5101,7 @@ fn concentric_carriers_apart(first: &NurbsSurface, second: &NurbsSurface, band: 
 }
 
 /// Whether two pieces are two different exact curves (`BREP_COINCIDENT_MERGE_EXACT_CIRCLES`,
-/// default off, `=1` on): each recognized as a circle to round-off (its
+/// default on, `=0` off): each recognized as a circle to round-off (its
 /// sampled residual within 1e-9 of its chord, at least 1, and 1e-13 of its
 /// distance from the origin: an analytic lane's section, not a fit), and a point of one
 /// standing off the other's whole circle by more than round-off (1e-8 of the
@@ -5001,7 +5115,7 @@ fn concentric_carriers_apart(first: &NurbsSurface, second: &NurbsSurface, band: 
 /// are left to the weld.
 
 fn distinct_exact_circles(a: &NurbsCurve, b: &NurbsCurve) -> Result<bool, KernelRefusal> {
-    if !crate::switch!("BREP_COINCIDENT_MERGE_EXACT_CIRCLES", false) {
+    if !crate::switch!("BREP_COINCIDENT_MERGE_EXACT_CIRCLES", true) {
         return Ok(false);
     }
     // The acceptance residual follows the arc's chord as the band below
@@ -5111,4 +5225,70 @@ fn distinct_exact_conics(a: &NurbsCurve, b: &NurbsCurve) -> Result<bool, KernelR
         Ok(worst)
     };
     Ok(off(b, a)? > band || off(a, b)? > band)
+}
+
+/// `BREP_COSURFACE_TANGENT_CYLINDERS` (default off; `on`, `check`). Two
+/// cylinders tangent from outside along a line their seams share read
+/// cosurface to the sampled pair classification (every sample on the shared
+/// seam line is close and parallel), and the cosurface branch exchanges each
+/// face's whole boundary onto the other. Only the shared seam lies on both
+/// carriers; a rim touches the other carrier at one point. Once a rim carries
+/// a vertex off that point (a second contact, where a hole is cut between two
+/// earlier holes), an arc of it is minted on a carrier it does not lie on and
+/// its pcurve refuses ("endpoint projection failed"). Under it, an edge whose
+/// interior lies wholly off the other carrier is not exchanged for such a
+/// pair. `check` prints the edges it would skip and exchanges them as before.
+/// The boolean's cylinder re-seat retry ([`with_tangent_cylinder_filter`])
+/// turns it on for its own attempt.
+fn tangent_cylinders_off_carrier_mode() -> crate::env_read::Mode {
+    if TANGENT_CYLINDER_FILTER.with(|cell| cell.get()) {
+        return crate::env_read::Mode::On;
+    }
+    crate::mode_switch!("BREP_COSURFACE_TANGENT_CYLINDERS", false)
+}
+
+thread_local! {
+    static TANGENT_CYLINDER_FILTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `action` with `BREP_COSURFACE_TANGENT_CYLINDERS` on for this thread's
+/// imprints (the re-seated attempt of a boolean, whose seams were moved onto
+/// tangent contacts that read cosurface).
+pub fn with_tangent_cylinder_filter<T>(action: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TANGENT_CYLINDER_FILTER.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(TANGENT_CYLINDER_FILTER.with(|cell| cell.replace(true)));
+    action()
+}
+
+/// Two cylinder carriers on different axes (never one surface, whatever the
+/// sampled reading says).
+fn distinct_cylinder_carriers(first: &NurbsSurface, second: &NurbsSurface, tolerance: f64) -> bool {
+    let cylinder = |surface: &NurbsSurface| match surface.analytic() {
+        Some(crate::AnalyticSurface::RuledRevolution { frame, rho0, rho1, .. }) if rho0 == rho1 => Some((frame.origin, frame.axis, *rho0)),
+        _ => None,
+    };
+    let (Some((o1, a1, r1)), Some((o2, _, r2))) = (cylinder(first), cylinder(second)) else { return false };
+    let delta = o2.sub(o1);
+    let off_axis = delta.sub(a1.scale(delta.dot(a1))).length();
+    off_axis > (tolerance * 100.0).max(1e-9) * (1.0 + r1.max(r2))
+}
+
+/// Whether every interior sample of `edge` lies farther than the contact band
+/// from `surface` (its ends may touch it).
+fn edge_interior_off_carrier(edge: &EdgeRecord, surface: &NurbsSurface, tolerance: f64) -> Result<bool, KernelRefusal> {
+    let band = (tolerance * 100.0).max(1e-6);
+    for k in 1..8 {
+        let t = edge.t0 + (edge.t1 - edge.t0) * k as f64 / 8.0;
+        let point = edge.curve.evaluate(t).or_refuse(KernelStage::Intersect, "evaluate")?;
+        let projection = project_point_to_surface(surface, point).or_refuse(KernelStage::Intersect, "project_point_to_surface")?;
+        if projection.distance <= band {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
