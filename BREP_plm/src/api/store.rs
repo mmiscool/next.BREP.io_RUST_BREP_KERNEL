@@ -278,7 +278,6 @@ pub(crate) async fn read_bounded(
     limit: u64,
     refusal: impl Fn() -> String,
 ) -> Result<String, Error> {
-    use futures_util::StreamExt;
     let too_large = || Error { status: StatusCode::PAYLOAD_TOO_LARGE, message: refusal() };
     let declared = headers
         .get(header::CONTENT_LENGTH)
@@ -288,8 +287,8 @@ pub(crate) async fn read_bounded(
         return Err(too_large());
     }
     let mut bytes = Vec::with_capacity(declared.unwrap_or(0) as usize);
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
+    let mut body = body;
+    while let Some(chunk) = super::body_io::next_chunk(&mut body).await {
         let chunk = chunk.map_err(|e| Error::bad_request(format!("the request body broke off: {e}")))?;
         if bytes.len() as u64 + chunk.len() as u64 > limit {
             return Err(too_large());

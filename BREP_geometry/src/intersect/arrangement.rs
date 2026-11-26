@@ -139,6 +139,12 @@ impl NodeLookup {
     }
 
     fn find_or_insert(&mut self, point: Vec2, nodes: &mut Vec<Node>) -> usize {
+        self.find_or_insert_where(point, nodes, |_| true)
+    }
+
+    /// [`Self::find_or_insert`] matching only nodes `accept` admits (lens
+    /// pairs kept apart, [`arrange_segments_lens_apart`]).
+    fn find_or_insert_where(&mut self, point: Vec2, nodes: &mut Vec<Node>, accept: impl Fn(usize) -> bool) -> usize {
         let key = self.cells.as_ref().and_then(|_| self.key(point));
         if key.is_none() {
             // Once a point cannot be indexed, retain the scan for the rest of
@@ -156,7 +162,7 @@ impl NodeLookup {
                             if first.is_some_and(|first| index >= first) {
                                 break;
                             }
-                            if nodes[index].point.distance(point) <= self.tolerance {
+                            if nodes[index].point.distance(point) <= self.tolerance && accept(index) {
                                 first = Some(index);
                                 break;
                             }
@@ -168,7 +174,8 @@ impl NodeLookup {
         } else {
             nodes
                 .iter()
-                .position(|node| node.point.distance(point) <= self.tolerance)
+                .enumerate()
+                .position(|(index, node)| node.point.distance(point) <= self.tolerance && accept(index))
         };
         if let Some(index) = found {
             return index;
@@ -694,7 +701,107 @@ pub fn arrange_segments(
     segments: &[Segment2],
     tolerance: f64,
 ) -> Result<Vec<ArrangementRegion>, String> {
-    arrange_segments_impl(segments, tolerance, true, true)
+    arrange_segments_impl(segments, tolerance, true, true, None)
+}
+
+/// One lens pair an arrangement keeps apart: chains `first` and `second`,
+/// which share both ends. `ends` holds, for each shared end, its point, the
+/// radius within which the two meet there (their ends' match), and the
+/// radius of the zone beside it where their polylines stand within the
+/// tolerance of each other (out to the first sample parting by more).
+pub struct LensPair {
+    pub first: u64,
+    pub second: u64,
+    pub ends: [(Vec2, f64, f64); 2],
+}
+
+impl LensPair {
+    fn joins(&self, a: u64, b: u64) -> bool {
+        a != b && ((self.first == a && self.second == b) || (self.first == b && self.second == a))
+    }
+
+    /// Whether `point` stands in one of the pair's end zones, off the end
+    /// itself: there the two never cross nor share a node.
+    fn suppressed(&self, point: Vec2) -> bool {
+        self.ends.iter().any(|&(end, meet, zone)| {
+            let distance = end.distance(point);
+            distance > meet && distance <= zone
+        })
+    }
+}
+
+/// Lens pairs kept apart: `chain_of[i]` is segment `i`'s chain.
+pub struct LensApart<'a> {
+    pub chain_of: &'a [u64],
+    pub pairs: &'a [LensPair],
+}
+
+impl LensApart<'_> {
+    /// Whether a crossing or a shared node of chains `a` and `b` at `point`
+    /// is suppressed: some pair of the two holds it in an end zone.
+    fn suppressed(&self, a: u64, b: u64, point: Vec2) -> bool {
+        self.pairs.iter().any(|pair| pair.joins(a, b) && pair.suppressed(point))
+    }
+}
+
+/// The representative of each node once the `bridges` (pairs of nodes within
+/// the tolerance, in the order found) are merged: union-find to the lower
+/// index, each group keeping the box of its members, and a union declined
+/// when any corner of the combined box would stand farther than twice the
+/// tolerance from the new representative. A chain of nodes each beside the
+/// next never grows into a group spread over more than that, whatever order
+/// the bridges come in (root to root distances alone allow 2.7 tolerances).
+fn merge_bridged(points: &[Vec2], bridges: &[(usize, usize)], tolerance: f64) -> Vec<usize> {
+    let mut root: Vec<usize> = (0..points.len()).collect();
+    let mut boxes: Vec<[f64; 4]> = points.iter().map(|p| [p.x, p.y, p.x, p.y]).collect();
+    fn find(root: &mut [usize], mut index: usize) -> usize {
+        while root[index] != index {
+            root[index] = root[root[index]];
+            index = root[index];
+        }
+        index
+    }
+    let reach = 2.0 * tolerance;
+    for &(first, second) in bridges {
+        let (a, b) = (find(&mut root, first), find(&mut root, second));
+        if a == b {
+            continue;
+        }
+        let (keep, gone) = (a.min(b), a.max(b));
+        let joined = [
+            boxes[keep][0].min(boxes[gone][0]),
+            boxes[keep][1].min(boxes[gone][1]),
+            boxes[keep][2].max(boxes[gone][2]),
+            boxes[keep][3].max(boxes[gone][3]),
+        ];
+        let centre = points[keep];
+        let far_x = (joined[0] - centre.x).abs().max((joined[2] - centre.x).abs());
+        let far_y = (joined[1] - centre.y).abs().max((joined[3] - centre.y).abs());
+        if far_x.hypot(far_y) > reach {
+            continue;
+        }
+        root[gone] = keep;
+        boxes[keep] = joined;
+    }
+    (0..points.len()).map(|index| find(&mut root, index)).collect()
+}
+
+/// [`arrange_segments`] with lens pairs kept apart near their ends: two
+/// chains a hair apart between two shared ends (a cap's rim and a section
+/// 1e-6 inside it, sampled at the same stations) run within the tolerance of
+/// each other beside each end, where a plain arrangement nodes them together
+/// (two samples within the tolerance, or two chords crossing at a grazing
+/// angle) a chord away from the true crossing. In those end zones they meet
+/// only at the end; elsewhere they are arranged as ever.
+pub fn arrange_segments_lens_apart(
+    segments: &[Segment2],
+    tolerance: f64,
+    apart: &LensApart,
+) -> Result<Vec<ArrangementRegion>, String> {
+    if apart.chain_of.len() != segments.len() {
+        return Err("arrange_segments_lens_apart: one chain per segment".into());
+    }
+    arrange_segments_impl(segments, tolerance, true, true, Some(apart))
 }
 
 fn arrange_segments_impl(
@@ -702,11 +809,32 @@ fn arrange_segments_impl(
     tolerance: f64,
     indexed: bool,
     indexed_nodes: bool,
+    apart: Option<&LensApart>,
 ) -> Result<Vec<ArrangementRegion>, String> {
+
     let defer_tags = switch!("BREP_ARRANGE_DEFER_TAGS", true);
     let end_on_segment = switch!("BREP_ARRANGE_END_ON_SEGMENT", true);
     let mut cuts = vec![Vec::<f64>::new(); segments.len()];
     let mut intersect_pair = |first: usize, second: usize| {
+        if let Some(apart) = apart {
+            let (chain_a, chain_b) = (apart.chain_of[first], apart.chain_of[second]);
+            if apart.pairs.iter().any(|pair| pair.joins(chain_a, chain_b)) {
+                // A crossing (or an end resting on the other's segment) in
+                // an end zone of the pair is not one.
+                let crossing = segment_intersection(segments[first].a, segments[first].b, segments[second].a, segments[second].b, tolerance)
+                    .map(|[t, _]| interpolate(segments[first].a, segments[first].b, t));
+                // Without a crossing, the ends resting on the other segment
+                // (where `end_on_segment_parameters` would node them).
+                let (one, two) = (&segments[first], &segments[second]);
+                let resting = [(one.a, two), (one.b, two), (two.a, one), (two.b, one)];
+                if crossing.is_some_and(|point| apart.suppressed(chain_a, chain_b, point))
+                    || (crossing.is_none()
+                        && resting.iter().any(|&(point, bar)| point_segment_distance(point, bar.a, bar.b) <= tolerance && apart.suppressed(chain_a, chain_b, point)))
+                {
+                    return;
+                }
+            }
+        }
         let Some([first_parameter, second_parameter]) = segment_intersection(
             segments[first].a,
             segments[first].b,
@@ -748,6 +876,7 @@ fn arrange_segments_impl(
     }
 
     let mut pieces = Vec::new();
+    let mut piece_chain: Vec<u64> = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
         let mut parameters = vec![0.0];
         cuts[index].sort_by(f64::total_cmp);
@@ -776,6 +905,9 @@ fn arrange_segments_impl(
                 b,
                 parent: if defer_tags { std::borrow::Cow::Borrowed(segment) } else { std::borrow::Cow::Owned(segment.clone()) },
             });
+            if let Some(apart) = apart {
+                piece_chain.push(apart.chain_of[index]);
+            }
         }
     }
 
@@ -783,9 +915,96 @@ fn arrange_segments_impl(
     let mut lookup = NodeLookup::new(tolerance, indexed_nodes && pieces.len() > 64);
     let mut piece_start = Vec::with_capacity(pieces.len());
     let mut piece_end = Vec::with_capacity(pieces.len());
-    for piece in &pieces {
-        piece_start.push(lookup.find_or_insert(piece.a, &mut nodes));
-        piece_end.push(lookup.find_or_insert(piece.b, &mut nodes));
+    if let Some(apart) = apart {
+        // Each node's chains: a lens pair's two chains share none in an end
+        // zone.
+        let mut node_chains: Vec<Vec<u64>> = Vec::new();
+        // The pieces of chains in no pair are noded first: a paired chain
+        // then finds a third chain's junction already there and joins it,
+        // whatever order the segments came in.
+        let paired = |chain: u64| apart.pairs.iter().any(|pair| pair.first == chain || pair.second == chain);
+        let mut order: Vec<usize> = (0..pieces.len()).filter(|&index| !paired(piece_chain[index])).collect();
+        order.extend((0..pieces.len()).filter(|&index| paired(piece_chain[index])));
+        piece_start.resize(pieces.len(), 0);
+        piece_end.resize(pieces.len(), 0);
+        for index in order {
+            let piece = &pieces[index];
+            let chain = piece_chain[index];
+            let mut ends = [0usize; 2];
+            for (slot, point) in [piece.a, piece.b].into_iter().enumerate() {
+                // Never one node with a chain this one pairs with, where
+                // that pair holds the point in an end zone: a node every
+                // other chain of which is such a partner is refused. A node
+                // a third chain holds too (a section across the lens near
+                // its end) is that chain's junction with both, and joined.
+                let node = lookup.find_or_insert_where(point, &mut nodes, |node| {
+                    let Some(chains) = node_chains.get(node) else { return true };
+                    let others: Vec<u64> = chains.iter().copied().filter(|&other| other != chain).collect();
+                    others.is_empty() || !others.iter().all(|&other| apart.suppressed(other, chain, point))
+                });
+                if node_chains.len() < nodes.len() {
+                    node_chains.resize(nodes.len(), Vec::new());
+                }
+                if !node_chains[node].contains(&chain) {
+                    node_chains[node].push(chain);
+                }
+                ends[slot] = node;
+            }
+            piece_start[index] = ends[0];
+            piece_end[index] = ends[1];
+        }
+        // Whatever order the chains were noded in, two nodes within the
+        // tolerance whose chains include two not kept apart there (a third
+        // chain's junction beside one arc's node and the other's) are one:
+        // the merge is closed over chains bridging nodes, so a paired
+        // section noded after both arcs still joins them. A group's members
+        // stand within twice the tolerance of its first node
+        // ([`merge_bridged`]).
+        let width = 2.0 * tolerance;
+        let mut cells: FxHashMap<[i64; 2], Vec<usize>> = FxHashMap::default();
+        let cell = |point: Vec2| -> Option<[i64; 2]> {
+            let q = [point.x / width, point.y / width];
+            q.iter().all(|v| v.is_finite() && v.abs() <= (1u64 << 48) as f64).then(|| q.map(|v| v.floor() as i64))
+        };
+        for (index, node) in nodes.iter().enumerate() {
+            if let Some(key) = cell(node.point) {
+                cells.entry(key).or_default().push(index);
+            }
+        }
+        let mut bridges: Vec<(usize, usize)> = Vec::new();
+        for index in 0..nodes.len() {
+            let Some([x, y]) = cell(nodes[index].point) else { continue };
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    let Some(others) = cells.get(&[x + dx, y + dy]) else { continue };
+                    for &other in others {
+                        if other <= index || nodes[other].point.distance(nodes[index].point) > tolerance {
+                            continue;
+                        }
+                        let point = nodes[index].point;
+                        let bridged = node_chains.get(index).is_some_and(|mine| {
+                            node_chains.get(other).is_some_and(|theirs| {
+                                mine.iter().any(|&a| theirs.iter().any(|&b| a == b || !apart.suppressed(a, b, point)))
+                            })
+                        });
+                        if bridged {
+                            bridges.push((index, other));
+                        }
+                    }
+                }
+            }
+        }
+        let points: Vec<Vec2> = nodes.iter().map(|node| node.point).collect();
+        let root = merge_bridged(&points, &bridges, tolerance);
+        for index in 0..pieces.len() {
+            piece_start[index] = root[piece_start[index]];
+            piece_end[index] = root[piece_end[index]];
+        }
+    } else {
+        for piece in &pieces {
+            piece_start.push(lookup.find_or_insert(piece.a, &mut nodes));
+            piece_end.push(lookup.find_or_insert(piece.b, &mut nodes));
+        }
     }
 
     let mut alive = vec![true; pieces.len()];
@@ -1004,5 +1223,6 @@ fn arrange_segments_impl(
     }
     Ok(regions.into_iter().map(|(region, _)| region).collect())
 }
+
 
 

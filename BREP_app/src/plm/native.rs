@@ -12,7 +12,7 @@
 //! * [`spawn`] polls a task at once (a future that is already resolved — the
 //!   test backends' — finishes right there, as it always did) and otherwise
 //!   parks it on this thread's queue.
-//! * The I/O runs on another thread (ehttp's worker, over ureq). Its waker is
+//! * The I/O runs on another thread (the HTTP thread, over ureq). Its waker is
 //!   `Send`: it marks the task ready and calls the wake hook ([`set_wake`], the
 //!   frame loop's `request_repaint`), so a response wakes the UI rather than
 //!   waiting for the mouse to move.

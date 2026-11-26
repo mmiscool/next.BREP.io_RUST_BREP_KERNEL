@@ -1,12 +1,12 @@
-//! The ehttp transport, both targets (plan S1).
+//! The HTTP transport, both targets (plan S1).
 //!
-//! ehttp is already the app's HTTP client (`http.rs`): `ureq` on a worker
+//! net.rs is the app's HTTP client (`http.rs`): `ureq` on a worker
 //! thread natively, the browser's `fetch` on wasm. The browser sends the PLM's
 //! session cookie by itself on a same-origin page (D6), so the web lane needs
 //! no cookie handling here. On native nothing keeps cookies, which is why the
 //! native app signs in with a token.
 //!
-//! ehttp answers through a callback on its own thread (natively). The future
+//! net.rs answers through a callback on its own thread (natively). The future
 //! returned here is completed from that callback and wakes whatever waker last
 //! polled it, so any executor that honours wakers drives it: S2's frame-driven
 //! native queue, `wasm_bindgen_futures` on the web, a test's `block_on`.
@@ -16,29 +16,29 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
-/// The PLM at `base` (`http://host:port`, no trailing slash) over ehttp.
-pub struct EhttpTransport {
+/// The PLM at `base` (`http://host:port`, no trailing slash) over net.rs.
+pub struct HttpTransport {
     pub base: String,
 }
 
-impl EhttpTransport {
+impl HttpTransport {
     pub fn new(base: impl Into<String>) -> Self {
         Self { base: base.into().trim_end_matches('/').to_string() }
     }
 }
 
-impl PlmTransport for EhttpTransport {
+impl PlmTransport for HttpTransport {
     fn send(&self, request: PlmRequest) -> PlmFuture<PlmResponse> {
         let slot = Arc::new(Mutex::new(Slot::default()));
-        let outgoing = ehttp::Request {
+        let outgoing = crate::net::Request {
             method: request.method.to_string(),
             url: format!("{}{}", self.base, request.path),
             body: request.body,
-            headers: ehttp::Headers { headers: request.headers },
-            ..ehttp::Request::get("")
+            headers: crate::net::Headers { headers: request.headers },
+            ..crate::net::Request::get("")
         };
         let filled = slot.clone();
-        ehttp::fetch(outgoing, move |result| {
+        crate::net::fetch(outgoing, move |result| {
             let answer = result.map(|response| PlmResponse {
                 status: response.status,
                 headers: response.headers.headers,
@@ -67,7 +67,7 @@ struct Slot {
     waker: Option<Waker>,
 }
 
-/// Resolves when ehttp's callback has filled the slot.
+/// Resolves when the HTTP callback has filled the slot.
 struct Answer {
     slot: Arc<Mutex<Slot>>,
 }

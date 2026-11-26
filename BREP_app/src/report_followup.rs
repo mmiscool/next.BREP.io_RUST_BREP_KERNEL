@@ -277,7 +277,7 @@ impl ReportFollowup {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
-        ehttp::fetch(ehttp::Request::get(status_url(&self.reports)), move |result| {
+        crate::net::fetch(crate::net::Request::get(status_url(&self.reports)), move |result| {
             let out = match result {
                 Ok(resp) if resp.ok => Ok(String::from_utf8_lossy(&resp.bytes).into_owned()),
                 Ok(resp) => Err(format!("HTTP {} {}", resp.status, resp.status_text)),

@@ -66,7 +66,7 @@ pub async fn file(State(db): State<Shared>, Path(path): Path<String>, headers: H
             Ok(file) => file,
             Err(error) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, &format!("cannot read the file: {error}")),
         };
-        (Body::from_stream(stream(file)), bare)
+        (super::body_io::file_body(file, 256 * 1024), bare)
     };
     let mut response = if fresh {
         StatusCode::NOT_MODIFIED.into_response()
@@ -86,21 +86,6 @@ fn set(response: &mut Response, name: header::HeaderName, value: &str) {
     if let Ok(value) = HeaderValue::from_str(value) {
         response.headers_mut().insert(name, value);
     }
-}
-
-fn stream(file: tokio::fs::File) -> impl futures_util::Stream<Item = Result<Vec<u8>, std::io::Error>> {
-    futures_util::stream::unfold(file, |mut file| async move {
-        use tokio::io::AsyncReadExt;
-        let mut buffer = vec![0u8; 256 * 1024];
-        match file.read(&mut buffer).await {
-            Ok(0) => None,
-            Ok(n) => {
-                buffer.truncate(n);
-                Some((Ok(buffer), file))
-            }
-            Err(e) => Some((Err(e), file)),
-        }
-    })
 }
 
 /// `GET /cad/config`: what an installer or a CAD app needs to know about this

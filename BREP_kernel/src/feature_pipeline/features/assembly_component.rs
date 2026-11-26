@@ -105,6 +105,29 @@ fn restore_solids_memoized(part_name: &str, payload: &str) -> Result<RestoredSna
     Ok(snapshot)
 }
 
+const COLOR_KEY: &str = crate::COLOR_METADATA_KEY;
+
+/// The record key holding the colour an instance took from its part
+/// ([`crate::scene_metadata_part_colors_json`]).
+pub(crate) const PART_COLOR_KEY: &str = "partColor";
+
+/// The colours a part document saved in its own `metadata` block (solid,
+/// face and edge names of the part, each `{ "color": "#rrggbb" }`): what the
+/// user set on the part, which the app keeps there rather than in the
+/// kernel's store, so the part's own run never stamps them.
+fn part_document_colors(document: &serde_json::Value) -> Vec<(String, String)> {
+    document
+        .get("metadata")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, record)| {
+            let color = record.get(COLOR_KEY)?.as_str()?.trim();
+            (!color.is_empty()).then(|| (name.clone(), color.to_string()))
+        })
+        .collect()
+}
+
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
     match build(ctx) {
         Ok(result) => result,
@@ -271,10 +294,23 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         })
         .collect();
 
-    // Stamp the part's captured metadata under the namespaced names.
-    for (name, mut metadata_record) in restored.metadata {
+    // Stamp the part's captured metadata under the namespaced names, with the
+    // colours the part's own document saved (`metadata`, what the user set on
+    // the part) over what its features stamped, as the part itself shows them.
+    let mut records: BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
+        restored.metadata.into_iter().collect();
+    for (name, saved) in part_document_colors(&entry.document) {
+        records.entry(name).or_default().insert(COLOR_KEY.into(), serde_json::Value::String(saved));
+    }
+    for (name, mut metadata_record) in records {
         if let Some(serde_json::Value::String(parent)) = metadata_record.get_mut("inheritsFrom") {
             *parent = component::namespaced(&ctx.id, parent);
+        }
+        // `partColor` is the colour this instance took from its part: the app
+        // follows a refreshed part while the assembly's saved colour is still
+        // that one, and keeps a colour the user set on the instance.
+        if let Some(color) = metadata_record.get(COLOR_KEY).cloned() {
+            metadata_record.insert(PART_COLOR_KEY.into(), color);
         }
         scene_metadata::set_record(&component::namespaced(&ctx.id, &name), metadata_record);
     }

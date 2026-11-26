@@ -2311,8 +2311,8 @@ fn sweep_with(screw: &Screw, tool: &SolidTool) -> Result<BrepSolid, KernelRefusa
     if let SolidTool::Revolved { meridian, .. } = tool {
         refuse_elliptic(meridian)?;
     }
-    if let SolidTool::Revolved { axis_origin, axis_direction, meridian, .. } = tool {
-        if let Some(body) = ball_across_axis(&screw, *axis_origin, *axis_direction, meridian)? {
+    if let SolidTool::Revolved { axis_origin, axis_direction, meridian, radial } = tool {
+        if let Some(body) = ball_across_axis(&screw, *axis_origin, *axis_direction, *radial, meridian)? {
             return Ok(body);
         }
         // (A tool whose radial direction lies along its axis is left to the
@@ -2344,6 +2344,12 @@ fn sweep_with(screw: &Screw, tool: &SolidTool) -> Result<BrepSolid, KernelRefusa
         }
         if let Some(body) = rod_across_axis(&screw, *axis_origin, *axis_direction, meridian)? {
             return Ok(body);
+        }
+    }
+    if let SolidTool::Polyhedron { vertices, faces } = tool {
+        let slid = screw.omega == 0.0 && screw.c2 == 0.0 && screw.frame.is_none() && screw.turns.is_none();
+        if slid && slid_hull_on() {
+            return slid_polyhedron_hull(&screw, vertices, faces);
         }
     }
     if let SolidTool::Polyhedron { vertices, faces } = tool {
@@ -3319,6 +3325,262 @@ fn trim_to_clip(screw: &Screw, vertices: &[Vec3], faces: &[Vec<usize>], clip: &c
     Ok(Some(polyhedron_of_planes(&planes)?))
 }
 
+/// `BREP_SWEEP_SLID_POLYHEDRON_HULL` (default on; `=0` restores the refusal): a convex polyhedron slid
+/// straight sweeps exactly the convex hull of its two end positions (every
+/// point between is on a segment from one to the other), so the sweep is that
+/// hull. The grazing split refused a face the slide moves in its own plane (a
+/// block slid along one of its faces: the face's sweep is flat).
+fn slid_hull_on() -> bool {
+    crate::switch!("BREP_SWEEP_SLID_POLYHEDRON_HULL", true)
+}
+
+/// The convex hull of the polyhedron at the screw's two ends, the screw being a
+/// straight slide. The polyhedron must be the convex one its faces bound (the
+/// hull of a concave tool is not its sweep), so its faces are read first: each
+/// flat, the set closed, and every corner on the inner side of every face.
+fn slid_polyhedron_hull(screw: &Screw, vertices: &[Vec3], faces: &[Vec<usize>]) -> Result<BrepSolid, KernelRefusal> {
+    if vertices.len() < 4 || faces.len() < 4 || vertices.len() > 256 {
+        return Err(input("polyhedron", "the tool needs at least four corners and four faces (and at most 256 corners)".into()));
+    }
+    let centroid = vertices.iter().fold(Vec3::new(0.0, 0.0, 0.0), |s, &p| s.add(p)).scale(1.0 / vertices.len() as f64);
+    let extent = vertices.iter().map(|p| p.sub(centroid).length()).fold(0.0f64, f64::max);
+    if !(extent > 0.0) {
+        return Err(input("polyhedron", "the tool's corners coincide".into()));
+    }
+    let slack = 1e-9 * extent;
+    let mut owner: HashMap<(usize, usize), usize> = HashMap::new();
+    // Either winding is a face's (as the grazing split reads it): each is
+    // turned to run counter-clockwise from outside before the faces are read.
+    let mut oriented: Vec<Vec<usize>> = Vec::with_capacity(faces.len());
+    let mut normals: Vec<Vec3> = Vec::with_capacity(faces.len());
+    for (index, face) in faces.iter().enumerate() {
+        if face.len() < 3 || face.iter().any(|&k| k >= vertices.len()) {
+            return Err(input("face", format!("face {index} names fewer than three corners or one past the tool's")));
+        }
+        // Newell's normal, then outward by the centroid.
+        let mut normal = Vec3::new(0.0, 0.0, 0.0);
+        for k in 0..face.len() {
+            let (a, b) = (vertices[face[k]].sub(centroid), vertices[face[(k + 1) % face.len()]].sub(centroid));
+            normal = normal.add(Vec3::new((a.y - b.y) * (a.z + b.z), (a.z - b.z) * (a.x + b.x), (a.x - b.x) * (a.y + b.y)));
+        }
+        // Against the tool's own size, not an absolute floor.
+        let length = normal.length();
+        if !(length > 1e-18 * extent * extent) {
+            return Err(input("face", format!("face {index} has no area")));
+        }
+        let mut normal = normal.scale(1.0 / length);
+        let mut face = face.clone();
+        let d = normal.dot(vertices[face[0]].sub(centroid));
+        let d = if d < 0.0 {
+            normal = normal.scale(-1.0);
+            face.reverse();
+            -d
+        } else {
+            d
+        };
+        for &k in &face {
+            if (normal.dot(vertices[k].sub(centroid)) - d).abs() > slack {
+                return Err(input("face", format!("face {index}'s corners are not in one plane")));
+            }
+        }
+        if vertices.iter().any(|p| normal.dot(p.sub(centroid)) - d > slack) {
+            return Err(input("convex", "the tool is not convex: a corner lies outside one of its faces".into()));
+        }
+        for k in 0..face.len() {
+            let (a, b) = (face[k], face[(k + 1) % face.len()]);
+            if owner.insert((a, b), index).is_some() {
+                return Err(input("closed", "an edge is used more than once the same way".into()));
+            }
+        }
+        oriented.push(face);
+        normals.push(normal);
+    }
+    for &(a, b) in owner.keys() {
+        if !owner.contains_key(&(b, a)) {
+            return Err(input("closed", "the polyhedron's faces do not close".into()));
+        }
+    }
+    // The faces must bound one closed part (the polyhedron builder's own
+    // reading: faces given twice, once each way, close into separate parts).
+    crate::make_polyhedron_brep(vertices, &oriented)?;
+    // The sweep is the tool's Minkowski sum with the slide [0, s]: faces it
+    // leaves behind at the start (n · s < 0), faces it leads with at the end
+    // (n · s > 0), faces it slides in their own plane stretched to the hull of
+    // their two copies, and one parallelogram per edge where the faces either
+    // side face opposite ways. Built from the tool's own faces, no plane is
+    // searched for and no tolerance grows with the slide.
+    let n = vertices.len();
+    let start: Vec<Vec3> = vertices.iter().map(|&p| screw.apply(screw.t0, p)).collect();
+    let end: Vec<Vec3> = vertices.iter().map(|&p| screw.apply(screw.t1, p)).collect();
+    let slide = end[0].sub(start[0]);
+    let travel = slide.length();
+    if !(travel > 0.0 && travel.is_finite()) {
+        return Err(input("still", "the slide does not move".into()));
+    }
+    let along = slide.scale(1.0 / travel);
+    // The polyhedron builder reads its faces against its whole extent, so a
+    // slide far longer than the tool's thinnest width is beyond what it
+    // builds (that width: the least spread of the corners along a face's
+    // normal).
+    let width = normals.iter().map(|nf| {
+        let reach: Vec<f64> = vertices.iter().map(|p| nf.dot(*p)).collect();
+        reach.iter().copied().fold(f64::NEG_INFINITY, f64::max) - reach.iter().copied().fold(f64::INFINITY, f64::min)
+    }).fold(f64::INFINITY, f64::min);
+    if slide.length() > 1e6 * width {
+        return Err(refuse("slid_hull", format!("the slide ({:.3e}) is more than 1e6 times the tool's thinnest width ({width:.3e})", slide.length())));
+    }
+    let side: Vec<i8> = normals.iter().map(|nf| {
+        let c = nf.dot(along);
+        if c.abs() <= 1e-12 { 0 } else if c > 0.0 { 1 } else { -1 }
+    }).collect();
+    let corners: Vec<Vec3> = start.iter().chain(end.iter()).copied().collect();
+    // A corner the slide carries onto another (a block slid by its own width)
+    // is one corner: every index is read as its first coincident one.
+    let canonical: Vec<usize> = (0..corners.len())
+        .map(|k| (0..k).find(|&j| corners[j].sub(corners[k]).length() <= slack).unwrap_or(k))
+        .collect();
+    let mut pool: Vec<usize> = canonical.clone();
+    pool.sort_unstable();
+    pool.dedup();
+    let canon = |set: Vec<usize>| -> Vec<usize> {
+        let mut out: Vec<usize> = set.into_iter().map(|k| canonical[k]).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    };
+    // A ring of corner indices, ordered as the convex hull of its points
+    // counter-clockwise about `normal` (corners inside it or on its sides
+    // dropped).
+    let ring = |set: &[usize], normal: Vec3| -> Option<Vec<usize>> {
+        let middle = set.iter().fold(Vec3::new(0.0, 0.0, 0.0), |s, &k| s.add(corners[k])).scale(1.0 / set.len() as f64);
+        // The longest offset in the plane, divided by its own length (no
+        // absolute floor: a small face is as good as a large one).
+        let u = set
+            .iter()
+            .map(|&k| corners[k].sub(middle))
+            .map(|r| r.sub(normal.scale(r.dot(normal))))
+            .max_by(|a, b| a.length().total_cmp(&b.length()))?;
+        let u = (u.length() > 0.0).then(|| u.scale(1.0 / u.length()))?;
+        let v = normal.cross(u);
+        let flat = |k: usize| {
+            let r = corners[k].sub(middle);
+            (r.dot(u), r.dot(v))
+        };
+        let mut order = set.to_vec();
+        order.sort_by(|&a, &b| {
+            let (pa, pb) = (flat(a), flat(b));
+            pa.0.total_cmp(&pb.0).then(pa.1.total_cmp(&pb.1))
+        });
+        // A point is on the line through two others when it stands off it by
+        // no more than the tool's tolerance (a distance, whatever the slide's
+        // length): twice the triangle's area over the base.
+        let left = |o: usize, a: usize, b: usize| {
+            let (po, pa, pb) = (flat(o), flat(a), flat(b));
+            let cross = (pa.0 - po.0) * (pb.1 - po.1) - (pa.1 - po.1) * (pb.0 - po.0);
+            cross > slack * (pb.0 - po.0).hypot(pb.1 - po.1)
+        };
+        let mut hull: Vec<usize> = Vec::new();
+        for pass in [false, true] {
+            let begin = hull.len();
+            let sequence: Vec<usize> = if pass { order.iter().rev().copied().collect() } else { order.clone() };
+            for k in sequence {
+                while hull.len() >= begin + 2 && !left(hull[hull.len() - 2], hull[hull.len() - 1], k) {
+                    hull.pop();
+                }
+                hull.push(k);
+            }
+            hull.pop();
+        }
+        if hull.len() < 3 {
+            return None;
+        }
+        // Every corner of the sweep on a side of this ring stays on it, in
+        // order: whichever face it came from, the neighbour across that side
+        // reads the same corners there, so the two rings carry the same edges.
+        let mut out: Vec<usize> = Vec::with_capacity(set.len());
+        for k in 0..hull.len() {
+            let (p, q) = (hull[k], hull[(k + 1) % hull.len()]);
+            out.push(p);
+            let (a, d) = (corners[p], corners[q].sub(corners[p]));
+            let length = d.length();
+            let mut between: Vec<(f64, usize)> = pool
+                .iter()
+                .filter(|&&m| m != p && m != q)
+                .filter_map(|&m| {
+                    let r = corners[m].sub(a);
+                    let t = r.dot(d) / (length * length);
+                    let off = r.sub(d.scale(t)).length();
+                    (t > 0.0 && t < 1.0 && off <= slack).then_some((t, m))
+                })
+                .collect();
+            between.sort_by(|x, y| x.0.total_cmp(&y.0));
+            out.extend(between.into_iter().map(|(_, m)| m));
+        }
+        Some(out)
+    };
+    // Coplanar faces of a convex polyhedron are one face of it: grouped by
+    // plane, each group read as one (the union of its corners).
+    let offsets: Vec<f64> = oriented.iter().zip(&normals).map(|(face, nf)| nf.dot(vertices[face[0]].sub(centroid))).collect();
+    let mut group = vec![usize::MAX; oriented.len()];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for f in 0..oriented.len() {
+        if group[f] != usize::MAX {
+            continue;
+        }
+        group[f] = groups.len();
+        let mut members = vec![f];
+        for g in f + 1..oriented.len() {
+            // One face only if the slide reads them alike too: two faces a
+            // hair apart in angle can face it opposite ways, and then their
+            // shared edge is a silhouette of its own.
+            if group[g] == usize::MAX && side[g] == side[f] && normals[g].sub(normals[f]).length() <= 1e-9 && (offsets[g] - offsets[f]).abs() <= slack {
+                group[g] = groups.len();
+                members.push(g);
+            }
+        }
+        groups.push(members);
+    }
+    let mut hull_faces: Vec<Vec<usize>> = Vec::new();
+    for (index, members) in groups.iter().enumerate() {
+        let f = members[0];
+        let mut corners_of: Vec<usize> = members.iter().flat_map(|&m| oriented[m].iter().copied()).collect();
+        corners_of.sort_unstable();
+        corners_of.dedup();
+        let set: Vec<usize> = canon(match side[f] {
+            -1 => corners_of,
+            1 => corners_of.iter().map(|&k| k + n).collect(),
+            _ => corners_of.iter().flat_map(|&k| [k, k + n]).collect(),
+        });
+        hull_faces.push(ring(&set, normals[f]).ok_or_else(|| refuse("slid_hull", format!("face group {index}'s sweep has no area")))?);
+    }
+    // In a fixed order, so the same tool builds the same body.
+    let mut edges: Vec<(usize, usize)> = owner.keys().copied().filter(|&(a, b)| a < b).collect();
+    edges.sort_unstable();
+    for (a, b) in edges {
+        let (f, g) = (owner[&(a, b)], owner[&(b, a)]);
+        // Once per edge between two faces of the hull's own (not two
+        // coplanar pieces of one), where the face on its left leads and the
+        // one on its right trails (or the other way): the edge's own sweep is
+        // a face.
+        if group[f] != group[g] && side[f] * side[g] < 0 {
+            let edge = start[b].sub(start[a]);
+            // Against the edge's own length (an edge of a silhouette is never
+            // along the slide: its faces would both slide in their planes).
+            let cross = edge.cross(along);
+            let length = cross.length();
+            if !(length > 1e-12 * edge.length()) {
+                return Err(refuse("slid_hull", "a silhouette edge runs along the slide".into()));
+            }
+            let mut normal = cross.scale(1.0 / length);
+            if normal.dot(start[a].sub(centroid)) < 0.0 {
+                normal = normal.scale(-1.0);
+            }
+            hull_faces.push(ring(&canon(vec![a, b, a + n, b + n]), normal).ok_or_else(|| refuse("slid_hull", "an edge's sweep has no area".into()))?);
+        }
+    }
+    crate::make_polyhedron_brep(&corners, &hull_faces)
+}
+
 /// The convex polyhedron {n · p ≤ d for every plane}: its corners (where three
 /// planes meet inside all) and a face per plane that bounds it.
 pub fn polyhedron_of_planes(planes: &[(Vec3, f64)]) -> Result<(Vec<Vec3>, Vec<Vec<usize>>), KernelRefusal> {
@@ -3713,7 +3975,11 @@ fn polyhedron_shadow(corners: &[[f64; 3]], faces: &[Vec<usize>], through: bool) 
 /// less the ball at the start. The two caps meet along the far arc, from S to
 /// N, of the circle where the two spheres meet. None when the motion or tool
 /// is not of that kind.
-fn ball_across_axis(screw: &Screw, origin: Vec3, axis: Vec3, meridian: &[OutlinePiece]) -> Result<Option<BrepSolid>, KernelRefusal> {
+fn ball_whole_turn_on() -> bool {
+    crate::switch!("BREP_SWEEP_BALL_WHOLE_TURN", true)
+}
+
+fn ball_across_axis(screw: &Screw, origin: Vec3, axis: Vec3, radial: Vec3, meridian: &[OutlinePiece]) -> Result<Option<BrepSolid>, KernelRefusal> {
     let [OutlinePiece::Arc { centre, radius, start, end }, OutlinePiece::Line { .. }] = meridian else { return Ok(None) };
     let (centre, r) = (*centre, *radius);
     if centre[0].abs() > 1e-12 * r || ((end - start).abs() - PI).abs() > 1e-12 || screw.c != 0.0 || screw.c2 != 0.0 || screw.omega == 0.0 {
@@ -3723,6 +3989,34 @@ fn ball_across_axis(screw: &Screw, origin: Vec3, axis: Vec3, meridian: &[Outline
     let centre_tool = origin.add(w.scale(centre[1]));
     let turned = screw.omega * (screw.t1 - screw.t0);
     if turned.abs() >= TAU - 1e-9 {
+        // `BREP_SWEEP_BALL_WHOLE_TURN` (default on; `=0` restores the refusal): a ball turned a whole
+        // turn about an axis that misses it sweeps the torus its great circle
+        // in the axis' half-plane turns: that circle, revolved about the axis.
+        let finite = |p: Vec3| p.x.is_finite() && p.y.is_finite() && p.z.is_finite();
+        let unit = |p: Vec3| finite(p) && (p.length() - 1.0).abs() <= 1e-9;
+        if ball_whole_turn_on() && turned.is_finite() && finite(radial) && finite(origin) && finite(axis) && unit(w) && finite(screw.a) && unit(screw.e) {
+            // The tool's own frame must be one (as every route reads it), and
+            // its meridian the half disc: the arc closed by the diameter back
+            // from the arc's end to its start.
+            radial.sub(w.scale(radial.dot(w))).normalized().map_err(|_| input("radial", "the radial direction lies along the axis".into()))?;
+            let [_, OutlinePiece::Line { from, to }] = meridian else { return Ok(None) };
+            let at = |angle: f64| [centre[0] + r * angle.cos(), centre[1] + r * angle.sin()];
+            let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= 1e-12 * r;
+            if !(near(*from, at(*end)) && near(*to, at(*start)) && from[0].abs() <= 1e-12 * r && to[0].abs() <= 1e-12 * r) {
+                return Err(input("meridian", "the ball's meridian is not the half disc closed by its diameter on the axis".into()));
+            }
+            let e = screw.e;
+            let off = centre_tool.sub(screw.a);
+            let radial = off.sub(e.scale(off.dot(e)));
+            // Whole only if the shortfall leaves no gap the ball's own size
+            // would see: the arc it misses, out at the ball's far side.
+            let gap = (TAU - turned.abs()).max(0.0) * (radial.length() + r);
+            if radial.length() > r * (1.0 + 1e-9) && gap <= 1e-9 * r {
+                let normal = frag(e.cross(radial).normalized(), "ball_turn")?;
+                let circle = frag(crate::make_circle(centre_tool, normal, r), "ball_turn")?;
+                return Ok(Some(frag(crate::revolve_profile_brep(&[circle], screw.a, e, TAU), "ball_turn")?));
+            }
+        }
         return Ok(None);
     }
     let e = screw.e.scale(screw.omega.signum()); // the sense the ball turns about
@@ -7460,5 +7754,6 @@ mod ring_fold;
 
 #[path = "solid_sweep_ball_screw.rs"]
 mod ball_screw;
+
 
 

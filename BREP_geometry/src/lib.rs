@@ -316,8 +316,8 @@ pub use spatial::{Aabb, Bvh};
 #[doc(hidden)]
 pub mod arrangement;
 pub use arrangement::{
-    arrange_segments, point_in_polygon, segment_intersection, ArrangementPiece, ArrangementRegion,
-    CycleUse, Segment2, Vec2,
+    arrange_segments, arrange_segments_lens_apart, point_in_polygon, segment_intersection, ArrangementPiece, ArrangementRegion,
+    CycleUse, LensApart, LensPair, Segment2, Vec2,
 };
 #[path = "geometry/pcurve.rs"]
 #[doc(hidden)]

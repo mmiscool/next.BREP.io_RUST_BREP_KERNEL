@@ -52,6 +52,10 @@ mod faces;
 pub use faces::fillet_faces;
 #[path = "fillet/full_round.rs"]
 mod full_round;
+#[path = "fillet/plate_limit.rs"]
+mod plate_limit;
+#[path = "fillet/plate_arc_limit.rs"]
+mod plate_arc_limit;
 #[path = "fillet/parallel_walls.rs"]
 mod parallel_walls;
 #[path = "fillet/chamfer_extent.rs"]

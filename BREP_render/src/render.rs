@@ -504,6 +504,38 @@ pub struct FrameParams<'a> {
     pub overlay: Option<&'a crate::widgets::WidgetOverlay>,
 }
 
+/// Run `future` to completion on this thread, parking it between polls. The
+/// native shells use it for wgpu's adapter/device requests and error scopes,
+/// which resolve without an executor (wgpu drives them itself). Native only:
+/// a browser tab cannot block.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct Unpark(std::thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let mut future = std::pin::pin!(future);
+    let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(output) => return output,
+            // A wake that came before this park leaves its token, so the
+            // park returns at once; a spurious return only polls again.
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
 /// Create a headless device: adapter picked by `BREP_RENDER_ADAPTER`
 /// (case-insensitive substring of the adapter name, e.g. "llvmpipe") or wgpu's
 /// high-performance default. Native only — the browser shell gets its device
@@ -514,12 +546,12 @@ pub fn create_headless_device() -> Result<(wgpu::Device, wgpu::Queue, String), S
     let want = std::env::var("BREP_RENDER_ADAPTER").ok();
     let adapter = if let Some(want) = &want {
         let want_lower = want.to_lowercase();
-        pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+        block_on(instance.enumerate_adapters(wgpu::Backends::all()))
             .into_iter()
             .find(|adapter| adapter.get_info().name.to_lowercase().contains(&want_lower))
             .ok_or_else(|| format!("no adapter matching BREP_RENDER_ADAPTER={want}"))?
     } else {
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
@@ -527,7 +559,7 @@ pub fn create_headless_device() -> Result<(wgpu::Device, wgpu::Queue, String), S
         .map_err(|error| format!("no wgpu adapter available: {error}"))?
     };
     let info = adapter.get_info();
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("brep-render"),
         ..Default::default()
     }))

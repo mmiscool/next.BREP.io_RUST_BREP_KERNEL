@@ -1576,6 +1576,7 @@ pub(super) fn extend_truncated_sections(
             pcurves,
             support_faces,
             shared_edge: None,
+                certified_ruling_side: None,
         });
         for key in [spec.f, spec.g] {
             match result.by_face.iter_mut().find(|record| {

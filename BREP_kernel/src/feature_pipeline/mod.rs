@@ -103,7 +103,7 @@ pub(crate) mod scene_metadata;
 pub use scene_metadata::IsolatedSceneMetadata;
 // The colour-only read of the name-keyed store: THREAD-LOCAL, so a caller whose
 // history runs off-thread must read it runner-side (`io/appearance.rs`).
-pub use scene_metadata::{scene_metadata_colors_json, scene_metadata_weld_colors_json};
+pub use scene_metadata::{scene_metadata_colors_json, scene_metadata_part_colors_json, scene_metadata_weld_colors_json};
 mod schema;
 // The kernel-owned feature-schema catalogue, reachable by NATIVE Rust consumers
 // (the engine-native egui UI in brep-app, via a brep-render re-export) — the same

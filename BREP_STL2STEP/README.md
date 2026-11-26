@@ -31,7 +31,7 @@ a successful run always prints a human-readable terminal report.
 Exit statuses are `0` for success, `2` for usage, `3` for STL input, `4` for conversion,
 and `5` for output I/O. Run `stl2step --help` for all recognition and tolerance options.
 
-The package is version 0.2.26 and contains only this binary. Licence: the Autodrop3d
+The package is version 0.2.27 and contains only this binary. Licence: the Autodrop3d
 licence in `LICENSE.md`, shipped in the crate.
 
 ## Licence

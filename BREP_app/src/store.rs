@@ -4059,8 +4059,8 @@ mod web_model {
 
     // --- IndexedDB request/transaction -> Future ----------------------------------
     // Hand-rolled rather than pulling `indexed_db_futures`: this crate deliberately
-    // keeps its wasm dependency tree thin (see the `ehttp` note in Cargo.toml about
-    // the `getrandom` dep-tree problem), and the whole adapter is the ~60 lines
+    // keeps its wasm dependency tree thin (the HTTP client, src/net.rs, is hand-rolled
+    // over `fetch` for the same reason), and the whole adapter is the ~60 lines
     // below. It owns its `Closure`s — dropping the future clears the handlers — so
     // a session of saves does not leak a pair of JS closures per write, which a
     // `Closure::forget()` sketch would.

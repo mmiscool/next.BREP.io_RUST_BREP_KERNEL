@@ -401,6 +401,40 @@ pub struct FaceKey {
     pub face_id: u64,
 }
 
+/// Ephemeral evidence bound to the exact minted curve and ordered supports.
+/// Serialized imprints deliberately discard it; geometric refits cannot inherit it.
+#[derive(Clone, Debug)]
+pub struct CertifiedRulingPiece {
+    pub(super) piece_id: u64,
+    pub(super) parameters: [f64; 2],
+    pub(super) vertices: [u64; 2],
+    pub(super) certificate: brep_geometry::certified_planar::ruling::CertifiedRuling,
+    pub(super) minted_curve: NurbsCurve,
+    pub(super) minted_pcurves: Vec<FacePcurve>,
+    pub(super) support_faces: [FaceKey; 2],
+}
+
+impl ImprintPieceRecord {
+    pub fn certified_ruling(&self, supports: [FaceKey; 2], charts: [&NurbsSurface; 2])
+        -> Option<&brep_geometry::certified_planar::ruling::CertifiedRuling>
+    {
+        let evidence = self.certified_ruling_side.as_ref()?;
+        (self.shared_edge.is_none() && evidence.piece_id == self.id
+            && evidence.parameters == [self.t0, self.t1]
+            && evidence.vertices == [self.start_vertex_id, self.end_vertex_id]
+            && self.support_faces == supports
+            && evidence.support_faces == supports
+            && brep_geometry::certified_planar::ruling::same_curve(&self.curve, &evidence.minted_curve)
+            && self.pcurves.len() == evidence.minted_pcurves.len()
+            && self.pcurves.iter().zip(&evidence.minted_pcurves).all(|(a,b)|
+                a.operand == b.operand && a.face_id == b.face_id
+                && brep_geometry::certified_planar::ruling::same_curve(&a.pcurve, &b.pcurve))
+            && evidence.certificate.accepts_subcurve(&self.curve)
+            && evidence.certificate.matches_surfaces(charts[0], charts[1]))
+            .then_some(&evidence.certificate)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ImprintPieceRecord {
     pub id: u64,
@@ -423,6 +457,8 @@ pub struct ImprintPieceRecord {
     /// historical behaviour; also what `BREP_SHARED_SECTION_EDGE=0` forces).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared_edge: Option<(u8, u64, bool)>,
+    #[serde(skip)]
+    pub certified_ruling_side: Option<CertifiedRulingPiece>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -638,3 +674,4 @@ mod pierce_clear;
 #[path = "imprint/intersection_cache.rs"]
 pub mod intersection_cache;
 use intersection_cache::intersect as intersect_curve_surface;
+

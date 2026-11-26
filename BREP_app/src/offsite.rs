@@ -241,7 +241,7 @@ mod web {
             return;
         }
         STATE.with(|s| *s.borrow_mut() = State::Asking);
-        ehttp::fetch(ehttp::Request::get("/cad/config"), move |result| {
+        crate::net::fetch(crate::net::Request::get("/cad/config"), move |result| {
             let policy = result
                 .ok()
                 .filter(|r| r.ok)

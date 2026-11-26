@@ -389,7 +389,12 @@ impl EngineState {
         // field now picks a construction plane through the ORDINARY candidate
         // list — including one sitting under a face, which the geometry-miss
         // fallback below could never reach.
-        match self.pick_top_at(x, y, &filter) {
+        //
+        // The click takes the TOP row of the same list the field's pick list
+        // shows, so a field that admits COMPONENT (an assembly pattern's seed
+        // components) takes the component owning the geometry under the
+        // cursor: the raw pick never holds a COMPONENT row of its own.
+        match self.ref_select_candidates_at(x, y).into_iter().next() {
             Some(hit) => self.ref_select_take_candidate(&hit),
             None => self.ref_select_take_miss(x, y, &filter),
         }
@@ -418,10 +423,20 @@ impl EngineState {
             return Vec::new();
         }
         let filter = &state.filter;
-        self.pick_candidates_at(x, y)
-            .into_iter()
+        let raw = self.pick_candidates_at(x, y);
+        let mut out: Vec<pick::PickCandidate> = raw
+            .iter()
             .filter(|c| filter.is_empty() || self.candidate_admitted(filter, c))
-            .collect()
+            .cloned()
+            .collect();
+        // A field that admits COMPONENT lists the component owning any hit
+        // (ranked last, so a SOLID or FACE the field also admits keeps the
+        // plain click). An empty filter admits every raw kind already.
+        if filter.iter().any(|k| k.eq_ignore_ascii_case("COMPONENT")) {
+            out.extend(self.component_candidates(&raw));
+            super::plane_pick::sort_pick_candidates(&mut out);
+        }
+        out
     }
 
     /// Whether `candidate` is already in the running reference list — the pick
@@ -921,6 +936,25 @@ impl EngineState {
                     };
                     selected.entry(bucket.to_string()).or_insert_with(|| names.clone());
                 }
+                // A COMPONENT pick names the component (`ACOMP3`): it lights
+                // through its member solids, as the selection's promotion does.
+                if state.filter.iter().any(|k| k.eq_ignore_ascii_case("COMPONENT")) {
+                    let mut solids: Vec<serde_json::Value> = selected
+                        .get("solids")
+                        .and_then(|v| v.as_array().cloned())
+                        .unwrap_or_default();
+                    for name in &state.names {
+                        for member in self.component_member_solids(name) {
+                            let member = serde_json::Value::String(member);
+                            if !solids.contains(&member) {
+                                solids.push(member);
+                            }
+                        }
+                    }
+                    if !solids.is_empty() {
+                        selected.insert("solids".to_string(), serde_json::Value::Array(solids));
+                    }
+                }
                 // No highlightable kind in the filter → fall back to solids (the
                 // prior default) so at least solid-name picks still light up.
                 if selected.is_empty() {
@@ -1189,6 +1223,39 @@ impl EngineState {
         }
     }
 
+    /// One COMPONENT candidate per assembly component owning any of the `raw`
+    /// hits (name = component id), carrying its NEAREST member hit's
+    /// depth/position (raw hits are kind-major, so all are scanned). A PLANE
+    /// hit owns no component. Shared by the pick list
+    /// ([`candidates_filtered_at`](Self::candidates_filtered_at)) and a
+    /// reference field that admits COMPONENT
+    /// ([`ref_select_candidates_at`](Self::ref_select_candidates_at)).
+    pub(super) fn component_candidates(&self, raw: &[pick::PickCandidate]) -> Vec<pick::PickCandidate> {
+        let mut components: Vec<pick::PickCandidate> = Vec::new();
+        for hit in raw {
+            let Some(owner) = self.hit_owning_component(hit) else {
+                continue;
+            };
+            match components.iter_mut().find(|c| c.name == owner) {
+                Some(entry) => {
+                    if hit.depth < entry.depth {
+                        entry.depth = hit.depth;
+                        entry.position = hit.position;
+                    }
+                }
+                None => components.push(pick::PickCandidate {
+                    kind: pick::PickKind::Component,
+                    name: owner,
+                    solid: String::new(),
+                    depth: hit.depth,
+                    screen_dist: hit.screen_dist,
+                    position: hit.position,
+                }),
+            }
+        }
+        components
+    }
+
     /// The same ranked, filter-respecting candidate list as typed values (the
     /// in-process egui pick-list popup consumes these directly, then re-hovers /
     /// selects a chosen one via [`hover_candidate`](Self::hover_candidate) /
@@ -1222,31 +1289,7 @@ impl EngineState {
             .cloned()
             .collect();
         if component_on {
-            // One entry per owning component, carrying its NEAREST member hit's
-            // depth/position (raw hits are kind-major, so scan them all).
-            let mut components: Vec<pick::PickCandidate> = Vec::new();
-            for hit in &raw {
-                let Some(owner) = self.hit_owning_component(hit) else {
-                    continue;
-                };
-                match components.iter_mut().find(|c| c.name == owner) {
-                    Some(entry) => {
-                        if hit.depth < entry.depth {
-                            entry.depth = hit.depth;
-                            entry.position = hit.position;
-                        }
-                    }
-                    None => components.push(pick::PickCandidate {
-                        kind: pick::PickKind::Component,
-                        name: owner,
-                        solid: String::new(),
-                        depth: hit.depth,
-                        screen_dist: hit.screen_dist,
-                        position: hit.position,
-                    }),
-                }
-            }
-            out.extend(components);
+            out.extend(self.component_candidates(&raw));
         }
         // Category-major (PickKind's discriminant order IS the pick-list order),
         // nearest first within a category — the shared ordering every pick path

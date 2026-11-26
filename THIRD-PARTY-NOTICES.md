@@ -83,7 +83,7 @@ of them, across every target and including dev-dependencies).
 | --- | --- | --- | --- |
 | `epaint_default_fonts` | `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0` | `egui` / `eframe` | native + wasm |
 | `unicode-ident` | `(MIT OR Apache-2.0) AND Unicode-3.0` | `wgpu` → `naga` | native + wasm |
-| `ring` | `Apache-2.0 AND ISC` | `ehttp` → `ureq` → `rustls` | native only |
+| `ring` | `Apache-2.0 AND ISC` | `ureq` → `rustls` | native only |
 | `dpi` | `Apache-2.0 AND MIT` | `eframe` → `winit` | native only |
 
   Only `epaint_default_fonts` conjoins *font* licences, which is why it gets the

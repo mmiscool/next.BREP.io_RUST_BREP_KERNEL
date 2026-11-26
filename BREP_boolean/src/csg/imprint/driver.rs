@@ -1524,6 +1524,7 @@ fn build_imprints_with_carrier_seeds(
         edge_splits: HashMap::default(),
         marched_pieces: HashSet::default(),
         exact_section: false,
+        pending_ruling: None,
         external_touch_only: false,
         emitted_pcurves: HashSet::default(),
         exact_pcurve_check: false,
@@ -1778,6 +1779,23 @@ fn build_imprints_with_carrier_seeds(
                     _=>None,
                 }
             } else {None};
+            let ruling_on = crate::switch!("BREP_SECTOR_EXTRUSION_RULING_SIDE", true);
+            let ruling_check = crate::switch!("BREP_SECTOR_EXTRUSION_RULING_SIDE_CHECK", false);
+            let rulings = if (ruling_on || ruling_check) && certified_on {
+                match (first.face.surface.linear_extrusion(), second.face.surface.linear_extrusion()) {
+                    (Some(a), Some(b)) if a.profile.degree > 1 && b.profile.degree > 1 =>
+                        brep_geometry::certified_planar::ruling::sections(first.chart(), second.chart(), options.tolerance),
+                    _ => None,
+                }
+            } else { None };
+            if ruling_check {
+                eprintln!("SECTOR_EXTRUSION_RULING_SIDE pair={}x{} old={:?} certified={:?} applied={}",
+                    first.face.id, second.face.id, certified_sections.as_ref().map(Vec::len),
+                    rulings.as_ref().map(Vec::len), ruling_on && rulings.is_some());
+            }
+            let rulings = if ruling_on { rulings } else { None };
+            let certified_sections = rulings.as_ref().map(|rs| rs.iter().map(|r| r.curve().clone()).collect())
+                .or(certified_sections);
             let witness_apart = certified_on && certified_sections.is_some();
             if certified_check {
                 if let Some(sections)=&certified_sections {
@@ -2020,7 +2038,8 @@ fn build_imprints_with_carrier_seeds(
                 }
                 let lane_fits = profile.enabled.then(crate::PcurveFitScope::open);
                 builder.exact_section = true;
-                for curve in curves {
+                for (index, curve) in curves.into_iter().enumerate() {
+                    builder.pending_ruling = rulings.as_ref().and_then(|rs| rs.get(index)).cloned();
                     let processed = builder.process_curve(
                         curve,
                         first,
@@ -4920,6 +4939,7 @@ fn split_pieces_at_tangent_ends(
                 pcurves: left_pcurves,
                 support_faces: piece.support_faces,
                 shared_edge: None,
+                certified_ruling_side: None,
             },
         );
         builder.pieces.insert(
@@ -4934,6 +4954,7 @@ fn split_pieces_at_tangent_ends(
                 pcurves: right_pcurves,
                 support_faces: piece.support_faces,
                 shared_edge: None,
+                certified_ruling_side: None,
             },
         );
         // Re-examine the halves: a run may end on the same piece twice.

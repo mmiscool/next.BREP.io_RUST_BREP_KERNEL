@@ -1205,6 +1205,7 @@ pub(super) fn merge_pair_imprint(
                 operand: remap_operand(face.operand),
                 face_id: face.face_id,
             }),
+            certified_ruling_side: None,
             shared_edge: piece
                 .shared_edge
                 .map(|(operand, edge_id, aligned)| (remap_operand(operand), edge_id, aligned)),
@@ -3304,6 +3305,7 @@ pub(super) fn translate_composite_imprint(
             pcurves,
             support_faces: [face(&piece.support_faces[0])?, face(&piece.support_faces[1])?],
             shared_edge,
+            certified_ruling_side: None,
         });
     }
     for by_face in record.by_face {

@@ -1,7 +1,6 @@
 //! Backups and exports over HTTP — administrators only. The work is in
 //! [`crate::backup`].
 
-use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
@@ -43,19 +42,7 @@ async fn stream_file(path: &std::path::Path, name: &str, media: &'static str, re
     if remove {
         let _ = tokio::fs::remove_file(path).await;
     }
-    let stream = futures_util::stream::unfold(file, |mut file| async move {
-        use tokio::io::AsyncReadExt;
-        let mut buffer = vec![0u8; 256 * 1024];
-        match file.read(&mut buffer).await {
-            Ok(0) => None,
-            Ok(n) => {
-                buffer.truncate(n);
-                Some((Ok::<_, std::io::Error>(buffer), file))
-            }
-            Err(e) => Some((Err(e), file)),
-        }
-    });
-    let mut response = Body::from_stream(stream).into_response();
+    let mut response = super::body_io::file_body(file, 256 * 1024).into_response();
     let h = response.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(media));
     h.insert(header::CONTENT_LENGTH, HeaderValue::from(size));

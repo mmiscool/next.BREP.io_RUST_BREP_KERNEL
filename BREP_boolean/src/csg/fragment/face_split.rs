@@ -3148,7 +3148,37 @@ fn fragment_face_arranged(
     }
     profile.dedup_bridge += profile.lap(lap_start);
     profile.arranged_faces += 1;
-    let regions = arrange_segments(&segments, arrangement_tolerance).or_refuse(KernelStage::Fragment, "arrange_segments")?;
+    // LENS PAIRS APART (`BREP_LENS_PAIR_APART`, default on, `=0` restores;
+    // `BREP_LENS_PAIR_APART_CHECK` reports the pairs and keeps the plain
+    // arrangement): on a lens's face, two open chains sharing both ends and
+    // parting on one side between them (a cap's rim and the other prism's
+    // section a hair inside it, both sampled at one set of stations) are
+    // arranged apart in the zone beside each end where their polylines run
+    // within four tolerances of each other, meeting there only at the end. Near each end the two run
+    // within the arrangement's tolerance, and the plain arrangement made a
+    // node of two samples there, or of two chords crossing at a grazing
+    // angle, a chord away from the true crossing: the runs ended there and
+    // the loop's vertex stood 0.025 off its edge.
+    let lens_apart_on = lens_face && crate::switch!("BREP_LENS_PAIR_APART", true);
+    let lens_apart_check = lens_face && crate::switch!("BREP_LENS_PAIR_APART_CHECK", false);
+    let lens_pairs: Vec<crate::LensPair> = if lens_apart_on || lens_apart_check {
+        let shapes: Vec<(Vec2, Vec2, &[(Vec2, Vec2)])> = chains.iter().map(|chain| (chain.start, chain.end, chain.segments.as_slice())).collect();
+        let pairs = lens_pairs(&shapes, arrangement_tolerance);
+        if lens_apart_check && !pairs.is_empty() {
+            let shown: Vec<(u64, u64, f64, f64)> = pairs.iter().map(|pair| (pair.first, pair.second, pair.ends[0].2, pair.ends[1].2)).collect();
+            eprintln!("lens pairs apart: face {} pairs (first, second, start zone, end zone) {shown:?}", face.id);
+        }
+        pairs
+    } else {
+        Vec::new()
+    };
+    let regions = if lens_apart_on && !lens_pairs.is_empty() {
+        let chain_of: Vec<u64> = segments.iter().map(|segment| tag_chain(&segment.tag).unwrap_or(u64::MAX)).collect();
+        let apart = crate::LensApart { chain_of: &chain_of, pairs: &lens_pairs };
+        crate::arrange_segments_lens_apart(&segments, arrangement_tolerance, &apart).or_refuse(KernelStage::Fragment, "arrange_segments")?
+    } else {
+        arrange_segments(&segments, arrangement_tolerance).or_refuse(KernelStage::Fragment, "arrange_segments")?
+    };
     profile.arrange += profile.lap(lap_start);
     profile.region_faces += 1;
     // Orient every rebuilt loop the way the SOURCE face's own loops are
@@ -3757,4 +3787,81 @@ pub fn fragment_solid_profiled(
 /// bridge (see RIM BRIDGE in `fragment_face_arranged`).
 fn rim_bridge_enabled() -> bool {
     crate::switch!("BREP_RIM_BRIDGE", true)
+}
+
+/// The lens pairs among `chains` (start, end, segments) that an arrangement
+/// at `tolerance` keeps apart in their end zones (`BREP_LENS_PAIR_APART`):
+/// two open chains sharing both ends (within ten tolerances), every sample of
+/// each farther than the tolerance from the other standing on one side of it,
+/// and the samples within the tolerance only running unbroken from the two
+/// ends. Each end's zone runs out to the first sample of either chain
+/// standing farther than four tolerances from the other.
+pub(crate) fn lens_pairs(chains: &[(Vec2, Vec2, &[(Vec2, Vec2)])], tolerance: f64) -> Vec<crate::LensPair> {
+    let (meet, zone_band) = (10.0 * tolerance, 4.0 * tolerance);
+    // The distance from `point` to a polyline, signed by the side of the
+    // nearest segment it stands on.
+    let signed_to = |point: Vec2, segments: &[(Vec2, Vec2)]| -> (f64, f64) {
+        let mut best = (f64::INFINITY, 0.0);
+        for (a, b) in segments {
+            let span = b.sub(*a);
+            let squared = span.dot(span);
+            let t = if squared > 0.0 { (point.sub(*a).dot(span) / squared).clamp(0.0, 1.0) } else { 0.0 };
+            let foot = Vec2 { x: a.x + span.x * t, y: a.y + span.y * t };
+            let distance = point.sub(foot).length();
+            if distance < best.0 {
+                let side = span.x * (point.y - a.y) - span.y * (point.x - a.x);
+                best = (distance, side.signum());
+            }
+        }
+        best
+    };
+    let points_of = |segments: &[(Vec2, Vec2)]| -> Vec<Vec2> { segments.iter().map(|(a, _)| *a).chain(segments.last().map(|(_, b)| *b)).collect() };
+    // How far from its first point a polyline (read from one end) runs until
+    // a sample stands farther than the zone band from the other.
+    let zone_from = |points: &[Vec2], other: &[(Vec2, Vec2)]| -> Option<f64> {
+        let end = points[0];
+        points.iter().skip(1).find(|point| signed_to(**point, other).0 > zone_band).map(|point| point.sub(end).length())
+    };
+    let one_side = |segments: &[(Vec2, Vec2)], other: &[(Vec2, Vec2)]| -> bool {
+        let readings: Vec<(f64, f64)> = points_of(segments).iter().map(|point| signed_to(*point, other)).collect();
+        let close = |reading: &(f64, f64)| reading.0 <= tolerance;
+        let head = readings.iter().take_while(|reading| close(reading)).count();
+        let tail = readings.iter().rev().take_while(|reading| close(reading)).count();
+        if head + tail >= readings.len() {
+            return false;
+        }
+        let middle = &readings[head..readings.len() - tail];
+        let sign = middle[0].1;
+        sign != 0.0 && middle.iter().all(|reading| !close(reading) && reading.1 == sign)
+    };
+    let mut pairs = Vec::new();
+    for i in 0..chains.len() {
+        for j in (i + 1)..chains.len() {
+            let ((a_start, a_end, a), (b_start, b_end, b)) = (chains[i], chains[j]);
+            if a.len() < 2 || b.len() < 2 {
+                continue;
+            }
+            let open = |start: Vec2, end: Vec2| start.sub(end).length() > meet;
+            let same = a_start.sub(b_start).length() <= meet && a_end.sub(b_end).length() <= meet;
+            let reversed = a_start.sub(b_end).length() <= meet && a_end.sub(b_start).length() <= meet;
+            if !(open(a_start, a_end) && open(b_start, b_end) && (same || reversed)) {
+                continue;
+            }
+            // A side change anywhere is a crossing of the chains themselves
+            // (two exact polylines 3e-7 apart crossing twice beside an end),
+            // and a contact inside the tolerance away from the ends is one
+            // the samples cannot tell from a crossing: either way the pair is
+            // arranged plainly.
+            if !(one_side(a, b) && one_side(b, a)) {
+                continue;
+            }
+            let (a_points, b_points) = (points_of(a), points_of(b));
+            let reversed_points = |points: &[Vec2]| -> Vec<Vec2> { points.iter().rev().copied().collect() };
+            let (b_from_a_start, b_from_a_end) = if same { (b_points.clone(), reversed_points(&b_points)) } else { (reversed_points(&b_points), b_points.clone()) };
+            let zone = |a_points: &[Vec2], b_points: &[Vec2]| -> Option<f64> { Some(zone_from(a_points, b)?.max(zone_from(b_points, a)?)) };
+            let (Some(start_zone), Some(end_zone)) = (zone(&a_points, &b_from_a_start), zone(&reversed_points(&a_points), &b_from_a_end)) else { continue };
+            pairs.push(crate::LensPair { first: i as u64, second: j as u64, ends: [(a_start, meet, start_zone), (a_end, meet, end_zone)] });
+        }
+    }
+    pairs
 }

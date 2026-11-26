@@ -47,6 +47,7 @@ pub mod icon_text;
 pub mod icons;
 pub mod instructions;
 mod http;
+mod net;
 /// The native binary's `log` sink (`main.rs`): `RUST_LOG` to stderr. Replaces
 /// `env_logger`; the wasm build logs through the browser console instead.
 #[cfg(not(target_arch = "wasm32"))]

@@ -247,6 +247,7 @@ pub(super) fn imprint_tangent_rim_cuts(
             pcurves: vec![FacePcurve { operand: cut_key.operand, face_id: cut_key.face_id, pcurve: planned.pcurve }],
             support_faces: [cut_key, rim_key],
             shared_edge: None,
+                certified_ruling_side: None,
         });
         if let Some(entry) = imprint
             .by_face

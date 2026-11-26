@@ -1362,6 +1362,10 @@ fn loop_area(region: &Region, arcs: &[Arc]) -> f64 {
     area
 }
 
+fn sliver_holes_on() -> bool {
+    crate::switch!("BREP_PLANAR_REGION_SLIVER_HOLES", true)
+}
+
 /// Extrude the loops (outer loops with the holes inside them) over the clip's
 /// axial range: one solid per outer loop.
 fn extrude(region: &Region, loops: &[Vec<Arc>], axial: [f64; 2], lift: &dyn Fn(P2, f64) -> Vec3) -> Result<Vec<BrepSolid>, KernelRefusal> {
@@ -1381,7 +1385,20 @@ fn extrude(region: &Region, loops: &[Vec<Arc>], axial: [f64; 2], lift: &dyn Fn(P
         inside
     };
     let mut groups: Vec<(usize, Vec<usize>)> = outers.iter().map(|&o| (o, Vec::new())).collect();
-    for h in (0..loops.len()).filter(|&k| areas[k] <= 0.0) {
+    // `BREP_PLANAR_REGION_SLIVER_HOLES` (default on; `=0` restores the refusal): a "loop" shorter in all
+    // than the model tolerance has no extent; it is a fragment of a boundary
+    // arc the tracing left over, not a hole (a block turned more than half
+    // round left one arc 2.8e-8 long, its ends 2.8e-8 apart, whose Green's
+    // area against the origin read -5.6e-8, and no outer loop held it).
+    let sliver = |k: usize| -> bool {
+        if !sliver_holes_on() {
+            return false;
+        }
+        let pts: Vec<P2> = loops[k].iter().flat_map(|arc| (0..=64).map(move |i| region.eval(arc.kind, arc.a + (arc.b - arc.a) * i as f64 / 64.0))).collect();
+        let length: f64 = pts.windows(2).map(|w| ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2)).sqrt()).sum();
+        length <= 1e-7 * region.scale
+    };
+    for h in (0..loops.len()).filter(|&k| areas[k] <= 0.0 && !sliver(k)) {
         let p = loops[h][0].start;
         let owner = groups.iter_mut().filter(|g| holds(g.0, p)).min_by(|a, b| areas[a.0].total_cmp(&areas[b.0]));
         match owner {

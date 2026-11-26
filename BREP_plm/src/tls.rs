@@ -14,6 +14,7 @@ use axum::extract::ConnectInfo;
 use axum::Router;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -42,7 +43,9 @@ pub fn load(cert: &Path, key: &Path) -> Result<ServerConfig, String> {
     Ok(config)
 }
 
-/// Serve `app` over TLS on `listener` until `shutdown` resolves.
+/// Serve `app` over TLS on `listener` until `shutdown` resolves. HTTP/1.1
+/// without upgrades: the PLM's router has no upgrade route, and each stream is
+/// kept by its task so it can be closed cleanly (see [`close_gracefully`]).
 pub async fn serve(
     listener: TcpListener,
     app: Router,
@@ -68,16 +71,54 @@ pub async fn serve(
             // A client that never finishes the handshake must not hold a task
             // forever.
             let handshake = tokio::time::timeout(std::time::Duration::from_secs(15), acceptor.accept(stream)).await;
-            let Ok(Ok(tls)) = handshake else { return };
+            let Ok(Ok(mut tls)) = handshake else { return };
             let service = app.map_request(move |mut request: axum::http::Request<hyper::body::Incoming>| {
                 request.extensions_mut().insert(ConnectInfo::<SocketAddr>(peer));
                 request
             });
+            // Served over a borrow of the stream, so it is this task's to
+            // close however the connection ends: after the last response, and
+            // after an error hyper answered itself (a malformed request's 400).
             let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(tls), TowerToHyperService::new(service))
-                .with_upgrades()
+                .serve_connection(TokioIo::new(&mut tls), TowerToHyperService::new(service))
                 .await;
+            close_gracefully(tls).await;
         });
     }
+}
+
+/// How long, and how much, a closing connection reads of what its client
+/// still sends.
+const LINGER: std::time::Duration = std::time::Duration::from_secs(3);
+const LINGER_BYTES: usize = 8 << 20;
+
+/// Close a TLS connection so its last response reaches the client. A handler
+/// may answer before reading the request's body (a refusal); dropping the
+/// stream then closes the socket with the client's unread body in it, the
+/// kernel answers with a reset, and the client's kernel discards the response
+/// it had not read yet (curl's 000, 28 of 30 refused 300 KB uploads). So the
+/// write side is shut first (close_notify, then a TCP half-close the client
+/// can still send into), and the rest of what it sends is read and dropped
+/// until it closes, for at most `LINGER` and `LINGER_BYTES`.
+async fn close_gracefully<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(mut tls: S) {
+    if tls.shutdown().await.is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(LINGER, async {
+        let mut buf = vec![0u8; 16 << 10];
+        let mut total = 0usize;
+        loop {
+            match tls.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total += n;
+                    if total >= LINGER_BYTES {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
 }
 

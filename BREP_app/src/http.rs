@@ -31,7 +31,7 @@ pub(crate) fn fetch_text_into(ctx: &egui::Context, url: String, tx: Sender<Resul
     fetch_into(ctx, url, text_of, tx);
 }
 
-fn text_of(response: ehttp::Response) -> String {
+fn text_of(response: crate::net::Response) -> String {
     response
         .text()
         .map(str::to_owned)
@@ -46,7 +46,7 @@ pub(crate) fn fetch_bytes(ctx: &egui::Context, url: String) -> Receiver<Result<V
 fn fetch<T: Send + 'static>(
     ctx: &egui::Context,
     url: String,
-    decode: impl FnOnce(ehttp::Response) -> T + Send + 'static,
+    decode: impl FnOnce(crate::net::Response) -> T + Send + 'static,
 ) -> Receiver<Result<T, String>> {
     let (tx, rx) = channel();
     fetch_into(ctx, url, decode, tx);
@@ -57,11 +57,11 @@ fn fetch<T: Send + 'static>(
 fn fetch_into<T: Send + 'static>(
     ctx: &egui::Context,
     url: String,
-    decode: impl FnOnce(ehttp::Response) -> T + Send + 'static,
+    decode: impl FnOnce(crate::net::Response) -> T + Send + 'static,
     tx: Sender<Result<T, String>>,
 ) {
     let ctx = ctx.clone();
-    ehttp::fetch(ehttp::Request::get(url), move |result| {
+    crate::net::fetch(crate::net::Request::get(url), move |result| {
         let out = match result {
             Ok(response) if response.ok => Ok(decode(response)),
             Ok(response) => Err(format!("HTTP {} {}", response.status, response.status_text)),

@@ -328,6 +328,7 @@ pub(super) struct ImprintBuilder<'a> {
     /// `BREP_EXACT_TANGENT_TOUCH`, its tangential hits on an edge it touches in
     /// passing are junctions, not grazes. See TANGENT TOUCH in `process_curve`.
     pub(super) exact_section: bool,
+    pub(super) pending_ruling: Option<brep_geometry::certified_planar::ruling::CertifiedRuling>,
     /// Set with `exact_section` around a plane's exact iso circle
     /// (`BREP_PLANAR_ISO_TANGENT_TOUCH`): its touch is a junction only where
     /// it is EXTERNAL, the section and a curved edge bending away from each
@@ -794,9 +795,18 @@ impl<'a> ImprintBuilder<'a> {
                 exact_section: self.exact_section, external_touch_only: self.external_touch_only,
                 marched: self.marched_section, accepted: Vec::new(), pieces: Vec::new(),
             });
+        let ruling = self.pending_ruling.take().filter(|r| {
+            let curve_matches = brep_geometry::certified_planar::ruling::same_curve(&curve, r.curve());
+            let charts_match = r.matches_surfaces(first.chart(), second.chart());
+            if crate::switch!("BREP_SECTOR_EXTRUSION_RULING_SIDE_CHECK", false) {
+                eprintln!("RULING_SOURCE pair={:?} curve={} charts={}",
+                    [first.key(),second.key()], curve_matches, charts_match);
+            }
+            curve_matches && charts_match
+        });
         let before = self.pieces.len();
         self.process_curve_impl(curve, first, second, test_faces, target_faces, refine,
-            exact_pcurves, record.as_mut().map(|record| &mut record.accepted))?;
+            exact_pcurves, record.as_mut().map(|record| &mut record.accepted), ruling.as_ref())?;
         if let Some(mut record) = record {
             record.pieces.extend(self.pieces[before..].iter().map(|piece| piece.id));
             self.planar_sections.push(record);
@@ -842,6 +852,14 @@ impl<'a> ImprintBuilder<'a> {
                     record.supports, missing.len(), record.pieces.len());
             }
             let removed: HashSet<_> = record.pieces.iter().copied().collect();
+            if crate::switch!("BREP_SECTOR_EXTRUSION_RULING_SIDE_CHECK", false) {
+                let certified: Vec<_> = self.pieces.iter().filter(|piece|
+                    removed.contains(&piece.id) && piece.certified_ruling_side.is_some())
+                    .map(|piece|piece.id).collect();
+                if !certified.is_empty() {
+                    eprintln!("RULING_REPLAY dropping={:?} pair={:?}", certified, record.supports);
+                }
+            }
             self.pieces.retain(|piece| !removed.contains(&piece.id));
             self.by_face.retain(|_, ids| { ids.retain(|id| !removed.contains(id)); !ids.is_empty() });
             self.marched_pieces.retain(|id| !removed.contains(id));
@@ -856,7 +874,7 @@ impl<'a> ImprintBuilder<'a> {
             self.external_touch_only = record.external_touch_only;
             let before = self.pieces.len();
             let result = self.process_curve_impl(record.curve, first, second, &test_faces,
-                &target_faces, record.refine, record.exact_pcurves, None);
+                &target_faces, record.refine, record.exact_pcurves, None, None);
             self.exact_section = exact;
             self.external_touch_only = external;
             result?;
@@ -883,6 +901,7 @@ impl<'a> ImprintBuilder<'a> {
         refine: bool,
         exact_pcurves: Option<[NurbsCurve; 2]>,
         accepted: Option<&mut Vec<f64>>,
+        ruling: Option<&brep_geometry::certified_planar::ruling::CertifiedRuling>,
     ) -> Result<(), KernelRefusal> {
         super::work_profile::add(|c| c.sections += 1);
         let profile = profile_enabled();
@@ -2062,7 +2081,17 @@ impl<'a> ImprintBuilder<'a> {
                 }
                 continue;
             }
-            let snapped = snap_curve_ends(&piece, start, end)?;
+            // A certified ruling may keep its exact geometry when its
+            // canonical vertices already meet it within model identity.
+            // Moving the curve would invalidate its crossing certificate.
+            let retain_ruling = ruling.is_some_and(|r| r.retains_endpoints(
+                &piece, [start,end], self.tolerance.min(crate::tolerance::DEFAULT_MODEL)));
+            if ruling.is_some() && crate::switch!("BREP_SECTOR_EXTRUSION_RULING_SIDE_CHECK", false) {
+                eprintln!("RULING_RETAIN pair={:?} piece={} retained={} source_subcurve={}",
+                    [first.key(),second.key()], self.next_id, retain_ruling,
+                    ruling.is_some_and(|r|r.accepts_subcurve(&piece)));
+            }
+            let snapped = if retain_ruling { piece.clone() } else { snap_curve_ends(&piece, start, end)? };
             let exact_for = |face: &TaggedFace<'_>| -> Option<&NurbsCurve> {
                 let [on_first, on_second] = piece_pcurves.as_ref()?;
                 if face.key() == first.key() {
@@ -2151,6 +2180,23 @@ impl<'a> ImprintBuilder<'a> {
             }
             minted_ends.push((t0, t1, start, end, start_radius, end_radius));
             super::work_profile::add(|c| c.minted_pieces += 1);
+            let certified_ruling_side = ruling.filter(|r| {
+                let accepted = r.accepts_subcurve(&snapped);
+                if crate::switch!("BREP_SECTOR_EXTRUSION_RULING_SIDE_CHECK", false) {
+                    let xy = r.ruling_xy();
+                    let deltas: Vec<_> = snapped.control_points.iter()
+                        .map(|p| (p.x-xy[0],p.y-xy[1],p.z,p.w)).collect();
+                    let source_z: Vec<_> = r.curve().control_points.iter().map(|p|p.z).collect();
+                    eprintln!("RULING_MINT pair={:?} piece={} accepted={} degree={} xy_delta_z_w={:?} source_z={:?}",
+                        [first.key(),second.key()], id, accepted, snapped.degree, deltas, source_z);
+                }
+                accepted
+            })
+                .map(|r| super::CertifiedRulingPiece {
+                    piece_id: id, parameters: [t0,t1], vertices: [start_vertex_id,end_vertex_id],
+                    certificate: r.clone(), minted_curve: snapped.clone(), minted_pcurves: pcurves.clone(),
+                    support_faces: [first.key(), second.key()],
+                });
             self.pieces.push(ImprintPieceRecord {
                 id,
                 curve: snapped,
@@ -2161,6 +2207,7 @@ impl<'a> ImprintBuilder<'a> {
                 pcurves,
                 support_faces: [first.key(), second.key()],
                 shared_edge: None,
+                certified_ruling_side,
             });
         }
         // Commit the splits a minted sub-segment ends at; the rest were

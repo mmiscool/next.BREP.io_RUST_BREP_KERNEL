@@ -243,7 +243,18 @@ pub fn gone() -> Error {
 }
 
 fn new_code() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    (0..6).map(|_| CODE_ALPHABET[rng.gen_range(0..CODE_ALPHABET.len())] as char).collect()
+    // Uniform over the alphabet: a byte at or above the largest multiple of
+    // its length is drawn again (rejection sampling), so no letter is likelier
+    // than another, as with `gen_range`.
+    let len = CODE_ALPHABET.len();
+    let limit = 256 - 256 % len;
+    let mut code = String::with_capacity(6);
+    let mut byte = [0u8; 1];
+    while code.len() < 6 {
+        crate::auth::fill_random(&mut byte);
+        if (byte[0] as usize) < limit {
+            code.push(CODE_ALPHABET[byte[0] as usize % len] as char);
+        }
+    }
+    code
 }

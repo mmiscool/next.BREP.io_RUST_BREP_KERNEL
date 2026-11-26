@@ -464,6 +464,19 @@ fn sector_class_impl(context: &SectorContext<'_>, fragment: &FaceFragmentRecord,
             }
         }
         let mut coedge_verdict = None;
+        // RULING SIDE (`BREP_SECTOR_EXTRUSION_RULING_SIDE`, default on, `=0` restores;
+        // `_CHECK` logs only): a crossing ruling of two exact extrusions
+        // carries a certified crossing sign from the imprint; the side reads
+        // from it, not from samples, which cannot resolve a crossing angle
+        // below their own foot residual.
+        let (ruling_on, ruling_check) = ruling_side_mode();
+        let ruling = if ruling_on || ruling_check { certified_ruling_class(context, fragment, own, other_key, piece, coedge) } else { None };
+        if ruling_on {
+            if let Some(class) = ruling {
+                coedge_verdict = Some(class);
+            }
+        }
+        if coedge_verdict.is_none() {
         for fraction in SAMPLE_FRACTIONS {
             samples += 1;
             match sample(context, fragment, &coedge.pcurve, t0 + (t1 - t0) * fraction, other, refine_projection)? {
@@ -480,6 +493,13 @@ fn sector_class_impl(context: &SectorContext<'_>, fragment: &FaceFragmentRecord,
                 }
                 Sample::Skip => {}
             }
+        }
+        }
+        if ruling_check && ruling.is_some() && ruling != coedge_verdict {
+            eprintln!(
+                "BREP_SECTOR_EXTRUSION_RULING_SIDE check: operand {} face {} piece {piece_id}: certified {:?}, sampled {:?}",
+                fragment.operand, fragment.source_face_id, ruling, coedge_verdict
+            );
         }
         let Some(class) = coedge_verdict else {
             return Ok(SectorVerdict::declined("undecided", ladder_steps, samples));
@@ -498,6 +518,118 @@ fn sector_class_impl(context: &SectorContext<'_>, fragment: &FaceFragmentRecord,
     Ok(SectorVerdict { class: verdict, route, ladder_steps, samples })
 }
 
+/// (applied, check-only) for `BREP_SECTOR_EXTRUSION_RULING_SIDE` (default on,
+/// `=0` restores the sampled reading): on applies the certified ruling side;
+/// with it `=0`, `_CHECK=1` only logs where the two differ.
+fn ruling_side_mode() -> (bool, bool) {
+    let on = crate::switch!("BREP_SECTOR_EXTRUSION_RULING_SIDE", true);
+    let check = crate::switch!("BREP_SECTOR_EXTRUSION_RULING_SIDE_CHECK", false);
+    (on, check && !on)
+}
+
+/// The side of `fragment` at its section coedge `coedge` (imprint piece
+/// `piece`) from the piece's certified crossing ruling, or `None` when the
+/// piece carries none that validates against its two support charts, or the
+/// coedge does not provably run along that ruling.
+///
+/// On two extrusions along Z, with chart normals `f_k (P_k' x Z)` (`f_k` the
+/// certificate's normal factors), oriented by each face's sense `σ`, and the
+/// coedge running `q Z`, the sector's binormal is `-q σ_own f_own P_own'` and
+/// its side reading against the other normal is
+/// `-q σ_own σ_other f_0 f_1 cross2(P_own', P_other')`; the certificate's
+/// crossing sign is `cross2(P_0', P_1')`, negated when this face is support 1.
+/// Positive is Out, as in [`sample`].
+fn certified_ruling_class(
+    context: &SectorContext<'_>,
+    fragment: &FaceFragmentRecord,
+    own: FaceKey,
+    other_key: FaceKey,
+    piece: &ImprintPieceRecord,
+    coedge: &crate::fragment::FragmentCoedge,
+) -> Option<PointClass> {
+    let supports = piece.support_faces;
+    let index = supports.iter().position(|key| *key == own)?;
+    if supports[1 - index] != other_key {
+        return None;
+    }
+    let charts = [&context.faces.get(&supports[0])?.surface, &context.faces.get(&supports[1])?.surface];
+    let ruling = piece.certified_ruling(supports, charts)?;
+    let other_face = context.faces.get(&other_key)?;
+    ruling_side(
+        RulingFacts {
+            crossing_sign: ruling.crossing_sign(),
+            normal_factors: ruling.normal_factors(),
+            profile_is_u: ruling.profile_is_u()[index],
+            sweep_sign: ruling.sweep_sign()[index],
+            profile_box: ruling.profile_boxes()[index],
+        },
+        index,
+        &coedge.pcurve,
+        fragment.same_sense,
+        other_face.same_sense,
+    )
+}
+
+/// What [`ruling_side`] reads from a validated certificate, for the face that
+/// is support `index` of the ruling's piece.
+#[derive(Clone, Copy, Debug)]
+struct RulingFacts {
+    crossing_sign: i8,
+    normal_factors: [i8; 2],
+    profile_is_u: bool,
+    sweep_sign: i8,
+    profile_box: [f64; 2],
+}
+
+/// The side of a fragment at a certified ruling it borders, from the
+/// certificate's facts for its own support `index` (0 or 1), the bordering
+/// coedge's `pcurve` (in traversal direction) and the two faces' senses.
+fn ruling_side(facts: RulingFacts, index: usize, pcurve: &NurbsCurve, own_same_sense: bool, other_same_sense: bool) -> Option<PointClass> {
+    if index > 1 {
+        return None;
+    }
+    // The coedge's direction along Z: its pcurve moves only in the chart's
+    // sweep coordinate, and the sign of that motion is certified by a
+    // strictly one-signed control polygon (the sign of a floating-point
+    // difference is exact). Unit weights only, as the producer: then the
+    // control coordinates are the chart parameters the boxes bound.
+    if pcurve.control_points.iter().any(|point| point.w != 1.0) {
+        return None;
+    }
+    let profile_is_u = facts.profile_is_u;
+    let sweep = |point: &crate::Vec4| if profile_is_u { point.y } else { point.x };
+    let profile = |point: &crate::Vec4| if profile_is_u { point.x } else { point.y };
+    let mut direction = 0i8;
+    for pair in pcurve.control_points.windows(2) {
+        let step = sweep(&pair[1]) - sweep(&pair[0]);
+        let here = if step > 0.0 { 1 } else if step < 0.0 { -1 } else { return None };
+        if direction == 0 {
+            direction = here;
+        } else if direction != here {
+            return None;
+        }
+    }
+    if direction == 0 {
+        return None;
+    }
+    // The coedge lies on the certified ruling: its profile coordinate stays
+    // inside the certified parameter box (a control-polygon hull bound).
+    let [low, high] = facts.profile_box;
+    if pcurve.control_points.iter().any(|point| !(profile(point) >= low && profile(point) <= high)) {
+        return None;
+    }
+    let q = direction * facts.sweep_sign;
+    let sense = |same: bool| if same { 1i8 } else { -1 };
+    let [f0, f1] = facts.normal_factors;
+    let crossing = if index == 0 { facts.crossing_sign } else { -facts.crossing_sign };
+    let side = -crossing * f0 * f1 * sense(own_same_sense) * sense(other_same_sense) * q;
+    match side {
+        1 => Some(PointClass::Out),
+        -1 => Some(PointClass::In),
+        _ => None,
+    }
+}
+
 /// `BREP_SECTOR_CENSUS=<file>`: one line per eligible fragment in check mode
 /// and one per selection, labelled by `BREP_CENSUS_LABEL`.
 pub fn sector_census_line(line: impl FnOnce() -> String) {
@@ -509,6 +641,7 @@ pub fn sector_census_line(line: impl FnOnce() -> String) {
         }
     }
 }
+
 
 
 

@@ -53,7 +53,7 @@ pub(crate) fn open_session(
     local: Rc<dyn StoreBackend>,
 ) -> PlmFuture<Rc<dyn StoreBackend>> {
     Box::pin(async move {
-        let client = Rc::new(PlmClient::new(Rc::new(super::transport::EhttpTransport::new(config.url.clone()))));
+        let client = Rc::new(PlmClient::new(Rc::new(super::transport::HttpTransport::new(config.url.clone()))));
         let Some(token) = config.token.as_deref() else {
             return Err(PlmError::SignIn(format!("no token for {}: paste one, or sign in with a password", config.url)).to_string());
         };
@@ -78,7 +78,7 @@ pub(crate) async fn open_web_session(local: Rc<dyn StoreBackend>) -> Result<Opti
     if !served_by_plm(&path) {
         return Ok(None);
     }
-    let client = Rc::new(PlmClient::new(Rc::new(super::transport::EhttpTransport::new(origin.clone()))));
+    let client = Rc::new(PlmClient::new(Rc::new(super::transport::HttpTransport::new(origin.clone()))));
     let me = client.sign_in_with_browser_session().await.map_err(|e| e.to_string())?;
     Ok(Some(compose(client, &origin, &me.username, local)))
 }

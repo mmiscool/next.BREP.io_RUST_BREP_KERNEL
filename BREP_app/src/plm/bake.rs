@@ -286,7 +286,7 @@ async fn report_failed(client: &PlmClient, job: BakeJob, error: String) -> Resul
 /// answer, refused the token, or does not serve this app.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn pass_blocking(url: &str, token: &str, max_jobs: usize) -> Result<Vec<JobOutcome>, String> {
-    let client = PlmClient::new(std::rc::Rc::new(super::transport::EhttpTransport::new(url)));
+    let client = PlmClient::new(std::rc::Rc::new(super::transport::HttpTransport::new(url)));
     let renewal = Renewal::new(url, token, RENEW_EVERY);
     block_on(async {
         client.sign_in_with_token(token).await.map_err(|e| e.to_string())?;
@@ -306,7 +306,7 @@ pub fn pass_spawned(url: &str, token: &str, max_jobs: usize) -> std::sync::Arc<s
     let out = slot.clone();
     let (url, token) = (url.to_string(), token.to_string());
     super::native::spawn(async move {
-        let client = PlmClient::new(std::rc::Rc::new(super::transport::EhttpTransport::new(&url)));
+        let client = PlmClient::new(std::rc::Rc::new(super::transport::HttpTransport::new(&url)));
         let renewal = Renewal::new(&url, &token, RENEW_EVERY);
         let result = async {
             client.sign_in_with_token(&token).await.map_err(|e| e.to_string())?;
@@ -375,14 +375,14 @@ impl Renewal {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     _ => return log,
                 }
-                let request = ehttp::Request {
-                    headers: ehttp::Headers::new(&[
+                let request = crate::net::Request {
+                    headers: crate::net::Headers::new(&[
                         ("Authorization", &format!("Bearer {token}")),
                         ("Content-Type", "application/json"),
                     ]),
-                    ..ehttp::Request::post(url.clone(), b"{}".to_vec())
+                    ..crate::net::Request::post(url.clone(), b"{}".to_vec())
                 };
-                match ehttp::fetch_blocking(&request) {
+                match crate::net::fetch_blocking(&request) {
                     Ok(response) if response.ok => log.renewed += 1,
                     Ok(response) => {
                         // Refused: the claim is not ours to keep any more.
@@ -433,7 +433,7 @@ impl Drop for Renewing {
     }
 }
 
-/// Drive `future` on this thread. ehttp answers on its own thread and wakes
+/// Drive `future` on this thread. net.rs answers on its own thread and wakes
 /// the waker it was polled with, which unparks this one.
 #[cfg(not(target_arch = "wasm32"))]
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -547,7 +547,7 @@ pub fn worker_main(args: impl IntoIterator<Item = String>) -> i32 {
             return 2;
         }
     };
-    let client = PlmClient::new(std::rc::Rc::new(super::transport::EhttpTransport::new(&args.url)));
+    let client = PlmClient::new(std::rc::Rc::new(super::transport::HttpTransport::new(&args.url)));
     match block_on(client.sign_in_with_token(&args.token)) {
         Ok(me) => println!("bake worker: signed in to {} as {}", args.url, me.username),
         Err(e) => {

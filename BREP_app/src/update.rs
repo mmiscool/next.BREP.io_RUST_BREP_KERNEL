@@ -253,7 +253,7 @@ fn server() -> String {
 
 /// The build on offer, if it is signed and not this one.
 fn check(server: &str, os: &str, own_sha: &str) -> Result<Option<Manifest>, String> {
-    let response = ehttp::fetch_blocking(&ehttp::Request::get(format!("{server}/api/public/app-update/{os}")))?;
+    let response = crate::net::fetch_blocking(&crate::net::Request::get(format!("{server}/api/public/app-update/{os}")))?;
     if !response.ok {
         return Err(format!("update check: HTTP {} {}", response.status, response.status_text));
     }
@@ -263,7 +263,7 @@ fn check(server: &str, os: &str, own_sha: &str) -> Result<Option<Manifest>, Stri
 }
 
 fn download_and_install(server: &str, exe: &Path, manifest: &Manifest) -> Result<(), String> {
-    let response = ehttp::fetch_blocking(&ehttp::Request::get(format!("{server}{}", manifest.download_path)))?;
+    let response = crate::net::fetch_blocking(&crate::net::Request::get(format!("{server}{}", manifest.download_path)))?;
     if !response.ok {
         return Err(format!("download: HTTP {} {}", response.status, response.status_text));
     }

@@ -934,6 +934,18 @@ pub fn fillet_edges(
     if let Some(built) = super::pivot_chain::pivot_chain(solid, edge_points, edge_names, radius, chamfer, name) {
         return built;
     }
+    let plate_mode = super::plate_limit::mode();
+    if !chamfer && edge_names.is_none() && name.is_none() && plate_mode != crate::env_read::Mode::Off {
+        if let Some(candidate) = super::plate_limit::build(solid, edge_points, radius)
+            .or_else(|| super::plate_arc_limit::build(solid, edge_points, radius)) {
+            if plate_mode == crate::env_read::Mode::On {
+                return candidate;
+            }
+            let ordinary = fillet_edges_composed(solid, edge_points, edge_names, radius, chamfer, name);
+            eprintln!("fillet.plate_limit ordinary={} candidate={}", ordinary.is_ok(), candidate.is_ok());
+            return ordinary;
+        }
+    }
     // One straight edge of a convex polyhedron chamfered: one plane clip
     // (`planar_clip.rs`, `BREP_CHAMFER_PLANAR_CLIP`).
     if chamfer && edge_points.len() == 1 && edge_names.is_none() {
@@ -4618,15 +4630,21 @@ fn fillet_edges_group_lanes(
                 let entry = if chamfer { "chamfer_edges" } else { "fillet_edges" };
                 check_mixed_concavity(solid, edge_id, entry)?;
                 check_support_extent(solid, edge_id, radius, entry)?;
-                fillet_or_chamfer(
-                    solid,
-                    edge_id,
-                    radius,
-                    chamfer,
-                    edge_name,
-                    ToolEnds::default(),
-                    Lane::CutterFirst,
-                )?
+                if chamfer {
+                    // Cut through its ends where the flush cutter leaves its
+                    // own end cap standing (`BREP_CHAMFER_MITER_THROUGH`).
+                    super::tool::chamfer_miter_unit(solid, edge_id, radius, edge_name)?
+                } else {
+                    fillet_or_chamfer(
+                        solid,
+                        edge_id,
+                        radius,
+                        chamfer,
+                        edge_name,
+                        ToolEnds::default(),
+                        Lane::CutterFirst,
+                    )?
+                }
             };
             combined = match combined {
                 Err(e) => Err(e),

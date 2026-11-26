@@ -2366,7 +2366,7 @@ impl eframe::App for BrepApp {
 
         // --- boot-load (?loadModel=): apply the fetched model once it lands ----
         // Replaces the seed with the URL-specified document (armed in `new`). The
-        // ehttp callback wakes the frame loop, so a plain per-frame drain suffices.
+        // The HTTP callback wakes the frame loop, so a plain per-frame drain suffices.
         // `load_model_and_fit` arms deferred framing; the pump above reframes it
         // next frame. `mark_clean` opens it as a non-dirty document.
         if self.pending_boot_load.is_some() {

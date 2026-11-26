@@ -1,6 +1,11 @@
 //! Complete projected polynomial-curve intersection cover. Unresolved boxes,
 //! tangencies, overlaps and budget exhaustion decline rather than returning
 //! a partial list. This module is not used by the normal intersection path.
+#[path = "certified_planar/crossing_sign.rs"]
+mod crossing_sign;
+#[path = "certified_planar/ruling.rs"]
+pub mod ruling;
+
 use crate::{CurveCurveIntersection, NurbsCurve};
 use std::ops::{Add, Sub, Mul, Neg};
 
@@ -62,7 +67,12 @@ fn midpoint(controls:&[P])->P {
 }
 
 #[derive(Clone)]
-struct Span { controls:Vec<P>, tangents:Vec<P>, start:f64, end:f64 }
+struct Span {
+    controls:Vec<P>, tangents:Vec<P>, start:f64, end:f64,
+    // Optional exact-parameter enclosures, independent of rounded labels.
+    // Only the certificate-producing entry point carries these through splits.
+    parameters:Option<[I;2]>,
+}
 impl Span {
     fn split(self)->Option<(Self,Self)> {
         let middle=self.start*0.5+self.end*0.5;
@@ -91,7 +101,12 @@ impl Span {
             left.push(work[0]);right.push(*work.last()?);
         }
         right.reverse();
-        Some((Self{controls:left,tangents:dl,start:self.start,end:middle},Self{controls:right,tangents:dr,start:middle,end:self.end}))
+        let parameters=self.parameters.map(|[a,b]| {
+            let m=(a+b)*I::point(0.5);
+            ([a,m],[m,b])
+        });
+        Some((Self{controls:left,tangents:dl,start:self.start,end:middle,parameters:parameters.map(|p|p.0)},
+            Self{controls:right,tangents:dr,start:middle,end:self.end,parameters:parameters.map(|p|p.1)}))
     }
     fn bounds(&self)->P {
         [0,1,2].map(|i|I::range(self.controls.iter().map(|p|p[i].lo).fold(f64::INFINITY,f64::min),
@@ -164,7 +179,7 @@ fn spans(curve:&NurbsCurve,derivative_net:bool,origin:Option<[f64;3]>)->Option<V
             let n=I::point((controls.len()-1) as f64);
             controls.windows(2).map(|pair|[0,1,2].map(|i|n*(pair[1][i]-pair[0][i]))).collect()
         } else {Vec::new()};
-        result.push(Span{controls,tangents,start:knots[a],end:knots[b]});
+        result.push(Span{controls,tangents,start:knots[a],end:knots[b],parameters:None});
         if b>=m {break;}
         for i in p-mult..=p {next[i]=points[b-p+i];}
         controls=next;a=b;b+=1;
@@ -324,7 +339,34 @@ fn intersections_with_frames(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64,
     if enabled {candidate} else {base}
 }
 
+/// A complete-cover root together with outward parameter intervals of the
+/// exact input curves. The refined point is not the parameter certificate.
+#[derive(Clone, Debug)]
+pub struct CertifiedCrossing {
+    pub intersection: CurveCurveIntersection,
+    pub parameters: [[f64;2];2],
+}
+
+/// Like [`intersections`], retaining root-parameter enclosures for subsequent
+/// derivative interval reads. These certify the supplied curves only; a
+/// caller that projects or transforms them must account for those operations.
+pub fn intersections_with_certificates(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64)->Option<Vec<CertifiedCrossing>> {
+    let derivative_net=crate::switch!("BREP_CERTIFIED_PROFILE_DERIVATIVE_NET",true);
+    let base=intersections_impl_records(first,second,tolerance,derivative_net,false,true);
+    if base.is_some() || !crate::switch!("BREP_CERTIFIED_PROFILE_LOCAL_FRAME",true) {return base;}
+    intersections_impl_records(first,second,tolerance,derivative_net,true,true)
+}
+
+pub(crate) fn certified_crossing_sign(first:&NurbsCurve,s_box:[f64;2],second:&NurbsCurve,t_box:[f64;2],axes:[usize;2])->Option<i8> {
+    crossing_sign::crossing_sign(first,s_box,second,t_box,axes)
+}
+
 fn intersections_impl(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64,derivative_net:bool,local_frame:bool)->Option<Vec<CurveCurveIntersection>> {
+    intersections_impl_records(first,second,tolerance,derivative_net,local_frame,false)
+        .map(|roots|roots.into_iter().map(|root|root.intersection).collect())
+}
+
+fn intersections_impl_records(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64,derivative_net:bool,local_frame:bool,certificates:bool)->Option<Vec<CertifiedCrossing>> {
     if !tolerance.is_finite() || tolerance<=0. {return None;}
     let mut low=[f64::INFINITY;3];let mut high=[f64::NEG_INFINITY;3];
     for p in first.control_points.iter().chain(&second.control_points) {
@@ -336,6 +378,10 @@ fn intersections_impl(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64,derivat
         area(*a).total_cmp(&area(*b))
     })?;
     let initial_origin=local_frame.then(||[0,1,2].map(|i|low[i]*0.5+high[i]*0.5));
+    let track=|mut span:Span| {
+        if certificates {span.parameters=Some([I::point(span.start),I::point(span.end)]);}
+        span
+    };
     let a=spans(first,derivative_net,initial_origin)?;
     let b=spans(second,derivative_net,initial_origin)?;
     let mut stack=Vec::new();
@@ -353,9 +399,9 @@ fn intersections_impl(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64,derivat
             let origin=[0,1,2].map(|k|origin[k]+px[k].mid()*0.5+py[k].mid()*0.5);
             let xs=spans(first,derivative_net,Some(origin))?;
             let ys=spans(second,derivative_net,Some(origin))?;
-            stack.push((xs[i].clone(),ys[j].clone(),0,Some(origin)));
+            stack.push((track(xs[i].clone()),track(ys[j].clone()),0,Some(origin)));
         } else {
-            stack.push((x.clone(),y.clone(),0,None));
+            stack.push((track(x.clone()),track(y.clone()),0,None));
         }
     }}
     let mut roots=Vec::new();let mut boxes=0;
@@ -375,7 +421,15 @@ fn intersections_impl(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64,derivat
                 }
                 let root=refine(first,second,&a,&b,k,axes,tolerance)?;
                 if !inside(root.point,ea,tolerance) || !inside(second.evaluate(root.t).ok()?,eb,tolerance) {return None;}
-                roots.push(root);continue;
+                let parameters=if certificates {
+                    let bound=|span:&Span,image:I|->Option<[f64;2]> {
+                        let [start,end]=span.parameters?;
+                        let p=start+(end-start)*image;
+                        p.finite().then_some([p.lo,p.hi])
+                    };
+                    [bound(&a,k[0])?,bound(&b,k[1])?]
+                } else {[[root.s,root.s],[root.t,root.t]]};
+                roots.push(CertifiedCrossing{intersection:root,parameters});continue;
             }
             Read::Unknown=>{}
         }
@@ -384,7 +438,7 @@ fn intersections_impl(first:&NurbsCurve,second:&NurbsCurve,tolerance:f64,derivat
         if size(&a)>=size(&b) {let (x,y)=a.split()?;stack.push((x,b.clone(),depth+1,origin));stack.push((y,b,depth+1,origin));}
         else {let (x,y)=b.split()?;stack.push((a.clone(),x,depth+1,origin));stack.push((a,y,depth+1,origin));}
     }
-    roots.sort_by(|a,b|a.s.total_cmp(&b.s).then(a.t.total_cmp(&b.t)));
+    roots.sort_by(|a,b|a.intersection.s.total_cmp(&b.intersection.s).then(a.intersection.t.total_cmp(&b.intersection.t)));
     Some(roots)
 }
 

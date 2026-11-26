@@ -23,7 +23,7 @@
 //!      preview thumbnail, and enter `Phase::Editing` — only NOW is the dialog
 //!      drawn, so the captured frame(s) never contain it.
 //!   3. Submit builds a small multipart body by hand (no extra deps) and fires
-//!      it through `ehttp`; the reply marshals back over an mpsc channel +
+//!      it through `net.rs`; the reply marshals back over an mpsc channel +
 //!      `request_repaint`, exactly like [`crate::panels::step_parts`].
 
 #[path = "bug_report_markup.rs"]
@@ -519,7 +519,7 @@ impl BugReportPanel {
         }
     }
 
-    /// Build the multipart body and fire the POST (native + wasm via ehttp).
+    /// Build the multipart body and fire the POST (native + wasm via net.rs).
     fn send(&mut self, ctx: &egui::Context) {
         // On a PLM-hosted app that does not allow the report site, say so
         // instead of letting the browser refuse the request (crate::offsite).
@@ -536,7 +536,7 @@ impl BugReportPanel {
             &self.model_json,
             self.screenshot_png.as_deref(),
         );
-        let mut req = ehttp::Request::post(REPORT_URL, body);
+        let mut req = crate::net::Request::post(REPORT_URL, body);
         // `Request::post` sets text/plain; replace it with our multipart type.
         req.headers
             .headers
@@ -545,7 +545,7 @@ impl BugReportPanel {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
-        ehttp::fetch(req, move |result| {
+        crate::net::fetch(req, move |result| {
             let out = match result {
                 Ok(resp) if resp.ok => Ok(crate::report_followup::id_of_reply(&resp.bytes)),
                 Ok(resp) => Err(format!("HTTP {} {}", resp.status, resp.status_text)),
@@ -685,8 +685,8 @@ fn compose_description(description: &str, diagnostics: &str) -> String {
     format!("{user}{SEPARATOR}{diagnostics}")
 }
 
-/// Hand-build a `multipart/form-data` body (avoids ehttp's `multipart` feature,
-/// which pulls `rand`→`getrandom` and would need the wasm `js` feature). The
+/// Hand-build a `multipart/form-data` body (no multipart crate:
+/// one pulls `rand`→`getrandom`, which would need the wasm `js` feature). The
 /// boundary carries a distinctive ASCII prefix plus the payload lengths so it
 /// can't collide with the (text) model JSON or the PNG bytes.
 fn build_multipart(

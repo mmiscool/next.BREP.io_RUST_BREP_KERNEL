@@ -527,7 +527,15 @@ pub(super) fn fillet_or_chamfer(
     let mut healed = solid.clone();
     let policy = crate::KernelTolerances::for_solid(&healed, 1e-7);
     crate::heal::heal_operands(&mut healed, &policy)?;
-    let mut result = fillet_or_chamfer_inner(&healed, edge_id, radius, chamfer, name, ends, lane)?;
+    let result = fillet_or_chamfer_inner(&healed, edge_id, radius, chamfer, name, ends, lane)?;
+    finish_blend(&healed, result, radius, lane)
+}
+
+/// The steps every cutter-ladder result takes after it is built on the healed
+/// body: the surgery's edge-vertex gaps healed, planar charts widened to their
+/// trims, trims made same-parameter, and (a blend with no corner closure after
+/// it) the cutter's standing scaffold settled.
+fn finish_blend(healed: &BrepSolid, mut result: BrepSolid, radius: f64, lane: Lane) -> Result<BrepSolid, KernelRefusal> {
     // Heal the §6.9 surgery so re-trimmed edges meet their corner vertices
     // exactly (the boolean-backed exact path is already committed; this is a
     // no-op there and on any clean blend).
@@ -535,8 +543,8 @@ pub(super) fn fillet_or_chamfer(
     // A trim the §6.9 surgery ran outside a planar carrier's chart is clamped
     // onto the chart's boundary by the pcurve builder, which leaves a wrong
     // region on a body `validate()` passes; widen the carrier to hold it.
-    crate::blend::fit_planar_charts_to_trims(&healed, &mut result)?;
-    crate::blend::same_parameter_trims(&healed, &mut result);
+    crate::blend::fit_planar_charts_to_trims(healed, &mut result)?;
+    crate::blend::same_parameter_trims(healed, &mut result);
     // A blend with no corner closure after it is finished here. A cutter-first
     // composition's cutter keeps its standing scaffold tagged until the group
     // has closed its corners, which read that topology (`settle_cutter_scaffold`).
@@ -1551,6 +1559,21 @@ pub(super) fn chamfer_through_end_faces(
     profile: &[NurbsCurve],
     name: Option<&str>,
 ) -> Option<BrepSolid> {
+    chamfer_through_ends(solid, edge_id, cross, profile, name, false)
+}
+
+/// [`chamfer_through_end_faces`], padding BOTH ends when `pad_every_end`
+/// (each by its rails' overrun, at least nothing, plus the margin), not only
+/// an end a rail runs on past: the miter composition's retry of a chamfer whose
+/// flush cutter left its own end cap standing (`chamfer_miter_unit_through`).
+fn chamfer_through_ends(
+    solid: &BrepSolid,
+    edge_id: u64,
+    cross: &EdgeCross,
+    profile: &[NurbsCurve],
+    name: Option<&str>,
+    pad_every_end: bool,
+) -> Option<BrepSolid> {
     if !chamfer_through_end_faces_on() || !cross.convex {
         return None;
     }
@@ -1594,6 +1617,11 @@ pub(super) fn chamfer_through_end_faces(
         needed[0] |= start.abs() > tolerance;
         needed[1] |= end.abs() > tolerance;
     }
+    if pad_every_end {
+        needed = [true, true];
+        ends.start = ends.start.max(0.0);
+        ends.end = ends.end.max(0.0);
+    }
     if needed == [false, false] {
         return None;
     }
@@ -1611,6 +1639,55 @@ pub(super) fn chamfer_through_end_faces(
         }
     }
     None
+}
+
+/// `BREP_CHAMFER_MITER_THROUGH` (default on; `=0` restores the flush cutter):
+/// in the miter composition (`fillet_edges_group`, each selected edge cut on
+/// the original body and the results intersected), a chamfer whose flush
+/// cutter leaves its own end cap standing is cut through both its ends.
+///
+/// The flush cutter's end is the cross-section square to the edge. On a box
+/// that is the plane of the face the end meets, but the corner edge of a
+/// drafted extrude meets its end cap obliquely, so the flush cut stops short
+/// of the cap and leaves a wedge closed by a triangular `:CAP` face; at a kink
+/// in a selected chain (a drafted wall over a straight one) it leaves a sliver
+/// cap between the two chamfers. A drafted LQFP body with its twelve corner
+/// edges chamfered kept both of its end caps square-cornered that way. Cut through, each chamfer plane runs out
+/// across the end face, and at a kink the intersected results meet along the
+/// line the two chamfer planes share.
+pub(super) fn chamfer_miter_through_on() -> bool {
+    switch!("BREP_CHAMFER_MITER_THROUGH", true)
+}
+
+/// One chamfered edge of the miter composition: the cutter-first build
+/// ([`fillet_or_chamfer`], flush ends), cut through its ends instead where the
+/// flush cutter left its own faces standing ([`chamfer_miter_through_on`]).
+pub(super) fn chamfer_miter_unit(solid: &BrepSolid, edge_id: u64, distance: f64, name: Option<&str>) -> Result<BrepSolid, KernelRefusal> {
+    let flush = fillet_or_chamfer(solid, edge_id, distance, true, name, ToolEnds::default(), Lane::CutterFirst)?;
+    if !chamfer_miter_through_on() || count_cutter_scaffold(&flush) == 0 {
+        return Ok(flush);
+    }
+    // The same healed body the flush build cut (`fillet_or_chamfer`).
+    let mut healed = solid.clone();
+    let policy = crate::KernelTolerances::for_solid(&healed, 1e-7);
+    crate::heal::heal_operands(&mut healed, &policy)?;
+    match chamfer_miter_unit_through(&healed, edge_id, distance, name) {
+        Some(through) => finish_blend(&healed, through, distance, Lane::CutterFirst),
+        None => Ok(flush),
+    }
+}
+
+/// The through cut of [`chamfer_miter_through_on`]: `None` when the edge is
+/// not a straight convex edge between planes, or no padding leaves a valid
+/// body with none of the cutter standing but its wall (material really
+/// continues past an end), in which case the flush cut stays.
+fn chamfer_miter_unit_through(solid: &BrepSolid, edge_id: u64, distance: f64, name: Option<&str>) -> Option<BrepSolid> {
+    let cross = analyze_edge(solid, edge_id, distance).ok()?;
+    let profile = match full_round_profile(&cross, distance, true).ok()? {
+        Some(profile) => profile,
+        None => cross_section_profile(&cross, distance, true).ok()?,
+    };
+    chamfer_through_ends(solid, edge_id, &cross, &profile, name, true)
 }
 
 fn fillet_or_chamfer_exact(

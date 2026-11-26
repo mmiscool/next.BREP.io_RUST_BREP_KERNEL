@@ -17,7 +17,7 @@ fn unsupported(what: &'static str, message: String) -> KernelRefusal {
 }
 
 /// A face's outward unit normal and a point on it, if it is a plane.
-fn plane_of(face: &FaceRecord) -> Option<(Vec3, Vec3)> {
+pub(super) fn plane_of(face: &FaceRecord) -> Option<(Vec3, Vec3)> {
     let s = &face.surface;
     if s.degree_u != 1 || s.degree_v != 1 {
         return None;

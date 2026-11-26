@@ -41,7 +41,18 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
     let mut seen = std::collections::BTreeSet::new();
     resolved.retain(|(name, _)| seen.insert(name.clone()));
     if resolved.is_empty() {
-        return Ok(result);
+        // Keep the names for reference repair, but do not report a selected
+        // source that no longer exists as a successful empty pattern.
+        let mut refused = ctx.fail(crate::KernelRefusal::input(
+            crate::KernelStage::Collect,
+            "unresolved_reference",
+            format!(
+                "pattern: none of the selected solids exists on this model ({}); repair the source selection and rerun",
+                result.unresolved.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", "),
+            ),
+        ));
+        refused.unresolved = result.unresolved;
+        return Ok(refused);
     }
 
     // `mode === 'LINEAR' ? linear : circular` — any non-LINEAR falls to circular.
@@ -129,6 +140,8 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             ..AddedSolid::default()
         });
     }
+
+    result.note_partial_resolution(&names);
 
     // UNION consumes each source (`removed: solids`); NONE keeps them (`[]`).
     if union_mode {

@@ -1,6 +1,34 @@
 use crate::{KernelRefusal, KernelStage, OrRefuse};
 use super::*;
 
+/// Canonical vertex placement need not move a certified section that still
+/// meets those vertices within model identity. Keep its pcurves with it;
+/// rebuilding either would invalidate the source-bound crossing evidence.
+pub(super) fn retain_certified_ruling(
+    piece: &ImprintPieceRecord,
+    face_map: &HashMap<FaceKey, &FaceRecord>,
+    charts: &FaceCharts<'_>,
+    vertices: [Vec3; 2],
+    tolerance: f64,
+    stage: &str,
+) -> bool {
+    if piece.certified_ruling_side.is_none() { return false; }
+    let supports = piece.support_faces;
+    let (Some(first), Some(second)) = (face_map.get(&supports[0]), face_map.get(&supports[1])) else {
+        return false;
+    };
+    let ruling = piece.certified_ruling(supports, [
+        chart_of(charts, supports[0], first), chart_of(charts, supports[1], second),
+    ]);
+    let retained = ruling.is_some_and(|r| r.retains_endpoints(
+        &piece.curve, vertices, tolerance.min(crate::tolerance::DEFAULT_MODEL)));
+    if crate::switch!("BREP_SECTOR_EXTRUSION_RULING_SIDE_CHECK", false) {
+        eprintln!("RULING_JUNCTION stage={} piece={} valid={} retained={}",
+            stage, piece.id, ruling.is_some(), retained);
+    }
+    retained
+}
+
 /// Rebuild a piece's pcurve on `surface`, PRESERVING the period branch of the
 /// pcurve it replaces. `build_pcurve_on_surface` projects every sample onto
 /// the surface's canonical branch; on a closed surface that silently moves a
@@ -364,7 +392,7 @@ fn two_radius_combine(
         return Ok(false);
     }
     let (_, sep_cap) = residual_merge_bands(raw_extent, tolerance);
-    relocate_junctions(result, &mut parent, &merged_point, face_map, charts, emitted_pcurves, (4.0 * sep_cap).max(1e-3), true)?;
+    relocate_junctions(result, &mut parent, &merged_point, face_map, charts, emitted_pcurves, tolerance, (4.0 * sep_cap).max(1e-3), true)?;
     Ok(true)
 }
 
@@ -593,6 +621,9 @@ pub fn canonicalize_imprint_junctions(
         if !canonical_vertices.contains(&piece.start_vertex_id)
             && !canonical_vertices.contains(&piece.end_vertex_id)
         {
+            continue;
+        }
+        if retain_certified_ruling(piece, &face_map, charts, [start,end], tolerance, "canonicalize") {
             continue;
         }
         piece.curve = snap_curve_ends(&piece.curve, start, end)?;
@@ -1028,7 +1059,7 @@ pub(super) fn merge_residual_coincident_vertices(
     // Escape hatch for the 2026-11-02 repair (POSITION above): the joint
     // point, unsnapped representatives and untouched splits of before.
     if std::env::var("BREP_RESIDUAL_MERGE_EDGE_PLACEMENT").as_deref() == Ok("0") {
-        relocate_junctions(result, &mut parent, &merged_point, face_map, charts, emitted_pcurves, (4.0 * sep_cap).max(1e-3), false)?;
+        relocate_junctions(result, &mut parent, &merged_point, face_map, charts, emitted_pcurves, tolerance, (4.0 * sep_cap).max(1e-3), false)?;
         return Ok(true);
     }
     absorb_junctions_enclosed_by_merged_groups(result, face_map, incident_faces, &verts, &mut parent, band, sep_cap, &on_different_edges)?;
@@ -1045,7 +1076,7 @@ pub(super) fn merge_residual_coincident_vertices(
         .filter(|(rep, _)| group_size.get(rep).is_some_and(|size| *size > 1))
         .map(|(rep, point)| (*rep, *point))
         .collect();
-    relocate_junctions(result, &mut parent, &moved, face_map, charts, emitted_pcurves, (4.0 * sep_cap).max(1e-3), true)?;
+    relocate_junctions(result, &mut parent, &moved, face_map, charts, emitted_pcurves, tolerance, (4.0 * sep_cap).max(1e-3), true)?;
     if retracted > 0 && std::env::var("BREP_DEBUG_JUNCTION").is_ok() {
         eprintln!("[merge] retracted {retracted} edge split(s) of absorbed junctions");
     }
@@ -1217,7 +1248,7 @@ fn consolidate_fuzzy_piece_ends(
         eprintln!("[consolidate] piece ends within their vertex's evidence radius snapped onto it: {ids:?}");
     }
     let mut parent: HashMap<u64, u64> = position.keys().map(|id| (*id, *id)).collect();
-    relocate_junctions(result, &mut parent, &stale, face_map, charts, emitted_pcurves, 0.0, true)?;
+    relocate_junctions(result, &mut parent, &stale, face_map, charts, emitted_pcurves, tolerance, 0.0, true)?;
     let mut retracted = 0usize;
     let chains = SplitChains::new(edge_curves)?;
     for (id, point) in &stale {
@@ -1531,6 +1562,7 @@ fn relocate_junctions(
     face_map: &HashMap<FaceKey, &FaceRecord>,
     charts: &FaceCharts<'_>,
     emitted_pcurves: &HashSet<(u64, FaceKey)>,
+    tolerance: f64,
     spur_limit: f64,
     snap_moved: bool,
 ) -> Result<(), KernelRefusal> {
@@ -1592,6 +1624,10 @@ fn relocate_junctions(
             let start_gap = piece.curve.evaluate(t0).or_refuse(KernelStage::Intersect, "evaluate")?.sub(start).length();
             let end_gap = piece.curve.evaluate(t1).or_refuse(KernelStage::Intersect, "evaluate")?.sub(end).length();
             if !repointed && start_gap <= 1e-12 && end_gap <= 1e-12 {
+                kept_pieces.push(piece);
+                continue;
+            }
+            if retain_certified_ruling(&piece, face_map, charts, [start,end], tolerance, "relocate") {
                 kept_pieces.push(piece);
                 continue;
             }

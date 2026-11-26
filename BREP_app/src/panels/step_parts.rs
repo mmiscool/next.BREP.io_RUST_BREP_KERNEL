@@ -11,7 +11,7 @@
 //! ([`EngineState::insert_component`]).
 //!
 //! ## Networking
-//! `ehttp` abstracts the two targets: native uses a background HTTP thread, wasm
+//! `net.rs` abstracts the two targets: native uses a background HTTP thread, wasm
 //! uses the browser `fetch`. Every step.parts host (the API, the GitHub-LFS STEP
 //! media host, and the Vercel-Blob PNG host) sends `Access-Control-Allow-Origin:
 //! *`, so the wasm/browser path is NOT CORS-blocked. Async results marshal back

@@ -13,7 +13,6 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hmac::Hmac;
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -28,8 +27,17 @@ const HASH_BYTES: usize = 32;
 /// the session tokens, the salts, and every record id.
 pub fn random_token(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
+    fill_random(&mut buf);
     URL_SAFE_NO_PAD.encode(buf)
+}
+
+/// Fill `buf` from the operating system's CSPRNG (`getrandom`: getrandom(2)
+/// on Linux, BCryptGenRandom on Windows). This is the source `rand`'s
+/// `thread_rng` seeded itself from, read directly. A machine that cannot
+/// produce randomness cannot issue a token or a salt, so it panics, as
+/// `thread_rng` did.
+pub fn fill_random(buf: &mut [u8]) {
+    getrandom::getrandom(buf).expect("the operating system's random source failed");
 }
 
 /// A fresh record id. 16 bytes is 128 bits — collision is not a failure mode
@@ -41,7 +49,7 @@ pub fn new_id() -> String {
 /// Hash `password` at [`DEFAULT_ITERATIONS`] with a fresh salt.
 pub fn hash_password(password: &str) -> String {
     let mut salt = [0u8; SALT_BYTES];
-    rand::thread_rng().fill_bytes(&mut salt);
+    fill_random(&mut salt);
     hash_with(password, &salt, DEFAULT_ITERATIONS)
 }
 

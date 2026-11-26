@@ -559,6 +559,7 @@ impl EngineState {
             moved_solids,
             imported_colors,
             weld_colors,
+            part_colors,
             consumed,
             assembly,
             stale_parts,
@@ -651,16 +652,24 @@ impl EngineState {
         // every replay, and a colour the user changed in the panel must win.
         // A weld bead is the one exception: its colour follows the weld's
         // Weld colour while the saved colour is still the one the weld applied
-        // (`weldColor`); a colour the user set differs from it and wins.
+        // (`weldColor`); a colour the user set differs from it and wins. A
+        // component's entity follows its PART's colour the same way
+        // (`partColor`): a recoloured part shows through a refresh, and a
+        // colour set on the instance in the assembly stays.
         let weld_colors: std::collections::HashMap<String, String> = weld_colors.into_iter().collect();
+        let part_colors: std::collections::HashMap<String, String> = part_colors.into_iter().collect();
         for (name, hex) in imported_colors {
             let saved = self.metadata.attribute(&name, "color").map(str::to_string);
-            match weld_colors.get(&name) {
-                Some(applied) => {
-                    let saved_weld = self.metadata.attribute(&name, "weldColor").map(str::to_string);
-                    if saved.is_none() || saved == saved_weld {
+            let applied = weld_colors
+                .get(&name)
+                .map(|applied| ("weldColor", applied))
+                .or_else(|| part_colors.get(&name).map(|applied| ("partColor", applied)));
+            match applied {
+                Some((marker, applied)) => {
+                    let saved_applied = self.metadata.attribute(&name, marker).map(str::to_string);
+                    if saved.is_none() || saved == saved_applied {
                         self.metadata.set_attribute(&name, "color", &hex);
-                        self.metadata.set_attribute(&name, "weldColor", applied);
+                        self.metadata.set_attribute(&name, marker, applied);
                     }
                 }
                 None if saved.is_none() => self.metadata.set_attribute(&name, "color", &hex),

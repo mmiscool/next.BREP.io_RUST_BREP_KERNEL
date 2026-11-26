@@ -18,6 +18,7 @@ pub mod attachments;
 pub mod audit_log;
 pub mod backups;
 pub mod bake_worker;
+mod body_io;
 pub mod bom;
 mod bom_config;
 mod frontend;

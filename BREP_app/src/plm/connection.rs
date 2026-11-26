@@ -18,7 +18,7 @@
 //!   session cookie, and the page reloads onto it. Forget signs the session
 //!   out and reloads.
 use super::client::{DesktopLink, LinkPoll, Me, PlmClient, PlmError};
-use super::transport::EhttpTransport;
+use super::transport::HttpTransport;
 use super::PlmTransport;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -101,7 +101,7 @@ pub struct PlmConnection {
     /// The server took this machine's sign-in (a sign-in or a check passed):
     /// the session may switch to it live (native Connect now).
     connectable: bool,
-    /// Builds the transport for the server's URL: ehttp in the app, the
+    /// Builds the transport for the server's URL: net.rs in the app, the
     /// in-process router in tests.
     transport: Rc<dyn Fn(&str) -> Rc<dyn PlmTransport>>,
     /// A browser sign-in's registration, in flight.
@@ -238,7 +238,7 @@ impl PlmConnection {
             last: None,
             reload: false,
             connectable: false,
-            transport: Rc::new(|url: &str| Rc::new(EhttpTransport::new(url.to_string())) as Rc<dyn PlmTransport>),
+            transport: Rc::new(|url: &str| Rc::new(HttpTransport::new(url.to_string())) as Rc<dyn PlmTransport>),
             registering: None,
             link: None,
             open_request: None,

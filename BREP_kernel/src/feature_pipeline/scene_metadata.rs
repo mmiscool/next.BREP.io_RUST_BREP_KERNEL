@@ -245,6 +245,23 @@ pub fn scene_metadata_weld_colors_json() -> String {
     })
 }
 
+/// Every component entity's part colour (`partColor`, the colour its
+/// instance took from the part), keyed by name: the app replaces an
+/// instance's saved colour with its part's colour only while that saved
+/// colour is still the one the part gave, never a colour the user set on the
+/// instance.
+pub fn scene_metadata_part_colors_json() -> String {
+    SCENE_METADATA.with(|store| {
+        let mut out = serde_json::Map::new();
+        for (name, record) in store.borrow().iter() {
+            if let Some(color) = record.get("partColor").and_then(|value| value.as_str()) {
+                out.insert(name.clone(), serde_json::Value::String(color.to_string()));
+            }
+        }
+        serde_json::Value::Object(out).to_string()
+    })
+}
+
 /// The OWN metadata record for a name (no inheritance) — the snapshot capture
 /// read (`io/snapshot.rs` embeds the record verbatim so a restored part carries
 /// its stamped topology metadata). `None` when the name has no record.

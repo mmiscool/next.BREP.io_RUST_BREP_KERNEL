@@ -3,7 +3,7 @@
 Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_geometry` · [licence summary](#licence)
 
 `BREP_geometry` holds the geometry layer of the BREP kernel: everything below topology. Its Rust library
-target is `brep_geometry`; this is version **0.30.0**.
+target is `brep_geometry`; this is version **0.31.0**.
 
 It is one of the implementation crates the kernel is built from. Applications
 should depend on [`BREP_kernel`](https://crates.io/crates/BREP_kernel), which

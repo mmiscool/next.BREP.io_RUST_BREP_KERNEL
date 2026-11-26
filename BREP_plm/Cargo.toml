@@ -1,6 +1,6 @@
 [package]
 name = "BREP_plm"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 # The floor the rest of the family builds on, and the compiler
 # rust-toolchain.toml pins. Nothing here needs more.
@@ -69,11 +69,13 @@ native-rusty-alloc = ["brep-kernel/native-rusty-alloc"]
 
 [dependencies]
 # The HTTP surface. 0.7 is what the registry already holds for this repo, and
-# nothing here needs 0.8's extractor changes.
-axum = "0.7"
+# nothing here needs 0.8's extractor changes. Only the features the server
+# uses: no `form` extractor, no MatchedPath/OriginalUri extensions, and no
+# `tracing` (nothing here installs a subscriber, so its events went nowhere).
+# Attachment, model and backup streams are axum bodies over the file
+# (src/api/body_io.rs), so no futures combinator crate is named.
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "query", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "io-util", "time"] }
-# Streaming attachment uploads (`Body::into_data_stream`) and downloads.
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 # preserve_order so a CAD document written back through the store API keeps its
 # key order — the kernel hashes documents, and a reordered map is a new hash.
@@ -85,8 +87,9 @@ hmac = "0.12"
 # Constant-time comparison for the password verify — a byte-by-byte `==` on a
 # hash is a timing oracle.
 subtle = "2"
-# Salts and session tokens.
-rand = "0.8"
+# Salts and session tokens, straight from the OS CSPRNG (auth::fill_random).
+# 0.2 is the line ring already locks here, so this names no new package.
+getrandom = "0.2"
 base64 = "0.22"
 # Part types in Pattern mode check a typed number against an admin regex.
 regex = "1"
@@ -101,8 +104,8 @@ brep-script-core = { package = "BREP_script_core", version = "0.1.6", path = "..
 # Scripts' synchronous `http.request`. Sync on purpose: a Boa host function
 # cannot await, and every call carries its own timeout.
 ureq = "2"
-brep-kernel = { package = "BREP_kernel", version = "0.30.0", path = "../BREP_kernel" }
-brep-ecad-core = { package = "BREP_ecad_core", version = "0.9.0", path = "../BREP_ecad_core" }
+brep-kernel = { package = "BREP_kernel", version = "0.31.0", path = "../BREP_kernel" }
+brep-ecad-core = { package = "BREP_ecad_core", version = "0.9.1", path = "../BREP_ecad_core" }
 brep-instructions = { package = "BREP_instructions", version = "0.4.1", path = "../BREP_instructions" }
 # Optional native TLS (`--tls-cert` / `--tls-key`). rustls and ring are
 # already in the tree through ureq; ring, not aws-lc, so no cmake. Plain

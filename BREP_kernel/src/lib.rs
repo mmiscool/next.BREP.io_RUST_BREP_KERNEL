@@ -527,7 +527,7 @@ pub use feature_pipeline::{native_import_payload, native_import_payload_with_app
 pub use feature_pipeline::IsolatedSceneMetadata;
 // The imported-colour read of the name-keyed scene-metadata store. Thread-local
 // like the rest of it, so an off-thread runner reads it and ships the result.
-pub use feature_pipeline::{scene_metadata_colors_json, scene_metadata_weld_colors_json};
+pub use feature_pipeline::{scene_metadata_colors_json, scene_metadata_part_colors_json, scene_metadata_weld_colors_json};
 // Family tables (rows, the expression rewrite, the persisted fingerprints): one
 // copy for the CAD app and the PLM server.
 pub use feature_pipeline::family;

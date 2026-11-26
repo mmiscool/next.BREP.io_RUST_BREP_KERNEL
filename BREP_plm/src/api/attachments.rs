@@ -10,7 +10,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -45,8 +44,8 @@ pub(crate) async fn receive_with_empty(db: &Shared, headers: &HeaderMap, body: B
             });
         }
     }
-    let mut stream = body.into_data_stream();
-    while let Some(chunk) = stream.next().await {
+    let mut body = body;
+    while let Some(chunk) = super::body_io::next_chunk(&mut body).await {
         let chunk = chunk.map_err(|e| Error::bad_request(format!("the upload broke off: {e}")))?;
         upload.write(&chunk)?;
     }
@@ -199,20 +198,8 @@ pub(crate) async fn stream_blob(
     let file = tokio::fs::File::open(db.blob_path(sha256))
         .await
         .map_err(|e| Error::internal(format!("the file for {name} is missing: {e}")))?;
-    let stream = futures_util::stream::unfold(file, |mut file| async move {
-        use tokio::io::AsyncReadExt;
-        let mut buffer = vec![0u8; 64 * 1024];
-        match file.read(&mut buffer).await {
-            Ok(0) => None,
-            Ok(n) => {
-                buffer.truncate(n);
-                Some((Ok::<_, std::io::Error>(buffer), file))
-            }
-            Err(e) => Some((Err(e), file)),
-        }
-    });
     let inline = inline && attach::inline_ok(media_type);
-    let mut response = Body::from_stream(stream).into_response();
+    let mut response = super::body_io::file_body(file, 64 * 1024).into_response();
     let h = response.headers_mut();
     h.insert(
         header::CONTENT_TYPE,

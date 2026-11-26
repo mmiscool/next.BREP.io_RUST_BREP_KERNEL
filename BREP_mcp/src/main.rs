@@ -11,153 +11,11 @@
 //!                                     rasterise a triangle mesh on the CPU and
 //!                                     measure its silhouette
 use brep_mcp::server::BrepServer;
-use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-#[derive(Parser)]
-#[command(name = "brep-mcp", version, about = "BREP MCP automation server")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Export and manage the reviewed Markdown skill bundle offline.
-    Skills {
-        #[command(subcommand)]
-        command: SkillCommand,
-    },
-    /// Serve MCP over stdio, or over streamable HTTP with `--http`.
-    Serve {
-        /// Where sessions keep their store, shots and logs (default: the OS temp dir).
-        #[arg(long)]
-        session_root: Option<PathBuf>,
-        /// Private persistent execution state for this server identity. Reuse
-        /// after restart; interrupted work is reconciled, never replayed.
-        #[arg(long, conflicts_with_all = ["instance", "ephemeral"])]
-        state_dir: Option<PathBuf>,
-        /// Stable named execution-state identity (default: headless). Use a
-        /// different name for each concurrently running server.
-        #[arg(long, conflicts_with = "ephemeral")]
-        instance: Option<String>,
-        /// Keep execution state only in memory for this process.
-        #[arg(long)]
-        ephemeral: bool,
-        /// Opt-in private diagnostic metadata archive. Independent of execution
-        /// state; bounded history and gaps, never automatic mutation replay.
-        #[arg(long)]
-        event_journal_dir: Option<PathBuf>,
-        /// Serve the streamable-HTTP transport on this loopback port instead of
-        /// stdio — the same transport `brep-app --mcp` exposes, with no window.
-        /// 0 picks a free port; the URL is printed on stderr.
-        #[arg(long, value_name = "PORT")]
-        http: Option<u16>,
-    },
-    /// Print the kernel feature catalogue rendered as JSON Schema.
-    Schema {
-        /// One feature (type or shortName) instead of the whole catalogue.
-        #[arg(long = "type")]
-        feature_type: Option<String>,
-        /// Also print the test-mcp script format schema.
-        #[arg(long)]
-        all: bool,
-        /// Write the generated docs (commands / features, md + json) into this directory
-        /// instead of printing.
-        #[arg(long)]
-        write: Option<PathBuf>,
-    },
-    /// Run test-mcp scripts through a headless session each.
-    Test {
-        scripts: Vec<PathBuf>,
-        #[arg(long, default_value = "headless")]
-        backend: String,
-        #[arg(long)]
-        out: Option<PathBuf>,
-        #[arg(long)]
-        update_baselines: bool,
-        #[arg(long)]
-        session_root: Option<PathBuf>,
-        /// ORDER CHECK: play the whole list a second time in REVERSE, and fail
-        /// if any script's session STARTED differently in the two passes.
-        /// One script must not change what the next one measures; scripts run
-        /// through one process, so only what a session owns is actually fresh.
-        /// Artefacts go under `<out>/forward` and `<out>/reverse`. Costs two
-        /// runs of the list — point it at a subset, not the whole glob.
-        #[arg(long)]
-        order_check: bool,
-        /// Where a script's `video.out` is resolved — the repo root, for the
-        /// documentation walkthroughs (`./build.sh docs-videos`). WITHOUT it a
-        /// script that declares a video is still recorded and encoded, but the
-        /// GIF only reaches the run's output directory: the `test-mcp` gate
-        /// plays every script and must not rewrite documentation assets as a
-        /// side effect of being run.
-        #[arg(long, value_name = "DIR")]
-        video_root: Option<PathBuf>,
-    },
-    /// Rasterise a triangle mesh `{positions, indices}` to a PNG on the CPU and
-    /// report its silhouette — the native STEP-validation renderer. No host,
-    /// no GPU, no window; `--help` prints the full option list. The same
-    /// command is `BREP_mcp_core`'s `render_mesh` example, which step-validation
-    /// calls directly so it need not build this binary's app host.
-    // `disable_help_flag` lets `--help` reach the renderer's own parser,
-    // which prints the framing modes and options.
-    #[command(name = "render-mesh", disable_help_flag = true)]
-    RenderMesh {
-        /// Everything after `render-mesh`, passed through unparsed.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// The TypeScript toolchain `run_script` checks TypeScript with.
-    Typescript {
-        #[command(subcommand)]
-        command: TypescriptCommand,
-    },
-    /// Render a document to a PNG through the headless host.
-    Shot {
-        doc: PathBuf,
-        png: PathBuf,
-        #[arg(long, default_value = "ISO")]
-        view: String,
-        #[arg(long, default_value = "1280x800")]
-        size: String,
-        #[arg(long, default_value_t = 1.0)]
-        ppp: f32,
-        #[arg(long)]
-        session_root: Option<PathBuf>,
-    },
-}
-
-#[derive(Subcommand)]
-enum TypescriptCommand {
-    /// Report the compiler `run_script` would check TypeScript with: the same
-    /// discovery and launcher probe `tools/list` advertises. Exits 1 when
-    /// TypeScript is unavailable.
-    Status,
-    /// Install the pinned TypeScript into the user-local prefix discovery
-    /// checks, with npm (`BREP_NPM` or PATH). Downloads; never run by a tool call.
-    Provision,
-}
-
-#[derive(Subcommand)]
-enum SkillCommand {
-    /// Export this binary's reviewed bundle; refuses to replace an existing file.
-    #[command(visible_alias = "fetch")]
-    Bundle { #[arg(long)] output: PathBuf },
-    /// Install or update the managed selection from this binary's exact bundle.
-    #[command(visible_alias = "update")]
-    Install {
-        #[arg(long)] bundle: PathBuf,
-        /// SHA256 obtained from the reviewed bundle, not an untrusted download.
-        #[arg(long)] sha256: String,
-        #[arg(long)] directory: PathBuf,
-    },
-    /// Verify the installed selection and report its version directory.
-    Inspect { #[arg(long)] directory: PathBuf },
-    /// Restore the previous installed version after verifying its reviewed pin.
-    Rollback { #[arg(long)] directory: PathBuf, #[arg(long)] sha256: String },
-}
+mod cli;
+use cli::{Command, SkillCommand, TypescriptCommand};
 
 fn skill_command(command: SkillCommand) -> Result<Value, String> {
     use brep_mcp_core::skill_distribution as distribution;
@@ -230,7 +88,7 @@ fn main() {
     if brep_mcp_core::cad::code::worker_entry() {
         return;
     }
-    let cli = Cli::parse();
+    let cli = cli::parse();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let code = match cli.command {
         Command::Typescript { command: TypescriptCommand::Status } => match brep_mcp_core::cad::code::typescript_status() {
