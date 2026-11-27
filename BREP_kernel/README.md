@@ -4,7 +4,7 @@ Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add B
 
 A native/WASM B-rep geometry kernel for building CAD applications, written in
 Rust. Published on crates.io as **`BREP_kernel`** with library name
-`brep_kernel`; this is version **0.32.1**.
+`brep_kernel`; this is version **0.32.2**.
 It is the authoritative geometry engine behind the BREP CAD application
 (`BREP_app` + `BREP_render` in this repository, re-exported as `brep::kernel` by
 the umbrella `BREP` crate), and is usable standalone as a

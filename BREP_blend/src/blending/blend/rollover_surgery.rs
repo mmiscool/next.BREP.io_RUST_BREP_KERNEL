@@ -503,12 +503,35 @@ pub(super) fn rollover_surgery(
     if traced.is_empty() {
         return Err(not_built("a crossed mate whose loop vanished entirely"));
     }
-    let outer_sign = {
+    let (outer_sign, rim_outer) = {
         let face = result.shells.iter().flat_map(|shell| &shell.faces).find(|face| face.id == crossed_mate.face.id).expect("found above");
-        super::chain::signed_area(&face.loops[1 - crossed_mate.loop_index].coedges)?.signum()
+        let other = super::chain::signed_area(&face.loops[1 - crossed_mate.loop_index].coedges)?;
+        let rim = super::chain::signed_area(&face.loops[crossed_mate.loop_index].coedges)?;
+        // `BREP_FILLET_ROLLOVER_BUILD`: the rim may be the crossed mate's
+        // OUTER loop (a lip's strip between the rim and the concave round
+        // inside it) rather than a hole in it (a bore mouth's top). The trace
+        // then follows the inner loop's edges, hole-wise, round what is now
+        // the face's only boundary: its winding is the rim's, and a trace
+        // that runs the other way is the same boundary reversed.
+        let rim_outer = crate::fillet::analyze::rollover_build_on() && rim.abs() > other.abs();
+        (if rim_outer { rim.signum() } else { other.signum() }, rim_outer)
     };
-    for coedges in &traced {
-        let area = super::chain::signed_area(coedges)?;
+    let mut traced = traced;
+    for coedges in traced.iter_mut() {
+        let mut area = super::chain::signed_area(coedges)?;
+        if rim_outer && area.signum() == -outer_sign {
+            let mut reversed = Vec::with_capacity(coedges.len());
+            for coedge in coedges.iter().rev() {
+                reversed.push(CoedgeRecord {
+                    id: coedge.id,
+                    edge_id: coedge.edge_id,
+                    forward: !coedge.forward,
+                    pcurve: coedge.pcurve.reversed().or_refuse(KernelStage::Refine, "reversed")?,
+                });
+            }
+            *coedges = reversed;
+            area = super::chain::signed_area(coedges)?;
+        }
         if area.signum() != outer_sign || area == 0.0 {
             return Err(not_built(format!("a re-traced loop that winds against its face (area {area:.3e})")));
         }

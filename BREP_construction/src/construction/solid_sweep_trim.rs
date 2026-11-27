@@ -76,6 +76,7 @@ thread_local! {
     static END_SLIVERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+
 /// End slivers contracted on this thread since the last call (the check
 /// reading of `BREP_SWEEP_TRIM_END_SLIVERS`).
 pub fn trim_end_slivers_take() -> u64 {

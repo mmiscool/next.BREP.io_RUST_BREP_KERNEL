@@ -3673,3 +3673,13 @@ impl PlanarRegion {
             .map(|(_, edge)| edge)
     }
 }
+
+/// `BREP_FILLET_ROLLOVER_BUILD` (default off): the rollover row's second
+/// piece. A ball that rolls off a narrow support onto the tangent round beside
+/// it is built by the existing rollover lanes where they reach it: the
+/// crossing is read as tangent at its foot on the crossed edge
+/// (`blend/rollover.rs`), and a crossed mate whose rim is its OUTER loop is
+/// re-traced round its one remaining boundary (`blend/rollover_surgery.rs`).
+pub(crate) fn rollover_build_on() -> bool {
+    switch!("BREP_FILLET_ROLLOVER_BUILD", false)
+}

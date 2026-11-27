@@ -1012,7 +1012,168 @@ pub fn apex_end_reach_enabled() -> bool {
 }
 
 
+/// `BREP_OFFSET_POLE_COLLAPSE` (default on; =0 restores the fit as it was): a
+/// fitted offset carrier closes on a point wherever its source does. A source
+/// boundary row that is one point (a pole: a revolved meridian meeting its
+/// axis) has a pointwise offset that is one point too (the pole moved along
+/// the axis), but the fit leaves that row a small ring (a spheroid's inner
+/// parallel surface: 3.2e-5 across at distance 1). The face's loop, a seam
+/// alone, then bounds nothing on the carrier: the kernel's own integrals do
+/// not notice, a STEP reader integrates the face to nothing. With the switch,
+/// such a row (one within the bar under which an image collapses) whose source
+/// row is one point to rounding AND whose exact offset image is one point to
+/// rounding (one tangent plane; a cone's apex has a cone of directions, and
+/// its image ring stays however small) closes on that exact image, weights
+/// kept.
+pub fn pole_collapse_enabled() -> bool {
+    switch!("BREP_OFFSET_POLE_COLLAPSE", true)
+}
+
+/// The fitted carrier with each boundary row the source closes on a point
+/// closed on one point too (see [`pole_collapse_enabled`]); unchanged where
+/// the domains differ (an extended carrier's rows are not the source's).
+pub fn collapse_source_poles(face: &FaceRecord, fitted: NurbsSurface, distance: f64) -> NurbsSurface {
+    let source = &face.surface;
+    let same = |a: Result<[f64; 2], _>, b: Result<[f64; 2], _>| matches!((a, b), (Ok(a), Ok(b)) if (a[0] - b[0]).abs() <= 1e-12 && (a[1] - b[1]).abs() <= 1e-12);
+    if !same(source.domain_u(), fitted.domain_u()) || !same(source.domain_v(), fitted.domain_v()) {
+        return fitted;
+    }
+    let point = |w: &Vec4| Vec3::new(w.x / w.w, w.y / w.w, w.z / w.w);
+    let spread = |points: &[Vec3]| points.iter().map(|q| q.sub(points[0]).length()).fold(0.0f64, f64::max);
+    let ([u0, u1], [v0, v1]) = match (source.domain_u(), source.domain_v()) {
+        (Ok(u), Ok(v)) => (u, v),
+        _ => return fitted,
+    };
+    // A source pole is ONE point to rounding, not a short edge: within a few
+    // ulps of its own coordinates (so a short edge on a long face is not
+    // one) AND within 1e-9 of the surface's own size (so neither is a short
+    // edge far from the origin, where an ulp is long). A true pole's copies of
+    // one axis point pass both; one too far out to pass is left as fitted.
+    let (mut low, mut high) = (Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY), Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY));
+    for q in source.control_points.iter().flatten().map(point) {
+        low = Vec3::new(low.x.min(q.x), low.y.min(q.y), low.z.min(q.z));
+        high = Vec3::new(high.x.max(q.x), high.y.max(q.y), high.z.max(q.z));
+    }
+    let extent = high.sub(low).length();
+    let one_point = |points: &[Vec3]| {
+        let magnitude = points.iter().map(|q| q.x.abs().max(q.y.abs()).max(q.z.abs())).fold(0.0f64, f64::max);
+        let gap = spread(points);
+        gap <= 64.0 * f64::EPSILON * (1.0 + magnitude) && gap <= 1e-9 * extent
+    };
+    // And the pole has ONE tangent plane, so its exact offset image (the pole
+    // moved d along that plane's normal) is one point too. Read on the
+    // source's own net, which is exact: the tangent directions at the pole are
+    // the directions from it to the next row's control points (a rational
+    // end's derivative points along them), and one tangent plane means they
+    // are coplanar. A revolved meridian meeting its axis square has them all
+    // in one plane, to rounding; a cone's apex has them on a cone, out of any
+    // plane by the sine of its tilt (1.7e-5 for a cone of height tan(0.001
+    // deg)), and its image is a ring however small, which stays.
+    let one_tangent_plane = |pole: Vec3, next: &[Vec3]| -> Option<Vec3> {
+        let directions: Vec<Vec3> = next.iter().filter_map(|q| q.sub(pole).normalized().ok()).collect();
+        if directions.len() < 3 {
+            return None;
+        }
+        let mut normal: Option<Vec3> = None;
+        let mut widest = 0.0f64;
+        for a in &directions {
+            for b in &directions {
+                let c = a.cross(*b);
+                if c.length() > widest {
+                    widest = c.length();
+                    normal = c.normalized().ok();
+                }
+            }
+        }
+        // Directions too near parallel to read a plane from (a patch a
+        // fraction of a degree wide) decline: the fit is left as it is.
+        // The image of a cone's apex is a ring of radius |d| times its
+        // directions' tilt out of the plane: the plane is the pole's own only
+        // when that ring is below rounding of the offset itself, whatever the
+        // surface's size (a cone 1e9 across and 0.1 high, offset 1e6, tilts
+        // 2e-10 and its ring is 1e-4; a true pole tilts by rounding alone).
+        let normal = normal.filter(|_| widest > 1e-3)?;
+        let tilt = directions.iter().map(|d| d.dot(normal).abs()).fold(0.0f64, f64::max);
+        (tilt <= 1e-9 && distance.abs() * tilt <= 1e-12 * (1.0 + distance.abs())).then_some(normal)
+    };
+    let collapse_bar = 1e-6f64.max(distance.abs() * 1e-2);
+    let mut net = fitted.control_points.clone();
+    let (rows, columns) = (net.len(), net.first().map_or(0, |row| row.len()));
+    if rows < 2 || columns < 2 {
+        return fitted;
+    }
+    // (source boundary, fitted boundary's cells) for the four boundaries.
+    let row_of = |grid: &Vec<Vec<Vec4>>, r: usize| -> Vec<Vec4> { grid[r].clone() };
+    let column_of = |grid: &Vec<Vec<Vec4>>, c: usize| -> Vec<Vec4> { grid.iter().map(|row| row[c]).collect() };
+    let (source_rows, source_columns) = (source.control_points.len(), source.control_points[0].len());
+    let boundaries: [(Vec<Vec4>, bool, usize, f64); 4] = [
+        (row_of(&source.control_points, 0), true, 0, u0),
+        (row_of(&source.control_points, source_rows - 1), true, rows - 1, u1),
+        (column_of(&source.control_points, 0), false, 0, v0),
+        (column_of(&source.control_points, source_columns - 1), false, columns - 1, v1),
+    ];
+    let mut collapsed = false;
+    for (source_cells, is_row, index, _) in boundaries {
+        let source_points: Vec<Vec3> = source_cells.iter().map(point).collect();
+        let next: Vec<Vec3> = if is_row {
+            let r = if index == 0 { 1 } else { source_rows - 2 };
+            source.control_points[r].iter().map(point).collect()
+        } else {
+            let c = if index == 0 { 1 } else { source_columns - 2 };
+            source.control_points.iter().map(|row| point(&row[c])).collect()
+        };
+        let Some(normal) = (if one_point(&source_points) { one_tangent_plane(source_points[0], &next) } else { None }) else {
+            continue;
+        };
+        let cells = if is_row { row_of(&net, index) } else { column_of(&net, index) };
+        let points: Vec<Vec3> = cells.iter().map(point).collect();
+        let ring = spread(&points);
+        if ring == 0.0 || !(ring <= collapse_bar) {
+            continue;
+        }
+        // The row closes on the pole's exact image, the pole moved |d| along
+        // its tangent plane's normal, on the side the fit offset to (the
+        // image nearer the fitted ring's weighted centre); not on that centre,
+        // which depends on how the ring's net is laid out (a duplicated seam
+        // control pulls it off the axis).
+        let total: f64 = cells.iter().map(|w| w.w).sum();
+        let fitted_centre = cells.iter().fold(Vec3::new(0.0, 0.0, 0.0), |sum, w| sum.add(Vec3::new(w.x, w.y, w.z))).scale(1.0 / total);
+        let pole = source_points[0];
+        let images = [pole.add(normal.scale(distance.abs())), pole.sub(normal.scale(distance.abs()))];
+        let centre = if images[0].sub(fitted_centre).length() <= images[1].sub(fitted_centre).length() { images[0] } else { images[1] };
+        if !(centre.sub(fitted_centre).length() <= collapse_bar) {
+            continue;
+        }
+        for k in 0..cells.len() {
+            let w = cells[k].w;
+            let cell = Vec4 { x: centre.x * w, y: centre.y * w, z: centre.z * w, w };
+            if is_row { net[index][k] = cell; } else { net[k][index] = cell; }
+        }
+        collapsed = true;
+    }
+    if !collapsed {
+        return fitted;
+    }
+    match NurbsSurface::new(fitted.degree_u, fitted.degree_v, fitted.knots_u.clone(), fitted.knots_v.clone(), net) {
+        Ok(surface) => surface,
+        Err(_) => fitted,
+    }
+}
+
 fn offset_surface_constructed(
+    face: &FaceRecord,
+    distance: f64,
+    extension: &CarrierExtension,
+    sphere_reading: &mut Option<f64>,
+) -> Result<(NurbsSurface, OffsetSurfaceLane, Option<NurbsSurface>), KernelRefusal> {
+    let (surface, lane, extended) = offset_surface_constructed_fitted(face, distance, extension, sphere_reading)?;
+    if !pole_collapse_enabled() {
+        return Ok((surface, lane, extended));
+    }
+    Ok((collapse_source_poles(face, surface, distance), lane, extended))
+}
+
+fn offset_surface_constructed_fitted(
     face: &FaceRecord,
     distance: f64,
     extension: &CarrierExtension,

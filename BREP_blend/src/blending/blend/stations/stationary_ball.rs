@@ -1,4 +1,5 @@
-//! `BREP_BLEND_STATIONARY_BALL` (default off): a ball that cannot roll.
+//! `BREP_BLEND_STATIONARY_BALL` (default on; =0 restores the march): a ball
+//! that cannot roll.
 //!
 //! A blend of radius r along an edge where one mate is a concave round of
 //! the same radius r (a cylinder of radius r met from inside, a fillet run
@@ -17,9 +18,9 @@
 //! great-circle arc between them.
 use super::*;
 
-/// The switch, default off.
+/// The switch, default on (=0 restores the march).
 pub(in crate::blend) fn enabled() -> bool {
-    switch!("BREP_BLEND_STATIONARY_BALL", false)
+    switch!("BREP_BLEND_STATIONARY_BALL", true)
 }
 
 fn unit_normal(surface: &NurbsSurface, point: Vec3) -> Option<(Vec3, Vec3)> {

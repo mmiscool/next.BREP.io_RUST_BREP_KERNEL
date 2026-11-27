@@ -3,7 +3,7 @@
 Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_offset` · [licence summary](#licence)
 
 `BREP_offset` holds the solid offsets of the BREP kernel. Its Rust library
-target is `brep_offset`; this is version **0.32.1**.
+target is `brep_offset`; this is version **0.32.2**.
 
 It is one of the implementation crates the kernel is built from. Applications
 should depend on [`BREP_kernel`](https://crates.io/crates/BREP_kernel), which

@@ -229,6 +229,12 @@ fn face_across<'a>(solid: &'a BrepSolid, face: &FaceRecord, edge_id: u64) -> Opt
         })
 }
 
+/// The point of edge `edge_id` nearest `point`.
+fn foot_on_edge(solid: &BrepSolid, edge_id: u64, point: Vec3) -> Option<Vec3> {
+    let edge = solid.edges.iter().find(|edge| edge.id == edge_id)?;
+    crate::project_point_to_curve(&edge.curve, point).ok().map(|projection| projection.point)
+}
+
 /// Whether `face` and `neighbour` are tangent at `point`: their outward
 /// normals agree to the solid's angular band, as `check_support_extent`'s
 /// tangent-neighbour scan reads them.
@@ -285,7 +291,12 @@ pub(super) fn tangent_crossings(
                 continue;
             };
             let point = face.surface.evaluate(uv[0], uv[1]).or_refuse(KernelStage::Classify, "evaluate")?;
-            if !tangent_at(solid, face, neighbour, point) {
+            // `BREP_FILLET_ROLLOVER_BUILD`: the chord's crossing lies a
+            // sagitta off the crossed edge, where a curved neighbour's normal
+            // already leans off the mate's by about sagitta / curvature
+            // radius; tangency is read at the crossing's foot ON the edge.
+            let at = if crate::fillet::analyze::rollover_build_on() { foot_on_edge(solid, edge_id, point).unwrap_or(point) } else { point };
+            if !tangent_at(solid, face, neighbour, at) {
                 continue;
             }
             // The ball's side: centre = p + rho * n_raw, and the outward
