@@ -758,7 +758,7 @@ impl RenderSettings {
                 let kind = match &field.kind {
                     FieldKind::Color => serde_json::json!({ "type": "color" }),
                     FieldKind::Bool => serde_json::json!({ "type": "bool" }),
-                    FieldKind::Enum { variants } => {
+                    FieldKind::Enum { variants, .. } => {
                         serde_json::json!({ "type": "enum", "variants": variants })
                     }
                     FieldKind::Number { min, max, step } => serde_json::json!({
@@ -828,8 +828,11 @@ pub enum FieldKind {
     /// A boolean toggle → a checkbox.
     Bool,
     /// A closed choice → a combo box. `variants` are the JSON string values
-    /// (exactly what `apply_json` accepts / `to_json` emits).
-    Enum { variants: Vec<String> },
+    /// (exactly what `apply_json` accepts / `to_json` emits). `labels` are what
+    /// the box shows for them, parallel to `variants`; empty (or a missing
+    /// entry) shows the value itself. A feature schema sets them with
+    /// `optionLabels` (`{value: label}`), so a stored key can read as words.
+    Enum { variants: Vec<String>, labels: Vec<String> },
     /// A bounded number → a slider / drag-value honoring `min`/`max`/`step`.
     Number { min: f64, max: f64, step: f64 },
     /// A 0..1 (or otherwise fractional) number → a slider honoring the bounds.
@@ -969,7 +972,7 @@ pub fn settings_schema() -> Vec<SettingsField> {
             "theme",
             "Theme",
             "Appearance",
-            FieldKind::Enum { variants: ["auto", "light", "dark"].iter().map(|s| s.to_string()).collect() },
+            FieldKind::Enum { variants: ["auto", "light", "dark"].iter().map(|s| s.to_string()).collect(), labels: Vec::new() },
         ),
         // A SLIDER (both `Range` and `Number` render an `egui::Slider` over the
         // given domain) scaling the whole egui UI via `Context::set_zoom_factor`.
@@ -1002,7 +1005,7 @@ pub fn settings_schema() -> Vec<SettingsField> {
             FieldKind::Bool,
         ),
         f("toolbarStyle", "Toolbar style", "Appearance",
-          FieldKind::Enum { variants: ["Ribbon", "Classic"].iter().map(|s| s.to_string()).collect() }),
+          FieldKind::Enum { variants: ["Ribbon", "Classic"].iter().map(|s| s.to_string()).collect(), labels: Vec::new() }),
         // --- Startup -------------------------------------------------------
         f(
             "disableRecoveryPrompt",
@@ -1037,14 +1040,14 @@ pub fn settings_schema() -> Vec<SettingsField> {
             "renderQuality",
             "Render Quality",
             "Scene",
-            FieldKind::Enum { variants: RENDER_QUALITY.iter().map(|(label, _)| label.to_string()).collect() },
+            FieldKind::Enum { variants: RENDER_QUALITY.iter().map(|(label, _)| label.to_string()).collect(), labels: Vec::new() },
         ),
         // --- Faces ---------------------------------------------------------
         f(
             "faceColorMode",
             "Face color mode",
             "Faces",
-            FieldKind::Enum { variants: ["uniform", "hashedBySolid"].iter().map(|s| s.to_string()).collect() },
+            FieldKind::Enum { variants: ["uniform", "hashedBySolid"].iter().map(|s| s.to_string()).collect(), labels: Vec::new() },
         ),
         f("faceColor", "Face color", "Faces", FieldKind::Color),
         f("faceSelectedColor", "Selected face", "Faces", FieldKind::Color),
@@ -1096,6 +1099,7 @@ pub fn settings_schema() -> Vec<SettingsField> {
             "Picking",
             FieldKind::Enum {
                 variants: MultiSelectMode::ALL.iter().map(|m| m.label().to_string()).collect(),
+                labels: Vec::new(),
             },
         ),
         // --- Sketch --------------------------------------------------------

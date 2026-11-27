@@ -13,6 +13,25 @@ pub struct PointArgs {
     pub y: f32,
 }
 
+/// The Draft Analysis view: on or off, and what it reads with. Every field
+/// is optional; an absent one leaves that setting as it is.
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DraftAnalysisArgs {
+    /// `true` turns the view on, `false` off. Setting any other field turns it on.
+    #[serde(default)]
+    pub open: Option<bool>,
+    /// The pull reference: a flat face (its outward normal), a datum plane or
+    /// a straight edge. `""` clears it (the last Draft feature's pull, else +Z).
+    #[serde(default)]
+    pub pull_direction: Option<String>,
+    #[serde(default)]
+    pub flip_pull: Option<bool>,
+    /// The minimum draft, degrees, at least 0 and under 90.
+    #[serde(default)]
+    pub min_angle: Option<f64>,
+}
+
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SelectArgs {
@@ -212,6 +231,46 @@ fn pick(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
     let a: PointArgs = parse_args(args)?;
     let (lx, ly) = local(ctx, a.x, a.y)?;
     Ok(Outcome::Done(json!({ "candidates": parse(&ctx.app.docs.engine().pick_json(lx, ly)) })))
+}
+
+fn draft_analysis(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
+    let a: DraftAnalysisArgs = parse_args(args)?;
+    let engine = ctx.app.docs.engine_mut();
+    let settings = a.pull_direction.is_some() || a.flip_pull.is_some() || a.min_angle.is_some();
+    if a.open == Some(false) {
+        if settings {
+            return Err("open: false turns the view off; send the settings without it".into());
+        }
+        engine.draft_analysis_close();
+    } else if settings {
+        let pull = a.pull_direction.map(|name| Some(name).filter(|n| !n.trim().is_empty()));
+        engine.draft_analysis_set(pull, a.flip_pull, a.min_angle)?;
+    } else if a.open == Some(true) {
+        engine.draft_analysis_open();
+    }
+    Ok(Outcome::Done(engine.draft_analysis_json()))
+}
+
+fn draft_analysis_result_schema() -> Value {
+    let number = json!({"type":"number"});
+    let face = json!({"type":"object","properties":{
+        "solid":{"type":"string"},"face":{"type":"string"},"minDeg":number,"maxDeg":number,
+        "class":{"enum":["positive","negative","needsDraft","straddle","cap"]},
+        "curved":{"type":"boolean"},"nearLimit":{"type":"boolean"}
+    },"required":["solid","face","minDeg","maxDeg","class","curved","nearLimit"],"additionalProperties":false});
+    let count = json!({"type":"integer","minimum":0});
+    json!({"type":"object","properties":{
+        "open":{"type":"boolean"},
+        "pullDirection":{"type":["string","null"]},
+        "flipPull":{"type":"boolean"},
+        "minAngle":number,
+        "pull":{"type":"array","items":number,"minItems":3,"maxItems":3},
+        "pullSource":{"type":"string"},
+        "error":{"type":["string","null"]},
+        "counts":{"type":"object","properties":{"positive":count,"negative":count,"needsDraft":count,"straddle":count,"cap":count},
+            "required":["positive","negative","needsDraft","straddle","cap"],"additionalProperties":false},
+        "faces":{"type":"array","items":face}
+    },"required":["open"],"additionalProperties":false})
 }
 
 fn hover(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
@@ -590,6 +649,7 @@ fn mass_properties(ctx: &mut Ctx<'_>, args: Value) -> Result<Outcome, String> {
 pub static COMMANDS: &[CommandSpec] = &[
     app_command!("scene", "scene_entities", "Every resident solid with its face and edge names and vertex positions (the reference names feature parameters take), plus the scene listing.", NoArgs, scene_entities, Read, READ, scene_entities_result_schema),
     app_command!("scene", "pick", "Ranked pick candidates under a surface point (VERTEX > EDGE > FACE > PLANE > SOLID > COMPONENT). Does not change the selection.", PointArgs, pick, Read, READ, pick_result_schema),
+    app_command!("scene", "draft_analysis", "The Draft Analysis view (Modeling > Blend > Draft Analysis): every shown face coloured by its draft against a pull and a minimum. Display only: never saved, never an undo step. `open` turns it on or off; `pullDirection` (a flat face, a datum plane or a straight edge; \"\" clears it), `flipPull` and `minAngle` (degrees) change what it reads with and turn it on. Answers the reading: the pull, its source, counts per class (positive, negative, needsDraft, straddle, cap) and each face's draft range (a curved face is sampled; `nearLimit` when its range ends within 0.05 deg of the minimum).", DraftAnalysisArgs, draft_analysis, Mutate, MUTATE_NOWAIT, draft_analysis_result_schema),
     app_command!("scene", "hover", "Set the hover highlight to whatever is under a surface point and return it.", PointArgs, hover, Mutate, MUTATE_NOWAIT, hover_result_schema),
     app_command!("scene", "select", "Replace the selection with one named entity: kind solid | face | edge | datum.", SelectArgs, select, Mutate, MUTATE_NOWAIT, selection_result_schema),
     app_command!("scene", "selection_set", "Replace the WHOLE selection with these named entities — the write twin of `selection`, and the way to put a multi-entity selection back (`select` takes one name). Vertices have no names and are not restored.", SelectionSetArgs, selection_set, Mutate, MUTATE_NOWAIT, selection_result_schema),

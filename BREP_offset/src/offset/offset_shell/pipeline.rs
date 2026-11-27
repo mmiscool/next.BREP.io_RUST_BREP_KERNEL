@@ -556,6 +556,205 @@ fn offset_shell_lanes(
     }
 }
 
+/// `BREP_OFFSET_COLLAPSE_MICRO_PIECES` (default on; `=0` restores): a section
+/// piece that is a POINT at the fragment arrangement's resolution on every
+/// carrier it cuts (its pcurve spans no more than the loop builder's epsilon,
+/// `20 * max(1e-7, 1e-6 * the chart's diagonal)`) is collapsed before the
+/// carriers are fragmented: it leaves every carrier, its ends become one
+/// vertex (the imprint may already have merged them), and every other section
+/// ending at that vertex has the end pole of its curve and of each pcurve moved
+/// onto the vertex (on the report, by about the collapsed pieces' 3e-5).
+///
+/// Cause (2026-11-26 report: an 8 x 4 bar whose end cap is filleted r 2 on all
+/// four edges, so the two long rounds meet in a full round, shelled inward by
+/// 1 refused "fragment_face: chain 13 fragmented into an incomplete run"): the
+/// full round's offset and each end round's offset are TANGENT at the apex
+/// where their two mitre curves meet. The section trace stops short of the
+/// apex on both mitres and adds two pieces about 3e-5 long that run on to it; the imprint merges
+/// each one's ends into the vertex the mitres stop at.
+/// The end round drops them as lying on its trim; the full round keeps them,
+/// and in its chart their two loose ends lie within the arrangement's epsilon
+/// of each other, so the pair reads as a closed chain of its own that no
+/// region can use whole. Dropping them alone was tried and is not enough: the
+/// assembly then refuses a non-integral genus with one-use edges at the apex,
+/// because the two mitres still stop short of it; moving the mitres' ends onto
+/// the vertex makes them meet there on both carriers.
+fn collapse_micro_pieces_on() -> bool {
+    switch!("BREP_OFFSET_COLLAPSE_MICRO_PIECES", true)
+}
+
+/// See [`collapse_micro_pieces_on`]. A group of micro pieces is left as it is
+/// when any section to be moved does not run over its curve's whole domain, or
+/// cuts a face none of the group's pieces gives a parameter point on.
+fn collapse_micro_pieces(imprint: &mut ImprintResultRecord, carriers: &[Carrier]) -> Result<(), KernelRefusal> {
+    let face_epsilon = |key: &FaceKey| -> Option<f64> {
+        let carrier = carriers.get(key.operand as usize)?;
+        let face = carrier.solid.shells.iter().flat_map(|shell| &shell.faces).find(|face| face.id == key.face_id)?;
+        let [u0, u1] = face.surface.domain_u().ok()?;
+        let [v0, v1] = face.surface.domain_v().ok()?;
+        Some(20.0 * 1e-7f64.max(1e-6 * (u1 - u0).hypot(v1 - v0)))
+    };
+    let span = |curve: &crate::NurbsCurve| -> Option<f64> {
+        let [t0, t1] = curve.domain().ok()?;
+        let start = curve.evaluate(t0).ok()?;
+        let mut reach = 0.0f64;
+        for step in 1..=16 {
+            let point = curve.evaluate(t0 + (t1 - t0) * step as f64 / 16.0).ok()?;
+            reach = reach.max(point.sub(start).length());
+        }
+        Some(reach)
+    };
+    let micro = imprint
+        .pieces
+        .iter()
+        .filter(|piece| {
+            piece.shared_edge.is_none()
+                && piece.pcurves.len() == 2
+                && piece.pcurves.iter().all(|pcurve| {
+                    let key = FaceKey { operand: pcurve.operand, face_id: pcurve.face_id };
+                    matches!((face_epsilon(&key), span(&pcurve.pcurve)), (Some(epsilon), Some(reach)) if reach <= epsilon)
+                })
+        })
+        .map(|piece| piece.id)
+        .collect::<Vec<_>>();
+    if micro.is_empty() {
+        return Ok(());
+    }
+    // Group the micro pieces that share a vertex; each group collapses onto
+    // the vertex most of its pieces meet at (the apex), the lowest id on a tie.
+    let mut groups: Vec<(HashSet<u64>, Vec<u64>)> = Vec::new();
+    for id in &micro {
+        let piece = imprint.pieces.iter().find(|piece| piece.id == *id).unwrap();
+        let ends = [piece.start_vertex_id, piece.end_vertex_id];
+        let joined = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, (vertices, _))| ends.iter().any(|end| vertices.contains(end)))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let mut group = (ends.iter().copied().collect::<HashSet<_>>(), vec![*id]);
+        for index in joined.into_iter().rev() {
+            let (vertices, pieces) = groups.remove(index);
+            group.0.extend(vertices);
+            group.1.extend(pieces);
+        }
+        groups.push(group);
+    }
+    let mut dropped = HashSet::default();
+    for (vertices, members) in groups {
+        let meeting = |vertex: u64| {
+            members
+                .iter()
+                .filter(|id| {
+                    let piece = imprint.pieces.iter().find(|piece| piece.id == **id).unwrap();
+                    piece.start_vertex_id == vertex || piece.end_vertex_id == vertex
+                })
+                .count()
+        };
+        let mut ordered = vertices.iter().copied().collect::<Vec<_>>();
+        ordered.sort_unstable();
+        let target = ordered.iter().copied().max_by_key(|vertex| (meeting(*vertex), std::cmp::Reverse(*vertex))).unwrap();
+        let Some(target_point) = imprint.vertices.iter().find(|vertex| vertex.id == target).map(|vertex| vertex.point) else {
+            continue;
+        };
+        // The target's parameter point on each face, read off a member's pcurve
+        // at the member's end that is the target (members chain to it, so a
+        // member not touching it gives the point through its partner).
+        let mut target_uv: HashMap<(u8, u64), Vec3> = HashMap::default();
+        for id in &members {
+            let piece = imprint.pieces.iter().find(|piece| piece.id == *id).unwrap();
+            if piece.start_vertex_id != target && piece.end_vertex_id != target {
+                continue;
+            }
+            for pcurve in &piece.pcurves {
+                // The pcurve end whose point on its face is the target's.
+                let Some(surface) = carriers
+                    .get(pcurve.operand as usize)
+                    .and_then(|carrier| carrier.solid.shells.iter().flat_map(|shell| &shell.faces).find(|face| face.id == pcurve.face_id))
+                    .map(|face| &face.surface)
+                else {
+                    continue;
+                };
+                let [t0, t1] = pcurve.pcurve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+                let mut best: Option<(f64, Vec3)> = None;
+                for t in [t0, t1] {
+                    let uv = pcurve.pcurve.evaluate(t).or_refuse(KernelStage::Intersect, "evaluate")?;
+                    let gap = surface.evaluate(uv.x, uv.y).or_refuse(KernelStage::Intersect, "evaluate")?.sub(target_point).length();
+                    if best.is_none_or(|(nearest, _)| gap < nearest) {
+                        best = Some((gap, uv));
+                    }
+                }
+                if let Some((_, uv)) = best {
+                    target_uv.insert((pcurve.operand, pcurve.face_id), uv);
+                }
+            }
+        }
+        // Every other section ending at a vertex of the group moves its end there.
+        let mut moves = Vec::new();
+        let mut complete = true;
+        for (index, piece) in imprint.pieces.iter().enumerate() {
+            if members.contains(&piece.id) {
+                continue;
+            }
+            for at_end in [false, true] {
+                let vertex = if at_end { piece.end_vertex_id } else { piece.start_vertex_id };
+                if !vertices.contains(&vertex) {
+                    continue;
+                }
+                if piece.start_vertex_id == piece.end_vertex_id {
+                    complete = false;
+                }
+                let [k0, k1] = piece.curve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+                let whole = (piece.t0 - k0).abs() <= 1e-12 * (k1 - k0).abs().max(1.0)
+                    && (piece.t1 - k1).abs() <= 1e-12 * (k1 - k0).abs().max(1.0);
+                if !whole || piece.pcurves.iter().any(|pcurve| !target_uv.contains_key(&(pcurve.operand, pcurve.face_id))) {
+                    complete = false;
+                }
+                moves.push((index, at_end));
+            }
+        }
+        if !complete {
+            os_debug!("micro pieces {members:?} kept: a section ending at them cannot be moved onto vertex {target}");
+            continue;
+        }
+        for (index, at_end) in moves {
+            let piece = &mut imprint.pieces[index];
+            let last = piece.curve.control_points.len() - 1;
+            let pole = if at_end { last } else { 0 };
+            let weight = piece.curve.control_points[pole].w;
+            let before = piece.curve.evaluate(if at_end { piece.t1 } else { piece.t0 }).or_refuse(KernelStage::Intersect, "evaluate")?;
+            piece.curve.control_points[pole] = crate::Vec4::from_point(target_point, weight);
+            os_debug!("  piece {} end moved {:.3e} onto vertex {target}", piece.id, before.sub(target_point).length());
+            for pcurve in &mut piece.pcurves {
+                let uv = target_uv[&(pcurve.operand, pcurve.face_id)];
+                // The pcurve end nearer the target in the chart: the section
+                // is long against the collapsed span, so that is its end there.
+                let [t0, t1] = pcurve.pcurve.domain().or_refuse(KernelStage::Intersect, "domain")?;
+                let start = pcurve.pcurve.evaluate(t0).or_refuse(KernelStage::Intersect, "evaluate")?;
+                let end = pcurve.pcurve.evaluate(t1).or_refuse(KernelStage::Intersect, "evaluate")?;
+                let last = pcurve.pcurve.control_points.len() - 1;
+                let pole = if end.sub(uv).length() <= start.sub(uv).length() { last } else { 0 };
+                let weight = pcurve.pcurve.control_points[pole].w;
+                pcurve.pcurve.control_points[pole] = crate::Vec4::from_point(Vec3::new(uv.x, uv.y, 0.0), weight);
+            }
+            if at_end {
+                piece.end_vertex_id = target;
+            } else {
+                piece.start_vertex_id = target;
+            }
+        }
+        os_debug!("micro pieces {members:?} collapsed onto vertex {target} at ({:.6},{:.6},{:.6})", target_point.x, target_point.y, target_point.z);
+        dropped.extend(members);
+    }
+    if !dropped.is_empty() {
+        imprint.pieces.retain(|piece| !dropped.contains(&piece.id));
+        for entry in imprint.by_face.iter_mut() {
+            entry.piece_ids.retain(|id| !dropped.contains(id));
+        }
+    }
+    Ok(())
+}
+
 /// The pipeline's one timed entry: `offset_shell` and `offset_solid` both run
 /// through it, so the `timing.*` split and the acceptance step are the same.
 /// Lane O row 38's switch, default on since batch 17 (`0`/`off` restores the fit): it asks the offset pipeline's
@@ -2523,11 +2722,7 @@ fn offset_shell_impl(
                             existing.parameters.push(parameter);
                         }
                     } else {
-                        imprint.edge_splits.push(EdgeSplitRecord {
-                            operand: *cone_index as u8,
-                            edge_id: edge.id,
-                            parameters: vec![parameter],
-                        });
+                        imprint.edge_splits.push(EdgeSplitRecord::new(*cone_index as u8, edge.id, vec![parameter]));
                     }
                     os_debug!(
                         "apex-cap ring split: cone carrier {cone_index} edge {} at t={parameter:.6}",
@@ -2582,6 +2777,9 @@ fn offset_shell_impl(
     )?;
     split_lap(6, &mut split_clock);
     synchronize_smooth_edge_splits(&mut imprint, &smooth.edge_pairs);
+    if collapse_micro_pieces_on() {
+        collapse_micro_pieces(&mut imprint, &carriers)?;
+    }
     split_lap(7, &mut split_clock);
     // This decides whether an imprint is genuinely the carrier's existing
     // trim, not whether independently fitted curves can later be sewn. The
@@ -3160,10 +3358,11 @@ fn offset_shell_impl(
                     continue;
                 }
                 os_debug!(
-                    "  select[{index}] src={} SHADOWED over all {} fragment(s): {:?}",
+                    "  select[{index}] src={} SHADOWED over all {} fragment(s): {:?} at {:?}",
                     carrier.source_face_id,
                     readings.len(),
-                    readings
+                    readings,
+                    fragments_by_carrier[index].iter().map(|fragment| fragment.test_point).collect::<Vec<_>>()
                 );
                 newly_shadowed.insert(carrier.source_face_id);
                 continue;

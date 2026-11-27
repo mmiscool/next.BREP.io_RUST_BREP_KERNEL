@@ -560,6 +560,7 @@ pub fn offered_commands(state: &ButtonState, info_open: bool) -> Vec<OfferedComm
     }
     commands.extend(offered_home_commands(engine));
     place_reference_after_undo(&mut commands);
+    place_after_their_features(&mut commands);
     debug_assert!(
         validate_commands(&commands).is_ok(),
         "invalid command registry: {:?}",
@@ -590,6 +591,27 @@ fn place_reference_after_undo(commands: &mut Vec<OfferedCommand>) {
         .map_or(rest.len(), |i| i + 1);
     rest.splice(insert..insert, reference);
     *commands = rest;
+}
+
+/// Workbench buttons that sit IN a feature group, after its features, rather
+/// than leading it: a workbench's buttons are declared before the feature
+/// catalogue, and a group's place is its first command's, so without this
+/// Modeling's Draft Analysis would pull the whole Blend group in front of
+/// Primitives. (Sheet Metal's and Assembly's buttons lead their groups on
+/// purpose, so this is a list, not a rule.)
+const AFTER_THEIR_FEATURES: &[&str] = &[super::modeling::DRAFT_ANALYSIS_BUTTON_ID];
+
+fn place_after_their_features(commands: &mut Vec<OfferedCommand>) {
+    for id in AFTER_THEIR_FEATURES {
+        let Some(at) = commands.iter().position(|c| c.id == *id) else { continue };
+        let button = commands.remove(at);
+        let group = |c: &OfferedCommand| {
+            let (a, b) = (c.segments(), button.segments());
+            a[0] == b[0] && a[1] == b[1]
+        };
+        let insert = commands.iter().rposition(group).map_or(at, |i| i + 1);
+        commands.insert(insert, button);
+    }
 }
 
 /// Groups are derived in first-declaration order; commands retain source order within them.

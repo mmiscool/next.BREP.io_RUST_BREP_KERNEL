@@ -121,6 +121,7 @@ pub static FEATURE_APPLICABILITY: &[(&str, fn(&SelectionProbe) -> bool)] = &[
     ("DF", super::features::delete_face::context_applicable),
     ("RFS", super::features::refit_faces::context_applicable),
     ("DFF", super::features::deform_face::context_applicable),
+    ("DRAFT", super::features::draft::context_applicable),
     ("SEW", super::features::sew_to_solid::context_applicable),
     ("THK", super::features::thicken::context_applicable),
     ("SM.TAB", super::features::sheet_metal_tab::context_applicable),

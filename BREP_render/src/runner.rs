@@ -1043,6 +1043,15 @@ pub trait HistoryRunner {
     fn cancel(&mut self) -> bool {
         false
     }
+
+    /// The agent this runner works on DIED, with what it said (consumed): a
+    /// browser worker whose wasm failed to start, or that trapped mid-command.
+    /// Nothing submitted to it will answer. The caller replaces it with
+    /// [`cancel`](Self::cancel) and reconciles as after one. `None` for a
+    /// runner that cannot die apart from its caller.
+    fn poll_failure(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Measure `query` against `runner`'s resident geometry and emit the object-info

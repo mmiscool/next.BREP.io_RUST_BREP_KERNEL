@@ -73,6 +73,7 @@ impl Engine {
             pass_token: String::new(),
             sig_scratch_before: Vec::new(),
             sig_scratch_after: Vec::new(),
+            min_change: false,
         })
     }
 
@@ -297,7 +298,7 @@ impl Engine {
         }
     }
 
-    fn process_constraints_of_type(&mut self, filter: &Filter) -> Result<(), String> {
+    pub(super) fn process_constraints_of_type(&mut self, filter: &Filter) -> Result<(), String> {
         for index in 0..self.constraints.len() {
             if !self.constraints[index].matches_filter(filter) {
                 continue;
@@ -485,127 +486,139 @@ impl Engine {
         let cycle_id = GLOBAL_DISTANCE_SOLVE_CYCLE_ID.fetch_add(1, Ordering::SeqCst) + 1;
 
         self.push_implied_temp_constraints()?;
-        // The coordinates as the caller stored them, before the tidy below
-        // rounds them onto the relaxation's six-decimal grid. The polish starts
-        // from these wherever relaxation never moved a coordinate off that grid.
-        let stored: Vec<(f64, f64)> = self.points.iter().map(|p| (p.x, p.y)).collect();
-        self.tidy_decimals_of_points(decimals_places, true);
+        // An interactive drag frame first tries the smallest change from where the
+        // points stand (the previous frame's solve, the dragged points pinned at the
+        // cursor): only what the constraints force moves, so free geometry stays put
+        // instead of drifting frame by frame. When that cannot satisfy every row,
+        // the full relaxation below runs as before.
+        self.pass_token = format!("{cycle_id}:drag");
+        let min_changed = self.min_change && self.min_change_solve()?;
+        let polish_complete = if min_changed {
+            // The min-change solve met every row to the polish's own exactness.
+            true
+        } else {
+            // The coordinates as the caller stored them, before the tidy below
+            // rounds them onto the relaxation's six-decimal grid. The polish starts
+            // from these wherever relaxation never moved a coordinate off that grid.
+            let stored: Vec<(f64, f64)> = self.points.iter().map(|p| (p.x, p.y)).collect();
+            self.tidy_decimals_of_points(decimals_places, true);
 
-        // Ground first, then everything.
-        self.pass_token = format!("{cycle_id}:pre");
-        self.process_constraints_of_type(&Filter::Type(CType::Ground, "⏚"))?;
-        self.process_constraints_of_type(&Filter::All)?;
+            // Ground first, then everything.
+            self.pass_token = format!("{cycle_id}:pre");
+            self.process_constraints_of_type(&Filter::Type(CType::Ground, "⏚"))?;
+            self.process_constraints_of_type(&Filter::All)?;
 
-        let order = [
-            Filter::Type(CType::PointOnLine, "⏛"),
-            Filter::Type(CType::Horizontal, "━"),
-            Filter::Type(CType::Vertical, "│"),
-            Filter::Type(CType::Midpoint, "⋯"),
-            Filter::Type(CType::Distance, "⟺"),
-            Filter::Type(CType::PointLine, POINT_LINE_DISTANCE_TYPE),
-            Filter::Type(CType::EqualDistance, "⇌"),
-            Filter::Type(CType::Angle, "∠"),
-            Filter::Type(CType::Perpendicular, "⟂"),
-            Filter::Type(CType::Parallel, "∥"),
-            Filter::Type(CType::Collinear, COLLINEAR_TYPE),
-            Filter::Type(CType::Concentric, CONCENTRIC_TYPE),
-            Filter::Type(CType::EqualRadius, EQUAL_RADIUS_TYPE),
-            Filter::Type(CType::Symmetric, SYMMETRIC_TYPE),
-            Filter::Type(CType::Tangent, TANGENT_TYPE),
-            // Curvature AFTER tangency: a `ϰ` carries its own G1 stage, and
-            // running it behind `⌒` lets a sketch that states both on one anchor
-            // settle on the tangent direction first.
-            Filter::Type(CType::SplineCurvature, SPLINE_CURVATURE_TYPE),
-            // Foot-parameter tangency behind both: `∿` states where a curve
-            // TOUCHES something, and running it after the anchor lanes lets a
-            // sketch that states both settle the anchor's direction first — the
-            // same reasoning that put `ϰ` behind `⌒`.
-            Filter::Type(CType::SplineFootTangent, SPLINE_FOOT_TANGENT_TYPE),
-            Filter::Type(CType::EqualDistance, "⇌"),
-            Filter::Type(CType::Distance, "⟺"),
-            Filter::Type(CType::PointLine, POINT_LINE_DISTANCE_TYPE),
-            Filter::Type(CType::EqualDistance, "⇌"),
-            Filter::Type(CType::Distance, "⟺"),
-            Filter::Type(CType::PointLine, POINT_LINE_DISTANCE_TYPE),
-            Filter::Type(CType::PointOnLine, "⏛"),
-            Filter::Type(CType::Horizontal, "━"),
-            Filter::Type(CType::Vertical, "│"),
-        ];
-        let coincident = Filter::Type(CType::Coincident, "≡");
-        let horizontal = Filter::Type(CType::Horizontal, "━");
-        let ascii_pipe = Filter::Type(CType::Other, "|");
+            let order = [
+                Filter::Type(CType::PointOnLine, "⏛"),
+                Filter::Type(CType::Horizontal, "━"),
+                Filter::Type(CType::Vertical, "│"),
+                Filter::Type(CType::Midpoint, "⋯"),
+                Filter::Type(CType::Distance, "⟺"),
+                Filter::Type(CType::PointLine, POINT_LINE_DISTANCE_TYPE),
+                Filter::Type(CType::EqualDistance, "⇌"),
+                Filter::Type(CType::Angle, "∠"),
+                Filter::Type(CType::Perpendicular, "⟂"),
+                Filter::Type(CType::Parallel, "∥"),
+                Filter::Type(CType::Collinear, COLLINEAR_TYPE),
+                Filter::Type(CType::Concentric, CONCENTRIC_TYPE),
+                Filter::Type(CType::EqualRadius, EQUAL_RADIUS_TYPE),
+                Filter::Type(CType::Symmetric, SYMMETRIC_TYPE),
+                Filter::Type(CType::Tangent, TANGENT_TYPE),
+                // Curvature AFTER tangency: a `ϰ` carries its own G1 stage, and
+                // running it behind `⌒` lets a sketch that states both on one anchor
+                // settle on the tangent direction first.
+                Filter::Type(CType::SplineCurvature, SPLINE_CURVATURE_TYPE),
+                // Foot-parameter tangency behind both: `∿` states where a curve
+                // TOUCHES something, and running it after the anchor lanes lets a
+                // sketch that states both settle the anchor's direction first — the
+                // same reasoning that put `ϰ` behind `⌒`.
+                Filter::Type(CType::SplineFootTangent, SPLINE_FOOT_TANGENT_TYPE),
+                Filter::Type(CType::EqualDistance, "⇌"),
+                Filter::Type(CType::Distance, "⟺"),
+                Filter::Type(CType::PointLine, POINT_LINE_DISTANCE_TYPE),
+                Filter::Type(CType::EqualDistance, "⇌"),
+                Filter::Type(CType::Distance, "⟺"),
+                Filter::Type(CType::PointLine, POINT_LINE_DISTANCE_TYPE),
+                Filter::Type(CType::PointOnLine, "⏛"),
+                Filter::Type(CType::Horizontal, "━"),
+                Filter::Type(CType::Vertical, "│"),
+            ];
+            let coincident = Filter::Type(CType::Coincident, "≡");
+            let horizontal = Filter::Type(CType::Horizontal, "━");
+            let ascii_pipe = Filter::Type(CType::Other, "|");
 
-        let mut prev = self.all_points_signature();
-        for iteration in 0..iterations {
-            self.pass_token = format!("{cycle_id}:{iteration}");
-            for step in &order {
-                self.process_constraints_of_type(step)?;
-                self.process_constraints_of_type(&coincident)?;
-                self.process_constraints_of_type(&horizontal)?;
-                self.process_constraints_of_type(&ascii_pipe)?;
-                self.tidy_decimals_of_points(decimals_places, false);
-                self.process_constraints_of_type(&horizontal)?;
-                self.process_constraints_of_type(&ascii_pipe)?;
-                self.tidy_decimals_of_points(decimals_places, false);
+            let mut prev = self.all_points_signature();
+            for iteration in 0..iterations {
+                self.pass_token = format!("{cycle_id}:{iteration}");
+                for step in &order {
+                    self.process_constraints_of_type(step)?;
+                    self.process_constraints_of_type(&coincident)?;
+                    self.process_constraints_of_type(&horizontal)?;
+                    self.process_constraints_of_type(&ascii_pipe)?;
+                    self.tidy_decimals_of_points(decimals_places, false);
+                    self.process_constraints_of_type(&horizontal)?;
+                    self.process_constraints_of_type(&ascii_pipe)?;
+                    self.tidy_decimals_of_points(decimals_places, false);
+                }
+                let current = self.all_points_signature();
+                if current == prev && !self.has_pending_distance_target_slides() {
+                    break;
+                }
+                prev = current;
             }
-            let current = self.all_points_signature();
-            if current == prev && !self.has_pending_distance_target_slides() {
-                break;
-            }
-            prev = current;
-        }
 
-        // Global least-squares polish. Relaxation above only reaches its ~1e-5
-        // residual floor (and the per-iteration 6-decimal `tidy` snaps points to
-        // that floor); this drives the constraint residuals to machine precision
-        // so downstream features receive exact geometry. It runs AFTER the final
-        // `tidy` pass and its result is deliberately NOT re-rounded, so the gained
-        // precision survives into the emitted points below.
-        //
-        // The tidy also ROUNDS THE INPUT, and the polish cannot recover a digit
-        // it was never given. When relaxation moved NOTHING — every coordinate
-        // is still bit for bit its stored value rounded — the sketch was already
-        // at rest on the grid, and the polish starts from the stored digits
-        // instead. Without that, a sketch already consistent to machine
-        // precision comes out on a DIFFERENT consistent configuration: an arc
-        // drawn through (7, 0), (6, −√3), (5, 0) had −√3 rounded to −1.732051,
-        // its implied equal-radius row read 1.66e-7, and the polish settled on a
-        // circle of radius 2 + 8.3e-8 about a centre 5.6e-8 away — which moved
-        // the thicken-torus-fold-band-full-revolution row 4.0e-6 off a closed
-        // form its lib fixture reads to 1.3e-8.
-        //
-        // All or nothing, never coordinate by coordinate. Once relaxation has
-        // moved a point, it moved it to satisfy a row against its partners'
-        // ROUNDED values, and handing those partners back their stored digits
-        // reopens that row by up to half a grid step: restored per coordinate,
-        // two spline fixtures ended with an anchor 2.1e-7 and 2.5e-7 off its
-        // rim. Such a sketch keeps the grid start it always had.
-        //
-        // The relaxation itself is unchanged, so only the polish's starting
-        // point moves, by at most the grid's half step — inside relaxation's own
-        // floor, which is also why a polish SKIPPED for cost leaves the restored
-        // points standing unpolished without harm. A sketch whose every stored
-        // coordinate is on the grid restores to itself, and so does any sketch
-        // this solver saved: its output rounds back to the grid point it was
-        // polished from.
-        if self.settings.newton_polish {
-            let k = 10f64.powi(decimals_places);
-            let on_grid = |stored: f64, now: f64| {
-                stored.is_finite() && (js_round(stored * k) / k).to_bits() == now.to_bits()
-            };
-            let at_rest = self
-                .points
-                .iter()
-                .zip(&stored)
-                .all(|(point, &(x, y))| on_grid(x, point.x) && on_grid(y, point.y));
-            if at_rest {
-                for (point, (x, y)) in self.points.iter_mut().zip(stored) {
-                    point.x = x;
-                    point.y = y;
+            // Global least-squares polish. Relaxation above only reaches its ~1e-5
+            // residual floor (and the per-iteration 6-decimal `tidy` snaps points to
+            // that floor); this drives the constraint residuals to machine precision
+            // so downstream features receive exact geometry. It runs AFTER the final
+            // `tidy` pass and its result is deliberately NOT re-rounded, so the gained
+            // precision survives into the emitted points below.
+            //
+            // The tidy also ROUNDS THE INPUT, and the polish cannot recover a digit
+            // it was never given. When relaxation moved NOTHING — every coordinate
+            // is still bit for bit its stored value rounded — the sketch was already
+            // at rest on the grid, and the polish starts from the stored digits
+            // instead. Without that, a sketch already consistent to machine
+            // precision comes out on a DIFFERENT consistent configuration: an arc
+            // drawn through (7, 0), (6, −√3), (5, 0) had −√3 rounded to −1.732051,
+            // its implied equal-radius row read 1.66e-7, and the polish settled on a
+            // circle of radius 2 + 8.3e-8 about a centre 5.6e-8 away — which moved
+            // the thicken-torus-fold-band-full-revolution row 4.0e-6 off a closed
+            // form its lib fixture reads to 1.3e-8.
+            //
+            // All or nothing, never coordinate by coordinate. Once relaxation has
+            // moved a point, it moved it to satisfy a row against its partners'
+            // ROUNDED values, and handing those partners back their stored digits
+            // reopens that row by up to half a grid step: restored per coordinate,
+            // two spline fixtures ended with an anchor 2.1e-7 and 2.5e-7 off its
+            // rim. Such a sketch keeps the grid start it always had.
+            //
+            // The relaxation itself is unchanged, so only the polish's starting
+            // point moves, by at most the grid's half step — inside relaxation's own
+            // floor, which is also why a polish SKIPPED for cost leaves the restored
+            // points standing unpolished without harm. A sketch whose every stored
+            // coordinate is on the grid restores to itself, and so does any sketch
+            // this solver saved: its output rounds back to the grid point it was
+            // polished from.
+            if self.settings.newton_polish {
+                let k = 10f64.powi(decimals_places);
+                let on_grid = |stored: f64, now: f64| {
+                    stored.is_finite() && (js_round(stored * k) / k).to_bits() == now.to_bits()
+                };
+                let at_rest = self
+                    .points
+                    .iter()
+                    .zip(&stored)
+                    .all(|(point, &(x, y))| on_grid(x, point.x) && on_grid(y, point.y));
+                if at_rest {
+                    for (point, (x, y)) in self.points.iter_mut().zip(stored) {
+                        point.x = x;
+                        point.y = y;
+                    }
                 }
             }
-        }
-        let polish_complete = self.newton_polish();
+            self.newton_polish()
+        };
 
         // The polish moved the points, so every `∿` constraint's persisted touch
         // point now describes a configuration that no longer exists. Re-solve the

@@ -162,7 +162,10 @@ pub fn schema() -> serde_json::Value {
             "multiple": false,
             "default_value": null,
             "label": "Direction reference",
-            "hint": "Optional geometry that sets the waypoint direction: a face normal, an edge direction or a plane normal. Without it the placement rotation's X axis is the direction."
+            "hint": format!(
+                "Optional geometry that sets the waypoint direction. {} Without it the placement rotation's X axis is the direction.",
+                common::DIRECTION_FROM_REFERENCE
+            )
         },
         "transform": {
             "type": "transform",

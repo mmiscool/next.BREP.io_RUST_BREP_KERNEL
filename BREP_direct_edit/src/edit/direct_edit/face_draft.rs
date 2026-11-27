@@ -992,7 +992,25 @@ pub fn draft_faces_parted(
     parting_point: Vec3,
     angle_radians: f64,
 ) -> Result<BrepSolid, KernelRefusal> {
-    let pull = check_inputs(face_ids, pull_direction, parting_point, angle_radians)?;
+    draft_faces_parted_sided(solid, face_ids, pull_direction, parting_point, angle_radians, angle_radians)
+}
+
+/// [`draft_faces_parted`] with its own angle on each side of the parting
+/// plane: `angle_along` for the pieces on the `+pull` side (drafted for
+/// `+pull`) and `angle_against` for those on the other side (drafted for
+/// `−pull`). Each leans its pieces away from the parting line by that angle
+/// (a negative one leans them toward it), as the two halves of a mould whose
+/// cores ask for different drafts. Equal angles are [`draft_faces_parted`].
+pub fn draft_faces_parted_sided(
+    solid: &BrepSolid,
+    face_ids: &[u64],
+    pull_direction: Vec3,
+    parting_point: Vec3,
+    angle_along: f64,
+    angle_against: f64,
+) -> Result<BrepSolid, KernelRefusal> {
+    check_inputs(face_ids, pull_direction, parting_point, angle_against)?;
+    let pull = check_inputs(face_ids, pull_direction, parting_point, angle_along)?;
     let scale = solid_model_scale(solid);
     let plane_tolerance = (scale * 1e-6).max(1e-7);
     let mut face_lookup: HashMap<u64, (usize, usize)> = HashMap::default();
@@ -1039,7 +1057,7 @@ pub fn draft_faces_parted(
         }
     };
     let mut halves = Vec::new();
-    for (piece, side_pull) in [(above, pull), (below, pull.scale(-1.0))] {
+    for (piece, side_pull, angle_radians) in [(above, pull, angle_along), (below, pull.scale(-1.0), angle_against)] {
         let mut lookup: HashMap<u64, (usize, usize)> = HashMap::default();
         for (shell_index, shell) in piece.shells.iter().enumerate() {
             for (face_index, face) in shell.faces.iter().enumerate() {
@@ -1068,4 +1086,80 @@ pub fn draft_faces_parted(
         crate::BooleanOperation::Union,
         &crate::BooleanOptions::default(),
     )
+}
+
+/// Whether [`draft_faces`] can draft face `face_id` of `solid` for the pull
+/// `pull_direction`: a plane parallel to the pull, or a cylinder whose axis is
+/// parallel to it — the same two tests the draft classifies its selection by,
+/// so a caller that gathers faces for a draft (every face along the pull, the
+/// faces round a neutral face, the faces tangent to a pick) agrees with it.
+/// `false` for a face the solid does not have.
+pub fn draft_face_qualifies(solid: &BrepSolid, face_id: u64, pull_direction: Vec3) -> bool {
+    let Ok(pull) = pull_direction.normalized() else {
+        return false;
+    };
+    let plane_tolerance = (solid_model_scale(solid) * 1e-6).max(1e-7);
+    let Some(face) = solid.shells.iter().flat_map(|shell| shell.faces.iter()).find(|face| face.id == face_id) else {
+        return false;
+    };
+    if let Ok(plane) = plane_of_surface(&face.surface, plane_tolerance, OP) {
+        return plane.normal.dot(pull).abs() <= 1e-9;
+    }
+    vertical_cylinder(&face.surface, pull, plane_tolerance).is_some()
+}
+
+/// The faces a draft of `seeds` reaches by TANGENT PROPAGATION: the seeds and
+/// every face joined to one of them, through a chain of faces that each
+/// qualify for the pull ([`draft_face_qualifies`]), across edges where the two
+/// faces meet smoothly (their outward normals agree at the edge's midpoint).
+/// Pick one wall of a box with rounded vertical corners and the walls and the
+/// corner rounds all come back. A face that does not qualify stops the chain:
+/// it is never added, so the result is always a selection the draft can take
+/// face by face. Sorted, seeds included.
+pub fn draft_tangent_faces(solid: &BrepSolid, seeds: &[u64], pull_direction: Vec3) -> Vec<u64> {
+    let faces: HashMap<u64, &FaceRecord> =
+        solid.shells.iter().flat_map(|shell| shell.faces.iter()).map(|face| (face.id, face)).collect();
+    let mut faces_of_edge: HashMap<u64, Vec<u64>> = HashMap::default();
+    for face in faces.values() {
+        for coedge in face.loops.iter().flat_map(|l| l.coedges.iter()) {
+            faces_of_edge.entry(coedge.edge_id).or_default().push(face.id);
+        }
+    }
+    let outward_at = |face: &FaceRecord, point: Vec3| -> Option<Vec3> {
+        let foot = crate::project_point_to_surface(&face.surface, point).ok()?;
+        let normal = face.surface.normal(foot.u, foot.v).ok()?;
+        Some(normal.scale(outward_sign(face)))
+    };
+    let mut reached: HashSet<u64> = seeds.iter().copied().filter(|id| faces.contains_key(id)).collect();
+    let mut queue: Vec<u64> = reached.iter().copied().collect();
+    while let Some(face_id) = queue.pop() {
+        let face = faces[&face_id];
+        for coedge in face.loops.iter().flat_map(|l| l.coedges.iter()) {
+            let Some(edge) = solid.edges.iter().find(|e| e.id == coedge.edge_id) else {
+                continue;
+            };
+            if edge.degenerate {
+                continue;
+            }
+            let Ok(middle) = edge.curve.evaluate(0.5 * (edge.t0 + edge.t1)) else {
+                continue;
+            };
+            for &other in faces_of_edge.get(&edge.id).into_iter().flatten() {
+                if reached.contains(&other) || !draft_face_qualifies(solid, other, pull_direction) {
+                    continue;
+                }
+                let (Some(a), Some(b)) = (outward_at(face, middle), outward_at(faces[&other], middle)) else {
+                    continue;
+                };
+                // Smooth: the normals agree to well under a degree.
+                if a.dot(b) >= (1e-3f64).cos() {
+                    reached.insert(other);
+                    queue.push(other);
+                }
+            }
+        }
+    }
+    let mut out: Vec<u64> = reached.into_iter().collect();
+    out.sort_unstable();
+    out
 }

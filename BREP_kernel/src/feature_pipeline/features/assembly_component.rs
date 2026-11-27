@@ -294,26 +294,7 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         })
         .collect();
 
-    // Stamp the part's captured metadata under the namespaced names, with the
-    // colours the part's own document saved (`metadata`, what the user set on
-    // the part) over what its features stamped, as the part itself shows them.
-    let mut records: BTreeMap<String, serde_json::Map<String, serde_json::Value>> =
-        restored.metadata.into_iter().collect();
-    for (name, saved) in part_document_colors(&entry.document) {
-        records.entry(name).or_default().insert(COLOR_KEY.into(), serde_json::Value::String(saved));
-    }
-    for (name, mut metadata_record) in records {
-        if let Some(serde_json::Value::String(parent)) = metadata_record.get_mut("inheritsFrom") {
-            *parent = component::namespaced(&ctx.id, parent);
-        }
-        // `partColor` is the colour this instance took from its part: the app
-        // follows a refreshed part while the assembly's saved colour is still
-        // that one, and keeps a colour the user set on the instance.
-        if let Some(color) = metadata_record.get(COLOR_KEY).cloned() {
-            metadata_record.insert(PART_COLOR_KEY.into(), color);
-        }
-        scene_metadata::set_record(&component::namespaced(&ctx.id, &name), metadata_record);
-    }
+    stamp_part_metadata(&ctx.id, restored.metadata, &entry.document);
 
     let mut result = FeatureResult::empty(ctx.id.clone(), ctx.feature_type.clone());
     result.added = added;
@@ -370,6 +351,34 @@ fn heal(part_name: &str, document: &serde_json::Value) -> Result<Decoded, String
         .map_err(|error| format!("part '{part_name}': rebuilt snapshot did not decode: {error}"))?;
     parts_library::heal_entry(part_name, &rebuilt);
     Ok((restored, rebuilt.ports, rebuilt.nested_constraints, rebuilt.nested_poses))
+}
+
+/// Stamp a part's captured metadata under component `component_id`'s
+/// namespaced names, with the colours the part's own document saved
+/// (`metadata`, what the user set on the part) over what its features
+/// stamped, as the part itself shows them. A placed component and every
+/// Pattern Component instance of it stamp the same records.
+pub(crate) fn stamp_part_metadata(
+    component_id: &str,
+    captured: impl IntoIterator<Item = (String, serde_json::Map<String, serde_json::Value>)>,
+    document: &serde_json::Value,
+) {
+    let mut records: BTreeMap<String, serde_json::Map<String, serde_json::Value>> = captured.into_iter().collect();
+    for (name, saved) in part_document_colors(document) {
+        records.entry(name).or_default().insert(COLOR_KEY.into(), serde_json::Value::String(saved));
+    }
+    for (name, mut metadata_record) in records {
+        if let Some(serde_json::Value::String(parent)) = metadata_record.get_mut("inheritsFrom") {
+            *parent = component::namespaced(component_id, parent);
+        }
+        // `partColor` is the colour this instance took from its part: the app
+        // follows a refreshed part while the assembly's saved colour is still
+        // that one, and keeps a colour the user set on the instance.
+        if let Some(color) = metadata_record.get(COLOR_KEY).cloned() {
+            metadata_record.insert(PART_COLOR_KEY.into(), color);
+        }
+        scene_metadata::set_record(&component::namespaced(component_id, &name), metadata_record);
+    }
 }
 
 /// A decoded part: its solids and metadata, its ports, its constraint rows and

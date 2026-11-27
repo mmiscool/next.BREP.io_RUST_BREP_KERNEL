@@ -193,6 +193,9 @@ pub struct EngineState {
     /// display time (a frame name maps to its producing feature TYPE via the
     /// history). See the appended construction-datum impl block at the END.
     construction_frames: Vec<(String, brep_kernel::Frame)>,
+    /// The DRAFT ANALYSIS view while it is on (`draft_analysis_ops`): display
+    /// only, never saved and never an undo step.
+    draft_analysis: Option<draft_analysis_ops::DraftAnalysisState>,
     /// The solved sketch PROFILES the last history run produced `(sketch id,
     /// profile)`. Stored so [`refresh_committed_sketches`](Self::refresh_committed_sketches)
     /// can synthesize each committed sketch's SHEET SOLID (planar face + named
@@ -396,6 +399,10 @@ pub struct EngineState {
     /// run was cancelled before any progress arrived), cleared by the next
     /// submit. The history header shows it until the model is rebuilt.
     cancelled_run: Option<String>,
+    /// Background-runner deaths in a row (see `recover_from_runner_failure`):
+    /// the first is restarted and rebuilt, the next is reported instead. Back
+    /// to 0 when a run lands or the failure has been reported.
+    runner_failures: u32,
     /// A TRANSIENT expressions source the runs evaluate instead of the
     /// document's own (the family table's row preview). Never written into
     /// the history: not saved, not undone, not dirty. See
@@ -747,6 +754,10 @@ pub enum RefSelectTarget {
     /// field's own path as three numbers; nothing is written when nothing was
     /// picked or the pick does not resolve.
     PointPick,
+    /// The DRAFT ANALYSIS window's pull field: Finish hands the one pick to
+    /// [`EngineState::draft_analysis_set`]. Display state only: nothing is
+    /// written to the document and nothing rolls.
+    DraftAnalysis,
 }
 
 /// The suffix a vec3 field's PICK button carries on its key (`pivot#pick`),
@@ -849,6 +860,7 @@ impl Default for EngineState {
             board_build: board_geometry::BoardBuild::default(),
             board_displays: Vec::new(),
             construction_frames: Vec::new(),
+            draft_analysis: None,
             sketch_profiles: Vec::new(),
             sketch_paths: Vec::new(),
             sketch_points: Vec::new(),
@@ -904,6 +916,7 @@ impl Default for EngineState {
             applied_generation: 0,
             run_progress: None,
             cancelled_run: None,
+            runner_failures: 0,
             expression_preview: None,
             runs_replied: 0,
             superseded_displays: HashMap::new(),
@@ -1063,6 +1076,8 @@ pub use expressions::ExpressionPreview;
 /// toggle): arm state, `__brep`-style annotation JSON, overlay publishing,
 /// drag + set-value writeback, `FEATURE_DIM_OVERLAY`, fd_* math helpers, tests.
 mod feature_dims;
+/// The Draft Analysis view: faces tinted by their draft against a pull.
+mod draft_analysis_ops;
 /// The assembly interference check: the bbox-prefiltered
 /// pairwise non-destructive INTERSECT sweep over component instances
 /// (`interference_check`), its report types, and the pure pair planner.
@@ -1191,6 +1206,7 @@ pub use board_geometry::{
 pub use bom::{OCCURRENCE_ATTRIBUTES, PART_ATTRIBUTES};
 pub use component_move::{ComponentMoveArm, TypedMove};
 pub use components::ComponentInfo;
+pub use draft_analysis_ops::{DraftAnalysisState, DRAFT_ANALYSIS_DEFAULT_MIN_DEG};
 pub use interference::{ClearancePair, InterferencePair, InterferenceReport, INTERFERENCE_OVERLAY_GROUP};
 pub use model_io::{
     EmbeddedOnly, PartSink, StepAssemblyImport, StepAssemblyProbe, StepAssemblyReport,
@@ -1204,8 +1220,9 @@ pub use wire_bom::{WireBomLine, WireLengthState};
 pub use spline_edit::SplineAnchorRow;
 pub use cage_edit::{CageArm, CageSelect, CageSummary, CAGE_PICK_RADIUS_PX};
 pub use deform_edit::{DeformArm, DeformPickRow, DEFORM_PICK_RADIUS_PX};
-pub use transform_gizmo::{GizmoMode, TransformArm};
+pub use transform_gizmo::{is_face_transform_type, GizmoMode, TransformArm};
 pub(crate) use transform_gizmo::rotate_euler_xyz_f64;
+
 
 
 

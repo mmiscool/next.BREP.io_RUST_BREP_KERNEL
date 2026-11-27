@@ -71,6 +71,7 @@ pub fn feature_schema_catalogue() -> serde_json::Value {
             super::features::boolean::schema(),
             super::features::fillet::schema(),
             super::features::chamfer::schema(),
+            super::features::draft::schema(),
             super::features::offset_shell::schema(),
             super::features::offset_face::schema(),
             super::features::push_face::schema(),
@@ -129,6 +130,9 @@ pub fn feature_schemas_json() -> String {
 pub fn feature_hidden_params(feature_type: &str, values: &serde_json::Value) -> Vec<String> {
     let keys: Vec<&'static str> = match feature_type {
         "H" => super::features::hole::hidden_params(values),
+        "DRAFT" => super::features::draft::hidden_params(values),
+        "PATTERN" => super::features::pattern::hidden_params(values),
+        "APAT" | "PATTERN COMPONENT" => super::features::assembly_pattern::hidden_params(values),
         "SM.CLOSED_CORNER" => super::features::sheet_metal_closed_corner::hidden_params(values),
         "WELD" => super::features::weld::hidden_params(values),
         "WELD.GROOVE" => super::features::weld::groove::hidden_params(values),

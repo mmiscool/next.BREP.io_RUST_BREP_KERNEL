@@ -225,7 +225,10 @@ impl PartsLibraryEntry {
 pub type PartsLibraryMap = BTreeMap<String, PartsLibraryEntry>;
 
 /// This build's identity for [`PartsLibraryEntry::snapshot_producer`]: the hash
-/// of the kernel source that `build.rs` computes. `None` when the build could
+/// of production source files that `build.rs` computes across the kernel family.
+/// Whole files proven private test-only by the exporter do not invalidate saved
+/// snapshots or nested rows. All bytes in retained files (including inline tests)
+/// and every default-off feature module still contribute. `None` when the build could
 /// not compute it, which disables stale-snapshot invalidation rather than
 /// making every snapshot look stale on every run.
 pub fn kernel_source_stamp() -> Option<&'static str> {

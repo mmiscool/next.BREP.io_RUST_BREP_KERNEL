@@ -647,7 +647,7 @@ pub fn pointer_tools(slot: SessionSlot) -> Vec<ToolSpec> {
         ToolSpec::new(
             "click_widget",
             "widgets",
-            "Click a published widget by its `panel/key` (see hit_rects / hit_key_docs), scrolling its pane so the widget is inside `panel:clip` first. Errors if the key is not published this frame. `count` is EXACT: 1 is a single click, 2 a double, 3 a triple, however recently another click landed \u{2014} egui's clock is first moved past the multi-click window of the clicks before (`click_gap`).",
+            "Click a published widget by its `panel/key` (see hit_rects / hit_key_docs), scrolling its pane so the widget is inside `panel:clip` first. A key not yet published is waited for (up to 20 s: a row whose data loads on its own time is drawn a few frames late); one that never appears is an error naming the key. `count` is EXACT: 1 is a single click, 2 a double, 3 a triple, however recently another click landed \u{2014} egui's clock is first moved past the multi-click window of the clicks before (`click_gap`).",
             object_schema(json!({ "key": { "type": "string" }, "button": { "type": "string", "enum": ["primary", "secondary", "middle"], "default": "primary" }, "count": { "type": "integer", "default": 1 } }), &["key"]),
             Annotations { read_only: false, destructive: false, idempotent: false, waits: false },
             move |args| {
@@ -1183,8 +1183,35 @@ async fn published_rect(session: &Session, key: &str) -> Result<[f32; 4], String
         .ok_or_else(|| format!("no widget `{key}` is published this frame (see hit_rects)"))
 }
 
+/// How long a widget action waits for its key to be published before it
+/// errors: a row whose data arrives on its own time (a document's parts
+/// library loading after the document opens) is drawn a few frames late on a
+/// loaded machine, and a script that clicks it at once would fail on timing
+/// alone. A key that never appears still fails, naming the key.
+const UNPUBLISHED_WAIT_MS: f64 = 20_000.0;
+
+/// Wait until `key` is published (its pane draws it), pinging a frame at a
+/// time, for at most [`UNPUBLISHED_WAIT_MS`].
+async fn await_published(session: &Session, panel: &str, key: &str) -> Result<(), String> {
+    let started = session.host.platform.now_ms();
+    loop {
+        let rects = session.host.call_ok("hit_rects", json!({ "prefix": format!("{panel}/") })).await?.result.unwrap_or(Value::Null);
+        if rects["rects"][key].is_array() {
+            return Ok(());
+        }
+        if session.host.platform.now_ms() - started > UNPUBLISHED_WAIT_MS {
+            return Err(format!(
+                "no widget `{key}` was published within {} s (see hit_rects)",
+                UNPUBLISHED_WAIT_MS / 1000.0
+            ));
+        }
+        session.host.call_ok("ping", json!({})).await?;
+    }
+}
+
 async fn scroll_into_view(session: &Session, key: &str) -> Result<[f32; 4], String> {
     let (panel, _) = key.split_once('/').ok_or("key must be `panel/key`")?;
+    await_published(session, panel, key).await?;
     const SLACK: f32 = 1.0;
     // egui SMOOTHS a wheel scroll over several frames, so the rect a pane
     // reports on the frame its widget first comes inside the clip is still

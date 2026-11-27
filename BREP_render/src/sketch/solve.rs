@@ -13,7 +13,18 @@
 //! read-only [`SketchDiagnostics`] the overlay coloring + DOF readout consume.
 
 use super::doc::{SketchDiagnostics, SketchDoc};
-use brep_kernel::{solve_sketch, SolveSketchRequest};
+use brep_kernel::{solve_sketch, solve_sketch_min_change, SolveSketchRequest};
+
+/// Whether a drag frame solves for the smallest change from the previous frame
+/// (`BREP_SKETCH_DRAG_MIN_CHANGE=1`; OFF by default). It was promoted and then set
+/// back to off: dragging a point held on a line whose far end is free, or a line
+/// parallel to a fixed one, the minimum-norm steps move free endpoints across the
+/// line, so over a long drag such a line grows several times its length or
+/// collapses, which is worse than the plain per-frame solve. It stays opt-in until
+/// the step keeps free line lengths and directions.
+pub fn drag_min_change() -> bool {
+    brep_kernel::switch!("BREP_SKETCH_DRAG_MIN_CHANGE", false)
+}
 
 /// User-tunable 2D solver knobs (the "Solver Settings" section), all optional
 /// — `None` keeps the kernel's default. Held on the [`super::SketchSession`] and
@@ -64,6 +75,24 @@ pub fn solve_with(
     doc: &SketchDoc,
     settings: &SketchSolverSettings,
 ) -> Result<(SketchDoc, SketchDiagnostics), String> {
+    solve_entry(doc, settings, false)
+}
+
+/// Like [`solve_with`], for one interactive drag frame: the kernel's
+/// [`solve_sketch_min_change`] first moves the free points by the smallest step that
+/// meets every constraint, and relaxes as [`solve_with`] does only when it cannot.
+pub fn solve_drag_with(
+    doc: &SketchDoc,
+    settings: &SketchSolverSettings,
+) -> Result<(SketchDoc, SketchDiagnostics), String> {
+    solve_entry(doc, settings, true)
+}
+
+fn solve_entry(
+    doc: &SketchDoc,
+    settings: &SketchSolverSettings,
+    min_change: bool,
+) -> Result<(SketchDoc, SketchDiagnostics), String> {
     let sketch = serde_json::to_value(doc).map_err(|e| format!("sketch serialize: {e}"))?;
     let request = SolveSketchRequest {
         sketch,
@@ -76,7 +105,11 @@ pub fn solve_with(
         polish: None,
     };
 
-    let response = solve_sketch(&request)?;
+    let response = if min_change {
+        solve_sketch_min_change(&request)?
+    } else {
+        solve_sketch(&request)?
+    };
     let solved = response
         .get("sketch")
         .cloned()

@@ -571,6 +571,183 @@ impl EngineState {
 }
 
 // ===========================================================================
+// Sketch fillet and chamfer tools: round or cut the corner two lines share.
+// ===========================================================================
+
+impl EngineState {
+    /// A fillet (`fillet`) or chamfer click at plane coordinates `(u, v)`: the
+    /// corner within the grab radius is rounded or cut with the session's
+    /// [`crate::sketch::corner::CornerOptions`]. One undo step on success; a
+    /// refusal changes nothing, leaves no undo step and records why in
+    /// `corner_message`. Returns whether the sketch changed.
+    pub fn sketch_corner_uv(&mut self, u: f64, v: f64, fillet: bool) -> bool {
+        let radius = self.sketch_pick_radius();
+        let corner = match self.sketch_edit.as_ref() {
+            Some(edit) => crate::sketch::corner::corner_near(&edit.session.doc, u, v, radius),
+            None => return false,
+        };
+        let Some(corner) = corner else {
+            if let Some(edit) = self.sketch_edit.as_mut() {
+                edit.session.corner_message = Some("no shared corner here: click the point where two lines meet".to_string());
+            }
+            self.dirty = true;
+            return false;
+        };
+        self.sketch_corner_at(&corner, fillet)
+    }
+
+    /// Round the corner at point `corner` with the fillet radius in the tool's
+    /// options. See [`Self::sketch_corner_uv`].
+    pub fn sketch_fillet_corner(&mut self, corner: &serde_json::Value, radius: f64) -> Result<(), String> {
+        if let Some(edit) = self.sketch_edit.as_mut() {
+            edit.session.corner_options.radius = radius;
+        }
+        self.sketch_corner_at(corner, true).then_some(()).ok_or_else(|| self.sketch_corner_refusal())
+    }
+
+    /// The selected sketch points, in selection order (the sketch actions card
+    /// offers Fillet whenever there is at least one).
+    pub fn sketch_selected_point_ids(&self) -> Vec<serde_json::Value> {
+        let Some(edit) = self.sketch_edit.as_ref() else {
+            return Vec::new();
+        };
+        edit.session
+            .selection
+            .items
+            .iter()
+            .filter(|r| r.get("kind").and_then(|v| v.as_str()) == Some("point"))
+            .filter_map(|r| r.get("id").cloned())
+            .collect()
+    }
+
+    /// Round every selected corner point with the fillet radius in the tool's
+    /// options (the toolbar's or the actions card's Fillet with points selected),
+    /// all in ONE undo step. The first corner in selection order carries the one
+    /// radius dimension; every other new arc is held equal to it
+    /// ([`crate::sketch::corner::fillet_corners`]). Points that are not a corner of
+    /// two lines are skipped and named in `corner_message`; when none can be
+    /// filleted nothing changes, no undo step is left and the reasons are
+    /// returned. Returns how many corners were rounded.
+    pub fn sketch_fillet_selected_points(&mut self) -> Result<usize, String> {
+        let points = self.sketch_selected_point_ids();
+        let Some(edit) = self.sketch_edit.as_mut() else {
+            return Err("no sketch is being edited".to_string());
+        };
+        if points.is_empty() {
+            let message = "select one or more corner points (where two lines meet) to fillet".to_string();
+            edit.session.corner_message = Some(message.clone());
+            self.dirty = true;
+            return Err(message);
+        }
+        edit.record_undo();
+        let radius = edit.session.corner_options.radius;
+        let (done, refused) = crate::sketch::corner::fillet_corners(&mut edit.session.doc, &points, radius);
+        let rounded = done.len();
+        let refusals: Vec<String> = refused
+            .iter()
+            .map(|(point, message)| format!("point {}: {message}", crate::sketch::doc::id_key(point)))
+            .collect();
+        edit.session.corner_message = (!refusals.is_empty()).then(|| refusals.join("; "));
+        self.dirty = true;
+        if rounded == 0 {
+            edit.undo_stack.pop();
+            return Err(edit.session.corner_message.clone().unwrap_or_default());
+        }
+        edit.session.clear_selection();
+        edit.session.set_hover(None);
+        self.resolve_active_sketch("fillet");
+        self.refresh_sketch_overlay();
+        Ok(rounded)
+    }
+
+    /// The Fillet command (the toolbar button and the actions card): with points
+    /// selected, round them all at once ([`Self::sketch_fillet_selected_points`]),
+    /// arming the fillet tool only when some were refused so its options card shows
+    /// why; with none selected, arm the click-a-corner tool. Returns how many
+    /// corners were rounded.
+    pub fn sketch_fillet_command(&mut self) -> usize {
+        if self.sketch_selected_point_ids().is_empty() {
+            self.sketch_set_tool(Some("fillet"));
+            return 0;
+        }
+        let rounded = self.sketch_fillet_selected_points().unwrap_or(0);
+        if rounded == 0 || self.sketch_corner_message().is_some() {
+            self.sketch_set_tool(Some("fillet"));
+        }
+        rounded
+    }
+
+    /// Cut the corner at point `corner`; `angle_degrees` sizes it by distance and
+    /// angle, `None` equally both ways. See [`Self::sketch_corner_uv`].
+    pub fn sketch_chamfer_corner(&mut self, corner: &serde_json::Value, distance: f64, angle_degrees: Option<f64>) -> Result<(), String> {
+        if let Some(edit) = self.sketch_edit.as_mut() {
+            let options = &mut edit.session.corner_options;
+            options.chamfer_distance = distance;
+            options.chamfer_by_angle = angle_degrees.is_some();
+            if let Some(angle) = angle_degrees {
+                options.chamfer_angle_degrees = angle;
+            }
+        }
+        self.sketch_corner_at(corner, false).then_some(()).ok_or_else(|| self.sketch_corner_refusal())
+    }
+
+    /// The fillet and chamfer tools' options, while a sketch is being edited.
+    pub fn sketch_corner_options(&self) -> Option<crate::sketch::corner::CornerOptions> {
+        self.sketch_edit.as_ref().map(|edit| edit.session.corner_options)
+    }
+
+    /// Set the fillet and chamfer tools' options (the tool-options panel).
+    pub fn set_sketch_corner_options(&mut self, options: crate::sketch::corner::CornerOptions) {
+        if let Some(edit) = self.sketch_edit.as_mut() {
+            edit.session.corner_options = options;
+            self.dirty = true;
+        }
+    }
+
+    /// Why the last fillet or chamfer click changed nothing, if it did not.
+    pub fn sketch_corner_message(&self) -> Option<String> {
+        self.sketch_edit.as_ref().and_then(|edit| edit.session.corner_message.clone())
+    }
+
+    fn sketch_corner_refusal(&self) -> String {
+        self.sketch_edit
+            .as_ref()
+            .and_then(|edit| edit.session.corner_message.clone())
+            .unwrap_or_else(|| "no sketch is being edited".to_string())
+    }
+
+    fn sketch_corner_at(&mut self, corner: &serde_json::Value, fillet: bool) -> bool {
+        let Some(edit) = self.sketch_edit.as_mut() else {
+            return false;
+        };
+        edit.record_undo();
+        let options = edit.session.corner_options;
+        let applied = if fillet {
+            crate::sketch::corner::fillet_corner(&mut edit.session.doc, corner, options.radius)
+        } else {
+            crate::sketch::corner::chamfer_corner(&mut edit.session.doc, corner, options.chamfer_size())
+        };
+        match applied {
+            Ok(_) => {
+                edit.session.corner_message = None;
+                edit.session.clear_selection();
+                edit.session.set_hover(None);
+                self.resolve_active_sketch(if fillet { "fillet" } else { "chamfer" });
+                self.refresh_sketch_overlay();
+                self.dirty = true;
+                true
+            }
+            Err(message) => {
+                edit.undo_stack.pop();
+                edit.session.corner_message = Some(message);
+                self.dirty = true;
+                false
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Sketch pickEdges tool (S6b-2) — link an external solid edge as a reference.
 //
 // A CLICK tool that acts on the 3D SCENE EDGE under the cursor (NOT a plane uv):

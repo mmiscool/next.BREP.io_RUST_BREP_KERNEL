@@ -156,7 +156,9 @@ pub use face_deform::{deform_face, face_deform_default_anchor, FaceDeformPick, F
 #[path = "direct_edit/face_deform_shell.rs"]
 pub mod face_deform_shell;
 pub use face_deform_shell::{deform_shell, ShellDeformPick, ShellDeformReport, ShellDeformSpec};
-pub use face_draft::{draft_faces, draft_faces_parted, draft_faces_unchecked};
+pub use face_draft::{
+    draft_face_qualifies, draft_faces, draft_faces_parted, draft_faces_parted_sided, draft_faces_unchecked, draft_tangent_faces,
+};
 #[path = "direct_edit/face_offset.rs"]
 pub mod face_offset;
 #[path = "direct_edit/face_offset_sphere.rs"]

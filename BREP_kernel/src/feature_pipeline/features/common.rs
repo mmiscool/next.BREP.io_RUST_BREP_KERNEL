@@ -8,6 +8,14 @@ use crate::feature_pipeline::{
 };
 use crate::{AffineTransform, BooleanOperation, BooleanOptions, BrepSolid, KernelRefusal, KernelStage, NurbsCurve, OrRefuse, Vec3, transform_brep};
 
+/// The one sentence every direction-reference field's hint carries (Pattern
+/// and Pattern Component `directionRef`, Waypoint `directionRef`), so the
+/// dialogs and the docs say the same thing about what a pick means. It
+/// matches the resolvers: a plane or planar face resolves to its normal, an
+/// edge to its start-to-end chord.
+pub const DIRECTION_FROM_REFERENCE: &str =
+    "A plane or planar face gives its normal; an edge or sketch line gives the direction from its start to its end.";
+
 /// Rotate a solid a half turn (180°) about the local X axis. This is a PROPER
 /// rotation (determinant +1), so `transform_brep` preserves face winding and every
 /// stamped face name. It realizes a NEGATIVE directional dimension: a primitive

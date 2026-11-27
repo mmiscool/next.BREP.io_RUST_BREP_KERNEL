@@ -55,21 +55,34 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         return Err(format!("pattern component id '{}' must have the form APAT<digits>", ctx.id));
     }
     // Seeds: component ids, or any name on a component (a face picked on it).
+    // An earlier Pattern Component's id seeds its WHOLE pattern: its seeds and
+    // every instance it placed (a pattern of a pattern). One instance of an
+    // earlier pattern may seed on its own too.
     let mut seeds: Vec<String> = Vec::new();
+    let push = |id: &str, seeds: &mut Vec<String>| {
+        if !seeds.iter().any(|seed| seed == id) {
+            seeds.push(id.to_string());
+        }
+    };
     for name in crate::feature_pipeline::features::common::reference_name_array(ctx.param("seeds")) {
+        if is_pattern_id(&name) {
+            if name == ctx.id {
+                return Err(format!("{}: a pattern cannot be its own seed", ctx.id));
+            }
+            let group = pattern_group(ctx.scene, &name);
+            if group.is_empty() {
+                result.unresolved.push(name);
+            }
+            for id in group {
+                push(&id, &mut seeds);
+            }
+            continue;
+        }
         match ctx.scene.owning_component(&name) {
-            Some(record) if record.pattern.is_some() => {
-                return Err(format!(
-                    "'{}' is an instance of pattern {}; pattern its seed instead",
-                    record.id,
-                    record.pattern.as_ref().map_or("", |p| p.pattern_id.as_str())
-                ));
+            Some(record) if record.pattern.as_ref().is_some_and(|p| p.pattern_id == ctx.id) => {
+                return Err(format!("{}: '{}' is this pattern's own instance; pick its seed", ctx.id, record.id));
             }
-            Some(record) => {
-                if !seeds.contains(&record.id) {
-                    seeds.push(record.id.clone());
-                }
-            }
+            Some(record) => push(&record.id.clone(), &mut seeds),
             None => result.unresolved.push(name),
         }
     }
@@ -111,6 +124,13 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
             let id = instance_id(&ctx.id, seed, n);
             let (mut instance, added) =
                 create_component(&id, &record.part_name, false, record.source.clone(), pose, members)?;
+            // The instance shows its part's colours as the seed does (the app
+            // then lets an override set on the seed show through).
+            crate::feature_pipeline::features::assembly_component::stamp_part_metadata(
+                &id,
+                restored.metadata.iter().cloned(),
+                &entry.document,
+            );
             instance.pattern =
                 Some(PatternFollow { pattern_id: ctx.id.clone(), seed: seed.clone(), delta, key: n, driver: None });
             result.added.extend(added);
@@ -118,6 +138,27 @@ fn build(ctx: &FeatureContext) -> Result<FeatureResult, String> {
         }
     }
     Ok(result)
+}
+
+/// Every component an earlier Pattern Component `pattern_id` controls, in a
+/// stable order: each seed it follows, then the instances it placed (an
+/// instance's own seed may be an instance of a still earlier pattern, which is
+/// then a member of THAT pattern's group, not of this one's).
+pub fn pattern_group(scene: &crate::feature_pipeline::SceneMap, pattern_id: &str) -> Vec<String> {
+    let instances: Vec<&crate::feature_pipeline::ComponentRecord> = scene
+        .components
+        .values()
+        .filter(|record| record.pattern.as_ref().is_some_and(|p| p.pattern_id == pattern_id))
+        .collect();
+    let mut group: Vec<String> = Vec::new();
+    for record in &instances {
+        let seed = &record.pattern.as_ref().expect("filtered on pattern").seed;
+        if !group.contains(seed) {
+            group.push(seed.clone());
+        }
+    }
+    group.extend(instances.iter().map(|record| record.id.clone()));
+    group
 }
 
 /// The key of hole `pid` (copy `k` of a part Pattern, 1 for the source).
@@ -359,6 +400,13 @@ fn build_driven(ctx: &FeatureContext, seeds: &[String], holes: bool, mut result:
             let id = instance_id(&ctx.id, seed, key);
             let (mut instance, added) =
                 create_component(&id, &record.part_name, false, record.source.clone(), pose, members)?;
+            // The instance shows its part's colours as the seed does (the app
+            // then lets an override set on the seed show through).
+            crate::feature_pipeline::features::assembly_component::stamp_part_metadata(
+                &id,
+                restored.metadata.iter().cloned(),
+                &entry.document,
+            );
             instance.pattern = Some(PatternFollow {
                 pattern_id: ctx.id.clone(),
                 seed: seed.clone(),
@@ -377,6 +425,25 @@ fn build_driven(ctx: &FeatureContext, seeds: &[String], holes: bool, mut result:
 /// actions, not feature offers. Added from the Assembly ribbon.
 pub fn context_applicable(_probe: &crate::feature_pipeline::SelectionProbe) -> bool {
     false
+}
+
+/// The dialog field-visibility hook ([`crate::feature_hidden_params`]), read
+/// the way [`build`] reads `mode` (case-insensitive, LINEAR when absent):
+/// HOLES and PATTERN follow the `driver` and ignore every layout input, count
+/// included; LINEAR and circular hide `driver` and what the part Pattern's
+/// mode hides ([`pattern::mode_hidden_params`]).
+pub fn hidden_params(values: &serde_json::Value) -> Vec<&'static str> {
+    let mode = values.get("mode").and_then(serde_json::Value::as_str).map(str::to_uppercase);
+    let mode = mode.as_deref().unwrap_or("LINEAR");
+    if mode == "HOLES" || mode == "PATTERN" {
+        return vec![
+            "linearInputMode", "offset", "directionRef", "linearDistance", "axisRef", "centerOffset", "totalAngleDeg",
+            "count", "countMode",
+        ];
+    }
+    let mut hidden = pattern::mode_hidden_params(mode == "LINEAR", values);
+    hidden.push("driver");
+    hidden
 }
 
 pub fn schema() -> serde_json::Value {
@@ -411,7 +478,7 @@ pub fn schema() -> serde_json::Value {
     if let Some(mode) = ordered.get_mut("mode") {
         mode["options"] = serde_json::json!(["LINEAR", "CIRCULAR", "HOLES", "PATTERN"]);
         mode["hint"] = serde_json::json!(
-            "Pattern type; HOLES follows every hole of another part's Hole feature, PATTERN every copy of another part's Pattern"
+            "LINEAR steps the copies along a line; CIRCULAR turns them about an axis; HOLES follows every hole of another part's Hole feature, PATTERN every copy of another part's Pattern. The dialog shows only the chosen mode's inputs"
         );
     }
     ordered.insert("driver".into(), serde_json::json!({

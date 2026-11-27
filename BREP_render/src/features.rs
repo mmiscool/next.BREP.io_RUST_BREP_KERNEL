@@ -206,6 +206,7 @@ pub fn feature_icon(kind: &str) -> Option<char> {
         "TF" | "TRANSFORM FACE" | "TRANSFORMFACE" => 0xE05D,
         "RFS" | "REFIT FACES" | "REFITFACES" => 0xE05E,
         "DFF" | "DEFORM FACE" | "DEFORMFACE" => 0xE0E1,
+        "DRAFT" => 0xE0FB,
         "SEW" | "SEW TO SOLID" | "SEWTOSOLID" => 0xE0E2,
         "FILL" | "FILL SURFACE" | "FILLSURFACE" => 0xE0E0,
         _ => return None,
@@ -400,6 +401,7 @@ pub fn form_fields_from_schema(schema: &Value) -> Vec<FormField> {
                     group: "Boolean".into(),
                     kind: FieldKind::Enum {
                         variants: BOOLEAN_OPS.iter().map(|s| s.to_string()).collect(),
+                        labels: Vec::new(),
                     },
                 });
                 fields.push(FormField {
@@ -460,14 +462,27 @@ pub fn form_fields_from_schema(schema: &Value) -> Vec<FormField> {
                 // `options`, using the field's `label` when present (e.g.
                 // flangeLengthReference → "Length reference", inset → "Flange
                 // position") else the prettified key.
-                let variants = crate::json_support::string_values(spec.get("options"))
+                let variants: Vec<String> = crate::json_support::string_values(spec.get("options"))
                     .map(String::from)
+                    .collect();
+                // `optionLabels` maps a stored value to the words the box shows;
+                // the value itself is what is saved, so renaming a label never
+                // touches a file.
+                let labels = variants
+                    .iter()
+                    .map(|value| {
+                        spec.get("optionLabels")
+                            .and_then(|labels| labels.get(value))
+                            .and_then(Value::as_str)
+                            .unwrap_or(value)
+                            .to_string()
+                    })
                     .collect();
                 fields.push(FormField {
                     path: vec![name.clone()],
                     label: field_label(spec, name),
                     group: "Parameters".into(),
-                    kind: FieldKind::Enum { variants },
+                    kind: FieldKind::Enum { variants, labels },
                 });
             }
             // Unmapped kernel param types (vec3-array/etc. arrive as more

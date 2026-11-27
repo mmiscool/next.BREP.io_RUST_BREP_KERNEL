@@ -139,6 +139,13 @@ impl EngineState {
         if self.history.index_of(id).is_none() {
             return false;
         }
+        // A Pattern or Pattern Component selects everything it controls,
+        // its originals included (owner 2026-11-25).
+        if let Some(solids) = self.pattern_controlled_solids(id) {
+            self.set_selection(&solids, &[], &[], &[]);
+            self.selected_feature = Some((id.to_string(), FeatureSelection::of(&self.emphasis)));
+            return true;
+        }
         let in_scene_faces: Vec<String> = self
             .scene
             .solids()
@@ -175,6 +182,85 @@ impl EngineState {
         self.set_selection(&solids, &in_scene_faces, &[], &datums);
         self.selected_feature = Some((id.to_string(), FeatureSelection::of(&self.emphasis)));
         true
+    }
+
+    /// ADD a feature's selection to the current one (a Ctrl/Cmd or Shift click
+    /// on its tree row): the same geometry [`Self::select_feature`] selects,
+    /// joined to what is selected rather than replacing it.
+    pub fn add_feature_to_selection(&mut self, id: &str) -> bool {
+        let before = (
+            self.emphasis.selected_solids.clone(),
+            self.emphasis.selected_faces.clone(),
+            self.emphasis.selected_edges.clone(),
+            self.emphasis.selected_datums.clone(),
+        );
+        if !self.select_feature(id) {
+            return false;
+        }
+        let (solids, faces, edges, datums) = before;
+        let join = |old: &crate::style::OrderedNames, new: &crate::style::OrderedNames| -> Vec<String> {
+            old.iter().chain(new.iter()).cloned().collect()
+        };
+        let solids = join(&solids, &self.emphasis.selected_solids);
+        let faces = join(&faces, &self.emphasis.selected_faces);
+        let edges = join(&edges, &self.emphasis.selected_edges);
+        let datums = join(&datums, &self.emphasis.selected_datums);
+        self.set_selection(&solids, &faces, &edges, &datums);
+        true
+    }
+
+    /// The solids a Pattern or Pattern Component controls, its originals
+    /// included: a part Pattern's source solids and every copy (a source that
+    /// an earlier Pattern made brings that Pattern's whole set), a Pattern
+    /// Component's seeds and every instance (a pattern of a pattern: the whole
+    /// tree). `None` for any other feature.
+    fn pattern_controlled_solids(&self, id: &str) -> Option<Vec<String>> {
+        let index = self.history.index_of(id)?;
+        match self.history.feature_type(index)?.as_str() {
+            "APAT" | "PATTERN COMPONENT" => Some(self.component_member_solids(id)),
+            "PATTERN" => {
+                let mut solids: Vec<String> = Vec::new();
+                self.part_pattern_solids(id, &mut solids, 0);
+                Some(solids)
+            }
+            _ => None,
+        }
+    }
+
+    fn part_pattern_solids(&self, id: &str, out: &mut Vec<String>, depth: usize) {
+        if depth > self.history.len() {
+            return;
+        }
+        let Some(index) = self.history.index_of(id) else { return };
+        let params = self.history.feature_params(index).unwrap_or_default();
+        let sources: Vec<String> = params["solids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect();
+        let mut push = |name: &str, out: &mut Vec<String>| {
+            if !out.iter().any(|seen| seen == name) {
+                out.push(name.to_string());
+            }
+        };
+        for solid in self.scene.solids() {
+            if self.provenance.get(&solid.name).map(String::as_str) == Some(id) || sources.contains(&solid.name) {
+                push(&solid.name, out);
+            }
+        }
+        // A source an earlier Pattern made: that Pattern's whole set too.
+        for source in &sources {
+            let Some(producer) = self.provenance.get(source) else { continue };
+            if producer == id {
+                continue;
+            }
+            let earlier = self.history.index_of(producer).and_then(|i| self.history.feature_type(i));
+            if earlier.as_deref() == Some("PATTERN") {
+                self.part_pattern_solids(producer, out, depth + 1);
+            }
+        }
     }
 
     /// The feature selected through [`Self::select_feature`], while the
@@ -433,10 +519,37 @@ impl EngineState {
         // (ranked last, so a SOLID or FACE the field also admits keeps the
         // plain click). An empty filter admits every raw kind already.
         if filter.iter().any(|k| k.eq_ignore_ascii_case("COMPONENT")) {
-            out.extend(self.component_candidates(&raw));
+            let components = self.component_candidates(&raw);
+            // A Pattern Component's seeds may be an earlier pattern WHOLE: each
+            // component under the cursor that an earlier pattern controls also
+            // lists that pattern (its id), right after the component itself,
+            // so a plain click still takes the one component.
+            let mut patterns: Vec<pick::PickCandidate> = Vec::new();
+            if self.ref_select_is_pattern_seeds(state) {
+                for component in &components {
+                    for pattern in self.patterns_of_component(&component.name) {
+                        if pattern != state.feature_id && !patterns.iter().any(|row| row.name == pattern) {
+                            patterns.push(pick::PickCandidate { name: pattern, ..component.clone() });
+                        }
+                    }
+                }
+            }
+            out.extend(components);
+            out.extend(patterns);
             super::plane_pick::sort_pick_candidates(&mut out);
         }
         out
+    }
+
+    /// Whether the running pick is a Pattern Component's `seeds` field.
+    fn ref_select_is_pattern_seeds(&self, state: &RefSelectState) -> bool {
+        state.target == RefSelectTarget::Feature
+            && state.path.last().is_some_and(|key| key == "seeds")
+            && self
+                .history
+                .index_of(&state.feature_id)
+                .and_then(|index| self.history.feature_type(index))
+                .is_some_and(|ty| ty == "APAT" || ty == "PATTERN COMPONENT")
     }
 
     /// Whether `candidate` is already in the running reference list — the pick
@@ -732,6 +845,18 @@ impl EngineState {
             self.end_ref_select(state.restore_index);
             return;
         }
+        // The DRAFT ANALYSIS pull: display state, so nothing is written to
+        // the document and nothing rolled; the tail is the highlight and the
+        // filter going back, and the analysis reads with the new pull.
+        if state.target == RefSelectTarget::DraftAnalysis {
+            let _ = self.emphasis.apply_json("{}");
+            self.selection_filter = SelectionFilter::default();
+            if let Err(error) = self.draft_analysis_set(Some(state.names.first().cloned()), None, None) {
+                self.push_notice(format!("Draft Analysis: {error}"));
+            }
+            self.dirty = true;
+            return;
+        }
         if state.target == RefSelectTarget::Simulation {
             let _ = self.emphasis.apply_json("{}");
             self.selection_filter = SelectionFilter::default();
@@ -787,6 +912,13 @@ impl EngineState {
                 self.dirty = true;
                 return;
             }
+            if state.target == RefSelectTarget::DraftAnalysis {
+                // Nothing rolled: the highlight and the filter go back, no run.
+                let _ = self.emphasis.apply_json("{}");
+                self.selection_filter = SelectionFilter::default();
+                self.dirty = true;
+                return;
+            }
             self.end_ref_select(state.restore_index);
         }
     }
@@ -820,6 +952,7 @@ impl EngineState {
                     | RefSelectTarget::Simulation
                     | RefSelectTarget::ReplaceRepair
                     | RefSelectTarget::PointPick
+                    | RefSelectTarget::DraftAnalysis
             )
         })
     }
@@ -1564,7 +1697,7 @@ impl EngineState {
     /// overlay groups are left untouched).
     pub fn clear_sketch_overlay(&mut self) {
         let _ = self.set_overlay_json(
-            "{\"groups\":[{\"name\":\"sketch-geometry\"},{\"name\":\"sketch-points\"},{\"name\":\"sketch-preview\"},{\"name\":\"sketch-dim-leaders\"},{\"name\":\"sketch-constraint-glyphs\"}]}",
+            "{\"groups\":[{\"name\":\"sketch-geometry\"},{\"name\":\"sketch-points\"},{\"name\":\"sketch-preview\"},{\"name\":\"sketch-dim-leaders\"},{\"name\":\"sketch-constraint-glyphs\"},{\"name\":\"sketch-dof-arrows\"}]}",
         );
         self.sketch_overlay_wpp = 0.0;
     }

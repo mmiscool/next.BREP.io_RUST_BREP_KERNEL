@@ -52,6 +52,7 @@ pub use brep_topology::*;
 pub mod sketch_solver;
 pub use sketch_solver::{
     is_sketch_origin_point_id, sketch_id_key, mint_sketch_id, solve_sketch, solve_sketch_from_json,
+    solve_sketch_min_change,
     SketchSolverSettings, SolveSketchRequest, SKETCH_ORIGIN_POINT_ID,
 };
 #[path = "solvers/assembly_solver.rs"]

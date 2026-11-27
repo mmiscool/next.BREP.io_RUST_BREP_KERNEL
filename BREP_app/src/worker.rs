@@ -39,6 +39,13 @@ pub struct WorkerRunner {
     /// The kept `onmessage` closure — dropping it detaches the handler, so it lives
     /// as long as the runner.
     _onmessage: Closure<dyn FnMut(MessageEvent)>,
+    /// The kept `onerror` closure: an uncaught error in the worker (its wasm failed
+    /// to start, or a command trapped) is how a dead worker shows itself.
+    _onerror: Closure<dyn FnMut(web_sys::Event)>,
+    /// What the worker said when it died, until [`HistoryRunner::poll_failure`]
+    /// takes it. Set by `_onerror` and by the boot-failure message `worker.js`
+    /// posts when its wasm will not start.
+    failure: Rc<RefCell<Option<String>>>,
     /// Demuxed completed run replies awaiting `poll_run`.
     run_buf: VecDeque<RunReply>,
     /// Demuxed completed measurement replies awaiting `poll_query`.
@@ -109,12 +116,22 @@ impl WorkerRunner {
         // and queue it for the next `poll_*` drain.
         let inbox: Rc<RefCell<VecDeque<Reply>>> = Rc::new(RefCell::new(VecDeque::new()));
         let inbox_cb = inbox.clone();
+        let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let failure_cb = failure.clone();
         let onmessage = Closure::wrap(Box::new(move |event: MessageEvent| {
-            if let Some(text) = event.data().as_string() {
+            let data = event.data();
+            if let Some(text) = data.as_string() {
                 match serde_json::from_str::<Reply>(&text) {
                     Ok(reply) => inbox_cb.borrow_mut().push_back(reply),
                     Err(error) => log::error!("worker reply parse failed: {error}"),
                 }
+            } else if let Some(said) = js_sys::Reflect::get(&data, &JsValue::from_str("brepWorkerFailed"))
+                .ok()
+                .and_then(|said| said.as_string())
+            {
+                // `worker.js` could not start its wasm: no command will ever be answered.
+                log::error!("history worker failed to start: {said}");
+                failure_cb.borrow_mut().get_or_insert(said);
             }
             // The app collects it now, not at its next frame (a background
             // tab has none): the automation pump's wake (`web_pump`).
@@ -124,11 +141,31 @@ impl WorkerRunner {
             }
         }) as Box<dyn FnMut(MessageEvent)>);
         worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+        let failure_cb = failure.clone();
+        // A plain `Event` when the worker's script itself failed to load, an
+        // `ErrorEvent` (with a `message`) for an uncaught error inside it: read
+        // the message only where there is one.
+        let onerror = Closure::wrap(Box::new(move |event: web_sys::Event| {
+            let said = js_sys::Reflect::get(&event, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|said| said.as_string())
+                .filter(|said| !said.is_empty())
+                .unwrap_or_else(|| "its script failed to load".to_string());
+            log::error!("history worker died: {said}");
+            failure_cb.borrow_mut().get_or_insert(said);
+            let wake = REPLY_WAKE.with(|w| w.borrow().clone());
+            if let Some(wake) = wake {
+                wake();
+            }
+        }) as Box<dyn FnMut(web_sys::Event)>);
+        worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
 
         Self {
             worker,
             inbox,
             _onmessage: onmessage,
+            _onerror: onerror,
+            failure,
             run_buf: VecDeque::new(),
             query_buf: VecDeque::new(),
             mesh_import_buf: VecDeque::new(),
@@ -240,12 +277,24 @@ impl Default for WorkerRunner {
 /// clear message if the browser cannot create it. `worker.js` buffers every
 /// message posted before its wasm has initialised, so the caller may post to
 /// the returned worker immediately.
+///
+/// The FIRST message is the page's own compiled `WebAssembly.Module`, as the
+/// code worker gets it: the worker instantiates that instead of fetching and
+/// compiling the app's ~94 MB wasm a second time per document (otherwise a
+/// model could never rebuild: the run waited on a worker whose own copy of the
+/// wasm never finished starting).
 fn spawn_worker() -> web_sys::Worker {
     let options = web_sys::WorkerOptions::new();
     // 0.3.104 deprecates the builder `type_()`; `set_type` is the current setter.
     options.set_type(web_sys::WorkerType::Module);
-    web_sys::Worker::new_with_options("./worker.js", &options)
-        .unwrap_or_else(|e| panic!("failed to spawn history worker (./worker.js): {e:?}"))
+    let worker = web_sys::Worker::new_with_options("./worker.js", &options)
+        .unwrap_or_else(|e| panic!("failed to spawn history worker (./worker.js): {e:?}"));
+    // A refused module only costs the worker its shortcut: without it,
+    // `worker.js` falls back to fetching the wasm itself.
+    if let Err(error) = worker.post_message(&wasm_bindgen::module()) {
+        log::warn!("history worker refused the compiled module, it will fetch the wasm: {error:?}");
+    }
+    worker
 }
 
 /// A closed document TAKES ITS WORKER WITH IT. Nothing else terminates a
@@ -473,6 +522,10 @@ impl HistoryRunner for WorkerRunner {
     // reply (the cancel is immediate between operations, which is where the
     // engine submits them).
 
+    fn poll_failure(&mut self) -> Option<String> {
+        self.failure.borrow_mut().take()
+    }
+
     fn poll_progress(&mut self) -> Option<RunProgress> {
         self.drain();
         let latest = self.progress_buf.pop_back();
@@ -493,7 +546,11 @@ impl HistoryRunner for WorkerRunner {
         self.worker = spawn_worker();
         self.worker
             .set_onmessage(Some(self._onmessage.as_ref().unchecked_ref()));
+        self.worker
+            .set_onerror(Some(self._onerror.as_ref().unchecked_ref()));
         self.inbox.borrow_mut().clear();
+        // The old worker's death is answered by this replacement.
+        self.failure.borrow_mut().take();
         self.run_buf.clear();
         self.query_buf.clear();
         self.mesh_import_buf.clear();

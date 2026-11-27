@@ -62,7 +62,7 @@ pub fn form_fields(doc: &CamDocument, op: &Operation) -> Vec<FormField> {
             path: vec!["strategy".to_string(), "unreachable".to_string()],
             label: "Unreachable points".to_string(),
             group: "Passes".to_string(),
-            kind: FieldKind::Enum { variants: brep_cam::model::UnreachablePolicy::VARIANTS.iter().map(|v| v.to_string()).collect() },
+            kind: FieldKind::Enum { variants: brep_cam::model::UnreachablePolicy::VARIANTS.iter().map(|v| v.to_string()).collect(), labels: Vec::new() },
         });
     }
     fields
@@ -80,7 +80,7 @@ pub fn form_field(doc: &CamDocument, op: &Operation) -> Option<FormField> {
             variants.push(current.to_string());
         }
     }
-    Some(FormField { path: vec![FIELD.to_string()], label: "Three-axis source operation".to_string(), group: "Passes".to_string(), kind: FieldKind::Enum { variants } })
+    Some(FormField { path: vec![FIELD.to_string()], label: "Three-axis source operation".to_string(), group: "Passes".to_string(), kind: FieldKind::Enum { variants, labels: Vec::new() } })
 }
 
 /// Put the designation (and a multi-axis finish's unreachable policy) into

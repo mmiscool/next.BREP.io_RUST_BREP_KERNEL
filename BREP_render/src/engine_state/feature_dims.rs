@@ -304,8 +304,9 @@ impl EngineState {
         // `offset_distance` the offset dimension gizmo drives — so it never gets a
         // transform gizmo: the origin-sphere toggle stays in dimension mode. (Other
         // dim features, e.g. a revolve, still toggle to their transform gizmo.)
+        // A DRAFT has none either: its arcs are the draft angle, nothing places it.
         if let Some(index) = self.history.index_of(&feature) {
-            if self.history.feature_type(index).as_deref() == Some("P") {
+            if matches!(self.history.feature_type(index).as_deref(), Some("P") | Some("DRAFT")) {
                 return;
             }
         }
@@ -332,7 +333,10 @@ impl EngineState {
         // Resolve any scene references the builder needs (extrude profile plane,
         // revolve axis line) from the run report's profiles/axes — keyed off the
         // ORIGINAL params so reference-name strings are read verbatim.
-        let refs = self.feature_dimension_refs(&feature_type, &params);
+        let mut refs = self.feature_dimension_refs(&feature_type, &params);
+        if feature_type == "DRAFT" {
+            (refs.draft_pull, refs.draft_neutral) = self.draft_pull_and_neutral(index);
+        }
         crate::feature_dimensions::build_annotations_with_refs(&feature_type, &resolved, &refs)
     }
 
@@ -388,6 +392,24 @@ impl EngineState {
             _ => {}
         }
         refs
+    }
+
+    /// A Draft's resolved pull and neutral point, from the `persistentData.draft`
+    /// its last successful run wrote (`pull`, `neutral`). `(None, None)` before
+    /// the feature has built.
+    pub(super) fn draft_pull_and_neutral(&self, index: usize) -> (Option<[f64; 3]>, Option<[f64; 3]>) {
+        let Some(persistent) = self.history.feature_persistent_data(index) else {
+            return (None, None);
+        };
+        let read = |key: &str| -> Option<[f64; 3]> {
+            let values = persistent.get("draft")?.get(key)?.as_array()?;
+            let mut out = [0.0; 3];
+            for (slot, value) in out.iter_mut().zip(values) {
+                *slot = value.as_f64()?;
+            }
+            (values.len() == 3 && out.iter().all(|v| v.is_finite())).then_some(out)
+        };
+        (read("pull"), read("neutral"))
     }
 
     /// Resolve a `profile` reference param to the world plane the extrude/revolve
@@ -541,10 +563,23 @@ impl EngineState {
         } else {
             self.feature_dimension_annotations(&feature)
         };
-        let (positions, colors) = crate::feature_dimensions::leaders_buffers(
+        let (mut positions, mut colors) = crate::feature_dimensions::leaders_buffers(
             &annotations,
             self.camera.world_per_pixel(),
         );
+        if let Some(index) = self.history.index_of(&feature) {
+            if self.history.feature_type(index).as_deref() == Some("DRAFT") {
+                if let (Some(pull), Some(neutral)) = self.draft_pull_and_neutral(index) {
+                    crate::feature_dimensions::append_draft_glyph(
+                        &mut positions,
+                        &mut colors,
+                        neutral,
+                        pull,
+                        self.camera.world_per_pixel(),
+                    );
+                }
+            }
+        }
         serde_json::json!({
             "groups": [
                 {

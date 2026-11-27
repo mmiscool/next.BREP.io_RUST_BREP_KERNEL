@@ -436,6 +436,17 @@ impl HistoryPanel {
             {
                 state.arm_transform(id);
             }
+            // A DRAFT's angle arcs stand on the pull and neutral point its
+            // build resolves, so a draft opened before it has built (a new one
+            // from the context bar) has no dimensions on open: arm them on the
+            // first frame they exist. Nothing else arms a draft (it has no
+            // transform), so this never undoes a toggle.
+            if state.gizmo_mode() == "none"
+                && state.history.index_of(id).and_then(|index| state.history.feature_type(index)).as_deref() == Some("DRAFT")
+                && state.feature_dimension_annotations_json(id) != "[]"
+            {
+                state.arm_dimension(id);
+            }
         }
     }
 
@@ -793,7 +804,9 @@ impl HistoryPanel {
         let mut delete: Option<String> = None;
         let mut drag_move: Option<(usize, usize)> = None;
         // The feature a single click SELECTED — applied after the draw loop too.
-        let mut select: Option<String> = None;
+        // The clicked row, and whether the click ADDS to the selection
+        // (Ctrl/Cmd or Shift, as in the viewport).
+        let mut select: Option<(String, bool)> = None;
         // The feature whose FORM to open — `(index, id)`. Applied after the draw
         // loop, with the roll, so the mode flip and the roll are one step.
         let mut open_form: Option<(usize, String)> = None;
@@ -922,7 +935,8 @@ impl HistoryPanel {
                 if edit_clicked || resp.double_clicked() {
                     open_form = Some((i, id.clone()));
                 } else if resp.clicked() {
-                    select = Some(id.clone());
+                    let additive = ui.input(|input| input.modifiers.command || input.modifiers.shift);
+                    select = Some((id.clone(), additive));
                 }
                 // A press ANYWHERE on the row can turn into a drag — the band
                 // senses drag too, because egui withdraws the click from a slow
@@ -1015,7 +1029,8 @@ impl HistoryPanel {
                             // feature, exactly like `resp.clicked()` does. egui
                             // never fires both a click and a drag for one press,
                             // so this can't select twice.
-                            select = state.feature_id_at(src);
+                            let additive = ui.input(|input| input.modifiers.command || input.modifiers.shift);
+                            select = state.feature_id_at(src).map(|id| (id, additive));
                         } else {
                             drag_move = Some((src, target));
                         }
@@ -1070,9 +1085,13 @@ impl HistoryPanel {
             state.roll_to(i);
         } else if let Some(i) = roll {
             state.roll_to(i);
-        } else if let Some(id) = select {
+        } else if let Some((id, additive)) = select {
             // Selecting never rolls: a click is a look, not a rebuild.
-            state.select_feature(&id);
+            if additive {
+                state.add_feature_to_selection(&id);
+            } else {
+                state.select_feature(&id);
+            }
         }
 
         // --- the command palette (a ctx-level modal; drawn last) --------------

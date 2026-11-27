@@ -1,6 +1,67 @@
 pub use super::*;
 
+/// Whether [`BrepSolid::validate`] checks that every loop id and every
+/// coedge id is used once across the solid (`BREP_VALIDATE_WIRE_IDS`, default
+/// off while the census finds what else repeats them). [`crate::TopologyArena`]
+/// already refuses a body that repeats either ("duplicate loop wire id"), so
+/// a body that validates but repeats one fails later, far from its producer.
+pub fn wire_ids_checked() -> bool {
+    crate::switch!("BREP_VALIDATE_WIRE_IDS", false)
+}
+
 impl BrepSolid {
+    /// Every loop id and coedge id used more than once across the solid, as
+    /// `duplicate loop id N` / `duplicate coedge id N` (each id once).
+    pub fn repeated_wire_ids(&self) -> Vec<String> {
+        let mut loops: HashMap<u64, usize> = HashMap::default();
+        let mut coedges: HashMap<u64, usize> = HashMap::default();
+        for loop_record in self.shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| &face.loops) {
+            *loops.entry(loop_record.id).or_default() += 1;
+            for coedge in &loop_record.coedges {
+                *coedges.entry(coedge.id).or_default() += 1;
+            }
+        }
+        let mut repeated: Vec<(u64, &str)> = loops
+            .into_iter()
+            .filter(|(_, uses)| *uses > 1)
+            .map(|(id, _)| (id, "loop"))
+            .chain(coedges.into_iter().filter(|(_, uses)| *uses > 1).map(|(id, _)| (id, "coedge")))
+            .collect();
+        repeated.sort_unstable_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(&b.0)));
+        repeated.into_iter().map(|(id, kind)| format!("duplicate {kind} id {id}")).collect()
+    }
+
+    /// Give every loop id and coedge id that repeats an earlier one (in
+    /// shell, face, loop order) a fresh id above the solid's largest, so each
+    /// is used once. The first use keeps its id; a solid with no repeats is
+    /// left exactly as it was. Returns how many ids changed. A producer that
+    /// numbers loops per face (the coplanar face merge) calls this before it
+    /// hands the body on.
+    pub fn renumber_repeated_wire_ids(&mut self) -> usize {
+        let wires = || self.shells.iter().flat_map(|shell| &shell.faces).flat_map(|face| &face.loops);
+        let mut next_loop = wires().map(|l| l.id).max().unwrap_or(0) + 1;
+        let mut next_coedge = wires().flat_map(|l| &l.coedges).map(|c| c.id).max().unwrap_or(0) + 1;
+        let (mut loops, mut coedges) = (HashSet::default(), HashSet::default());
+        let mut changed = 0;
+        for loop_record in self.shells.iter_mut().flat_map(|shell| &mut shell.faces).flat_map(|face| &mut face.loops) {
+            if !loops.insert(loop_record.id) {
+                loop_record.id = next_loop;
+                loops.insert(next_loop);
+                next_loop += 1;
+                changed += 1;
+            }
+            for coedge in &mut loop_record.coedges {
+                if !coedges.insert(coedge.id) {
+                    coedge.id = next_coedge;
+                    coedges.insert(next_coedge);
+                    next_coedge += 1;
+                    changed += 1;
+                }
+            }
+        }
+        changed
+    }
+
     pub fn validate(&self) -> Vec<ValidationIssue> {
         self.validate_with_tolerances(&KernelTolerances::for_solid(self, 1e-7))
     }
@@ -181,6 +242,10 @@ impl BrepSolid {
         }
         if edges.len() != self.edges.len() {
             issues.push(ValidationIssue::error("duplicate edge id"));
+        }
+
+        if wire_ids_checked() {
+            issues.extend(self.repeated_wire_ids().into_iter().map(ValidationIssue::error));
         }
 
         let mut edge_uses: HashMap<u64, Vec<bool>> = HashMap::default();

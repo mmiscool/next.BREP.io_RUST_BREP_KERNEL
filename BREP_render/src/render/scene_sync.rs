@@ -72,11 +72,12 @@ impl RenderCore {
         let mut per_face: Vec<Option<u32>> = Vec::with_capacity(solid.faces.len());
         for face in &solid.faces {
             let opacity = solid.face_opacity(face);
-            if face.color_override.is_none() && opacity == base {
+            let color = face.analysis_color.or(face.color_override);
+            if color.is_none() && opacity == base {
                 per_face.push(None);
                 continue;
             }
-            let key = (face.color_override, opacity);
+            let key = (color, opacity);
             let slot = match keys.iter().position(|k| *k == key) {
                 Some(slot) => slot,
                 None => {

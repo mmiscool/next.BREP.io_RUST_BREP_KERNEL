@@ -501,11 +501,7 @@ pub(super) fn synchronize_smooth_edge_splits(
             {
                 split.parameters = parameters.clone();
             } else {
-                imprint.edge_splits.push(EdgeSplitRecord {
-                    operand,
-                    edge_id,
-                    parameters: parameters.clone(),
-                });
+                imprint.edge_splits.push(EdgeSplitRecord::new(operand, edge_id, parameters.clone()));
             }
         }
     }

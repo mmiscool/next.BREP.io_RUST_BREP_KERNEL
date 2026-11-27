@@ -222,6 +222,8 @@ impl Viewport {
             // The open part's MOUNT FRAME: the footprint's axes and seating
             // outline in the model's coordinates. Painted, never hit-tested.
             Self::draw_mount_frame(&ctx, rect, state);
+            // The hovered sketch point's / curve's remaining freedoms, by the pointer.
+            Self::draw_sketch_hover_freedom(&ctx, rect, state);
             // The gizmo's own READOUT: what the drag is worth, and — when the
             // motion refused — why, said at the gizmo rather than in a dock on
             // the far side of the window. Also the Transform Face PIVOT marker,
@@ -519,7 +521,13 @@ impl Viewport {
                         state.sketch_hover_at(point.0, point.1);
                         self.touch_drag_offset = (point.0 - lx, point.1 - ly);
                         point
-                    } else { (lx, ly) };
+                    } else {
+                        // Anchor the grab where the button went down: egui reports
+                        // the drag start a few pixels into the gesture, and anchoring
+                        // there left the dragged point or glyph that far behind the
+                        // cursor for the whole drag.
+                        drag_start_local(response, rect).unwrap_or((lx, ly))
+                    };
                     state.sketch_drag_begin(gx, gy)
                 } {
                     self.sketch_dragging = true;
@@ -575,6 +583,15 @@ impl Viewport {
             if self.dragging {
                 state.pointer_up();
                 self.dragging = false;
+            }
+        }
+
+        // A double-click on a constraint glyph the user dragged off its line puts it
+        // back at its default place (SELECT mode only; draw tools keep their clicks).
+        if response.double_clicked() && state.sketch_active_tool().is_none() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let (lx, ly) = local(pos);
+                state.sketch_reset_glyph_offset_at(lx, ly);
             }
         }
 

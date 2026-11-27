@@ -249,10 +249,18 @@ pub use assemble::apply_assembly_heal_chain;
 
 /// A boolean's operands at the working scale (`brep/rescale.rs`): unless `BREP_WORKING_SCALE=0`, operands whose combined box diagonal
 /// is below 1/16 are scaled up by a power of two, and the result is scaled back.
+/// Under `BREP_LARGE_WORKING_SCALE`, a refused large operation also tries a
+/// smaller working scale. Its successful original result always takes precedence.
 struct WorkingScale {
     factor: f64,
     solids: Vec<BrepSolid>,
     options: BooleanOptions,
+}
+
+thread_local! {
+    // The original attempt includes its nested boolean calls. Only after it
+    // refuses do we try the large-model working scale; unwind restores it.
+    static ORIGINAL_WORKING_SCALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl WorkingScale {
@@ -260,7 +268,10 @@ impl WorkingScale {
         let Some(bounds) = crate::rescale::bounds_of(operands.iter().copied()) else {
             return Ok(None);
         };
-        let Some(factor) = crate::rescale::guard_factor(bounds) else {
+        let Some(factor) = crate::rescale::guard_factor(bounds).or_else(|| {
+            if ORIGINAL_WORKING_SCALE.with(|state| state.get()) { None }
+            else { crate::rescale::large_guard_factor(bounds) }
+        }) else {
             return Ok(None);
         };
         crate::rescale::profile_fired("boolean", factor, bounds);
@@ -272,6 +283,28 @@ impl WorkingScale {
         let mut options = options.clone();
         options.imprint.maximum_ssi_step = options.imprint.maximum_ssi_step.map(|step| step * factor);
         Ok(Some(Self { factor, solids, options }))
+    }
+
+    /// Retain the original successful result bit for bit. A failed fallback
+    /// retains the original refusal too, rather than replacing its evidence.
+    fn run<T>(
+        &self,
+        original: impl FnOnce() -> Result<T, KernelRefusal>,
+        scaled: impl FnOnce() -> Result<T, KernelRefusal>,
+    ) -> Result<T, KernelRefusal> {
+        if self.factor >= 1.0 { return scaled(); }
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) { ORIGINAL_WORKING_SCALE.with(|state| state.set(self.0)); }
+        }
+        let answer = {
+            let _restore = Restore(ORIGINAL_WORKING_SCALE.with(|state| state.replace(true)));
+            original()
+        };
+        match answer {
+            Ok(value) => Ok(value),
+            Err(original) => scaled().or(Err(original)),
+        }
     }
 
     fn back(&self, solid: &BrepSolid) -> Result<BrepSolid, KernelRefusal> {
@@ -290,9 +323,12 @@ pub fn boolean_operation(
     options: &BooleanOptions,
 ) -> Result<BrepSolid, KernelRefusal> {
     if let Some(scaled) = WorkingScale::of(&[first, second], options)? {
-        return boolean_operation(&scaled.solids[0], &scaled.solids[1], operation, &scaled.options)
-            .map_err(|error| scaled.refusal(error))
-            .and_then(|solid| scaled.back(&solid));
+        return scaled.run(
+            || boolean_operation(first, second, operation, options),
+            || boolean_operation(&scaled.solids[0], &scaled.solids[1], operation, &scaled.options)
+                .map_err(|error| scaled.refusal(error))
+                .and_then(|solid| scaled.back(&solid)),
+        );
     }
     boolean_operation_unscaled(first, second, operation, options)
         .or_else(|refused| window_retry::retry(first, second, operation, options, refused, boolean_operation_unscaled))
@@ -2381,9 +2417,12 @@ fn boolean_operation_nary_arranged(
 ) -> Result<BrepSolid, KernelRefusal> {
     if operands.len() > 1 {
         if let Some(scaled) = WorkingScale::of(&operands.iter().collect::<Vec<_>>(), options)? {
-            return boolean_operation_nary_with_options(&scaled.solids, operation, &scaled.options)
-                .map_err(|error| scaled.refusal(error))
-                .and_then(|solid| scaled.back(&solid));
+            return scaled.run(
+                || boolean_operation_nary_with_options(operands, operation, options),
+                || boolean_operation_nary_with_options(&scaled.solids, operation, &scaled.options)
+                    .map_err(|error| scaled.refusal(error))
+                    .and_then(|solid| scaled.back(&solid)),
+            );
         }
     }
     if operands.is_empty() {
@@ -2710,12 +2749,17 @@ pub fn boolean_operation_with_diagnostics(
     options: &BooleanOptions,
 ) -> Result<KernelOutcome<BrepSolid>, KernelRefusal> {
     if let Some(scaled) = WorkingScale::of(&[first, second], options)? {
-        let mut outcome = boolean_operation_with_diagnostics(&scaled.solids[0], &scaled.solids[1], operation, &scaled.options)
-            .map_err(|error| scaled.refusal(error))?;
-        outcome.value = scaled.back(&outcome.value)?;
-        outcome.diagnostics.count_n("working_scale.fired", 1);
-        outcome.diagnostics.measure_max("working_scale.factor", scaled.factor);
-        return Ok(outcome);
+        return scaled.run(
+            || boolean_operation_with_diagnostics(first, second, operation, options),
+            || {
+                let mut outcome = boolean_operation_with_diagnostics(&scaled.solids[0], &scaled.solids[1], operation, &scaled.options)
+                    .map_err(|error| scaled.refusal(error))?;
+                outcome.value = scaled.back(&outcome.value)?;
+                outcome.diagnostics.count_n("working_scale.fired", 1);
+                outcome.diagnostics.measure_max("working_scale.factor", scaled.factor);
+                Ok(outcome)
+            },
+        );
     }
     let _account = profile::Scope::new("boolean.other");
     // A whole ball turned onto the line the other operand cuts it about
@@ -3094,9 +3138,14 @@ pub fn boolean_split_operands(
     options: &BooleanOptions,
 ) -> Result<(BrepSolid, BrepSolid), KernelRefusal> {
     if let Some(scaled) = WorkingScale::of(&[first, second], options)? {
-        let (split_first, split_second) = boolean_split_operands(&scaled.solids[0], &scaled.solids[1], &scaled.options)
-            .map_err(|error| scaled.refusal(error))?;
-        return Ok((scaled.back(&split_first)?, scaled.back(&split_second)?));
+        return scaled.run(
+            || boolean_split_operands(first, second, options),
+            || {
+                let (split_first, split_second) = boolean_split_operands(&scaled.solids[0], &scaled.solids[1], &scaled.options)
+                    .map_err(|error| scaled.refusal(error))?;
+                Ok((scaled.back(&split_first)?, scaled.back(&split_second)?))
+            },
+        );
     }
     let policy = boolean_policy(first, second, options)?;
     let (first, second) = prepared_operands(first, second, &policy)?;
@@ -4104,4 +4153,5 @@ fn boolean_pipeline(
         candidates,
     ))
 }
+
 

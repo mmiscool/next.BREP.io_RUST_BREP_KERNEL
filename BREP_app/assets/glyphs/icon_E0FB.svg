@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_feat_draft" brep:unicode="E0FB">
+  <!-- A block whose walls lean in as they rise from the neutral plane (blue, at the base), the pull arrow above. -->
+  <path d="M1.8 19.2H22.2" style="fill:none" stroke="#3d86c4" stroke-width="1.1" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1.6 1.4"/>
+  <path d="M3.5 19.2 12.2 21.5 13.4 12.8 6.4 11.2Z" fill="#f0b840" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M12.2 21.5 20.5 17.6 17.6 10.4 13.4 12.8Z" fill="#d4901f" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M6.4 11.2 11.6 9 17.6 10.4 13.4 12.8Z" fill="#ffd977" stroke="#7a4d10" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M3.5 19.2 3.5 11.2" style="fill:none" stroke="#3d86c4" stroke-width="1.1" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="1.2 1.2"/>
+  <path d="M11.8 7.4V1.6M9.6 3.8 11.8 1.6 14 3.8" style="fill:none" stroke="#3d86c4" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

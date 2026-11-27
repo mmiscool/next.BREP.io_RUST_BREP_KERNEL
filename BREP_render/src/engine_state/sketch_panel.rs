@@ -221,6 +221,34 @@ impl EngineState {
             .collect()
     }
 
+    /// The Issues list: the constraints the solver names as conflicting (first),
+    /// then the redundant ones (consistent repeats of earlier constraints), as
+    /// Constraints rows whose label notes which (`… — conflicting` /
+    /// `… — redundant`). Empty when the sketch has neither.
+    pub fn sketch_issue_rows(&self) -> Vec<SketchEntityRow> {
+        let Some(edit) = self.sketch_edit.as_ref() else {
+            return Vec::new();
+        };
+        let diag = &edit.session.diagnostics;
+        let rows = self.sketch_constraint_rows();
+        let mut out: Vec<SketchEntityRow> = Vec::new();
+        for (note, pick) in [("conflicting", true), ("redundant", false)] {
+            for row in &rows {
+                let hit = if pick {
+                    diag.constraint_conflicting(&row.id)
+                } else {
+                    diag.constraint_redundant(&row.id) && !diag.constraint_conflicting(&row.id)
+                };
+                if hit {
+                    let mut r = row.clone();
+                    r.label = format!("{} \u{2014} {note}", row.label);
+                    out.push(r);
+                }
+            }
+        }
+        out
+    }
+
     /// Select an entity BY ref from a list row (mirrors [`sketch_click_at`](Self::sketch_click_at)): honors the
     /// SAME "Multi-select" setting — under `ClickToggles` a plain click toggles the row
     /// (no modifier needed); under `CtrlClick` a plain click replaces the

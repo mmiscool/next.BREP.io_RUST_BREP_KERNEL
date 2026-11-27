@@ -61,7 +61,7 @@ use brep_solvers::*;
 // The public root API of the kernel, from the crates below.
 pub use brep_solvers::sketch_solver::{
     is_sketch_origin_point_id, sketch_id_key, mint_sketch_id, solve_sketch, solve_sketch_from_json,
-    SketchSolverSettings, SolveSketchRequest, SKETCH_ORIGIN_POINT_ID,
+    solve_sketch_min_change, SketchSolverSettings, SolveSketchRequest, SKETCH_ORIGIN_POINT_ID,
 };
 pub use brep_solvers::assembly_solver::{
     solve_assembly, AssemblyBody, AssemblyMate, AssemblySolution, AssemblySolveOptions, BodyFreedom, BodyPose,
@@ -214,7 +214,7 @@ pub use brep_offset::offset_shell::{
     OffsetFaceRole, OffsetShellFaceImageRecord, OffsetShellResultRecord,
 };
 pub use brep_direct_edit::direct_edit::{
-    delete_face_and_heal, delete_faces_and_heal, draft_faces, draft_faces_parted, draft_faces_unchecked, move_faces, move_faces_unchecked,
+    delete_face_and_heal, delete_faces_and_heal, draft_face_qualifies, draft_faces, draft_faces_parted, draft_faces_parted_sided, draft_faces_unchecked, draft_tangent_faces, move_faces, move_faces_unchecked,
     offset_freeform_face, offset_freeform_face_unchecked,
     offset_revolution_face, offset_revolution_face_unchecked, offset_ruled_face, offset_ruled_face_unchecked, offset_sphere_face,
     offset_sphere_face_unchecked, offset_torus_face, offset_torus_face_unchecked,
@@ -444,7 +444,7 @@ pub use feature_pipeline::{first_reference_name, imported_solid_names, is_gear_t
 // Transform Face's default pivot (the selection's boundary centre) over the
 // results of a replayed prefix, so the gizmo and the stored `pivot` agree with
 // the feature by construction.
-pub use feature_pipeline::{face_transform_pivot, face_transform_reference_point};
+pub use feature_pipeline::{face_transform_pivot, face_transform_reference_point, TRANSFORM_FACE_DEFAULT_PIVOT_KEY};
 // Typed, in-process pipeline surface for native consumers (brep-render): run a
 // whole history and read the results without a JSON round trip.
 pub use feature_pipeline::{
@@ -517,7 +517,7 @@ pub use feature_pipeline::features::sketch3d::{
 // Sheet-metal flat-pattern (unfold) → 2D vector export, keyed by resident handle.
 pub use feature_pipeline::{flat_pattern_dxf, flat_pattern_svg, is_sheet_metal_handle};
 // The part Pattern's per-instance suppression list.
-pub use feature_pipeline::{pattern_component_instance, pattern_parse_suppressed};
+pub use feature_pipeline::{is_pattern_component_id, pattern_component_instance, pattern_parse_suppressed};
 // Native IMPORT3D payload: finished solids → the `io/snapshot` container with
 // IMPORT3D's naming stamped on, i.e. the `inputParams.nativeBrep` an import lane
 // bakes into a part document (`features/import3d.rs` reads it back verbatim).
@@ -699,7 +699,8 @@ pub use abi::*;
 
 
 /// The source hashes of the kernel's crates (each crate's `build.rs`); together they are the stamp the
-/// parts library compares snapshots against, so a change in any kernel crate invalidates them.
+/// parts library compares snapshots against. Production-file changes in any kernel crate invalidate
+/// them; whole private test-only files proven by the exporter are excluded from each crate hash.
 pub(crate) static KERNEL_SOURCE_HASHES: &[Option<&str>] = &[option_env!("BREP_KERNEL_SOURCE_HASH"), brep_geometry::SOURCE_HASH, brep_topology::SOURCE_HASH, brep_surface_offset::SOURCE_HASH, brep_boolean::SOURCE_HASH, brep_construction::SOURCE_HASH, brep_blend::SOURCE_HASH, brep_offset::SOURCE_HASH, brep_direct_edit::SOURCE_HASH, brep_solvers::SOURCE_HASH];
 
 /// One stamp over the crates' hashes; `None` when any crate could not compute its own.

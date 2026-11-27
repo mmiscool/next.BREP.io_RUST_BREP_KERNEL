@@ -31,6 +31,7 @@ pub mod camera;
 pub mod color;
 pub mod constraint_overlays;
 pub mod controls;
+pub mod draft_analysis;
 pub mod engine_state;
 pub mod feature_dimensions;
 pub mod features;

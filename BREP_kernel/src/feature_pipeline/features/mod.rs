@@ -53,6 +53,7 @@ pub mod chamfer;
 pub mod delete_face;
 pub mod refit_faces;
 pub mod deform_face;
+pub mod draft;
 pub mod sew_to_solid;
 pub mod fillet;
 pub mod hole;

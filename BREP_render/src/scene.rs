@@ -40,6 +40,11 @@ pub struct FaceDisplay {
     /// [`RenderScene::apply_metadata_opacity`]. `None` = inherit the solid.
     #[serde(default)]
     pub opacity: Option<f32>,
+    /// The DRAFT ANALYSIS tint (`crate::draft_analysis`), set while the
+    /// analysis is on. It wins over `color_override` and leaves it untouched,
+    /// so the user's face colours come back when the analysis is turned off.
+    #[serde(default)]
+    pub analysis_color: Option<[f32; 3]>,
 }
 
 /// One display edge: a world-space polyline plus the kernel edge identity and
@@ -328,6 +333,31 @@ impl RenderScene {
             solid.pose = None;
         }
         true
+    }
+
+    /// Set the DRAFT ANALYSIS tint of solid `name`'s faces (face `i` takes
+    /// `colors[i]`; an empty slice clears every face), bumping the revision
+    /// only when one changed. The user's `color_override` is not touched.
+    /// Returns whether anything changed.
+    pub fn set_face_analysis_colors(&mut self, name: &str, colors: &[Option<[f32; 3]>]) -> bool {
+        let Some(slot) = self.index.get(name).copied() else {
+            return false;
+        };
+        let solid = &mut self.solids[slot];
+        let mut changed = false;
+        for (index, face) in solid.faces.iter_mut().enumerate() {
+            let color = colors.get(index).copied().flatten();
+            if face.analysis_color != color {
+                face.analysis_color = color;
+                changed = true;
+            }
+        }
+        if changed {
+            solid.revision = next_revision();
+            solid.shape_revision = 0;
+            solid.pose = None;
+        }
+        changed
     }
 
     /// Re-derive every solid's and face's opacity from the name-keyed
@@ -904,6 +934,7 @@ pub fn solid_display_from_payload(
             kind: FaceKind::Unknown,
             color_override: None,
             opacity: None,
+            analysis_color: None,
         })
         .collect();
     let mut run_start = 0u32;

@@ -296,8 +296,7 @@ impl EngineState {
             if ignore {
                 return None;
             }
-            metadata
-                .attribute(name, COLOR_METADATA_KEY)
+            shown_color(metadata, name)
                 .and_then(crate::style::parse_css_hex)
                 // A derived BOARD body has a colour of its own and no producing
                 // feature to have coloured it, so without this fallback the
@@ -316,7 +315,7 @@ impl EngineState {
         // An edge's own `color` and `transparency`: the stored attributes
         // only (no board default), the colour hidden by the override.
         let changed = self.scene.apply_metadata_edge_looks(
-            |name| if ignore { None } else { metadata.attribute(name, COLOR_METADATA_KEY).and_then(crate::style::parse_css_hex) },
+            |name| if ignore { None } else { shown_color(metadata, name).and_then(crate::style::parse_css_hex) },
             |name| metadata.attribute(name, TRANSPARENCY_METADATA_KEY).and_then(transparency_opacity),
         ) || changed;
         if changed {
@@ -334,6 +333,35 @@ impl EngineState {
     pub fn metadata_value(&self) -> Value {
         self.metadata.to_json()
     }
+}
+
+/// The colour an entity shows: its own `color`, except that a Pattern
+/// Component instance's entity whose colour was not set on the instance itself
+/// (none, or still the `partColor` it took from its part) shows its SEED
+/// entity's colour, so a colour set on the seed in the assembly reaches every
+/// copy, and a copy of a copy through its own seed. A colour set on the
+/// instance wins.
+fn shown_color<'a>(metadata: &'a MetadataStore, name: &str) -> Option<&'a str> {
+    let own = metadata.attribute(name, COLOR_METADATA_KEY);
+    let set_on_instance = own.is_some() && own != metadata.attribute(name, PART_COLOR_METADATA_KEY);
+    if !set_on_instance {
+        if let Some(color) = pattern_seed_entity(name).and_then(|seed| shown_color(metadata, &seed)) {
+            return Some(color);
+        }
+    }
+    own
+}
+
+/// The marker the kernel stamps on a component entity's colour taken from
+/// its part (`assembly_component::PART_COLOR_KEY`).
+const PART_COLOR_METADATA_KEY: &str = "partColor";
+
+/// The seed entity a Pattern Component instance's entity copies:
+/// `APAT5.ACOMP3.i2:F9` → `ACOMP3:F9`; `None` for anything else.
+fn pattern_seed_entity(name: &str) -> Option<String> {
+    let (head, rest) = name.split_once(':')?;
+    let (_, seed, _) = brep_kernel::pattern_component_instance(head)?;
+    Some(format!("{seed}:{rest}"))
 }
 
 // --- EngineState: measurements + provenance (SEPARATE impl block) ------------

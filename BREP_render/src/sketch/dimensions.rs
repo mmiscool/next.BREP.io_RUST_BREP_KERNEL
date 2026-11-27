@@ -119,15 +119,34 @@ fn linear_endpoints(
     }
 }
 
+/// A size for an annotation of an entity `entity` long: `frac` of it, kept between
+/// `min_px` and `max_px` screen pixels at `wpp` world units per pixel. So a mark on a
+/// small entity shrinks with it instead of swamping it, but never below a legible size,
+/// and never grows past its screen-constant size. Without a usable zoom (`wpp` not
+/// positive) or entity size, the screen-constant size alone (or `fallback` when there
+/// is no zoom either).
+pub(super) fn screen_fit(wpp: f64, entity: f64, frac: f64, min_px: f64, max_px: f64, fallback: f64) -> f64 {
+    if !(wpp > 0.0) || !wpp.is_finite() {
+        return fallback;
+    }
+    let (lo, hi) = (wpp * min_px, wpp * max_px);
+    if !(entity > 0.0) || !entity.is_finite() {
+        return hi;
+    }
+    (entity * frac).clamp(lo, hi)
+}
+
 /// The default radial label offset from the CENTER — port of `radialOffsetToPlane`
-/// (the no-saved branch).
-fn radial_default_offset(pc: [f64; 2], pr: [f64; 2]) -> [f64; 2] {
+/// (the no-saved branch): a push past the rim of a third of the radius, at least
+/// twelve screen pixels.
+fn radial_default_offset(pc: [f64; 2], pr: [f64; 2], wpp: f64) -> [f64; 2] {
     let vx = pr[0] - pc[0];
     let vy = pr[1] - pc[1];
     let l = vx.hypot(vy);
     let (rx, ry) = if l > 1e-9 { (vx / l, vy / l) } else { (1.0, 0.0) };
     let (nx, ny) = (-ry, rx);
-    let base = (l * 0.35).max(0.2);
+    let floor = if wpp > 0.0 && wpp.is_finite() { wpp * 12.0 } else { 0.2 };
+    let base = (l * 0.35).max(floor);
     [
         vx + rx * base + nx * base * 0.35,
         vy + ry * base + ny * base * 0.35,
@@ -178,8 +197,9 @@ fn dim_geometry(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    // Screen-constant sizes (port of the previous `worldPerPixel`-scaled bases).
-    let ah = (wpp * 6.0).max(0.06);
+    // Arrowheads: six screen pixels, smaller on a short dimension (a fifth of what it
+    // measures, at least 2.5 px), so a sub-millimetre dimension is not all arrow.
+    let arrow_head = |measured: f64| screen_fit(wpp, measured, 0.2, 2.5, 6.0, 0.06);
     let arrow_s = 0.6;
 
     if is_radial_dimension(c) {
@@ -193,7 +213,8 @@ fn dim_geometry(
             return None;
         }
         let diameter = c.raw.get("displayStyle").and_then(Value::as_str) == Some("diameter");
-        let off = saved_offset(dim_offsets, id).unwrap_or_else(|| radial_default_offset(center, [pr.x, pr.y]));
+        let ah = arrow_head(radius);
+        let off = saved_offset(dim_offsets, id).unwrap_or_else(|| radial_default_offset(center, [pr.x, pr.y], wpp));
         let label_uv = [center[0] + off[0], center[1] + off[1]];
 
         // Direction center -> label (fall back to center -> rim).
@@ -244,7 +265,10 @@ fn dim_geometry(
         let len = dx.hypot(dy).max(1e-9);
         let (tx, ty) = (dx / len, dy / len);
         let (nx, ny) = (-ty, tx);
-        let base = (wpp * 20.0).max(0.1);
+        let ah = arrow_head(len);
+        // The default label push off the segment: twenty screen pixels, down to twelve
+        // on a short segment.
+        let base = screen_fit(wpp, len, 0.8, 12.0, 20.0, 0.1);
         let mid = [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0];
         // Offset from the midpoint to the label; default a normal push of `base`.
         let off = saved_offset(dim_offsets, id).unwrap_or([nx * base, ny * base]);
@@ -337,7 +361,11 @@ fn dim_geometry(
             d = d.signum() * (two_pi - 1e-6);
         }
 
-        let base_r = (wpp * 24.0).max(0.3);
+        // The angle arc's radius: twenty-four screen pixels, down to ten when the
+        // shorter of the two lines is short, so the arc stays near the corner it marks.
+        let shorter = d1x.hypot(d1y).min(d2x.hypot(d2y));
+        let base_r = screen_fit(wpp, shorter, 0.6, 10.0, 24.0, 0.3);
+        let ah = arrow_head(base_r);
         let off = saved_offset(dim_offsets, id).unwrap_or([0.0, 0.0]);
         let r = base_r + off[0].hypot(off[1]);
         let (cx, cy) = (inter[0], inter[1]);

@@ -4,9 +4,11 @@ use crate::json_support::vec3_or as read_vec3;
 use crate::geometry3d::{cross3 as cross, dot3 as dot, sub3 as sub};
 
 pub mod constraint_glyphs;
+pub mod corner;
 pub mod dimensions;
 pub mod doc;
 pub mod external_ref;
+pub mod freedom;
 pub mod handdraw;
 pub mod infer;
 pub mod session;
@@ -184,10 +186,16 @@ pub(crate) fn constraint_base_color(
 ) -> u32 {
     if diag.constraint_conflicting(id) {
         colors.conflict
+    } else if diag.constraint_redundant(id) {
+        REDUNDANT_CONSTRAINT_COLOR
     } else {
         colors.constraint
     }
 }
+
+/// A redundant constraint's glyph / dimension colour: the over-constrained yellow
+/// of the sketch status readout, so the readout and the marks it counts agree.
+pub const REDUNDANT_CONSTRAINT_COLOR: u32 = 0xffcf5c;
 
 /// Normalize `v`, or `None` when it is (near) zero / non-finite.
 fn normalize(v: [f64; 3]) -> Option<[f64; 3]> {
@@ -201,3 +209,4 @@ fn normalize(v: [f64; 3]) -> Option<[f64; 3]> {
 
 
 pub mod text;
+

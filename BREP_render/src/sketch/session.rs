@@ -37,6 +37,11 @@ pub struct SketchSession {
     /// User-tunable solver knobs (the Solver Settings panel). Read by every
     /// [`resolve`](Self::resolve); default reproduces the historical solve.
     pub solver_settings: solve::SketchSolverSettings,
+    /// The fillet and chamfer tools' options.
+    pub corner_options: super::corner::CornerOptions,
+    /// Why the last fillet or chamfer click changed nothing (a refusal), shown
+    /// in the tool's options panel; cleared by the next edit that succeeds.
+    pub corner_message: Option<String>,
 }
 
 /// A sketch session's selection set and hover — ONE implementation for the
@@ -84,6 +89,8 @@ impl SketchSession {
             dim_offsets: serde_json::Map::new(),
             colors: SketchColors::default(),
             solver_settings: solve::SketchSolverSettings::default(),
+            corner_options: super::corner::CornerOptions::default(),
+            corner_message: None,
         })
     }
 
@@ -91,6 +98,27 @@ impl SketchSession {
     /// honoring the session's [`solver_settings`](Self::solver_settings).
     pub fn resolve(&mut self) -> Result<(), String> {
         let (solved, diagnostics) = solve::solve_with(&self.doc, &self.solver_settings)?;
+        self.doc = solved;
+        self.diagnostics = diagnostics;
+        Ok(())
+    }
+
+    /// Re-solve one interactive drag frame: with `BREP_SKETCH_DRAG_MIN_CHANGE` on,
+    /// the smallest change from the current coordinates
+    /// ([`resolve_min_change`](Self::resolve_min_change)); otherwise a plain
+    /// [`resolve`](Self::resolve).
+    pub fn resolve_drag(&mut self) -> Result<(), String> {
+        if solve::drag_min_change() {
+            self.resolve_min_change()
+        } else {
+            self.resolve()
+        }
+    }
+
+    /// Re-solve by the smallest change of the free coordinates that meets every
+    /// constraint ([`solve::solve_drag_with`]), relaxing only when that fails.
+    pub fn resolve_min_change(&mut self) -> Result<(), String> {
+        let (solved, diagnostics) = solve::solve_drag_with(&self.doc, &self.solver_settings)?;
         self.doc = solved;
         self.diagnostics = diagnostics;
         Ok(())
@@ -164,6 +192,20 @@ impl SketchSession {
         )
     }
 
+    /// The `set_overlay` JSON for the `sketch-dof-arrows` group: the free directions
+    /// of the hovered point (or of each point of the hovered geometry), drawn as
+    /// double-headed arrows. Empty when nothing movable is hovered.
+    pub fn freedom_arrows_overlay_json(&self, world_per_pixel: f64) -> String {
+        super::freedom::freedom_arrows_overlay_json(
+            &self.doc,
+            &self.diagnostics,
+            &self.plane,
+            world_per_pixel,
+            &self.colors,
+            self.selection.hovered.as_ref(),
+        )
+    }
+
     /// The `set_overlay` JSON for the `sketch-constraint-glyphs` group (S6c): the small
     /// screen-constant line-art marks for every GEOMETRIC (non-dimensional) constraint
     /// — perpendicular, parallel, horizontal/vertical, coincident, equal, … (see
@@ -175,6 +217,7 @@ impl SketchSession {
             &self.doc,
             &self.diagnostics,
             &self.plane,
+            &self.dim_offsets,
             world_per_pixel,
             &self.colors,
         )
@@ -188,6 +231,7 @@ impl SketchSession {
             &self.doc,
             &self.diagnostics,
             &self.plane,
+            &self.dim_offsets,
             world_per_pixel,
             &self.colors,
             self.selection.hovered.as_ref(),
@@ -326,7 +370,11 @@ impl SketchSession {
     /// [`constraint_glyphs`]: super::constraint_glyphs
     pub fn pick_constraint(&self, u: f64, v: f64, radius: f64, world_per_pixel: f64) -> Option<Value> {
         let mut best: Option<(f64, &Value)> = None;
-        for c in &self.doc.constraints {
+        let mut glyphs: std::collections::HashMap<usize, Vec<([f64; 2], [f64; 2])>> =
+            super::constraint_glyphs::glyph_layout_segments(&self.doc, &self.dim_offsets, world_per_pixel)
+                .into_iter()
+                .collect();
+        for (index, c) in self.doc.constraints.iter().enumerate() {
             if c.temporary() {
                 continue;
             }
@@ -334,9 +382,7 @@ impl SketchSession {
             // A constraint contributes glyph segments (geometric) XOR leader segments
             // (dimensional); measure the cursor against whichever it draws.
             let mut dmin = f64::INFINITY;
-            for (a, b) in
-                super::constraint_glyphs::constraint_glyph_segments(c, &self.doc, world_per_pixel)
-            {
+            for (a, b) in glyphs.remove(&index).unwrap_or_default() {
                 let d = point_segment_distance((u, v), a.into(), b.into()).0;
                 if d < dmin {
                     dmin = d;

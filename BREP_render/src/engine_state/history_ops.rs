@@ -1,5 +1,9 @@
 use super::*;
 
+/// How many times in a row a dead background runner is restarted and the
+/// document rebuilt before the engine stops and reports it instead.
+const MAX_RUNNER_RESTARTS: u32 = 1;
+
 // --- Scene feed (R10) -------------------------------------------------
 
 impl EngineState {
@@ -135,6 +139,9 @@ impl EngineState {
                 self.history.busy().unwrap_or("an agent's change to this document is still evaluating")
             ));
         }
+        if let Some(error) = self.runner.poll_failure() {
+            self.recover_from_runner_failure(error);
+        }
         self.pump_plugin_installations();
         // The runner REFUSED a run because its resident parts library could not
         // serve it (see `Reply::NeedPartsLibrary`). It has already forgotten
@@ -242,6 +249,7 @@ impl EngineState {
             self.runs_replied += 1;
             if reply.generation >= self.run_generation && self.accept_plugin_run(&reply) {
                 self.applied_generation = reply.generation;
+                self.runner_failures = 0;
                 self.apply_run_output(reply.output);
             } else {
                 // Superseded — but the runner's baseline has moved past every
@@ -445,6 +453,28 @@ impl EngineState {
         if !self.run_pending() || !self.runner.cancel() {
             return false;
         }
+        let (stalled_on, dropped_imports, dropped_probes) = self.forget_runner_work();
+        self.cancelled_run = Some(stalled_on.clone().unwrap_or_default());
+        if notify {
+            self.push_notice(match stalled_on {
+                Some(id) if !id.is_empty() => format!(
+                    "Run cancelled while executing {id}. The model shows the last completed \
+                     result; edit or delete the feature to rebuild."
+                ),
+                _ => "Run cancelled. The model shows the last completed result; the next edit \
+                      rebuilds it."
+                    .to_string(),
+            });
+        }
+        self.notice_dropped_runner_work(dropped_imports, dropped_probes);
+        true
+    }
+
+    /// After the runner was replaced by an empty one (a cancel, or a browser
+    /// worker that died): forget everything that was waiting on the old one.
+    /// Returns the feature the run had reached and how many mesh imports and
+    /// STEP probes were dropped.
+    fn forget_runner_work(&mut self) -> (Option<String>, usize, usize) {
         // The replaced runner holds no session, and drops any answer pending.
         self.session_requested = None;
         let stalled_on = self.run_progress.take().map(|progress| progress.feature_id);
@@ -472,18 +502,10 @@ impl EngineState {
         self.instructions_views_pending = false;
         self.library_resync = false;
         self.sketch_links_released = false;
-        self.cancelled_run = Some(stalled_on.clone().unwrap_or_default());
-        if notify {
-            self.push_notice(match stalled_on {
-                Some(id) if !id.is_empty() => format!(
-                    "Run cancelled while executing {id}. The model shows the last completed \
-                     result; edit or delete the feature to rebuild."
-                ),
-                _ => "Run cancelled. The model shows the last completed result; the next edit \
-                      rebuilds it."
-                    .to_string(),
-            });
-        }
+        (stalled_on, dropped_imports, dropped_probes)
+    }
+
+    fn notice_dropped_runner_work(&mut self, dropped_imports: usize, dropped_probes: usize) {
         if dropped_imports > 0 {
             self.push_notice(format!(
                 "cancelled {dropped_imports} pending mesh import{}",
@@ -493,7 +515,35 @@ impl EngineState {
         if dropped_probes > 0 {
             self.push_notice("cancelled the STEP file being read — upload it again to import it");
         }
-        true
+    }
+
+    /// The runner's background agent DIED (see
+    /// [`crate::runner::HistoryRunner::poll_failure`]): a browser worker that
+    /// could not start, or trapped. Nothing it held will answer, so without
+    /// this the busy line said "Rebuilding model" forever over an empty scene.
+    /// Replace it as a cancel does and
+    /// rebuild the document on the new one; a second failure in a row stops
+    /// retrying and says so, rather than restarting a worker that dies on
+    /// this document every time (the next edit tries again, with one restart).
+    fn recover_from_runner_failure(&mut self, error: String) {
+        self.runner_failures += 1;
+        let stalled_on = self.run_progress.as_ref().map(|progress| progress.feature_id.clone());
+        let was_running = self.run_pending();
+        self.runner.cancel();
+        let (_, dropped_imports, dropped_probes) = self.forget_runner_work();
+        self.notice_dropped_runner_work(dropped_imports, dropped_probes);
+        if self.runner_failures <= MAX_RUNNER_RESTARTS {
+            self.push_notice(format!("The model's background worker stopped ({error}); restarted it and rebuilding."));
+            self.rerun_history();
+        } else {
+            // Said; the user's next edit is a fresh try with one restart of its own.
+            self.runner_failures = 0;
+            self.cancelled_run = was_running.then(|| stalled_on.unwrap_or_default());
+            self.push_notice(format!(
+                "The model's background worker stopped again ({error}). The model shows the last \
+                 completed result; reload the page to try again."
+            ));
+        }
     }
 
     /// How many run replies the runner has sent back (see `runs_replied`).
@@ -573,6 +623,12 @@ impl EngineState {
         }
         for (id, data) in &report.plugin_persistent_data {
             self.history.fold_plugin_persistent_data(id, data.clone());
+        }
+        // A Transform Face whose `pivot` is still null gets the default its own
+        // run computed (`transform_face::DEFAULT_PIVOT_KEY`), stored without an
+        // undo step — but only while its faces are the ones that run resolved.
+        for (id, pivot, faces) in &report.face_transform_pivots {
+            self.fold_face_transform_pivot(id, *pivot, faces);
         }
         // The runner already forced fresh displays for the solver-moved solids
         // (their snapshot entries arrive `Some`); nothing extra to do main-side.

@@ -728,7 +728,7 @@ impl RegionView {
                 path: vec!["kind".into()],
                 label: "Fit as".into(),
                 group: "Region".into(),
-                kind: FieldKind::Enum { variants: FitKind::ALL.iter().map(|k| k.label().to_string()).collect() },
+                kind: FieldKind::Enum { variants: FitKind::ALL.iter().map(|k| k.label().to_string()).collect(), labels: Vec::new() },
             },
             FormField { path: vec!["tolerance".into()], label: "Distance tolerance (mm)".into(), group: "Region".into(), kind: FieldKind::BoundedScalar { min: 1e-9, max: 1e6, step: 1e-4 } },
             FormField { path: vec!["normalAngle".into()], label: "Normal angle (°)".into(), group: "Region".into(), kind: FieldKind::BoundedScalar { min: 0.01, max: 89.0, step: 0.1 } },

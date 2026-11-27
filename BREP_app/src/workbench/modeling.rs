@@ -18,8 +18,28 @@ fn includes(feature: &FeatureInfo<'_>) -> bool {
         && !super::gears::is_gear_type(feature.type_code)
 }
 
-/// No extra toolbar buttons in v1.
-static BUTTONS: &[WorkbenchButton] = &[];
+/// The Draft Analysis toggle's id; the shell turns the view on or off.
+pub const DRAFT_ANALYSIS_BUTTON_ID: &str = "modeling.draft_analysis";
+
+/// Modeling's own button: Draft Analysis, beside Draft in the Blend group.
+/// It reads PRESSED while the analysis is on.
+static BUTTONS: &[WorkbenchButton] = &[WorkbenchButton {
+    id: DRAFT_ANALYSIS_BUTTON_ID,
+    // The Draft block with its faces painted by their draft (U+E0FC).
+    glyph: "\u{E0FC}",
+    ribbon_path: "Home/Blend/Draft Analysis",
+    size: super::CommandSize::Compact,
+    tooltip: "Draft Analysis \u{2014} colour faces by their draft against a pull direction and a minimum (display only)",
+    // Not in All: All's single row is as wide as the automation window allows
+    // (`the_automation_width_holds_every_workbench_row_on_one_line`), the way
+    // eCAD's actions are in All's union but never offered there. Not while a
+    // sketch is edited either: the sketch's tools are the row then.
+    when: Some(|state| state.engine.settings.workbench != "all" && !state.engine.any_sketch_mode()),
+    pressed: Some(|state| state.engine.draft_analysis_active()),
+    disabled: None,
+    caption: None,
+    menu: &[],
+}];
 
 /// The shared PMI panel (Modeling is one of its hosts).
 static PANELS: &[&str] = &[super::pmi::PANEL_ID];

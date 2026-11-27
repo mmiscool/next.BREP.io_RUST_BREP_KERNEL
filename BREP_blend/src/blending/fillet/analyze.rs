@@ -1114,6 +1114,11 @@ enum SupportExtent {
 /// The slug of [`rollover_only_refusal`]'s refusal (`UnsupportedGeometry`).
 pub const TANGENT_ROLLOVER_ONLY_WHAT: &str = "tangent_rollover_only";
 
+/// Whether `refusal` is [`rollover_only_refusal`]'s.
+pub fn is_rollover_only(refusal: &KernelRefusal) -> bool {
+    matches!(&refusal.class, crate::RefusalClass::UnsupportedGeometry { what } if what == TANGENT_ROLLOVER_ONLY_WHAT)
+}
+
 // The edges whose reach was met only through a tangent neighbour the SIDED
 // rule admits (`neighbour_carries_ball_sided`): a rollover lane can follow
 // that neighbour, no lane on the mates' own carriers can. Cleared at each
@@ -1372,6 +1377,22 @@ fn support_extent_pass(
         if boundary.is_empty() {
             continue;
         }
+        let region = if contact_containment_on() { PlanarRegion::of(solid, face) } else { None };
+        let classifier = std::cell::OnceCell::new();
+        let strictly_inside = |point: Vec3| {
+            classifier
+                .get_or_init(|| SolidClassifier::new(solid, crate::KernelTolerances::for_solid(solid, 1e-7).model).ok())
+                .as_ref()
+                .and_then(|classifier| classifier.classify(point).ok())
+                .is_some_and(|reading| reading.class == PointClass::In)
+        };
+        let tangent: Vec<&FaceRecord> = if region.is_some() { tangent_neighbours(solid, face) } else { Vec::new() };
+        let admitted: Vec<u64> = tangent
+            .iter()
+            .filter(|neighbour| neighbour_carries_ball_sided(solid, face, neighbour, size, side))
+            .map(|neighbour| neighbour.id)
+            .collect();
+        let tangent: Vec<u64> = tangent.iter().map(|neighbour| neighbour.id).collect();
         for step in 0..=SAMPLES {
             let fraction = step as f64 / SAMPLES as f64;
             let (station, direction) = match &cross.path {
@@ -1393,6 +1414,47 @@ fn support_extent_pass(
             if !extent.is_finite() {
                 continue;
             }
+            // `BREP_FILLET_CONTACT_CONTAINMENT`: on a planar support the
+            // contact itself is placed, not bounded. A face that reaches far
+            // enough SOMEWHERE (a ring of underside strip, whose far side is
+            // always far along the contact direction) passes the bound at a
+            // station whose contact lies off it; read exactly, that contact
+            // is an overrun unless it leaves across a tangent edge onto a
+            // neighbour this pass admits.
+            // Onto a neighbour on the SAME carrier (a face split along a
+            // seam of one plane) the extension is the neighbour and every lane
+            // builds it; onto a different carrier only a rollover does, so
+            // the unsigned pass counts it an overrun and the sided pass
+            // admits it (recorded rollover-only, `support_extent`).
+            // Only an exit across a TANGENT edge is read: off a sharp edge, or
+            // near an end where a corner takes the ball, the bound above keeps
+            // its benefit of the doubt.
+            // The end stations are the corners' (a vertex blend or the next
+            // stripe takes the ball there), and the edge's other support is
+            // never the neighbour rolled onto.
+            let interior = step != 0 && step != SAMPLES;
+            let other = faces[1 - support].id;
+            let contact_off = interior && region.as_ref().is_some_and(|region| {
+                let contact = station.add(direction.scale(reach));
+                if region.contains(contact) {
+                    return false;
+                }
+                let Some(across) = region.first_crossing(station, contact, edge_id).and_then(|edge| face_across_edge(solid, face, edge)) else {
+                    return false;
+                };
+                if across == other {
+                    return false;
+                }
+                // The lanes build the ball on this face's extension. That ball
+                // is the rolling ball only while its contact there is ON the
+                // body or over air (the neighbour continues the carrier, or
+                // falls away under it); a contact strictly INSIDE the body
+                // leaves the ball floating off the neighbour, which only a
+                // rollover builds. The unsigned pass counts that an overrun,
+                // the sided pass admits it (recorded rollover-only).
+                tangent.contains(&across)
+                    && !(admitted.contains(&across) && (side.is_some() || !strictly_inside(contact)))
+            });
             // Equality is the LIMIT case and it is exact: at r = the support's
             // own width the contact lands on the far boundary, the support is
             // consumed whole, and the network builds it to the closed form
@@ -1400,7 +1462,7 @@ fn support_extent_pass(
             // the surgery SNAPS a rail across (`consumed_band`): a wider
             // slack admits a rail that runs off its face and is neither
             // snapped nor refused.
-            if reach <= extent + crate::blend::consumed_band(solid) {
+            if !contact_off && reach <= extent + crate::blend::consumed_band(solid) {
                 continue;
             }
             let required = reach - crate::blend::consumed_band(solid);
@@ -1411,16 +1473,21 @@ fn support_extent_pass(
                     Err(_) => f64::INFINITY,
                 })
                 .fold(f64::NEG_INFINITY, f64::max);
-            if extent >= required {
+            if !contact_off && extent >= required {
                 continue;
             }
+            let reaches = if contact_off && extent >= required {
+                "its contact there lies off that face, past an edge no lane can roll the ball across".to_string()
+            } else {
+                format!("that face only reaches {extent:.6} there")
+            };
             let refusal = KernelRefusal::input(
                 KernelStage::Classify,
                 "support_extent",
                 format!(
                     "{entry}: {size} is too large for the faces it must lie on — the blend would \
                      meet face {} at {reach:.6} from the edge (reach = size·cot(φ/2), φ = {:.3}°), \
-                     but that face only reaches {extent:.6} there. A rolling ball that cannot touch \
+                     but {reaches}. A rolling ball that cannot touch \
                      both supports is tangent to neither, so what would be built is not a blend of \
                      this edge: reduce the size, or select the neighbouring faces' edges too so the \
                      blend has somewhere to run.",
@@ -3499,3 +3566,110 @@ pub fn check_blend_wall_loops(result: &BrepSolid, entry: &str) -> Result<(), Ker
 
 
 
+
+/// `BREP_FILLET_CONTACT_CONTAINMENT` (default on; `=0` restores the bound
+/// alone): `support_extent` places
+/// each station's contact on a planar support exactly (see the station loop).
+fn contact_containment_on() -> bool {
+    switch!("BREP_FILLET_CONTACT_CONTAINMENT", true)
+}
+
+/// The face other than `face` that uses `edge_id`.
+fn face_across_edge(solid: &BrepSolid, face: &FaceRecord, edge_id: u64) -> Option<u64> {
+    solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .find(|other| other.id != face.id && other.loops.iter().flat_map(|l| &l.coedges).any(|c| c.edge_id == edge_id))
+        .map(|other| other.id)
+}
+
+/// A planar face's region in its plane: every loop as a polygon of boundary
+/// samples, each segment tagged with its edge, and the samples' chord error.
+struct PlanarRegion {
+    origin: Vec3,
+    u: Vec3,
+    w: Vec3,
+    segments: Vec<((f64, f64), (f64, f64), u64)>,
+    margin: f64,
+}
+
+impl PlanarRegion {
+    const SAMPLES: usize = 64;
+
+    fn of(solid: &BrepSolid, face: &FaceRecord) -> Option<Self> {
+        if !matches!(face.surface.analytic(), Some(crate::AnalyticSurface::Plane { .. })) {
+            return None;
+        }
+        let first = face.loops.first()?.coedges.first()?.edge_id;
+        let seed = solid.edges.iter().find(|edge| edge.id == first)?;
+        let origin = seed.curve.evaluate(seed.t0).ok()?;
+        let (_, normal) = face_plane_normal(face, origin).ok()?;
+        let along = seed.curve.evaluate(seed.t1).ok()?.sub(origin);
+        let along = if along.length() > 1e-12 { along } else { seed.curve.evaluate(0.5 * (seed.t0 + seed.t1)).ok()?.sub(origin) };
+        let u = along.sub(normal.scale(along.dot(normal))).normalized().ok()?;
+        let w = normal.cross(u);
+        let flat = |p: Vec3| (p.sub(origin).dot(u), p.sub(origin).dot(w));
+        let mut segments = Vec::new();
+        let mut sag = 0f64;
+        for coedge in face.loops.iter().flat_map(|l| &l.coedges) {
+            let border = solid.edges.iter().find(|edge| edge.id == coedge.edge_id)?;
+            let at = |k: f64| border.curve.evaluate(border.t0 + (border.t1 - border.t0) * k / Self::SAMPLES as f64).ok();
+            for step in 0..Self::SAMPLES {
+                let (a, b, middle) = (at(step as f64)?, at(step as f64 + 1.0)?, at(step as f64 + 0.5)?);
+                sag = sag.max(middle.sub(a.add(b).scale(0.5)).length());
+                segments.push((flat(a), flat(b), border.id));
+            }
+        }
+        let model = crate::KernelTolerances::for_solid(solid, 1e-7).model;
+        Some(PlanarRegion { origin, u, w, segments, margin: 2.0 * sag + 4.0 * model })
+    }
+
+    fn flat(&self, point: Vec3) -> (f64, f64) {
+        (point.sub(self.origin).dot(self.u), point.sub(self.origin).dot(self.w))
+    }
+
+    fn distance(segment: &((f64, f64), (f64, f64), u64), (x, y): (f64, f64)) -> f64 {
+        let ((ax, ay), (bx, by), _) = *segment;
+        let (dx, dy) = (bx - ax, by - ay);
+        let along = (((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy).max(f64::MIN_POSITIVE)).clamp(0.0, 1.0);
+        (x - ax - along * dx).hypot(y - ay - along * dy)
+    }
+
+    /// Inside the region (even-odd over every loop), or within the
+    /// samples' error of its boundary.
+    fn contains(&self, point: Vec3) -> bool {
+        let (x, y) = self.flat(point);
+        let mut inside = false;
+        for &((ax, ay), (bx, by), _) in &self.segments {
+            if (ay > y) != (by > y) && x < ax + (y - ay) * (bx - ax) / (by - ay) {
+                inside = !inside;
+            }
+        }
+        inside || self.segments.iter().any(|segment| Self::distance(segment, (x, y)) <= self.margin)
+    }
+
+    /// The first boundary edge other than `except` that the segment
+    /// `from → to` crosses, nearest `from`: where a contact run from the
+    /// blended edge leaves the face.
+    fn first_crossing(&self, from: Vec3, to: Vec3, except: u64) -> Option<u64> {
+        let (a, b) = (self.flat(from), self.flat(to));
+        let r = (b.0 - a.0, b.1 - a.1);
+        self.segments
+            .iter()
+            .filter(|segment| segment.2 != except)
+            .filter_map(|&((cx, cy), (dx, dy), edge)| {
+                let s = (dx - cx, dy - cy);
+                let denominator = r.0 * s.1 - r.1 * s.0;
+                if denominator.abs() <= 1e-18 {
+                    return None;
+                }
+                let (ex, ey) = (cx - a.0, cy - a.1);
+                let lambda = (ex * s.1 - ey * s.0) / denominator;
+                let mu = (ex * r.1 - ey * r.0) / denominator;
+                ((0.0..=1.0).contains(&lambda) && (0.0..=1.0).contains(&mu)).then_some((lambda, edge))
+            })
+            .min_by(|x, y| x.0.total_cmp(&y.0))
+            .map(|(_, edge)| edge)
+    }
+}

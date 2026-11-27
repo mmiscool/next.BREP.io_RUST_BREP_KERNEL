@@ -197,6 +197,8 @@ pub struct BrepApp {
     /// row per interfering pair (click = select both components), a green
     /// all-clear pass line, and a Re-run button.
     interference: crate::panels::interference::InterferenceWindow,
+    /// The Draft Analysis window (its state is the engine's: per document).
+    draft_analysis: crate::panels::draft_analysis::DraftAnalysisWindow,
     /// Auto Constraints window (Assembly workbench): opened by the `⚿` toolbar
     /// button, it lists the constraint types the kernel's inference lane can
     /// read out of the components' current placement, with what a scan found
@@ -903,6 +905,7 @@ impl BrepApp {
             plm: crate::panels::plm_host::PlmHost::new(),
             info_windows: InfoWindows::new(),
             interference: crate::panels::interference::InterferenceWindow::new(),
+            draft_analysis: crate::panels::draft_analysis::DraftAnalysisWindow::new(),
             auto_constraints: crate::panels::auto_constraints::AutoConstraintsWindow::new(),
             step_parts: crate::panels::step_parts::StepPartsPanel::new(),
             selection: SelectionPanel::new(),
@@ -1625,6 +1628,7 @@ impl BrepApp {
             "__brepSelection" => engine.selection_json(),
             "__brepInfoWindows" => self.info_windows.published_json(self.docs.engine_mut()),
             "__brepInterference" => self.interference.state_json_in(engine),
+            "__brepDraftAnalysis" => engine.draft_analysis_json().to_string(),
             "__brepAutoConstraints" => self.auto_constraints.state_json(),
             "__brepStepParts" => self.step_parts.state_json(),
             "__brepSelectionFilter" => engine.selection_filter_json(),
@@ -1856,6 +1860,12 @@ impl BrepApp {
         if let Some(tool) = crate::workbench::sketch::draw_tool(id) {
             let engine = self.docs.engine_mut();
             let armed = engine.sketch_active_tool().unwrap_or("select") == tool;
+            // Fillet with corner points selected rounds them all at once (owner
+            // 2026-11-26), the same command as the actions card's Fillet.
+            if tool == "fillet" && !armed && !engine.sketch_selected_point_ids().is_empty() {
+                engine.sketch_fillet_command();
+                return true;
+            }
             engine.sketch_set_tool(Some(if armed { "select" } else { tool }));
             return true;
         }
@@ -1893,6 +1903,10 @@ impl BrepApp {
             // intersect sweep NOW and open the results window.
             "assembly.interference" => {
                 self.interference.open_and_run(self.docs.engine_mut());
+            }
+            // Modeling's Draft Analysis: the view on or off (display only).
+            crate::workbench::modeling::DRAFT_ANALYSIS_BUTTON_ID => {
+                self.docs.engine_mut().draft_analysis_toggle();
             }
             // Assembly's Auto Constraints: open the inference window and scan
             // the current placement NOW, so it opens showing real counts.
@@ -3167,6 +3181,8 @@ impl eframe::App for BrepApp {
                     self.family_table.preview_card(ui, self.docs.engine_mut());
                     // 1. Exit controls for whatever special mode is active.
                     if !(compact && sketch) { self.mode_bar.card(ui, self.docs.engine_mut()); }
+                    // 1b. The armed fillet/chamfer tool's options.
+                    if self.docs.engine().sketch_mode() { self.sketch.tool_options_card(ui, self.docs.engine_mut()); }
                     // 2. Context actions: sketch actions in sketch mode, else the
                     // modeling selection actions. Same rail, mode-appropriate items.
                     let has_actions = if self.docs.engine().sketch_mode() { self.docs.engine().sketch_selection_count() > 0 }
@@ -3258,6 +3274,9 @@ impl eframe::App for BrepApp {
         // --- interference results window: same floating idiom, owned report;
         // its Re-run button re-drives the engine check.
         self.interference.show(&ctx, self.docs.engine_mut());
+
+        // --- Draft Analysis window: shown while the engine's analysis is on.
+        self.draft_analysis.show(&ctx, self.docs.engine_mut());
 
         // --- auto-constraints window: the inference scan + its Create button.
         self.auto_constraints.show(&ctx, self.docs.engine_mut());
@@ -3356,6 +3375,7 @@ impl eframe::App for BrepApp {
             crate::automation::registry::publish("__brepSheetsHit", "Sheets panel widget rects (sheets:*)", &self.sheets.hits_json());
             crate::automation::registry::publish("__brepInfoWindowsHit", "info window widget rects", &self.info_windows.hits_json());
             crate::automation::registry::publish("__brepInterferenceHit", "interference panel widget rects", &self.interference.hits_json());
+            crate::automation::registry::publish("__brepDraftAnalysisHit", "Draft Analysis window widget rects (draftAnalysis:*)", &self.draft_analysis.hits_json());
             crate::automation::registry::publish("__brepAutoConstraintsHit", "auto-constraints widget rects", &self.auto_constraints.hits_json());
             crate::automation::registry::publish("__brepStepPartsHit", "STEP parts library widget rects", &self.step_parts.hits_json());
             crate::automation::registry::publish("__brepSelectionHit", "selection bar widget rects (filter:kind, clear, hide)", &self.selection.hits_json());

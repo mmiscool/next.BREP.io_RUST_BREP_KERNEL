@@ -78,6 +78,8 @@ mod planar_clip;
 pub mod tool;
 #[path = "fillet/pivot_chain.rs"]
 mod pivot_chain;
+#[path = "fillet/outline_extend.rs"]
+mod outline_extend;
 #[path = "fillet/vanishing.rs"]
 mod vanishing;
 #[path = "fillet/spine_first.rs"]

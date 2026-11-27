@@ -17,6 +17,42 @@ use std::path::PathBuf;
 mod cli;
 use cli::{Command, SkillCommand, TypescriptCommand};
 
+// Each script gets its own record, including partial sessions that fail during
+// setup. Stderr only: program replies and artifact contracts stay unchanged.
+struct TestSessionTiming<'a> {
+    path: &'a std::path::Path,
+    pass: &'a str,
+    started: std::time::Instant,
+    stage_started: std::time::Instant,
+    stage: &'static str,
+    outcome: &'static str,
+}
+
+impl<'a> TestSessionTiming<'a> {
+    fn new(path: &'a std::path::Path, pass: &'a str) -> Self {
+        let now = std::time::Instant::now();
+        Self { path, pass, started: now, stage_started: now, stage: "load", outcome: "incomplete" }
+    }
+    fn record(&self, stage: &str, elapsed: std::time::Duration) {
+        eprintln!("BREP_SESSION_TIMING {}", json!({
+            "script": self.path, "pass": self.pass, "stage": stage,
+            "elapsed_ms": elapsed.as_secs_f64() * 1000.0, "outcome": self.outcome,
+        }));
+    }
+    fn next(&mut self, stage: &'static str) {
+        self.record(self.stage, self.stage_started.elapsed());
+        self.stage = stage;
+        self.stage_started = std::time::Instant::now();
+    }
+}
+
+impl Drop for TestSessionTiming<'_> {
+    fn drop(&mut self) {
+        self.record(self.stage, self.stage_started.elapsed());
+        self.record("total", self.started.elapsed());
+    }
+}
+
 fn skill_command(command: SkillCommand) -> Result<Value, String> {
     use brep_mcp_core::skill_distribution as distribution;
     let receipt = match command {
@@ -219,6 +255,7 @@ fn main() {
                     eprintln!("--- order check: {pass} pass ({} scripts) ---", list.len());
                 }
                 for path in list {
+                    let mut timing = TestSessionTiming::new(path, pass);
                     // A `.js` script is a PROGRAM, played through code mode
                     // (`brep_mcp::program`); a `.json` one is a step list.
                     let is_program = path.extension().is_some_and(|e| e == "js");
@@ -250,6 +287,7 @@ fn main() {
                     // artefacts, so the file modal lists what this script saved
                     // and a `session_restart` comes back to it. It is also the
                     // app's config root, where the PLM fixture writes D5's files.
+                    timing.next("store");
                     let store = if needs_app || script.plm.is_some() {
                         match brep_mcp::runner::prepare_store(&out_dir, &script.fixtures) {
                             Ok(s) => Some(s),
@@ -265,6 +303,7 @@ fn main() {
                     // THE PLM FIXTURE starts, and is seeded, before the app, so
                     // an app that reads D5's files at boot finds a live server.
                     // It lives until the end of this iteration (dropped = killed).
+                    timing.next("plm-start");
                     let plm = match (&script.plm, &store) {
                         (Some(spec), Some(store)) => match brep_mcp::plm_fixture::PlmFixture::start(spec, &out_dir, store) {
                             Ok(f) => {
@@ -279,6 +318,7 @@ fn main() {
                         },
                         _ => None,
                     };
+                    timing.next("app-start");
                     if let Some(store) = store.as_ref().filter(|_| needs_app) {
                         let args = json!({
                             "backend": "headless",
@@ -307,6 +347,7 @@ fn main() {
                         video_root: video_root.clone(),
                         plm: plm.clone(),
                     };
+                    timing.next("run");
                     let result = rt.block_on(async {
                         match &program {
                             Some(program) => brep_mcp::program::run(program, &server.state, &opts).await,
@@ -316,6 +357,8 @@ fn main() {
                             }
                         }
                     });
+                    timing.outcome = if result.passed { "pass" } else { "fail" };
+                    timing.next("teardown");
                     if needs_app {
                         rt.block_on(stop_session(&server));
                     }

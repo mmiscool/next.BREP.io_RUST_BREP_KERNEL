@@ -513,6 +513,35 @@ pub fn context_applicable(probe: &crate::feature_pipeline::SelectionProbe) -> bo
     probe.solids > 0 || probe.edges > 0 || probe.faces > 0
 }
 
+/// The dialog field-visibility hook ([`crate::feature_hidden_params`]): the
+/// params a Pattern dialog hides for its current values. Read the way
+/// [`execute`] reads them, so a hidden field is one the run ignores: any `mode`
+/// other than LINEAR (case-insensitive, LINEAR when absent) is circular.
+pub fn hidden_params(values: &serde_json::Value) -> Vec<&'static str> {
+    let mode = values.get("mode").and_then(serde_json::Value::as_str).map(str::to_uppercase);
+    mode_hidden_params(mode.as_deref().unwrap_or("LINEAR") == "LINEAR", values)
+}
+
+/// The fields LINEAR or circular mode ignores, shared with Pattern Component.
+/// LINEAR drops the circular inputs and, of its own, keeps the gizmo `offset`
+/// (position only: its rotation and scale rows are dropped) in `transform`
+/// input mode, or the direction and distance in `vector distance` mode
+/// (any other value reads as `transform`, as [`resolve_linear_delta`] does).
+/// Circular drops every linear input.
+pub(crate) fn mode_hidden_params(linear: bool, values: &serde_json::Value) -> Vec<&'static str> {
+    if !linear {
+        return vec!["linearInputMode", "offset", "directionRef", "linearDistance"];
+    }
+    let mut hidden = vec!["axisRef", "centerOffset", "totalAngleDeg"];
+    let input = values.get("linearInputMode").and_then(serde_json::Value::as_str).unwrap_or("vector distance");
+    if normalize_option(input) == "VECTOR_DISTANCE" {
+        hidden.push("offset");
+    } else {
+        hidden.extend(["directionRef", "linearDistance", "offset.rotationEuler", "offset.scale"]);
+    }
+    hidden
+}
+
 pub fn schema() -> serde_json::Value {
     serde_json::json!({
     "type": "PATTERN",
@@ -543,7 +572,7 @@ pub fn schema() -> serde_json::Value {
                 "CIRCULAR"
             ],
             "default_value": "LINEAR",
-            "hint": "Pattern type"
+            "hint": "LINEAR steps the copies along a line; CIRCULAR turns them about an axis. The dialog shows only the chosen mode's inputs"
         },
         "linearInputMode": {
             "type": "options",
@@ -552,8 +581,12 @@ pub fn schema() -> serde_json::Value {
                 "vector distance"
             ],
             "default_value": "vector distance",
-            "label": "Linear input",
-            "hint": "Use transform controls or a selected direction plus distance"
+            "optionLabels": {
+                "transform": "Offset vector",
+                "vector distance": "Direction + distance"
+            },
+            "label": "Linear step",
+            "hint": "LINEAR: how one copy's step to the next is given. `transform` (Offset vector): type the step as X, Y, Z in Step offset. `vector distance` (Direction + distance): pick a Direction and give the Distance along it"
         },
         "count": {
             "type": "number",
@@ -590,8 +623,8 @@ pub fn schema() -> serde_json::Value {
                     1
                 ]
             },
-            "label": "Offset (use gizmo)",
-            "hint": "Use Move gizmo to set direction and distance (position only)"
+            "label": "Step offset",
+            "hint": "LINEAR, Offset vector step: the move from one copy to the next, as X, Y, Z (only the position is used)"
         },
         "directionRef": {
             "type": "reference_selection",
@@ -603,13 +636,16 @@ pub fn schema() -> serde_json::Value {
             "multiple": false,
             "default_value": null,
             "label": "Direction",
-            "hint": "Select an EDGE direction or FACE/PLANE normal for linear spacing"
+            "hint": format!(
+                "LINEAR, Direction + distance step: what the copies step along. {} Empty: world +X",
+                common::DIRECTION_FROM_REFERENCE
+            )
         },
         "linearDistance": {
             "type": "number",
             "default_value": 10,
             "label": "Distance",
-            "hint": "Distance between linear pattern instances along the selected direction"
+            "hint": "LINEAR, Direction + distance step: the distance between neighbouring copies along Direction (the whole run with count and span)"
         },
         "axisRef": {
             "type": "reference_selection",
@@ -619,17 +655,17 @@ pub fn schema() -> serde_json::Value {
             "multiple": false,
             "default_value": null,
             "label": "Axis",
-            "hint": "Select an EDGE to define the circular pattern axis"
+            "hint": "CIRCULAR: the edge or sketch line the copies turn about; the axis runs from its start to its end through its start point. Empty: world +Y through the origin"
         },
         "centerOffset": {
             "type": "number",
             "default_value": 0,
-            "hint": "Offset along axis from reference origin to pattern center"
+            "hint": "CIRCULAR: how far along the axis from the axis start point the pattern centre sits"
         },
         "totalAngleDeg": {
             "type": "number",
             "default_value": 360,
-            "hint": "Angle between circular instances, or total span when Count mode is count and span"
+            "hint": "CIRCULAR: the angle between neighbouring copies, or the whole span with count and span"
         },
         "booleanMode": {
             "type": "options",

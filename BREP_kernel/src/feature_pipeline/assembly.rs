@@ -257,10 +257,28 @@ pub(crate) fn finish_history_run(
 /// left it (`delta · seed`), so instances follow a mated seed in the same run.
 /// A moved instance is reported like a solved body (its solids re-tessellate)
 /// but writes no pose back: it has no feature of its own to fold into.
+///
+/// A seed may itself be an instance (a pattern of a pattern), so the pass
+/// repeats until nothing moves: each pass carries the moves one level further
+/// down. Seeds always come from earlier features, so the chain has no cycle
+/// and its depth is at most the number of Pattern Components.
 fn follow_pattern_seeds(
     scene: &mut crate::feature_pipeline::SceneMap,
     outcome: &mut lifecycle::LifecycleOutcome,
 ) {
+    let levels = scene.components.values().filter(|record| record.pattern.is_some()).count() + 1;
+    for _ in 0..levels {
+        if !follow_pattern_seeds_once(scene, outcome) {
+            break;
+        }
+    }
+}
+
+/// One follow pass; whether any instance moved.
+fn follow_pattern_seeds_once(
+    scene: &mut crate::feature_pipeline::SceneMap,
+    outcome: &mut lifecycle::LifecycleOutcome,
+) -> bool {
     let follows: Vec<(String, crate::AffineTransform)> = scene
         .components
         .values()
@@ -286,11 +304,13 @@ fn follow_pattern_seeds(
             moved.then(|| (record.id.clone(), target))
         })
         .collect();
+    let moved = !follows.is_empty();
     for (id, target) in follows {
         if crate::feature_pipeline::component::update_component_transform(scene, &id, target).is_ok() {
             outcome.moved_solids.extend(scene.component_solids(&id));
         }
     }
+    moved
 }
 
 

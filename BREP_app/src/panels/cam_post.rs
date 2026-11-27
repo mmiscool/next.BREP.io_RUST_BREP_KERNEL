@@ -121,7 +121,7 @@ fn post_field(key: &str, spec: &brep_cam::post::PropertySpec) -> Option<brep_ren
     use brep_render::style::FieldKind;
     let kind = match spec.kind.as_str() {
         "boolean" => FieldKind::Bool,
-        "enum" => FieldKind::Enum { variants: spec.values.iter().flatten().filter_map(Value::as_str).map(str::to_string).collect() },
+        "enum" => FieldKind::Enum { variants: spec.values.iter().flatten().filter_map(Value::as_str).map(str::to_string).collect(), labels: Vec::new() },
         "number" | "integer" => match spec.min {
             Some(min) => FieldKind::BoundedScalar { min, max: spec.max.unwrap_or(f64::MAX), step: 1.0 },
             None => FieldKind::Scalar { step: 1.0 },

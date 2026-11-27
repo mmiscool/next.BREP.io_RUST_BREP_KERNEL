@@ -71,6 +71,7 @@ mod cmd_scene;
 mod cmd_sheets;
 #[cfg(feature = "automation")]
 mod cmd_settings;
+mod cmd_sketch;
 #[cfg(feature = "automation")]
 mod cmd_shell;
 #[cfg(feature = "automation")]

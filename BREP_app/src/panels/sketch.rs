@@ -45,12 +45,23 @@ pub struct SketchPanel {
     /// its own. Merged into one panel the automation host would test the card's rect
     /// against the list's viewport and scroll for a widget that was never in it.
     list_hits: HashMap<String, egui::Rect>,
+    /// Per-frame fillet/chamfer tool-options card widget rects (`tool:` keys),
+    /// published with the actions card in `__brepSketchHit`.
+    tool_hits: HashMap<String, egui::Rect>,
     /// Collapse state for the entity-list sections (default open = false).
     curves_collapsed: bool,
     points_collapsed: bool,
     constraints_collapsed: bool,
     /// Solver Settings section starts COLLAPSED (advanced/rarely-touched).
     solver_collapsed: bool,
+    /// The Issues section (conflicting + redundant constraints) collapse state.
+    issues_collapsed: bool,
+    /// The status dot was clicked: open the Issues section and scroll it into view
+    /// on the next list frame.
+    issues_reveal: bool,
+    /// The status row's clickable DOF readout (`issues`), published with the card
+    /// rects as `sketch/issues`.
+    status_hits: HashMap<String, egui::Rect>,
 }
 
 impl SketchPanel {
@@ -86,7 +97,13 @@ impl SketchPanel {
             // dimension text), so it must be taken BEFORE the session borrow.
             let conflict = conflict_color(state);
             if let Some(session) = state.sketch_edit_session() {
-                dof_readout(ui, &session.diagnostics, conflict);
+                // The readout is the way into the Issues list: a click opens it.
+                let resp = dof_readout(ui, &session.diagnostics, conflict);
+                self.status_hits.insert("issues".to_string(), resp.rect);
+                if resp.clicked() {
+                    self.issues_collapsed = false;
+                    self.issues_reveal = true;
+                }
             }
             ui.separator();
             ui.label(
@@ -121,6 +138,89 @@ impl SketchPanel {
                 state.toggle_sketch_camera_lock();
             }
         });
+    }
+
+    /// The armed fillet or chamfer tool's options, through the shared form view:
+    /// the fillet radius, or the chamfer's sizing (an `Equal distance` /
+    /// `Distance + angle` dropdown, the distance, the angle), with the last
+    /// refusal as an error banner. Its exit button puts the tool down. No-op
+    /// unless one of the two is armed. Hit keys carry the `tool:` prefix.
+    pub fn tool_options_card(&mut self, ui: &mut egui::Ui, state: &mut EngineState) {
+        use crate::form_view::{form_view, FormBanner, FormViewSpec};
+        use serde_json::{json, Value};
+        self.tool_hits.clear();
+        let fillet = match state.sketch_active_tool() {
+            Some("fillet") => true,
+            Some("chamfer") => false,
+            _ => return,
+        };
+        let Some(mut options) = state.sketch_corner_options() else { return };
+        const EQUAL: &str = "Equal distance";
+        const BY_ANGLE: &str = "Distance + angle";
+        let schema = if fillet {
+            json!({ "inputParamsSchema": {
+                "radius": { "type": "number", "label": "Radius (mm)", "default_value": 1.0,
+                    "hint": "The arc's radius; it stays a dimension you can edit or drag afterwards" }
+            }})
+        } else {
+            json!({ "inputParamsSchema": {
+                "mode": { "type": "options", "label": "Size by", "options": [EQUAL, BY_ANGLE], "default_value": EQUAL },
+                "distance": { "type": "number", "label": "Distance (mm)", "default_value": 1.0,
+                    "hint": "From the corner along the first line (and the second, when equal)" },
+                "angle": { "type": "number", "label": "Angle (deg)", "default_value": 45.0,
+                    "hint": "The cut's angle to the first line" }
+            }})
+        };
+        let fields = brep_render::features::form_fields_from_schema(&schema);
+        let mut params = if fillet {
+            json!({ "radius": options.radius })
+        } else {
+            json!({
+                "mode": if options.chamfer_by_angle { BY_ANGLE } else { EQUAL },
+                "distance": options.chamfer_distance,
+                "angle": options.chamfer_angle_degrees,
+            })
+        };
+        let mut hidden: std::collections::HashSet<String> = Default::default();
+        if !fillet && !options.chamfer_by_angle {
+            hidden.insert("angle".to_string());
+        }
+        let message = state.sketch_corner_message();
+        let spec = FormViewSpec {
+            title: if fillet { "Fillet corner" } else { "Chamfer corner" },
+            subtitle: Some("Click where two lines meet"),
+            fields: &fields,
+            hidden: Some(&hidden),
+            banner: message.as_deref().map(|text| FormBanner::error(text, egui::Color32::from_rgb(0xf8, 0x51, 0x49))),
+            trailing: None,
+            exit_label: "Done",
+            extra: None,
+            rollback: false,
+            hits_prefix: "tool:",
+            read_only: None,
+            picking: None,
+        };
+        let out = form_view(ui, &spec, &mut params, Some(&mut self.tool_hits));
+        if out.changed {
+            let number = |key: &str| params.get(key).and_then(Value::as_f64).filter(|v| v.is_finite() && *v > 0.0);
+            if fillet {
+                if let Some(radius) = number("radius") {
+                    options.radius = radius;
+                }
+            } else {
+                options.chamfer_by_angle = params.get("mode").and_then(Value::as_str) == Some(BY_ANGLE);
+                if let Some(distance) = number("distance") {
+                    options.chamfer_distance = distance;
+                }
+                if let Some(angle) = number("angle") {
+                    options.chamfer_angle_degrees = angle;
+                }
+            }
+            state.set_sketch_corner_options(options);
+        }
+        if out.exit_clicked {
+            state.sketch_set_tool(None);
+        }
     }
 
     /// The in-sketch CONTEXT actions — the selection-driven constraint palette
@@ -165,6 +265,17 @@ impl SketchPanel {
                 "Convert to construction geometry"
             };
             items.push(ActionItem::new("construction", "◐ Construction", tip));
+        }
+        if !state.sketch_selected_point_ids().is_empty() {
+            let radius = state.sketch_corner_options().map_or(1.0, |o| o.radius);
+            items.push(ActionItem::new(
+                "fillet",
+                "Fillet",
+                format!(
+                    "Round every selected corner (a point where two lines meet) at once with a radius {radius} tangent arc; \
+                     the first corner you selected carries the one radius dimension and the others are held equal to it"
+                ),
+            ));
         }
         if state.sketch_selected_angle_constraint().is_some() {
             items.push(ActionItem::new(
@@ -219,6 +330,12 @@ impl SketchPanel {
             }
             Some("angle") => {
                 state.sketch_cycle_angle_measure();
+            }
+            Some("fillet") => {
+                // Every selected corner at once; a refused point (all, or some of
+                // several) arms the fillet tool so its options card shows why (and
+                // the radius to change) in place of failing silently.
+                state.sketch_fillet_command();
             }
             Some("cleanup") => {
                 state.sketch_cleanup_unused_points();
@@ -281,6 +398,29 @@ impl SketchPanel {
             ui.add_space(4.0);
             // Snapshot the rows first (immutable borrow), then render with `&mut
             // state` so per-row select/hover can call back into the engine.
+            // ISSUES first: the conflicting, then redundant, constraints, each row
+            // selecting / deleting its constraint like a Constraints row. Shown only
+            // while there are any; its rows publish as `issue:<id>` (`del:issue:<id>`)
+            // so they are told apart from the same constraint's Constraints row.
+            let issues = state.sketch_issue_rows();
+            if !issues.is_empty() {
+                let mut issue_hits: HashMap<String, egui::Rect> = HashMap::new();
+                entity_section(ui, &mut self.issues_collapsed, state, "Issues", "constraint", issues, &mut issue_hits);
+                for (key, rect) in issue_hits {
+                    let key = if let Some(rest) = key.strip_prefix("del:constraint:") {
+                        format!("del:issue:{rest}")
+                    } else if let Some(rest) = key.strip_prefix("constraint:") {
+                        format!("issue:{rest}")
+                    } else {
+                        key
+                    };
+                    if self.issues_reveal && key == "section:Issues" {
+                        ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+                    }
+                    hits.insert(key, rect);
+                }
+            }
+            self.issues_reveal = false;
             let curves = state.sketch_geometry_rows();
             let points = state.sketch_point_rows();
             let constraints = state.sketch_constraint_rows();
@@ -325,6 +465,8 @@ impl SketchPanel {
         }
         let mut hits = self.ctx_hits.clone();
         hits.extend(self.text_hits.clone());
+        hits.extend(self.tool_hits.clone());
+        hits.extend(self.status_hits.clone());
         crate::automation::hit_rects::hits_json(&hits)
     }
 
@@ -400,6 +542,23 @@ impl SketchPanel {
                 .iter()
                 .map(|a| a.symbol.clone())
                 .collect::<Vec<_>>(),
+            // Precise freedom: the redundant constraints (the conflicting ones are
+            // above), the Issues list rows in order, each movable point's free
+            // directions, and the hovered entity's readout.
+            "redundantConstraints": session
+                .map(|s| s.diagnostics.redundant_constraints.clone())
+                .unwrap_or_default(),
+            "issues": state
+                .sketch_issue_rows()
+                .iter()
+                .map(|r| serde_json::json!({ "id": r.id, "label": r.label }))
+                .collect::<Vec<_>>(),
+            "pointFreedom": session.map(|s| serde_json::to_value(&s.diagnostics.point_freedom).unwrap_or_default()),
+            "hoverFreedom": state.sketch_hover_freedom_label(),
+            // The geometric-constraint glyphs as drawn (id, pixel centre and size,
+            // saved stand-off), so the verifier can drag one and check its size.
+            "glyphs": serde_json::from_str::<serde_json::Value>(&state.sketch_glyphs_json())
+                .unwrap_or_default(),
             // S5 editable dimensions.
             "dimensionCount": dimensions.len(),
             "dimensions": dimensions,
@@ -413,6 +572,15 @@ impl SketchPanel {
             // S6b-3 handdraw: the live freehand stroke sample count (the verifier
             // asserts a stroke captures while dragging, then clears + emits on end).
             "handdrawPoints": state.sketch_handdraw_len(),
+            // Fillet / chamfer: the tools' options and why the last corner click
+            // changed nothing (null after one that did).
+            "cornerOptions": state.sketch_corner_options().map(|o| serde_json::json!({
+                "radius": o.radius,
+                "chamferMode": if o.chamfer_by_angle { "Distance + angle" } else { "Equal distance" },
+                "chamferDistance": o.chamfer_distance,
+                "chamferAngle": o.chamfer_angle_degrees,
+            })),
+            "cornerMessage": state.sketch_corner_message(),
         })
         .to_string()
     }
@@ -433,7 +601,7 @@ fn dof_readout(
     ui: &mut egui::Ui,
     diag: &brep_render::sketch::SketchDiagnostics,
     conflict: egui::Color32,
-) {
+) -> egui::Response {
     let (color, label): (egui::Color32, String) = if diag.conflicting {
         // Name HOW MANY constraints the solver implicated, so the readout and the
         // red rows/glyphs are visibly the same statement. The solver never raises
@@ -468,11 +636,16 @@ fn dof_readout(
         )
     };
 
-    ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
         ui.painter().circle_filled(rect.center(), 5.0, color);
         ui.label(egui::RichText::new(label).strong());
     });
+    // The dot and its label are one button: a click opens the Issues list (which
+    // names the conflicting and redundant constraints), a hover says so.
+    ui.interact(row.response.rect, ui.id().with("sketch-dof-readout"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Show which constraints conflict or repeat (Issues list)")
 }
 
 /// One collapsible entity-list section, rendered with the shared `tree` widget so
@@ -632,14 +805,18 @@ fn solver_settings_section(ui: &mut egui::Ui, collapsed: &mut bool, state: &mut 
 /// separate PANELS because they are separate blobs: `sketch` is the floating
 /// actions card, `sketchlist` the scrolling entity list that owns a `panel:clip`.
 pub static HIT_KEYS: &[HitKeyDoc] = &[
+    HitKeyDoc { panel: "sketch", prefix: "tool:", meaning: "the armed fillet or chamfer tool's options form (tool:field:radius, tool:field:mode with entries tool:field:mode#Equal distance / tool:field:mode#Distance + angle, tool:field:distance, tool:field:angle, tool:form:return puts the tool down, tool:form:error while the last click was refused)", command: None },
     HitKeyDoc { panel: "sketch", prefix: "text", meaning: "edit selected text; text:contents, text:font (its entries text:font#<name> while open), text:apply and text:cancel address the dialog", command: None },
     HitKeyDoc { panel: "sketch", prefix: "constraint:", meaning: "apply the offered sketch constraint to the selection (constraint:glyph, e.g. constraint:⌒)", command: None },
     HitKeyDoc { panel: "sketch", prefix: "fix", meaning: "ground the selected points, or unground them when all are grounded", command: None },
     HitKeyDoc { panel: "sketch", prefix: "construction", meaning: "flip the selection between construction and regular geometry", command: None },
     HitKeyDoc { panel: "sketch", prefix: "angle", meaning: "with one ∠ constraint selected, measure the angle the next way round (its supplement in the adjacent sector; the value flips to 180 − value, the geometry stays put)", command: None },
+    HitKeyDoc { panel: "sketch", prefix: "fillet", meaning: "with points selected, round every selected corner (two lines meeting) at once with the fillet tool's radius in one undo step: one radius dimension on the first selected corner's arc, the others equal to it (⊜); a refusal arms the fillet tool showing why. The toolbar's sketch.tool.fillet does the same while points are selected", command: None },
     HitKeyDoc { panel: "sketch", prefix: "cleanup", meaning: "remove points no geometry or constraint uses", command: None },
     HitKeyDoc { panel: "sketch", prefix: "delete", meaning: "delete the selected sketch entities", command: None },
-    HitKeyDoc { panel: "sketchlist", prefix: "section:", meaning: "collapse or expand an entity-list section (section:Curves / section:Points / section:Constraints)", command: None },
+    HitKeyDoc { panel: "sketch", prefix: "issues", meaning: "the constraint-status readout (DOF / fully constrained / redundant / conflicting): opens the entity list's Issues section and scrolls it into view", command: None },
+    HitKeyDoc { panel: "sketchlist", prefix: "section:", meaning: "collapse or expand an entity-list section (section:Issues while a constraint is redundant or conflicting / section:Curves / section:Points / section:Constraints)", command: None },
+    HitKeyDoc { panel: "sketchlist", prefix: "issue:", meaning: "select the redundant or conflicting constraint an Issues row names (issue:<constraint id>; its delete is del:issue:<id>)", command: None },
     HitKeyDoc { panel: "sketchlist", prefix: "geometry:", meaning: "select a curve row by entity id; hold ctrl (modifiers_set) to add to the selection", command: None },
     HitKeyDoc { panel: "sketchlist", prefix: "point:", meaning: "select a point row by entity id; hold ctrl to add to the selection", command: None },
     HitKeyDoc { panel: "sketchlist", prefix: "constraint:", meaning: "select a constraint row by entity id; hold ctrl to add to the selection", command: None },

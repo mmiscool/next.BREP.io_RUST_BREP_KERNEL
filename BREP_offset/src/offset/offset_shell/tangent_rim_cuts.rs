@@ -237,18 +237,14 @@ pub(super) fn imprint_tangent_rim_cuts(
         minted.insert(id);
         let cut_key = FaceKey { operand: planned.cut as u8, face_id: carriers[planned.cut].solid.shells[0].faces[0].id };
         let rim_key = FaceKey { operand: planned.rim as u8, face_id: carriers[planned.rim].solid.shells[0].faces[0].id };
-        imprint.pieces.push(ImprintPieceRecord {
+        imprint.pieces.push(ImprintPieceRecord::new(
             id,
-            curve: rim.curve.clone(),
-            t0: rim.t0,
-            t1: rim.t1,
-            start_vertex_id,
-            end_vertex_id,
-            pcurves: vec![FacePcurve { operand: cut_key.operand, face_id: cut_key.face_id, pcurve: planned.pcurve }],
-            support_faces: [cut_key, rim_key],
-            shared_edge: None,
-                certified_ruling_side: None,
-        });
+            rim.curve.clone(),
+            [rim.t0, rim.t1],
+            [start_vertex_id, end_vertex_id],
+            vec![FacePcurve { operand: cut_key.operand, face_id: cut_key.face_id, pcurve: planned.pcurve }],
+            [cut_key, rim_key],
+        ));
         if let Some(entry) = imprint
             .by_face
             .iter_mut()

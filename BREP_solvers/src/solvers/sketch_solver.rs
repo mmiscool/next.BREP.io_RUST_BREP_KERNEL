@@ -379,6 +379,9 @@ struct Engine {
     pass_token: String,
     sig_scratch_before: Vec<SigEntry>,
     sig_scratch_after: Vec<SigEntry>,
+    /// An interactive drag frame ([`solve_sketch_min_change`]): try the smallest
+    /// change from the given coordinates first, relaxation only if that fails.
+    min_change: bool,
 }
 
 #[path = "sketch_solver/jsnum.rs"]
@@ -398,6 +401,10 @@ mod constraints_foot;
 mod dof_polish;
 #[path = "sketch_solver/api.rs"]
 mod api;
+#[path = "sketch_solver/drag.rs"]
+mod drag;
+#[path = "sketch_solver/freedom.rs"]
+mod freedom;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -413,7 +420,7 @@ use constraints_shape::{
 };
 use jsnum::*;
 
-pub use api::{solve_sketch, solve_sketch_from_json};
+pub use api::{solve_sketch, solve_sketch_from_json, solve_sketch_min_change};
 
 /// Mint a collision-free sketch ID, with caller-selected reserved IDs omitted.
 pub fn mint_sketch_id<'a>(ids: impl Iterator<Item = &'a Value>, skip: impl Fn(&Value) -> bool) -> Value {

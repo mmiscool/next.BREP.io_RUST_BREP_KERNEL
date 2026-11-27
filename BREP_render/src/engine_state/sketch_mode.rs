@@ -13,6 +13,10 @@ pub struct SketchDrag {
     pub(super) anchor: (f64, f64),
     /// Only point grabs infer constraints on release, even if an edge has one free end.
     pub(super) infer_on_drop: bool,
+    /// A constraint GLYPH grab instead of a point grab (`points` is then empty): the
+    /// constraint id and its stand-off at the grab, which the drag moves by the
+    /// cursor's motion (along the glyph's line normal, or freely).
+    pub(super) glyph: Option<(serde_json::Value, crate::sketch::constraint_glyphs::GlyphShift)>,
 }
 
 /// The active engine-native sketch edit — the live session plus the state to

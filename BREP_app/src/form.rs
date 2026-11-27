@@ -193,13 +193,19 @@ pub fn field_input_with(
             }
             (r.changed(), r.rect)
         }
-        FieldKind::Enum { variants } => {
+        FieldKind::Enum { variants, labels } => {
             let orig = value_at(current, path)
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
             let mut sel = orig.clone();
-            let choices: Vec<(String, &str, &str)> = variants.iter().map(|v| (v.to_string(), v.as_str(), v.as_str())).collect();
+            // The value is also the hit key's suffix (`…#transform`); the label
+            // is only what the box shows.
+            let choices: Vec<(String, &str, &str)> = variants
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (v.to_string(), v.as_str(), labels.get(i).map_or(v.as_str(), String::as_str)))
+                .collect();
             let width = (!ui.layout().prefer_right_to_left()).then(|| ui.available_width());
             let (changed, response) = enum_dropdown(ui, &path.join("."), &choices, &mut sel, width, probe.as_deref_mut());
             if changed {

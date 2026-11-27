@@ -45,7 +45,7 @@ pub fn load(cert: &Path, key: &Path) -> Result<ServerConfig, String> {
 
 /// Serve `app` over TLS on `listener` until `shutdown` resolves. HTTP/1.1
 /// without upgrades: the PLM's router has no upgrade route, and each stream is
-/// kept by its task so it can be closed cleanly (see [`close_gracefully`]).
+/// kept by its task so it can be closed cleanly (see `close_gracefully`).
 pub async fn serve(
     listener: TcpListener,
     app: Router,

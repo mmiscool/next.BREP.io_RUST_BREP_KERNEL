@@ -56,6 +56,50 @@ impl EngineState {
             .map(|_| head.to_string())
     }
 
+    /// Every component a Pattern Component `pattern_id` controls: the seeds it
+    /// follows and every instance it placed, in a stable order (instances in
+    /// the record order, each seed before the first instance that follows it).
+    /// A seed that is itself an instance of an earlier pattern is included as
+    /// itself; a seed that is an earlier PATTERN brings in that pattern's whole
+    /// group, so a nested pattern names the whole tree. Empty when no instance
+    /// of `pattern_id` exists.
+    pub fn pattern_group(&self, pattern_id: &str) -> Vec<String> {
+        let mut group: Vec<String> = Vec::new();
+        for record in self.assembly_components() {
+            let Some((pattern, seed, _)) = brep_kernel::pattern_component_instance(&record.id) else { continue };
+            if pattern != pattern_id {
+                continue;
+            }
+            // A seed that is an earlier pattern's instance carries that
+            // pattern's own seed chain: walk it so the tree is whole.
+            let mut chain = vec![seed.clone()];
+            let mut cursor = seed;
+            while let Some((_, inner, _)) = brep_kernel::pattern_component_instance(&cursor) {
+                chain.push(inner.clone());
+                cursor = inner;
+            }
+            for id in chain.into_iter().rev().chain(std::iter::once(record.id.clone())) {
+                if !group.contains(&id) {
+                    group.push(id);
+                }
+            }
+        }
+        group
+    }
+
+    /// The Pattern Components a component belongs to: the pattern that placed
+    /// it (an instance), and every pattern that follows it as a seed.
+    pub fn patterns_of_component(&self, component_id: &str) -> Vec<String> {
+        let mut patterns: Vec<String> = Vec::new();
+        for record in self.assembly_components() {
+            let Some((pattern, seed, _)) = brep_kernel::pattern_component_instance(&record.id) else { continue };
+            if (record.id == component_id || seed == component_id) && !patterns.contains(&pattern) {
+                patterns.push(pattern);
+            }
+        }
+        patterns
+    }
+
     /// The owning top-level occurrence of every selected vertex (vertices
     /// carry no names, so the app's selection read cannot resolve them), or
     /// `None` when any selected vertex is not component geometry.

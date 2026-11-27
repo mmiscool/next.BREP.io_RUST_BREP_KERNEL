@@ -40,6 +40,8 @@ impl EngineState {
         // The active PMI view's annotation graphics (screen-constant arrows
         // that also face the camera).
         self.ensure_pmi_overlay_current();
+        // The Draft Analysis tint, re-read when the shown solids changed.
+        self.ensure_draft_analysis_current();
     }
 
     /// Frame the whole scene (used right after the first history feed).

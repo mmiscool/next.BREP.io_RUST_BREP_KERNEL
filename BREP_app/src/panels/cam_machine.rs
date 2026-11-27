@@ -90,8 +90,8 @@ pub fn post_choices() -> Vec<String> {
 pub fn machine_form_fields(machine: &Machine) -> Vec<FormField> {
     let mut fields = vec![
         field(&["name"], "Name", "Machine", FieldKind::Text { read_only: false }),
-        field(&["kind"], "Kind (a change starts its axis layout)", "Machine", FieldKind::Enum { variants: MACHINE_KINDS.iter().map(|s| s.to_string()).collect() }),
-        field(&["post"], "Post processor", "Machine", FieldKind::Enum { variants: post_choices() }),
+        field(&["kind"], "Kind (a change starts its axis layout)", "Machine", FieldKind::Enum { variants: MACHINE_KINDS.iter().map(|s| s.to_string()).collect(), labels: Vec::new() }),
+        field(&["post"], "Post processor", "Machine", FieldKind::Enum { variants: post_choices(), labels: Vec::new() }),
         field(&["toolChangeSeconds"], "Tool change (s)", "Machine", FieldKind::Scalar { step: 0.5 }),
         scalar(&["spindle", "minRpm"], "Spindle minimum (rpm)", "Limits"),
         scalar(&["spindle", "maxRpm"], "Spindle maximum (rpm)", "Limits"),
@@ -104,7 +104,7 @@ pub fn machine_form_fields(machine: &Machine) -> Vec<FormField> {
         field(&["travel", "max"], "Travel maximum", "Travel", FieldKind::Vec3 { step: 10.0 }),
     ];
     if matches!(machine.kind, MachineKind::Mill5 { .. }) {
-        fields.push(field(&["kinematics"], "Layout", "Axes", FieldKind::Enum { variants: KINEMATICS.iter().map(|s| s.to_string()).collect() }));
+        fields.push(field(&["kinematics"], "Layout", "Axes", FieldKind::Enum { variants: KINEMATICS.iter().map(|s| s.to_string()).collect(), labels: Vec::new() }));
     }
     if matches!(machine.kind, MachineKind::MillTurn { .. }) {
         fields.push(field(&["yAxis"], "Y axis", "Axes", FieldKind::Bool));

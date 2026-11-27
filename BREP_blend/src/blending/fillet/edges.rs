@@ -934,6 +934,34 @@ pub fn fillet_edges(
     if let Some(built) = super::pivot_chain::pivot_chain(solid, edge_points, edge_names, radius, chamfer, name) {
         return built;
     }
+    // A concave selection whose pad runs off a planar support's outline into
+    // air: rounded on the support extended past the outline and cut back
+    // (`outline_extend.rs`, `BREP_FILLET_OUTLINE_EXTEND`).
+    if !chamfer && outer {
+        let mode = super::outline_extend::mode();
+        if mode == crate::env_read::Mode::On {
+            if let Some(built) = super::outline_extend::build(solid, edge_points, edge_names, radius, name) {
+                return Ok(built);
+            }
+        }
+        if mode == crate::env_read::Mode::Check {
+            // Check mode builds both and reports, with how many faces of the
+            // ordinary answer face the wrong way in a support's plane. The
+            // ordinary answer is this entry nested, which takes every lane
+            // below exactly as it would here (depth gates only the vertex-pick
+            // widening above, already declined, and this lane).
+            let candidate = super::outline_extend::build(solid, edge_points, edge_names, radius, name);
+            let ordinary = fillet_edges(solid, edge_points, edge_names, radius, chamfer, name);
+            let reversed = ordinary.as_ref().map_or(0, |body| super::outline_extend::new_reversed_support_faces(solid, body, edge_points, radius));
+            crate::blend::record_count("count.outline_extend.reversed_support_faces", reversed as u64);
+            if let Some(disagreement) = super::outline_extend::disagreement(candidate.as_ref(), ordinary.as_ref()) {
+                eprintln!("fillet.outline_extend DISAGREES ({reversed} reversed support faces in the ordinary answer): {disagreement}");
+            } else if reversed > 0 {
+                eprintln!("fillet.outline_extend: the ordinary answer has {reversed} reversed support faces and no candidate");
+            }
+            return ordinary;
+        }
+    }
     let plate_mode = super::plate_limit::mode();
     if !chamfer && edge_names.is_none() && name.is_none() && plate_mode != crate::env_read::Mode::Off {
         if let Some(candidate) = super::plate_limit::build(solid, edge_points, radius)

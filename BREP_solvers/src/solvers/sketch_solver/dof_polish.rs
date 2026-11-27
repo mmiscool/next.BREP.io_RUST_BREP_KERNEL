@@ -172,6 +172,12 @@ impl Engine {
                             } else {
                                 atoms.push(DofResidual::Perpendicular(anchor, handle, p0, anchor));
                             }
+                        } else if let Some((joint, far)) = self.tangent_joint_row(p0, p1, p2, p3, &c.raw) {
+                            // The line ENDS on the arc (a fillet, or a joint
+                            // drawn end to end), so the joint is on the circle
+                            // already and tangency is the radius square to
+                            // the line there: dot(joint − centre, far − joint).
+                            atoms.push(DofResidual::Perpendicular(p2, joint, joint, far));
                         } else if self.is_line_pair(p0, p1) {
                             let dx = gx(p1) - gx(p0);
                             let dy = gy(p1) - gy(p0);
@@ -539,6 +545,8 @@ impl Engine {
             .map(|(&v, &norm)| v / norm.max(norm_floor))
             .collect();
 
+        // The rows again for the freedom report below (the rank pass consumes them).
+        let jac_rows = jac.clone();
         let (rank, basis) = rank_and_nullspace(jac, m, n);
         let dof = n - rank;
         let redundant = m.saturating_sub(rank);
@@ -627,6 +635,7 @@ impl Engine {
                     flagged[owner] = true;
                 }
             }
+            self.flag_tangents_behind_implied_rows(&mut flagged);
             // One entry per constraint in doc order — a multi-row atom group
             // (collinear, coincident) collapses back to its single constraint.
             // The engine's own implied rows are analysed but never NAMED: they
@@ -710,6 +719,10 @@ impl Engine {
             );
         }
 
+        // Which way each point can still move, each geometry's remaining freedoms,
+        // and the constraints that repeat earlier ones (sketch_solver/freedom.rs).
+        let freedom = self.freedom_report(&basis, &point_cols, &jac_rows, &row_owner, &conflicting_ids);
+
         let mut diag = Map::new();
         diag.insert("dof".into(), Value::Number(dof.into()));
         diag.insert("rank".into(), Value::Number(rank.into()));
@@ -724,6 +737,9 @@ impl Engine {
         );
         diag.insert("pointMobility".into(), Value::Object(point_mobility));
         diag.insert("geometryMobility".into(), Value::Object(geometry_mobility));
+        diag.insert("pointFreedom".into(), Value::Object(freedom.points));
+        diag.insert("geometryFreedom".into(), Value::Object(freedom.geometries));
+        diag.insert("redundantConstraints".into(), Value::Array(freedom.redundant));
         Value::Object(diag)
     }
 
@@ -912,7 +928,7 @@ impl Engine {
 const DOF_RANK_REL_TOL: f64 = 1e-9;
 /// A null-space component below this (per basis vector, L-inf normalized) is
 /// treated as zero when deciding whether a point can still move.
-const DOF_MOBILITY_TOL: f64 = 1e-6;
+pub(super) const DOF_MOBILITY_TOL: f64 = 1e-6;
 
 // --- Levenberg-Marquardt polish tuning (post-relaxation exactness pass) -----
 /// Maximum outer LM iterations.
@@ -932,6 +948,117 @@ const POLISH_STEP_REL_TOL: f64 = 1e-13;
 /// large sketch cannot stall an interactive drag frame; relaxation stands and
 /// the non-worsening guard trivially holds.
 const POLISH_MAX_FREE_COORDS: usize = 1200;
+
+impl Engine {
+    /// TANGENT JOINT (`BREP_SKETCH_TANGENT_JOINT`, default on, `=0` restores
+    /// the distance row; `BREP_SKETCH_TANGENT_JOINT_CHECK=1` reports each
+    /// joint): the row of a
+    /// line–circle `⌒` whose line ENDS on the circle, as `(joint, far)` — the
+    /// line's endpoint on the circle and its other end — or `None` for the
+    /// plain distance-to-line row.
+    ///
+    /// When the joint is the circle's boundary point, the distance row's
+    /// gradient at an exact joint is zero in every coordinate: moving the joint
+    /// or the centre across the line changes the distance and the radius
+    /// alike, and moving either along it, or swinging the far end about the
+    /// joint, changes neither to first order. The row reads as dependent (or
+    /// takes its rank from whatever residue the relaxation left), so a filleted
+    /// corner (two tangents and a radius) read two freedoms too many and two
+    /// redundant rows. With the joint on the circle, tangency is the radius
+    /// square to the line there, one independent row.
+    fn tangent_joint_row(&self, a: usize, b: usize, center: usize, boundary: usize, raw: &Map<String, Value>) -> Option<(usize, usize)> {
+        let on = brep_geometry::switch!("BREP_SKETCH_TANGENT_JOINT", true);
+        let check = brep_geometry::switch!("BREP_SKETCH_TANGENT_JOINT_CHECK", false);
+        if !(on || check) || !self.is_line_pair(a, b) {
+            return None;
+        }
+        let joint = self.tangent_joint(a, b, center, boundary)?;
+        if check {
+            eprintln!(
+                "BREP_SKETCH_TANGENT_JOINT_CHECK: tangent {} meets its circle at point {}: {}",
+                raw.get("id").map(|id| id.to_string()).unwrap_or_default(),
+                self.points[joint.0].id,
+                if on { "perpendicular row" } else { "distance row kept" }
+            );
+        }
+        on.then_some(joint)
+    }
+
+    /// `(joint, far)` when one end of the line `a`–`b` lies on the circle
+    /// about `center` by construction: it IS the circle's boundary point or an
+    /// endpoint of an arc about that centre, or a `≡` holds it to one.
+    fn tangent_joint(&self, a: usize, b: usize, center: usize, boundary: usize) -> Option<(usize, usize)> {
+        let mut on_circle: Vec<usize> = vec![boundary];
+        let center_key = point_key(&self.points[center].id);
+        for geometry in &self.geometries {
+            let Some(obj) = geometry.as_object() else { continue };
+            if !matches!(obj.get("type").and_then(Value::as_str), Some("arc" | "circle")) {
+                continue;
+            }
+            let Some(points) = obj.get("points").and_then(Value::as_array) else { continue };
+            if points.first().map(point_key) != Some(center_key.clone()) {
+                continue;
+            }
+            on_circle.extend(points.iter().skip(1).filter_map(|p| self.point_index_of(p)));
+        }
+        let lies_on = |p: usize| on_circle.iter().any(|&q| self.same_point(p, q));
+        if a == b || a == center || b == center {
+            return None;
+        }
+        if lies_on(a) {
+            Some((a, b))
+        } else if lies_on(b) {
+            Some((b, a))
+        } else {
+            None
+        }
+    }
+
+    /// `p` is `q`, or a `≡` holds the two together.
+    fn same_point(&self, p: usize, q: usize) -> bool {
+        p == q
+            || self.constraints.iter().any(|c| {
+                c.ctype == CType::Coincident
+                    && matches!(c.point_idx.as_slice(), [Some(x), Some(y), ..] if (*x == p && *y == q) || (*x == q && *y == p))
+            })
+    }
+
+    /// A joint row leaves holding the joint ON the circle to the arc's implied
+    /// equal-radius row when the joint is the arc's far end, so a joint come
+    /// off its arc shows as that row's residual, and an implied row is never
+    /// named. Name, in its place, each tangent whose joint it holds.
+    fn flag_tangents_behind_implied_rows(&self, flagged: &mut [bool]) {
+        if !brep_geometry::switch!("BREP_SKETCH_TANGENT_JOINT", true) {
+            return;
+        }
+        let held: Vec<usize> = self
+            .constraints
+            .iter()
+            .zip(flagged.iter())
+            .filter(|(c, &hit)| hit && c.temporary)
+            .flat_map(|(c, _)| c.point_idx.iter().flatten().copied())
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        for (ci, c) in self.constraints.iter().enumerate() {
+            if c.ctype != CType::Tangent || c.temporary {
+                continue;
+            }
+            let [Some(a), Some(b), Some(center), Some(boundary), ..] = c.point_idx.as_slice() else {
+                continue;
+            };
+            if !self.is_line_pair(*a, *b) {
+                continue;
+            }
+            if let Some((joint, _)) = self.tangent_joint(*a, *b, *center, *boundary) {
+                if held.iter().any(|&p| self.same_point(joint, p)) {
+                    flagged[ci] = true;
+                }
+            }
+        }
+    }
+}
 
 /// One scalar (or paired) residual equation contributing rows to the Jacobian.
 /// Indices reference points by their engine index; `coords` is `[x0,y0,...]`.
@@ -1241,7 +1368,7 @@ pub(super) fn eval_residuals(residuals: &[DofResidual], coords: &[f64]) -> Vec<f
 /// respect to the free coordinates listed in `free_global`. `m` is the length
 /// of the stacked residual vector. Shared by the diagnostics rank/null-space
 /// computation and the Newton polish step assembly.
-fn finite_diff_jacobian(
+pub(super) fn finite_diff_jacobian(
     residuals: &[DofResidual],
     coords: &[f64],
     free_global: &[usize],
@@ -1282,7 +1409,7 @@ fn finite_diff_jacobian(
 /// Numerical rank and null-space basis of a dense `m x n` matrix via
 /// Gauss-Jordan elimination with partial pivoting. Returns `(rank, basis)`
 /// where `basis` holds `n - rank` null-space vectors (each length `n`).
-fn rank_and_nullspace(mut a: Vec<Vec<f64>>, m: usize, n: usize) -> (usize, Vec<Vec<f64>>) {
+pub(super) fn rank_and_nullspace(mut a: Vec<Vec<f64>>, m: usize, n: usize) -> (usize, Vec<Vec<f64>>) {
     if n == 0 {
         return (0, Vec::new());
     }

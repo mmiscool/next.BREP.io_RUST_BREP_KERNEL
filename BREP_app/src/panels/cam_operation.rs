@@ -68,11 +68,11 @@ fn walk(kind: &str, prefix: &[String], value: &Value, group: &str, tool_ids: &[S
         let kind = match v {
             Value::Number(_) => FieldKind::Scalar { step: 0.1 },
             Value::Bool(_) => FieldKind::Bool,
-            Value::String(_) if key == "referenceTool" => FieldKind::Enum { variants: tool_ids.to_vec() },
+            Value::String(_) if key == "referenceTool" => FieldKind::Enum { variants: tool_ids.to_vec(), labels: Vec::new() },
             // A string the model lists as an enum field is a choice; any
             // other string (a rotary axis NAME, a probe result prefix) is free text.
             Value::String(_) => match enum_choice(kind, &path) {
-                Some(variants) => FieldKind::Enum { variants: variants.iter().map(|s| s.to_string()).collect() },
+                Some(variants) => FieldKind::Enum { variants: variants.iter().map(|s| s.to_string()).collect(), labels: Vec::new() },
                 None => FieldKind::Text { read_only: false },
             },
             _ => continue,
@@ -229,9 +229,9 @@ pub fn operation_form_fields(operation: &Operation, tools: &[Tool]) -> Vec<FormF
         field("enabled", "Enabled", "Operation", FieldKind::Bool),
         // The strategy is chosen here, from the model's kinds; choosing another
         // starts it at that kind's defaults (apply_operation_form).
-        field("strategyKind", "Strategy", "Operation", FieldKind::Enum { variants: crate::document::cam::strategy_kinds().iter().map(|k| k.to_string()).collect() }),
-        field("tool", "Tool", "Tool", FieldKind::Enum { variants: tools.iter().map(|t| t.id.as_str().to_string()).collect() }),
-        field("liveToolMode", "Live tooling", "Tool", FieldKind::Enum { variants: vec!["auto".into(), "live".into(), "off".into()] }),
+        field("strategyKind", "Strategy", "Operation", FieldKind::Enum { variants: crate::document::cam::strategy_kinds().iter().map(|k| k.to_string()).collect(), labels: Vec::new() }),
+        field("tool", "Tool", "Tool", FieldKind::Enum { variants: tools.iter().map(|t| t.id.as_str().to_string()).collect(), labels: Vec::new() }),
+        field("liveToolMode", "Live tooling", "Tool", FieldKind::Enum { variants: vec!["auto".into(), "live".into(), "off".into()], labels: Vec::new() }),
         field("feedsOverride", "Override the tool's feeds", "Tool", FieldKind::Bool),
         nested(&["feeds", "spindleRpm"], "Spindle speed (rpm)", "Tool", FieldKind::Scalar { step: 10.0 }),
         nested(&["feeds", "cuttingFeed"], "Cutting feed", "Tool", FieldKind::Scalar { step: 10.0 }),
@@ -310,7 +310,7 @@ fn chain_fields(operation: &Operation) -> Vec<FormField> {
         out.push(f(&["summary"], "Curves", FieldKind::Text { read_only: true }));
         out.push(f(&["closed"], "Closed", FieldKind::Bool));
         out.push(f(&["reversed"], "Reversed", FieldKind::Bool));
-        out.push(f(&["side"], "Tool side", FieldKind::Enum { variants: chain_choice("side") }));
+        out.push(f(&["side"], "Tool side", FieldKind::Enum { variants: chain_choice("side"), labels: Vec::new() }));
         out.push(f(&["offset"], "Offset from the chain", FieldKind::Scalar { step: 0.1 }));
         if matches!(chain.source, ChainSource::SketchProfile { .. }) {
             out.push(f(&["regions"], "Regions (indices, empty = all)", FieldKind::Text { read_only: false }));

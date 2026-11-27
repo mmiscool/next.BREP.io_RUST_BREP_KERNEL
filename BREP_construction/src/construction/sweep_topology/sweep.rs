@@ -9,7 +9,10 @@ pub use super::stations::{
 /// TRANSPLANTING the profile onto the path — see [`SectionPlacement`] for the
 /// other reading, and for why the choice changes the solid.
 ///
-/// Reuses the loft builder rather than a bespoke swept surface: the path is
+/// A certified rational quadratic circular arc uses an exact revolution
+/// (`BREP_SWEEP_EXACT_ARC=0` restores the loft), provided the placed section's
+/// control hull stays outside the revolution axis. Other paths use the loft
+/// builder: the path is
 /// sampled at `STATIONS` uniform stations, a rotation-minimizing frame is
 /// propagated along it (double-reflection RMF, Wang et al. 2008 — the frame
 /// does NOT spin at inflections the way raw Frenet does), a rigidly
@@ -29,6 +32,11 @@ pub fn sweep_profile_along_path(
     path: &NurbsCurve,
     name: Option<&str>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    if switch!("BREP_SWEEP_EXACT_ARC", true) {
+        if let Some(solid) = exact_arc_sweep(profile, path)? {
+            return Ok(solid);
+        }
+    }
     // 32 stations is the original fixed sampling — golden parity pins the
     // emitted geometry to it — and it stays the count for every path whose
     // tangent turns through at most a full turn. A path that turns further
@@ -45,6 +53,62 @@ pub fn sweep_profile_along_path(
         false, // This solid-only API does not return station diagnostics.
     )
     .map(|swept| swept.solid)
+}
+
+/// A rational quadratic arc is certified span by span: the Bernstein
+/// coefficients of |X - centre W|² - radius² W² and of the plane equation
+/// vanish to rounding. Sampled recognition alone cannot establish this.
+fn exact_arc_sweep(profile: &[NurbsCurve], path: &NurbsCurve) -> Result<Option<BrepSolid>, KernelRefusal> {
+    if path.degree != 2 { return Ok(None); }
+    let [a, b] = path.domain().or_refuse(KernelStage::Collect, "domain")?;
+    let Some(circle) = crate::recognize_circle(path, a, b, 1e-9) else { return Ok(None); };
+    let Some(spans) = crate::curve::bezier_decompose_raw(
+        &path.knots, &path.control_points, 2,
+        Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 },
+        |a, b, t| a.scale(1.0 - t).add(b.scale(t)),
+    ) else { return Ok(None); };
+    let mut turn = 0.0;
+    for span in spans {
+        if span.iter().any(|p| p.w <= 0.0) { return Ok(None); }
+        let d: Vec<Vec3> = span.iter().map(|p|
+            Vec3::new(p.x, p.y, p.z).sub(circle.centre.scale(p.w))
+        ).collect();
+        let weight = span.iter().map(|p| p.w).fold(0.0_f64, f64::max);
+        if d.iter().any(|p| p.dot(circle.axis).abs() > 1e-12 * circle.radius * weight) {
+            return Ok(None);
+        }
+        for k in 0..=4 {
+            let mut residual = 0.0;
+            for i in 0..=2 {
+                if k < i || k - i > 2 { continue; }
+                let j = k - i;
+                let factor = [1.0, 2.0, 1.0][i] * [1.0, 2.0, 1.0][j] / [1.0, 4.0, 6.0, 4.0, 1.0][k];
+                residual += factor * (d[i].dot(d[j]) - circle.radius.powi(2) * span[i].w * span[j].w);
+            }
+            if residual.abs() > 1e-12 * circle.radius.powi(2) * weight.powi(2) { return Ok(None); }
+        }
+        let step = d[0].cross(d[2]).dot(circle.axis).atan2(d[0].dot(d[2]));
+        if step <= 0.0 { return Ok(None); }
+        turn += step;
+    }
+    if turn >= std::f64::consts::TAU - 1e-12 { return Ok(None); }
+    let placement = resolve_placement(profile, None, SectionPlacement::Transplant)?;
+    let start = path.evaluate(a).or_refuse(KernelStage::Collect, "evaluate")?;
+    let tangent = circle.axis.cross(start.sub(circle.centre)).normalized().or_refuse(KernelStage::Collect, "tangent")?;
+    let (section, _) = place_section(profile, placement, SectionPlacement::Transplant, start, tangent)?;
+    // Keep folds on the existing refusal path. Positive rational weights and
+    // control points strictly on the outer side certify the entire section.
+    let radial = start.sub(circle.centre).scale(1.0 / circle.radius);
+    for curve in &section {
+        for p in &curve.control_points {
+            if p.w <= 0.0 || p.point().or_refuse(KernelStage::Collect, "control")?.sub(circle.centre).dot(radial) <= 0.0 {
+                return Ok(None);
+            }
+        }
+    }
+    let solid = crate::revolve_profile_brep(&section, circle.centre, circle.axis, turn)
+        .or_refuse(KernelStage::Fragment, "revolve")?;
+    Ok(Some(crate::accept_sound(solid, "sweepSolid")?))
 }
 
 /// Twisted path sweep (§5.7): identical to [`sweep_profile_along_path`], but
@@ -81,6 +145,11 @@ pub fn sweep_profile_twisted(
             "twist_finite",
             "sweep_profile_twisted: twist angle must be finite",
         ));
+    }
+    if twist_angle == 0.0 && switch!("BREP_SWEEP_EXACT_ARC", true) {
+        if let Some(solid) = exact_arc_sweep(profile, path)? {
+            return Ok(solid);
+        }
     }
     // 16 turns is where the 1024-station cap meets 16 stations/quarter-turn;
     // beyond it the cap would degrade the twist sampling density silently.
@@ -1892,7 +1961,10 @@ fn chain_stations(
     // cap by any distribution. The loft's interpolation solve is O(stations³)
     // per control column, so silently accepting such a path would look like a
     // hang. Refuse with the count instead — the same honesty the twist cap uses.
-    if emitted > SWEEP_MAX_STATIONS {
+    let cap = if lane == SamplerLane::SingleCurve && switch!("BREP_HELIX_FULL_DENSITY", true) {
+        4097
+    } else { SWEEP_MAX_STATIONS };
+    if emitted > cap {
         return Err(KernelRefusal::unsupported(
             KernelStage::Collect,
             "station_cap",
@@ -3200,18 +3272,14 @@ pub fn fit_helix_curve(
 /// is FIT: points (R·cosθ, R·sinθ, pitch·θ/2π) in the axis frame are sampled
 /// uniformly in θ and globally interpolated with a cubic (`interpolate_curve`
 /// — the same machinery every other fitted path here uses).  DENSITY: 64
-/// samples per turn, capped at 1025 total nodes.  Cubic interpolation error
-/// on a circle of radius R with node spacing Δθ is ≈ R·Δθ⁴/384: ~2·10⁻⁷·R at
-/// 64/turn, and still ~6·10⁻⁵·R at the cap's worst case (16/turn at the
-/// 64-turn limit) — orders below any profile a caller could sweep without
-/// self-intersecting.  Uniform-in-θ parameters are exact chord-length for a
-/// helix (constant speed), which is what the averaged-knot interpolation
-/// assumes.
+/// intervals per turn, up to 4097 nodes at the supported 64-turn limit.
+/// Cubic interpolation error on a circle of radius R with node spacing Δθ
+/// is approximately R·Δθ⁴/384. Uniform-in-θ parameters are exact chord-length
+/// for a constant-radius helix.
 ///
-/// The fitted path then drives the EXISTING path-sweep core with 32 stations
-/// per turn (min 32, capped at 1024 — the loft's dense interpolation solve is
-/// O(stations³) per control column, so the cap trades per-turn density, never
-/// correctness, at high turn counts).
+/// The fitted path drives the path-sweep core at 64 intervals per turn,
+/// retaining that density through 64 turns. `BREP_HELIX_FULL_DENSITY=0`
+/// restores the old 1024-station cap, which reduced the density on long coils.
 ///
 /// GUARDS beyond the path sweep's own: the path sweep documents
 /// self-intersection as caller responsibility, so the helix variant — which
@@ -3366,7 +3434,13 @@ pub fn sweep_profile_helix(
     // swept/ball-thread-groove 2.6e-7 and 2.7e-7. The path fit (64 samples a
     // turn) is already ~2e-8 of R and is unchanged.
     let per_turn = if switch!("BREP_HELIX_DENSE_STATIONS", true) { 64.0 } else { 32.0 };
-    let stations = ((turns * per_turn).ceil() as usize).clamp(32, 1024);
+    let stations = if switch!("BREP_HELIX_FULL_DENSITY", true) {
+        // Keep 64 intervals per turn through the supported 64 turns. The
+        // old global cap silently dropped a forty-turn coil to 25.6/turn.
+        ((turns * per_turn).ceil() as usize + 1).clamp(32, 4097)
+    } else {
+        ((turns * per_turn).ceil() as usize).clamp(32, 1024)
+    };
     // The helix builder places the profile ON the fitted helix (the coil's
     // section is drawn once and carried round), which is `Transplant` by
     // construction — the radius comes from the helix argument, not the profile's
@@ -3385,4 +3459,5 @@ pub fn sweep_profile_helix(
     .map(|swept| swept.solid)
     .map_err(|error| error.with_message(|error| format!("sweep_profile_helix: {error}")))
 }
+
 

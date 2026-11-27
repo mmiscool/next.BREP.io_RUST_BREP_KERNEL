@@ -45,6 +45,18 @@ pub fn tip_splice_on() -> bool {
     crate::switch!("BREP_SWEEP_TRIM_TIP_SPLICE", true)
 }
 
+/// `BREP_SWEEP_SHORT_RETURNING_SPLIT` (default off, `=1` on): a ring
+/// envelope's double curve that runs out to a tip and back is split at its tip
+/// however short it is ([`Arrangement::split_returning_self_arcs`]). Otherwise
+/// only one longer than four tolerances is split, and a short one stays one
+/// arc that has no mate (an arc cannot mate itself): the tumbling torus turned
+/// the other way over 70..100 degrees leaves one such double curve, 0.014
+/// long, where it starts at the motion's first pose, and the trimmed sheets do
+/// not close.
+pub fn short_returning_split_on() -> bool {
+    crate::switch!("BREP_SWEEP_SHORT_RETURNING_SPLIT", false)
+}
+
 /// `BREP_SWEEP_TRIM_ONE_SIDED` (default on, `=0` gives the vertex up as before): the vertex solve's Jacobian
 /// read one-sided where a sheet ends within the difference step (a strip's
 /// zero line leaving its face at the vertex), where it gave the vertex up.
@@ -741,6 +753,53 @@ impl PoseGrid {
     }
 }
 
+/// Whether each polyline lies within `tolerance` of the other, read both
+/// ways. The gap to a polyline moves no faster than the point does, so each
+/// segment read at steps h (at most a quarter of the tolerance) with every
+/// gap within the tolerance less h/2 holds the whole segment within it.
+fn polylines_within(a: &[Vec3], b: &[Vec3], tolerance: f64) -> bool {
+    if !(tolerance > 0.0) {
+        return false;
+    }
+    let near = |from: &[Vec3], to: &[Vec3]| {
+        if from.len() == 1 {
+            return polyline_gap(to, from[0]) <= tolerance;
+        }
+        from.windows(2).all(|w| {
+            let length = w[1].sub(w[0]).length();
+            let steps = (4.0 * length / tolerance).ceil().clamp(1.0, 1e6) as usize;
+            let h = length / steps as f64;
+            (0..=steps).all(|k| polyline_gap(to, w[0].add(w[1].sub(w[0]).scale(k as f64 / steps as f64))) + 0.5 * h <= tolerance)
+        })
+    };
+    near(a, b) && near(b, a)
+}
+
+/// The distance from `x` to the polyline through `points`.
+fn polyline_gap(points: &[Vec3], x: Vec3) -> f64 {
+    if points.len() == 1 {
+        return x.sub(points[0]).length();
+    }
+    points.windows(2).fold(f64::INFINITY, |best, w| {
+        let d = w[1].sub(w[0]);
+        let len2 = d.dot(d);
+        let s = if len2 > 0.0 { (x.sub(w[0]).dot(d) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        best.min(x.sub(w[0].add(d.scale(s))).length())
+    })
+}
+
+/// `BREP_SWEEP_TRIM_EDGE_FLOOR` (default off: with it on, the crossed
+/// forward tumble's refined edges leave its tessellation two edges unmatched;
+/// held until that is understood): the trim engine refines each
+/// edge's stations toward its trims meeting it on their faces' surfaces
+/// within half the pcurve refinement tolerance, so a boolean the solid enters
+/// has fewer trims to refit. Best effort, not a bound: an edge whose doubling
+/// stops reading better (or reaches 1536 stations) keeps its best reading,
+/// which may be above that, and a boolean refits it as before.
+pub fn trim_edge_floor_on() -> bool {
+    crate::switch!("BREP_SWEEP_TRIM_EDGE_FLOOR", false)
+}
+
 /// Whether the trim grid reads a node's sign alone where its own point is
 /// outside its pose, its full value only where a crossing needs it (default
 /// on, `=0` reads every value; the same contour).
@@ -1153,9 +1212,18 @@ impl<'a> ConvexSweep<'a> {
         let (_, reach) = Depth::centre_and_reach(torus);
         let sweep = ConvexSweep { tool: Tool::Ring(torus), motion, grid, size: reach, seam, warp: None, collars: Vec::new() };
         const ROUND: usize = 64;
-        // (Under the collar switch a circle grazed all round is the collar's.)
-        for &t in grid.times.iter().filter(|_| !ring::ring_collar_on()) {
-            if (0..ROUND).any(|k| sweep.ring_branches(t, std::f64::consts::TAU * k as f64 / ROUND as f64).is_none()) {
+        // Under the collar switch a circle grazed all round at an isolated
+        // point is the collar's (a pose may land on one by chance, at one or
+        // two of the stations); more of a pose's circles grazed all round is
+        // not two branches (a motion standing still grazes every circle).
+        // An isolated point lands on a station at one pose at most: a station
+        // grazed all round at two poses is a circle that keeps grazing, no
+        // collar's.
+        let allowed = if ring::ring_collar_on() { 2 } else { 0 };
+        let mut grazed_before = vec![false; ROUND];
+        for &t in &grid.times {
+            let grazed: Vec<usize> = (0..ROUND).filter(|&k| sweep.ring_branches(t, std::f64::consts::TAU * k as f64 / ROUND as f64).is_none()).collect();
+            if grazed.len() > allowed || grazed.iter().any(|&k| std::mem::replace(&mut grazed_before[k], true)) {
                 return Err(refuse("trim_ring_branches", "the ring's grazing loop is not two branches all through the motion".into()));
             }
         }
@@ -2957,41 +3025,87 @@ impl<'a> ConvexSweep<'a> {
             if !(total > 1e-9 * self.size) {
                 return Err(refuse("trim_edge", "an edge has no length".into()));
             }
-            let stations = ((total / (0.01 * self.size)).ceil() as usize).clamp(8, 96);
+            let first_stations = ((total / (0.01 * self.size)).ceil() as usize).clamp(8, 96);
             let own_side = side_of(&arc.params);
             let mate_side = side_of(&mate.params);
             let local_arc = matches!(arc.border, Border::Sheet(_)) && self.local_raw(arc.sheet, arc.params[arc.params.len() / 2]).is_some_and(|l| l.abs() < 1e-6);
-            let mut world = Vec::with_capacity(stations + 1);
-            let mut own_uv = Vec::with_capacity(stations + 1);
-            let mut mate_uv = Vec::with_capacity(stations + 1);
-            let mut params = Vec::with_capacity(stations + 1);
             let chart_a = charts[loop_of[a]].as_ref().ok_or_else(|| refuse("trim_edge", "an arc's face has no surface".into()))?;
             let chart_b = charts[loop_of[b]].as_ref().ok_or_else(|| refuse("trim_edge", "an arc's face has no surface".into()))?;
-            for i in 0..=stations {
-                let target = total * i as f64 / stations as f64;
-                let w = lengths.partition_point(|&l| l < target).clamp(1, last);
-                let f = if lengths[w] > lengths[w - 1] { (target - lengths[w - 1]) / (lengths[w] - lengths[w - 1]) } else { 0.0 };
-                let lerp = |x: [f64; 2], y: [f64; 2]| [x[0] + (y[0] - x[0]) * f, x[1] + (y[1] - x[1]) * f];
-                let (x, p, q) = if i == 0 {
-                    pts[0]
-                } else if i == stations {
-                    pts[last]
-                } else {
-                    let (p, q) = (lerp(pts[w - 1].1, pts[w].1), lerp(pts[w - 1].2, pts[w].2));
-                    let (xr, pr, qr, gap) = self.refine_point(arc.sheet, mate.sheet, p, q, own_side, mate_side, local_arc).ok_or_else(|| refuse("trim_edge", "an edge station left its sheets".into()))?;
-                    worst_gap = worst_gap.max(gap);
-                    (xr, pr, qr)
+            let build_at = |stations: usize| -> Result<(NurbsCurve, NurbsCurve, NurbsCurve, f64), KernelRefusal> {
+                let mut gap_seen = 0.0f64;
+                let mut world = Vec::with_capacity(stations + 1);
+                let mut own_uv = Vec::with_capacity(stations + 1);
+                let mut mate_uv = Vec::with_capacity(stations + 1);
+                let mut params = Vec::with_capacity(stations + 1);
+                for i in 0..=stations {
+                    let target = total * i as f64 / stations as f64;
+                    let w = lengths.partition_point(|&l| l < target).clamp(1, last);
+                    let f = if lengths[w] > lengths[w - 1] { (target - lengths[w - 1]) / (lengths[w] - lengths[w - 1]) } else { 0.0 };
+                    let lerp = |x: [f64; 2], y: [f64; 2]| [x[0] + (y[0] - x[0]) * f, x[1] + (y[1] - x[1]) * f];
+                    let (x, p, q) = if i == 0 {
+                        pts[0]
+                    } else if i == stations {
+                        pts[last]
+                    } else {
+                        let (p, q) = (lerp(pts[w - 1].1, pts[w].1), lerp(pts[w - 1].2, pts[w].2));
+                        let (xr, pr, qr, gap) = self.refine_point(arc.sheet, mate.sheet, p, q, own_side, mate_side, local_arc).ok_or_else(|| refuse("trim_edge", "an edge station left its sheets".into()))?;
+                        gap_seen = gap_seen.max(gap);
+                        (xr, pr, qr)
+                    };
+                    world.push(x);
+                    let ua = self.surface_uv(arc.sheet, chart_a, p);
+                    let ub = self.surface_uv(mate.sheet, chart_b, q);
+                    own_uv.push(Vec3::new(ua[0], ua[1], 0.0));
+                    mate_uv.push(Vec3::new(ub[0], ub[1], 0.0));
+                    params.push(i as f64 / stations as f64);
+                }
+                let curve = frag(crate::interpolate_curve(&world, 5, &params), "trim_edge_curve")?;
+                let pa = frag(crate::interpolate_curve(&own_uv, 5, &params), "trim_pcurve")?;
+                let pb = frag(crate::interpolate_curve(&mate_uv, 5, &params), "trim_pcurve")?;
+                Ok((curve, pa, pb, gap_seen))
+            };
+            let (mut curve, mut pa, mut pb, mut gap) = build_at(first_stations)?;
+            // `BREP_SWEEP_TRIM_EDGE_FLOOR`: the stations doubled toward each
+            // trim, read on its face's surface, meeting the edge within half
+            // the pcurve refinement tolerance at four points inside every
+            // interval (a trim further off is refitted by every boolean the
+            // solid enters, a global projection onto its whole carrier).
+            // Best effort: what cannot get there keeps its best reading.
+            if trim_edge_floor_on() {
+                let target = 0.5 * crate::PCURVE_REFINEMENT_TOLERANCE;
+                let miss = |curve: &NurbsCurve, pa: &NurbsCurve, pb: &NurbsCurve, stations: usize| -> Result<f64, KernelRefusal> {
+                    (0..stations * 4).map(|k| (k as f64 + 0.5) / (stations * 4) as f64).try_fold(0.0f64, |worst, s| -> Result<f64, KernelRefusal> {
+                        let c = frag(curve.evaluate(s), "trim_edge_curve")?;
+                        let ua = frag(pa.evaluate(s), "trim_pcurve")?;
+                        let ub = frag(pb.evaluate(s), "trim_pcurve")?;
+                        let xa = frag(chart_a.surface.evaluate(ua.x, ua.y), "trim_surface")?;
+                        let xb = frag(chart_b.surface.evaluate(ub.x, ub.y), "trim_surface")?;
+                        Ok(worst.max(xa.sub(c).length()).max(xb.sub(c).length()))
+                    })
                 };
-                world.push(x);
-                let ua = self.surface_uv(arc.sheet, chart_a, p);
-                let ub = self.surface_uv(mate.sheet, chart_b, q);
-                own_uv.push(Vec3::new(ua[0], ua[1], 0.0));
-                mate_uv.push(Vec3::new(ub[0], ub[1], 0.0));
-                params.push(i as f64 / stations as f64);
+                // The best edge read so far is kept: a doubling that reads no
+                // better (a station near an end can find the double curve's
+                // other preimage) ends the refinement, the edge as it was.
+                // Strictly no worse than the fixed stations: a reading that
+                // fails, or a refined edge whose stations' sheets meet less
+                // closely than the build admits, keeps the edge it had.
+                let mut stations = first_stations;
+                if let Ok(mut best) = miss(&curve, &pa, &pb, stations) {
+                    while best > target && stations < 1536 {
+                        let more = 2 * stations;
+                        let Ok((c2, a2, b2, g2)) = build_at(more) else { break };
+                        if !(g2 <= 1e-8 * self.size) {
+                            break;
+                        }
+                        let Ok(read) = miss(&c2, &a2, &b2, more) else { break };
+                        if !(read < best) {
+                            break;
+                        }
+                        (curve, pa, pb, gap, best, stations) = (c2, a2, b2, g2, read, more);
+                    }
+                }
             }
-            let curve = frag(crate::interpolate_curve(&world, 5, &params), "trim_edge_curve")?;
-            let pa = frag(crate::interpolate_curve(&own_uv, 5, &params), "trim_pcurve")?;
-            let pb = frag(crate::interpolate_curve(&mate_uv, 5, &params), "trim_pcurve")?;
+            worst_gap = worst_gap.max(gap);
             let k = id();
             edge_records.push(EdgeRecord { id: k, curve, t0: 0.0, t1: 1.0, start_vertex_id: vs, end_vertex_id: ve, degenerate: false, name: None });
             coedge_of[a] = Some((k, true, pa));
@@ -3474,6 +3588,116 @@ impl Arrangement {
         removed
     }
 
+    /// The rim between an envelope and a collar is found twice: exactly by
+    /// the collar's sides and by the envelope's grid only to its resolution.
+    /// Of the arcs that leaves unmated along a rim:
+    /// - an envelope arc bordering a collar whose ends are one vertex (within
+    ///   `tolerance`) is a sliver of the grid's rim and is contracted, its
+    ///   neighbours meeting at its middle;
+    /// - an envelope arc the grid labelled as crossing its own sheet, with
+    ///   the ends of an unmated collar side that borders that envelope, is
+    ///   that side's rim and is labelled as bordering the collar.
+    /// Returns how many arcs were contracted or relabelled.
+    fn repair_collar_rims(&mut self, unmated: &[usize], tolerance: f64) -> usize {
+        let mut changed = 0;
+        for &id in unmated {
+            let arc = &self.arcs[id];
+            if !matches!(arc.sheet, SheetId::Envelope(..)) || arc.points.len() < 2 {
+                continue;
+            }
+            let (a, b) = (arc.points[0], *arc.points.last().expect("points"));
+            match arc.border {
+                // A sliver: every point of it within the tolerance of its
+                // middle (not a long arc that happens to come back).
+                Border::Sheet(SheetId::Collar(_)) if a.sub(b).length() <= tolerance && {
+                    let middle = a.add(b).scale(0.5);
+                    arc.points.iter().all(|x| x.sub(middle).length() <= tolerance)
+                } =>
+                {
+                    changed += usize::from(self.contract_in_loop(id));
+                }
+                Border::Sheet(other) if other == arc.sheet => {
+                    let sheet = arc.sheet;
+                    let side = unmated.iter().copied().find(|&k| {
+                        let s = &self.arcs[k];
+                        matches!(s.sheet, SheetId::Collar(_))
+                            && s.border == Border::Sheet(sheet)
+                            && s.points.len() >= 2
+                            && (s.params.iter().all(|p| p[0].abs() <= 1e-6) || s.params.iter().all(|p| (p[0] - 1.0).abs() <= 1e-6))
+                            && {
+                                let (c, d) = (s.points[0], *s.points.last().expect("points"));
+                                (c.sub(a).length() <= tolerance && d.sub(b).length() <= tolerance) || (c.sub(b).length() <= tolerance && d.sub(a).length() <= tolerance)
+                            }
+                            // The same curve, not two meeting at their ends:
+                            // each one's points within the tolerance of the
+                            // other's polyline.
+                            && polylines_within(&arc.points, &s.points, tolerance)
+                    });
+                    if let Some(k) = side {
+                        self.arcs[id].border = Border::Sheet(self.arcs[k].sheet);
+                        changed += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
+    /// Contract arc `id` in its loop (its neighbours meet at its middle), as
+    /// the fold corners are; false where its loop is too short to lose it.
+    fn contract_in_loop(&mut self, id: usize) -> bool {
+        let Some(lp) = self.loops.iter_mut().find(|l| l.arcs.contains(&id)) else { return false };
+        let n = lp.arcs.len();
+        if n <= 2 {
+            return false;
+        }
+        let i = lp.arcs.iter().position(|&x| x == id).expect("in its loop");
+        let middle = self.arcs[id].points[0].add(*self.arcs[id].points.last().expect("points")).scale(0.5);
+        let (prev, next) = (lp.arcs[(i + n - 1) % n], lp.arcs[(i + 1) % n]);
+        *self.arcs[prev].points.last_mut().expect("points") = middle;
+        self.arcs[next].points[0] = middle;
+        lp.arcs.remove(i);
+        self.arcs[id].points.clear();
+        true
+    }
+
+    /// Unmated arcs on a collar that cross the collar itself and come back to
+    /// where they left (ends one point, shorter than `below`): a double
+    /// curve's tip where the collar's λ direction all but vanishes in the
+    /// world, a slit below the grid with no arc across to mate. Each is
+    /// contracted as the fold corners are (its neighbours meet at its
+    /// middle). Returns how many.
+    fn contract_unmated_collar_returns(&mut self, unmated: &[usize], below: f64) -> usize {
+        let returning = |arc: &ArcRecord| {
+            matches!(arc.sheet, SheetId::Collar(_))
+                && arc.border == Border::Sheet(arc.sheet)
+                && arc.points.len() >= 2
+                && arc.length() < below
+                && arc.points[0].sub(*arc.points.last().expect("points")).length() <= 1e-3 * below
+        };
+        let mut removed = 0;
+        for &id in unmated {
+            if !returning(&self.arcs[id]) {
+                continue;
+            }
+            let Some(lp) = self.loops.iter_mut().find(|l| l.arcs.contains(&id)) else { continue };
+            let n = lp.arcs.len();
+            if n <= 2 {
+                continue;
+            }
+            let i = lp.arcs.iter().position(|&a| a == id).expect("in its loop");
+            let middle = self.arcs[id].points[0].add(*self.arcs[id].points.last().expect("points")).scale(0.5);
+            let (prev, next) = (lp.arcs[(i + n - 1) % n], lp.arcs[(i + 1) % n]);
+            *self.arcs[prev].points.last_mut().expect("points") = middle;
+            self.arcs[next].points[0] = middle;
+            lp.arcs.remove(i);
+            self.arcs[id].points.clear();
+            removed += 1;
+        }
+        removed
+    }
+
     /// Unmated arcs the imprint left at the motion's very start or end, below
     /// the grid (every parameter within two time steps of an end, shorter
     /// than `below`): a partner sheet's arc there was never
@@ -3573,12 +3797,23 @@ impl Arrangement {
                 let arc = &self.arcs[id];
                 let own = matches!(arc.border, Border::Sheet(other) if other == arc.sheet) && matches!(arc.sheet, SheetId::Envelope(..));
                 let n = arc.points.len();
-                if !own || n < 3 || arc.points[0].sub(arc.points[n - 1]).length() > tolerance || arc.length() <= 4.0 * tolerance {
+                let shortest = if short_returning_split_on() { 0.0 } else { 4.0 * tolerance };
+                if !own || n < 3 || arc.points[0].sub(arc.points[n - 1]).length() > tolerance || arc.length() <= shortest {
                     i += 1;
                     continue;
                 }
                 let start = arc.points[0];
                 let tip = (1..n - 1).max_by(|&a, &b| arc.points[a].sub(start).length().total_cmp(&arc.points[b].sub(start).length())).expect("an inner sample");
+                // A short one (only under the switch) must turn back: its
+                // tip four times farther from its start than its ends are
+                // from each other (not a short arc that runs straight on),
+                // and its way out and its way back one curve within the
+                // tolerance (not a small loop round something).
+                let reach = arc.points[tip].sub(start).length();
+                if arc.length() <= 4.0 * tolerance && !(reach > 4.0 * start.sub(arc.points[n - 1]).length() && polylines_within(&arc.points[..=tip], &arc.points[tip..], tolerance)) {
+                    i += 1;
+                    continue;
+                }
                 let back = ArcRecord { sheet: arc.sheet, border: arc.border, points: arc.points[tip..].to_vec(), params: arc.params[tip..].to_vec() };
                 let new_id = self.arcs.len();
                 self.arcs.push(back);
@@ -3590,6 +3825,23 @@ impl Arrangement {
             }
         }
         splits
+    }
+
+    /// Whether end `which` (0 start, 1 end) of arc `b` is where a trim leaves
+    /// a collar's side: `b` runs along the side (its λ fraction 0 or 1
+    /// throughout, to 1e-6) and that end is off the tube angle's seam.
+    fn collar_rim_crossing(&self, b: usize, which: usize) -> bool {
+        let arc = &self.arcs[b];
+        if !matches!(arc.sheet, SheetId::Collar(_)) || arc.params.len() < 2 {
+            return false;
+        }
+        let side = |f: f64| if f.abs() <= 1e-6 { Some(0) } else if (f - 1.0).abs() <= 1e-6 { Some(1) } else { None };
+        let Some(which_side) = side(arc.params[0][0]) else { return false };
+        if arc.params.iter().any(|p| side(p[0]) != Some(which_side)) {
+            return false;
+        }
+        let v = if which == 0 { arc.params[0][1] } else { arc.params[arc.params.len() - 1][1] };
+        v > 1e-9 && v < 1.0 - 1e-9
     }
 
     /// Whether arc `b` borders arc `a` back (the pair a mate needs).
@@ -3614,6 +3866,15 @@ impl Arrangement {
         for _round in 0..8 {
             let mut changed = false;
             let n = self.arcs.len();
+            // With collars, the ends of each envelope's double curves with
+            // itself: where one meets another sheet's border it is a vertex of
+            // that border however near another, and is imprinted on it.
+            let collared = self.arcs.iter().any(|c| matches!(c.sheet, SheetId::Collar(_)) && !c.points.is_empty());
+            let self_ends: Vec<(SheetId, Vec3)> = if collared {
+                self.arcs.iter().filter(|c| matches!(c.sheet, SheetId::Envelope(..)) && c.border == Border::Sheet(c.sheet) && c.points.len() >= 2).flat_map(|c| [(c.sheet, c.points[0]), (c.sheet, *c.points.last().expect("points"))]).collect()
+            } else {
+                Vec::new()
+            };
             for a in 0..n {
                 if self.arcs[a].points.len() < 2 {
                     continue;
@@ -3625,8 +3886,15 @@ impl Arrangement {
                     if self.arcs[b].points.len() < 2 || !self.borders_back(a, b) {
                         continue;
                     }
-                    for end in [self.arcs[b].points[0], *self.arcs[b].points.last().expect("points")] {
-                        if end.sub(ends_a.0).length() <= tolerance || end.sub(ends_a.1).length() <= tolerance {
+                    for (which, end) in [(0usize, self.arcs[b].points[0]), (1, *self.arcs[b].points.last().expect("points"))] {
+                        // A collar side's end where a trim leaves it is an
+                        // exact point of the rim it shares with an envelope,
+                        // whose own grid finds the same crossing only to its
+                        // resolution: it is imprinted however near the arc's
+                        // own end, so long as it falls inside the arc.
+                        let rim = self.collar_rim_crossing(b, which) || self_ends.iter().any(|&(sheet, x)| sheet == self.arcs[b].sheet && x.sub(end).length() <= 0.05 * tolerance);
+                        let clear = if rim { 0.05 * tolerance } else { tolerance };
+                        if end.sub(ends_a.0).length() <= clear || end.sub(ends_a.1).length() <= clear {
                             continue;
                         }
                         let points = &self.arcs[a].points;
@@ -3634,7 +3902,11 @@ impl Arrangement {
                             let d = w[1].sub(w[0]);
                             let len2 = d.dot(d);
                             let s = if len2 > 0.0 { (end.sub(w[0]).dot(d) / len2).clamp(0.0, 1.0) } else { 0.0 };
-                            let gap = end.sub(w[0].add(d.scale(s))).length();
+                            let foot = w[0].add(d.scale(s));
+                            let gap = end.sub(foot).length();
+                            if rim && (foot.sub(ends_a.0).length() <= clear || foot.sub(ends_a.1).length() <= clear) {
+                                continue;
+                            }
                             if gap <= tolerance && best.map_or(true, |x| gap < x.0) {
                                 best = Some((gap, k, end, s));
                             }
@@ -3685,6 +3957,12 @@ impl Arrangement {
         self.split_returning_self_arcs(tolerance);
         let imprinted = self.imprint(tolerance);
         let mut mating = self.mate(tolerance);
+        if !mating.unmated.is_empty() && self.contract_unmated_collar_returns(&mating.unmated, below) > 0 {
+            mating = self.mate(tolerance);
+        }
+        if !mating.unmated.is_empty() && self.repair_collar_rims(&mating.unmated, tolerance) > 0 {
+            mating = self.mate(tolerance);
+        }
         if !mating.unmated.is_empty() && end_slivers_on() {
             let dropped = self.contract_unmated_end_slivers(&mating.unmated, below);
             if dropped > 0 {

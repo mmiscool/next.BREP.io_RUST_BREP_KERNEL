@@ -11,7 +11,7 @@ impl EngineState {
     /// [`set_sketch_overlay`](Self::set_sketch_overlay) push).
     pub(super) fn refresh_sketch_overlay(&mut self) {
         let world_per_pixel = self.camera.world_per_pixel();
-        let (json, preview, leaders, glyphs) = match self.sketch_edit.as_ref() {
+        let (json, preview, leaders, glyphs, arrows) = match self.sketch_edit.as_ref() {
             Some(edit) => (
                 edit.session.overlay_json_with_state(world_per_pixel),
                 edit.session.preview_overlay_json(
@@ -23,6 +23,7 @@ impl EngineState {
                 edit.session.dim_leaders_overlay_json_with_state(world_per_pixel),
                 edit.session
                     .constraint_glyphs_overlay_json_with_state(world_per_pixel),
+                edit.session.freedom_arrows_overlay_json(world_per_pixel),
             ),
             None => return,
         };
@@ -35,6 +36,8 @@ impl EngineState {
         let _ = self.set_overlay_json(&leaders);
         // The geometric-constraint glyphs ride in `sketch-constraint-glyphs` (S6c).
         let _ = self.set_overlay_json(&glyphs);
+        // The hovered entity's free directions ride in `sketch-dof-arrows`.
+        let _ = self.set_overlay_json(&arrows);
         // Remember the zoom these groups were baked at: their construction dashes,
         // dimension arrowheads and constraint glyphs are all screen-constant, so
         // `ensure_sketch_overlay_current` re-bakes them when it moves.
@@ -210,7 +213,7 @@ impl EngineState {
             }
         });
         let Some(points) = points else {
-            return false;
+            return self.sketch_glyph_drag_begin(u, v);
         };
         if let Some(edit) = self.sketch_edit.as_mut() {
             // Snapshot ONCE at the gesture start so the whole drag is one undo step
@@ -220,7 +223,7 @@ impl EngineState {
             let infer_on_drop = edit.session.selection.hovered.as_ref()
                 .and_then(|entity| entity.get("kind"))
                 .and_then(serde_json::Value::as_str) != Some("geometry");
-            edit.drag = Some(SketchDrag { points, anchor: (u, v), infer_on_drop });
+            edit.drag = Some(SketchDrag { points, anchor: (u, v), infer_on_drop, glyph: None });
         }
         true
     }
@@ -244,6 +247,21 @@ impl EngineState {
             return;
         };
         let (du, dv) = (u - drag.anchor.0, v - drag.anchor.1);
+        if let Some((cid, shift)) = &drag.glyph {
+            use crate::sketch::constraint_glyphs::{glyph_shift_entry, GlyphShift};
+            let moved = match *shift {
+                GlyphShift::Normal { normal, n } => {
+                    GlyphShift::Normal { normal, n: n + du * normal[0] + dv * normal[1] }
+                }
+                GlyphShift::Free { offset } => GlyphShift::Free { offset: [offset[0] + du, offset[1] + dv] },
+            };
+            edit.session
+                .dim_offsets
+                .insert(crate::sketch::doc::id_key(cid), glyph_shift_entry(moved));
+            self.refresh_sketch_overlay();
+            self.dirty = true;
+            return;
+        }
         let session = &mut edit.session;
         let before = session.doc.clone();
         for (id, ox, oy, _) in &drag.points {
@@ -253,7 +271,7 @@ impl EngineState {
                 p.fixed = true;
             }
         }
-        match session.resolve() {
+        match session.resolve_drag() {
             Ok(()) => {
                 for (id, _, _, orig_fixed) in &drag.points {
                     if let Some(p) = session.doc.point_mut(id) {
@@ -293,6 +311,21 @@ impl EngineState {
             .map_or(false, |edit| edit.drag.is_some());
         if !had_grab {
             return;
+        }
+        // A glyph drag moved only its stand-off: no solve, no inference. Discard the
+        // snapshot of a grab that moved nothing.
+        if let Some(edit) = self.sketch_edit.as_mut() {
+            if edit.drag.as_ref().map_or(false, |d| d.glyph.is_some()) {
+                edit.drag = None;
+                if edit.undo_stack.last().map_or(false, |snap| {
+                    snap.doc == edit.session.doc && snap.dim_offsets == edit.session.dim_offsets
+                }) {
+                    edit.undo_stack.pop();
+                }
+                self.refresh_sketch_overlay();
+                self.dirty = true;
+                return;
+            }
         }
         // Drop radius for constraint inference == the point grab radius (12 px in
         // world units) — read before the `&mut` borrow of `sketch_edit`.
@@ -334,6 +367,141 @@ impl EngineState {
         }
         self.refresh_sketch_overlay();
         self.dirty = true;
+    }
+
+    /// Begin a constraint GLYPH drag when the hovered entity is a geometric
+    /// constraint's glyph: the press at plane `(u, v)` grabs the glyph's stand-off,
+    /// which [`sketch_drag_to`](Self::sketch_drag_to) moves with the cursor (along the
+    /// line normal for a line glyph) and stores per constraint in `dimOffsets`, so it
+    /// saves and undoes with the sketch. Returns whether a glyph was grabbed.
+    fn sketch_glyph_drag_begin(&mut self, u: f64, v: f64) -> bool {
+        let wpp = self.camera.world_per_pixel();
+        let Some(edit) = self.sketch_edit.as_mut() else {
+            return false;
+        };
+        let Some(hovered) = edit.session.selection.hovered.clone() else {
+            return false;
+        };
+        if hovered.get("kind").and_then(serde_json::Value::as_str) != Some("constraint") {
+            return false;
+        }
+        let Some(cid) = hovered.get("id").cloned() else {
+            return false;
+        };
+        let key = crate::sketch::doc::id_key(&cid);
+        let shift = edit
+            .session
+            .doc
+            .constraints
+            .iter()
+            .find(|c| c.raw.get("id").map(crate::sketch::doc::id_key).as_deref() == Some(key.as_str()))
+            .and_then(|c| {
+                crate::sketch::constraint_glyphs::constraint_glyph_shift(
+                    c,
+                    &edit.session.doc,
+                    &edit.session.dim_offsets,
+                    wpp,
+                )
+            });
+        let Some(shift) = shift else {
+            return false;
+        };
+        edit.record_undo();
+        edit.drag = Some(SketchDrag {
+            points: Vec::new(),
+            anchor: (u, v),
+            infer_on_drop: false,
+            glyph: Some((cid, shift)),
+        });
+        true
+    }
+
+    /// The hovered point's or geometry's remaining freedoms, for the hover readout
+    /// (`"2 DOF free"`, `"Fully constrained"`), or `None` when nothing such is
+    /// hovered.
+    pub fn sketch_hover_freedom_label(&self) -> Option<String> {
+        let edit = self.sketch_edit.as_ref()?;
+        let hovered = edit.session.selection.hovered.as_ref()?;
+        crate::sketch::freedom::freedom_label(&edit.session.doc, &edit.session.diagnostics, hovered)
+    }
+
+    /// The geometric-constraint glyphs as drawn, for the verifier: per glyph its
+    /// constraint id, its centre in CSS pixels, its size (box diagonal) in pixels,
+    /// and its saved stand-off (`dimOffsets` entry, `null` when at its default place).
+    /// `[]` outside sketch mode.
+    pub fn sketch_glyphs_json(&self) -> String {
+        let Some(edit) = self.sketch_edit.as_ref() else {
+            return "[]".to_string();
+        };
+        let wpp = self.camera.world_per_pixel();
+        let session = &edit.session;
+        let glyphs: Vec<serde_json::Value> = crate::sketch::constraint_glyphs::glyph_layout_segments(
+            &session.doc,
+            &session.dim_offsets,
+            wpp,
+        )
+        .into_iter()
+        .filter_map(|(index, segments)| {
+            let c = &session.doc.constraints[index];
+            let id = c.raw.get("id")?.clone();
+            let mut lo = [f64::INFINITY; 2];
+            let mut hi = [f64::NEG_INFINITY; 2];
+            for (a, b) in &segments {
+                for p in [a, b] {
+                    let w = session.plane.to_world(p[0], p[1]);
+                    let (x, y, _) = self.camera.project(w);
+                    lo = [lo[0].min(x), lo[1].min(y)];
+                    hi = [hi[0].max(x), hi[1].max(y)];
+                }
+            }
+            let key = crate::sketch::doc::id_key(&id);
+            Some(serde_json::json!({
+                "id": id,
+                "type": c.ctype(),
+                "center": [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0],
+                "sizePx": (hi[0] - lo[0]).hypot(hi[1] - lo[1]),
+                "offset": session.dim_offsets.get(&key).cloned(),
+            }))
+        })
+        .collect();
+        serde_json::Value::Array(glyphs).to_string()
+    }
+
+    /// [`sketch_reset_glyph_offset`](Self::sketch_reset_glyph_offset) for the
+    /// constraint glyph under CSS-pixel `(x, y)`, if any.
+    pub fn sketch_reset_glyph_offset_at(&mut self, x: f64, y: f64) -> bool {
+        let hit = self.sketch_entity_at(x, y);
+        match hit {
+            Some(entity) if entity.get("kind").and_then(serde_json::Value::as_str) == Some("constraint") => {
+                let id = entity.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                self.sketch_reset_glyph_offset(&id)
+            }
+            _ => false,
+        }
+    }
+
+    /// Put a constraint's glyph back at its default place (double-click on the glyph):
+    /// drop its saved stand-off. One undo step; returns whether anything changed.
+    pub fn sketch_reset_glyph_offset(&mut self, constraint_id: &serde_json::Value) -> bool {
+        let key = crate::sketch::doc::id_key(constraint_id);
+        let Some(edit) = self.sketch_edit.as_mut() else {
+            return false;
+        };
+        let is_glyph = edit
+            .session
+            .doc
+            .constraints
+            .iter()
+            .find(|c| c.raw.get("id").map(crate::sketch::doc::id_key).as_deref() == Some(key.as_str()))
+            .map_or(false, |c| !matches!(c.ctype(), Some("⟺") | Some("↥") | Some("∠")) && !c.temporary());
+        if !is_glyph || !edit.session.dim_offsets.contains_key(&key) {
+            return false;
+        }
+        edit.record_undo();
+        edit.session.dim_offsets.remove(&key);
+        self.refresh_sketch_overlay();
+        self.dirty = true;
+        true
     }
 
     /// The number of selected sketch entities (0 when not in sketch mode) — the mode
@@ -467,6 +635,12 @@ impl EngineState {
         // snapshot (and pops it on a no-op), so short-circuit before the draw path.
         if tool == "trim" {
             self.sketch_trim_uv(u, v);
+            return;
+        }
+        // Fillet and chamfer act on the corner under the cursor at once, owning
+        // their undo snapshot like trim.
+        if tool == "fillet" || tool == "chamfer" {
+            self.sketch_corner_uv(u, v, tool == "fillet");
             return;
         }
         // pickEdges is NOT a uv-placement tool — it acts on a 3D scene edge (routed via
@@ -1005,9 +1179,10 @@ impl EngineState {
 //   2. Drop every geometry that is SELECTED *or* references any selected point (the
 //      remove-point cascade — deleting a vertex kills geometry that used it).
 //   3. Drop the selected points.
-//   4. Orphan cleanup: drop any remaining point NOT referenced by any surviving
-//      geometry (a shared vertex — still referenced — stays; a deleted line's now
-//      unshared endpoints vanish). Always on for this slice.
+//   4. Orphan cleanup: drop any point a dropped geometry used that NO surviving
+//      geometry references (a shared vertex — still referenced — stays; a deleted
+//      line's now unshared endpoints vanish). Points no geometry used before the
+//      delete (a fillet's construction virtual sharp) are never orphaned by it.
 //   5. Drop any constraint that is SELECTED *or* references a removed point (selected ∪
 //      orphaned) — done LAST, over the full removed-point set, so no constraint dangles
 //      either. A selected constraint drops ONLY itself; the geometry/points it
@@ -1074,19 +1249,28 @@ impl EngineState {
         }
 
         // 2. Drop geometries that are selected OR reference any selected point (so a
-        //    deleted vertex never leaves a geometry dangling).
+        //    deleted vertex never leaves a geometry dangling). Remember every point a
+        //    dropped geometry used: only those can be orphaned by this delete.
+        let mut released: HashSet<String> = HashSet::new();
         doc.geometries.retain(|g| {
-            if sel_geo.contains(&id_key(&g.id)) {
-                return false;
+            let keep = !sel_geo.contains(&id_key(&g.id)) && !g.points.iter().any(|pid| sel_pt.contains(&id_key(pid)));
+            if !keep {
+                released.extend(g.points.iter().map(id_key));
             }
-            !g.points.iter().any(|pid| sel_pt.contains(&id_key(pid)))
+            keep
         });
 
         // 3. Drop the explicitly-selected points.
         doc.points.retain(|p| !sel_pt.contains(&id_key(&p.id)));
 
-        // 4. Orphan cleanup: drop points no longer referenced by any surviving
-        //    geometry. Accumulate every removed point id (selected ∪ orphaned).
+        // 4. Orphan cleanup: drop points a dropped geometry used that no surviving
+        //    geometry references. A point no geometry used before the delete is
+        //    left alone: a fillet's or chamfer's virtual sharp (the construction
+        //    corner its trimmed lines and the width/height dimensions still hang
+        //    on) is held only by constraints, and deleting an unrelated
+        //    constraint must not take it, and every constraint on it, along.
+        //    Accumulate every removed point
+        //    id (selected ∪ orphaned).
         let referenced: HashSet<String> = doc
             .geometries
             .iter()
@@ -1095,7 +1279,7 @@ impl EngineState {
         let mut removed_pts = sel_pt;
         doc.points.retain(|p| {
             let key = id_key(&p.id);
-            if referenced.contains(&key) || key == origin_key {
+            if referenced.contains(&key) || key == origin_key || !released.contains(&key) {
                 true
             } else {
                 removed_pts.insert(key);

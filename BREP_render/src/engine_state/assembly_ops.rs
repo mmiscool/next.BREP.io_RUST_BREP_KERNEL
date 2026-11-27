@@ -900,6 +900,17 @@ impl EngineState {
     /// A component's member SOLID scene names (empty for an unknown id) — the
     /// selection/hover unit COMPONENT entries resolve to.
     pub fn component_member_solids(&self, component_id: &str) -> Vec<String> {
+        // A Pattern Component's id stands for its whole group (seeds and
+        // instances), as a pattern-of-a-pattern seed or a sidebar selection.
+        if brep_kernel::is_pattern_component_id(component_id) {
+            let group = self.pattern_group(component_id);
+            return self
+                .assembly_components
+                .iter()
+                .filter(|record| group.contains(&record.id))
+                .flat_map(|record| record.solids.iter().cloned())
+                .collect();
+        }
         self.assembly_components
             .iter()
             .filter(|record| record.id == component_id)

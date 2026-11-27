@@ -76,6 +76,8 @@ pub mod info;
 pub mod info_windows;
 pub mod auto_constraints;
 pub mod interference;
+/// The Draft Analysis window (Modeling > Blend > Draft Analysis).
+pub mod draft_analysis;
 pub mod kicad_import;
 // Native only: the `--kicad-library` window and the bulk sweep it runs. Both
 // are `#![cfg(not(target_arch = "wasm32"))]` inside, so the wasm build compiles

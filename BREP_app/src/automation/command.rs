@@ -221,6 +221,7 @@ pub fn registry() -> Vec<&'static CommandSpec> {
         cmd_scene::COMMANDS,
         cmd_camera::COMMANDS,
         cmd_settings::COMMANDS,
+        cmd_sketch::COMMANDS,
         cmd_shell::COMMANDS,
         cmd_plugins::COMMANDS,
         cmd_metadata::COMMANDS,

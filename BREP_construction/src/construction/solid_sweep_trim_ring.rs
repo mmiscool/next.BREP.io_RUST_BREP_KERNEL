@@ -61,7 +61,11 @@ impl<'a> ConvexSweep<'a> {
     /// all round.
     #[doc(hidden)]
     pub fn ring_branches(&self, t: f64, psi: f64) -> Option<(f64, f64)> {
-        let (a, b, c) = self.ring_harmonic(t, psi);
+        Self::branches_of(self.ring_harmonic(t, psi))
+    }
+
+    /// [`ConvexSweep::ring_branches`] from the harmonic (a, b, c) read there.
+    fn branches_of((a, b, c): (f64, f64, f64)) -> Option<(f64, f64)> {
         let r = a.hypot(b);
         if !(c.abs() < r) {
             return None;
@@ -84,6 +88,44 @@ impl<'a> ConvexSweep<'a> {
     /// half 1 the rest.
     fn half_psi(&self, half: u8, u: f64) -> f64 {
         self.seam + PI * (f64::from(half) + u)
+    }
+
+    /// The world point a ring envelope's carrier is fitted through. That is
+    /// the envelope itself, except deep inside a collar's disc: there no face
+    /// lies, and the branch turns through every tube angle about the root
+    /// (no continuous branch fills the disc). There it is blended, smoothly
+    /// in (t, ψ), into the ring's core point: true from 0.99 of the disc's radius
+    /// out, all core within a twentieth of it (a wide blend keeps the
+    /// carriers small).
+    pub(super) fn ring_fit_world(&self, sheet: SheetId, p: [f64; 2]) -> Option<Vec3> {
+        if let SheetId::Envelope(branch, half) = sheet {
+            let q = self.warp.as_ref().map_or(p, |w| w.chart(half, p));
+            let (t, psi) = (self.t_of(q[1]), self.half_psi(half, q[0]));
+            for c in &self.collars {
+                let dpsi = (psi - c.psi + PI).rem_euclid(TAU) - PI;
+                if !((t - c.t).abs() <= c.reach[0] && dpsi.abs() <= c.reach[1]) {
+                    continue;
+                }
+                // The harmonic read once, for the disc's measure and the
+                // envelope's point both (as `ring_point_whole` reads it).
+                let harmonic = self.ring_harmonic(t, psi);
+                let (a, b) = (harmonic.0, harmonic.1);
+                let x = (a.hypot(b) / c.radius - 0.05) / 0.94;
+                if x >= 1.0 {
+                    continue;
+                }
+                let e = |y: f64| if y > 0.0 { (-1.0 / y).exp() } else { 0.0 };
+                let weight = e(x) / (e(x) + e(1.0 - x));
+                let core = self.motion.pose(t).apply(self.ring_at(psi, 0.0).add(self.ring_at(psi, PI)).scale(0.5));
+                if weight <= 0.0 {
+                    return Some(core);
+                }
+                let (lower, upper) = Self::branches_of(harmonic)?;
+                let truth = self.grazing_point(t, psi, if branch == 0 { lower } else { upper }).world;
+                return Some(core.add(truth.sub(core).scale(weight)));
+            }
+        }
+        self.ring_point_whole(sheet, p).map(|q| q.world)
     }
 
     /// A ring sheet's point (None where its branches are not defined, and on
@@ -193,13 +235,17 @@ impl<'a> ConvexSweep<'a> {
         let step = solve(collar.jacobian, target)?;
         let (mut t, mut psi) = (collar.t + step[0], collar.psi + step[1]);
         let scale = collar.radius.max(1e-300);
+        // Newton's first step on the Jacobian there, then that Jacobian kept
+        // (the disc is small, the steps after the first tiny): the same
+        // residual reached for a fifth of the readings.
+        let mut kept: Option<[[f64; 2]; 2]> = None;
         for _ in 0..40 {
             let f = self.harmonic_ab(t, psi);
             let r = [f[0] - target[0], f[1] - target[1]];
             if r[0].hypot(r[1]) <= 1e-14 * scale {
                 return Some((t, psi));
             }
-            let m = self.harmonic_jacobian(t, psi);
+            let m = *kept.get_or_insert_with(|| self.harmonic_jacobian(t, psi));
             let d = solve(m, r)?;
             t -= d[0];
             psi -= d[1];
@@ -461,7 +507,7 @@ impl<'a> ConvexSweep<'a> {
     fn ring_envelope_adaptive(&self, sheet: SheetId, lo: f64, hi: f64, span: (f64, f64)) -> Result<SheetSurface, KernelRefusal> {
         const CAP: usize = 1024;
         let exact = |u: f64, tau: f64| -> Result<Vec3, KernelRefusal> {
-            self.ring_point_whole(sheet, [u, tau]).map(|q| q.world).ok_or_else(|| refuse("trim_ring_rows", "a ring envelope's rows are undefined in its span".into()))
+            self.ring_fit_world(sheet, [u, tau]).ok_or_else(|| refuse("trim_ring_rows", "a ring envelope's rows are undefined in its span".into()))
         };
         let mut us: Vec<f64> = (0..=32).map(|i| span.0 + (span.1 - span.0) * i as f64 / 32.0).collect();
         let mut taus: Vec<f64> = (0..=16).map(|k| lo + (hi - lo) * k as f64 / 16.0).collect();
@@ -534,7 +580,7 @@ impl<'a> ConvexSweep<'a> {
                     let us: Vec<f64> = (0..=nu).map(|i| span.0 + (span.1 - span.0) * i as f64 / nu as f64).collect();
                     let taus: Vec<f64> = (0..=nt).map(|k| lo + (hi - lo) * k as f64 / nt as f64).collect();
                     let exact = |u: f64, tau: f64| -> Result<Vec3, KernelRefusal> {
-                        self.ring_point_whole(sheet, [u, tau]).map(|q| q.world).ok_or_else(|| refuse("trim_ring_rows", "a ring envelope's rows are undefined in its span".into()))
+                        self.ring_fit_world(sheet, [u, tau]).ok_or_else(|| refuse("trim_ring_rows", "a ring envelope's rows are undefined in its span".into()))
                     };
                     let mut rows: Vec<Vec<Vec3>> = Vec::with_capacity(taus.len());
                     let mut knots_u = Vec::new();
@@ -598,6 +644,14 @@ impl<'a> ConvexSweep<'a> {
                 let (v_low, v_high) = (low - margin, high + margin);
                 let theta_v = v_high - v_low;
                 if theta_v >= TAU {
+                    // Past a collar's root the grazing branch can turn by more
+                    // than the band leaves of the tube over a half: no patch
+                    // of the ring holds the band, but it is smooth in its own
+                    // chart, where its carrier is fitted as an envelope's is
+                    // (a sweep without collars too, under its switch).
+                    if !self.collars.is_empty() || ring_band_fit_on() {
+                        return self.ring_envelope_adaptive(sheet, -0.02, 1.02, (0.0, 1.0));
+                    }
                     return Err(refuse("trim_ring_band", "a ring band wraps all the way round its tube".into()));
                 }
                 let torus = self.ring();
@@ -669,9 +723,10 @@ impl Stretch {
             if f > 0.0 { hi = x } else { lo = x }
             let slope = 1.0 + self.gain / (1.0 + ((x - self.centre) / self.width).powi(2));
             let next = x - f / slope;
-            // A Newton step inside the bracket, else its middle; a step that
-            // does not move has converged.
-            let next = if next >= lo && next <= hi { next } else { 0.5 * (lo + hi) };
+            // A Newton step strictly inside the bracket, else its middle (a
+            // step onto the bracket's end can swing between its ends without
+            // closing it); a step that does not move has converged.
+            let next = if next > lo && next < hi { next } else { 0.5 * (lo + hi) };
             if next == x {
                 break;
             }
@@ -715,12 +770,21 @@ pub struct RingCollar {
     reach: [f64; 2],
 }
 
-/// `BREP_SWEEP_RING_COLLAR` (default off): a ring whose whole tube circle
-/// grazes at some point of the motion (its grazing harmonic's a = b = 0, where
-/// the branches' names turn) is swept with a collar there ([`RingCollar`],
-/// `SheetId::Collar`) instead of declined by [`RING_BRANCH_MARGIN`].
+/// `BREP_SWEEP_RING_COLLAR` (default on; `=0` restores the decline): a ring
+/// whose whole tube circle grazes at some point of the motion (its grazing
+/// harmonic's a = b = 0, where the branches' names turn) is swept with a
+/// collar there ([`RingCollar`], `SheetId::Collar`) instead of declined by
+/// [`RING_BRANCH_MARGIN`]. A motion with no such point is still declined by
+/// the margin where its branches all but meet.
 pub fn ring_collar_on() -> bool {
-    crate::switch!("BREP_SWEEP_RING_COLLAR", false)
+    crate::switch!("BREP_SWEEP_RING_COLLAR", true)
+}
+
+/// `BREP_SWEEP_RING_BAND_FIT` (default off): an end band whose grazing
+/// branch turns so far over a half that the band wraps past the whole tube
+/// is fitted in its own chart instead of refused (with collars it always is).
+pub fn ring_band_fit_on() -> bool {
+    crate::switch!("BREP_SWEEP_RING_BAND_FIT", false)
 }
 
 /// `BREP_SWEEP_RING_MEETING` (default off): a ring whose grazing branches
@@ -823,21 +887,15 @@ pub fn sweep_ring_tumbled(centre: Vec3, axis: Vec3, major: f64, minor: f64, moti
     // swing): the arrangement does not close there; declined before the work
     // (a sweep that builds keeps 0.045 and more, the crossed tumbles' are
     // 0.0045 and 0.0011).
-    {
-        let probe = PoseGrid::new(motion, &torus, from, to, 2);
-        let sweep = ConvexSweep::new_ring(&torus, motion, &probe)?;
-        let (mut least, mut most) = (f64::INFINITY, 0.0f64);
-        for i in 0..=120 {
-            let t = from + (to - from) * i as f64 / 120.0;
-            for k in 0..128 {
-                let (a, b, c) = sweep.ring_harmonic(t, TAU * k as f64 / 128.0);
-                let r = a.hypot(b);
-                least = least.min(r - c.abs());
-                most = most.max(r);
+    // The seam the early read found the margin on is tried first.
+    let mut seams = RING_SEAMS.to_vec();
+    if !ring_meeting_on() {
+        match ring_branches_declined(&torus, motion, from, to)? {
+            Err(refusal) => return Err(refusal),
+            Ok(seam) => {
+                seams.retain(|&s| s != seam);
+                seams.insert(0, seam);
             }
-        }
-        if !(least > RING_BRANCH_MARGIN * most) && !ring_meeting_on() && !ring_collar_on() {
-            return Err(refuse("trim_ring_branches_near", format!("the ring's grazing branches come within {:.1e} of meeting (of a swing {most:.2}): not closed here", least.max(0.0))));
         }
     }
     let poses = ((10.0 * degrees).ceil() as usize).clamp(750, 6000) + 1;
@@ -856,7 +914,7 @@ pub fn sweep_ring_tumbled(centre: Vec3, axis: Vec3, major: f64, minor: f64, moti
         .unwrap_or_else(|| PoseGrid::new(motion, &torus, from, to, poses));
     let size = major + minor;
     let mut last = None;
-    for seam in [45f64, 100.0, 20.0, 135.0, 70.0] {
+    for seam in seams {
         let mut sweep = ConvexSweep::new_ring_with_seam(&torus, motion, &grid, seam.to_radians())?;
         if ring_collar_on() {
             match sweep.ring_collars(from, to) {
@@ -922,6 +980,59 @@ pub fn sweep_ring_tumbled(centre: Vec3, axis: Vec3, major: f64, minor: f64, moti
         return Ok(body);
     }
     Err(last.expect("tried"))
+}
+
+/// The seams the ring route tries, in order.
+const RING_SEAMS: [f64; 5] = [45.0, 100.0, 20.0, 135.0, 70.0];
+
+/// The ring route's early decline: the branches all but meet somewhere (the
+/// margin between the tube's grazing roots under [`RING_BRANCH_MARGIN`] of the
+/// grazing value's largest swing), so the arrangement does not close there.
+/// Under the collar a true root of (a, b) is the collar's, so the margin is
+/// read outside the collars' discs, on each of the route's seams with the
+/// collars it takes, and the motion is declined only where it fails on every
+/// one; a motion whose branches only come near meeting elsewhere (no root
+/// there) is still declined before the work.
+/// Some(refusal) to decline.
+pub(super) fn ring_branches_declined(torus: &Torus, motion: &TwoTurnMotion, from: f64, to: f64) -> Result<Result<f64, KernelRefusal>, KernelRefusal> {
+    let probe = PoseGrid::new(motion, torus, from, to, 2);
+    // The margin on one seam: outside the collars it takes (none without the
+    // switch), against the largest swing. (least, most)
+    let margin_on = |seam: f64| -> Result<(f64, f64), KernelRefusal> {
+        let mut sweep = ConvexSweep::new_ring_with_seam(torus, motion, &probe, seam.to_radians())?;
+        if ring_collar_on() {
+            if let Some(collars) = sweep.ring_collars(from, to) {
+                sweep.collars = collars;
+            }
+        }
+        let (mut least, mut most) = (f64::INFINITY, 0.0f64);
+        for i in 0..=120 {
+            let t = from + (to - from) * i as f64 / 120.0;
+            for k in 0..128 {
+                let psi = TAU * k as f64 / 128.0;
+                let (a, b, c) = sweep.ring_harmonic(t, psi);
+                let r = a.hypot(b);
+                most = most.max(r);
+                if sweep.collar_holding(t, psi).is_none() {
+                    least = least.min(r - c.abs());
+                }
+            }
+        }
+        Ok((least, most))
+    };
+    // Without the collar the seam changes nothing; with it, any seam on which
+    // the margin holds is one the route can sweep on.
+    let seams: &[f64] = if ring_collar_on() { &RING_SEAMS } else { &RING_SEAMS[..1] };
+    let mut first = None;
+    for &seam in seams {
+        let (least, most) = margin_on(seam)?;
+        if least > RING_BRANCH_MARGIN * most {
+            return Ok(Ok(seam));
+        }
+        first.get_or_insert((least, most));
+    }
+    let (least, most) = first.expect("one seam read");
+    Ok(Err(refuse("trim_ring_branches_near", format!("the ring's grazing branches come within {:.1e} of meeting (of a swing {most:.2}): not closed here", least.max(0.0)))))
 }
 
 /// `BREP_SWEEP_RING_ONE_FLUX` (default on; `=0` restores build's own sign

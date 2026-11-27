@@ -3923,6 +3923,10 @@ fn finish_merge(
     validate: bool,
     validation_scope: Option<&HashSet<u64>>,
 ) -> Result<BrepSolid, KernelRefusal> {
+    // A merged face numbers its loops from 1 (`reproject_loops`,
+    // `walk_cycles`), so two merged faces can share a loop id, which the
+    // topology arena refuses ("duplicate loop wire id"): give repeats fresh ids.
+    result.renumber_repeated_wire_ids();
     let used_edges = result
         .shells
         .iter()

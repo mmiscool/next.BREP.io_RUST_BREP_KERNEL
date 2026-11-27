@@ -415,6 +415,39 @@ pub struct CertifiedRulingPiece {
 }
 
 impl ImprintPieceRecord {
+    /// A freshly minted section piece: the curve over `[t0, t1]` from vertex
+    /// `[start, end]`, with its pcurves on the two support faces. It shares no
+    /// existing edge and carries no certified ruling side; set `shared_edge`
+    /// (or call [`Self::with_shared_edge`]) when it reuses a boundary edge.
+    pub fn new(
+        id: u64,
+        curve: NurbsCurve,
+        [t0, t1]: [f64; 2],
+        [start_vertex_id, end_vertex_id]: [u64; 2],
+        pcurves: Vec<FacePcurve>,
+        support_faces: [FaceKey; 2],
+    ) -> Self {
+        Self {
+            id,
+            curve,
+            t0,
+            t1,
+            start_vertex_id,
+            end_vertex_id,
+            pcurves,
+            support_faces,
+            shared_edge: None,
+            certified_ruling_side: None,
+        }
+    }
+
+    /// This piece resolved to the existing boundary edge `(operand, edge_id,
+    /// aligned)`, or to none.
+    pub fn with_shared_edge(mut self, shared_edge: Option<(u8, u64, bool)>) -> Self {
+        self.shared_edge = shared_edge;
+        self
+    }
+
     pub fn certified_ruling(&self, supports: [FaceKey; 2], charts: [&NurbsSurface; 2])
         -> Option<&brep_geometry::certified_planar::ruling::CertifiedRuling>
     {
@@ -435,7 +468,10 @@ impl ImprintPieceRecord {
     }
 }
 
+/// Not exhaustive: a new field is not a breaking change. Outside this crate,
+/// build one with `ImprintPieceRecord::new`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct ImprintPieceRecord {
     pub id: u64,
     pub curve: NurbsCurve,
@@ -461,11 +497,21 @@ pub struct ImprintPieceRecord {
     pub certified_ruling_side: Option<CertifiedRulingPiece>,
 }
 
+/// Not exhaustive: a new field is not a breaking change. Outside this crate,
+/// build one with `EdgeSplitRecord::new`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct EdgeSplitRecord {
     pub operand: u8,
     pub edge_id: u64,
     pub parameters: Vec<f64>,
+}
+
+impl EdgeSplitRecord {
+    /// Split `operand`'s edge `edge_id` at `parameters`.
+    pub fn new(operand: u8, edge_id: u64, parameters: Vec<f64>) -> Self {
+        Self { operand, edge_id, parameters }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -366,6 +366,18 @@ fn plane_parallel_to(
 /// axis-parallel partial cylinder) and a parallel wall ride rigidly under an
 /// axis-parallel push, while any oblique push falls through to the (planar-only)
 /// re-intersection path and refuses.
+/// `BREP_MOVE_INVARIANT_RULED_SLIDE` (default on; `=0` restores): a moved
+/// carrier that is not a plane (a bore wall) meeting a fixed ruled carrier the
+/// translation leaves INVARIANT (a cylinder slid along its own axis) has its
+/// corners and rims carried rigidly by the translation, and a fixed face that
+/// measures flat without a plane tag (a revolved radial line — a counterbore's
+/// shoulder) is moved against and re-trimmed as the plane it is; off, such a
+/// corner refuses as "the MOVED cap meeting a ruled neighbour" and such a rim
+/// as "SM3 territory".
+fn invariant_ruled_slide_enabled() -> bool {
+    crate::switch!(live "BREP_MOVE_INVARIANT_RULED_SLIDE", true)
+}
+
 fn carrier_invariant_under(
     solid: &BrepSolid,
     face_lookup: &HashMap<u64, (usize, usize)>,
@@ -1756,8 +1768,27 @@ pub fn move_faces_unchecked(
                 // The cap sharing this ruled rim is the moved planar face at the
                 // vertex; its plane defines the homothety (D₀ from the apex).
                 if let Some(cap) = adjacent.iter().copied().find(|f| moved.contains(f)) {
-                    let moved_plane =
-                        cached_plane(&mut planes, solid, &face_lookup, cap, plane_tolerance)
+                    // A moved side that is NOT a cap (a bore wall, itself a
+                    // cylinder) against a fixed ruled carrier the push leaves
+                    // INVARIANT (a band cylinder slid along its own axis): the
+                    // corner rides rigidly — it stays on the fixed carrier and on
+                    // the translated moved one.
+                    let cap_plane =
+                        cached_plane(&mut planes, solid, &face_lookup, cap, plane_tolerance);
+                    if cap_plane.is_err()
+                        && invariant_ruled_slide_enabled()
+                        && carrier_invariant_under(
+                            solid,
+                            &face_lookup,
+                            fixed_at[0],
+                            translation,
+                            parallel_tolerance,
+                        )
+                    {
+                        new_vertex.insert(vertex.id, vertex.point.add(translation));
+                        continue;
+                    }
+                    let moved_plane = cap_plane
                             .map_err(|_| {
                                 unsupported_carrier(
                                     solid,
@@ -2260,7 +2291,19 @@ pub fn move_faces_unchecked(
                 moved_face,
                 fixed_face,
             } => {
-                if let Some((frame, rho0, rho1, height)) =
+                if rigid
+                    && invariant_ruled_slide_enabled()
+                    && carrier_ruled(solid, &face_lookup, *fixed_face).is_some()
+                    && carrier_invariant_under(solid, &face_lookup, *fixed_face, translation, parallel_tolerance)
+                    && cached_plane(&mut planes, solid, &face_lookup, *moved_face, plane_tolerance).is_err()
+                {
+                    // A moved bore wall against a fixed ruled carrier the push
+                    // leaves invariant (a cylinder slid along its own axis): the
+                    // whole rim slides along the fixed carrier while staying on
+                    // the translated moved one — exact for any curve type, the
+                    // ruled twin of the parallel-flat Translate arm below.
+                    actions.insert(edge.id, EdgeMoveAction::Translate);
+                } else if let Some((frame, rho0, rho1, height)) =
                     carrier_ruled(solid, &face_lookup, *fixed_face)
                 {
                     // The rim re-intersects the (unchanged) ruled carrier. Build
@@ -2356,7 +2399,12 @@ pub fn move_faces_unchecked(
                             None => EdgeMoveAction::Transform(map),
                         },
                     );
-                } else if carrier_is_planar(solid, &face_lookup, *fixed_face) {
+                } else if carrier_is_planar(solid, &face_lookup, *fixed_face)
+                    // A flat the recognizer did not TAG as a plane (a revolved
+                    // radial line — a hole's shoulder annulus) that the
+                    // classification already measured flat and cached.
+                    || (invariant_ruled_slide_enabled() && planes.contains_key(fixed_face))
+                {
                     let fixed_plane = planes[fixed_face];
                     if rigid && translation.dot(fixed_plane.normal).abs() <= parallel_tolerance {
                         // The whole edge slides inside the fixed plane while
@@ -2563,7 +2611,7 @@ pub fn move_faces_unchecked(
                     // than running it, attributed the Plane × Torus refusal to
                     // this arm; the probe (`examples/plane_push_refusal_probe.rs`,
                     // `carrier/torus.*`) shows the classification arm firing.
-                    cached_plane(&mut planes, solid, &face_lookup, face.id, plane_tolerance)
+                    let plane = cached_plane(&mut planes, solid, &face_lookup, face.id, plane_tolerance)
                         .map_err(|_| {
                             unsupported_carrier(
                                 solid,
@@ -2572,6 +2620,12 @@ pub fn move_faces_unchecked(
                                 "a FIXED face the push must re-trim",
                             )
                         })?;
+                    // It measured flat: re-trim it as the plane it is, so the
+                    // pcurves of its moved rim are rebuilt rather than left
+                    // on the edge's old station.
+                    if invariant_ruled_slide_enabled() {
+                        face_actions.push((shell_index, face_index, FaceMoveAction::Retrim(plane)));
+                    }
                 }
             }
         }

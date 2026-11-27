@@ -321,6 +321,16 @@ fn carried_floors_enabled() -> bool {
     switch!(live "BREP_REDRILL_CARRIED_FLOORS", true)
 }
 
+/// `BREP_REDRILL_UNSELECTED_STEPS` (default on; `=0` restores): a stepped hole
+/// whose walls are selected but whose flat STEP between two of them is not (a
+/// counterbore's shoulder, when only the two walls were picked) heals that step
+/// with the walls — it is bounded by them alone and the re-drilled stack
+/// rebuilds it — and names the re-drilled step after it; off, the heal leaves
+/// the step and the road declines `bore_does_not_heal`.
+fn unselected_steps_enabled() -> bool {
+    switch!(live "BREP_REDRILL_UNSELECTED_STEPS", true)
+}
+
 /// One piece of a stepped hole's stack: axial stations `lo < hi` along the
 /// hole's axis and the radius at each.
 #[derive(Clone, Copy, Debug)]
@@ -528,9 +538,43 @@ fn redrill_stepped_hole(
     if turn.is_some() && (floor.is_some() || point.is_some()) {
         return Err(decline("turned_blind_stepped_hole", "a turn carries the hole's axis off its floor, which is not selected".into()));
     }
+    // An UNSELECTED step between two selected walls (a counterbore's shoulder
+    // when only its walls were picked): a flat square to the axis whose every
+    // edge is an edge of a selected wall. The stack rebuilds it, so it is
+    // healed with the walls and takes its name back on the re-drilled step.
+    let steps: Vec<&FaceRecord> = if unselected_steps_enabled() {
+        let wall_edges: HashSet<u64> = revolutions
+            .iter()
+            .flat_map(|(face, ..)| face.loops.iter().flat_map(|lp| lp.coedges.iter().map(|coedge| coedge.edge_id)))
+            .collect();
+        let inner = |s: f64| pieces.windows(2).any(|pair| (pair[0].hi - s).abs() <= band && (pair[1].lo - s).abs() <= band);
+        solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| !face_ids.contains(&face.id))
+            // Every edge a wall's — or the step's OWN seam (a flat annulus
+            // stored as a revolved radial line runs one radial edge twice).
+            .filter(|face| {
+                let uses = |edge_id: u64| face.loops.iter().flat_map(|lp| &lp.coedges).filter(|coedge| coedge.edge_id == edge_id).count();
+                face.loops
+                    .iter()
+                    .flat_map(|lp| &lp.coedges)
+                    .all(|coedge| wall_edges.contains(&coedge.edge_id) || uses(coedge.edge_id) == 2)
+                    && face.loops.iter().flat_map(|lp| &lp.coedges).any(|coedge| wall_edges.contains(&coedge.edge_id))
+            })
+            .filter(|face| {
+                plane_of_surface(&face.surface, band, OP_STEP)
+                    .is_ok_and(|plane| plane.normal.cross(axis).length() <= 1e-9 && inner(station(plane.origin)))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut heal_ids: Vec<u64> = face_ids.to_vec();
     heal_ids.extend(floor.map(|(face, ..)| face.id));
     heal_ids.extend(point.map(|(face, ..)| face.id));
+    heal_ids.extend(steps.iter().map(|face| face.id));
     let healed = match crate::delete_faces_and_heal(solid, &heal_ids) {
         Ok(healed) => healed,
         Err(error) => super::face_move_convex::filled_without(solid, &heal_ids).map_err(|fill| {
@@ -666,6 +710,7 @@ fn redrill_stepped_hole(
     let mut taken: HashSet<String> = drilled.shells.iter().flat_map(|shell| &shell.faces).filter_map(|face| face.name.clone()).collect();
     let mut sources: Vec<&FaceRecord> = selected.to_vec();
     sources.extend(point.map(|(face, ..)| face));
+    sources.extend(steps.iter().copied());
     let same_surface = |source: &FaceRecord, other: &FaceRecord| -> bool {
         match (source.surface.analytic(), other.surface.analytic()) {
             (Some(AnalyticSurface::RuledRevolution { frame: a, rho0: a0, rho1: a1, .. }), Some(AnalyticSurface::RuledRevolution { frame: b, rho0: b0, rho1: b1, .. })) => {

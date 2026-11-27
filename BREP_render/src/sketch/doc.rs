@@ -191,9 +191,38 @@ pub struct SketchDiagnostics {
     pub point_mobility: std::collections::BTreeMap<String, String>,
     #[serde(default, rename = "geometryMobility")]
     pub geometry_mobility: std::collections::BTreeMap<String, String>,
+    /// `id_key -> PointFreedom` for each point that can still move: how many ways
+    /// and along which directions (unit plane vectors).
+    #[serde(default, rename = "pointFreedom")]
+    pub point_freedom: std::collections::BTreeMap<String, PointFreedom>,
+    /// `id_key -> remaining freedoms` of each geometry's points taken together.
+    #[serde(default, rename = "geometryFreedom")]
+    pub geometry_freedom: std::collections::BTreeMap<String, i64>,
+    /// The constraints whose rows repeat what earlier constraints already state
+    /// (consistent, so not conflicting): the ones an over-constrained sketch can
+    /// drop. [`id_key`] strings, never also in `conflicting_constraints`.
+    #[serde(default, rename = "redundantConstraints")]
+    pub redundant_constraints: Vec<String>,
+}
+
+/// How a point can still move: `dof` free directions (1 or 2), each a unit
+/// `(u, v)` plane vector.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PointFreedom {
+    #[serde(default)]
+    pub dof: i64,
+    #[serde(default)]
+    pub directions: Vec<[f64; 2]>,
 }
 
 impl SketchDiagnostics {
+    /// Whether `id` names a redundant constraint (see
+    /// [`redundant_constraints`](Self::redundant_constraints)).
+    pub fn constraint_redundant(&self, id: &Value) -> bool {
+        let key = id_key(id);
+        self.redundant_constraints.iter().any(|c| *c == key)
+    }
+
     /// Whether `id` names a constraint in the conflicting group (matched via
     /// [`id_key`], so a numeric `4` and a string `"4"` agree with the solver).
     pub fn constraint_conflicting(&self, id: &Value) -> bool {

@@ -458,24 +458,28 @@ impl EngineState {
             .is_some_and(|ty| is_face_transform_type(&ty))
     }
 
-    /// The point a Transform Face turns about: its stored `pivot`, or — while
-    /// that is still null — the kernel's default, the selection's centre over
-    /// the scene the feature runs against. `None` when neither exists (no face
-    /// resolves), which is what keeps the gizmo off an empty selection.
+    /// The point a Transform Face turns about: its STORED `pivot`. `None` while
+    /// that is null — no face resolves yet, or the run that reports the
+    /// selection's default ([`Self::fold_face_transform_pivot`]) has not landed
+    /// — which is what keeps the gizmo off until there is somewhere to put it.
+    /// Never a history replay: this is read every frame, and a replay here runs
+    /// on the app's own thread, whose history cache is cold under a background
+    /// runner: its first replay rebuilds the whole prefix (54 s on one user's
+    /// model, which froze the app).
     fn face_transform_pivot(
         &self,
-        index: usize,
+        _index: usize,
         params: &serde_json::Value,
         env: Option<&brep_kernel::Env>,
     ) -> Option<[f64; 3]> {
         match params.get("pivot") {
             Some(pivot) if !pivot.is_null() => Some(read_pose_vec3(env, Some(params), "pivot", [0.0; 3])),
-            _ => self.face_transform_default_pivot(index, params),
+            _ => None,
         }
     }
 
     /// Whether the Transform Face `feature_id` has a pivot to put its gizmo on —
-    /// a stored one, or faces that resolve to a default. The history panel arms
+    /// stored, or the default its run reported once that lands. The history panel arms
     /// the gizmo on the frame this first holds.
     pub fn face_transform_has_pivot(&self, feature_id: &str) -> bool {
         let Some(index) = self.history.index_of(feature_id) else {
@@ -487,34 +491,38 @@ impl EngineState {
         self.is_face_transform_feature(index) && self.face_transform_pivot(index, &params, None).is_some()
     }
 
-    /// Transform Face's DEFAULT pivot for `params.faces`: the prefix BEFORE the
-    /// feature is replayed (warm, like [`Self::xform_pivot`]'s) and handed to
-    /// [`brep_kernel::face_transform_pivot`] — the same resolution and centre the
-    /// feature itself falls back to, so the stored value and the kernel agree by
-    /// construction.
-    fn face_transform_default_pivot(
-        &self,
-        index: usize,
-        params: &serde_json::Value,
-    ) -> Option<[f64; 3]> {
-        let names = brep_kernel::reference_names(params.get("faces"));
-        if names.is_empty() {
-            return None;
+    /// Store the DEFAULT pivot a Transform Face's own run reported for `faces`
+    /// (`brep_kernel::TRANSFORM_FACE_DEFAULT_PIVOT_KEY`, the selection's centre
+    /// over the scene the feature ran against — the same resolution and centre
+    /// [`brep_kernel::face_transform_pivot`] gives) into its `pivot`, when that is
+    /// still null and its faces are still `faces`. No undo step and no re-run:
+    /// the run that reported it already used exactly that value. Stored rather
+    /// than derived per run, so the rotation centre is a number in the document:
+    /// a re-run, a gizmo drag, or an upstream edit never moves it.
+    pub(crate) fn fold_face_transform_pivot(&mut self, id: &str, pivot: [f64; 3], faces: &[String]) {
+        let Some(index) = self.history.index_of(id) else {
+            return;
+        };
+        if !self.is_face_transform_feature(index) {
+            return;
         }
-        let request: HistoryRequest =
-            serde_json::from_value(self.history.request_before(index)?).ok()?;
-        let _trace = crate::run_trace::span("face_transform_pivot");
-        let result = self.execute_plugin_history(&request);
-        brep_kernel::face_transform_pivot(&result.results, &names)
+        let Some(params) = self.history.feature_params(index) else {
+            return;
+        };
+        if !params.get("pivot").is_none_or(serde_json::Value::is_null)
+            || brep_kernel::reference_names(params.get("faces")) != faces
+        {
+            return;
+        }
+        self.history.fold_param_no_undo(id, "pivot", serde_json::json!(pivot));
     }
 
-    /// STORE a Transform Face's pivot into the params about to be written for
+    /// Prepare a Transform Face's pivot in the params about to be written for
     /// the feature at `index`: when this write changes the face selection
-    /// without also setting a pivot, or leaves the pivot null, `pivot` becomes the
-    /// new selection's centre (null again when nothing resolves). A pivot the
-    /// write sets itself is kept. Stored rather than derived per run, so the
-    /// rotation centre is a number in the document: a re-run, a gizmo drag, or an
-    /// upstream edit never moves it. Every lane that writes feature params calls
+    /// without also setting a pivot, `pivot` goes back to null, and the run the
+    /// write starts reports the new selection's centre, which
+    /// [`Self::fold_face_transform_pivot`] stores when it lands. A pivot the
+    /// write sets itself is kept. Every lane that writes feature params calls
     /// this before the write (`update_feature_params`, the batch lane, the
     /// reference picker's Finish).
     pub(crate) fn stamp_face_transform_pivot(&self, index: usize, params: &mut serde_json::Value) {
@@ -525,16 +533,11 @@ impl EngineState {
         let faces_changed = brep_kernel::reference_names(before.get("faces"))
             != brep_kernel::reference_names(params.get("faces"));
         let pivot_set_here = before.get("pivot") != params.get("pivot");
-        let unset = params.get("pivot").is_none_or(serde_json::Value::is_null);
-        if !(unset || (faces_changed && !pivot_set_here)) {
+        if !faces_changed || pivot_set_here {
             return;
         }
-        let pivot = self.face_transform_default_pivot(index, params);
         if let Some(object) = params.as_object_mut() {
-            object.insert(
-                "pivot".into(),
-                pivot.map_or(serde_json::Value::Null, |pivot| serde_json::json!(pivot)),
-            );
+            object.insert("pivot".into(), serde_json::Value::Null);
         }
     }
 

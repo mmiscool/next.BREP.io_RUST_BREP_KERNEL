@@ -81,8 +81,14 @@ pub(crate) use features::transform::bbox_center as transform_bbox_center;
 // Transform Face's default pivot over a replayed prefix: the value the app
 // stores into `pivot` when a face selection is committed, computed by the same
 // resolution and centre the feature falls back to for a null pivot.
-pub use features::transform_face::{face_transform_pivot, reference_point as face_transform_reference_point};
-/// A Pattern Component instance id (`APAT1.ACOMP3.i4`) as `(pattern, seed, n)`.
+pub use features::transform_face::{face_transform_pivot, reference_point as face_transform_reference_point, DEFAULT_PIVOT_KEY as TRANSFORM_FACE_DEFAULT_PIVOT_KEY};
+/// Whether `id` has the form of a Pattern Component's id (`APAT<digits>`).
+pub fn is_pattern_component_id(id: &str) -> bool {
+    features::assembly_pattern::is_pattern_id(id)
+}
+
+/// A Pattern Component instance id (`APAT1.ACOMP3.i4`) as `(pattern, seed, n)`;
+/// the seed may be an earlier pattern's instance (`APAT2.APAT1.ACOMP3.i2.i3`).
 pub fn pattern_component_instance(id: &str) -> Option<(String, String, i64)> {
     features::assembly_pattern::parse_instance_id(id).map(|(p, s, n)| (p.to_string(), s.to_string(), n))
 }
@@ -1760,6 +1766,7 @@ pub(crate) fn execute_feature_with_later(
         "DF" | "DELETE FACE" | "DELETEFACE" => features::delete_face::execute(&ctx),
         "RFS" | "REFIT FACES" | "REFITFACES" => features::refit_faces::execute(&ctx),
         "DFF" | "DEFORM FACE" | "DEFORMFACE" => features::deform_face::execute(&ctx),
+        "DRAFT" => features::draft::execute(&ctx),
         "SEW" | "SEW TO SOLID" | "SEWTOSOLID" => features::sew_to_solid::execute(&ctx),
         "THK" | "THICKEN" => features::thicken::execute(&ctx),
         "H" | "HOLE" => features::hole::execute(&ctx),
@@ -2089,8 +2096,9 @@ fn has_persistent_data(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Null => false,
         // A gear's `gearData` is derived output (diameters, thicknesses) and
-        // holds no reference, so it alone does not count.
-        serde_json::Value::Object(map) => map.keys().any(|key| key != "gearData"),
+        // holds no reference, so it alone does not count; nor does a draft's
+        // `draft` (its resolved pull and neutral point, numbers only).
+        serde_json::Value::Object(map) => map.keys().any(|key| key != "gearData" && key != "draft"),
         serde_json::Value::Array(items) => !items.is_empty(),
         serde_json::Value::String(text) => !text.is_empty(),
         _ => true,
@@ -2300,6 +2308,12 @@ fn produced_names(result: &FeatureResult) -> Vec<String> {
     // A component's id is a produced name: a reference to the component (a
     // COMPONENT-type selection in a descriptor) versions against its producer.
     names.extend(result.components.iter().map(|record| record.id.clone()));
+    // A Pattern Component that placed instances produces its own id too: a
+    // later pattern whose seed is this whole pattern (`seeds: ["APAT5"]`)
+    // then re-runs when this one changes what it places.
+    if result.components.iter().any(|record| record.pattern.as_ref().is_some_and(|p| p.pattern_id == result.id)) {
+        names.push(result.id.clone());
+    }
     names.extend(result.solid_aliases.iter().map(|(legacy, _)| legacy.clone()));
     names
 }

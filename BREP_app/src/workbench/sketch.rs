@@ -54,6 +54,8 @@ pub const DRAW_TOOLS: &[(&str, &str)] = &[
     ("sketch.tool.bezier", "bezier"),
     ("sketch.tool.handdraw", "handdraw"),
     ("sketch.tool.trim", "trim"),
+    ("sketch.tool.fillet", "fillet"),
+    ("sketch.tool.chamfer", "chamfer"),
     ("sketch.tool.pickEdges", "pickEdges"),
     ("sketch.tool.text", "text"),
 ];
@@ -72,7 +74,7 @@ fn sketch_is_open(state: &ButtonState) -> bool {
 }
 
 /// Whether the armed tool IS the one `id` names — the pressed predicate,
-/// shared by all ten so the table stays the only list. `select` is the armed
+/// shared by them all so the table stays the only list. `select` is the armed
 /// tool exactly when nothing else is (the engine stores it as `None`).
 fn tool_armed(state: &ButtonState, id: &str) -> bool {
     let Some(tool) = draw_tool(id) else {
@@ -81,7 +83,7 @@ fn tool_armed(state: &ButtonState, id: &str) -> bool {
     state.engine.sketch_active_tool().unwrap_or("select") == tool
 }
 
-/// The twelve buttons: the eleven tools, then the
+/// The fourteen buttons: the thirteen tools, then the
 /// one-shot Auto-constrain.
 ///
 /// Every glyph is catalogued artwork (this app ships no font fallback, so an
@@ -179,6 +181,28 @@ pub static BUTTONS: &[WorkbenchButton] = &[
         ribbon_path: "Home/Sketch/Trim curve", size: crate::workbench::CommandSize::Compact, tooltip: "Trim curve",
         when: Some(sketch_is_open),
         pressed: Some(|state| tool_armed(state, "sketch.tool.trim")),
+        disabled: None,
+        caption: None,
+        menu: &[],
+    },
+    WorkbenchButton {
+        id: "sketch.tool.fillet",
+        glyph: "\u{E08F}",
+        ribbon_path: "Home/Sketch/Fillet corner", size: crate::workbench::CommandSize::Compact,
+        tooltip: "Fillet corner (click where two lines meet; with corner points selected, rounds them all at once, equal radii; radius in the tool options)",
+        when: Some(sketch_is_open),
+        pressed: Some(|state| tool_armed(state, "sketch.tool.fillet")),
+        disabled: None,
+        caption: None,
+        menu: &[],
+    },
+    WorkbenchButton {
+        id: "sketch.tool.chamfer",
+        glyph: "\u{E090}",
+        ribbon_path: "Home/Sketch/Chamfer corner", size: crate::workbench::CommandSize::Compact,
+        tooltip: "Chamfer corner (click where two lines meet; size in the tool options)",
+        when: Some(sketch_is_open),
+        pressed: Some(|state| tool_armed(state, "sketch.tool.chamfer")),
         disabled: None,
         caption: None,
         menu: &[],

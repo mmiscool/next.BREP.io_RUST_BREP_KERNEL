@@ -75,6 +75,26 @@ pub fn guard_factor(bounds: Aabb) -> Option<f64> {
     factor_for_diagonal(bounds.diagonal())
 }
 
+/// A large boolean's fallback working scale. Unlike the small-model guard,
+/// this is tried only after the original operation refuses: downscaling can
+/// put a thin feature below an absolute identity band even on a large body.
+/// Powers of two preserve coordinates exactly, including length-valued
+/// carrier parameters and their pcurves through [`scale_operand`].
+pub fn large_guard_factor(bounds: Aabb) -> Option<f64> {
+    let diagonal = bounds.diagonal();
+    if !enabled() || !crate::switch!("BREP_LARGE_WORKING_SCALE", true)
+        || !diagonal.is_finite() || diagonal <= 64.0 {
+        return None;
+    }
+    let mut factor = 1.0;
+    let mut size = diagonal;
+    while size > 32.0 {
+        size *= 0.5;
+        factor *= 0.5;
+    }
+    Some(factor)
+}
+
 /// See [`guard_factor`]; the switch is not consulted.
 pub fn factor_for_diagonal(diagonal: f64) -> Option<f64> {
     if !(diagonal.is_finite() && diagonal >= SMALLEST_DIAGONAL && diagonal < FIRING_DIAGONAL) {

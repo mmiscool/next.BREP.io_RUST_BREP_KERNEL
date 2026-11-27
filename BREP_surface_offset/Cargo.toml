@@ -1,6 +1,6 @@
 [package]
 name = "BREP_surface_offset"
-version = "0.31.0"
+version = "0.32.0"
 edition = "2021"
 license-file = "LICENSE.md"
 description = "Rust B-rep CAD kernel (next.BREP.io): surface offsets: offset carriers, trims, regularity and fold loci."
@@ -26,8 +26,8 @@ include = [
 name = "brep_surface_offset"
 
 [dependencies]
-BREP_geometry = { version = "0.31.0", path = "../BREP_geometry" }
-BREP_topology = { version = "0.31.0", path = "../BREP_topology" }
+BREP_geometry = { version = "0.32.0", path = "../BREP_geometry" }
+BREP_topology = { version = "0.32.0", path = "../BREP_topology" }
 BREP_RANSAC = { version = "0.2.3", path = "../BREP_RANSAC" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

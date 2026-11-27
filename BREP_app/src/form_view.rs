@@ -202,6 +202,15 @@ const FORM_MARGIN: i8 = 10;
 /// stroke is not flush against the dock border.
 const FORM_OUTER_MARGIN: i8 = 6;
 
+/// Whether the visibility hook hides field `f`: the set names a schema param
+/// (its first path segment, e.g. `offset` hides the whole transform), the
+/// field's own key, or its dotted path (`offset.scale` hides one row of it).
+fn field_hidden(hidden: &HashSet<String>, f: &FormField) -> bool {
+    hidden.contains(f.key())
+        || f.path.first().is_some_and(|param| hidden.contains(param))
+        || (f.path.len() > 1 && hidden.contains(&f.path.join(".")))
+}
+
 pub fn form_view(
     ui: &mut egui::Ui,
     spec: &FormViewSpec<'_>,
@@ -358,7 +367,7 @@ fn form_body(
         // draws a bare header. Evaluated fresh each frame against the live params
         // by the consumer, this is what makes fields show/hide as the field that
         // governs them (e.g. a hole's type) changes.
-        if spec.hidden.is_some_and(|h| h.contains(f.key())) {
+        if spec.hidden.is_some_and(|h| field_hidden(h, f)) {
             continue;
         }
         match f.group.as_str() {

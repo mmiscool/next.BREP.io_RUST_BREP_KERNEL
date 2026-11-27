@@ -42,7 +42,7 @@ fn scalar(key: &str, label: &str, group: &str) -> FormField {
 }
 
 fn choice(key: &str, label: &str, group: &str, variants: &[&str]) -> FormField {
-    field(key, label, group, FieldKind::Enum { variants: variants.iter().map(|s| s.to_string()).collect() })
+    field(key, label, group, FieldKind::Enum { variants: variants.iter().map(|s| s.to_string()).collect(), labels: Vec::new() })
 }
 
 /// The form's fields, in dialog order: Tool, Geometry, Holder, Feeds,

@@ -3,7 +3,7 @@
 Part of the [next.BREP.io](https://next.brep.io) Rust B-rep kernel: `cargo add BREP_boolean` · [licence summary](#licence)
 
 `BREP_boolean` holds the booleans and healing of the BREP kernel. Its Rust library
-target is `brep_boolean`; this is version **0.31.0**.
+target is `brep_boolean`; this is version **0.32.0**.
 
 It is one of the implementation crates the kernel is built from. Applications
 should depend on [`BREP_kernel`](https://crates.io/crates/BREP_kernel), which

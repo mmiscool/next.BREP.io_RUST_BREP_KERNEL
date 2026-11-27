@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:brep="https://brep.io/icons"
+     viewBox="0 0 24 24" width="24" height="24" brep:glyph-name="icon_draft_analysis" brep:unicode="E0FC">
+  <!-- Draft Analysis: the Draft block with its faces painted by their draft (green with the pull, yellow needs draft, grey-blue the cap), the pull arrow above. -->
+  <path d="M3.5 19.2 12.2 21.5 13.4 12.8 6.4 11.2Z" fill="#33b84d" stroke="#1d4a26" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M12.2 21.5 20.5 17.6 17.6 10.4 13.4 12.8Z" fill="#f2cc26" stroke="#6b5410" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M6.4 11.2 11.6 9 17.6 10.4 13.4 12.8Z" fill="#8c9eb3" stroke="#3a4552" stroke-width="1.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M11.8 7.4V1.6M9.6 3.8 11.8 1.6 14 3.8" style="fill:none" stroke="#3d86c4" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

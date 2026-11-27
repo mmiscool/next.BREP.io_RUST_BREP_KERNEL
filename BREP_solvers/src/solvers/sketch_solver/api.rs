@@ -177,6 +177,20 @@ fn remove_constraints_duplicated_by_implied_geometry(sketch: &mut Value) {
 // ---------------------------------------------------------------------------
 
 pub fn solve_sketch(request: &SolveSketchRequest) -> Result<Value, String> {
+    solve_sketch_mode(request, false)
+}
+
+/// [`solve_sketch`] for one frame of an interactive drag: the solve first looks for
+/// the smallest change of the free coordinates from where they stand (the caller
+/// passes the previous frame's solved sketch with the dragged points pinned), so
+/// free geometry the drag does not force stays where it was instead of drifting or
+/// stretching frame by frame. When that cannot meet every constraint, the frame
+/// solves exactly as [`solve_sketch`] does.
+pub fn solve_sketch_min_change(request: &SolveSketchRequest) -> Result<Value, String> {
+    solve_sketch_mode(request, true)
+}
+
+fn solve_sketch_mode(request: &SolveSketchRequest, min_change: bool) -> Result<Value, String> {
     let mut settings = SketchSolverSettings::default();
     if let Some(tolerance) = request.tolerance {
         settings.tolerance = tolerance;
@@ -207,6 +221,7 @@ pub fn solve_sketch(request: &SolveSketchRequest) -> Result<Value, String> {
 
     let iterations = request.iterations.unwrap_or(1500);
     let mut engine = Engine::new(&sketch, settings)?;
+    engine.min_change = min_change;
     let solved = engine.solve(iterations)?;
 
     let mut response = Map::new();

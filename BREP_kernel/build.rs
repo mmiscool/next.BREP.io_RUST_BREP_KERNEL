@@ -1,10 +1,12 @@
 //! Stamps the build with a hash of the kernel's own source.
 //!
-//! `BREP_KERNEL_SOURCE_HASH` is an FNV-1a 64 hash over every `src/**/*.rs`
-//! path and its contents, in sorted path order. It changes exactly when the
-//! kernel source does, so a cache of evaluated geometry keyed on it goes stale
-//! exactly when the code that produced the geometry has changed — the parts
-//! library's snapshots are the consumer (`feature_pipeline/parts_library.rs`).
+//! `BREP_KERNEL_SOURCE_HASH` is an FNV-1a 64 hash of source paths and their
+//! complete contents, in sorted path order. Private builds exclude only whole
+//! files proven test-only by the public exporter's reachability rules. Every
+//! production file, including default-off feature modules, remains an input.
+//! Test-only edits therefore preserve parts-library snapshot identities; edits
+//! to production files (including their inline tests) still invalidate them.
+//! Published builds hash every shipped `src/**/*.rs` file without extra tools.
 //!
 //! Deliberately not a git revision: the published crate has no `.git`, and a
 //! HEAD-derived value would recompile the kernel on every docs-only commit.
@@ -27,10 +29,16 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-fn source_hash(root: &Path) -> std::io::Result<u64> {
+fn source_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     collect(&root.join("src"), &mut files)?;
     files.sort();
+    // Standalone/public builds have no private classifier. Watch additions too.
+    println!("cargo:rerun-if-changed=src");
+    Ok(files)
+}
+
+fn source_hash(root: &Path, files: &[PathBuf]) -> std::io::Result<u64> {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut feed = |bytes: &[u8]| {
         for byte in bytes {
@@ -38,7 +46,7 @@ fn source_hash(root: &Path) -> std::io::Result<u64> {
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     };
-    for path in &files {
+    for path in files {
         let relative = path.strip_prefix(root).unwrap_or(path);
         feed(relative.to_string_lossy().replace('\\', "/").as_bytes());
         feed(&[0]);
@@ -51,9 +59,17 @@ fn source_hash(root: &Path) -> std::io::Result<u64> {
 fn main() {
     let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src");
-    match source_hash(&root) {
+    let result = source_files(&root).and_then(|files| {
+        // Watching the directory would also watch all excluded test files.
+        // A newly reachable module changes its watched parent or Cargo.toml.
+        for path in &files {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+        source_hash(&root, &files)
+    });
+    match result {
         Ok(hash) => println!("cargo:rustc-env=BREP_KERNEL_SOURCE_HASH={hash:016x}"),
         Err(error) => println!("cargo:warning=BREP_KERNEL_SOURCE_HASH not set: {error}"),
     }
 }
+

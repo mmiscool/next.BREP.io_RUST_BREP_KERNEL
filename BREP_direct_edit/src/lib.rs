@@ -76,7 +76,7 @@ pub use brep_offset::*;
 #[doc(hidden)]
 pub mod direct_edit;
 pub use direct_edit::{
-    delete_face_and_heal, delete_faces_and_heal, draft_faces, draft_faces_parted, draft_faces_unchecked, move_faces, move_faces_unchecked,
+    delete_face_and_heal, delete_faces_and_heal, draft_face_qualifies, draft_faces, draft_faces_parted, draft_faces_parted_sided, draft_faces_unchecked, draft_tangent_faces, move_faces, move_faces_unchecked,
     offset_freeform_face, offset_freeform_face_unchecked,
     offset_revolution_face, offset_revolution_face_unchecked, offset_ruled_face, offset_ruled_face_unchecked, offset_sphere_face,
     offset_sphere_face_unchecked, offset_torus_face, offset_torus_face_unchecked,

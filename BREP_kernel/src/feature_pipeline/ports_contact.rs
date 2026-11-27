@@ -28,6 +28,18 @@
 //!   cup's floor behind its rim). A wire attaches at a cap's
 //!   centroid and leaves along its outward normal, which for a swept pin is
 //!   the path's end tangent; on a straight round pin the two rules agree;
+//! * the STRIP rule, for a body the end-cap rule finds no distinct ends on
+//!   and no Direction picks (a gull-wing lead: its end caps do not face each
+//!   other, and its flat sides lie at the extremes too): the end caps where
+//!   its longest path along its edges runs out, each seated on its SOLE (the
+//!   flat face beside the cap, square to it and facing away from the other
+//!   end: the foot's underside) when it has one, the wire leaving along the
+//!   sole's normal. A cube still has no distinct ends under it
+//!   (`BREP_CONTACT_STRIP_ENDS`, on; `0` turns it off). With
+//!   `BREP_CONTACT_STRIP_AXIS` (off) it also takes a body the axis rule would
+//!   read across: one whose only round face is a bend (a lead with one round
+//!   bend, a right-angle header pin), which reaches farther from that axis
+//!   than it runs along it;
 //! * the DIRECTION rule, for a body with no distinct ends (a cube, a block
 //!   terminal) when the point names a Direction (`directionRef`: a face's
 //!   normal, an edge, an axis, a datum): the end is the body's extreme along
@@ -38,7 +50,8 @@
 //! The WIRE END is the end farther from the centre of the rest of the part,
 //! or the `+axis` end (the chord between the ends in its canonical sense:
 //! largest component positive) when the body is the only solid or the two
-//! are equally far; under the direction rule it is the end the Direction
+//! are equally far (under the strip rule, the end with the longer sole: a
+//! lead's foot); under the direction rule it is the end the Direction
 //! points to. `reverseDirection` takes the other one. The wire leaves OUTWARD
 //! from the chosen end.
 //!
@@ -76,6 +89,9 @@ pub enum ContactRule {
     Caps,
     /// The point's Direction, on a body with no distinct ends.
     Direction,
+    /// The end caps at the ends of a bent strip's longest path, each seated
+    /// on its sole when it has one (`BREP_CONTACT_STRIP_ENDS`).
+    Strip,
 }
 
 impl ContactRule {
@@ -85,6 +101,7 @@ impl ContactRule {
             ContactRule::Axis => "axis",
             ContactRule::Caps => "caps",
             ContactRule::Direction => "direction",
+            ContactRule::Strip => "strip",
         }
     }
 }
@@ -159,7 +176,8 @@ pub struct PortContactRow {
     /// Whether the body SEATED the origin (no `pointRef`). With a `pointRef`
     /// the body is reported, but the origin is the reference's.
     pub seats_origin: bool,
-    /// `"axis"`, `"caps"` or `"direction"`: the rule that found the ends.
+    /// `"axis"`, `"caps"`, `"strip"` or `"direction"`: the rule that found
+    /// the ends.
     #[serde(default)]
     pub rule: String,
 }
@@ -204,7 +222,7 @@ pub fn contact_body_end(
         Some(toward) => toward,
         // Otherwise the end farther from the rest of the part.
         None => {
-            let mut plus_side = true;
+            let mut plus_side = ends.plus_by_default;
             if let Some(centre) = rest_of_part_centre(scene, handle) {
                 let plus = ends.plus_end.sub(centre).length();
                 let minus = ends.minus_end.sub(centre).length();
@@ -240,6 +258,10 @@ struct Ends {
     /// Under the direction rule, whether the Direction points to the `+axis`
     /// end; `None` leaves the side to the rest of the part.
     toward: Option<bool>,
+    /// The wire end when the rest of the part does not decide (the body is
+    /// the only solid, or both ends are equally far): the `+axis` end, except
+    /// under the strip rule (the end with the longer sole, a lead's foot).
+    plus_by_default: bool,
 }
 
 /// The body's ends by the first rule that applies, and its size scale.
@@ -292,6 +314,15 @@ fn body_ends(solid: &crate::BrepSolid, name: &str, direction: Option<Vec3>) -> R
         if high - low <= RELATIVE_TOLERANCE * scale {
             return Err(format!("contact body '{name}' has no length along its axis"));
         }
+        // A body reaching farther from its one axis than it runs along it is
+        // no pin on that axis: a lead with one round bend, whose bend is its
+        // only round face. The strip rule takes it when it finds its ends.
+        let reach = points.iter().map(|p| off_axis(origin, axis, *p)).fold(0.0, f64::max);
+        if direction.is_none() && reach > high - low && strip_axis_enabled() {
+            if let Some(ends) = strip_body_ends(solid, &points, scale) {
+                return Ok((ends, scale));
+            }
+        }
         let ends = Ends {
             axis,
             plus_end: origin.add(axis.scale(high)),
@@ -300,6 +331,7 @@ fn body_ends(solid: &crate::BrepSolid, name: &str, direction: Option<Vec3>) -> R
             minus_outward: axis.scale(-1.0),
             rule: ContactRule::Axis,
             toward: None,
+            plus_by_default: true,
         };
         return Ok((ends, scale));
     }
@@ -378,7 +410,16 @@ fn body_ends(solid: &crate::BrepSolid, name: &str, direction: Option<Vec3>) -> R
                 minus_outward: minus.outward,
                 rule: ContactRule::Caps,
                 toward: None,
+                plus_by_default: true,
             };
+            return Ok((ends, scale));
+        }
+    }
+
+    // No distinct ends and no Direction: a bent strip (a gull-wing lead) still
+    // has two, at the ends of its longest path along its edges.
+    if direction.is_none() && strip_ends_enabled() {
+        if let Some(ends) = strip_body_ends(solid, &points, scale) {
             return Ok((ends, scale));
         }
     }
@@ -419,8 +460,308 @@ fn body_ends(solid: &crate::BrepSolid, name: &str, direction: Option<Vec3>) -> R
         minus_outward: axis.scale(-1.0),
         rule: ContactRule::Direction,
         toward: Some(direction.dot(axis) > 0.0),
+        plus_by_default: true,
     };
     Ok((ends, scale))
+}
+
+/// Whether the strip rule runs: `BREP_CONTACT_STRIP_ENDS`, on unless `0` or
+/// `off`. It only answers a body every earlier rule refused with no
+/// Direction, so turning it on moves no seat that resolved before.
+fn strip_ends_enabled() -> bool {
+    crate::switch!("BREP_CONTACT_STRIP_ENDS", true)
+}
+
+/// Whether the strip rule also takes a body the AXIS rule would seat, when
+/// it reaches farther from its one axis than it runs along it (a lead with
+/// one round bend): `BREP_CONTACT_STRIP_AXIS`, OFF unless set. It moves a
+/// seat that resolved before, so it waits for promotion.
+fn strip_axis_enabled() -> bool {
+    strip_ends_enabled() && crate::switch!("BREP_CONTACT_STRIP_AXIS", false)
+}
+
+/// The two ends of a bent strip (a gull-wing or J lead, a bent tab): the
+/// body every other rule finds no distinct ends on, because its flat end caps
+/// do not face each other and its long flat sides lie at the extremes too.
+///
+/// Its ends are where its longest path runs out. The path is measured along
+/// the body's EDGES (a strip's long edges follow its bends, and an edge
+/// never cuts across a face, so a bend cannot be short-cut): the two points
+/// farthest apart along them (a double sweep: the farthest point from any
+/// point, then the farthest from that) are corners of the two end caps. At
+/// each, the cap is the flat terminal face lying wholly at that end: the one
+/// whose NEAREST boundary point is farthest along the path from the other
+/// end (first from the far corner, then from the whole cap found there, so
+/// crossing the strip's width never counts; the caps found each way must
+/// agree). A side face running the strip's length reaches back to the other
+/// end, and a face of the last straight run reaches back to its bend, so a
+/// cap beats both by the run's length. The cap must beat every other face
+/// by at least half its own size, or the end is not distinct (a cube's three
+/// faces at a corner tie) and the body is still refused: so a strip's last
+/// straight run must be longer than half its cap's diagonal. A body whose
+/// edges are not one connected piece (a face with a hole: pins merged into a
+/// housing, a cross hole) is no strip and is refused too.
+///
+/// With no rest of the part to say which end the wire takes, it takes the
+/// end with the longer sole: a lead's foot is longer than the shoulder where
+/// it leaves the package.
+///
+/// Each end is then SEATED ON ITS SOLE when it has one: the flat terminal
+/// face beside the cap, square to it, facing away from the other end (a
+/// gull-wing foot's underside, which is what lands on the pad). The point is
+/// the sole's centroid and the wire leaves along its normal, INTO the board,
+/// as a through-hole pin's tail does; Align to footprint reads that
+/// direction as the seating plane. An end with no sole keeps its cap's
+/// centroid and outward normal, as a swept pin's end does.
+fn strip_ends(
+    solid: &crate::BrepSolid,
+    planes: &[(&crate::FaceRecord, Vec3)],
+    behind: &dyn Fn(Vec3, Vec3) -> bool,
+    slack: f64,
+) -> Option<((Cap, f64), (Cap, f64))> {
+    let graph = WireGraph::of(solid);
+    if graph.points.len() < 2 {
+        return None;
+    }
+    let from_start = graph.distances(0);
+    // One piece of wire, or no strip: a face with a hole (pins merged into a
+    // housing, a cross hole) leaves edges no path along the others reaches.
+    if from_start.iter().any(|d| !d.is_finite()) {
+        return None;
+    }
+    let p = farthest(&from_start)?;
+    let from_p = graph.distances(p);
+
+    // Terminal flat faces, with their boundary nodes.
+    let faces: Vec<(&crate::FaceRecord, Vec3, Vec3, Vec<usize>)> = planes
+        .iter()
+        .filter_map(|(face, normal)| {
+            let centre = boundary_centroid(solid, face)?;
+            if !behind(centre, *normal) {
+                return None;
+            }
+            let nodes = graph.face_nodes(face);
+            (!nodes.is_empty()).then(|| (*face, *normal, centre, nodes))
+        })
+        .collect();
+    // The cap at the end the field `from_other` is measured away from.
+    let cap_at = |from_other: &[f64]| -> Option<usize> {
+        let mut scored: Vec<(f64, usize)> = faces
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, _, nodes))| {
+                (nodes.iter().map(|n| from_other[*n]).fold(f64::INFINITY, f64::min), i)
+            })
+            .filter(|(score, _)| score.is_finite())
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let &(best, i) = scored.first()?;
+        let size = graph.spread(&faces[i].3);
+        let distinct = scored.get(1).map_or(true, |&(second, _)| best - second >= 0.5 * size);
+        (distinct && size > slack).then_some(i)
+    };
+    // The cap at q's end, from p; then each end measured from the WHOLE cap
+    // at the other (a corner alone would favour the side face across the
+    // strip from it by the strip's width), and the two must agree.
+    let at_q = cap_at(&from_p)?;
+    let at_p = cap_at(&graph.distances_from(&faces[at_q].3))?;
+    if at_p == at_q || cap_at(&graph.distances_from(&faces[at_p].3))? != at_q {
+        return None;
+    }
+    let cap = |i: usize| Cap { point: faces[i].2, outward: faces[i].1, line: None };
+    let (a, b) = (cap(at_p), cap(at_q));
+    if same_end(&a, &b) || a.point.sub(b.point).length() <= slack {
+        return None;
+    }
+    // Each end on its sole, when it has one, with the sole's size (0 for
+    // none).
+    let soled = |end: usize, other: Vec3| -> (Cap, f64) {
+        let (cap_face, normal, centre, _) = &faces[end];
+        let Ok(away) = other.sub(*centre).normalized() else { return (cap(end), 0.0) };
+        let cap_edges: Vec<u64> = face_edges(cap_face);
+        faces
+            .iter()
+            .enumerate()
+            .filter(|(i, (face, n, _, _))| {
+                *i != end
+                    && n.dot(*normal).abs() <= SQUARE
+                    && n.dot(away) <= -SOLE_AWAY
+                    && face_edges(face).iter().any(|e| cap_edges.contains(e))
+            })
+            .min_by(|x, y| x.1 .1.dot(away).total_cmp(&y.1 .1.dot(away)))
+            .map(|(_, (_, n, c, nodes))| (Cap { point: *c, outward: *n, line: None }, graph.spread(nodes)))
+            .unwrap_or_else(|| (cap(end), 0.0))
+    };
+    Some((soled(at_p, b.point), soled(at_q, a.point)))
+}
+
+/// The strip rule's ends ([`strip_ends`]) as [`Ends`], over the body's flat
+/// faces.
+fn strip_body_ends(solid: &crate::BrepSolid, points: &[Vec3], scale: f64) -> Option<Ends> {
+    let slack = TERMINAL_TOLERANCE * scale;
+    let behind = |centre: Vec3, outward: Vec3| points.iter().all(|p| p.sub(centre).dot(outward) <= slack);
+    let planes: Vec<(&crate::FaceRecord, Vec3)> = solid
+        .shells
+        .iter()
+        .flat_map(|shell| &shell.faces)
+        .filter_map(|face| match crate::resolve_face_selection(solid, face.id) {
+            Ok(SelectionGeometry::Plane { normal, .. }) => normal.normalized().ok().map(|normal| (face, normal)),
+            _ => None,
+        })
+        .collect();
+    let ((a, a_sole), (b, b_sole)) = strip_ends(solid, &planes, &behind, slack)?;
+    let axis = canonical(a.point.sub(b.point).normalized().ok()?);
+    let ((plus, plus_sole), (minus, minus_sole)) =
+        if a.point.dot(axis) >= b.point.dot(axis) { ((a, a_sole), (b, b_sole)) } else { ((b, b_sole), (a, a_sole)) };
+    Some(Ends {
+        axis,
+        plus_end: plus.point,
+        minus_end: minus.point,
+        plus_outward: plus.outward,
+        minus_outward: minus.outward,
+        rule: ContactRule::Strip,
+        toward: None,
+        plus_by_default: plus_sole >= minus_sole,
+    })
+}
+
+/// Two flat faces whose normals are within this (|n1 . n2|) are square.
+const SQUARE: f64 = 1e-3;
+/// A sole faces away from the other end: its normal against the direction
+/// to it by at least this (cosine).
+const SOLE_AWAY: f64 = 0.25;
+
+/// The edge ids of a face's loops.
+fn face_edges(face: &crate::FaceRecord) -> Vec<u64> {
+    face.loops.iter().flat_map(|l| l.coedges.iter().map(|c| c.edge_id)).collect()
+}
+
+/// The index of the largest finite distance.
+fn farthest(distances: &[f64]) -> Option<usize> {
+    distances
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.is_finite())
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i)
+}
+
+/// The body's edges as a graph: each vertex one node, each edge sampled into
+/// a chain of nodes between its two vertices.
+struct WireGraph {
+    points: Vec<Vec3>,
+    links: Vec<Vec<(usize, f64)>>,
+    /// Each edge id's chain of nodes.
+    chains: std::collections::HashMap<u64, Vec<usize>>,
+}
+
+impl WireGraph {
+    fn of(solid: &crate::BrepSolid) -> Self {
+        let mut graph = WireGraph { points: Vec::new(), links: Vec::new(), chains: Default::default() };
+        let mut vertex_node: std::collections::HashMap<u64, usize> = Default::default();
+        for vertex in &solid.vertices {
+            vertex_node.insert(vertex.id, graph.node(vertex.point));
+        }
+        for edge in &solid.edges {
+            if edge.degenerate {
+                continue;
+            }
+            let (Some(&start), Some(&end)) = (vertex_node.get(&edge.start_vertex_id), vertex_node.get(&edge.end_vertex_id))
+            else {
+                continue;
+            };
+            let mut chain = vec![start];
+            for i in 1..EDGE_SAMPLES {
+                let t = edge.t0 + (edge.t1 - edge.t0) * (i as f64 / EDGE_SAMPLES as f64);
+                if let Ok(point) = edge.curve.evaluate(t) {
+                    chain.push(graph.node(point));
+                }
+            }
+            chain.push(end);
+            for pair in chain.windows(2) {
+                let length = graph.points[pair[0]].sub(graph.points[pair[1]]).length();
+                graph.links[pair[0]].push((pair[1], length));
+                graph.links[pair[1]].push((pair[0], length));
+            }
+            graph.chains.insert(edge.id, chain);
+        }
+        graph
+    }
+
+    fn node(&mut self, point: Vec3) -> usize {
+        self.points.push(point);
+        self.links.push(Vec::new());
+        self.points.len() - 1
+    }
+
+    /// The nodes on a face's boundary.
+    fn face_nodes(&self, face: &crate::FaceRecord) -> Vec<usize> {
+        let mut nodes: Vec<usize> = face_edges(face)
+            .iter()
+            .filter_map(|e| self.chains.get(e))
+            .flatten()
+            .copied()
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        nodes
+    }
+
+    /// The largest distance between two of `nodes`: a face's size.
+    fn spread(&self, nodes: &[usize]) -> f64 {
+        let mut largest = 0.0_f64;
+        for (k, a) in nodes.iter().enumerate() {
+            for b in &nodes[k + 1..] {
+                largest = largest.max(self.points[*a].sub(self.points[*b]).length());
+            }
+        }
+        largest
+    }
+
+    /// The shortest distance along the edges from `source` to every node.
+    fn distances(&self, source: usize) -> Vec<f64> {
+        self.distances_from(&[source])
+    }
+
+    /// The shortest distance along the edges from the nearest of `sources`
+    /// to every node.
+    fn distances_from(&self, sources: &[usize]) -> Vec<f64> {
+        use std::cmp::Reverse;
+        let mut best = vec![f64::INFINITY; self.points.len()];
+        let mut heap = std::collections::BinaryHeap::new();
+        for &source in sources {
+            best[source] = 0.0;
+            heap.push(Reverse((Ordered(0.0), source)));
+        }
+        while let Some(Reverse((Ordered(d), node))) = heap.pop() {
+            if d > best[node] {
+                continue;
+            }
+            for &(next, length) in &self.links[node] {
+                let through = d + length;
+                if through < best[next] {
+                    best[next] = through;
+                    heap.push(Reverse((Ordered(through), next)));
+                }
+            }
+        }
+        best
+    }
+}
+
+/// An `f64` ordered by `total_cmp`, for the heap.
+#[derive(Clone, Copy, PartialEq)]
+struct Ordered(f64);
+impl Eq for Ordered {}
+impl PartialOrd for Ordered {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Ordered {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
 }
 
 /// The body's extent `[low, high]` along an axis through `origin`, measured

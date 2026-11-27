@@ -42,6 +42,7 @@ pub const STATE_BLOBS: &[(&str, &str)] = &[
     ("__brepSelection", "selection {solids, faces, edges, datums, vertices}; the name arrays are in pick order, oldest first"),
     ("__brepInfoWindows", "open info windows (mass properties, topology, metadata)"),
     ("__brepInterference", "interference check state"),
+    ("__brepDraftAnalysis", "Draft Analysis view {open; when open: pullDirection, flipPull, minAngle, pull (unit, flip applied), pullSource, error, counts {positive, negative, needsDraft, straddle, cap}, faces [{solid, face, minDeg, maxDeg, class, curved, nearLimit}]}"),
     ("__brepAutoConstraints", "auto-constraint inference state"),
     ("__brepStepParts", "STEP parts library panel state"),
     ("__brepSelectionFilter", "which entity kinds a viewport click may pick"),

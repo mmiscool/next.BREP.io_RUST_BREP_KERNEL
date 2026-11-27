@@ -17,6 +17,14 @@ pub struct SceneBuildReport {
     /// Successful plugin callback state, committed with the accepted scene only.
     #[serde(default)]
     pub plugin_persistent_data: Vec<(String, serde_json::Value)>,
+    /// The default pivot each Transform Face with a null `pivot` reported
+    /// (`brep_kernel::feature_pipeline::features::transform_face::DEFAULT_PIVOT_KEY`):
+    /// `(feature id, pivot, the faces it was computed for)`. The engine stores
+    /// it into the feature's `pivot` when the run lands, so the app never
+    /// replays the history on its own (cold-cache) thread to find it.
+    /// Additive: `#[serde(default)]`, omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub face_transform_pivots: Vec<(String, [f64; 3], Vec<String>)>,
     /// Per-feature hard errors, as `"<feature id>: <message>"`.
     pub feature_errors: Vec<String>,
     /// Unresolved reference-selection names, as `"<feature id>: <name>"`.
@@ -207,6 +215,19 @@ fn request_has_assembly(request: &HistoryRequest) -> bool {
         })
 }
 
+/// A Transform Face result's reported default pivot and the faces it was
+/// computed for (see [`SceneBuildReport::face_transform_pivots`]).
+fn face_transform_default_pivot(data: &serde_json::Value) -> Option<([f64; 3], Vec<String>)> {
+    let entry = data.get(brep_kernel::TRANSFORM_FACE_DEFAULT_PIVOT_KEY)?;
+    let pivot = entry.get("pivot")?.as_array()?;
+    let pivot: Vec<f64> = pivot.iter().filter_map(serde_json::Value::as_f64).collect();
+    let pivot: [f64; 3] = pivot.try_into().ok()?;
+    if !pivot.iter().all(|c| c.is_finite()) {
+        return None;
+    }
+    Some((pivot, brep_kernel::reference_names(entry.get("faces"))))
+}
+
 fn fold_history(result: &brep_kernel::HistoryResult, report: &mut SceneBuildReport) -> SceneLayout {
     // Removals first (a boolean result reuses a removed target's name), then
     // additions, insertion-ordered — mirrors SceneMap::apply.
@@ -218,7 +239,14 @@ fn fold_history(result: &brep_kernel::HistoryResult, report: &mut SceneBuildRepo
         std::collections::HashMap::new();
     for (index, feature) in result.results.iter().enumerate() {
         if let Some(data) = &feature.persistent_data {
-            if feature.error.is_none() { report.plugin_persistent_data.push((feature.id.clone(), data.clone())); }
+            if crate::engine_state::is_face_transform_type(&feature.feature_type) {
+                // Not document state: the run's default pivot, on success and on refusal.
+                if let Some(pivot) = face_transform_default_pivot(data) {
+                    report.face_transform_pivots.push((feature.id.clone(), pivot.0, pivot.1));
+                }
+            } else if feature.error.is_none() {
+                report.plugin_persistent_data.push((feature.id.clone(), data.clone()));
+            }
         }
         // A feature whose `inputParams` carry no `id` still has to be nameable in
         // the report, or its errors read as `": <message>"` and point at nothing.

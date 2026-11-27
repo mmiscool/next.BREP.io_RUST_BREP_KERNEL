@@ -59,9 +59,9 @@
 //! of each boundary edge sampled at [`CENTRE_SAMPLES`] equal steps across its
 //! active parameter range (a face with no edge at all — a closed sphere —
 //! contributes its surface control points). Exact for straight-edged faces.
-//! The app stores that value into `pivot` the moment the face selection is
-//! committed (through [`face_transform_pivot`], the same computation), so the
-//! rotation centre is a number in the document: re-running the history, dragging
+//! Every run with a null `pivot` reports that value on its result
+//! ([`DEFAULT_PIVOT_KEY`]), and the app stores it into `pivot` when the run
+//! lands, so the rotation centre is a number in the document: re-running the history, dragging
 //! the gizmo, or editing a feature upstream never moves it. A null pivot in a
 //! hand-written document is resolved the same way on every run, from the same
 //! input, so it cannot drift either.
@@ -115,10 +115,42 @@ pub const REFUSED_STEP_TRANSLATION: &str = "translation";
 pub const CENTRE_SAMPLES: usize = 64;
 
 pub fn execute(ctx: &FeatureContext) -> FeatureResult {
-    match build(ctx) {
+    let mut result = match build(ctx) {
         Ok(result) => result,
         Err(error) => ctx.fail(error),
+    };
+    if let Some(report) = default_pivot_report(ctx) {
+        result.persistent_data = Some(report);
     }
+    result
+}
+
+/// The key of the [`FeatureResult::persistent_data`] a Transform Face with a
+/// NULL `pivot` reports: `{"defaultPivot": {"pivot": [x, y, z], "faces": [...]}}`,
+/// the selection's centre over this run's input and the `faces` it was
+/// computed for. The app stores that value into `pivot` when the run lands
+/// (and only while `faces` still match), so the default reaches the document
+/// from the run that already resolved it — never from a second history replay
+/// on the app's own thread, which has no warm history cache and froze the UI
+/// for as long as a cold rebuild of the whole prefix. Reported on success AND
+/// on refusal: a refused motion still has a pivot for its gizmo.
+pub const DEFAULT_PIVOT_KEY: &str = "defaultPivot";
+
+fn default_pivot_report(ctx: &FeatureContext) -> Option<serde_json::Value> {
+    if !matches!(ctx.param("pivot"), None | Some(serde_json::Value::Null)) {
+        return None;
+    }
+    let names = common::reference_name_array(ctx.param("faces"));
+    if names.is_empty() {
+        return None;
+    }
+    let (handle, face_ids) = resolve_selection(ctx.scene, &names, &mut Vec::new())?;
+    let centre =
+        crate::with_registered_solid_str(handle, |solid| Ok(selection_centre(solid, &face_ids)))
+            .ok()??;
+    Some(serde_json::json!({
+        DEFAULT_PIVOT_KEY: { "pivot": [centre.x, centre.y, centre.z], "faces": names },
+    }))
 }
 
 /// The selection resolved against a scene: the one target solid's handle and

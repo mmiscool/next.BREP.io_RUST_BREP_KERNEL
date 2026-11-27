@@ -171,6 +171,13 @@ pub struct ResolvedRefs {
     /// Screen-constant so the handle is a consistent size; ignored once the value
     /// is non-zero.
     pub plane_dim_length: Option<f64>,
+    /// Draft (`DRAFT`): the resolved unit PULL direction the feature drafted
+    /// for, from its result's `persistentData.draft.pull`.
+    pub draft_pull: Option<[f64; 3]>,
+    /// Draft (`DRAFT`): the resolved neutral (or parting) plane point, from
+    /// `persistentData.draft.neutral` — where the angle arcs and the pull arrow
+    /// stand.
+    pub draft_neutral: Option<[f64; 3]>,
 }
 
 /// Build the linear dimension annotations for a feature `type` from its
@@ -208,6 +215,7 @@ pub fn build_annotations_with_refs(
         "E" => build_extrude(input_params, resolved),
         "R" => build_revolve(input_params, resolved),
         "P" => build_plane(input_params, resolved),
+        "DRAFT" => build_draft(input_params, resolved),
         _ => Vec::new(),
     }
 }
@@ -388,6 +396,69 @@ fn build_plane(params: &Value, resolved: &ResolvedRefs) -> Vec<FeatureDimAnnotat
         "Offset",
     )]
 }
+
+/// Draft (`DRAFT`): the ANGLE as an arc swept from the pull about a line square
+/// to it, at the neutral plane point: the arc's zero line runs along the pull
+/// and its end leans by the draft angle, which is how a drafted wall leans. A
+/// parting line drafted with its own angle on each side gets a second arc,
+/// `angle2`, swept from the reversed pull. Needs the resolved pull and neutral
+/// point (the feature's last successful run); `[]` otherwise.
+fn build_draft(params: &Value, resolved: &ResolvedRefs) -> Vec<FeatureDimAnnotation> {
+    let (Some(pull), Some(neutral)) = (resolved.draft_pull, resolved.draft_neutral) else {
+        return Vec::new();
+    };
+    let pull = normalize_or(pull, [0.0, 0.0, 1.0]);
+    let hinge = arbitrary_perpendicular(pull);
+    let mut out = vec![FeatureDimAnnotation::angular("angle", neutral, hinge, pull, resolve_number(params, "angle"), "A")];
+    let parted = params.get("type").and_then(Value::as_str) == Some("Parting line");
+    let same = params.get("sameBothSides").and_then(Value::as_bool).unwrap_or(true);
+    if parted && !same {
+        let against = [-pull[0], -pull[1], -pull[2]];
+        out.push(FeatureDimAnnotation::angular("angle2", neutral, hinge, against, resolve_number(params, "angle2"), "A2"));
+    }
+    out
+}
+
+/// The Draft's two GLYPHS, appended to the dimension overlay's triangle
+/// buffers: the PULL as an arrow from the neutral point along the pull (blue,
+/// not a handle: it has no value to drag), and the NEUTRAL PLANE as a square
+/// outline about the point, square to the pull. Screen-constant sizes.
+pub fn append_draft_glyph(
+    positions: &mut Vec<f32>,
+    colors: &mut Vec<f32>,
+    neutral: [f64; 3],
+    pull: [f64; 3],
+    world_per_pixel: f64,
+) {
+    let mut tb = TriBuf { positions: std::mem::take(positions), colors: std::mem::take(colors) };
+    let d = normalize_or(pull, [0.0, 0.0, 1.0]);
+    let at = |k: f64| [neutral[0] + d[0] * k, neutral[1] + d[1] * k, neutral[2] + d[2] * k];
+    let length = DRAFT_PULL_LEN_PX * world_per_pixel;
+    let cone = CONE_LEN_PX * world_per_pixel;
+    push_tube(&mut tb, neutral, at(length - cone), SHAFT_RAD_PX * world_per_pixel, PULL_RGB);
+    push_cone(&mut tb, at(length - cone), at(length), CONE_RAD_PX * world_per_pixel, PULL_RGB);
+    let (u, v) = axis_basis(d);
+    let half = DRAFT_PLANE_HALF_PX * world_per_pixel;
+    let corner = |a: f64, b: f64| {
+        [
+            neutral[0] + (u[0] * a + v[0] * b) * half,
+            neutral[1] + (u[1] * a + v[1] * b) * half,
+            neutral[2] + (u[2] * a + v[2] * b) * half,
+        ]
+    };
+    let corners = [corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)];
+    for i in 0..4 {
+        push_tube(&mut tb, corners[i], corners[(i + 1) % 4], ANGLE_RAY_RAD_PX * world_per_pixel, PULL_RGB);
+    }
+    *positions = tb.positions;
+    *colors = tb.colors;
+}
+
+/// The Draft glyphs' colour (the reference blue of the feature icons) and
+/// screen sizes.
+const PULL_RGB: [f32; 3] = [0.239, 0.525, 0.769];
+const DRAFT_PULL_LEN_PX: f64 = 90.0;
+const DRAFT_PLANE_HALF_PX: f64 = 60.0;
 
 /// Revolve (`R`): one ANGULAR dim = `angle` DEGREES swept about the resolved axis
 /// line, oriented toward the profile front (the `orient_revolve_axis` port — so

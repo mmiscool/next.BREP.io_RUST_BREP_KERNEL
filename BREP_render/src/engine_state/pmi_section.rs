@@ -284,6 +284,7 @@ pub(super) fn clip_display_all(display: &mut SolidDisplay, planes: &[Plane]) {
             kind: FaceKind::SectionCap,
             color_override: Some(SECTION_CAP_RGB),
             opacity: None,
+            analysis_color: None,
         });
     }
     let mut edges = Vec::new();

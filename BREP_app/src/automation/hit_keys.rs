@@ -55,6 +55,7 @@ pub fn hit_key_docs() -> Vec<&'static HitKeyDoc> {
         crate::panels::info::HIT_KEYS,
         crate::panels::info_windows::HIT_KEYS,
         crate::panels::interference::HIT_KEYS,
+        crate::panels::draft_analysis::HIT_KEYS,
         crate::panels::auto_constraints::HIT_KEYS,
         crate::panels::step_parts::HIT_KEYS,
         crate::panels::wire_harness::HIT_KEYS,

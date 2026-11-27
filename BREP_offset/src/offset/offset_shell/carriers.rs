@@ -1185,31 +1185,32 @@ pub(super) fn merge_pair_imprint(
         let id = *next_piece_id;
         *next_piece_id += 1;
         piece_map.insert(piece.id, id);
-        global.pieces.push(ImprintPieceRecord {
-            id,
-            curve: piece.curve,
-            t0: piece.t0,
-            t1: piece.t1,
-            start_vertex_id: vertex_map[&piece.start_vertex_id],
-            end_vertex_id: vertex_map[&piece.end_vertex_id],
-            pcurves: piece
-                .pcurves
-                .into_iter()
-                .map(|pcurve| FacePcurve {
-                    operand: remap_operand(pcurve.operand),
-                    face_id: pcurve.face_id,
-                    pcurve: pcurve.pcurve,
-                })
-                .collect(),
-            support_faces: piece.support_faces.map(|face| FaceKey {
-                operand: remap_operand(face.operand),
-                face_id: face.face_id,
-            }),
-            certified_ruling_side: None,
-            shared_edge: piece
-                .shared_edge
-                .map(|(operand, edge_id, aligned)| (remap_operand(operand), edge_id, aligned)),
-        });
+        global.pieces.push(
+            ImprintPieceRecord::new(
+                id,
+                piece.curve,
+                [piece.t0, piece.t1],
+                [vertex_map[&piece.start_vertex_id], vertex_map[&piece.end_vertex_id]],
+                piece
+                    .pcurves
+                    .into_iter()
+                    .map(|pcurve| FacePcurve {
+                        operand: remap_operand(pcurve.operand),
+                        face_id: pcurve.face_id,
+                        pcurve: pcurve.pcurve,
+                    })
+                    .collect(),
+                piece.support_faces.map(|face| FaceKey {
+                    operand: remap_operand(face.operand),
+                    face_id: face.face_id,
+                }),
+            )
+            .with_shared_edge(
+                piece
+                    .shared_edge
+                    .map(|(operand, edge_id, aligned)| (remap_operand(operand), edge_id, aligned)),
+            ),
+        );
     }
     for by_face in pair.by_face {
         let operand = remap_operand(by_face.operand);
@@ -1251,11 +1252,7 @@ pub(super) fn merge_pair_imprint(
                 }
             }
         } else {
-            global.edge_splits.push(EdgeSplitRecord {
-                operand,
-                edge_id: split.edge_id,
-                parameters: split.parameters,
-            });
+            global.edge_splits.push(EdgeSplitRecord::new(operand, split.edge_id, split.parameters));
         }
     }
 }
@@ -1618,6 +1615,24 @@ pub(super) fn miter_vertex_gauge_on() -> bool {
     switch!("BREP_OFFSET_MITER_VERTEX_GAUGE", true)
 }
 
+/// `BREP_OFFSET_MITER_TANGENT_VERTEX` (default on; `=0` restores): a point
+/// whose foot lies past a VERTEX of a planar face where every edge of the face
+/// meeting at that vertex is TANGENT to a retained face reads the Euclidean
+/// distance to the vertex, `hypot(height, past)`, as a tangent edge's interior
+/// already does. Around such a corner the face continues smoothly into its
+/// rounds, so the offset skin there is rounded too and no miter exists.
+///
+/// Cause (2026-11-26 report: a rounded-rectangle profile extruded, its end cap
+/// filleted r 1, shelled outward by 3.5 refused "completed shell has invalid
+/// topology"): each cap corner is where two r 1 quarter rounds meet a sphere
+/// corner (a degenerate torus) at its pole. A point of the sphere's offset
+/// skin at 45 degrees read `max(height, past)` = `(1 + d) / sqrt(2)` from the
+/// cap, under `d` once `d > 2.414`; all four sphere corners read shadowed, were
+/// omitted, and left four open holes. `hypot` reads 3.86 against 3.5 there.
+pub(super) fn miter_tangent_vertex_on() -> bool {
+    switch!("BREP_OFFSET_MITER_TANGENT_VERTEX", true)
+}
+
 /// `BREP_OFFSET_MITER_CURVED_NEIGHBOUR` (default on; `=0` restores): past a
 /// sharp edge whose neighbour is CURVED, the mitered distance to a planar face
 /// reads `max(height, h_S)`, `h_S` the point's signed height over the
@@ -1784,6 +1799,8 @@ fn miter_distance_with_neighbours(
         }
         if !at_vertex && tangent(edge)? {
             best = best.min(height.hypot(past));
+        } else if at_vertex && miter_tangent_vertex_on() && vertex_edges_all_tangent(edge, foot, edges, tangent)? {
+            best = best.min(height.hypot(past));
         } else {
             let mut reading = height.max(past);
             // NEIGHBOUR GAUGE (`BREP_OFFSET_MITER_NEIGHBOUR_GAUGE`): across the interior of a
@@ -1863,6 +1880,39 @@ fn miter_distance_with_neighbours(
         }
     }
     Ok(Some(best))
+}
+
+/// Whether every non-degenerate edge of the face meeting `edge` at its end
+/// nearest `foot` is tangent to a retained face (see
+/// [`miter_tangent_vertex_on`]).
+fn vertex_edges_all_tangent(
+    edge: &EdgeRecord,
+    foot: Vec3,
+    edges: &[&EdgeRecord],
+    tangent: &mut dyn FnMut(&EdgeRecord) -> Result<bool, KernelRefusal>,
+) -> Result<bool, KernelRefusal> {
+    let start = edge.curve.evaluate(edge.t0).or_refuse(KernelStage::Refine, "evaluate")?;
+    let end = edge.curve.evaluate(edge.t1).or_refuse(KernelStage::Refine, "evaluate")?;
+    let at = if start.sub(foot).length() <= end.sub(foot).length() { start } else { end };
+    let band = 1e-9 * (1.0 + at.length());
+    let mut met = 0;
+    for other in edges.iter().copied() {
+        if other.degenerate {
+            continue;
+        }
+        let ends = [
+            other.curve.evaluate(other.t0).or_refuse(KernelStage::Refine, "evaluate")?,
+            other.curve.evaluate(other.t1).or_refuse(KernelStage::Refine, "evaluate")?,
+        ];
+        if !ends.iter().any(|end| end.sub(at).length() <= band) {
+            continue;
+        }
+        if !tangent(other)? {
+            return Ok(false);
+        }
+        met += 1;
+    }
+    Ok(met >= 2)
 }
 
 /// How far `point` sits from its OWN retained face in the MITERED metric, less
@@ -3295,18 +3345,17 @@ pub(super) fn translate_composite_imprint(
             }
             None => None,
         };
-        out.pieces.push(ImprintPieceRecord {
-            id: piece.id,
-            curve: piece.curve,
-            t0: piece.t0,
-            t1: piece.t1,
-            start_vertex_id: piece.start_vertex_id,
-            end_vertex_id: piece.end_vertex_id,
-            pcurves,
-            support_faces: [face(&piece.support_faces[0])?, face(&piece.support_faces[1])?],
-            shared_edge,
-            certified_ruling_side: None,
-        });
+        out.pieces.push(
+            ImprintPieceRecord::new(
+                piece.id,
+                piece.curve,
+                [piece.t0, piece.t1],
+                [piece.start_vertex_id, piece.end_vertex_id],
+                pcurves,
+                [face(&piece.support_faces[0])?, face(&piece.support_faces[1])?],
+            )
+            .with_shared_edge(shared_edge),
+        );
     }
     for by_face in record.by_face {
         let key = face(&FaceKey { operand: by_face.operand, face_id: by_face.face_id })?;
@@ -3339,7 +3388,7 @@ pub(super) fn translate_composite_imprint(
                 }
             }
         } else {
-            out.edge_splits.push(EdgeSplitRecord { operand, edge_id, parameters: split.parameters });
+            out.edge_splits.push(EdgeSplitRecord::new(operand, edge_id, split.parameters));
         }
     }
     for (_, edge_id) in record.barrier_edges {
