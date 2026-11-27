@@ -2,7 +2,7 @@
 //! `egui::Event`s in the frame's `RawInput`; `click` / `drag` / `hotkey` are
 //! host-side compositions of these.
 use crate::automation::command::{parse_args, schema_of, Annotations, CommandSpec, Handler, NoArgs, Phase};
-use crate::automation::pointer::{Button, Modifiers, Pointer, PointerState, WheelUnit};
+use crate::automation::pointer::{Button, Modifiers, Platform, Pointer, PointerState, WheelUnit};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -92,6 +92,17 @@ fn wheel(p: &mut Pointer, args: Value, out: &mut Vec<egui::Event>) -> Result<Val
 fn modifiers_set(p: &mut Pointer, args: Value, _out: &mut Vec<egui::Event>) -> Result<Value, String> {
     let m: Modifiers = parse_args(args)?;
     p.set_modifiers(m);
+    Ok(empty())
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PlatformArgs {
+    /// `mac`, `windows` or `linux`.
+    os: Platform,
+}
+fn platform_set(p: &mut Pointer, args: Value, _out: &mut Vec<egui::Event>) -> Result<Value, String> {
+    let a: PlatformArgs = parse_args(args)?;
+    p.platform = Some(a.os);
     Ok(empty())
 }
 fn key(p: &mut Pointer, args: Value, out: &mut Vec<egui::Event>) -> Result<Value, String> {
@@ -185,6 +196,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "pointer_gone", group: "pointer", doc: "Take the pointer off the surface (PointerGone): clears hover state and released buttons.", phase: Phase::Input, annotations: Annotations::INPUT, args_schema: schema_of::<NoArgs>, result_schema: crate::automation::command::empty_result_schema, handler: Handler::Input(pointer_gone) },
     CommandSpec { name: "wheel", group: "pointer", doc: "Scroll at the current pointer position. dy < 0 zooms the viewport in; over a panel it scrolls. Raw MouseWheel, unit point/line/page.", phase: Phase::Input, annotations: Annotations::INPUT, args_schema: schema_of::<WheelArgs>, result_schema: crate::automation::command::empty_result_schema, handler: Handler::Input(wheel) },
     CommandSpec { name: "modifiers_set", group: "pointer", doc: "Set the held modifier keys for every following pointer and key event until changed.", phase: Phase::Input, annotations: Annotations::INPUT, args_schema: schema_of::<Modifiers>, result_schema: crate::automation::command::empty_result_schema, handler: Handler::Input(modifiers_set) },
+    CommandSpec { name: "platform_set", group: "pointer", doc: "Emulate an operating system's input conventions from the next frame on (egui's `Context::set_os` and the modifier mapping): on `mac` the `command` modifier is Cmd and `ctrl` is Control alone, so a Ctrl+click is the secondary (right) click and Cmd+click is the additive select; on `windows`/`linux` `ctrl` and `command` are one key. Stays until set again.", phase: Phase::Input, annotations: Annotations::INPUT, args_schema: schema_of::<PlatformArgs>, result_schema: crate::automation::command::empty_result_schema, handler: Handler::Input(platform_set) },
     CommandSpec { name: "key", group: "keyboard", doc: "Press (pressed=true) or release a key by egui name, with the held modifiers.", phase: Phase::Input, annotations: Annotations::INPUT, args_schema: schema_of::<KeyArgs>, result_schema: crate::automation::command::empty_result_schema, handler: Handler::Input(key) },
     CommandSpec { name: "text", group: "keyboard", doc: "Type text into the focused widget (an egui Text event). Click a field first.", phase: Phase::Input, annotations: Annotations::INPUT, args_schema: schema_of::<TextArgs>, result_schema: crate::automation::command::empty_result_schema, handler: Handler::Input(text) },
     CommandSpec { name: "paste", group: "keyboard", doc: "Paste text into the focused widget, as Ctrl+V delivers it (an egui Paste event, the whole text at once). A spreadsheet's tab-separated rows pasted into a table land as a block.", phase: Phase::Input, annotations: Annotations::INPUT, args_schema: schema_of::<PasteArgs>, result_schema: crate::automation::command::empty_result_schema, handler: Handler::Input(paste) },

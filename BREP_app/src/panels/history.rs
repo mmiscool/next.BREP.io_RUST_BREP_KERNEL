@@ -270,6 +270,9 @@ impl PanelMode {
 #[derive(Default)]
 pub struct HistoryPanel {
     rejected_edit: Option<(String, String)>,
+    /// The RANGE anchor: the feature a plain or primary click last selected
+    /// (Shift+click selects from it to the clicked row).
+    anchor: Option<String>,
     /// The per-frame map of egui widget screen rects, published to JS for the
     /// headed verifier. Rebuilt every frame.
     hits: HashMap<String, egui::Rect>,
@@ -806,7 +809,7 @@ impl HistoryPanel {
         // The feature a single click SELECTED — applied after the draw loop too.
         // The clicked row, and whether the click ADDS to the selection
         // (Ctrl/Cmd or Shift, as in the viewport).
-        let mut select: Option<(String, bool)> = None;
+        let mut select: Option<(String, crate::select_mods::RowClick)> = None;
         // The feature whose FORM to open — `(index, id)`. Applied after the draw
         // loop, with the roll, so the mode flip and the roll are one step.
         let mut open_form: Option<(usize, String)> = None;
@@ -935,8 +938,7 @@ impl HistoryPanel {
                 if edit_clicked || resp.double_clicked() {
                     open_form = Some((i, id.clone()));
                 } else if resp.clicked() {
-                    let additive = ui.input(|input| input.modifiers.command || input.modifiers.shift);
-                    select = Some((id.clone(), additive));
+                    select = Some((id.clone(), crate::select_mods::RowClick::in_ctx(ui.ctx())));
                 }
                 // A press ANYWHERE on the row can turn into a drag — the band
                 // senses drag too, because egui withdraws the click from a slow
@@ -1029,8 +1031,8 @@ impl HistoryPanel {
                             // feature, exactly like `resp.clicked()` does. egui
                             // never fires both a click and a drag for one press,
                             // so this can't select twice.
-                            let additive = ui.input(|input| input.modifiers.command || input.modifiers.shift);
-                            select = state.feature_id_at(src).map(|id| (id, additive));
+                            let click = crate::select_mods::RowClick::in_ctx(ui.ctx());
+                            select = state.feature_id_at(src).map(|id| (id, click));
                         } else {
                             drag_move = Some((src, target));
                         }
@@ -1085,12 +1087,41 @@ impl HistoryPanel {
             state.roll_to(i);
         } else if let Some(i) = roll {
             state.roll_to(i);
-        } else if let Some((id, additive)) = select {
+        } else if let Some((id, click)) = select {
             // Selecting never rolls: a click is a look, not a rebuild.
-            if additive {
-                state.add_feature_to_selection(&id);
-            } else {
-                state.select_feature(&id);
+            // Plain: this feature; primary (Ctrl, Cmd on macOS): add it;
+            // Shift: the RANGE from the anchor (history order); primary+Shift:
+            // add that range.
+            use crate::select_mods::RowClick;
+            let ids: Vec<String> = (0..).map_while(|i| state.feature_id_at(i)).collect();
+            let range = match (&self.anchor, click.is_range()) {
+                (Some(anchor), true) => crate::select_mods::range(&ids, anchor, &id).map(<[String]>::to_vec),
+                _ => None,
+            };
+            match (click, range) {
+                (RowClick::Range, Some(range)) => {
+                    for (i, feature) in range.iter().enumerate() {
+                        if i == 0 {
+                            state.select_feature(feature);
+                        } else {
+                            state.add_feature_to_selection(feature);
+                        }
+                    }
+                }
+                (RowClick::AddRange, Some(range)) => {
+                    for feature in &range {
+                        state.add_feature_to_selection(feature);
+                    }
+                }
+                (RowClick::Toggle | RowClick::AddRange, _) => {
+                    state.add_feature_to_selection(&id);
+                }
+                (RowClick::Replace | RowClick::Range, _) => {
+                    state.select_feature(&id);
+                }
+            }
+            if click.sets_anchor() || self.anchor.as_ref().is_none_or(|a| !ids.contains(a)) {
+                self.anchor = Some(id);
             }
         }
 

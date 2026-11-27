@@ -522,6 +522,8 @@ impl SketchPanel {
             // S2 picking state (the headless verifier asserts hover/selection).
             "hovered": session.and_then(|s| s.selection.hovered.clone()),
             "selectionCount": state.sketch_selection_count(),
+            // The selected refs themselves ({kind, id}, selection order).
+            "selection": session.map(|s| s.selection.items.clone()).unwrap_or_default(),
             // Constraint selection (select + delete): how many selected refs are
             // constraints, so the verifier can assert a constraint pick + delete.
             "selectedConstraintCount": state.sketch_selected_constraint_count(),
@@ -721,7 +723,7 @@ fn entity_section(
         if delete_clicked {
             to_delete = Some(row.id.clone());
         } else if resp.clicked() {
-            let additive = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+            let additive = crate::select_mods::primary_in(ui.ctx());
             state.sketch_select_entity(kind, row.id.clone(), additive);
         }
         if resp.label.hovered() {

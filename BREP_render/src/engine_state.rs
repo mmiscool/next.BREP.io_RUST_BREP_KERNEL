@@ -110,6 +110,10 @@ pub struct EngineState {
     /// consults it via `pick_filtered`; see the appended `SelectionFilter` impl
     /// block near the end of this file for the state + honoring logic.
     pub selection_filter: SelectionFilter,
+    /// The HELD-LETTER filter override: the
+    /// kind a held key (S/F/E/V/C/P) admits and the bottom filter it
+    /// replaced, restored when the key is released.
+    pub(crate) filter_override: Option<(&'static str, SelectionFilter)>,
     /// The transform-controls gizmo controller: which feature (if any) has the
     /// move/rotate gizmo armed (via the in-viewport center-sphere toggle), plus the
     /// in-flight handle drag. All the arm/drag/apply logic lives in the appended
@@ -843,6 +847,7 @@ impl Default for EngineState {
             ref_select: None,
             replace_repair_pick: None,
             selection_filter: SelectionFilter::default(),
+            filter_override: None,
             transform_gizmo: TransformArm::default(),
             component_move: ComponentMoveArm::default(),
             sketch_edit: None,
@@ -1098,6 +1103,8 @@ mod model_io;
 /// single-hit pick (`pick_top_at`), the shared candidate ordering, and the
 /// plane-pick tests. Read its header for how a plane competes for a pick.
 mod plane_pick;
+mod box_select;
+pub use box_select::BoxSelectMode;
 /// Scene & object queries: `pick_json`/`hover_json`, settings + emphasis +
 /// visibility + color overrides, `scene_listing_json`, `depth_range_bbox`,
 /// `scene_entities_json`/select-by-name, mass properties + object info, tests.

@@ -203,6 +203,24 @@ pub fn import_step_bodies(text: &str) -> Result<ImportedStep, StepBodyError> {
         })));
     }
     if imported.solids.is_empty() {
+        // A SURFACE MODEL and nothing else (`BREP_STEP_SURFACE_MODEL_SHEETS`,
+        // default on, =0 restores the refusal): a file whose only bodies are
+        // open SHELL_BASED_SURFACE_MODEL shells, which the solid lane skips,
+        // reads as those sheets (`BodyKind::Sheet`), as the Parasolid and IGES
+        // lanes already read theirs. Until 2026-11-26 such a file was refused as
+        // having no body (step-conformance's bowl_01: five faces of a revolved
+        // bowl, written by Open CASCADE). A file with any solid, or any body
+        // that failed, is unchanged; so is a sheet read that fails or refuses.
+        if imported.failed == 0
+            && imported.sheets_skipped > 0
+            && crate::switch!("BREP_STEP_SURFACE_MODEL_SHEETS", true)
+        {
+            if let Ok(sheets) = bodies::collect_step_solids_with(text, true, false) {
+                if sheets.failed == 0 && sheets.refused_bodies.is_empty() && !sheets.solids.is_empty() {
+                    return Ok(ImportedStep { solids: sheets.solids, appearances: sheets.appearances, approximations: Vec::new() });
+                }
+            }
+        }
         // A file of AP242 tessellated solids and no B-rep body at all reads as
         // polyhedra; a B-rep body that failed keeps its own error.
         let entities = parse_data_section(text).map_err(StepBodyError::Text)?;

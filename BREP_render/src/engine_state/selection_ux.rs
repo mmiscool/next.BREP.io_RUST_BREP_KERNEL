@@ -1640,7 +1640,7 @@ impl EngineState {
     /// The scene name a SOLID candidate resolves to (its owning `solid`, falling
     /// back to `name` when the pick didn't carry one) — the same rule
     /// `set_selection_to_candidate` uses.
-    fn candidate_solid_name(&self, candidate: &pick::PickCandidate) -> String {
+    pub(super) fn candidate_solid_name(&self, candidate: &pick::PickCandidate) -> String {
         if candidate.solid.is_empty() {
             candidate.name.clone()
         } else {

@@ -309,6 +309,35 @@ impl SketchSession {
     /// POINT wins over geometry when one is in range (points take priority), else
     /// the nearest geometry whose polyline passes within `radius`. Construction
     /// geometry is included (it is pickable). `None` when nothing is in range.
+    /// The points and curves a BOX takes, `quad` being the screen box's four
+    /// corners on the sketch plane (in order): every entity of the sketch is
+    /// drawn and visible, so WINDOW (`crossing == false`) takes what lies
+    /// fully inside and CROSSING anything that touches it. Point refs first,
+    /// then geometry refs, in document order.
+    pub fn box_refs(&self, quad: [(f64, f64); 4], crossing: bool) -> Vec<Value> {
+        let inside = |p: (f64, f64)| quad_contains(&quad, p);
+        let mut out = Vec::new();
+        for p in &self.doc.points {
+            if inside((p.x, p.y)) {
+                out.push(point_ref(&p.id));
+            }
+        }
+        for g in &self.doc.geometries {
+            let poly = tessellate::geometry_polyline_uv(g, &self.doc);
+            if poly.is_empty() {
+                continue;
+            }
+            let all = poly.iter().all(|q| inside((q[0], q[1])));
+            let touches = all
+                || poly.iter().any(|q| inside((q[0], q[1])))
+                || poly.windows(2).any(|seg| quad_crosses(&quad, (seg[0][0], seg[0][1]), (seg[1][0], seg[1][1])));
+            if if crossing { touches } else { all } {
+                out.push(geometry_ref(&g.id));
+            }
+        }
+        out
+    }
+
     pub fn pick_entity(&self, u: f64, v: f64, radius: f64) -> Option<Value> {
         // Points first (priority over geometry under the cursor).
         let mut best_pt: Option<(f64, &Value)> = None;
@@ -527,6 +556,35 @@ fn seed_doc() -> SketchDoc {
 // (so numeric `4` and string `"4"` are the same entity).
 
 /// Build a `{"kind":"point","id":<id>}` entity ref.
+/// Whether `p` lies in the convex quad (either winding).
+fn quad_contains(quad: &[(f64, f64); 4], p: (f64, f64)) -> bool {
+    let mut sign = 0.0_f64;
+    for i in 0..4 {
+        let (a, b) = (quad[i], quad[(i + 1) % 4]);
+        let cross = (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0);
+        if cross.abs() < 1e-12 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether segment `a`-`b` crosses an edge of the quad.
+fn quad_crosses(quad: &[(f64, f64); 4], a: (f64, f64), b: (f64, f64)) -> bool {
+    let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0);
+    (0..4).any(|i| {
+        let (c, d) = (quad[i], quad[(i + 1) % 4]);
+        let (o1, o2) = (orient(a, b, c), orient(a, b, d));
+        let (o3, o4) = (orient(c, d, a), orient(c, d, b));
+        o1 * o2 < 0.0 && o3 * o4 < 0.0
+    })
+}
+
 pub fn point_ref(id: &Value) -> Value {
     json!({ "kind": "point", "id": id.clone() })
 }

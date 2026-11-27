@@ -190,6 +190,7 @@ pub struct FormViewOut {
 /// | `field:{path}` | a field's input widget |
 /// | `field:{path}#{variant}` | an OPEN enum's items |
 /// | `field:{path}#activate` / `#x{i}` | a reference's Select / remove buttons (the focused field's Select is its Done) |
+/// | `field:{path}#line{i}` / `#xsel` | a list reference's line (click selects, Ctrl/Cmd toggles, Shift selects the range) / its Remove selected button |
 /// | `field:{path}#line{i}` | a reference's i-th chosen-entity line |
 /// | `form:trailing:{Section}:{i}` | a read-only section's i-th line (`Outputs`) |
 ///

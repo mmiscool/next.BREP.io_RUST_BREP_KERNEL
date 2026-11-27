@@ -136,8 +136,20 @@ impl SelectionPanel {
         // then would clobber that constraint, so LOCK the row: it still shows
         // the constrained kinds (greyed) but is non-interactive until the
         // picker finishes/cancels and the filter is restored.
-        let locked = state.ref_select_active();
-        if locked {
+        let held = state.filter_override();
+        let locked = state.ref_select_active() || held.is_some();
+        if let (Some(kind), false) = (held, state.ref_select_active()) {
+            // A HELD LETTER overrides this row for as long as it is held
+            // (the viewport's held-letter override): say so, the row greyed
+            // underneath, until the key is released.
+            let resp = ui.label(
+                egui::RichText::new(format!("\u{2328} Key held: only {} pickable", held_kind_label(kind)))
+                    .strong()
+                    .color(ui.visuals().warn_fg_color),
+            );
+            self.hits.insert("filter:override".into(), resp.rect);
+            resp.on_hover_text("Release the key and this filter is back.");
+        } else if locked {
             ui.icon_label(egui::RichText::new("\u{1f512} Reference selection — filter locked").weak())
                 .on_hover_text(
                     "The pick filter is set by the field being referenced. \
@@ -152,7 +164,7 @@ impl SelectionPanel {
         // — the constrained filter cannot be overwritten. Rects are still laid
         // out and published so the verifier and layout stay consistent.
         ui.add_enabled_ui(!locked, |ui| {
-            let mut filter = state.selection_filter();
+            let mut filter = state.bottom_selection_filter();
             let before = filter;
 
             // Leading "All" TRISTATE CHECKBOX (mirrors the Scene tree's group
@@ -240,5 +252,18 @@ fn toggle_all_target(filter: &SelectionFilter) -> bool {
 /// The hit keys this panel publishes (see `automation::hit_keys`).
 pub static HIT_KEYS: &[HitKeyDoc] = &[
     HitKeyDoc { panel: "selection", prefix: "filters:toggle", meaning: "show or hide pickable filters when the status bar is compact", command: None },
-    HitKeyDoc { panel: "selection", prefix: "filter:", meaning: "toggle which entity kinds a click may pick (filter:ALL, filter:kind)", command: None },
+    HitKeyDoc { panel: "selection", prefix: "filter:", meaning: "toggle which entity kinds a click may pick (filter:ALL, filter:kind); filter:override is the note shown while a held letter (S/F/E/V/C/P, D for faces in PCB) overrides the row", command: None },
 ];
+
+/// How the held-letter override's kind reads in the filter row.
+fn held_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "SOLID" => "solids",
+        "FACE" => "faces",
+        "EDGE" => "edges",
+        "VERTEX" => "vertices",
+        "COMPONENT" => "components",
+        "PLANE" => "planes",
+        _ => "?",
+    }
+}

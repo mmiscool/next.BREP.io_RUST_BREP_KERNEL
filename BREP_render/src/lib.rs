@@ -43,6 +43,7 @@ pub mod history;
 mod json_support;
 pub mod metadata;
 pub mod pick;
+pub mod box_pick;
 pub mod pipeline;
 pub mod render;
 pub mod run_trace;

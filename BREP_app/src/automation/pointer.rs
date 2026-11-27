@@ -51,13 +51,51 @@ pub struct Modifiers {
 }
 
 impl Modifiers {
+    /// The egui modifiers off macOS: `ctrl` and `command` are one key.
     pub fn egui(self) -> egui::Modifiers {
-        egui::Modifiers {
-            alt: self.alt,
-            ctrl: self.ctrl || self.command,
-            shift: self.shift,
-            mac_cmd: self.command,
-            command: self.ctrl || self.command,
+        self.egui_for(false)
+    }
+
+    /// The egui modifiers as the platform's runner reports them. On macOS
+    /// (`mac`, see `platform_set`) Ctrl and Cmd are two keys: `ctrl` is
+    /// Control alone, `command` is Cmd (`mac_cmd` and egui's `command`), as
+    /// egui-winit reports them there.
+    pub fn egui_for(self, mac: bool) -> egui::Modifiers {
+        if mac {
+            egui::Modifiers {
+                alt: self.alt,
+                ctrl: self.ctrl,
+                shift: self.shift,
+                mac_cmd: self.command,
+                command: self.command,
+            }
+        } else {
+            egui::Modifiers {
+                alt: self.alt,
+                ctrl: self.ctrl || self.command,
+                shift: self.shift,
+                mac_cmd: self.command,
+                command: self.ctrl || self.command,
+            }
+        }
+    }
+}
+
+/// The operating system `platform_set` emulates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    Mac,
+    Windows,
+    Linux,
+}
+
+impl Platform {
+    pub fn os(self) -> egui::os::OperatingSystem {
+        match self {
+            Self::Mac => egui::os::OperatingSystem::Mac,
+            Self::Windows => egui::os::OperatingSystem::Windows,
+            Self::Linux => egui::os::OperatingSystem::Nix,
         }
     }
 }
@@ -89,6 +127,13 @@ pub struct Pointer {
     pub pos: Option<egui::Pos2>,
     pub buttons: [bool; 5],
     pub modifiers: Modifiers,
+    /// The emulated OS (`platform_set`); `None` keeps the host's. Applied to
+    /// egui (`Context::set_os`) by `drain_input`, and it decides how
+    /// [`Modifiers`] map to egui's.
+    pub platform: Option<Platform>,
+    /// Whether the last pass's `raw.modifiers` were this pointer's (see
+    /// `drain_input`): the user's own modifiers apply otherwise.
+    pub modifiers_applied: bool,
     /// egui's clock for the frame being drained, set by
     /// [`drain_input`](crate::automation::queue::AutomationQueue::drain_input)
     /// before the frame's commands run.
@@ -137,7 +182,7 @@ impl Pointer {
                 self.released = Some(now);
             }
         }
-        out.push(egui::Event::PointerButton { pos, button: button.egui(), pressed, modifiers: self.modifiers.egui() });
+        out.push(egui::Event::PointerButton { pos, button: button.egui(), pressed, modifiers: self.egui_modifiers() });
         Ok(())
     }
 
@@ -186,8 +231,13 @@ impl Pointer {
             unit,
             delta: egui::vec2(dx, dy),
             phase: egui::TouchPhase::Move,
-            modifiers: self.modifiers.egui(),
+            modifiers: self.egui_modifiers(),
         });
+    }
+
+    /// The held modifiers as this pointer's platform reports them.
+    pub fn egui_modifiers(&self) -> egui::Modifiers {
+        self.modifiers.egui_for(self.platform == Some(Platform::Mac))
     }
 
     pub fn set_modifiers(&mut self, m: Modifiers) {
@@ -196,7 +246,7 @@ impl Pointer {
 
     pub fn key(&mut self, name: &str, pressed: bool, repeat: bool, out: &mut Vec<egui::Event>) -> Result<(), String> {
         let key = egui::Key::from_name(name).ok_or_else(|| format!("unknown key `{name}` (egui key names: A..Z, 0..9, Enter, Escape, Tab, Space, Backspace, Delete, ArrowLeft/Right/Up/Down, Home, End, PageUp/Down, F1..F12, Minus, Plus, …)"))?;
-        out.push(egui::Event::Key { key, physical_key: None, pressed, repeat, modifiers: self.modifiers.egui() });
+        out.push(egui::Event::Key { key, physical_key: None, pressed, repeat, modifiers: self.egui_modifiers() });
         Ok(())
     }
 

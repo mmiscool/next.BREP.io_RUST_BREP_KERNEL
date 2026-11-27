@@ -196,10 +196,79 @@ impl EngineState {
         self.selection_filter
     }
 
+    /// Start the HELD-LETTER override: while the key is held only `kind`
+    /// (`SOLID`, `FACE`, `EDGE`, `VERTEX`, `COMPONENT`, `PLANE`) is
+    /// pickable — for hover, clicks and box drags alike — and the bottom
+    /// filter comes back untouched by [`Self::end_filter_override`]. Refused
+    /// (false) while a reference field is picking (the field sets the kinds)
+    /// or for an unknown kind; a second letter while one is held replaces
+    /// the override, keeping the bottom filter it saved.
+    pub fn begin_filter_override(&mut self, kind: &str) -> bool {
+        let kind: &'static str = match kind.to_ascii_uppercase().as_str() {
+            "SOLID" => "SOLID",
+            "FACE" => "FACE",
+            "EDGE" => "EDGE",
+            "VERTEX" => "VERTEX",
+            "COMPONENT" => "COMPONENT",
+            "PLANE" => "PLANE",
+            _ => return false,
+        };
+        if self.ref_select_active() {
+            return false;
+        }
+        let saved = self.filter_override.map_or(self.selection_filter, |(_, saved)| saved);
+        let mut only = SelectionFilter {
+            solid: false,
+            sketch: false,
+            face: false,
+            edge: false,
+            vertex: false,
+            plane: false,
+            component: false,
+        };
+        only.set(kind, true);
+        if kind == "SOLID" {
+            // Bodies: a committed sketch's sheet is a body too.
+            only.sketch = true;
+        }
+        self.selection_filter = only;
+        self.filter_override = Some((kind, saved));
+        self.dirty = true;
+        true
+    }
+
+    /// End the held-letter override: the bottom filter it replaced is back.
+    pub fn end_filter_override(&mut self) {
+        if let Some((_, saved)) = self.filter_override.take() {
+            // A reference field that began meanwhile set its own kinds and
+            // restores the default when it ends; leave those alone.
+            if !self.ref_select_active() {
+                self.selection_filter = saved;
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// The kind the held-letter override admits, if one is held.
+    pub fn filter_override(&self) -> Option<&'static str> {
+        self.filter_override.map(|(kind, _)| kind)
+    }
+
+    /// The bottom filter as the user set it (the saved one while a held
+    /// letter overrides it).
+    pub fn bottom_selection_filter(&self) -> SelectionFilter {
+        self.filter_override.map_or(self.selection_filter, |(_, saved)| saved)
+    }
+
     /// Replace the whole selection filter. Purely a policy change (no geometry or
     /// camera moves), so it does NOT mark the scene dirty; the NEXT click honors it.
     pub fn set_selection_filter(&mut self, filter: SelectionFilter) {
-        self.selection_filter = filter;
+        // Set while a letter is held: it is the bottom filter that changes,
+        // and the override still applies until the key is released.
+        match self.filter_override.as_mut() {
+            Some((_, saved)) => *saved = filter,
+            None => self.selection_filter = filter,
+        }
     }
 
     /// Toggle one kind's pickability by name (`"SOLID"`/`"FACE"`/`"EDGE"`/`"VERTEX"`).

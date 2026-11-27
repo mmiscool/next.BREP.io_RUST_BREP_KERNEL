@@ -1042,6 +1042,53 @@ pub fn exact_extrusion_wall_readings(
         .collect()
 }
 
+/// The wall reading of a still ball's rows (a blend over a concave round of
+/// its own radius: every section's centre is one point, the wall a sphere
+/// patch), read directly: every point of the shipped surface stands exactly
+/// the radius off that centre, and the reading is how far it does not. The
+/// slope reader cannot read it (the centre path has no slope). Eight probes an
+/// interval, one entry per interval overlapping `window`.
+pub fn exact_ball_wall_readings(
+    rows: &FittedRows,
+    parameters: &[f64],
+    window: [f64; 2],
+    centre: Vec3,
+    radius: f64,
+) -> Vec<Result<f64, String>> {
+    let intervals = parameters.len().saturating_sub(1);
+    let overlapped: Vec<usize> =
+        (0..intervals).filter(|&interval| parameters[interval + 1] > window[0] && parameters[interval] < window[1]).collect();
+    let Ok([v_low, v_high]) = rows.surface.domain_v() else {
+        return overlapped.iter().map(|interval| Err(format!("interval {interval}: wall surface v domain unreadable"))).collect();
+    };
+    overlapped
+        .into_iter()
+        .map(|interval| -> Result<f64, String> {
+            let (from, to) = (parameters[interval], parameters[interval + 1]);
+            let inside = |u: f64| u >= window[0] && u <= window[1];
+            let mut probes: Vec<f64> =
+                (1..8).map(|step| from + (to - from) * step as f64 / 8.0).filter(|u| inside(*u)).collect();
+            probes.extend(window.into_iter().filter(|end| *end > from && *end < to));
+            if probes.is_empty() {
+                return Err(format!("interval {interval}: no probe in its shipped part of [{:.17}, {:.17}]", window[0], window[1]));
+            }
+            let mut worst = 0.0_f64;
+            for u in probes {
+                for k in 1..OPEN_WALL_SECTIONS {
+                    let v = v_low + (v_high - v_low) * k as f64 / OPEN_WALL_SECTIONS as f64;
+                    let point = rows.surface.evaluate(u, v).map_err(|error| format!("interval {interval}: wall point (u {u:.9}, v {v:.6}) unreadable: {error}"))?;
+                    let reading = (point.sub(centre).length() - radius).abs();
+                    if !reading.is_finite() {
+                        return Err(format!("interval {interval}: wall point (u {u:.9}, v {v:.6}) reads {reading}"));
+                    }
+                    worst = worst.max(reading);
+                }
+            }
+            Ok(worst)
+        })
+        .collect()
+}
+
 /// The wall reading of an EXACT REVOLUTION's rows
 /// (`support::exact_revolution_rows`), read directly: the wall is the ball's
 /// sweep along the centre CIRCLE, so every point of the shipped surface
@@ -1117,6 +1164,11 @@ pub fn open_wall_readings_why(
     dense: &OpenDenseCentres,
     radius: f64,
 ) -> Vec<Result<f64, String>> {
+    // A still ball (every station's centre the same point, bit for bit: only
+    // the stationary stations build that) is a sphere patch, read exactly.
+    if crate::blend::stations::stationary_ball::enabled() && crate::blend::stations::stationary_ball::is_still(stations) {
+        return exact_ball_wall_readings(rows, parameters, window, stations[0].center, radius);
+    }
     let intervals = parameters.len().saturating_sub(1);
     let overlapped: Vec<usize> =
         (0..intervals).filter(|&interval| parameters[interval + 1] > window[0] && parameters[interval] < window[1]).collect();

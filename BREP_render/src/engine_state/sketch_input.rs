@@ -146,6 +146,59 @@ impl EngineState {
         changed
     }
 
+    /// The sketch entities a screen box from `start` to `end` (viewport CSS
+    /// px) takes: WINDOW dragged left to right (fully inside), CROSSING right
+    /// to left (touching). Empty when a corner's ray misses the plane.
+    pub fn sketch_box_refs(&self, start: (f64, f64), end: (f64, f64)) -> Vec<serde_json::Value> {
+        let corners = [(start.0, start.1), (end.0, start.1), (end.0, end.1), (start.0, end.1)];
+        let mut quad = [(0.0, 0.0); 4];
+        for (slot, (x, y)) in quad.iter_mut().zip(corners) {
+            match self.sketch_uv_at(x, y) {
+                Some(uv) => *slot = uv,
+                None => return Vec::new(),
+            }
+        }
+        self.sketch_edit
+            .as_ref()
+            .map(|edit| edit.session.box_refs(quad, end.0 < start.0))
+            .unwrap_or_default()
+    }
+
+    /// The live box preview in a sketch: the hover lights exactly what the
+    /// release would take (owner 2026-11-26). Returns how many.
+    pub fn sketch_box_preview(&mut self, start: (f64, f64), end: (f64, f64)) -> usize {
+        let refs = self.sketch_box_refs(start, end);
+        let count = refs.len();
+        let hover = (!refs.is_empty()).then(|| serde_json::Value::Array(refs));
+        if let Some(edit) = self.sketch_edit.as_mut() {
+            edit.session.set_hover(hover);
+        }
+        self.refresh_sketch_overlay();
+        self.dirty = true;
+        count
+    }
+
+    /// Apply a sketch box to the selection: replace, add or remove (see
+    /// [`super::BoxSelectMode`]). Clears the preview. Returns how many it took.
+    pub fn sketch_box_select(&mut self, start: (f64, f64), end: (f64, f64), mode: super::BoxSelectMode) -> usize {
+        let refs = self.sketch_box_refs(start, end);
+        if let Some(edit) = self.sketch_edit.as_mut() {
+            edit.session.set_hover(None);
+            if mode == super::BoxSelectMode::Replace {
+                edit.session.clear_selection();
+            }
+            for entity_ref in &refs {
+                let selected = edit.session.selection.is_selected(entity_ref);
+                if selected != (mode != super::BoxSelectMode::Remove) {
+                    edit.session.toggle_selection(entity_ref.clone());
+                }
+            }
+        }
+        self.refresh_sketch_overlay();
+        self.dirty = true;
+        refs.len()
+    }
+
     /// Clear the sketch hover (pointer left the viewport / moved over the ViewCube).
     /// Returns whether a hover was cleared.
     pub fn sketch_clear_hover(&mut self) -> bool {

@@ -5,6 +5,7 @@ pub mod analytic_rim;
 pub(in crate::blend) use analytic_rim::net_bound;
 pub mod analytic_network;
 pub mod analytic_arc;
+pub mod stationary_ball;
 mod offset_memo;
 
 use crate::{KernelRefusal, KernelStage, OrRefuse, RefusalClass};

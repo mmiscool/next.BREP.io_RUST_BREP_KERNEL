@@ -64,6 +64,16 @@ struct CandidatePopup {
 /// texture + the egui blit that composites it into egui's frame, plus the
 /// pointer/wheel/ViewCube routing. Borrows `&mut EngineState` to draw + drive;
 /// never owns the engine brain.
+/// A live Shift+left-drag box (see `interaction::box_select_mode`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BoxDrag {
+    pub start: (f64, f64),
+    pub end: (f64, f64),
+    pub mode: brep_render::engine_state::BoxSelectMode,
+    /// Where the live preview (what the box would take) was last resolved.
+    pub previewed: Option<(f64, f64)>,
+}
+
 pub struct Viewport {
     /// The engine's wgpu render core, built from eframe's device/queue/format.
     core: RenderCore,
@@ -105,6 +115,11 @@ pub struct Viewport {
     /// param via [`EngineState::feature_dimension_drag`] instead of orbiting the
     /// camera. `None` when no arrow drag is in flight.
     dim_dragging: Option<String>,
+    /// A live BOX selection (Shift+left-drag): press and current point
+    /// (viewport-local px) and what the release does to the selection.
+    box_drag: Option<BoxDrag>,
+    /// The key holding the held-letter filter override, if one is held.
+    held_filter_key: Option<egui::Key>,
     /// True while a sketch POINT drag started over the viewport is live (S2) — the
     /// press grabbed a movable sketch point, so the drag moves it instead of
     /// orbiting the camera.

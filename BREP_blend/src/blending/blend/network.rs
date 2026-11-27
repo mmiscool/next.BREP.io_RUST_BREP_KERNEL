@@ -1986,11 +1986,22 @@ fn blend_star_network_building(
             } else { None };
             let mut certified_rows = None;
             let mut certified_parameters = None;
+            // `BREP_BLEND_STATIONARY_BALL`: a ball that cannot roll (a mate
+            // that is a concave round of the blend's own radius) has exact
+            // stations; its rows are fitted from them.
+            let stationary = if certified.is_none() && poles == [false, false] && bounded_ends == [false, false] {
+                wall_radius.and_then(|radius| super::stations::stationary_ball::construct(edge, first, second, radius, overshoot, ends, station_count))
+            } else { None };
             let marched = if let Some(certified) = certified {
                 certified_rows = Some(certified.rows);
                 certified_parameters = Some(certified.parameters);
                 Ok((certified.stations, certified.vertex_indices, StationRefinement::default(),
                     OpenDenseCentres { station_ts: certified.station_ts, ..OpenDenseCentres::default() }))
+            } else if let Some((stations, vertex_indices, station_ts)) = stationary {
+                // The ball stands still: its wall is read exactly against the
+                // one centre (`exact_ball_wall_readings`), not off dense rows.
+                Ok((stations, vertex_indices, StationRefinement::default(),
+                    OpenDenseCentres { station_ts, ..OpenDenseCentres::default() }))
             } else {
                 march_open_stations_core(
                     edge, first, second, &radius_at, overshoot, ends, station_count, poles, bounded_ends,
@@ -2218,6 +2229,7 @@ fn blend_star_network_building(
         let window = {
             let (low, high) = (vertex_indices[0].min(vertex_indices[1]), vertex_indices[0].max(vertex_indices[1]));
             shipped_window(&parameters, parameters[low], parameters[high])
+                .or_else(|| super::stations::stationary_ball::reading_window(&stations, &dense.station_ts, &parameters, edge))
         };
         let reading_timing = super::BlendTimer::start("timing.rung_reading_ms");
         let rails_timing = super::BlendTimer::start("timing.rung_reading.rails_ms");

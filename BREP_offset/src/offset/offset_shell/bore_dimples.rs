@@ -28,6 +28,20 @@ pub(super) fn bore_dimples_enabled() -> bool {
     switch!("BREP_OFFSET_BORE_DIMPLES", true)
 }
 
+/// `BREP_OFFSET_DIMPLE_FAR_CAP` (default on; `=0` restores): a plane
+/// parallel to a bore's end plane, beyond the body from it, whose region
+/// misses the rim's disc, no longer bars the dimple, however near it stands
+/// (it is never nearer a dimple point than the rim; see `reach_of_others`).
+///
+/// Cause (brep-bench offset/wide-hole-plate-grown-by-its-hole, a plate 4 thick
+/// with a hole of radius 20 grown by 20): each end's dimple was declined for
+/// the plate's other face 4 away, and the grown body came out filled
+/// (volume +4819 over the closed form).
+fn dimple_far_cap_on() -> bool {
+    switch!("BREP_OFFSET_DIMPLE_FAR_CAP", true)
+}
+
+
 /// A straight bore: a point on its axis, the unit axis, its radius and the
 /// axial span its cylinder faces cover (from the point).
 struct Bore {
@@ -364,7 +378,42 @@ fn reach_of_others(source: &BrepSolid, bore: &Bore, t: f64, out: Vec3, distance:
             let straight = edges.iter().all(|edge| edge.curve.straight_segment(1e-9 * scale).is_some());
             square && below && within && straight
         };
-        if !side {
+        // A far cap (`BREP_OFFSET_DIMPLE_FAR_CAP`): a plane parallel to the end
+        // plane, below it, whose region holds no point of the rim's disc. A
+        // dimple point P (over the disc, ρ < r, at height h > 0) and a cap
+        // point Q (ρ ≥ r, height below 0) are at least r − ρ apart across and
+        // h apart along, so |PQ| is at least P's distance to the rim. The
+        // cap's region misses the disc when its boundary does (every edge
+        // sample at ρ ≥ r) and it does not hold the axis's foot.
+        let far_cap = !side && planar && dimple_far_cap_on() && {
+            let normal = match (face.surface.domain_u(), face.surface.domain_v()) {
+                (Ok([u0, u1]), Ok([v0, v1])) => face.surface.normal(0.5 * (u0 + u1), 0.5 * (v0 + v1)).ok(),
+                _ => None,
+            };
+            let parallel = normal.is_some_and(|n| n.dot(out).abs() >= 1.0 - 1e-12);
+            let samples: Vec<Vec3> = edges
+                .iter()
+                .flat_map(|edge| {
+                    let [t0, t1] = edge.curve.domain().unwrap_or([0.0, 0.0]);
+                    (0..=32).filter_map(move |k| edge.curve.evaluate(t0 + (t1 - t0) * k as f64 / 32.0).ok())
+                })
+                .collect();
+            let below = !samples.is_empty() && samples.iter().all(|p| height(*p) < -1e-9 * scale);
+            let outside = samples.iter().all(|p| {
+                let d = p.sub(centre);
+                let w = d.sub(out.scale(d.dot(out)));
+                w.length() >= bore.radius - 1e-9 * scale
+            });
+            let misses_axis = samples.first().is_some_and(|p| {
+                let foot = centre.add(out.scale(height(*p)));
+                crate::project_point_to_surface(&face.surface, foot).is_ok_and(|f| {
+                    f.distance <= 1e-9 * scale
+                        && crate::parameter_point_in_face(face, crate::Vec2 { x: f.u, y: f.v }, 1e-9).is_ok_and(|class| class == crate::PolygonClass::Outside)
+                })
+            });
+            parallel && below && outside && misses_axis
+        };
+        if !(side || far_cap) {
             os_debug!("bore dimples: face {} stands within {distance} of the dimple at {t}", face.id);
             return false;
         }

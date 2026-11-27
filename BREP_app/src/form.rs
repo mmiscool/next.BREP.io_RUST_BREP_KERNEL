@@ -371,6 +371,23 @@ pub fn field_input_with(
             let pkey = path.join(".");
             let mut removed: Option<usize> = None;
             let mut activate_rect = egui::Rect::NOTHING;
+            // CHIP SELECTION in a list field:
+            // click a line to select it, Ctrl/Cmd+click toggles one, Shift+
+            // click selects the RANGE from the last clicked line; "Remove
+            // selected" drops them all. Kept by NAME in egui
+            // memory, so a list that changed under it simply forgets the gone.
+            let chips_id = egui::Id::new(("brep-ref-chips", pkey.clone()));
+            let mut chips: RefChips = ui.data(|d| d.get_temp(chips_id)).unwrap_or_default();
+            chips.selected.retain(|n| names.contains(n));
+            // A focused field removes one running pick per frame (the engine
+            // takes them by index), highest first so the rest stay valid.
+            chips.pending.retain(|n| names.contains(n));
+            if let Some(i) = chips.pending.iter().filter_map(|n| names.iter().position(|m| m == n)).max() {
+                chips.pending.retain(|n| *n != names[i]);
+                removed = Some(i);
+                ui.ctx().request_repaint();
+            }
+            let mut remove_selected = false;
             ui.vertical(|ui| {
                 let width = ui.available_width();
                 let hint = if focused.is_some() {
@@ -458,10 +475,21 @@ pub fn field_input_with(
                                 ui.with_layout(
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
+                                        let selected = *multiple && chips.selected.contains(name);
+                                        let mut text = egui::RichText::new(format!("• {name}"));
+                                        if selected {
+                                            text = text
+                                                .background_color(ui.visuals().selection.bg_fill)
+                                                .color(ui.visuals().selection.stroke.color);
+                                        }
                                         let line = ui.add(
-                                            egui::Label::new(format!("• {name}"))
-                                                .truncate(),
+                                            egui::Label::new(text)
+                                                .truncate()
+                                                .sense(egui::Sense::click()),
                                         );
+                                        if *multiple && line.clicked() {
+                                            chips.click(&names, name, crate::select_mods::RowClick::in_ctx(ui.ctx()));
+                                        }
                                         // Hovering the line reports the entity it
                                         // names, so the caller can light it in the
                                         // 3D scene exactly as mousing over it there
@@ -484,7 +512,32 @@ pub fn field_input_with(
                         );
                     });
                 }
+                if *multiple && !chips.selected.is_empty() {
+                    let label = format!("✕ Remove selected ({})", chips.selected.len());
+                    let resp = ui.add(egui::Button::new(egui::RichText::new(label).color(REMOVE_RED)).small());
+                    if let Some(map) = probe.as_deref_mut() {
+                        map.insert(format!("{pkey}#xsel"), resp.rect);
+                    }
+                    remove_selected = resp.clicked();
+                }
             });
+            if remove_selected {
+                if focused.is_some() {
+                    chips.pending = std::mem::take(&mut chips.selected);
+                    if let Some(i) = chips.pending.iter().filter_map(|n| names.iter().position(|m| m == n)).max() {
+                        chips.pending.retain(|n| *n != names[i]);
+                        removed = Some(i);
+                        ui.ctx().request_repaint();
+                    }
+                } else {
+                    let gone = std::mem::take(&mut chips.selected);
+                    ui.data_mut(|d| d.insert_temp(chips_id, chips));
+                    let kept: Vec<String> = names.into_iter().filter(|n| !gone.contains(n)).collect();
+                    set_at(current, path, Value::Array(kept.into_iter().map(Value::String).collect()));
+                    return (true, activate_rect);
+                }
+            }
+            ui.data_mut(|d| d.insert_temp(chips_id, chips.clone()));
             if let Some(i) = removed {
                 if focused.is_some() {
                     // The running list is the engine's: an intent, not an edit.
@@ -502,6 +555,50 @@ pub fn field_input_with(
                 return (true, activate_rect);
             }
             (false, activate_rect)
+        }
+    }
+}
+
+/// A list reference field's chip selection (see the field drawer).
+#[derive(Clone, Default, Debug)]
+struct RefChips {
+    selected: Vec<String>,
+    anchor: Option<String>,
+    /// Running picks still to remove, one per frame.
+    pending: Vec<String>,
+}
+
+impl RefChips {
+    fn click(&mut self, names: &[String], name: &String, click: crate::select_mods::RowClick) {
+        use crate::select_mods::RowClick;
+        let range = self.anchor.as_ref().and_then(|a| crate::select_mods::range(names, a, name)).map(<[String]>::to_vec);
+        match (click, range) {
+            (RowClick::Range, Some(range)) => self.selected = range,
+            (RowClick::AddRange, Some(range)) => {
+                for n in range {
+                    if !self.selected.contains(&n) {
+                        self.selected.push(n);
+                    }
+                }
+            }
+            (RowClick::Toggle | RowClick::AddRange, _) => {
+                if let Some(at) = self.selected.iter().position(|n| n == name) {
+                    self.selected.remove(at);
+                } else {
+                    self.selected.push(name.clone());
+                }
+            }
+            (RowClick::Replace | RowClick::Range, _) => {
+                // A plain click on the only selected line clears it.
+                if self.selected.len() == 1 && self.selected[0] == *name {
+                    self.selected.clear();
+                } else {
+                    self.selected = vec![name.clone()];
+                }
+            }
+        }
+        if click.sets_anchor() || self.anchor.as_ref().is_none_or(|a| !names.contains(a)) {
+            self.anchor = Some(name.clone());
         }
     }
 }

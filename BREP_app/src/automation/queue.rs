@@ -506,7 +506,24 @@ impl AutomationQueue {
         if std::mem::take(&mut inner.pointer.reset_clicks) {
             ctx.input_mut(|i| i.pointer = egui::PointerState::default());
         }
-        raw.modifiers = inner.pointer.modifiers.egui();
+        // The held modifiers are the SCRIPT's only while a script holds one.
+        // Writing them every pass replaced the user's real Shift/Ctrl/Cmd with
+        // "none" in every build that carries automation (the default native
+        // build and the browser's WebMCP host), so `InputState::modifiers`
+        // never saw a real modifier and Shift+drag box select never started.
+        // A script's release clears what it set, once.
+        let held = inner.pointer.egui_modifiers();
+        if held != egui::Modifiers::NONE {
+            raw.modifiers = held;
+            inner.pointer.modifiers_applied = true;
+        } else if std::mem::take(&mut inner.pointer.modifiers_applied) {
+            raw.modifiers = egui::Modifiers::NONE;
+        }
+        if let Some(platform) = inner.pointer.platform {
+            if ctx.os() != platform.os() {
+                ctx.set_os(platform.os());
+            }
+        }
         inner.input_this_pass = !events.is_empty();
         raw.events.extend(events);
     }

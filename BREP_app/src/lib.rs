@@ -55,6 +55,8 @@ pub mod logger;
 /// The embedded MCP server (`brep-app --mcp`); native builds with `mcp`.
 #[cfg(all(not(target_arch = "wasm32"), feature = "mcp"))]
 pub mod mcp;
+/// Selection modifiers: Cmd/Ctrl primary, macOS Ctrl+click = secondary, list ranges.
+pub mod select_mods;
 /// What the Delete key / Delete command removes for the current selection (every target).
 pub mod delete_selection;
 /// The desktop event loop: eframe's winit application plus application-command

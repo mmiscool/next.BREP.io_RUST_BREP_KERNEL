@@ -1,6 +1,6 @@
 [package]
 name = "BREP_app"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2021"
 license-file = "LICENSE.md"
 repository = "https://github.com/mmiscool/next.BREP.io_RUST_BREP_KERNEL"
@@ -87,7 +87,7 @@ brep-plugins = { package = "BREP_plugins", version = "0.24.0", path = "../BREP_p
 # without `scripting`), so posting is a Boa caller on wasm too.
 brep_cam = { package = "BREP_cam", version = "0.22.0", path = "../BREP_cam", features = ["post-runtime"] }
 # The windowing-agnostic viewer brain + wgpu-29 render core we are hosting.
-brep-render = { package = "BREP_render", version = "0.31.0", path = "../BREP_render" }
+brep-render = { package = "BREP_render", version = "0.31.1", path = "../BREP_render" }
 # Manufacturing instructions: the block, the wizard, step edits and the player.
 brep_instructions = { package = "BREP_instructions", version = "0.4.1", path = "../BREP_instructions" }
 # Motion studies: the simulation block the Simulation pane edits.

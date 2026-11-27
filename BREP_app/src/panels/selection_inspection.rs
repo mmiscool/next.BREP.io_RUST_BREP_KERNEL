@@ -18,7 +18,7 @@ impl Cache {
             || crate::workbench::ecad::Target::of_workbench(&state.settings.workbench).is_some()
         {
             return json!({"shown":false,"text":"","pending":false,"lengthUnit":"mm",
-                "areaUnit":"mm²","totals":{},"items":[]});
+                "areaUnit":"mm²","totals":{},"counts":{},"items":[]});
         }
         let selection = json!({"selection":state.selection_value(),
             "vertices":state.emphasis.selected_vertices.iter().map(|v| json!([v.solid, v.position])).collect::<Vec<_>>()}).to_string();
@@ -108,9 +108,38 @@ pub fn readout(state: &mut EngineState) -> Value {
         parts.push(format!("Vertex: ({}, {}, {}) mm", num(x), num(y), num(z)));
         items.push(json!({"kind":"vertex", "solid":vertex.solid, "position":vertex.position}));
     }
+    // COUNTS BY TYPE first when more than one entity is selected
+    // ("3 solids, 12 faces").
+    let datums = state.emphasis.selected_datums.len();
+    let counts = [
+        (solids.len(), "solid", "solids"),
+        (faces.len(), "face", "faces"),
+        (edges.len(), "edge", "edges"),
+        (vertices.len(), "vertex", "vertices"),
+        (datums, "plane", "planes"),
+    ];
+    let total: usize = counts.iter().map(|(n, _, _)| n).sum();
+    let mut count_map = serde_json::Map::new();
+    for (n, _, many) in counts {
+        if n > 0 {
+            count_map.insert(many.into(), json!(n));
+        }
+    }
+    if total > 1 {
+        let phrase: Vec<String> = counts
+            .iter()
+            .filter(|(n, _, _)| *n > 0)
+            .map(|(n, one, many)| format!("{n} {}", if *n == 1 { one } else { many }))
+            .collect();
+        parts.insert(0, phrase.join(", "));
+        // A long run of single-vertex coordinates says nothing more.
+        if vertices.len() > 1 {
+            parts.retain(|p| !p.starts_with("Vertex: "));
+        }
+    }
     if pending { parts.push("Measuring…".into()); }
     if unavailable { parts.push("Measurement unavailable".into()); }
     json!({"shown":!parts.is_empty(), "text":parts.join(" · "), "pending":pending,
-        "lengthUnit":"mm", "areaUnit":"mm²", "totals":totals, "items":items})
+        "lengthUnit":"mm", "areaUnit":"mm²", "totals":totals, "counts":count_map, "items":items})
 }
 

@@ -125,6 +125,10 @@ impl Viewport {
                 let rect = ui.available_rect_before_wrap();
             self.last_rect = Some(rect);
             let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+            // The HELD-LETTER filter override, before any pick this frame.
+            self.update_held_filter(ui.ctx(), &response, state);
+            // Select all / invert (primary+A / primary+I) over the 3D view.
+            select_all_keys(ui.ctx(), &response, state);
 
             // Track viewport size in the engine (logical px) + offscreen (physical).
             let phys_w = (rect.width() * ppp).round().max(1.0) as u32;
@@ -191,6 +195,13 @@ impl Viewport {
                         painter.line_segment([cursor - axis, cursor + axis], egui::Stroke::new(1.0, egui::Color32::WHITE));
                     }
                 }
+            }
+            if let Some(drag) = self.box_drag {
+                draw_box_drag(&ui.painter().with_clip_rect(rect), rect, drag);
+            }
+            // The held-letter override's cursor badge.
+            if let (Some(kind), Some(pos)) = (state.filter_override(), response.hover_pos()) {
+                draw_held_filter_badge(&ui.painter().with_clip_rect(rect), pos, kind);
             }
         });
 
@@ -424,7 +435,7 @@ impl Viewport {
                     state.sketch3d_tool_click_at(lx, ly);
                 } else {
                     let mods = ui.ctx().input(|i| i.modifiers);
-                    state.sketch3d_click_at(lx, ly, mods.command || mods.ctrl);
+                    state.sketch3d_click_at(lx, ly, crate::select_mods::primary(ui.ctx().os(), mods));
                 }
             }
         }
@@ -514,6 +525,12 @@ impl Viewport {
                     self.sketch_handdrawing = true;
                 } else if precision {
                     self.touch_drawing = true;
+                } else if let Some(mode) = (!draw_mode).then(|| box_select_mode(ui.ctx(), response, state)).flatten() {
+                    // Shift+LEFT-drag in SELECT mode: a BOX over the sketch's
+                    // points and curves (window / crossing, as in the 3D view).
+                    let start = drag_start_local(response, rect).unwrap_or((lx, ly));
+                    self.box_drag = Some(super::BoxDrag { start, end: (lx, ly), mode, previewed: None });
+                    state.sketch_box_preview(start, (lx, ly));
                 } else if !draw_mode && {
                     self.touch_drag_offset = (0.0, 0.0);
                     let (gx, gy) = if finger {
@@ -552,6 +569,14 @@ impl Viewport {
                 } else if self.touch_drawing {
                     let (x, y) = super::touch::sketch_target(state, lx, ly, true);
                     state.sketch_hover_at(x, y);
+                } else if let Some(drag) = self.box_drag.as_mut() {
+                    drag.end = (lx, ly);
+                    let moved = drag.previewed.is_none_or(|(px, py)| (px - lx).abs() + (py - ly).abs() >= 3.0);
+                    if moved {
+                        drag.previewed = Some((lx, ly));
+                        state.sketch_box_preview(drag.start, drag.end);
+                    }
+                    ui.ctx().request_repaint();
                 } else if self.sketch_dragging {
                     if finger {
                         state.sketch_drag_to(lx + self.touch_drag_offset.0, ly + self.touch_drag_offset.1);
@@ -579,6 +604,12 @@ impl Viewport {
             if self.sketch_dragging {
                 state.sketch_drag_end();
                 self.sketch_dragging = false;
+            }
+            if let Some(mut drag) = self.box_drag.take() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    drag.end = local(pos);
+                }
+                state.sketch_box_select(drag.start, drag.end, drag.mode);
             }
             if self.dragging {
                 state.pointer_up();
@@ -619,7 +650,7 @@ impl Viewport {
                 } else {
                     let mods = ui.ctx().input(|i| i.modifiers);
                     let point = if finger { super::touch::sketch_target(state, lx, ly, false) } else { (lx, ly) };
-                    state.sketch_click_at(point.0, point.1, mods.command || mods.ctrl);
+                    state.sketch_click_at(point.0, point.1, crate::select_mods::additive(ui.ctx().os(), mods));
                 }
             }
         }
@@ -906,6 +937,11 @@ impl Viewport {
                     // angle-arc handle, §8.4 grabbable arrows) → the drag previews
                     // that constraint's value; release commits + auto-solves.
                     DragStart::Constraint => self.constraint_dragging = true,
+                    DragStart::Camera if box_select_mode(ui.ctx(), response, state).is_some() => {
+                        // Shift+LEFT-drag: a BOX selection, not an orbit.
+                        let mode = box_select_mode(ui.ctx(), response, state).expect("checked");
+                        self.box_drag = Some(super::BoxDrag { start: (gx, gy), end: (lx, ly), mode, previewed: None });
+                    }
                     DragStart::Camera => {
                         let btn = if response.dragged_by(egui::PointerButton::Secondary) {
                             BUTTON_RIGHT
@@ -948,6 +984,17 @@ impl Viewport {
                     // Drive the constraint handle: the value PREVIEWS live (arrow +
                     // label track the pointer); nothing commits until release.
                     state.constraint_drag_to(lx, ly);
+                } else if let Some(drag) = self.box_drag.as_mut() {
+                    drag.end = (lx, ly);
+                    // The live preview: what releasing here would take, and
+                    // nothing else lit. Re-resolved once the pointer has moved
+                    // a few points, not every frame.
+                    let moved = drag.previewed.is_none_or(|(px, py)| (px - lx).abs() + (py - ly).abs() >= 3.0);
+                    if moved {
+                        drag.previewed = Some((lx, ly));
+                        state.hover_box_preview(drag.start, drag.end);
+                    }
+                    ui.ctx().request_repaint();
                 } else if self.dragging {
                     state.pointer_move(lx, ly);
                 }
@@ -961,6 +1008,14 @@ impl Viewport {
                 let (lx, ly) = (lx + self.touch_drag_offset.0, ly + self.touch_drag_offset.1);
                 let feature = state.dimension_armed_feature();
                 state.feature_dimension_drag(&feature, field, lx, ly);
+            }
+            if let (Some(drag), Some(pos)) = (self.box_drag.as_mut(), response.interact_pointer_pos()) {
+                drag.end = local(pos);
+            }
+            if let Some(drag) = self.box_drag.take() {
+                state.box_select(drag.start, drag.end, drag.mode);
+                state.clear_hover();
+                self.hover_lit_since = None;
             }
             self.finish_pointer_drag(state);
         }
@@ -1085,7 +1140,7 @@ impl Viewport {
                     self.hover_lit_since = None;
                 } else if state.cage_edit_feature().is_some()
                     && state
-                        .cage_point_pick_at(lx, ly, mods.command || mods.ctrl || mods.shift)
+                        .cage_point_pick_at(lx, ly, crate::select_mods::additive(ui.ctx().os(), mods))
                         .is_some()
                 {
                     // A control point of the NURBS Solid whose cage editor is
@@ -1098,9 +1153,12 @@ impl Viewport {
                     // A pick handle of the Deform Face whose form is open: the
                     // transform gizmo arms on it (a drag moves the pick along
                     // its normal) and the click stops here.
-                } else if mods.command || mods.ctrl {
-                    // Ctrl/Cmd+click ADDS/TOGGLES the top pick directly, no list
-                    // (the classic additive shortcut, both multi-select modes).
+                } else if crate::select_mods::additive(ui.ctx().os(), mods) {
+                    // Ctrl+click (Cmd+click on macOS) or Shift+click ADDS/TOGGLES
+                    // the top pick directly, no list (the classic additive
+                    // shortcut, both multi-select modes; Shift means "more"
+                    // everywhere). On macOS a Ctrl+click never gets here: it is
+                    // the secondary click (`select_mods::rewrite_raw`).
                     state.select_toggle_at(lx, ly);
                 } else if state.spline_anchor_pick_at(lx, ly).is_some() {
                     // An anchor dot of the spline whose editor is open: that
@@ -1202,6 +1260,7 @@ impl Viewport {
             && self.dim_dragging.is_none()
             && !self.constraint_dragging
             && self.pmi_label_dragging.is_none()
+            && self.box_drag.is_none()
             && !label_hover
         {
             match response.hover_pos() {
@@ -1285,8 +1344,52 @@ impl Viewport {
     }
 
     /// Close captures before handing a single pointer to multitouch navigation.
+    /// The held-letter override: a letter pressed while the pointer is over
+    /// the 3D view (no text field focused, no Ctrl/Cmd/Alt) narrows the
+    /// filter to its kind until THAT key is released — wherever the pointer
+    /// is then. A second letter while one is held is ignored.
+    fn update_held_filter(&mut self, ctx: &egui::Context, response: &egui::Response, state: &mut EngineState) {
+        if let Some(key) = self.held_filter_key {
+            if !ctx.input(|i| i.key_down(key)) {
+                self.held_filter_key = None;
+                state.end_filter_override();
+                ctx.request_repaint();
+            }
+            return;
+        }
+        if state.filter_override().is_some() {
+            // The engine still holds one this viewport did not start (a
+            // document switch mid-hold): end it.
+            state.end_filter_override();
+        }
+        if !response.hovered() || ctx.egui_wants_keyboard_input() || state.any_sketch_mode() {
+            return;
+        }
+        let mods = ctx.input(|i| i.modifiers);
+        if mods.ctrl || mods.command || mods.mac_cmd || mods.alt {
+            return;
+        }
+        let pcb = crate::workbench::ecad::Target::of_workbench(&state.settings.workbench)
+            == Some(crate::workbench::ecad::Target::Pcb);
+        for key in HELD_FILTER_KEYS {
+            let Some(kind) = held_filter_kind(key, pcb) else { continue };
+            if ctx.input(|i| i.key_pressed(key)) && state.begin_filter_override(kind) {
+                self.held_filter_key = Some(key);
+                // The hover re-resolves under the new filter this frame.
+                state.clear_hover();
+                ctx.request_repaint();
+                break;
+            }
+        }
+    }
+
     fn finish_pointer_drag(&mut self, state: &mut EngineState) {
         self.touch_drag_offset = (0.0, 0.0);
+        // A box cut short (multitouch took over) selects nothing.
+        if self.box_drag.take().is_some() {
+            state.clear_hover();
+            state.sketch_clear_hover();
+        }
         self.touch_drawing = false;
         if self.gizmo_dragging {
             state.transform_release();
@@ -1545,7 +1648,7 @@ impl Viewport {
                 // A reference field's row: into the field's running list,
                 // named exactly as a plain click would name it.
                 state.ref_select_take_candidate(&candidates[i]);
-            } else if toggles || mods.command || mods.ctrl {
+            } else if toggles || crate::select_mods::additive(ctx.os(), mods) {
                 state.toggle_candidate(&candidates[i]);
             } else {
                 state.select_candidate(&candidates[i]);
@@ -1850,6 +1953,140 @@ fn drag_start_local(response: &egui::Response, rect: egui::Rect) -> Option<(f64,
 /// component Move gizmo → ◎ dimension arrowhead → assembly-constraint handle →
 /// camera. Split out of `handle_viewport_input` so the claim can be driven from
 /// a test without a GPU-backed [`Viewport`].
+/// Primary+A (Ctrl+A, Cmd+A on macOS) selects every visible entity of the
+/// current filter type, primary+I inverts within it — while the pointer is
+/// over the 3D view and no text field has the keyboard (there they are the
+/// field's own select-all). Not in a sketch (its own selection); while a
+/// reference field picks, primary+A fills it instead.
+fn select_all_keys(ctx: &egui::Context, response: &egui::Response, state: &mut EngineState) {
+    if !response.hovered() || ctx.egui_wants_keyboard_input() || state.any_sketch_mode() {
+        return;
+    }
+    let os = ctx.os();
+    let (all, invert) = ctx.input(|i| {
+        let primary = crate::select_mods::primary(os, i.modifiers) && !i.modifiers.alt && !i.modifiers.shift;
+        (primary && i.key_pressed(egui::Key::A), primary && i.key_pressed(egui::Key::I))
+    });
+    if state.ref_select_active() {
+        // A reference field is picking: Ctrl/Cmd+A fills a MULTIPLE field
+        // with every visible entity it admits; invert has no meaning there.
+        if all {
+            state.ref_select_all_visible();
+            ctx.request_repaint();
+        }
+    } else if all || invert {
+        state.select_all_visible(invert);
+        ctx.request_repaint();
+    }
+}
+
+/// The HELD-LETTER keys: held over the 3D
+/// view, each admits only its kind, for exactly as long as it is held. In
+/// the PCB workbench F and R are taken (flip, rotate), so faces are D there.
+pub(super) fn held_filter_kind(key: egui::Key, pcb: bool) -> Option<&'static str> {
+    use egui::Key;
+    match key {
+        Key::S => Some("SOLID"),
+        Key::F if !pcb => Some("FACE"),
+        Key::D if pcb => Some("FACE"),
+        Key::E => Some("EDGE"),
+        Key::V => Some("VERTEX"),
+        Key::C => Some("COMPONENT"),
+        Key::P => Some("PLANE"),
+        _ => None,
+    }
+}
+
+const HELD_FILTER_KEYS: [egui::Key; 7] =
+    [egui::Key::S, egui::Key::F, egui::Key::D, egui::Key::E, egui::Key::V, egui::Key::C, egui::Key::P];
+
+fn draw_held_filter_badge(painter: &egui::Painter, pos: egui::Pos2, kind: &str) {
+    let text = match kind {
+        "SOLID" => "solids",
+        "FACE" => "faces",
+        "EDGE" => "edges",
+        "VERTEX" => "vertices",
+        "COMPONENT" => "components",
+        "PLANE" => "planes",
+        _ => kind,
+    };
+    let galley = painter.layout_no_wrap(text.to_string(), egui::FontId::proportional(11.0), egui::Color32::BLACK);
+    let at = pos + egui::vec2(14.0, 14.0);
+    let r = egui::Rect::from_min_size(at, galley.size() + egui::vec2(8.0, 4.0));
+    painter.rect_filled(r, 3.0, egui::Color32::from_rgb(255, 200, 80));
+    painter.galley(at + egui::vec2(4.0, 2.0), galley, egui::Color32::BLACK);
+}
+
+/// What a LEFT drag starting now would do to the selection as a BOX, or
+/// `None` when it is not a box drag. Shift+drag replaces, primary
+/// (Ctrl, Cmd on macOS)+Shift+drag adds, Alt/Option+Shift+drag removes.
+/// The 3D view and the (planar) sketch: a reference pick, a 3D sketch, touch
+/// input and the right/middle buttons keep their own drags.
+pub(super) fn box_select_mode(
+    ctx: &egui::Context,
+    response: &egui::Response,
+    state: &EngineState,
+) -> Option<brep_render::engine_state::BoxSelectMode> {
+    use brep_render::engine_state::BoxSelectMode;
+    if !response.dragged_by(egui::PointerButton::Primary)
+        || state.ref_select_active()
+        || state.sketch3d_mode()
+        || super::touch::enabled(ctx)
+    {
+        return None;
+    }
+    let mods = ctx.input(|i| i.modifiers);
+    if !mods.shift {
+        return None;
+    }
+    Some(if mods.alt {
+        BoxSelectMode::Remove
+    } else if crate::select_mods::primary(ctx.os(), mods) {
+        BoxSelectMode::Add
+    } else {
+        BoxSelectMode::Replace
+    })
+}
+
+/// The live box: WINDOW (dragged left to right) solid with an "inside" hint,
+/// CROSSING (right to left) dashed with a "touching" hint — the common CAD
+/// convention (docs: the selection page).
+fn draw_box_drag(painter: &egui::Painter, rect: egui::Rect, drag: super::BoxDrag) {
+    use brep_render::engine_state::BoxSelectMode;
+    let a = rect.min + egui::vec2(drag.start.0 as f32, drag.start.1 as f32);
+    let b = rect.min + egui::vec2(drag.end.0 as f32, drag.end.1 as f32);
+    let r = egui::Rect::from_two_pos(a, b);
+    let crossing = drag.end.0 < drag.start.0;
+    let (fill, line) = if crossing {
+        (egui::Color32::from_rgba_unmultiplied(80, 200, 120, 28), egui::Color32::from_rgb(110, 220, 140))
+    } else {
+        (egui::Color32::from_rgba_unmultiplied(80, 150, 255, 32), egui::Color32::from_rgb(120, 170, 255))
+    };
+    painter.rect_filled(r, 0.0, fill);
+    let stroke = egui::Stroke::new(1.0, line);
+    if crossing {
+        let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+        for pair in corners.windows(2) {
+            painter.extend(egui::Shape::dashed_line(&[pair[0], pair[1]], stroke, 6.0, 4.0));
+        }
+    } else {
+        painter.rect_stroke(r, 0.0, stroke, egui::StrokeKind::Inside);
+    }
+    let what = if crossing { "touching" } else { "inside" };
+    let how = match drag.mode {
+        BoxSelectMode::Replace => "",
+        BoxSelectMode::Add => " (+ add)",
+        BoxSelectMode::Remove => " (- remove)",
+    };
+    painter.text(
+        b + egui::vec2(10.0, 10.0),
+        egui::Align2::LEFT_TOP,
+        format!("{what}{how}"),
+        egui::FontId::proportional(12.0),
+        line,
+    );
+}
+
 pub(super) fn route_drag_start(state: &mut EngineState, x: f64, y: f64) -> DragStart {
     if let Some((cx, cy)) = viewcube_local(state, x, y) {
         state.viewcube_click(cx, cy);

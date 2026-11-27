@@ -126,6 +126,43 @@ pub fn pick_unoccluded(
     hits
 }
 
+/// The FRONT face hit under CSS-pixel `(x, y)` — what the depth buffer shows
+/// there: a FACE candidate, or a SOLID one for a section cap. Faces only (no
+/// edge/vertex screen tests), so it is the cheap visibility probe box
+/// selection ([`crate::box_pick`]) casts per sample.
+pub(crate) fn front_face_at(
+    scene: &RenderScene,
+    camera: &ViewCamera,
+    x: f64,
+    y: f64,
+    options: &PickOptions,
+) -> Option<PickCandidate> {
+    let ray = camera.pick_ray(x, y);
+    let (_, _, forward) = camera.basis();
+    let mut hits: Vec<PickCandidate> = Vec::new();
+    let mut triangles = Vec::new();
+    for solid in scene.solids() {
+        if !solid.visible || !ray_hits_aabb(&ray, &solid.bbox) {
+            continue;
+        }
+        let candidates = if solid.mesh.indices.len() / 3 > 128 {
+            triangles.clear();
+            scene.pick_triangles(solid, &ray, &mut triangles);
+            Some(triangles.as_slice())
+        } else {
+            None
+        };
+        pick_faces(solid, camera, &ray, forward, options, candidates, &mut hits);
+    }
+    hits.into_iter().min_by(|a, b| a.depth.total_cmp(&b.depth))
+}
+
+/// The view depth of a world point (along the camera's forward axis).
+pub(crate) fn point_view_depth(camera: &ViewCamera, point: [f64; 3]) -> f64 {
+    let (_, _, forward) = camera.basis();
+    view_depth(camera, forward, point)
+}
+
 /// Rank candidates under CSS-pixel `(x, y)`. Ordered by the priority chain
 /// then depth; a SOLID entry per hit solid is appended at the end (the earlier
 /// "extras" behavior).

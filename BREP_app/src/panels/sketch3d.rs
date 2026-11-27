@@ -386,7 +386,7 @@ fn entity_section(
         if delete_clicked {
             to_delete = Some(row.id.clone());
         } else if resp.clicked() {
-            let additive = ui.input(|i| i.modifiers.command || i.modifiers.ctrl);
+            let additive = crate::select_mods::primary_in(ui.ctx());
             state.sketch3d_select_entity(entity_ref(&row.id), additive);
         }
     }

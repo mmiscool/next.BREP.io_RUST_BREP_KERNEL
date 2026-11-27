@@ -20,9 +20,9 @@ geometry consumer never compiles `wgpu` / `eframe`.
 
 ```toml
 [dependencies]
-BREP = "0.34"                                     # kernel only (headless)
-BREP = { version = "0.34", features = ["render"] } # + the wgpu render engine
-BREP = { version = "0.34", features = ["full"] }  # app + render + gizmos
+BREP = "0.35"                                     # kernel only (headless)
+BREP = { version = "0.35", features = ["render"] } # + the wgpu render engine
+BREP = { version = "0.35", features = ["full"] }  # app + render + gizmos
 ```
 
 Additional features: `reconstruction` (opt-in recognition integration), `full`
@@ -34,7 +34,7 @@ Additional features: `reconstruction` (opt-in recognition integration), `full`
 > `brep` (lowercase, lint-clean). This mirrors the whole family — package
 > `BREP_render` / lib `brep_render`, etc.
 
-This is version 0.34.0. The optional reconstruction feature re-exports the
+This is version 0.35.0. The optional reconstruction feature re-exports the
 reconstruction library directly; rendering also consumes it transitively.
 
 Licence: the Autodrop3d licence in `LICENSE.md`, shipped in the crate

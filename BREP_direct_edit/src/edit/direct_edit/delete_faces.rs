@@ -1897,6 +1897,56 @@ fn flat_on_round_or_fill(solid: &BrepSolid, face_ids: &[u64]) -> Option<BrepSoli
     filled
 }
 
+/// `face_ids` with every ZERO-AREA survivor that the selection alone bounds
+/// appended: an unselected face whose every coedge lies on an edge a selected
+/// face also uses, and whose area is negligible at the solid's scale.
+///
+/// Such a face is a sliver: a corner round of radius zero, kept as a
+/// two-coedge loop whose two edges are the same line between the same two
+/// vertices (an imported shelled box's inner corners). It bounds nothing, it is not
+/// a face the user can see or pick, and it can never be the face a patch is
+/// capped AGAINST — so keeping it standing only turns a pocket's cap into the
+/// "whole boundary of ..." refusal (as it did for a user who selected every
+/// visible face of a shelled box's pocket, three zero-radius inner corners
+/// left out). A face with real area keeps that refusal: whether it is
+/// part of the pocket is the user's to say.
+///
+/// Repeated to a fixed point, so a sliver bounded by the selection and other
+/// slivers goes too. Ids come out in the order given, the slivers after them.
+pub(super) fn with_enclosed_slivers(solid: &BrepSolid, face_ids: &[u64]) -> Vec<u64> {
+    let mut selected: HashSet<u64> = face_ids.iter().copied().collect();
+    let mut out = face_ids.to_vec();
+    let scale = solid_model_scale(solid);
+    let negligible = scale * scale * 1e-9;
+    loop {
+        let counts = census(solid, &selected);
+        let on_selection = |coedge: &CoedgeRecord| {
+            counts
+                .get(&coedge.edge_id)
+                .is_some_and(|count| count.selected > 0)
+        };
+        let slivers: Vec<u64> = solid
+            .shells
+            .iter()
+            .flat_map(|shell| &shell.faces)
+            .filter(|face| !selected.contains(&face.id))
+            .filter(|face| {
+                let mut coedges = face.loops.iter().flat_map(|loop_record| &loop_record.coedges);
+                coedges.clone().next().is_some() && coedges.all(on_selection)
+            })
+            .filter(|face| crate::face_area(face).is_ok_and(|area| area.abs() <= negligible))
+            .map(|face| face.id)
+            .collect();
+        if slivers.is_empty() {
+            return out;
+        }
+        for face_id in slivers {
+            selected.insert(face_id);
+            out.push(face_id);
+        }
+    }
+}
+
 /// The whole selection's heal, without the soundness floor: see
 /// [`delete_faces_and_heal`].
 fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<BrepSolid, KernelRefusal> {
@@ -1928,6 +1978,9 @@ fn delete_faces_and_heal_impl(solid: &BrepSolid, face_ids: &[u64]) -> Result<Bre
     // and its caps together.
     let face_ids =
         with_owned_caps(solid, &face_ids, op)?;
+    // A zero-area sliver the selection alone bounds goes with it, picked or
+    // not (see `with_enclosed_slivers`).
+    let face_ids = with_enclosed_slivers(solid, &face_ids);
     if face_ids.len() == 1 {
         // One face is still a network when caps left standing by a second
         // round sit at its ends — a first round's cylinder whose end arcs the

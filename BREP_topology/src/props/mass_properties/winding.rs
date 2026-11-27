@@ -119,7 +119,37 @@ pub fn winding_band_integral_with_pole_gauge(
             return Ok(Some(values));
         }
     }
+    // ONE-POLE CARRIERS (`BREP_MASS_SINGLE_POLE_GAUGE`, default on, =0
+    // restores): a rim on a surface that collapses to a point at exactly one
+    // end of its cross parameter (a dome written as a rational B-spline with a
+    // row of control points at the pole, step-conformance's dome_nurbs) bounds
+    // the cap between it and that pole, the only side the loop closes. The
+    // primitive is based at the pole. Based at v0 while the pole is at v1, it
+    // read the strip from v0 to a rim lying at v0: area and volume 0.
+    if p_is_u && net_u != 0 && crate::switch!("BREP_MASS_SINGLE_POLE_GAUGE", true) {
+        if let Some(pole_at_v1) = single_pole_end(face, [u0, u1], [v0, v1])? {
+            return Ok(Some(winding_loops_integral_oriented(face, kinds, true, refine, true, pole_at_v1, false)?));
+        }
+    }
     Ok(Some(winding_loops_integral(face, kinds, p_is_u, refine)?))
+}
+
+/// Whether the carrier collapses to one point along exactly one of its end
+/// iso lines `v = v0`, `v = v1`: `Some(true)` for `v1`, `Some(false)` for
+/// `v0`, `None` for neither or both. Collapsed means 33 stations along the
+/// line within a billionth of the carrier's size of each other.
+fn single_pole_end(face: &FaceRecord, [u0, u1]: [f64; 2], [v0, v1]: [f64; 2]) -> Result<Option<bool>, String> {
+    let line = |v: f64| -> Result<Vec<Vec3>, String> {
+        (0..=32).map(|k| face.surface.evaluate(u0 + (u1 - u0) * k as f64 / 32.0, v)).collect()
+    };
+    let (low, high) = (line(v0)?, line(v1)?);
+    let size = low.iter().chain(&high).map(|p| p.sub(low[0]).length()).fold(0.0f64, f64::max).max(1e-300);
+    let collapsed = |points: &[Vec3]| points.iter().all(|p| p.sub(points[0]).length() <= 1e-9 * size);
+    Ok(match (collapsed(&low), collapsed(&high)) {
+        (false, true) => Some(true),
+        (true, false) => Some(false),
+        _ => None,
+    })
 }
 
 /// The boundary integral itself: `∮ −G du` (or `∮ H dv`) over every loop of

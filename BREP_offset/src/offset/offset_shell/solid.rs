@@ -61,6 +61,12 @@ pub fn offset_solid(
     Ok(built)
 }
 
+/// The rounded growth of a piece another lane assembles ([`super::corner_tubes`]):
+/// [`offset_solid`]'s own route, unread.
+pub(super) fn offset_solid_unread_for_pieces(source: &BrepSolid, distance: f64) -> Result<BrepSolid, KernelRefusal> {
+    Ok(offset_solid_unread(source, distance, OffsetCorners::Rounded)?.solid)
+}
+
 /// [`offset_solid`] before its result is read back ([`super::rim_witness`]).
 fn offset_solid_unread(
     source: &BrepSolid,
@@ -94,6 +100,12 @@ fn offset_solid_joined(
     distance: f64,
     corners: OffsetCorners,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    // A torus grown exactly to its hole is the horn torus (`BREP_OFFSET_HORN_TORUS`).
+    if corners == OffsetCorners::Rounded {
+        if let Some(grown) = super::convex_erosion::horn_torus_growth(source, distance) {
+            return Ok(grown);
+        }
+    }
     // A right prism over a smooth convex profile grows by its parts, the
     // rims' tubes fitted about the profile (`BREP_OFFSET_PRISM_GROWTH`).
     if corners == OffsetCorners::Rounded && distance > 0.0 {
@@ -145,6 +157,13 @@ fn offset_solid_joined_rest(
     distance: f64,
     corners: OffsetCorners,
 ) -> Result<OffsetShellResultRecord, KernelRefusal> {
+    // A concave rounded corner the growth passes: the sharp-cornered body's
+    // growth with the tubes about the corners' arcs (`BREP_OFFSET_CORNER_TUBES`).
+    if corners == OffsetCorners::Rounded && distance > 0.0 {
+        if let Some(grown) = super::corner_tubes::corner_tubes_growth(source, distance) {
+            return Ok(grown);
+        }
+    }
     if corners == OffsetCorners::Rounded && distance > 0.0 {
         if let Some(grown) = grown_across_reflex_edges(source, distance) {
             return Ok(grown);
@@ -192,6 +211,11 @@ fn offset_solid_joined_rest(
                     if let Some(eroded) = super::revolved_curved_erosion::revolved_curved_erosion(source, distance) {
                         return Ok(eroded);
                     }
+                    // A convex body of planes and spheres: its faces' regions
+                    // shrunk and met (`BREP_OFFSET_CONVEX_EROSION`).
+                    if let Some(eroded) = super::convex_erosion::convex_erosion(source, distance) {
+                        return Ok(eroded);
+                    }
                 }
                 if let Some(grown) = grown_by_pieces(source, distance)? {
                     return Ok(grown);
@@ -218,6 +242,13 @@ fn offset_solid_joined_rest(
         OffsetCorners::Sharp => Ok(sharp),
         OffsetCorners::Rounded => match round_offset_joins(sharp, distance, Some(source)) {
             Ok(rounded) => Ok(rounded),
+            // A shrink whose rounds the blend cannot build: the exact erosion
+            // lanes the pipeline's refusal is offered (`BREP_OFFSET_SHRINK_AFTER_ROUND`).
+            Err(error) if distance < 0.0 && shrink_after_round_on() => super::prism_erosion::prism_erosion(source, distance, false)
+                .or_else(|| super::revolved_erosion::revolved_erosion(source, distance, false))
+                .or_else(|| super::revolved_curved_erosion::revolved_curved_erosion(source, distance))
+                .or_else(|| super::convex_erosion::convex_erosion(source, distance))
+                .ok_or(error),
             // A mitred body cannot carry the ball over a vertex of degree four
             // or more; a convex polyhedron's parallel body is built directly.
             Err(error) => match crate::blend::convex_parallel::convex_polyhedron_parallel(source, distance) {
@@ -235,6 +266,20 @@ fn offset_solid_joined_rest(
         },
     }
 }
+
+/// `BREP_OFFSET_SHRINK_AFTER_ROUND` (default on; `=0` restores): a rounded
+/// SHRINK whose sharp body assembled but whose concave rounds the blend could
+/// not build is offered the exact erosion lanes a pipeline refusal is.
+///
+/// Cause (brep-bench offset/plus-shaped-plate-shrunk, a plus 4 thick shrunk by
+/// 1): the sharp body is right, but each arm is left exactly 2d wide and the
+/// rounds of its inside corners refuse ("faces are tangent along the edge";
+/// "dihedral angle too degenerate"), while the prism's erosion is its
+/// outline's erosion extruded between the caps moved in.
+fn shrink_after_round_on() -> bool {
+    switch!("BREP_OFFSET_SHRINK_AFTER_ROUND", true)
+}
+
 
 /// `BREP_OFFSET_PIPE_FIRST` (default on; `=0` restores; `check` builds both and
 /// compares their volumes): the pipe-parallel lane answers a rounded growth
@@ -486,7 +531,7 @@ fn sharp_join_midpoints(solid: &BrepSolid, convex: bool) -> Result<Vec<Vec3>, Ke
 /// along the edge and `n_a` that face's outward normal, `n_a × t` points into
 /// the first face; the join is convex when the second face's outward normal
 /// points away from there.
-fn edge_is_convex_join(
+pub(super) fn edge_is_convex_join(
     edge: &EdgeRecord,
     (first, first_forward): (&FaceRecord, bool),
     second: &FaceRecord,
@@ -946,71 +991,239 @@ fn grown_across_reflex_edges(source: &BrepSolid, distance: f64) -> Option<Offset
     if !reflex_by_pieces_enabled() {
         return None;
     }
-    let attempt = || -> Result<Option<OffsetShellResultRecord>, KernelRefusal> {
-        let band = 1e-9 * crate::solid_scale(source).max(1.0);
-        let faces = source.shells.iter().flat_map(|shell| &shell.faces).collect::<Vec<_>>();
-        let mut uses = HashMap::<u64, Vec<(&FaceRecord, bool)>>::default();
-        for face in &faces {
-            for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
-                uses.entry(coedge.edge_id).or_default().push((face, coedge.forward));
-            }
+    match reflex_growth(source, distance, REFLEX_DEPTH) {
+        Ok(Some(solid)) => {
+            let face_images = solid
+                .shells
+                .iter()
+                .flat_map(|shell| &shell.faces)
+                .map(|_| OffsetShellFaceImageRecord { role: OffsetFaceRole::Offset, source_face_id: 0 })
+                .collect();
+            Some(OffsetShellResultRecord { solid, face_images })
         }
-        let mut planes: Vec<(Vec3, Vec3)> = Vec::new();
-        for edge in &source.edges {
-            if edge.degenerate {
-                continue;
-            }
-            let Some(pair) = uses.get(&edge.id) else { continue };
-            if pair.len() != 2 || pair[0].0.id == pair[1].0.id {
-                continue;
-            }
-            if edge_is_convex_join(edge, pair[0], pair[1].0, 1.0 - 1e-6)? != Some(false) {
-                continue;
-            }
-            for (face, _) in pair {
-                let Some((point, normal)) = super::rim_welds::planar_surface_frame(&face.surface, band)? else {
-                    continue;
-                };
-                let seen = planes
-                    .iter()
-                    .any(|(other, axis)| axis.dot(normal).abs() >= 1.0 - 1e-12 && point.sub(*other).dot(*axis).abs() <= band);
-                if !seen {
-                    planes.push((point, normal));
-                }
-            }
-        }
-        if planes.is_empty() || planes.len() > 8 {
-            return Ok(None);
-        }
-        // One plane per reflex edge is enough, and fewer pieces meet in fewer
-        // places: try each plane alone first, then all of them.
-        let mut sets = planes.iter().map(|plane| vec![*plane]).collect::<Vec<_>>();
-        if planes.len() > 1 {
-            sets.push(planes.clone());
-        }
-        for set in &sets {
-            match grown_union(source, set, distance) {
-                Ok(Some(solid)) => {
-                    os_debug!("reflex by pieces: {} plane(s)", set.len());
-                    let face_images = solid
-                        .shells
-                        .iter()
-                        .flat_map(|shell| &shell.faces)
-                        .map(|_| OffsetShellFaceImageRecord { role: OffsetFaceRole::Offset, source_face_id: 0 })
-                        .collect();
-                    return Ok(Some(OffsetShellResultRecord { solid, face_images }));
-                }
-                Ok(None) => {}
-                Err(error) => os_debug!("reflex by pieces: {} plane(s) declined: {error}", set.len()),
-            }
-        }
-        Ok(None)
-    };
-    match attempt() {
-        Ok(result) => result,
+        Ok(None) => None,
         Err(error) => {
             os_debug!("reflex by pieces declined: {error}");
             None
         }
     }
+}
+
+/// How many times [`reflex_growth`] cuts a piece that still has reflex
+/// edges again (`BREP_OFFSET_REFLEX_RECURSE`).
+const REFLEX_DEPTH: usize = 6;
+
+/// `BREP_OFFSET_REFLEX_RECURSE` (default on; `=0` restores): a piece of
+/// [`grown_across_reflex_edges`] that still has a reflex edge between planar
+/// faces is grown by the lane again, cut at its own reflex planes, instead of
+/// by `fillet_edges`, which blends the crease where that edge meets two
+/// rounded rims.
+///
+/// Cause (a plate with a square hole grown by 1, brep-bench
+/// offset/plate-with-a-square-hole-grown, read volume +0.0823 and area
+/// −0.1215 against the closed form; plus-shaped, U-shaped, star and
+/// square-pocketed plates likewise): the lane took the first single plane
+/// that split the body, x = 3, and the U-shaped piece beyond it kept two
+/// reflex edges, whose four ends the fillet rounded as a rolling ball does
+/// (it opens the sharp body, and the opening keeps a spindle torus about each
+/// reflex edge where the parallel body has a crease: (1 − π/4)(5/3 − π/2)d³
+/// = 0.020574 too much volume at each end).
+fn reflex_recurse_enabled() -> bool {
+    switch!("BREP_OFFSET_REFLEX_RECURSE", true)
+}
+
+
+/// The planes of the planar faces beside each reflex (concave) edge of
+/// `source`, each plane once.
+fn reflex_planes(source: &BrepSolid) -> Result<Vec<(Vec3, Vec3)>, KernelRefusal> {
+    let band = 1e-9 * crate::solid_scale(source).max(1.0);
+    let faces = source.shells.iter().flat_map(|shell| &shell.faces).collect::<Vec<_>>();
+    let mut uses = HashMap::<u64, Vec<(&FaceRecord, bool)>>::default();
+    for face in &faces {
+        for coedge in face.loops.iter().flat_map(|loop_record| &loop_record.coedges) {
+            uses.entry(coedge.edge_id).or_default().push((face, coedge.forward));
+        }
+    }
+    let mut planes: Vec<(Vec3, Vec3)> = Vec::new();
+    for edge in &source.edges {
+        if edge.degenerate {
+            continue;
+        }
+        let Some(pair) = uses.get(&edge.id) else { continue };
+        if pair.len() != 2 || pair[0].0.id == pair[1].0.id {
+            continue;
+        }
+        if edge_is_convex_join(edge, pair[0], pair[1].0, 1.0 - 1e-6)? != Some(false) {
+            continue;
+        }
+        for (face, _) in pair {
+            let Some((point, normal)) = super::rim_welds::planar_surface_frame(&face.surface, band)? else {
+                continue;
+            };
+            let seen = planes
+                .iter()
+                .any(|(other, axis)| axis.dot(normal).abs() >= 1.0 - 1e-12 && point.sub(*other).dot(*axis).abs() <= band);
+            if !seen {
+                planes.push((point, normal));
+            }
+        }
+    }
+    Ok(planes)
+}
+
+/// The rounded growth of `source` as the union of its pieces' growths, cut at
+/// the planes of [`reflex_planes`]; `None` when it has none or no set of them
+/// builds. With `BREP_OFFSET_REFLEX_RECURSE` a piece that still has reflex
+/// planes is grown the same way, at most [`REFLEX_DEPTH`] levels deep and
+/// [`REFLEX_BUDGET`] plane sets in all; where that finds nothing the lane's
+/// single cuts answer as they do without the switch.
+fn reflex_growth(source: &BrepSolid, distance: f64, depth: usize) -> Result<Option<BrepSolid>, KernelRefusal> {
+    let planes = reflex_planes(source)?;
+    if planes.is_empty() {
+        return Ok(None);
+    }
+    if reflex_recurse_enabled() {
+        let mut budget = REFLEX_BUDGET;
+        if let Some(solid) = reflex_growth_whole(source, &planes, distance, depth, &mut budget)? {
+            return Ok(Some(solid));
+        }
+        os_debug!("reflex by pieces: no set leaves every piece free of reflex edges ({} set(s) tried)", REFLEX_BUDGET - budget);
+    }
+    if planes.len() > 8 {
+        return Ok(None);
+    }
+    for set in &plane_sets(&planes) {
+        match grown_union(source, set, distance) {
+            Ok(Some(solid)) => {
+                os_debug!("reflex by pieces: {} plane(s)", set.len());
+                return Ok(Some(solid));
+            }
+            Ok(None) => {}
+            Err(error) => os_debug!("reflex by pieces: {} plane(s) declined: {error}", set.len()),
+        }
+    }
+    Ok(None)
+}
+
+/// How many plane sets one [`reflex_growth`] tries at most, over all its
+/// levels (`BREP_OFFSET_REFLEX_RECURSE`).
+const REFLEX_BUDGET: usize = 24;
+
+/// Each plane alone, then all of them when there are two to eight: one plane
+/// per reflex edge is enough, and fewer pieces meet in fewer places.
+fn plane_sets(planes: &[(Vec3, Vec3)]) -> Vec<Vec<(Vec3, Vec3)>> {
+    let mut sets = planes.iter().map(|plane| vec![*plane]).collect::<Vec<_>>();
+    if planes.len() > 1 && planes.len() <= 8 {
+        sets.push(planes.to_vec());
+    }
+    sets
+}
+
+/// [`reflex_growth`] with `BREP_OFFSET_REFLEX_RECURSE`: the first set of
+/// `planes` whose every piece grows free of reflex planes (a piece with reflex
+/// planes of its own grown again, `depth` more levels), or `None`; never a
+/// piece rounded by the fillet across a reflex edge beside a planar face (one
+/// between curved faces is rounded as before).
+fn reflex_growth_whole(source: &BrepSolid, planes: &[(Vec3, Vec3)], distance: f64, depth: usize, budget: &mut usize) -> Result<Option<BrepSolid>, KernelRefusal> {
+    for set in &plane_sets(planes) {
+        if *budget == 0 {
+            return Ok(None);
+        }
+        *budget -= 1;
+        match reflex_union(source, set, distance, depth, budget) {
+            Ok(Some(solid)) => {
+                os_debug!("reflex by pieces: {} plane(s), depth {depth}", set.len());
+                return Ok(Some(solid));
+            }
+            Ok(None) => {}
+            Err(error) => os_debug!("reflex by pieces: {} plane(s) declined: {error}", set.len()),
+        }
+    }
+    Ok(None)
+}
+
+/// [`grown_union`] for the recursive reflex lane: `source` cut at `planes`,
+/// each disjoint lump of each piece grown on its own, a lump with reflex
+/// planes by [`reflex_growth_whole`]; `None` when one of those finds nothing
+/// or `depth` is spent.
+fn reflex_union(source: &BrepSolid, planes: &[(Vec3, Vec3)], distance: f64, depth: usize, budget: &mut usize) -> Result<Option<BrepSolid>, KernelRefusal> {
+    let pieces = cut_by_planes(source, planes);
+    if pieces.len() < 2 {
+        return Ok(None);
+    }
+    let lumps = pieces.iter().flat_map(solid_lumps).collect::<Vec<_>>();
+    os_debug!("reflex by pieces: {} plane(s) cut the body into {} lump(s)", planes.len(), lumps.len());
+    let inners = lumps.iter().map(reflex_planes).collect::<Result<Vec<_>, _>>()?;
+    if depth == 0 && inners.iter().any(|inner| !inner.is_empty()) {
+        return Ok(None);
+    }
+    let mut grown = Vec::with_capacity(lumps.len());
+    for (index, (lump, inner)) in lumps.iter().zip(&inners).enumerate() {
+        if !inner.is_empty() {
+            match reflex_growth_whole(lump, inner, distance, depth - 1, budget)? {
+                Some(solid) => grown.push(solid),
+                None => return Ok(None),
+            }
+            continue;
+        }
+        // A lump free of reflex planes with a curved face grows by the whole
+        // route, so a bore through it keeps its dimples (a recess's ring over
+        // its floor); a lump of planes is rounded as the lane always did.
+        let band = 1e-9 * crate::solid_scale(lump).max(1.0);
+        let mut curved = false;
+        for face in lump.shells.iter().flat_map(|shell| &shell.faces) {
+            if super::rim_welds::planar_surface_frame(&face.surface, band)?.is_none() {
+                curved = true;
+                break;
+            }
+        }
+        if curved {
+            let lump_grown = offset_solid_unread(lump, distance, OffsetCorners::Rounded)
+                .map_err(|error| error.with_message(|message| format!("lump {index}: {message}")))?;
+            grown.push(lump_grown.solid);
+            continue;
+        }
+        let sharp = offset_body(lump, &[], -distance, Body::Whole, "offset_solid_piece")
+            .map_err(|error| error.with_message(|message| format!("lump {index}: {message}")))?;
+        grown.push(round_offset_joins(sharp, distance, None)?.solid);
+    }
+    union_of_grown(&grown)
+}
+
+/// `solid` as one solid per shell when every shell bounds material of its
+/// own (positive volume alone: no void shell), else `solid` whole.
+fn solid_lumps(solid: &BrepSolid) -> Vec<BrepSolid> {
+    if solid.shells.len() < 2 {
+        return vec![solid.clone()];
+    }
+    let mut lumps = Vec::with_capacity(solid.shells.len());
+    for shell in &solid.shells {
+        let mut edge_ids = rustc_hash::FxHashSet::default();
+        for coedge in shell.faces.iter().flat_map(|face| &face.loops).flat_map(|loop_record| &loop_record.coedges) {
+            edge_ids.insert(coedge.edge_id);
+        }
+        let edges = solid.edges.iter().filter(|edge| edge_ids.contains(&edge.id)).cloned().collect::<Vec<_>>();
+        let vertex_ids = edges.iter().flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id]).collect::<rustc_hash::FxHashSet<_>>();
+        let mut lump = BrepSolid {
+            mass_properties_cache: Default::default(),
+            vertices: solid.vertices.iter().filter(|vertex| vertex_ids.contains(&vertex.id)).cloned().collect(),
+            edges,
+            shells: vec![shell.clone()],
+            genus: 0,
+            cells: Vec::new(),
+            ..solid.clone()
+        };
+        // genus = S − χ/2, χ = V − E + F − H over the non-degenerate cells,
+        // as `validate` reads it.
+        let live = lump.edges.iter().filter(|edge| !edge.degenerate).flat_map(|edge| [edge.start_vertex_id, edge.end_vertex_id]).collect::<rustc_hash::FxHashSet<_>>();
+        let chi = live.len() as i64 - lump.edges.iter().filter(|edge| !edge.degenerate).count() as i64 + shell.faces.len() as i64
+            - lump.bounding_hole_count();
+        lump.genus = 1 - chi / 2;
+        let positive = crate::solid_mass_properties(&lump).is_ok_and(|m| m.volume > 0.0);
+        if !positive || !lump.validate().is_empty() {
+            return vec![solid.clone()];
+        }
+        lumps.push(lump);
+    }
+    lumps
 }

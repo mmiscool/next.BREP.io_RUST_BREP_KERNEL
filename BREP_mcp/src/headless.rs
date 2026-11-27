@@ -406,6 +406,9 @@ fn step(harness: &mut App, queue: &Arc<brep_app::automation::queue::AutomationQu
     let view = harness.state().app().view_rect();
     let ctx = harness.ctx.clone();
     queue.drain_input(harness.input_mut(), frame, ppp, view, &ctx);
+    // As the app's `raw_input_hook` does after its input: on (emulated)
+    // macOS a Ctrl+click is the secondary click.
+    brep_app::select_mods::rewrite_raw(&ctx, harness.input_mut());
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| harness.step()));
     match r {
         Ok(()) => Ok(()),

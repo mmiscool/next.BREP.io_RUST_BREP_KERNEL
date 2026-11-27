@@ -2034,19 +2034,10 @@ impl BrepApp {
 
 }
 
-impl eframe::App for BrepApp {
-    /// The browser's automation pump reaches the app between frames through
-    /// eframe's runner (`WebRunner::app_mut`, `web_pump`). A web-only method.
-    #[cfg(target_arch = "wasm32")]
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
-    }
-
-    /// Phase 1 of the automation frame (§4.4): queued input commands become
-    /// egui events; a screenshot that landed completes its reply. Called by
-    /// every eframe runner before `ui`; the headless host calls it itself.
-    #[cfg(feature = "automation")]
-    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+/// Phase 1 of the automation frame (§4.4), from `raw_input_hook`.
+#[cfg(feature = "automation")]
+impl BrepApp {
+    fn automation_input(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         let view = self.viewport.last_rect();
         // eframe runs a pass without `ui` when the window is not visible (a
         // hidden tab's timer frames, an occluded or minimised window): input
@@ -2076,6 +2067,26 @@ impl eframe::App for BrepApp {
             return;
         }
         self.automation.drain_input(raw_input, ctx.cumulative_frame_nr(), ctx.pixels_per_point(), view, ctx);
+    }
+}
+
+impl eframe::App for BrepApp {
+    /// The browser's automation pump reaches the app between frames through
+    /// eframe's runner (`WebRunner::app_mut`, `web_pump`). A web-only method.
+    #[cfg(target_arch = "wasm32")]
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
+    /// Phase 1 of the automation frame (§4.4): queued input commands become
+    /// egui events; a screenshot that landed completes its reply. Called by
+    /// every eframe runner before `ui`; the headless host calls it itself.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        #[cfg(feature = "automation")]
+        self.automation_input(ctx, raw_input);
+        // macOS: Ctrl+click is the secondary click (after the automation
+        // input, so scripts exercise it too).
+        crate::select_mods::rewrite_raw(ctx, raw_input);
     }
 
 

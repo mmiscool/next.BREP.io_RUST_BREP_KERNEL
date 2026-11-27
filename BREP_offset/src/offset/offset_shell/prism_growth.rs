@@ -44,6 +44,17 @@ pub(super) fn prism_growth_on() -> bool {
 const FIRST_STATIONS: usize = 64;
 const MAX_STATIONS: usize = 512;
 
+/// `BREP_OFFSET_PRISM_GROWTH_STATIONS` (default on; `=0` restores): the
+/// fits refine up to 2048 stations, not 512. Cause (brep-bench
+/// offset/flat-elliptic-cylinder-grown, semi-axes 10 and 2 grown by 1): the
+/// fits read 7.3e-9 off at 512 stations, over the 1e-9 bar, and settle about
+/// eighty times closer per doubling; the lane declined and the blend refused
+/// the rims ("wall stands 9.6e-7 off the rolling ball").
+fn max_stations() -> usize {
+    if switch!("BREP_OFFSET_PRISM_GROWTH_STATIONS", true) { 4 * MAX_STATIONS } else { MAX_STATIONS }
+}
+
+
 /// The grown rounded parallel body of `source` by `distance` (> 0), or `None`.
 pub(super) fn prism_growth(source: &BrepSolid, distance: f64) -> Option<OffsetShellResultRecord> {
     if !prism_growth_on() || !(distance > 0.0) || !distance.is_finite() {
@@ -190,7 +201,8 @@ fn prism_growth_impl(source: &BrepSolid, distance: f64) -> Result<Option<OffsetS
     // The fits, refined until both read their exact points midway between stations.
     let mut fitted = None;
     let mut stations = FIRST_STATIONS;
-    while stations <= MAX_STATIONS {
+    let most = max_stations();
+    while stations <= most {
         let parameters: Vec<f64> = (0..=stations).map(|k| std::f64::consts::TAU * k as f64 / stations as f64).collect();
         let mut points = Vec::with_capacity(stations);
         let mut offsets = Vec::with_capacity(stations);

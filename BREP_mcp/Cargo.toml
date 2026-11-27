@@ -1,6 +1,6 @@
 [package]
 name = "BREP_mcp"
-version = "0.28.0"
+version = "0.29.0"
 edition = "2021"
 rust-version = "1.92"
 license-file = "LICENSE.md"
@@ -42,7 +42,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # printed and refused; no argument-parser crate.
 # The app with its automation layer, for the headless host. Default features
 # off: the app's own embedded server (`mcp`) is not needed under the harness.
-brep-app = { package = "BREP_app", version = "0.33.0", path = "../BREP_app", default-features = false, features = ["automation"] }
+brep-app = { package = "BREP_app", version = "0.34.0", path = "../BREP_app", default-features = false, features = ["automation"] }
 egui = "0.35"
 egui_kittest = { version = "0.35", features = ["wgpu", "eframe"] }
 # The harness's app state is an `eframe::App` — `crate::annotate::Annotated`,

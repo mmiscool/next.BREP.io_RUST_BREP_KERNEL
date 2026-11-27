@@ -614,7 +614,7 @@ impl BomPanel {
         }
         if let Some(id) = &out.clicked {
             // Ctrl/Cmd or Shift toggles the line into the selection.
-            let additive = ui.input(|i| i.modifiers.command || i.modifiers.shift);
+            let additive = crate::select_mods::primary_in(ui.ctx()) || ui.input(|i| i.modifiers.shift);
             if let Some(line) = self.nested.get(id) {
                 nested::select_paths(state, &line.paths, additive);
             } else if let Some(group) = groups.iter().find(|group| group.key == *id) {

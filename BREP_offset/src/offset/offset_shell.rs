@@ -137,6 +137,10 @@ mod outward_side_widen;
 pub mod box_cavity;
 #[path = "offset_shell/revolved_shell.rs"]
 pub mod revolved_shell;
+#[path = "offset_shell/corner_tubes.rs"]
+pub mod corner_tubes;
+#[path = "offset_shell/convex_erosion.rs"]
+pub mod convex_erosion;
 
 pub use carrier_rebuild::*;
 pub use carriers::*;

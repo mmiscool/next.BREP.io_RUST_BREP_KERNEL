@@ -174,7 +174,13 @@ pub(crate) fn interaction_color(
 /// Whether an entity ref (`{"kind":…,"id":…}`) names the `(kind, id)` entity —
 /// ids compared via [`id_key`] so a numeric `4` and string `"4"` match the solver's
 /// identity keying. `pub(crate)` so the constraint overlays share the one matcher.
+///
+/// An ARRAY of refs matches when any of them does: a box drag's live preview
+/// lights its whole take through the one hover slot.
 pub(crate) fn ref_matches(r: &Value, kind: &str, id: &Value) -> bool {
+    if let Value::Array(refs) = r {
+        return refs.iter().any(|r| ref_matches(r, kind, id));
+    }
     r.get("kind").and_then(Value::as_str) == Some(kind)
         && r.get("id").map(id_key) == Some(id_key(id))
 }
